@@ -1,0 +1,596 @@
+//! `SessionHost` — single owner of all `lean-rs` state.
+//!
+//! `lean-rs` types (`LeanRuntime`, `LeanHost`, `LeanCapabilities`,
+//! `LeanSession`, `SessionPool`) are `!Send` and carry a `'lean` lifetime
+//! anchored to a process-global runtime. They cannot cross `tokio` task
+//! boundaries, and they cannot live inside an `Arc<Mutex<…>>` accessed from
+//! multiple async tasks.
+//!
+//! The pattern used here: one dedicated OS thread owns all Lean state.
+//! Async tool handlers submit `Request` enum values over an
+//! [`mpsc`](tokio::sync::mpsc) channel and await a `oneshot` reply. From the
+//! caller's perspective the host looks like an async actor; the lifetime
+//! tangle stays hidden inside the worker thread.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::thread;
+
+use lean_rs::LeanRuntime;
+use lean_rs_host::meta::{
+    LeanMetaOptions, LeanMetaResponse, LeanMetaTransparency, infer_type as meta_infer_type,
+    is_def_eq as meta_is_def_eq, whnf as meta_whnf,
+};
+use lean_rs_host::{
+    LeanCapabilities, LeanElabFailure, LeanElabOptions, LeanHost, LeanKernelOutcome, LeanSession, LeanSourceRange,
+    ProofSummary,
+};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::error::{Result, ServerError};
+
+/// Source-range projection — public fields mirroring `LeanSourceRange`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct SourceRange {
+    pub file: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct Position {
+    pub line: u32,
+    pub column: u32,
+    pub end_line: Option<u32>,
+    pub end_column: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct Diagnostic {
+    pub severity: String,
+    pub message: String,
+    pub position: Option<Position>,
+    pub file: String,
+}
+
+/// Structured failure payload — the projection of `LeanElabFailure` we send
+/// over JSON. Failure is part of a successful tool call; this is never an
+/// MCP error.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ElabFailure {
+    pub diagnostics: Vec<Diagnostic>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ElabSuccess {
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct KernelOutcome {
+    /// One of `Checked`, `Rejected`, `Unavailable`, `Unsupported`, or
+    /// `Unknown` (for non-exhaustive future variants).
+    pub status: String,
+    pub summary: Option<KernelSummary>,
+    pub failure: Option<ElabFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct KernelSummary {
+    pub declaration_name: String,
+    pub kind: String,
+    pub type_signature: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct MetaOutcome {
+    /// One of `Ok`, `Failed`, `TimeoutOrHeartbeat`, `Unsupported`, or
+    /// `Unknown` (for non-exhaustive future variants).
+    pub status: String,
+    pub rendered: Option<String>,
+    pub definitionally_equal: Option<bool>,
+    pub failure: Option<ElabFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationRow {
+    pub name: String,
+    pub kind: String,
+    /// v0.1 always `None`: `LeanExpr` is opaque across the worker channel
+    /// boundary in published `lean-rs` 0.1.x. Surfaces in v0.2.
+    pub type_signature: Option<String>,
+    pub source: Option<SourceRange>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionHost {
+    tx: mpsc::Sender<Request>,
+    lake_root: String,
+    lean_toolchain: String,
+}
+
+impl SessionHost {
+    pub fn spawn(lake_root: PathBuf, package: String, library: String, default_imports: Vec<String>) -> Result<Self> {
+        type InitMsg = std::result::Result<(String, mpsc::Sender<Request>), ServerError>;
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
+        let lake_root_owned = lake_root.clone();
+        thread::Builder::new()
+            .name("lean-host-mcp/session".to_owned())
+            .spawn(move || {
+                worker_main(lake_root_owned, package, library, default_imports, init_tx);
+            })
+            .map_err(|e| ServerError::Internal(format!("spawn worker thread: {e}")))?;
+
+        let (toolchain, tx) = init_rx
+            .recv()
+            .map_err(|_| ServerError::Internal("worker thread died during init".into()))??;
+
+        Ok(Self {
+            tx,
+            lake_root: lake_root.to_string_lossy().into_owned(),
+            lean_toolchain: toolchain,
+        })
+    }
+
+    pub fn lake_root(&self) -> &str {
+        &self.lake_root
+    }
+
+    pub fn lean_toolchain(&self) -> &str {
+        &self.lean_toolchain
+    }
+
+    async fn submit<T: Send + 'static>(&self, build: impl FnOnce(oneshot::Sender<Result<T>>) -> Request) -> Result<T> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(build(resp_tx))
+            .await
+            .map_err(|_| ServerError::SessionGone)?;
+        resp_rx.await.map_err(|_| ServerError::SessionGone)?
+    }
+
+    pub async fn elaborate(
+        &self,
+        source: String,
+        imports: Vec<String>,
+    ) -> Result<std::result::Result<ElabSuccess, ElabFailure>> {
+        self.submit(|reply| Request::Elaborate { source, imports, reply }).await
+    }
+
+    pub async fn kernel_check(&self, source: String, imports: Vec<String>) -> Result<KernelOutcome> {
+        self.submit(|reply| Request::KernelCheck { source, imports, reply })
+            .await
+    }
+
+    pub async fn infer_type(&self, source: String, imports: Vec<String>) -> Result<MetaOutcome> {
+        self.submit(|reply| Request::InferType { source, imports, reply }).await
+    }
+
+    pub async fn whnf(&self, source: String, imports: Vec<String>) -> Result<MetaOutcome> {
+        self.submit(|reply| Request::Whnf { source, imports, reply }).await
+    }
+
+    pub async fn is_def_eq(&self, lhs: String, rhs: String, imports: Vec<String>) -> Result<MetaOutcome> {
+        self.submit(|reply| Request::IsDefEq {
+            lhs,
+            rhs,
+            imports,
+            reply,
+        })
+        .await
+    }
+
+    /// Look up a declaration by fully-qualified name. Returns `None` when
+    /// Lean reports the declaration as `"missing"`. Used by `hover_by_name`.
+    pub async fn describe(&self, name: String, imports: Vec<String>) -> Result<Option<DeclarationRow>> {
+        self.submit(|reply| Request::Describe { name, imports, reply }).await
+    }
+}
+
+#[derive(Debug)]
+enum Request {
+    Elaborate {
+        source: String,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<std::result::Result<ElabSuccess, ElabFailure>>>,
+    },
+    KernelCheck {
+        source: String,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<KernelOutcome>>,
+    },
+    InferType {
+        source: String,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<MetaOutcome>>,
+    },
+    Whnf {
+        source: String,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<MetaOutcome>>,
+    },
+    IsDefEq {
+        lhs: String,
+        rhs: String,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<MetaOutcome>>,
+    },
+    Describe {
+        name: String,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<Option<DeclarationRow>>>,
+    },
+}
+
+fn worker_main(
+    lake_root: PathBuf,
+    package: String,
+    library: String,
+    default_imports: Vec<String>,
+    init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<Request>), ServerError>>,
+) {
+    let runtime = match LeanRuntime::init() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = init_reply.send(Err(ServerError::Lean(format!("runtime init: {e}"))));
+            return;
+        }
+    };
+
+    let host = match LeanHost::from_lake_project(runtime, &lake_root) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = init_reply.send(Err(ServerError::BadProject(format!(
+                "open lake project at {}: {e}",
+                lake_root.display()
+            ))));
+            return;
+        }
+    };
+
+    let caps = match host.load_capabilities(&package, &library) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = init_reply.send(Err(ServerError::BadProject(format!(
+                "load capabilities {package}/{library}: {e} (does this Lake project depend on lean-rs-host shims?)"
+            ))));
+            return;
+        }
+    };
+
+    let toolchain = lean_toolchain_label(&lake_root);
+    let (tx, mut rx) = mpsc::channel::<Request>(64);
+    if init_reply.send(Ok((toolchain, tx))).is_err() {
+        return;
+    }
+
+    let mut state = WorkerState {
+        caps: &caps,
+        sessions: HashMap::new(),
+        default_imports,
+    };
+
+    while let Some(req) = rx.blocking_recv() {
+        state.handle(req);
+    }
+}
+
+struct WorkerState<'lean, 'h> {
+    caps: &'h LeanCapabilities<'lean, 'h>,
+    sessions: HashMap<Vec<String>, LeanSession<'lean, 'h>>,
+    default_imports: Vec<String>,
+}
+
+impl<'lean, 'h> WorkerState<'lean, 'h> {
+    fn session_for(&mut self, imports: Vec<String>) -> Result<&mut LeanSession<'lean, 'h>> {
+        let key = if imports.is_empty() {
+            self.default_imports.clone()
+        } else {
+            imports
+        };
+        if !self.sessions.contains_key(&key) {
+            let module_refs: Vec<&str> = key.iter().map(String::as_str).collect();
+            let session = self
+                .caps
+                .session(&module_refs, None, None)
+                .map_err(|e| ServerError::Lean(format!("import {key:?}: {e}")))?;
+            self.sessions.insert(key.clone(), session);
+        }
+        Ok(self.sessions.get_mut(&key).expect("just inserted"))
+    }
+
+    fn handle(&mut self, req: Request) {
+        match req {
+            Request::Elaborate { source, imports, reply } => {
+                let _ = reply.send(self.do_elaborate(&source, imports));
+            }
+            Request::KernelCheck { source, imports, reply } => {
+                let _ = reply.send(self.do_kernel_check(&source, imports));
+            }
+            Request::InferType { source, imports, reply } => {
+                let _ = reply.send(self.do_infer_type(&source, imports));
+            }
+            Request::Whnf { source, imports, reply } => {
+                let _ = reply.send(self.do_whnf(&source, imports));
+            }
+            Request::IsDefEq {
+                lhs,
+                rhs,
+                imports,
+                reply,
+            } => {
+                let _ = reply.send(self.do_is_def_eq(&lhs, &rhs, imports));
+            }
+            Request::Describe { name, imports, reply } => {
+                let _ = reply.send(self.do_describe(&name, imports));
+            }
+        }
+    }
+
+    fn do_elaborate(
+        &mut self,
+        source: &str,
+        imports: Vec<String>,
+    ) -> Result<std::result::Result<ElabSuccess, ElabFailure>> {
+        let session = self.session_for(imports)?;
+        let opts = LeanElabOptions::new();
+        match session.elaborate(source, None, &opts, None) {
+            Ok(Ok(_expr)) => Ok(Ok(ElabSuccess { ok: true })),
+            Ok(Err(failure)) => Ok(Err(project_failure(&failure))),
+            Err(e) => Err(ServerError::Lean(format!("elaborate: {e}"))),
+        }
+    }
+
+    fn do_kernel_check(&mut self, source: &str, imports: Vec<String>) -> Result<KernelOutcome> {
+        let session = self.session_for(imports)?;
+        let opts = LeanElabOptions::new();
+        let outcome = session
+            .kernel_check(source, &opts, None, None)
+            .map_err(|e| ServerError::Lean(format!("kernel_check: {e}")))?;
+        Ok(project_kernel_outcome(session, outcome))
+    }
+
+    fn do_infer_type(&mut self, source: &str, imports: Vec<String>) -> Result<MetaOutcome> {
+        let session = self.session_for(imports)?;
+        let opts = LeanElabOptions::new();
+        let expr = match session.elaborate(source, None, &opts, None) {
+            Ok(Ok(expr)) => expr,
+            Ok(Err(failure)) => return Ok(failure_meta(failure)),
+            Err(e) => return Err(ServerError::Lean(format!("elaborate for infer_type: {e}"))),
+        };
+        let meta_opts = LeanMetaOptions::new();
+        let response = session
+            .run_meta(&meta_infer_type(), expr, &meta_opts, None)
+            .map_err(|e| ServerError::Lean(format!("run_meta infer_type: {e}")))?;
+        Ok(project_meta_unit(response))
+    }
+
+    fn do_whnf(&mut self, source: &str, imports: Vec<String>) -> Result<MetaOutcome> {
+        let session = self.session_for(imports)?;
+        let opts = LeanElabOptions::new();
+        let expr = match session.elaborate(source, None, &opts, None) {
+            Ok(Ok(expr)) => expr,
+            Ok(Err(failure)) => return Ok(failure_meta(failure)),
+            Err(e) => return Err(ServerError::Lean(format!("elaborate for whnf: {e}"))),
+        };
+        let meta_opts = LeanMetaOptions::new();
+        let response = session
+            .run_meta(&meta_whnf(), expr, &meta_opts, None)
+            .map_err(|e| ServerError::Lean(format!("run_meta whnf: {e}")))?;
+        Ok(project_meta_unit(response))
+    }
+
+    fn do_is_def_eq(&mut self, lhs: &str, rhs: &str, imports: Vec<String>) -> Result<MetaOutcome> {
+        let session = self.session_for(imports)?;
+        let opts = LeanElabOptions::new();
+        let lhs_expr = match session.elaborate(lhs, None, &opts, None) {
+            Ok(Ok(e)) => e,
+            Ok(Err(failure)) => return Ok(failure_meta(failure)),
+            Err(e) => return Err(ServerError::Lean(format!("elaborate lhs: {e}"))),
+        };
+        let rhs_expr = match session.elaborate(rhs, None, &opts, None) {
+            Ok(Ok(e)) => e,
+            Ok(Err(failure)) => return Ok(failure_meta(failure)),
+            Err(e) => return Err(ServerError::Lean(format!("elaborate rhs: {e}"))),
+        };
+        let meta_opts = LeanMetaOptions::new();
+        let response = session
+            .run_meta(
+                &meta_is_def_eq(),
+                (lhs_expr, rhs_expr, LeanMetaTransparency::default()),
+                &meta_opts,
+                None,
+            )
+            .map_err(|e| ServerError::Lean(format!("run_meta is_def_eq: {e}")))?;
+        Ok(project_meta_bool(response))
+    }
+
+    fn do_describe(&mut self, name: &str, imports: Vec<String>) -> Result<Option<DeclarationRow>> {
+        let session = self.session_for(imports)?;
+        let kind = match session.declaration_kind(name, None) {
+            Ok(k) if k == "missing" => return Ok(None),
+            Ok(k) => k,
+            Err(e) => return Err(ServerError::Lean(format!("declaration_kind {name}: {e}"))),
+        };
+        // type_signature is None in v0.1 — see DeclarationRow doc.
+        let source = session
+            .declaration_source_range(name, None)
+            .ok()
+            .flatten()
+            .map(project_source_range);
+        Ok(Some(DeclarationRow {
+            name: name.to_owned(),
+            kind,
+            type_signature: None,
+            source,
+        }))
+    }
+}
+
+fn lean_toolchain_label(lake_root: &std::path::Path) -> String {
+    let path = lake_root.join("lean-toolchain");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn project_failure(failure: &LeanElabFailure) -> ElabFailure {
+    ElabFailure {
+        diagnostics: failure
+            .diagnostics()
+            .iter()
+            .map(|d| Diagnostic {
+                severity: format!("{:?}", d.severity()),
+                message: d.message().to_owned(),
+                position: d.position().map(|p| Position {
+                    line: p.line(),
+                    column: p.column(),
+                    end_line: p.end_line(),
+                    end_column: p.end_column(),
+                }),
+                file: d.file_label().to_owned(),
+            })
+            .collect(),
+        truncated: failure.truncated(),
+    }
+}
+
+fn project_kernel_outcome<'lean>(
+    session: &mut LeanSession<'lean, '_>,
+    outcome: LeanKernelOutcome<'lean>,
+) -> KernelOutcome {
+    match outcome {
+        LeanKernelOutcome::Checked(evidence) => {
+            let summary = session.summarize_evidence(&evidence, None).ok().map(project_summary);
+            KernelOutcome {
+                status: "Checked".into(),
+                summary,
+                failure: None,
+            }
+        }
+        LeanKernelOutcome::Rejected(failure) => KernelOutcome {
+            status: "Rejected".into(),
+            summary: None,
+            failure: Some(project_failure(&failure)),
+        },
+        LeanKernelOutcome::Unavailable(failure) => KernelOutcome {
+            status: "Unavailable".into(),
+            summary: None,
+            failure: Some(project_failure(&failure)),
+        },
+        LeanKernelOutcome::Unsupported(failure) => KernelOutcome {
+            status: "Unsupported".into(),
+            summary: None,
+            failure: Some(project_failure(&failure)),
+        },
+        _ => KernelOutcome {
+            status: "Unknown".into(),
+            summary: None,
+            failure: None,
+        },
+    }
+}
+
+fn project_summary(summary: ProofSummary) -> KernelSummary {
+    KernelSummary {
+        declaration_name: summary.declaration_name().to_owned(),
+        kind: summary.kind().to_owned(),
+        type_signature: summary.type_signature().to_owned(),
+    }
+}
+
+fn project_source_range(range: LeanSourceRange) -> SourceRange {
+    SourceRange {
+        file: range.file,
+        start_line: range.start_line,
+        start_column: range.start_column,
+        end_line: range.end_line,
+        end_column: range.end_column,
+    }
+}
+
+/// Project a `LeanMetaResponse<T>` whose `Ok` payload we don't expose. Used
+/// for `infer_type` and `whnf` — the resulting `LeanExpr` is opaque across
+/// the worker boundary, so we report success and a placeholder string.
+fn project_meta_unit<T>(response: LeanMetaResponse<T>) -> MetaOutcome {
+    match response {
+        LeanMetaResponse::Ok(_) => MetaOutcome {
+            status: "Ok".into(),
+            rendered: Some("<opaque LeanExpr>".into()),
+            definitionally_equal: None,
+            failure: None,
+        },
+        LeanMetaResponse::Failed(failure) => MetaOutcome {
+            status: "Failed".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: Some(project_failure(&failure)),
+        },
+        LeanMetaResponse::TimeoutOrHeartbeat(failure) => MetaOutcome {
+            status: "TimeoutOrHeartbeat".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: Some(project_failure(&failure)),
+        },
+        LeanMetaResponse::Unsupported(failure) => MetaOutcome {
+            status: "Unsupported".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: Some(project_failure(&failure)),
+        },
+        _ => MetaOutcome {
+            status: "Unknown".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: None,
+        },
+    }
+}
+
+fn project_meta_bool(response: LeanMetaResponse<bool>) -> MetaOutcome {
+    match response {
+        LeanMetaResponse::Ok(b) => MetaOutcome {
+            status: "Ok".into(),
+            rendered: None,
+            definitionally_equal: Some(b),
+            failure: None,
+        },
+        LeanMetaResponse::Failed(failure) => MetaOutcome {
+            status: "Failed".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: Some(project_failure(&failure)),
+        },
+        LeanMetaResponse::TimeoutOrHeartbeat(failure) => MetaOutcome {
+            status: "TimeoutOrHeartbeat".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: Some(project_failure(&failure)),
+        },
+        LeanMetaResponse::Unsupported(failure) => MetaOutcome {
+            status: "Unsupported".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: Some(project_failure(&failure)),
+        },
+        _ => MetaOutcome {
+            status: "Unknown".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: None,
+        },
+    }
+}
+
+fn failure_meta(failure: LeanElabFailure) -> MetaOutcome {
+    MetaOutcome {
+        status: "Failed".into(),
+        rendered: None,
+        definitionally_equal: None,
+        failure: Some(project_failure(&failure)),
+    }
+}

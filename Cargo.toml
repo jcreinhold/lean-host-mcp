@@ -1,0 +1,49 @@
+[package]
+name = "lean-host-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["Jacob Reinhold <jcreinhold@gmail.com>"]
+description = "MCP server hosting Lean 4 in-process via lean-rs"
+repository = "https://github.com/jcreinhold/lean-host-mcp"
+license = "MIT OR Apache-2.0"
+keywords = ["lean", "lean4", "mcp", "model-context-protocol"]
+categories = ["development-tools"]
+publish = false
+
+[lib]
+name = "lean_host_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lean-host-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "2"
+walkdir = "2"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+lean-rs = "0.1"
+lean-rs-host = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+insta = { version = "1", features = ["json"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Pedantic stays off in v0.1 — too noisy against tokio + macro-generated
+# code. Default clippy still catches real bugs.
