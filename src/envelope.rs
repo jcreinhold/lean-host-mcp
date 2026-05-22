@@ -33,7 +33,10 @@ pub struct Freshness {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct Response<T: Serialize + JsonSchema> {
+pub struct Response<T>
+where
+    T: Serialize + JsonSchema,
+{
     pub result: T,
     pub freshness: Freshness,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -42,7 +45,10 @@ pub struct Response<T: Serialize + JsonSchema> {
     pub next_actions: Vec<String>,
 }
 
-impl<T: Serialize + JsonSchema> Response<T> {
+impl<T> Response<T>
+where
+    T: Serialize + JsonSchema,
+{
     pub fn ok(result: T, freshness: Freshness) -> Self {
         Self {
             result,
@@ -52,11 +58,13 @@ impl<T: Serialize + JsonSchema> Response<T> {
         }
     }
 
+    #[must_use]
     pub fn warn(mut self, msg: impl Into<String>) -> Self {
         self.warnings.push(msg.into());
         self
     }
 
+    #[must_use]
     pub fn hint(mut self, msg: impl Into<String>) -> Self {
         self.next_actions.push(msg.into());
         self

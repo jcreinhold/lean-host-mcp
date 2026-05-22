@@ -35,7 +35,7 @@ impl From<ServerError> for McpError {
     fn from(err: ServerError) -> Self {
         // -32603 == internal error in JSON-RPC. The MCP spec leaves wider
         // codes available but most clients only branch on this band.
-        McpError::internal_error(err.to_string(), None)
+        Self::internal_error(err.to_string(), None)
     }
 }
 

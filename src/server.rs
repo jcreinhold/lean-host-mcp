@@ -104,7 +104,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::scan::ProjectScanRequest>,
     ) -> std::result::Result<Json<Response<tools::scan::ProjectScanResult>>, McpError> {
-        wrap(tools::scan::project_scan(&self.ctx, req).await)
+        wrap(tools::scan::project_scan(&self.ctx, req))
     }
 }
 

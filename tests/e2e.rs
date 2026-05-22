@@ -11,6 +11,10 @@
 //!     cargo test --test e2e -- --ignored
 //! ```
 
+// Test code: `expect`, `unwrap`, and `panic!` are the idiomatic way to
+// surface test failures and unreachable setup branches.
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 use std::path::PathBuf;
 
 use lean_host_mcp::SessionHost;
@@ -25,9 +29,8 @@ fn fixture_env() -> Option<(PathBuf, String, String)> {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn elaborate_prelude_term() {
-    let (root, pkg, lib) = match fixture_env() {
-        Some(t) => t,
-        None => panic!("LEAN_HOST_MCP_TEST_FIXTURE not set"),
+    let Some((root, pkg, lib)) = fixture_env() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let host = SessionHost::spawn(root, pkg, lib, vec!["LeanRsFixture.Handles".into()]).expect("spawn");
     let result = host
@@ -40,9 +43,8 @@ async fn elaborate_prelude_term() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn describe_prelude_name() {
-    let (root, pkg, lib) = match fixture_env() {
-        Some(t) => t,
-        None => panic!("LEAN_HOST_MCP_TEST_FIXTURE not set"),
+    let Some((root, pkg, lib)) = fixture_env() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let host = SessionHost::spawn(root, pkg, lib, vec!["LeanRsFixture.Handles".into()]).expect("spawn");
     let row = host

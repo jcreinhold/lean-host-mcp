@@ -42,8 +42,98 @@ tempfile = "3"
 insta = { version = "1", features = ["json"] }
 
 [lints.rust]
-unsafe_code = "forbid"
+future-incompatible = "warn"
+let-underscore = "warn"
+nonstandard-style = "warn"
+redundant_lifetimes = "warn"
+rust-2018-idioms = "warn"
+rust-2024-compatibility = "deny"
+single_use_lifetimes = "warn"
+trivial_casts = "warn"
+unreachable_pub = "warn"
+unsafe-code = "deny"
+unused = { level = "warn", priority = -1 }
 
+# Comprehensive Clippy configuration for correctness, performance, and style
+# (ported from ~/Code/lean-dup).
 [lints.clippy]
-# Pedantic stays off in v0.1 — too noisy against tokio + macro-generated
-# code. Default clippy still catches real bugs.
+# === CORRECTNESS & BUG PREVENTION ===
+all = { level = "warn", priority = -10 }
+complexity = { level = "warn", priority = -9 }
+correctness = { level = "warn", priority = -8 }
+suspicious = { level = "warn", priority = -7 }
+
+# === PERFORMANCE OPTIMIZATION ===
+clone_on_ref_ptr = "warn"
+inefficient_to_string = "warn"
+large_stack_arrays = "warn"
+manual_memcpy = "warn"
+perf = { level = "warn", priority = -6 }
+redundant_clone = "warn"
+
+# === STYLE & IDIOMATIC RUST ===
+nursery = { level = "warn", priority = -5 }
+pedantic = { level = "warn", priority = -4 }
+style = { level = "warn", priority = -3 }
+
+# === SAFETY & RELIABILITY ===
+arithmetic_side_effects = "warn"
+exit = "warn"
+expect_used = "warn"
+get_unwrap = "warn"
+indexing_slicing = "warn"
+mem_forget = "deny"
+mutex_integer = "warn"
+panic = "warn"
+ptr_as_ptr = "warn"
+rc_mutex = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+wildcard_enum_match_arm = "warn"
+
+# === DOCUMENTATION & MAINTAINABILITY ===
+blanket_clippy_restriction_lints = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+
+# === CARGO & DEPENDENCY MANAGEMENT ===
+cargo = { level = "warn", priority = -1 }
+cargo_common_metadata = "allow"
+lint_groups_priority = "warn"
+
+# === ALLOWABLE EXCEPTIONS ===
+items_after_statements = "allow"
+match_same_arms = "allow"
+missing_const_for_fn = "allow"
+missing_docs_in_private_items = "allow"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+must_use_candidate = "allow"
+option_if_let_else = "allow"
+redundant_closure_for_method_calls = "allow"
+redundant_pub_crate = "allow"
+similar_names = "allow"
+single_match_else = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+type_complexity = "allow"
+unnecessary_wraps = "allow"
+
+# === ALLOWABLE EXCEPTIONS FOR NUMERICAL REASONS ===
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+float_arithmetic = "allow"
+
+# === ADDITIONAL SAFETY LINTS ===
+disallowed_methods = "deny"
+disallowed_types = "deny"
+implicit_clone = "warn"
+map_flatten = "warn"
+map_unwrap_or = "warn"
+needless_collect = "warn"

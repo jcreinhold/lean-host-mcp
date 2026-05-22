@@ -1,6 +1,9 @@
 //! `project_scan` — filesystem regex sweep over the project's `.lean` files.
 //! No Lean session involvement; cheapest tool in the catalogue.
 
+// Same ownership rationale as `tools::lean`.
+#![allow(clippy::needless_pass_by_value)]
+
 use std::path::Path;
 
 use schemars::JsonSchema;
@@ -50,7 +53,11 @@ pub struct ProjectScanResult {
     pub truncated: bool,
 }
 
-pub async fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<Response<ProjectScanResult>> {
+/// # Errors
+///
+/// Returns `ServerError::Internal` if the custom preset omits a pattern or
+/// the supplied pattern fails to compile as a regex.
+pub fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<Response<ProjectScanResult>> {
     let freshness = ctx.freshness(&[], &new_session_id());
     let pattern = match req.preset {
         Preset::Sorry => r"\bsorry\b".to_owned(),
@@ -72,19 +79,15 @@ pub async fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<
         .into_iter()
         .filter_entry(|e| !is_ignored_dir(e.file_name().to_str().unwrap_or("")))
     {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() {
             continue;
         }
         if entry.path().extension().and_then(|s| s.to_str()) != Some("lean") {
             continue;
         }
-        let contents = match std::fs::read_to_string(entry.path()) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
         };
         for (idx, line) in contents.lines().enumerate() {
             if re.is_match(line) {
@@ -92,14 +95,11 @@ pub async fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<
                     truncated = true;
                     break 'walk;
                 }
+                let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
+                let rel_path = entry.path().strip_prefix(root).unwrap_or_else(|_| entry.path());
                 hits.push(ProjectScanHit {
-                    file: entry
-                        .path()
-                        .strip_prefix(root)
-                        .unwrap_or(entry.path())
-                        .to_string_lossy()
-                        .into_owned(),
-                    line: (idx + 1) as u32,
+                    file: rel_path.to_string_lossy().into_owned(),
+                    line: line_no,
                     text: line.trim_end().to_owned(),
                 });
             }

@@ -5,7 +5,12 @@
 //! (parse errors, elaboration errors, kernel rejections, meta timeouts) are
 //! part of the *successful* tool result — clients branch on the `status`
 //! field. Only infrastructure failures (worker dead, runtime not initialised)
-//! escape as MCP errors.
+//! escape as MCP errors — see [`crate::error::ServerError`].
+
+// Tool handlers receive owned request structs by design (they consume the
+// request and forward owned strings into the `SessionHost` channel); the
+// pass-by-value flag is intentional.
+#![allow(clippy::needless_pass_by_value)]
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,6 +37,11 @@ pub enum ElaborateResult {
     Failed(ElabFailure),
 }
 
+/// # Errors
+///
+/// Surfaces `ServerError` only on infrastructure failures (Lean runtime
+/// not reachable). Lean-reported elaboration failures travel in the
+/// `Failed` variant of the result.
 pub async fn elaborate(ctx: &ToolContext, req: ElaborateRequest) -> Result<Response<ElaborateResult>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let result = match ctx.host.elaborate(req.source, req.imports).await? {
@@ -49,6 +59,9 @@ pub struct KernelCheckRequest {
     pub imports: Vec<String>,
 }
 
+/// # Errors
+///
+/// Infrastructure failures only; Lean rejections travel as `KernelOutcome::status`.
 pub async fn kernel_check(ctx: &ToolContext, req: KernelCheckRequest) -> Result<Response<KernelOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let outcome = ctx.host.kernel_check(req.source, req.imports).await?;
@@ -63,6 +76,9 @@ pub struct InferTypeRequest {
     pub imports: Vec<String>,
 }
 
+/// # Errors
+///
+/// Infrastructure failures only; meta-domain failures travel as `MetaOutcome::status`.
 pub async fn infer_type(ctx: &ToolContext, req: InferTypeRequest) -> Result<Response<MetaOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let outcome = ctx.host.infer_type(req.term, req.imports).await?;
@@ -77,6 +93,9 @@ pub struct WhnfRequest {
     pub imports: Vec<String>,
 }
 
+/// # Errors
+///
+/// Infrastructure failures only.
 pub async fn whnf(ctx: &ToolContext, req: WhnfRequest) -> Result<Response<MetaOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let outcome = ctx.host.whnf(req.term, req.imports).await?;
@@ -91,6 +110,9 @@ pub struct IsDefEqRequest {
     pub imports: Vec<String>,
 }
 
+/// # Errors
+///
+/// Infrastructure failures only.
 pub async fn is_def_eq(ctx: &ToolContext, req: IsDefEqRequest) -> Result<Response<MetaOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let outcome = ctx.host.is_def_eq(req.lhs, req.rhs, req.imports).await?;
@@ -112,6 +134,9 @@ pub enum HoverByNameResult {
     Missing { name: String },
 }
 
+/// # Errors
+///
+/// Infrastructure failures only; missing names return `HoverByNameResult::Missing`.
 pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result<Response<HoverByNameResult>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let result = match ctx.host.describe(req.name.clone(), req.imports).await? {

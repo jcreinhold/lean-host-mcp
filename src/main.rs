@@ -34,7 +34,7 @@ struct Cli {
 
     /// Lean library name within the package whose dylib carries the
     /// `lean_rs_host_*` symbols (the `lean_lib` declaration). Defaults to a
-    /// PascalCase of the package name.
+    /// `PascalCase` of the package name.
     #[arg(long, env = "LEAN_HOST_MCP_LIBRARY")]
     library: Option<String>,
 
@@ -57,6 +57,10 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(
+    let_underscore_drop,
+    reason = "try_init's failure means a subscriber is already installed; we'd continue without ours either way"
+)]
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();

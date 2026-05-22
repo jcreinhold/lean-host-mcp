@@ -11,6 +11,19 @@
 //! [`mpsc`](tokio::sync::mpsc) channel and await a `oneshot` reply. From the
 //! caller's perspective the host looks like an async actor; the lifetime
 //! tangle stays hidden inside the worker thread.
+//!
+//! All public methods on [`SessionHost`] return [`crate::error::Result`].
+//! Errors flow only for infrastructure failures (worker thread gone, Lean
+//! runtime init failed, Lake project unusable) — Lean-domain failures
+//! (parse, elaboration, kernel rejection, meta timeout) are part of the
+//! `Ok` payload.
+
+// `let _ = reply.send(…)` / `let _ = init_reply.send(…)` are the canonical
+// "ignore failure when the receiver dropped" pattern; the dropped value is
+// a oneshot::Sender whose only destructor is "wake the receiver if any".
+// `needless_pass_by_value` flags actor-style closure args and the
+// `worker_main` ownership transfer; both intentionally take ownership.
+#![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -113,6 +126,15 @@ pub struct SessionHost {
 }
 
 impl SessionHost {
+    /// Spawn the dedicated session thread, init Lean, open the Lake project,
+    /// load capabilities. Blocks on the worker's readiness signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError::Lean` if the Lean runtime fails to initialise,
+    /// or `ServerError::BadProject` if the Lake project at `lake_root` does
+    /// not open or its capability dylib does not export the required
+    /// `lean_rs_host_*` symbols.
     pub fn spawn(lake_root: PathBuf, package: String, library: String, default_imports: Vec<String>) -> Result<Self> {
         type InitMsg = std::result::Result<(String, mpsc::Sender<Request>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
@@ -152,6 +174,11 @@ impl SessionHost {
         resp_rx.await.map_err(|_| ServerError::SessionGone)?
     }
 
+    /// # Errors
+    ///
+    /// Infrastructure failures only (worker thread gone, Lean call panicked);
+    /// Lean-reported elaboration failures travel in the inner `Err` variant
+    /// without becoming a [`ServerError`].
     pub async fn elaborate(
         &self,
         source: String,
@@ -160,19 +187,32 @@ impl SessionHost {
         self.submit(|reply| Request::Elaborate { source, imports, reply }).await
     }
 
+    /// # Errors
+    ///
+    /// Infrastructure failures only; kernel rejections travel via
+    /// [`KernelOutcome::status`].
     pub async fn kernel_check(&self, source: String, imports: Vec<String>) -> Result<KernelOutcome> {
         self.submit(|reply| Request::KernelCheck { source, imports, reply })
             .await
     }
 
+    /// # Errors
+    ///
+    /// Infrastructure failures only.
     pub async fn infer_type(&self, source: String, imports: Vec<String>) -> Result<MetaOutcome> {
         self.submit(|reply| Request::InferType { source, imports, reply }).await
     }
 
+    /// # Errors
+    ///
+    /// Infrastructure failures only.
     pub async fn whnf(&self, source: String, imports: Vec<String>) -> Result<MetaOutcome> {
         self.submit(|reply| Request::Whnf { source, imports, reply }).await
     }
 
+    /// # Errors
+    ///
+    /// Infrastructure failures only.
     pub async fn is_def_eq(&self, lhs: String, rhs: String, imports: Vec<String>) -> Result<MetaOutcome> {
         self.submit(|reply| Request::IsDefEq {
             lhs,
@@ -185,6 +225,10 @@ impl SessionHost {
 
     /// Look up a declaration by fully-qualified name. Returns `None` when
     /// Lean reports the declaration as `"missing"`. Used by `hover_by_name`.
+    ///
+    /// # Errors
+    ///
+    /// Infrastructure failures only.
     pub async fn describe(&self, name: String, imports: Vec<String>) -> Result<Option<DeclarationRow>> {
         self.submit(|reply| Request::Describe { name, imports, reply }).await
     }
@@ -291,15 +335,17 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         } else {
             imports
         };
-        if !self.sessions.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.sessions.entry(key.clone()) {
             let module_refs: Vec<&str> = key.iter().map(String::as_str).collect();
             let session = self
                 .caps
                 .session(&module_refs, None, None)
                 .map_err(|e| ServerError::Lean(format!("import {key:?}: {e}")))?;
-            self.sessions.insert(key.clone(), session);
+            slot.insert(session);
         }
-        Ok(self.sessions.get_mut(&key).expect("just inserted"))
+        self.sessions
+            .get_mut(&key)
+            .ok_or_else(|| ServerError::Internal("session vanished after insert".into()))
     }
 
     fn handle(&mut self, req: Request) {
@@ -434,8 +480,7 @@ fn lean_toolchain_label(lake_root: &std::path::Path) -> String {
     let path = lake_root.join("lean-toolchain");
     std::fs::read_to_string(&path)
         .ok()
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_else(|| "unknown".into())
+        .map_or_else(|| "unknown".into(), |s| s.trim().to_owned())
 }
 
 fn project_failure(failure: &LeanElabFailure) -> ElabFailure {
