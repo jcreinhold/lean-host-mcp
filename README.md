@@ -81,9 +81,9 @@ project is unusable.
 
 `goal_at_position`, `type_at_position`, `references_of_name`, and `file_diagnostics` depend on an optional
 `lean_rs_host_process_module_with_info_tree` shim. A capability dylib built without it answers
-`{ "status": "unsupported" }` per call; the tools never raise. Files whose header imports modules the server's open
-env doesn't have are still processed; missing imports surface as an envelope warning (single-file tools) or a result
-sidebar (`references_of_name`). A header that doesn't parse short-circuits to `header_parse_failed`.
+`{ "status": "unsupported" }` per call; the tools never raise. Files whose header imports modules the server's open env
+doesn't have are still processed; missing imports surface as an envelope warning (single-file tools) or a result sidebar
+(`references_of_name`). A header that doesn't parse short-circuits to `header_parse_failed`.
 
 ## Build, test, lint
 

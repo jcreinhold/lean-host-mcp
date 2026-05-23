@@ -13,13 +13,13 @@ is the deeper layering write-up. This file captures what's relevant only to work
 
 Tools fall into four groups by shared plumbing: session-backed handlers (`src/tools/lean.rs`), the filesystem sweep
 (`src/tools/scan.rs`), SQLite-indexed lookups (`src/tools/index.rs`), and the position-tool cluster
-(`src/tools/position.rs`). The position tools drive `lean-rs` 0.1.4's `process_module_with_info_tree`
-(header-aware), projecting the upstream `ProcessedFile` (four info-tree arrays plus diagnostics) through a
-content-hashed in-memory cache (`src/cache.rs`). Three are cursor-driven (`goal_at_position`, `type_at_position`,
-`references_of_name`); the fourth, `file_diagnostics`, is file-scoped but rides the same cache, so the typical agent
-loop ("what's wrong; then probe the problem site") pays for the elaboration once. The shim is optional, so each
-position tool returns `{ "status": "unsupported" }` cleanly when the loaded dylib lacks it. Missing imports become an
-envelope warning; header parse failures short-circuit to a `header_parse_failed` status variant.
+(`src/tools/position.rs`). The position tools drive `lean-rs` 0.1.4's `process_module_with_info_tree` (header-aware),
+projecting the upstream `ProcessedFile` (four info-tree arrays plus diagnostics) through a content-hashed in-memory
+cache (`src/cache.rs`). Three are cursor-driven (`goal_at_position`, `type_at_position`, `references_of_name`); the
+fourth, `file_diagnostics`, is file-scoped but rides the same cache, so the typical agent loop ("what's wrong; then
+probe the problem site") pays for the elaboration once. The shim is optional, so each position tool returns
+`{ "status": "unsupported" }` cleanly when the loaded dylib lacks it. Missing imports become an envelope warning; header
+parse failures short-circuit to a `header_parse_failed` status variant.
 
 ## Common commands
 

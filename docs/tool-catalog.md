@@ -122,11 +122,11 @@ Name-prefix listing, ordered by name. Omit `module_prefix` to walk the whole tab
 
 ## Position tools (`src/tools/position.rs`)
 
-The three position tools drive `process_module_with_info_tree`: they read the file, hand the full source (header +
-body) to Lean's frontend, and project the resulting info tree. The file's own `import` declarations are parsed by Lean
-and validated against the server's open env; mismatch surfaces as an envelope `warnings` entry (single-file tools) or
-a result sidebar (`references_of_name`). The projection is cached against `(file_path, sha256(contents))`, so repeat
-calls on the same bytes reuse it; an edit invalidates structurally.
+The three position tools drive `process_module_with_info_tree`: they read the file, hand the full source (header + body)
+to Lean's frontend, and project the resulting info tree. The file's own `import` declarations are parsed by Lean and
+validated against the server's open env; mismatch surfaces as an envelope `warnings` entry (single-file tools) or a
+result sidebar (`references_of_name`). The projection is cached against `(file_path, sha256(contents))`, so repeat calls
+on the same bytes reuse it; an edit invalidates structurally.
 
 `process_module_with_info_tree` is an **optional** capability shim. When the loaded dylib was built against pre-0.1.4
 `lean-rs-host`, every position tool answers `{ "status": "unsupported" }` cleanly; the tools never raise.
@@ -159,8 +159,8 @@ All line and column inputs are **1-indexed**. Result spans use the same conventi
 ```
 
 `file` resolves relative to `lake_root` when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal` inside the
-elaboration context; the strings are diagnostic text only. When the file's header imports modules the server's open
-env doesn't have, the result is still returned but the envelope's `warnings` array names the missing modules.
+elaboration context; the strings are diagnostic text only. When the file's header imports modules the server's open env
+doesn't have, the result is still returned but the envelope's `warnings` array names the missing modules.
 
 ### `type_at_position`
 
@@ -211,9 +211,9 @@ recorded one, such as coercion sites. When inference did not produce a type, `ty
 ```
 
 `kind` is `"def"` at binder sites, `"ref"` at use sites. Hits cap at 1000 (sets `truncated: true`). The walk continues
-past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib lacks the
-shim), `header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...] }`).
-Results are sorted by `(file, line, column)`. Name matching is exact: pass the fully-qualified form Lean records.
+past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib lacks the shim),
+`header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...] }`). Results are
+sorted by `(file, line, column)`. Name matching is exact: pass the fully-qualified form Lean records.
 
 ### `file_diagnostics`
 
