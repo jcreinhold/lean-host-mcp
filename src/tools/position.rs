@@ -38,7 +38,7 @@ use walkdir::WalkDir;
 use crate::cache::{ProcessedFileCache, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
-use crate::session::{Diagnostic, ElabFailure, project_failure};
+use crate::session::{Diagnostic, ElabFailure, Severity, project_failure};
 use crate::tools::{ToolContext, is_ignored_dir, new_session_id};
 
 /// Hard cap on the number of references aggregated in
@@ -336,19 +336,50 @@ pub struct FileDiagnosticsRequest {
     pub file: PathBuf,
 }
 
+/// Per-severity counts attached to every diagnostics-bearing variant. The
+/// first read most callers do is "are there errors?"; surfacing the totals
+/// here saves them iterating the list to find out.
+#[derive(Debug, Clone, Copy, Default, Serialize, JsonSchema)]
+pub struct DiagnosticSummary {
+    pub errors: usize,
+    pub warnings: usize,
+    pub info: usize,
+}
+
+impl DiagnosticSummary {
+    fn from_diagnostics(diagnostics: &[Diagnostic]) -> Self {
+        let mut s = Self::default();
+        for d in diagnostics {
+            let bucket = match d.severity {
+                Severity::Error => &mut s.errors,
+                Severity::Warning => &mut s.warnings,
+                Severity::Info => &mut s.info,
+            };
+            *bucket = bucket.saturating_add(1);
+        }
+        s
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum FileDiagnosticsResult {
-    /// File was elaborated; `diagnostics` lists every recorded message
-    /// (possibly empty). `truncated` is set when Lean hit the diagnostic
-    /// byte budget and the list is a prefix.
-    Ok {
+    /// Elaboration ran to completion. `summary` is the up-front
+    /// errors/warnings/info tally; `diagnostics` is the full list, sorted
+    /// by `(line, column)`. `truncated` is true only when Lean hit the
+    /// diagnostic byte budget and the list is a prefix.
+    ///
+    /// Note: `summary.errors > 0` means the file has elaboration errors —
+    /// `status: "elaborated"` only says we got far enough to collect them.
+    Elaborated {
+        summary: DiagnosticSummary,
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
     },
-    /// The file's header did not parse; `diagnostics` are the parser's.
-    /// Same wire shape as `Ok` so a caller renders one structure, not two.
+    /// The file's header did not parse; the body was never elaborated.
+    /// Same shape as `Elaborated` so callers render one structure, not two.
     HeaderParseFailed {
+        summary: DiagnosticSummary,
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
     },
@@ -372,10 +403,14 @@ pub async fn file_diagnostics(
             missing_imports,
         } => (file, freshly_processed, missing_imports),
         EnsureOutcome::HeaderParseFailed { diagnostics } => {
+            let ElabFailure { diagnostics, truncated } = diagnostics;
+            let diagnostics = sort_diagnostics(diagnostics);
+            let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
             return Ok(Response::ok(
                 FileDiagnosticsResult::HeaderParseFailed {
-                    diagnostics: diagnostics.diagnostics,
-                    truncated: diagnostics.truncated,
+                    summary,
+                    diagnostics,
+                    truncated,
                 },
                 freshness,
             ));
@@ -385,11 +420,21 @@ pub async fn file_diagnostics(
         }
     };
     let projected = project_failure(&file.diagnostics);
-    let result = FileDiagnosticsResult::Ok {
-        diagnostics: projected.diagnostics,
+    let diagnostics = sort_diagnostics(projected.diagnostics);
+    let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
+    let result = FileDiagnosticsResult::Elaborated {
+        summary,
+        diagnostics,
         truncated: projected.truncated,
     };
     Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+}
+
+/// Sort diagnostics by `(line, column)` so the wire order is deterministic
+/// — Lean's source order is usually but not always position-ordered.
+fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    diagnostics.sort_by_key(|d| d.position.as_ref().map_or((u32::MAX, u32::MAX), |p| (p.line, p.column)));
+    diagnostics
 }
 
 // --- shared plumbing ---------------------------------------------------

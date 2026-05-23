@@ -176,26 +176,31 @@ fn file_diagnostics_request_round_trips() {
 
 #[test]
 fn file_diagnostics_result_serialises_status_tag() {
-    use lean_host_mcp::tools::position::FileDiagnosticsResult;
+    use lean_host_mcp::tools::position::{DiagnosticSummary, FileDiagnosticsResult};
 
     let s = serde_json::to_string(&FileDiagnosticsResult::Unsupported).unwrap();
     assert_eq!(s, r#"{"status":"unsupported"}"#);
 
-    let s = serde_json::to_string(&FileDiagnosticsResult::Ok {
-        diagnostics: Vec::new(),
-        truncated: false,
-    })
-    .unwrap();
-    assert_eq!(s, r#"{"status":"ok","diagnostics":[],"truncated":false}"#);
-
-    let s = serde_json::to_string(&FileDiagnosticsResult::HeaderParseFailed {
+    let s = serde_json::to_string(&FileDiagnosticsResult::Elaborated {
+        summary: DiagnosticSummary::default(),
         diagnostics: Vec::new(),
         truncated: false,
     })
     .unwrap();
     assert_eq!(
         s,
-        r#"{"status":"header_parse_failed","diagnostics":[],"truncated":false}"#
+        r#"{"status":"elaborated","summary":{"errors":0,"warnings":0,"info":0},"diagnostics":[],"truncated":false}"#
+    );
+
+    let s = serde_json::to_string(&FileDiagnosticsResult::HeaderParseFailed {
+        summary: DiagnosticSummary::default(),
+        diagnostics: Vec::new(),
+        truncated: false,
+    })
+    .unwrap();
+    assert_eq!(
+        s,
+        r#"{"status":"header_parse_failed","summary":{"errors":0,"warnings":0,"info":0},"diagnostics":[],"truncated":false}"#
     );
 }
 
@@ -377,11 +382,14 @@ async fn file_diagnostics_returns_clean_file_empty() {
     )
     .await
     .expect("file_diagnostics");
-    let FileDiagnosticsResult::Ok { diagnostics, .. } = resp.result else {
-        panic!("expected Ok variant, got something else");
+    let FileDiagnosticsResult::Elaborated {
+        summary, diagnostics, ..
+    } = resp.result
+    else {
+        panic!("expected Elaborated variant, got something else");
     };
-    assert!(
-        diagnostics.iter().all(|d| d.severity != "Error"),
+    assert_eq!(
+        summary.errors, 0,
         "clean fixture should record no error-severity diagnostics; got {diagnostics:?}"
     );
 }
@@ -412,12 +420,19 @@ async fn file_diagnostics_returns_real_errors() {
     )
     .await
     .expect("file_diagnostics");
-    let FileDiagnosticsResult::Ok { diagnostics, .. } = resp.result else {
-        panic!("expected Ok variant with diagnostics; got something else");
+    let FileDiagnosticsResult::Elaborated {
+        summary, diagnostics, ..
+    } = resp.result
+    else {
+        panic!("expected Elaborated variant with diagnostics; got something else");
     };
+    assert!(
+        summary.errors >= 1,
+        "summary.errors must reflect the deliberate failure; got {summary:?}"
+    );
     let error = diagnostics
         .iter()
-        .find(|d| d.severity == "Error")
+        .find(|d| matches!(d.severity, lean_host_mcp::session::Severity::Error))
         .expect("at least one error-severity diagnostic for `1 + 1 = 3 := rfl`");
     let pos = error.position.as_ref().expect("error diagnostic has a position");
     assert_eq!(pos.line, 2, "error must be reported on the theorem line (got {pos:?})");

@@ -225,24 +225,29 @@ site" loop pays for the elaboration once.
 // request
 { "file": "LeanRsFixture/SourceRanges.lean" }
 
-// result: file elaborated (diagnostics may be empty, info-only, or carry errors)
+// result: elaboration completed; diagnostics may be empty, info-only, or carry errors
 {
-  "status": "ok",
+  "status": "elaborated",
+  "summary": { "errors": 1, "warnings": 0, "info": 0 },
   "diagnostics": [
-    { "severity": "Error", "message": "type mismatch ...",
-      "position": { "line": 12, "column": 9, "end_line": 12, "end_column": 13 },
-      "file": "..." }
+    { "severity": "error", "message": "type mismatch ...",
+      "position": { "line": 12, "column": 9, "end_line": 12, "end_column": 13 } }
   ],
   "truncated": false
 }
 
 // result: file's header did not parse — body never elaborated; diagnostics are the parser's
-{ "status": "header_parse_failed", "diagnostics": [...], "truncated": false }
+{ "status": "header_parse_failed",
+  "summary": { "errors": 1, "warnings": 0, "info": 0 },
+  "diagnostics": [...], "truncated": false }
 
 // result: capability dylib missing the info-tree shim
 { "status": "unsupported" }
 ```
 
-`truncated` is `true` only when Lean hit the diagnostic byte budget; the list is then a prefix. `Ok` and
-`HeaderParseFailed` deliberately share the same on-wire shape (`diagnostics` + `truncated`) so a caller renders one
-structure. The same `MissingImports` envelope-warning behaviour as the cursor-driven tools applies.
+`status: "elaborated"` only means we got far enough to collect diagnostics — `summary.errors > 0` is the real "does
+this file have problems?" signal. `severity` is lowercase (`"error" | "warning" | "info"`). `diagnostics` is sorted by
+`(line, column)`. The per-diagnostic `file` field is omitted for Lean's synthetic source labels (almost always).
+`truncated` is true only when Lean hit the diagnostic byte budget; the list is then a prefix. `Elaborated` and
+`HeaderParseFailed` share the same shape (`summary` + `diagnostics` + `truncated`) so callers render one structure.
+The same `MissingImports` envelope-warning behaviour as the cursor-driven tools applies.

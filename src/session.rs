@@ -37,7 +37,7 @@ use lean_rs_host::meta::{
 };
 use lean_rs_host::{
     LeanCapabilities, LeanDeclarationFilter, LeanElabFailure, LeanElabOptions, LeanHost, LeanKernelOutcome,
-    LeanSession, LeanSourceRange, ProofSummary,
+    LeanSession, LeanSeverity, LeanSourceRange, ProofSummary,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -61,12 +61,39 @@ pub struct Position {
     pub end_column: Option<u32>,
 }
 
+/// Wire-stable severity classification. The three Lean severities map to
+/// `snake_case` strings so the field is uniform with every other status
+/// discriminant in the server.
+#[derive(Debug, Clone, Copy, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl Severity {
+    /// `LeanSeverity` is `#[non_exhaustive]`; a future variant falls back
+    /// to `Info` rather than blocking the response.
+    pub fn from_lean(s: LeanSeverity) -> Self {
+        match s {
+            LeanSeverity::Error => Self::Error,
+            LeanSeverity::Warning => Self::Warning,
+            LeanSeverity::Info | _ => Self::Info,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct Diagnostic {
-    pub severity: String,
+    pub severity: Severity,
     pub message: String,
     pub position: Option<Position>,
-    pub file: String,
+    /// Real source path when Lean attached one. Omitted for the synthetic
+    /// `<elaborate>` label that elaboration-buffer calls always produce —
+    /// the caller already knows which file they asked about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// Structured failure payload — the projection of `LeanElabFailure` we send
@@ -700,7 +727,7 @@ pub(crate) fn project_failure(failure: &LeanElabFailure) -> ElabFailure {
             .diagnostics()
             .iter()
             .map(|d| Diagnostic {
-                severity: format!("{:?}", d.severity()),
+                severity: Severity::from_lean(d.severity()),
                 message: d.message().to_owned(),
                 position: d.position().map(|p| Position {
                     line: p.line(),
@@ -708,10 +735,21 @@ pub(crate) fn project_failure(failure: &LeanElabFailure) -> ElabFailure {
                     end_line: p.end_line(),
                     end_column: p.end_column(),
                 }),
-                file: d.file_label().to_owned(),
+                file: meaningful_file_label(d.file_label()),
             })
             .collect(),
         truncated: failure.truncated(),
+    }
+}
+
+/// Strip Lean's synthetic source label so it never reaches the wire. Every
+/// call that elaborates a string buffer (rather than a file on disk) gets
+/// labelled `<elaborate>` — it is never actionable for the caller.
+fn meaningful_file_label(label: &str) -> Option<String> {
+    if label.is_empty() || label == "<elaborate>" || label.starts_with('<') {
+        None
+    } else {
+        Some(label.to_owned())
     }
 }
 
