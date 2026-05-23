@@ -1,51 +1,43 @@
 # lean-host-mcp
 
-Model Context Protocol server that hosts Lean 4 in-process via
-[`lean-rs`](https://crates.io/crates/lean-rs). The "host" in the name signals
-what differentiates it from `lean-lsp-mcp`: this server owns a `LeanRuntime`
-and a `LeanCapabilities` dylib directly rather than wrapping an external LSP
-process.
+Model Context Protocol server that hosts Lean 4 in-process via [`lean-rs`](https://crates.io/crates/lean-rs). The "host"
+in the name signals what differentiates it from `lean-lsp-mcp`: this server owns a `LeanRuntime` and a
+`LeanCapabilities` dylib directly rather than wrapping an external LSP process.
 
-## Status — v0.1
+## Status — v0.1.1
 
-Seven tools that work today against the published `lean-rs` 0.1.x:
+Ten tools against `lean-rs` 0.1.3:
 
 | Tool | What it does |
 | --- | --- |
 | `elaborate` | Type-check a Lean term against the project environment; return structured diagnostics on failure. |
 | `kernel_check` | Run a full elaborate + kernel-check on a declaration source; return `Checked` / `Rejected` / `Unavailable` / `Unsupported` plus diagnostics. |
-| `infer_type` | `Meta.inferType` on a term, with bounded heartbeats. |
-| `whnf` | `Meta.whnf` on a term. |
-| `is_def_eq` | `Meta.isDefEq` on two terms (default transparency). |
-| `hover_by_name` | Look up kind and source range for a fully-qualified Lean name. |
+| `infer_type` | `Meta.inferType` on a term, with bounded heartbeats. Result is pretty-printed via `pp_expr`. |
+| `whnf` | `Meta.whnf` on a term. Result is pretty-printed via `pp_expr`. |
+| `is_def_eq` | `Meta.isDefEq` on two terms with selectable transparency. |
+| `hover_by_name` | Look up kind, source range, and rendered type for a fully-qualified Lean name. |
 | `project_scan` | Filesystem regex sweep for `sorry`, `admit`, `axiom`, `set_option`, or a custom pattern. |
+| `find_symbol` | Case-insensitive substring search across declaration names; backed by the SQLite index. |
+| `find_lemma` | As `find_symbol`, restricted to theorems. |
+| `outline` | Name-prefix listing (e.g. everything under `Nat.`). |
 
-Explicitly **not** in v0.1 (deferred to v0.2+):
+Explicitly **not** here yet (deferred to v0.2+):
 
-- **Declaration enumeration** (`find_symbol`, `find_lemma`, `outline`).
-  The published `lean-rs` 0.1.x has no `LeanName → String` rendering on the
-  Rust side; `list_declarations` returns opaque handles. A new `@[export]`
-  shim in `lean-rs` lands this in v0.2.
-- **Pretty-printed types**. `hover_by_name`'s `type_signature` field is
-  always `None` for the same reason — `LeanExpr` is opaque across the
-  worker channel boundary. v0.2.
-- **Position-based queries** (`goal`, `hover`, `references` at cursor) —
-  new shims in `lean-rs`. v0.2.
+- **Position-based queries** (`goal`, `hover`, `references` at cursor) — new shims in `lean-rs`. v0.2.
 - `try_tactics`, `unfold_at`, `explain_simp` — depend on the position API.
 - `edit` / `replace_proof` — depend on a re-elaborate-after-edit shim.
 - `lean-rs-worker` process isolation — v0.3.
 
-See `docs/version-matrix.md` for the supported `lean-rs` / Lean toolchain
-matrix.
+See `docs/version-matrix.md` for the supported `lean-rs` / Lean toolchain matrix.
 
 ## Prerequisite — the shim contract
 
-`lean-rs-host` loads a Lean capability dylib that exports 26 mandatory + 4
-optional `lean_rs_host_*` symbols. v0.1 of this server does not bundle a
-self-contained shim crate. You point `--lake-root` at a Lake project whose
+`lean-rs-host` 0.1.3 loads a Lean capability dylib that exports 28 mandatory + 6 optional `lean_rs_host_*` symbols.
+v0.1.1 of this server does not bundle a self-contained shim crate. You point `--lake-root` at a Lake project whose
 `lakefile.lean` already wires up the `lean-rs-host` interop shims (see
-[`lean-rs/fixtures/lean/`](https://github.com/jcreinhold/lean-rs/tree/main/fixtures/lean)
-for the canonical template).
+[`lean-rs/fixtures/lean/`](https://github.com/jcreinhold/lean-rs/tree/main/fixtures/lean) for the canonical template).
+Capability dylibs built against 0.1.2 must be rebuilt: 0.1.3 added two mandatory and two optional shims for name and
+expression rendering.
 
 Wiring a shim into your project is a v0.2 README task. For now:
 
@@ -82,10 +74,8 @@ cargo build --release
 }
 ```
 
-The server reads `LEAN_HOST_MCP_LAKE_ROOT`, `LEAN_HOST_MCP_PACKAGE`,
-`LEAN_HOST_MCP_LIBRARY`, `LEAN_HOST_MCP_IMPORTS`, and
-`LEAN_HOST_MCP_CACHE_DIR` from the environment if you prefer not to repeat
-flags.
+The server reads `LEAN_HOST_MCP_LAKE_ROOT`, `LEAN_HOST_MCP_PACKAGE`, `LEAN_HOST_MCP_LIBRARY`, `LEAN_HOST_MCP_IMPORTS`,
+and `LEAN_HOST_MCP_CACHE_DIR` from the environment if you prefer not to repeat flags.
 
 ## Response envelope
 
@@ -105,8 +95,7 @@ Every tool returns:
 }
 ```
 
-This is the only shape every tool shares. See `docs/tool-catalog.md` for
-per-tool schemas.
+This is the only shape every tool shares. See `docs/tool-catalog.md` for per-tool schemas.
 
 ## Build, test
 

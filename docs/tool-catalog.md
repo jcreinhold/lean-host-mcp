@@ -41,9 +41,9 @@ Full elaborate + addDecl. Returns Lean's `LeanKernelOutcome` projected.
 { "term": "Nat.succ 0", "imports": [] }
 ```
 
-The `rendered` field in the result is a placeholder string in v0.1 — the
-underlying `LeanExpr` is opaque across the worker channel boundary. v0.2
-backfills the pretty-printed form once `lean-rs` exposes a shim.
+The `rendered` field is the pretty-printed form via the optional `pp_expr` shim. If the loaded capability dylib lacks
+`lean_rs_host_meta_pp_expr`, the server falls back to `Expr.toString` and attaches a warning to the envelope; the field
+is still populated either way.
 
 ### `is_def_eq`
 
@@ -53,21 +53,22 @@ backfills the pretty-printed form once `lean-rs` exposes a shim.
 { "status": "Ok", "definitionally_equal": true, "rendered": null, "failure": null }
 ```
 
-`transparency` is optional and accepts `default` | `reducible` |
-`instances` | `all` (default: `default`). Picks the reducibility view
-the underlying `Meta.isDefEq` runs under — the same two terms can be
-def-eq under one setting and not another.
+`transparency` is optional and accepts `default` | `reducible` | `instances` | `all` (default: `default`). Picks the
+reducibility view the underlying `Meta.isDefEq` runs under — the same two terms can be def-eq under one setting and not
+another.
 
 ### `hover_by_name`
 
 ```jsonc
 { "name": "Nat.add_zero" }
 // result
-{ "status": "found",   "name": "Nat.add_zero", "kind": "theorem", "source": { ... } }
+{ "status": "found",   "name": "Nat.add_zero", "kind": "theorem",
+  "type_signature": "∀ (n : Nat), n + 0 = n", "source": { ... } }
 { "status": "missing", "name": "Nat.foo_bar" }
 ```
 
-`type_signature` is always `None` in v0.1 (see `infer_type` note above).
+`type_signature` is rendered via `Expr.toString` — cheap and deterministic, but without notation. For the user-visible
+pretty form, call `infer_type` on the declaration's term.
 
 ## Project scan (`src/tools/scan.rs`)
 
@@ -79,3 +80,33 @@ def-eq under one setting and not another.
 ```
 
 Presets: `sorry` | `admit` | `axiom` | `set_option` | `custom`.
+
+## Index tools (`src/tools/index.rs`)
+
+All three rebuild a SQLite-backed declaration index on first call after the Lake manifest changes. Subsequent calls
+reuse the cache. Limits default to 50, clamp at 500. Result rows have shape
+`{ "name", "kind", "type_signature": "..." | null, "source": { ... } | null }`.
+
+### `find_symbol`
+
+Case-insensitive substring on declaration names.
+
+```jsonc
+{ "query": "add_zero", "limit": 20 }
+```
+
+### `find_lemma`
+
+As `find_symbol`, restricted to `kind = "theorem"`.
+
+```jsonc
+{ "query": "add_zero" }
+```
+
+### `outline`
+
+Name-prefix listing, ordered by name. Omit `module_prefix` to walk the whole table.
+
+```jsonc
+{ "module_prefix": "Nat.", "limit": 200 }
+```

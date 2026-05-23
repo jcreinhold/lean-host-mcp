@@ -32,11 +32,11 @@ use std::thread;
 use lean_rs::LeanRuntime;
 use lean_rs_host::meta::{
     LeanMetaOptions, LeanMetaResponse, LeanMetaTransparency, infer_type as meta_infer_type,
-    is_def_eq as meta_is_def_eq, whnf as meta_whnf,
+    is_def_eq as meta_is_def_eq, pp_expr as meta_pp_expr, whnf as meta_whnf,
 };
 use lean_rs_host::{
-    LeanCapabilities, LeanElabFailure, LeanElabOptions, LeanHost, LeanKernelOutcome, LeanSession, LeanSourceRange,
-    ProofSummary,
+    LeanCapabilities, LeanDeclarationFilter, LeanElabFailure, LeanElabOptions, LeanHost, LeanKernelOutcome,
+    LeanSession, LeanSourceRange, ProofSummary,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -106,14 +106,21 @@ pub struct MetaOutcome {
     pub rendered: Option<String>,
     pub definitionally_equal: Option<bool>,
     pub failure: Option<ElabFailure>,
+    /// Set when the optional `meta_pp_expr` shim was missing and rendering
+    /// fell back to `Expr.toString`. Internal — tool handlers translate
+    /// this into an envelope warning; the field never serialises.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub raw_fallback_used: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DeclarationRow {
     pub name: String,
     pub kind: String,
-    /// v0.1 always `None`: `LeanExpr` is opaque across the worker channel
-    /// boundary in published `lean-rs` 0.1.x. Surfaces in v0.2.
+    /// Pretty-printed type signature via `Expr.toString` (cheap, no notation,
+    /// deterministic). `None` only when the declaration has no recoverable
+    /// type — typically internal artifacts or non-definitional entries.
     pub type_signature: Option<String>,
     pub source: Option<SourceRange>,
 }
@@ -239,6 +246,36 @@ impl SessionHost {
     pub async fn describe(&self, name: String, imports: Vec<String>) -> Result<Option<DeclarationRow>> {
         self.submit(|reply| Request::Describe { name, imports, reply }).await
     }
+
+    /// List every declaration in the open environment as a Vec of fully-
+    /// qualified strings. Filter controls private / generated / internal
+    /// inclusion (use [`LeanDeclarationFilter::default()`] for the
+    /// declaration-browser preset).
+    ///
+    /// # Errors
+    ///
+    /// Infrastructure failures only.
+    pub async fn list_declarations_strings(
+        &self,
+        filter: LeanDeclarationFilter,
+        imports: Vec<String>,
+    ) -> Result<Vec<String>> {
+        self.submit(|reply| Request::ListDeclarationStrings { filter, imports, reply })
+            .await
+    }
+
+    /// Bulk-describe every declaration in `names`. Output order matches
+    /// input order; entries Lean reports as `"missing"` are omitted.
+    /// Uses upstream's bulk `declaration_kind` / `declaration_type` shims
+    /// to keep the rebuild affordable on six-figure environments.
+    ///
+    /// # Errors
+    ///
+    /// Infrastructure failures only.
+    pub async fn describe_bulk(&self, names: Vec<String>, imports: Vec<String>) -> Result<Vec<DeclarationRow>> {
+        self.submit(|reply| Request::DescribeBulk { names, imports, reply })
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -274,6 +311,16 @@ enum Request {
         name: String,
         imports: Vec<String>,
         reply: oneshot::Sender<Result<Option<DeclarationRow>>>,
+    },
+    ListDeclarationStrings {
+        filter: LeanDeclarationFilter,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<String>>>,
+    },
+    DescribeBulk {
+        names: Vec<String>,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<DeclarationRow>>>,
     },
 }
 
@@ -382,6 +429,12 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
             Request::Describe { name, imports, reply } => {
                 let _ = reply.send(self.do_describe(&name, imports));
             }
+            Request::ListDeclarationStrings { filter, imports, reply } => {
+                let _ = reply.send(self.do_list_declaration_strings(filter, imports));
+            }
+            Request::DescribeBulk { names, imports, reply } => {
+                let _ = reply.send(self.do_describe_bulk(names, imports));
+            }
         }
     }
 
@@ -408,6 +461,10 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         Ok(project_kernel_outcome(session, outcome))
     }
 
+    // Two meta hops per call: one to compute the expression (infer_type /
+    // whnf), one to pretty-print it via pp_expr. The optional pp_expr shim
+    // may be absent on older capability dylibs; fall back to expr_to_string_raw
+    // and flag the response so the tool handler can emit a warning.
     fn do_infer_type(&mut self, source: &str, imports: Vec<String>) -> Result<MetaOutcome> {
         let session = self.session_for(imports)?;
         let opts = LeanElabOptions::new();
@@ -420,7 +477,7 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         let response = session
             .run_meta(&meta_infer_type(), expr, &meta_opts, None)
             .map_err(|e| ServerError::Lean(format!("run_meta infer_type: {e}")))?;
-        Ok(project_meta_unit(response))
+        render_meta_response(session, response, &meta_opts)
     }
 
     fn do_whnf(&mut self, source: &str, imports: Vec<String>) -> Result<MetaOutcome> {
@@ -435,7 +492,7 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         let response = session
             .run_meta(&meta_whnf(), expr, &meta_opts, None)
             .map_err(|e| ServerError::Lean(format!("run_meta whnf: {e}")))?;
-        Ok(project_meta_unit(response))
+        render_meta_response(session, response, &meta_opts)
     }
 
     fn do_is_def_eq(
@@ -471,7 +528,7 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
             Ok(k) => k,
             Err(e) => return Err(ServerError::Lean(format!("declaration_kind {name}: {e}"))),
         };
-        // type_signature is None in v0.1 — see DeclarationRow doc.
+        let type_signature = render_type_signature(session, name)?;
         let source = session
             .declaration_source_range(name, None)
             .ok()
@@ -480,9 +537,81 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         Ok(Some(DeclarationRow {
             name: name.to_owned(),
             kind,
-            type_signature: None,
+            type_signature,
             source,
         }))
+    }
+
+    fn do_list_declaration_strings(
+        &mut self,
+        filter: LeanDeclarationFilter,
+        imports: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let session = self.session_for(imports)?;
+        session
+            .list_declarations_strings(&filter, None, None)
+            .map_err(|e| ServerError::Lean(format!("list_declarations_strings: {e}")))
+    }
+
+    fn do_describe_bulk(&mut self, names: Vec<String>, imports: Vec<String>) -> Result<Vec<DeclarationRow>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session = self.session_for(imports)?;
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let kinds = session
+            .declaration_kind_bulk(&refs, None, None)
+            .map_err(|e| ServerError::Lean(format!("declaration_kind_bulk: {e}")))?;
+        let types = session
+            .declaration_type_bulk(&refs, None, None)
+            .map_err(|e| ServerError::Lean(format!("declaration_type_bulk: {e}")))?;
+
+        let mut out = Vec::with_capacity(names.len());
+        for (idx, name) in names.iter().enumerate() {
+            let kind = kinds.get(idx).cloned().unwrap_or_else(|| "missing".to_owned());
+            if kind == "missing" {
+                continue;
+            }
+            let ty_expr = types.get(idx).and_then(Option::as_ref);
+            let type_signature = match ty_expr {
+                Some(expr) => Some(
+                    session
+                        .expr_to_string_raw(expr, None)
+                        .map_err(|e| ServerError::Lean(format!("expr_to_string_raw {name}: {e}")))?,
+                ),
+                None => None,
+            };
+            let source = session
+                .declaration_source_range(name, None)
+                .ok()
+                .flatten()
+                .map(project_source_range);
+            out.push(DeclarationRow {
+                name: name.clone(),
+                kind,
+                type_signature,
+                source,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Render a declaration's type via `Expr.toString`. `Ok(None)` means the
+/// declaration has no recoverable type expression (Lean returned `none`).
+fn render_type_signature(session: &mut LeanSession<'_, '_>, name: &str) -> Result<Option<String>> {
+    let ty = session
+        .declaration_type(name, None)
+        .map_err(|e| ServerError::Lean(format!("declaration_type {name}: {e}")))?;
+    match ty {
+        Some(expr) => {
+            let rendered = session
+                .expr_to_string_raw(&expr, None)
+                .map_err(|e| ServerError::Lean(format!("expr_to_string_raw {name}: {e}")))?;
+            Ok(Some(rendered))
+        }
+        None => Ok(None),
     }
 }
 
@@ -568,40 +697,90 @@ fn project_source_range(range: LeanSourceRange) -> SourceRange {
     }
 }
 
-/// Project a `LeanMetaResponse<T>` whose `Ok` payload we don't expose. Used
-/// for `infer_type` and `whnf` — the resulting `LeanExpr` is opaque across
-/// the worker boundary, so we report success and a placeholder string.
+/// Pretty-print the `Ok` payload of an infer-type / whnf response. Falls
+/// back to `Expr.toString` when the optional `meta_pp_expr` shim is missing
+/// on the loaded capability dylib, setting `raw_fallback_used` so the tool
+/// handler can attach a warning to the envelope.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "LeanMetaResponse is #[non_exhaustive] upstream; the wildcard forwards future variants to project_meta_unit, which handles them"
+)]
+fn render_meta_response<'lean>(
+    session: &mut LeanSession<'lean, '_>,
+    response: LeanMetaResponse<lean_rs::LeanExpr<'lean>>,
+    meta_opts: &LeanMetaOptions,
+) -> Result<MetaOutcome> {
+    let expr = match response {
+        LeanMetaResponse::Ok(expr) => expr,
+        non_ok => return Ok(project_meta_unit(non_ok)),
+    };
+    let pp = session
+        .run_meta(&meta_pp_expr(), expr.clone(), meta_opts, None)
+        .map_err(|e| ServerError::Lean(format!("run_meta pp_expr: {e}")))?;
+    match pp {
+        LeanMetaResponse::Ok(rendered) => Ok(MetaOutcome {
+            status: "Ok".into(),
+            rendered: Some(rendered),
+            definitionally_equal: None,
+            failure: None,
+            raw_fallback_used: false,
+        }),
+        LeanMetaResponse::Unsupported(_) => {
+            let raw = session
+                .expr_to_string_raw(&expr, None)
+                .map_err(|e| ServerError::Lean(format!("expr_to_string_raw: {e}")))?;
+            Ok(MetaOutcome {
+                status: "Ok".into(),
+                rendered: Some(raw),
+                definitionally_equal: None,
+                failure: None,
+                raw_fallback_used: true,
+            })
+        }
+        non_ok => Ok(project_meta_unit(non_ok)),
+    }
+}
+
+/// Project a `LeanMetaResponse<T>` whose `Ok` payload we don't expose.
+/// After [`render_meta_response`] takes the `Ok(expr)` branch this only
+/// fires for non-Ok variants, but stays generic so callers don't need to
+/// duplicate the failure projection.
 fn project_meta_unit<T>(response: LeanMetaResponse<T>) -> MetaOutcome {
     match response {
         LeanMetaResponse::Ok(_) => MetaOutcome {
             status: "Ok".into(),
-            rendered: Some("<opaque LeanExpr>".into()),
+            rendered: None,
             definitionally_equal: None,
             failure: None,
+            raw_fallback_used: false,
         },
         LeanMetaResponse::Failed(failure) => MetaOutcome {
             status: "Failed".into(),
             rendered: None,
             definitionally_equal: None,
             failure: Some(project_failure(&failure)),
+            raw_fallback_used: false,
         },
         LeanMetaResponse::TimeoutOrHeartbeat(failure) => MetaOutcome {
             status: "TimeoutOrHeartbeat".into(),
             rendered: None,
             definitionally_equal: None,
             failure: Some(project_failure(&failure)),
+            raw_fallback_used: false,
         },
         LeanMetaResponse::Unsupported(failure) => MetaOutcome {
             status: "Unsupported".into(),
             rendered: None,
             definitionally_equal: None,
             failure: Some(project_failure(&failure)),
+            raw_fallback_used: false,
         },
         _ => MetaOutcome {
             status: "Unknown".into(),
             rendered: None,
             definitionally_equal: None,
             failure: None,
+            raw_fallback_used: false,
         },
     }
 }
@@ -613,30 +792,35 @@ fn project_meta_bool(response: LeanMetaResponse<bool>) -> MetaOutcome {
             rendered: None,
             definitionally_equal: Some(b),
             failure: None,
+            raw_fallback_used: false,
         },
         LeanMetaResponse::Failed(failure) => MetaOutcome {
             status: "Failed".into(),
             rendered: None,
             definitionally_equal: None,
             failure: Some(project_failure(&failure)),
+            raw_fallback_used: false,
         },
         LeanMetaResponse::TimeoutOrHeartbeat(failure) => MetaOutcome {
             status: "TimeoutOrHeartbeat".into(),
             rendered: None,
             definitionally_equal: None,
             failure: Some(project_failure(&failure)),
+            raw_fallback_used: false,
         },
         LeanMetaResponse::Unsupported(failure) => MetaOutcome {
             status: "Unsupported".into(),
             rendered: None,
             definitionally_equal: None,
             failure: Some(project_failure(&failure)),
+            raw_fallback_used: false,
         },
         _ => MetaOutcome {
             status: "Unknown".into(),
             rendered: None,
             definitionally_equal: None,
             failure: None,
+            raw_fallback_used: false,
         },
     }
 }
@@ -647,5 +831,6 @@ fn failure_meta(failure: LeanElabFailure) -> MetaOutcome {
         rendered: None,
         definitionally_equal: None,
         failure: Some(project_failure(&failure)),
+        raw_fallback_used: false,
     }
 }

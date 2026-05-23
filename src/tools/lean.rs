@@ -107,7 +107,10 @@ pub struct InferTypeRequest {
 pub async fn infer_type(ctx: &ToolContext, req: InferTypeRequest) -> Result<Response<MetaOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let outcome = ctx.host.infer_type(req.term, req.imports).await?;
-    Ok(Response::ok(outcome, freshness))
+    Ok(attach_render_warning(
+        Response::ok(outcome.clone(), freshness),
+        &outcome,
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -124,7 +127,20 @@ pub struct WhnfRequest {
 pub async fn whnf(ctx: &ToolContext, req: WhnfRequest) -> Result<Response<MetaOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let outcome = ctx.host.whnf(req.term, req.imports).await?;
-    Ok(Response::ok(outcome, freshness))
+    Ok(attach_render_warning(
+        Response::ok(outcome.clone(), freshness),
+        &outcome,
+    ))
+}
+
+/// Propagate the worker's `raw_fallback_used` flag into an envelope
+/// warning. Keeps `session.rs` free of warning vocabulary.
+fn attach_render_warning(resp: Response<MetaOutcome>, outcome: &MetaOutcome) -> Response<MetaOutcome> {
+    if outcome.raw_fallback_used {
+        resp.warn("optional `meta_pp_expr` shim missing on the capability dylib; rendered via `Expr.toString` fallback")
+    } else {
+        resp
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

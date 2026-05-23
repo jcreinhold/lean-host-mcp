@@ -7,22 +7,25 @@
 //!   project Lean responses into the JSON envelope.
 //! - [`scan`] — `project_scan`. No Lean dependency; pure filesystem walk
 //!   with a configurable regex.
-//!
-//! Tools that need to *enumerate* declarations (`find_symbol`,
-//! `find_lemma`, `outline`) are deferred until `lean-rs` exposes a
-//! `LeanName → String` rendering shim. The published 0.1.x has no such
-//! path; the index would have nothing to populate.
+//! - [`index`] — `find_symbol`, `find_lemma`, `outline`. Thin wrappers
+//!   over the SQLite-backed [`DeclarationIndex`](crate::DeclarationIndex);
+//!   rebuild on Lake-manifest change.
 
+use std::sync::Arc;
+
+pub mod index;
 pub mod lean;
 pub mod scan;
 
 use crate::envelope::Freshness;
+use crate::index::DeclarationIndex;
 use crate::session::SessionHost;
 
 /// Shared state every tool handler reads.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub host: SessionHost,
+    pub index: Arc<DeclarationIndex>,
     pub lake_root: String,
     pub default_imports: Vec<String>,
 }

@@ -1,15 +1,15 @@
 [package]
-name = "lean-host-mcp"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.91"
 authors = ["Jacob Reinhold <jcreinhold@gmail.com>"]
-description = "MCP server hosting Lean 4 in-process via lean-rs"
-repository = "https://github.com/jcreinhold/lean-host-mcp"
-license = "MIT OR Apache-2.0"
-keywords = ["lean", "lean4", "mcp", "model-context-protocol"]
 categories = ["development-tools"]
+description = "MCP server hosting Lean 4 in-process via lean-rs"
+edition = "2024"
+keywords = ["lean", "lean4", "mcp", "model-context-protocol"]
+license = "MIT OR Apache-2.0"
+name = "lean-host-mcp"
 publish = false
+repository = "https://github.com/jcreinhold/lean-host-mcp"
+rust-version = "1.91"
+version = "0.1.0"
 
 [lib]
 name = "lean_host_mcp"
@@ -20,26 +20,29 @@ name = "lean-host-mcp"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { version = "1.7", features = ["server", "transport-io", "macros", "schemars"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+rmcp = { version = "1.7", features = ["macros", "schemars", "server", "transport-io"] }
+schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = "1.2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-anyhow = "1"
-thiserror = "2"
-walkdir = "2"
-regex = "1"
 uuid = { version = "1", features = ["v4"] }
-clap = { version = "4", features = ["derive", "env"] }
+walkdir = "2"
 
 lean-rs = "0.1"
 lean-rs-host = "0.1"
 
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+
 [dev-dependencies]
-tempfile = "3"
 insta = { version = "1", features = ["json"] }
+tempfile = "3"
 
 [lints.rust]
 future-incompatible = "warn"

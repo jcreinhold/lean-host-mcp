@@ -11,19 +11,23 @@
 //! - [`session`] — `SessionHost`, the single owner of all `lean-rs`
 //!   `LeanRuntime` / `LeanHost` / `LeanCapabilities` / `LeanSession` state.
 //!   Tools talk to it through a channel because `LeanSession` is `!Send`.
+//! - [`index`] — `DeclarationIndex`, the SQLite-backed projection of the
+//!   environment the three index tools query.
 //! - [`error`] — `ServerError`, the one error type tool handlers return.
 //! - [`tools`] — tool implementations, grouped by what plumbing they share
 //!   (`lean` for session-backed tools, `scan` for the filesystem regex
-//!   sweep).
+//!   sweep, `index` for the SQLite-backed lookups).
 //! - [`server`] — rmcp glue.
 
 pub mod envelope;
 pub mod error;
+pub mod index;
 pub mod server;
 pub mod session;
 pub mod tools;
 
 pub use envelope::{Freshness, Response};
 pub use error::{Result, ServerError};
+pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};
 pub use server::LeanHostService;
 pub use session::SessionHost;

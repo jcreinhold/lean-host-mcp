@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
 use rmcp::ServiceExt;
@@ -13,7 +14,7 @@ use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
-use lean_host_mcp::{LeanHostService, SessionHost};
+use lean_host_mcp::{DeclarationIndex, LeanHostService, SessionHost, default_cache_dir};
 
 /// Stdio MCP server that hosts a Lean 4 environment in-process.
 #[derive(Debug, Parser)]
@@ -42,6 +43,11 @@ struct Cli {
     /// own modules are reachable here once Lake has built them.
     #[arg(long, env = "LEAN_HOST_MCP_IMPORTS", value_delimiter = ',')]
     imports: Vec<String>,
+
+    /// Directory for the `SQLite` declaration index. Defaults to
+    /// `$XDG_CACHE_HOME/lean-host-mcp` (or `$HOME/.cache/lean-host-mcp`).
+    #[arg(long, env = "LEAN_HOST_MCP_CACHE_DIR")]
+    cache_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -78,8 +84,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         "starting lean-host-mcp",
     );
 
+    let cache_dir = cli.cache_dir.clone().unwrap_or_else(default_cache_dir);
+    let lake_root_str = cli.lake_root.to_string_lossy().into_owned();
+    let index = Arc::new(DeclarationIndex::open(&cache_dir, &lake_root_str)?);
+
     let host = SessionHost::spawn(cli.lake_root, package, library, cli.imports)?;
-    let service = LeanHostService::new(host);
+    let service = LeanHostService::new(host, index);
     let server = service.serve(stdio()).await?;
     server.waiting().await?;
     Ok(())

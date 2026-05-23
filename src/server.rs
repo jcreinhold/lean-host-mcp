@@ -6,6 +6,8 @@
 //! `Json<Response<T>>` so rmcp generates structured-content output and a
 //! schema downstream clients can introspect.
 
+use std::sync::Arc;
+
 use rmcp::Json;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -13,6 +15,7 @@ use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInf
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::envelope::Response;
+use crate::index::DeclarationIndex;
 use crate::session::SessionHost;
 use crate::tools::{self, ToolContext};
 
@@ -30,11 +33,12 @@ pub struct LeanHostService {
 }
 
 impl LeanHostService {
-    pub fn new(host: SessionHost) -> Self {
+    pub fn new(host: SessionHost, index: Arc<DeclarationIndex>) -> Self {
         let ctx = ToolContext {
             lake_root: host.lake_root().to_owned(),
             default_imports: Vec::new(),
             host,
+            index,
         };
         Self {
             ctx,
@@ -105,6 +109,34 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::scan::ProjectScanRequest>,
     ) -> std::result::Result<Json<Response<tools::scan::ProjectScanResult>>, McpError> {
         wrap(tools::scan::project_scan(&self.ctx, req))
+    }
+
+    #[tool(
+        description = "Find declarations by name (case-insensitive substring). Rebuilds the index when the Lake manifest changes."
+    )]
+    async fn find_symbol(
+        &self,
+        Parameters(req): Parameters<tools::index::FindSymbolRequest>,
+    ) -> std::result::Result<Json<Response<Vec<crate::index::IndexedDeclaration>>>, McpError> {
+        wrap(tools::index::find_symbol(&self.ctx, req).await)
+    }
+
+    #[tool(description = "Find theorems by name (case-insensitive substring); kind is restricted to `theorem`.")]
+    async fn find_lemma(
+        &self,
+        Parameters(req): Parameters<tools::index::FindLemmaRequest>,
+    ) -> std::result::Result<Json<Response<Vec<crate::index::IndexedDeclaration>>>, McpError> {
+        wrap(tools::index::find_lemma(&self.ctx, req).await)
+    }
+
+    #[tool(
+        description = "List declarations by fully-qualified name prefix. Omit `module_prefix` to walk the full table."
+    )]
+    async fn outline(
+        &self,
+        Parameters(req): Parameters<tools::index::OutlineRequest>,
+    ) -> std::result::Result<Json<Response<Vec<crate::index::IndexedDeclaration>>>, McpError> {
+        wrap(tools::index::outline(&self.ctx, req).await)
     }
 }
 
