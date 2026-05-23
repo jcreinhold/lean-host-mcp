@@ -21,12 +21,12 @@ For every performance problem:
 1. **Classify** — is the bottleneck elaboration, simp, typeclass synthesis, kernel reduction, or build structure?
 1. **Read only the reference that matches:**
 
-| Bottleneck                                           | Reference                                  |
-| ---------------------------------------------------- | ------------------------------------------ |
-| Don't know yet / need profiling                      | `references/profiling-and-diagnostics.md`  |
-| Slow tactic, simp timeout, heartbeat limit           | `references/tactic-performance.md`         |
-| Large oleans, term bloat, transparency control       | `references/term-size-and-transparency.md` |
-| Slow build, Lake parallelism, imports, module layout | `references/compilation-and-build.md`      |
+| Bottleneck | Reference |
+| --- | --- |
+| Don't know yet / need profiling | `references/profiling-and-diagnostics.md` |
+| Slow tactic, simp timeout, heartbeat limit | `references/tactic-performance.md` |
+| Large oleans, term bloat, transparency control | `references/term-size-and-transparency.md` |
+| Slow build, Lake parallelism, imports, module layout | `references/compilation-and-build.md` |
 
 Do not read reference files speculatively. Profile first, then read the one that matches.
 
@@ -78,18 +78,18 @@ These eight changes fix the majority of Lean 4 performance problems:
 
 From fastest to slowest — prefer the cheapest tactic that closes the goal:
 
-| Tactic                          | Speed        | When to use                                    |
-| ------------------------------- | ------------ | ---------------------------------------------- |
-| `exact`, `apply`, `constructor` | Fastest      | Direct term construction                       |
-| `assumption`                    | Fast         | Goal matches a hypothesis                      |
-| `omega`                         | Fast         | Linear `Nat`/`Int` arithmetic                  |
-| `norm_num`                      | Fast         | Numeric normalization                          |
-| `decide`                        | Medium       | Small decidable computations                   |
-| `native_decide`                 | Fast (large) | Large decidable computations (trusts compiler) |
-| `dsimp`                         | Medium       | Definitional simplification only               |
-| `simp only [...]`               | Medium       | Constrained rewrite set                        |
-| `simp`                          | Slow         | Full database search                           |
-| `aesop`                         | Slow         | Best-first proof search                        |
+| Tactic | Speed | When to use |
+| --- | --- | --- |
+| `exact`, `apply`, `constructor` | Fastest | Direct term construction |
+| `assumption` | Fast | Goal matches a hypothesis |
+| `omega` | Fast | Linear `Nat`/`Int` arithmetic |
+| `norm_num` | Fast | Numeric normalization |
+| `decide` | Medium | Small decidable computations |
+| `native_decide` | Fast (large) | Large decidable computations (trusts compiler) |
+| `dsimp` | Medium | Definitional simplification only |
+| `simp only [...]` | Medium | Constrained rewrite set |
+| `simp` | Slow | Full database search |
+| `aesop` | Slow | Best-first proof search |
 
 When a proof needs `simp` or `aesop` during exploration, always extract the explicit result with `simp?` or `aesop?`
 before committing.

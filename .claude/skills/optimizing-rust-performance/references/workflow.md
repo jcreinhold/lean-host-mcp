@@ -8,9 +8,9 @@ Pick the workload that matches the user-visible complaint.
 
 - Parser or syntax-only suspicion: use parser-only or parse-stage workloads.
 - Typechecker, evaluator, normalization, or unification suspicion: start with the nearest crate bench, then confirm with
-    a broader frontend workload if the change may affect compile latency.
+  a broader frontend workload if the change may affect compile latency.
 - End-to-end compile throughput suspicion: use `crates/pipeline/build/benches/pipeline_bench.rs` or the `profiling/`
-    binaries first.
+  binaries first.
 - Runtime or interpreter suspicion: use `crates/execution/interpreter/benches/interpreter.rs` or backend benches.
 
 Prefer existing workloads over inventing new ones. If nothing credible exists, add one before changing code.
@@ -46,13 +46,13 @@ Use `collect_baseline_quick` for iteration and `collect_baseline_full` when allo
 Match tool to symptom.
 
 - CPU time hot path: Criterion, `profile_*`, `./profiling/scripts/profile.sh`, `cargo flamegraph`, or
-    `./profiling/scripts/profile_with_samply.sh`.
+  `./profiling/scripts/profile_with_samply.sh`.
 - Allocation rate or retained heap suspicion: `collect_baseline_full` or
-    `crates/frontend/typecheck-infer/benches/dhat_profile.rs`.
+  `crates/frontend/typecheck-infer/benches/dhat_profile.rs`.
 - Cache/layout suspicion: inspect sizes, pointer chasing, key choice, and hot/cold field mix after profiling points
-    there.
+  there.
 - Compile-time code size suspicion in codegen-heavy crates: consider `cargo llvm-lines` only after runtime or throughput
-    profiles point at LLVM/codegen work.
+  profiles point at LLVM/codegen work.
 
 Useful commands:
 

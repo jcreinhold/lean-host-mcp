@@ -15,13 +15,13 @@ definitionally equal). But the terms still exist in the olean and must be loaded
 
 ## Tactics That Produce Large Terms
 
-| Tactic                    | Term size  | Why                                       |
-| ------------------------- | ---------- | ----------------------------------------- |
-| `decide` on large inputs  | Very large | Kernel evaluation trace of every step     |
-| `simp` with many rewrites | Large      | Chain of `Eq.mpr` / `congrArg` steps      |
-| `aesop`                   | Large      | Search tree encoded in proof term         |
-| `omega`                   | Small      | Abstracts proof into auxiliary definition |
-| `exact` / `apply`         | Minimal    | Direct term reference                     |
+| Tactic | Term size | Why |
+| --- | --- | --- |
+| `decide` on large inputs | Very large | Kernel evaluation trace of every step |
+| `simp` with many rewrites | Large | Chain of `Eq.mpr` / `congrArg` steps |
+| `aesop` | Large | Search tree encoded in proof term |
+| `omega` | Small | Abstracts proof into auxiliary definition |
+| `exact` / `apply` | Minimal | Direct term reference |
 
 ## Reducing Term Size
 
@@ -69,13 +69,13 @@ often produces a smaller term.
 Lean has a hierarchy that controls when definitions are unfolded. Choosing the right level prevents unnecessary kernel
 work in downstream files.
 
-| Keyword / Attribute  | Transparency     | Unfolded by                          | Use for                 |
-| -------------------- | ---------------- | ------------------------------------ | ----------------------- |
-| `abbrev`             | Reducible        | Everything (simp, typeclass, kernel) | True synonyms, notation |
-| `def`                | Semireducible    | Explicit `unfold`/`delta`            | General definitions     |
-| `@[irreducible] def` | Irreducible      | Nothing (must use API lemmas)        | Expensive internals     |
-| `opaque`             | Opaque           | Nothing, ever (even kernel)          | FFI stubs, axiom-like   |
-| `theorem`            | Proof-irrelevant | Nothing (proof irrelevance)          | All proofs              |
+| Keyword / Attribute | Transparency | Unfolded by | Use for |
+| --- | --- | --- | --- |
+| `abbrev` | Reducible | Everything (simp, typeclass, kernel) | True synonyms, notation |
+| `def` | Semireducible | Explicit `unfold`/`delta` | General definitions |
+| `@[irreducible] def` | Irreducible | Nothing (must use API lemmas) | Expensive internals |
+| `opaque` | Opaque | Nothing, ever (even kernel) | FFI stubs, axiom-like |
+| `theorem` | Proof-irrelevant | Nothing (proof irrelevance) | All proofs |
 
 ### When to use `@[irreducible]`
 
