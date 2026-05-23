@@ -214,3 +214,35 @@ recorded one, such as coercion sites. When inference did not produce a type, `ty
 past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib lacks the
 shim), `header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...] }`).
 Results are sorted by `(file, line, column)`. Name matching is exact: pass the fully-qualified form Lean records.
+
+### `file_diagnostics`
+
+Elaboration diagnostics — errors, warnings, info — for a `.lean` file. Same elaborator pass that backs
+`goal_at_position` / `type_at_position`, so the projection is cached and the typical "what's wrong; probe the problem
+site" loop pays for the elaboration once.
+
+```jsonc
+// request
+{ "file": "LeanRsFixture/SourceRanges.lean" }
+
+// result: file elaborated (diagnostics may be empty, info-only, or carry errors)
+{
+  "status": "ok",
+  "diagnostics": [
+    { "severity": "Error", "message": "type mismatch ...",
+      "position": { "line": 12, "column": 9, "end_line": 12, "end_column": 13 },
+      "file": "..." }
+  ],
+  "truncated": false
+}
+
+// result: file's header did not parse — body never elaborated; diagnostics are the parser's
+{ "status": "header_parse_failed", "diagnostics": [...], "truncated": false }
+
+// result: capability dylib missing the info-tree shim
+{ "status": "unsupported" }
+```
+
+`truncated` is `true` only when Lean hit the diagnostic byte budget; the list is then a prefix. `Ok` and
+`HeaderParseFailed` deliberately share the same on-wire shape (`diagnostics` + `truncated`) so a caller renders one
+structure. The same `MissingImports` envelope-warning behaviour as the cursor-driven tools applies.

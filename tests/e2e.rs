@@ -162,6 +162,43 @@ fn goal_result_serialises_status_tag() {
     assert_eq!(s, r#"{"status":"unsupported"}"#);
 }
 
+#[test]
+fn file_diagnostics_request_round_trips() {
+    use lean_host_mcp::tools::position::FileDiagnosticsRequest;
+
+    let r: FileDiagnosticsRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean"}"#).unwrap();
+    assert_eq!(r.file, PathBuf::from("Foo/Bar.lean"));
+
+    // Unknown fields are ignored, same as the cursor-driven requests.
+    let r2: FileDiagnosticsRequest = serde_json::from_str(r#"{"file":"X.lean","line":1}"#).unwrap();
+    assert_eq!(r2.file, PathBuf::from("X.lean"));
+}
+
+#[test]
+fn file_diagnostics_result_serialises_status_tag() {
+    use lean_host_mcp::tools::position::FileDiagnosticsResult;
+
+    let s = serde_json::to_string(&FileDiagnosticsResult::Unsupported).unwrap();
+    assert_eq!(s, r#"{"status":"unsupported"}"#);
+
+    let s = serde_json::to_string(&FileDiagnosticsResult::Ok {
+        diagnostics: Vec::new(),
+        truncated: false,
+    })
+    .unwrap();
+    assert_eq!(s, r#"{"status":"ok","diagnostics":[],"truncated":false}"#);
+
+    let s = serde_json::to_string(&FileDiagnosticsResult::HeaderParseFailed {
+        diagnostics: Vec::new(),
+        truncated: false,
+    })
+    .unwrap();
+    assert_eq!(
+        s,
+        r#"{"status":"header_parse_failed","diagnostics":[],"truncated":false}"#
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn hover_by_name_populates_type_signature() {
@@ -290,6 +327,152 @@ async fn process_file_projects_tactic_and_term_info() {
     assert!(
         !file.names.is_empty(),
         "fixture must record at least one name reference"
+    );
+}
+
+/// Build a `ToolContext` from a freshly spawned `SessionHost`, sharing one
+/// `ProcessedFileCache` so cache-warmth assertions across multiple tool
+/// calls in the same test are observable.
+fn make_tool_context(
+    root: &std::path::Path,
+    pkg: String,
+    lib: String,
+    imports: Vec<String>,
+) -> lean_host_mcp::tools::ToolContext {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    let host = SessionHost::spawn(root.to_path_buf(), pkg, lib, imports.clone()).expect("spawn");
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    // Leak the tempdir so it outlives the test; the SQLite file is opened
+    // for the test's lifetime and the OS will clean /tmp eventually.
+    let cache_path = cache_dir.keep();
+    let index = lean_host_mcp::DeclarationIndex::open(&cache_path, &root.to_string_lossy()).expect("open index");
+    let processed_files = Arc::new(lean_host_mcp::ProcessedFileCache::with_capacity(
+        NonZeroUsize::new(16).unwrap(),
+    ));
+    lean_host_mcp::tools::ToolContext {
+        lake_root: host.lake_root().to_owned(),
+        default_imports: imports,
+        processed_files,
+        host,
+        index: Arc::new(index),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn file_diagnostics_returns_clean_file_empty() {
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
+
+    let Some((root, pkg, lib)) = fixture_env() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = make_tool_context(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let resp = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file: PathBuf::from("LeanRsFixture/SourceRanges.lean"),
+        },
+    )
+    .await
+    .expect("file_diagnostics");
+    let FileDiagnosticsResult::Ok { diagnostics, .. } = resp.result else {
+        panic!("expected Ok variant, got something else");
+    };
+    assert!(
+        diagnostics.iter().all(|d| d.severity != "Error"),
+        "clean fixture should record no error-severity diagnostics; got {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn file_diagnostics_returns_real_errors() {
+    use std::io::Write;
+
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
+
+    let Some((root, pkg, lib)) = fixture_env() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = make_tool_context(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+
+    // Two-line file so the error's line number is unambiguous.
+    let mut tmp = tempfile::NamedTempFile::with_suffix(".lean").expect("tempfile");
+    writeln!(tmp, "-- broken file").unwrap();
+    writeln!(tmp, "theorem broken : 1 + 1 = 3 := rfl").unwrap();
+    tmp.flush().unwrap();
+
+    let resp = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file: tmp.path().to_path_buf(),
+        },
+    )
+    .await
+    .expect("file_diagnostics");
+    let FileDiagnosticsResult::Ok { diagnostics, .. } = resp.result else {
+        panic!("expected Ok variant with diagnostics; got something else");
+    };
+    let error = diagnostics
+        .iter()
+        .find(|d| d.severity == "Error")
+        .expect("at least one error-severity diagnostic for `1 + 1 = 3 := rfl`");
+    let pos = error.position.as_ref().expect("error diagnostic has a position");
+    assert_eq!(pos.line, 2, "error must be reported on the theorem line (got {pos:?})");
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn file_diagnostics_cache_warm() {
+    use lean_host_mcp::tools::position::{
+        FileDiagnosticsRequest, GoalAtPositionRequest, file_diagnostics, goal_at_position,
+    };
+
+    const HINT_FRAGMENT: &str = "file processed and cached";
+
+    let Some((root, pkg, lib)) = fixture_env() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = make_tool_context(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let file = PathBuf::from("LeanRsFixture/SourceRanges.lean");
+
+    // Cold: must record the cache-and-process hint.
+    let cold = file_diagnostics(&ctx, FileDiagnosticsRequest { file: file.clone() })
+        .await
+        .expect("cold file_diagnostics");
+    assert!(
+        cold.next_actions.iter().any(|n| n.contains(HINT_FRAGMENT)),
+        "cold call should attach the cache hint; next_actions={:?}",
+        cold.next_actions
+    );
+
+    // Different tool, same file: must hit the shared cache (no hint).
+    let probe = goal_at_position(
+        &ctx,
+        GoalAtPositionRequest {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+        },
+    )
+    .await
+    .expect("goal_at_position");
+    assert!(
+        probe.next_actions.iter().all(|n| !n.contains(HINT_FRAGMENT)),
+        "second tool call against the cached file must not re-process; next_actions={:?}",
+        probe.next_actions
+    );
+
+    // Warm: same tool, still cached.
+    let warm = file_diagnostics(&ctx, FileDiagnosticsRequest { file })
+        .await
+        .expect("warm file_diagnostics");
+    assert!(
+        warm.next_actions.iter().all(|n| !n.contains(HINT_FRAGMENT)),
+        "warm file_diagnostics call must not re-process; next_actions={:?}",
+        warm.next_actions
     );
 }
 

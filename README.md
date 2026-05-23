@@ -4,11 +4,11 @@ A Model Context Protocol server that hosts Lean 4 in-process through [`lean-rs`]
 owns a `LeanRuntime` and a `LeanCapabilities` dylib directly, so tool calls run as in-process Meta and kernel operations
 rather than as messages to an external LSP. That's the difference from `lean-lsp-mcp`.
 
-Thirteen tools are exposed: six session-backed Lean operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`,
+Fourteen tools are exposed: six session-backed Lean operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`,
 `is_def_eq`, `hover_by_name`), a filesystem sweep (`project_scan`), three SQLite-indexed lookups (`find_symbol`,
-`find_lemma`, `outline`), and three cursor-driven queries (`goal_at_position`, `type_at_position`,
-`references_of_name`). Per-tool request and result schemas live in [`docs/tool-catalog.md`](docs/tool-catalog.md);
-internal layering in [`docs/architecture.md`](docs/architecture.md).
+`find_lemma`, `outline`), three cursor-driven queries (`goal_at_position`, `type_at_position`, `references_of_name`),
+and a file-scoped diagnostics query (`file_diagnostics`). Per-tool request and result schemas live in
+[`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in [`docs/architecture.md`](docs/architecture.md).
 
 ## Prerequisite: a Lake project linking the host shim
 
@@ -77,9 +77,9 @@ Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are pa
 MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the Lake
 project is unusable.
 
-## Capability shims and the three position tools
+## Capability shims and the position-tool cluster
 
-`goal_at_position`, `type_at_position`, and `references_of_name` depend on an optional
+`goal_at_position`, `type_at_position`, `references_of_name`, and `file_diagnostics` depend on an optional
 `lean_rs_host_process_module_with_info_tree` shim. A capability dylib built without it answers
 `{ "status": "unsupported" }` per call; the tools never raise. Files whose header imports modules the server's open
 env doesn't have are still processed; missing imports surface as an envelope warning (single-file tools) or a result

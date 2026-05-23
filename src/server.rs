@@ -1,4 +1,4 @@
-//! rmcp server glue. Registers thirteen tools and wires them to the
+//! rmcp server glue. Registers fourteen tools and wires them to the
 //! [`tools`](crate::tools) module.
 //!
 //! Each `#[tool]` handler is a thin call into the implementation function;
@@ -183,6 +183,16 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::position::ReferencesOfNameRequest>,
     ) -> std::result::Result<Json<Response<tools::position::ReferencesOfNameResult>>, McpError> {
         wrap(tools::position::references_of_name(&self.ctx, req).await)
+    }
+
+    #[tool(
+        description = "Elaboration diagnostics for a .lean file (errors, warnings, info). Returns Ok / HeaderParseFailed / Unsupported."
+    )]
+    async fn file_diagnostics(
+        &self,
+        Parameters(req): Parameters<tools::position::FileDiagnosticsRequest>,
+    ) -> std::result::Result<Json<Response<tools::position::FileDiagnosticsResult>>, McpError> {
+        wrap(tools::position::file_diagnostics(&self.ctx, req).await)
     }
 }
 

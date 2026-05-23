@@ -1,10 +1,15 @@
 //! Position-based tools: `goal_at_position`, `type_at_position`,
-//! `references_of_name`.
+//! `references_of_name`, `file_diagnostics`.
 //!
-//! All three project the same upstream value —
+//! All four project the same upstream value —
 //! [`ProcessedFile`](lean_rs_host::host::process::ProcessedFile) — into a
 //! tool-specific result enum. Repeated calls against the same source bytes
 //! reuse a cached projection (see [`crate::cache::ProcessedFileCache`]).
+//!
+//! `file_diagnostics` is grouped here despite not taking a cursor: it shares
+//! the cache-and-projection plumbing with its three siblings, so an agent's
+//! typical "what's wrong; then probe the problem site" loop pays for the
+//! elaboration once.
 //!
 //! The tools drive
 //! [`SessionHost::process_module`](crate::SessionHost::process_module) — the
@@ -33,7 +38,7 @@ use walkdir::WalkDir;
 use crate::cache::{ProcessedFileCache, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
-use crate::session::{ElabFailure, project_failure};
+use crate::session::{Diagnostic, ElabFailure, project_failure};
 use crate::tools::{ToolContext, is_ignored_dir, new_session_id};
 
 /// Hard cap on the number of references aggregated in
@@ -321,6 +326,70 @@ pub async fn references_of_name(
         any_freshly_processed,
         &[],
     ))
+}
+
+// --- file_diagnostics --------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FileDiagnosticsRequest {
+    /// Path to a `.lean` file. Resolved against `lake_root` if relative.
+    pub file: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FileDiagnosticsResult {
+    /// File was elaborated; `diagnostics` lists every recorded message
+    /// (possibly empty). `truncated` is set when Lean hit the diagnostic
+    /// byte budget and the list is a prefix.
+    Ok {
+        diagnostics: Vec<Diagnostic>,
+        truncated: bool,
+    },
+    /// The file's header did not parse; `diagnostics` are the parser's.
+    /// Same wire shape as `Ok` so a caller renders one structure, not two.
+    HeaderParseFailed {
+        diagnostics: Vec<Diagnostic>,
+        truncated: bool,
+    },
+    /// Capability dylib lacks `process_module_with_info_tree`.
+    Unsupported,
+}
+
+/// # Errors
+///
+/// As [`goal_at_position`].
+pub async fn file_diagnostics(
+    ctx: &ToolContext,
+    req: FileDiagnosticsRequest,
+) -> Result<Response<FileDiagnosticsResult>> {
+    let freshness = ctx.freshness(&[], &new_session_id());
+    let outcome = ensure_processed(ctx, &req.file).await?;
+    let (file, fresh, missing) = match outcome {
+        EnsureOutcome::Ready {
+            file,
+            freshly_processed,
+            missing_imports,
+        } => (file, freshly_processed, missing_imports),
+        EnsureOutcome::HeaderParseFailed { diagnostics } => {
+            return Ok(Response::ok(
+                FileDiagnosticsResult::HeaderParseFailed {
+                    diagnostics: diagnostics.diagnostics,
+                    truncated: diagnostics.truncated,
+                },
+                freshness,
+            ));
+        }
+        EnsureOutcome::Unsupported => {
+            return Ok(Response::ok(FileDiagnosticsResult::Unsupported, freshness));
+        }
+    };
+    let projected = project_failure(&file.diagnostics);
+    let result = FileDiagnosticsResult::Ok {
+        diagnostics: projected.diagnostics,
+        truncated: projected.truncated,
+    };
+    Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
 }
 
 // --- shared plumbing ---------------------------------------------------
