@@ -213,11 +213,18 @@ impl SessionHost {
     /// # Errors
     ///
     /// Infrastructure failures only.
-    pub async fn is_def_eq(&self, lhs: String, rhs: String, imports: Vec<String>) -> Result<MetaOutcome> {
+    pub async fn is_def_eq(
+        &self,
+        lhs: String,
+        rhs: String,
+        imports: Vec<String>,
+        transparency: LeanMetaTransparency,
+    ) -> Result<MetaOutcome> {
         self.submit(|reply| Request::IsDefEq {
             lhs,
             rhs,
             imports,
+            transparency,
             reply,
         })
         .await
@@ -260,6 +267,7 @@ enum Request {
         lhs: String,
         rhs: String,
         imports: Vec<String>,
+        transparency: LeanMetaTransparency,
         reply: oneshot::Sender<Result<MetaOutcome>>,
     },
     Describe {
@@ -366,9 +374,10 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
                 lhs,
                 rhs,
                 imports,
+                transparency,
                 reply,
             } => {
-                let _ = reply.send(self.do_is_def_eq(&lhs, &rhs, imports));
+                let _ = reply.send(self.do_is_def_eq(&lhs, &rhs, imports, transparency));
             }
             Request::Describe { name, imports, reply } => {
                 let _ = reply.send(self.do_describe(&name, imports));
@@ -429,7 +438,13 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         Ok(project_meta_unit(response))
     }
 
-    fn do_is_def_eq(&mut self, lhs: &str, rhs: &str, imports: Vec<String>) -> Result<MetaOutcome> {
+    fn do_is_def_eq(
+        &mut self,
+        lhs: &str,
+        rhs: &str,
+        imports: Vec<String>,
+        transparency: LeanMetaTransparency,
+    ) -> Result<MetaOutcome> {
         let session = self.session_for(imports)?;
         let opts = LeanElabOptions::new();
         let lhs_expr = match session.elaborate(lhs, None, &opts, None) {
@@ -444,12 +459,7 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         };
         let meta_opts = LeanMetaOptions::new();
         let response = session
-            .run_meta(
-                &meta_is_def_eq(),
-                (lhs_expr, rhs_expr, LeanMetaTransparency::default()),
-                &meta_opts,
-                None,
-            )
+            .run_meta(&meta_is_def_eq(), (lhs_expr, rhs_expr, transparency), &meta_opts, None)
             .map_err(|e| ServerError::Lean(format!("run_meta is_def_eq: {e}")))?;
         Ok(project_meta_bool(response))
     }

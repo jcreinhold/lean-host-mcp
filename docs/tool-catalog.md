@@ -48,14 +48,15 @@ backfills the pretty-printed form once `lean-rs` exposes a shim.
 ### `is_def_eq`
 
 ```jsonc
-{ "lhs": "1 + 1", "rhs": "2", "imports": [] }
+{ "lhs": "1 + 1", "rhs": "2", "imports": [], "transparency": "reducible" }
 // result
 { "status": "Ok", "definitionally_equal": true, "rendered": null, "failure": null }
 ```
 
-Uses `LeanMetaTransparency::Default` — every `is_def_eq` call in v0.1
-sees the same reducibility view. Configurable transparency is a v0.2
-schema addition.
+`transparency` is optional and accepts `default` | `reducible` |
+`instances` | `all` (default: `default`). Picks the reducibility view
+the underlying `Meta.isDefEq` runs under — the same two terms can be
+def-eq under one setting and not another.
 
 ### `hover_by_name`
 

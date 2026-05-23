@@ -12,6 +12,7 @@
 // pass-by-value flag is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
+use lean_rs_host::meta::LeanMetaTransparency;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,30 @@ use crate::envelope::Response;
 use crate::error::Result;
 use crate::session::{DeclarationRow, ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome};
 use crate::tools::{ToolContext, new_session_id};
+
+/// Reducibility view for `is_def_eq`. Mirrors `LeanMetaTransparency`
+/// upstream; kept local so the `#[non_exhaustive]` upstream enum doesn't
+/// leak through the wire schema.
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Transparency {
+    #[default]
+    Default,
+    Reducible,
+    Instances,
+    All,
+}
+
+impl Transparency {
+    fn to_lean(self) -> LeanMetaTransparency {
+        match self {
+            Self::Default => LeanMetaTransparency::Default,
+            Self::Reducible => LeanMetaTransparency::Reducible,
+            Self::Instances => LeanMetaTransparency::Instances,
+            Self::All => LeanMetaTransparency::All,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ElaborateRequest {
@@ -108,6 +133,11 @@ pub struct IsDefEqRequest {
     pub rhs: String,
     #[serde(default)]
     pub imports: Vec<String>,
+    /// Reducibility view to run under. Omit for Lean's standard
+    /// (`default`) transparency. Accepted: `default` | `reducible` |
+    /// `instances` | `all`.
+    #[serde(default)]
+    pub transparency: Option<Transparency>,
 }
 
 /// # Errors
@@ -115,7 +145,8 @@ pub struct IsDefEqRequest {
 /// Infrastructure failures only.
 pub async fn is_def_eq(ctx: &ToolContext, req: IsDefEqRequest) -> Result<Response<MetaOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let outcome = ctx.host.is_def_eq(req.lhs, req.rhs, req.imports).await?;
+    let transparency = req.transparency.unwrap_or_default().to_lean();
+    let outcome = ctx.host.is_def_eq(req.lhs, req.rhs, req.imports, transparency).await?;
     Ok(Response::ok(outcome, freshness))
 }
 

@@ -55,6 +55,17 @@ async fn describe_prelude_name() {
 }
 
 #[test]
+fn is_def_eq_request_round_trips_transparency() {
+    use lean_host_mcp::tools::lean::{IsDefEqRequest, Transparency};
+
+    let without: IsDefEqRequest = serde_json::from_str(r#"{"lhs":"1+1","rhs":"2"}"#).unwrap();
+    assert!(without.transparency.is_none());
+
+    let with: IsDefEqRequest = serde_json::from_str(r#"{"lhs":"1+1","rhs":"2","transparency":"reducible"}"#).unwrap();
+    assert!(matches!(with.transparency, Some(Transparency::Reducible)));
+}
+
+#[test]
 fn envelope_serialises() {
     use lean_host_mcp::{Freshness, Response};
     let r = Response::ok(
