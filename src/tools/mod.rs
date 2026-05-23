@@ -10,13 +10,19 @@
 //! - [`index`] — `find_symbol`, `find_lemma`, `outline`. Thin wrappers
 //!   over the SQLite-backed [`DeclarationIndex`](crate::DeclarationIndex);
 //!   rebuild on Lake-manifest change.
+//! - [`position`] — `goal_at_position`, `type_at_position`,
+//!   `references_of_name`. Thin lookups over a `ProcessedFileCache`-backed
+//!   [`ProcessedFile`](lean_rs_host::host::process::ProcessedFile)
+//!   projection; the cache is keyed on path + content hash.
 
 use std::sync::Arc;
 
 pub mod index;
 pub mod lean;
+pub mod position;
 pub mod scan;
 
+use crate::cache::ProcessedFileCache;
 use crate::envelope::Freshness;
 use crate::index::DeclarationIndex;
 use crate::session::SessionHost;
@@ -26,6 +32,7 @@ use crate::session::SessionHost;
 pub struct ToolContext {
     pub host: SessionHost,
     pub index: Arc<DeclarationIndex>,
+    pub processed_files: Arc<ProcessedFileCache>,
     pub lake_root: String,
     pub default_imports: Vec<String>,
 }
@@ -48,4 +55,11 @@ impl ToolContext {
 
 pub fn new_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Directory names skipped during `.lean` file enumeration. Shared between
+/// [`scan::project_scan`] and [`position::references_of_name`] so both tools
+/// agree on what counts as "the project".
+pub(crate) fn is_ignored_dir(name: &str) -> bool {
+    matches!(name, ".lake" | ".git" | "target" | "build" | "node_modules" | ".direnv")
 }

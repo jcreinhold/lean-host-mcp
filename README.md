@@ -4,9 +4,9 @@ Model Context Protocol server that hosts Lean 4 in-process via [`lean-rs`](https
 in the name signals what differentiates it from `lean-lsp-mcp`: this server owns a `LeanRuntime` and a
 `LeanCapabilities` dylib directly rather than wrapping an external LSP process.
 
-## Status — v0.1.1
+## Status — v0.1.0 (unreleased)
 
-Ten tools against `lean-rs` 0.1.3:
+Thirteen tools against `lean-rs` 0.1.3:
 
 | Tool | What it does |
 | --- | --- |
@@ -20,11 +20,16 @@ Ten tools against `lean-rs` 0.1.3:
 | `find_symbol` | Case-insensitive substring search across declaration names; backed by the SQLite index. |
 | `find_lemma` | As `find_symbol`, restricted to theorems. |
 | `outline` | Name-prefix listing (e.g. everything under `Nat.`). |
+| `goal_at_position` | Proof goal at a cursor in a `.lean` file. Backed by a content-hashed `ProcessedFile` cache. |
+| `type_at_position` | Type (and expected type, when recorded) of the innermost term at a cursor. |
+| `references_of_name` | All binder / use-site occurrences of a fully-qualified Lean name across one or many files. |
 
-Explicitly **not** here yet (deferred to v0.2+):
+The three position tools depend on the optional `lean_rs_host_process_with_info_tree` capability shim. A capability
+dylib built without it answers `{ "status": "unsupported" }` cleanly per call — the tools never error.
 
-- **Position-based queries** (`goal`, `hover`, `references` at cursor) — new shims in `lean-rs`. v0.2.
-- `try_tactics`, `unfold_at`, `explain_simp` — depend on the position API.
+Explicitly **not** here yet (deferred to v0.3+):
+
+- `try_tactics`, `unfold_at`, `explain_simp` — speculative tactic execution at a position.
 - `edit` / `replace_proof` — depend on a re-elaborate-after-edit shim.
 - `lean-rs-worker` process isolation — v0.3.
 
@@ -33,8 +38,8 @@ See `docs/version-matrix.md` for the supported `lean-rs` / Lean toolchain matrix
 ## Prerequisite — the shim contract
 
 `lean-rs-host` 0.1.3 loads a Lean capability dylib that exports 28 mandatory + 6 optional `lean_rs_host_*` symbols.
-v0.1.1 of this server does not bundle a self-contained shim crate. You point `--lake-root` at a Lake project whose
-`lakefile.lean` already wires up the `lean-rs-host` interop shims (see
+This crate does not bundle a self-contained shim. You point `--lake-root` at a Lake project whose `lakefile.lean`
+already wires up the `lean-rs-host` interop shims (see
 [`lean-rs/fixtures/lean/`](https://github.com/jcreinhold/lean-rs/tree/main/fixtures/lean) for the canonical template).
 Capability dylibs built against 0.1.2 must be rebuilt: 0.1.3 added two mandatory and two optional shims for name and
 expression rendering.

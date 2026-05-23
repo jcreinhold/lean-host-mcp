@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
-use crate::tools::{ToolContext, new_session_id};
+use crate::tools::{ToolContext, is_ignored_dir, new_session_id};
 
 const MAX_HITS: usize = 1000;
 
@@ -106,8 +106,4 @@ pub fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<Respon
         }
     }
     Ok(Response::ok(ProjectScanResult { hits, truncated }, freshness))
-}
-
-fn is_ignored_dir(name: &str) -> bool {
-    matches!(name, ".lake" | ".git" | "target" | "build" | "node_modules" | ".direnv")
 }

@@ -67,6 +67,18 @@ Rebuild is on-demand, gated by SHA-256 of `lake-manifest.json`. The session walk
 in one transaction, and the fingerprint is stamped last so a crashed
 rebuild leaves the index detectably stale rather than partially populated.
 
+## File-level processing cache
+
+Three tools (`goal_at_position`, `type_at_position`, `references_of_name`) project the upstream
+`ProcessedFile` value — four arrays of info-tree nodes plus diagnostics — into tool-specific results. Re-processing on
+every cursor move would be wasteful, so `src/cache.rs` ships a small LRU (`Arc<ProcessedFile>`, capacity 16) keyed on
+`(file_path, sha256(contents))`. Any edit to the source bytes misses structurally. The cache lives on `ToolContext`,
+not as a global. `ProcessedFile` is `Send + Sync + 'static`, so cached entries are read by tool handlers without
+re-entering the actor thread.
+
+The cache does **not** track the Lean environment. Environment churn (re-import, capability reload) is the
+`LeanHostService::new` boundary; the file cache is invalidated only by content change.
+
 ## Why no `lean-rs-worker` yet
 
 Subprocess isolation is real value, but pulling in `lean-rs-worker` means authoring a separate worker child binary,

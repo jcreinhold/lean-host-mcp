@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 
 use lean_host_mcp::SessionHost;
+use lean_rs_host as _;
 
 fn fixture_env() -> Option<(PathBuf, String, String)> {
     let root = std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok()?;
@@ -90,6 +91,65 @@ fn outline_request_accepts_module_prefix() {
     assert!(none.module_prefix.is_none());
 }
 
+#[test]
+fn position_requests_round_trip() {
+    use lean_host_mcp::tools::position::{GoalAtPositionRequest, ReferencesOfNameRequest, TypeAtPositionRequest};
+
+    let g: GoalAtPositionRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
+    assert_eq!(g.line, 7);
+    assert_eq!(g.column, 3);
+    assert!(g.imports.is_empty());
+
+    let t: TypeAtPositionRequest =
+        serde_json::from_str(r#"{"file":"X.lean","line":1,"column":1,"imports":["A.B"]}"#).unwrap();
+    assert_eq!(t.imports, vec!["A.B".to_owned()]);
+
+    let r_default: ReferencesOfNameRequest = serde_json::from_str(r#"{"name":"Nat.add"}"#).unwrap();
+    assert!(r_default.files.is_empty());
+    assert!(r_default.imports.is_empty());
+
+    let r_full: ReferencesOfNameRequest =
+        serde_json::from_str(r#"{"name":"Nat.add","files":["A.lean","B.lean"]}"#).unwrap();
+    assert_eq!(r_full.files.len(), 2);
+}
+
+#[test]
+fn references_result_skips_empty_fields() {
+    use lean_host_mcp::tools::position::ReferencesOfNameResult;
+
+    let empty = ReferencesOfNameResult {
+        references: Vec::new(),
+        truncated: false,
+        unsupported_files: Vec::new(),
+    };
+    let s = serde_json::to_string(&empty).unwrap();
+    assert!(!s.contains("truncated"), "truncated=false must be omitted: {s}");
+    assert!(
+        !s.contains("unsupported_files"),
+        "empty unsupported_files must be omitted: {s}"
+    );
+
+    let with_flags = ReferencesOfNameResult {
+        references: Vec::new(),
+        truncated: true,
+        unsupported_files: vec!["A.lean".into()],
+    };
+    let s = serde_json::to_string(&with_flags).unwrap();
+    assert!(s.contains("\"truncated\":true"));
+    assert!(s.contains("\"unsupported_files\":[\"A.lean\"]"));
+}
+
+#[test]
+fn goal_result_serialises_status_tag() {
+    use lean_host_mcp::tools::position::GoalAtPositionResult;
+
+    let s = serde_json::to_string(&GoalAtPositionResult::NoTacticContext).unwrap();
+    assert_eq!(s, r#"{"status":"no_tactic_context"}"#);
+
+    let s = serde_json::to_string(&GoalAtPositionResult::Unsupported).unwrap();
+    assert_eq!(s, r#"{"status":"unsupported"}"#);
+}
+
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn hover_by_name_populates_type_signature() {
@@ -105,6 +165,87 @@ async fn hover_by_name_populates_type_signature() {
     assert!(
         row.type_signature.is_some(),
         "expr_to_string_raw should yield a type for Nat.add_zero"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn process_file_projects_tactic_and_term_info() {
+    use lean_rs_host::host::process::ProcessFileOutcome;
+
+    let Some((root, pkg, lib)) = fixture_env() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let host = SessionHost::spawn(root, pkg, lib, vec!["LeanRsFixture.Handles".into()]).expect("spawn");
+    // process_with_info_tree elaborates commands against the open
+    // environment; we deliberately omit the `import` header (the
+    // environment already has the imports) and provide a self-contained
+    // theorem + a `#check` so the projection records tactic, term, and
+    // name nodes.
+    let source = "\
+        theorem fixtureGoal : True := by\n  \
+          trivial\n\
+        \n\
+        #check Nat.succ 0\n";
+    let outcome = host
+        .process_file(source.to_owned(), vec!["LeanRsFixture.Handles".into()])
+        .await
+        .expect("process_file");
+    let ProcessFileOutcome::Processed(file) = outcome else {
+        panic!("fixture capability dylib must export process_with_info_tree");
+    };
+
+    eprintln!(
+        "fixture projection: commands={} tactics={} terms={} names={}",
+        file.commands.len(),
+        file.tactics.len(),
+        file.terms.len(),
+        file.names.len()
+    );
+    if let Some(first) = file.tactics.first() {
+        eprintln!(
+            "first tactic at {}:{}-{}:{} goals_before={:?}",
+            first.start_line, first.start_column, first.end_line, first.end_column, first.goals_before
+        );
+    }
+    if let Some(first) = file.terms.first() {
+        eprintln!(
+            "first term at {}:{}-{}:{} expr={:?} type={:?}",
+            first.start_line, first.start_column, first.end_line, first.end_column, first.expr_str, first.type_str
+        );
+    }
+    if let Some(name) = file.names.first() {
+        eprintln!(
+            "first name {} at {}:{} (binder={})",
+            name.name, name.start_line, name.start_column, name.is_binder
+        );
+    }
+
+    // The fixture must record at least one tactic node (the theorem body)
+    // and at least one term node. Asserting via recorded spans is more
+    // robust than hardcoding cursor positions against the elaborator's
+    // exact recording strategy.
+    let tactic = file.tactics.first().expect("at least one tactic node in fixture");
+    let hit = file
+        .tactic_at(tactic.start_line, tactic.start_column)
+        .expect("tactic_at must find a node at its own start position");
+    assert_eq!(hit.start_line, tactic.start_line);
+    assert!(
+        !tactic.goals_before.is_empty(),
+        "first tactic should record goals_before"
+    );
+
+    let term = file.terms.first().expect("at least one term node in fixture");
+    assert!(
+        file.term_at(term.start_line, term.start_column).is_some(),
+        "term_at must find a node at the first recorded term position"
+    );
+
+    // Names: the fixture imports Lean / opens Lean, so at least one
+    // reference to a Lean-namespaced symbol must exist.
+    assert!(
+        !file.names.is_empty(),
+        "fixture must record at least one name reference"
     );
 }
 

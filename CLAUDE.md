@@ -8,10 +8,13 @@ MCP (Model Context Protocol) server that hosts Lean 4 **in-process** via `lean-r
 it from `lean-lsp-mcp`: this server owns a `LeanRuntime` + `LeanCapabilities` dylib directly rather than wrapping an
 external LSP. Single crate, library + binary, stdio transport.
 
-Status is v0.1.1: ten working tools — the six session-backed handlers (`elaborate`, `kernel_check`, `infer_type`,
-`whnf`, `is_def_eq`, `hover_by_name`), one filesystem sweep (`project_scan`), and three index-backed lookups
-(`find_symbol`, `find_lemma`, `outline`). `hover_by_name`'s `type_signature` and `infer_type` / `whnf`'s `rendered` are
-populated via `lean-rs` 0.1.3's `expr_to_string_raw` and the optional `meta::pp_expr` service.
+Status is v0.1.0 (unreleased): thirteen working tools — the six session-backed handlers (`elaborate`, `kernel_check`,
+`infer_type`, `whnf`, `is_def_eq`, `hover_by_name`), one filesystem sweep (`project_scan`), three index-backed lookups
+(`find_symbol`, `find_lemma`, `outline`), and three cursor-driven position tools (`goal_at_position`,
+`type_at_position`, `references_of_name`). Position tools project `lean-rs` 0.1.3's `ProcessedFile` (four info-tree
+arrays + diagnostics) through a content-hashed in-memory cache (`src/cache.rs`); the underlying
+`process_with_info_tree` shim is optional, so each position tool exposes an `Unsupported` result variant for
+capability dylibs built against pre-0.1.3 `lean-rs-host`.
 
 ## Common commands
 
@@ -29,9 +32,9 @@ E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY`
 `LeanRsFixture`).
 
 Running the server requires a Lake project that links the `lean-rs-host` shim (exports 28 mandatory + 6 optional
-`lean_rs_host_*` symbols as of 0.1.3). v0.1.1 does not bundle one; the canonical template is `lean-rs/fixtures/lean/`.
-Capability dylibs built against 0.1.2 must be rebuilt — 0.1.3 added two mandatory and two optional shims for name and
-expression rendering. After `lake build` in that fixture, run:
+`lean_rs_host_*` symbols as of 0.1.3). This crate does not bundle one; the canonical template is
+`lean-rs/fixtures/lean/`. Capability dylibs built against 0.1.2 must be rebuilt — 0.1.3 added two mandatory and two
+optional shims for name and expression rendering. After `lake build` in that fixture, run:
 
 ```sh
 ./target/release/lean-host-mcp \
@@ -73,17 +76,20 @@ src/
   server.rs      rmcp glue (LeanHostService)
   session.rs     SessionHost actor + projection structs (Diagnostic, ElabFailure, …)
   index.rs       DeclarationIndex — SQLite-backed deep module behind the three index tools
+  cache.rs       ProcessedFileCache — LRU<Arc<ProcessedFile>> keyed on (path, sha256)
   envelope.rs    Response<T> = { result, freshness, warnings, next_actions }
   error.rs       ServerError
   tools/
-    mod.rs       ToolContext (host + index + lake_root + default_imports)
+    mod.rs       ToolContext (host + index + processed_files + lake_root + default_imports)
     lean.rs      six session-backed handlers
     scan.rs      project_scan — pure filesystem regex sweep, no Lean dependency
     index.rs     find_symbol / find_lemma / outline — thin wrappers over DeclarationIndex
+    position.rs  goal_at_position / type_at_position / references_of_name — cache-backed
 ```
 
 Tools are grouped by **shared plumbing**, not one-file-per-tool. The six `lean.rs` handlers all hit `SessionHost`; the
-three `tools/index.rs` handlers all hit the SQLite index; `scan.rs` is plumbing-free.
+three `tools/index.rs` handlers all hit the SQLite index; the three `tools/position.rs` handlers share the
+`ProcessedFileCache`; `scan.rs` is plumbing-free.
 
 ## The envelope contract
 
@@ -122,7 +128,6 @@ established style.
 
 | `lean-host-mcp` | `lean-rs` / `lean-rs-host` | Lean toolchain |
 | --- | --- | --- |
-| 0.1.1 | 0.1.3 | leanprover/lean4 v4.30.0-rc2 (pinned by `lean-rs`) |
-| 0.1.0 | 0.1.x | leanprover/lean4 v4.29.x |
+| 0.1.0 (unreleased) | 0.1.3 | leanprover/lean4 v4.30.0-rc2 (pinned by `lean-rs`) |
 
 Bumping the supported Lean toolchain is a `lean-rs` change first, then a crate-version bump here.

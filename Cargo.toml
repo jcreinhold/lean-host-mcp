@@ -37,6 +37,8 @@ walkdir = "2"
 lean-rs = "0.1"
 lean-rs-host = "0.1"
 
+lru = "0.12"
+parking_lot = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 

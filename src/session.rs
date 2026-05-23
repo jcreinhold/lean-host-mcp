@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use lean_rs::LeanRuntime;
+use lean_rs_host::host::process::ProcessFileOutcome;
 use lean_rs_host::meta::{
     LeanMetaOptions, LeanMetaResponse, LeanMetaTransparency, infer_type as meta_infer_type,
     is_def_eq as meta_is_def_eq, pp_expr as meta_pp_expr, whnf as meta_whnf,
@@ -276,6 +277,23 @@ impl SessionHost {
         self.submit(|reply| Request::DescribeBulk { names, imports, reply })
             .await
     }
+
+    /// Run `IO.processCommands` over `source` with info collection enabled
+    /// and return the upstream [`ProcessFileOutcome`]. Powers the
+    /// position-based tools (`goal_at_position`, `type_at_position`,
+    /// `references_of_name`).
+    ///
+    /// Returns [`ProcessFileOutcome::Unsupported`] as a value when the
+    /// loaded capability dylib lacks `lean_rs_host_process_with_info_tree`;
+    /// callers project that to a per-tool `Unsupported` result variant.
+    ///
+    /// # Errors
+    ///
+    /// Infrastructure failures only.
+    pub async fn process_file(&self, source: String, imports: Vec<String>) -> Result<ProcessFileOutcome> {
+        self.submit(|reply| Request::ProcessFile { source, imports, reply })
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -321,6 +339,11 @@ enum Request {
         names: Vec<String>,
         imports: Vec<String>,
         reply: oneshot::Sender<Result<Vec<DeclarationRow>>>,
+    },
+    ProcessFile {
+        source: String,
+        imports: Vec<String>,
+        reply: oneshot::Sender<Result<ProcessFileOutcome>>,
     },
 }
 
@@ -434,6 +457,9 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
             }
             Request::DescribeBulk { names, imports, reply } => {
                 let _ = reply.send(self.do_describe_bulk(names, imports));
+            }
+            Request::ProcessFile { source, imports, reply } => {
+                let _ = reply.send(self.do_process_file(&source, imports));
             }
         }
     }
@@ -551,6 +577,14 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
         session
             .list_declarations_strings(&filter, None, None)
             .map_err(|e| ServerError::Lean(format!("list_declarations_strings: {e}")))
+    }
+
+    fn do_process_file(&mut self, source: &str, imports: Vec<String>) -> Result<ProcessFileOutcome> {
+        let session = self.session_for(imports)?;
+        let opts = LeanElabOptions::new();
+        session
+            .process_with_info_tree(source, &opts, None)
+            .map_err(|e| ServerError::Lean(format!("process_with_info_tree: {e}")))
     }
 
     fn do_describe_bulk(&mut self, names: Vec<String>, imports: Vec<String>) -> Result<Vec<DeclarationRow>> {

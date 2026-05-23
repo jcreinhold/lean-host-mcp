@@ -110,3 +110,85 @@ Name-prefix listing, ordered by name. Omit `module_prefix` to walk the whole tab
 ```jsonc
 { "module_prefix": "Nat.", "limit": 200 }
 ```
+
+## Position tools (`src/tools/position.rs`)
+
+The three position tools share a content-hashed in-memory cache of `ProcessedFile` projections (see
+`docs/architecture.md`). The first call against a file triggers `IO.processCommands` with info collection; subsequent
+calls against the same bytes reuse the cached projection. The `next_actions` hint signals when a fresh process was run.
+
+`process_with_info_tree` is an **optional** capability shim. When the loaded dylib was built against a pre-0.1.3
+`lean-rs-host`, every position tool answers `{ "status": "unsupported" }` cleanly — they never error.
+
+All line / column inputs are **1-indexed**. Result spans use the same convention.
+
+### `goal_at_position`
+
+```jsonc
+// request
+{ "file": "LeanRsFixture/SourceRanges.lean", "line": 8, "column": 3 }
+
+// result — tactic context found
+{
+  "status": "goal",
+  "goals_before": ["⊢ True"],
+  "goals_after":  [],
+  "span": { "start_line": 8, "start_column": 3, "end_line": 8, "end_column": 10 }
+}
+
+// result — no tactic at cursor
+{ "status": "no_tactic_context" }
+
+// result — capability dylib missing the shim
+{ "status": "unsupported" }
+```
+
+`file` resolves relative to `lake_root` when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal` inside the
+elaboration context; the strings are diagnostic text only.
+
+### `type_at_position`
+
+```jsonc
+// request
+{ "file": "LeanRsFixture/SourceRanges.lean", "line": 7, "column": 24 }
+
+// result — innermost term found
+{
+  "status": "term",
+  "expr":          "True",
+  "type_str":      "Prop",
+  "expected_type": null,
+  "span": { "start_line": 7, "start_column": 24, "end_line": 7, "end_column": 28 }
+}
+
+// result — no term recorded
+{ "status": "no_term" }
+
+// result — capability dylib missing the shim
+{ "status": "unsupported" }
+```
+
+`expr` and `type_str` use `Expr.toString` (raw notation). `expected_type` is set only at sites where the elaborator
+recorded one (e.g., coercion sites). When inference did not produce a type, `type_str` is the empty string.
+
+### `references_of_name`
+
+```jsonc
+// request — search every project .lean file
+{ "name": "Nat.add" }
+
+// request — restrict to specific files
+{ "name": "Nat.add", "files": ["LeanRsFixture/Scalars.lean"] }
+
+// result
+{
+  "references": [
+    { "file": "LeanRsFixture/Scalars.lean", "line": 12, "column": 7,
+      "end_line": 12, "end_column": 14, "kind": "ref" }
+  ]
+}
+```
+
+`kind` is `"def"` at binder sites, `"ref"` at use sites. Capped at 1000 hits (sets `truncated: true`). Files whose
+dylib reports `Unsupported` accumulate in `unsupported_files` and are skipped. The result is sorted by
+`(file, line, column)`. Name matching is exact — supply the fully-qualified form Lean records.

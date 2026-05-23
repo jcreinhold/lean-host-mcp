@@ -19,6 +19,7 @@
 //!   sweep, `index` for the SQLite-backed lookups).
 //! - [`server`] — rmcp glue.
 
+pub mod cache;
 pub mod envelope;
 pub mod error;
 pub mod index;
@@ -26,6 +27,7 @@ pub mod server;
 pub mod session;
 pub mod tools;
 
+pub use cache::{FileCache, ProcessedFileCache};
 pub use envelope::{Freshness, Response};
 pub use error::{Result, ServerError};
 pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};
