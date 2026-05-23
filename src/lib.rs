@@ -27,7 +27,7 @@ pub mod server;
 pub mod session;
 pub mod tools;
 
-pub use cache::{FileCache, ProcessedFileCache};
+pub use cache::ProcessedFileCache;
 pub use envelope::{Freshness, Response};
 pub use error::{Result, ServerError};
 pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};

@@ -63,5 +63,10 @@ so `cache.rs` ships a small LRU of `Arc<ProcessedFile>`, capacity 16, keyed on `
 to the source bytes misses structurally. The cache lives on `ToolContext` rather than as a global. `ProcessedFile` is
 `Send + Sync + 'static`, so cached entries are read by tool handlers without re-entering the actor thread.
 
+The cache is populated through `SessionHost::process_module` (the header-aware shim added in `lean-rs-host` 0.1.4).
+Files whose header references modules the session's open env doesn't have are still cached — the body's partial
+projection is real data, and the `MissingImports` signal travels alongside on the envelope. Header parse failures and
+`Unsupported` outcomes are not cached.
+
 The cache does **not** track the Lean environment. Environment churn (re-import, capability reload) is the
 `LeanHostService::new` boundary; the file cache is invalidated only by content change.

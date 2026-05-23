@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use lean_rs::LeanRuntime;
-use lean_rs_host::host::process::ProcessFileOutcome;
+use lean_rs_host::host::process::{ProcessFileOutcome, ProcessModuleOutcome};
 use lean_rs_host::meta::{
     LeanMetaOptions, LeanMetaResponse, LeanMetaTransparency, infer_type as meta_infer_type,
     is_def_eq as meta_is_def_eq, pp_expr as meta_pp_expr, whnf as meta_whnf,
@@ -278,14 +278,11 @@ impl SessionHost {
             .await
     }
 
-    /// Run `IO.processCommands` over `source` with info collection enabled
-    /// and return the upstream [`ProcessFileOutcome`]. Powers the
-    /// position-based tools (`goal_at_position`, `type_at_position`,
-    /// `references_of_name`).
-    ///
-    /// Returns [`ProcessFileOutcome::Unsupported`] as a value when the
-    /// loaded capability dylib lacks `lean_rs_host_process_with_info_tree`;
-    /// callers project that to a per-tool `Unsupported` result variant.
+    /// Run `IO.processCommands` over body-only `source` with info collection
+    /// enabled and return the upstream [`ProcessFileOutcome`]. The source
+    /// must **not** carry an `import` header — see [`Self::process_module`]
+    /// for the header-aware sibling that drives the
+    /// `goal_at_position` / `type_at_position` / `references_of_name` tools.
     ///
     /// # Errors
     ///
@@ -293,6 +290,32 @@ impl SessionHost {
     pub async fn process_file(&self, source: String, imports: Vec<String>) -> Result<ProcessFileOutcome> {
         self.submit(|reply| Request::ProcessFile { source, imports, reply })
             .await
+    }
+
+    /// Run a full Lean source file (header + body) through Lean's frontend
+    /// pipeline with info collection enabled. The header is parsed via
+    /// `Lean.Parser.parseHeader`; `IO.processCommands` resumes from the
+    /// parser state the header produced, so info-tree positions come back
+    /// in the original file's coordinate system.
+    ///
+    /// The returned [`ProcessModuleOutcome`] has four arms: `Ok`
+    /// (header parsed, env satisfies imports, body processed),
+    /// `MissingImports` (body still ran but some imports aren't in the
+    /// session's open env — soft warning), `HeaderParseFailed`
+    /// (header didn't parse, body never ran), and `Unsupported`
+    /// (capability dylib lacks the shim).
+    ///
+    /// Routes to the **default** session — the env the file's parsed
+    /// header is validated against. Per-call import selection is not
+    /// meaningful here because the file's own header decides what the
+    /// projection ran with.
+    ///
+    /// # Errors
+    ///
+    /// Infrastructure failures only; every Lean-domain outcome is a
+    /// variant of [`ProcessModuleOutcome`].
+    pub async fn process_module(&self, source: String) -> Result<ProcessModuleOutcome> {
+        self.submit(|reply| Request::ProcessModule { source, reply }).await
     }
 }
 
@@ -344,6 +367,10 @@ enum Request {
         source: String,
         imports: Vec<String>,
         reply: oneshot::Sender<Result<ProcessFileOutcome>>,
+    },
+    ProcessModule {
+        source: String,
+        reply: oneshot::Sender<Result<ProcessModuleOutcome>>,
     },
 }
 
@@ -460,6 +487,9 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
             }
             Request::ProcessFile { source, imports, reply } => {
                 let _ = reply.send(self.do_process_file(&source, imports));
+            }
+            Request::ProcessModule { source, reply } => {
+                let _ = reply.send(self.do_process_module(&source));
             }
         }
     }
@@ -587,6 +617,14 @@ impl<'lean, 'h> WorkerState<'lean, 'h> {
             .map_err(|e| ServerError::Lean(format!("process_with_info_tree: {e}")))
     }
 
+    fn do_process_module(&mut self, source: &str) -> Result<ProcessModuleOutcome> {
+        let session = self.session_for(Vec::new())?;
+        let opts = LeanElabOptions::new();
+        session
+            .process_module_with_info_tree(source, &opts, None)
+            .map_err(|e| ServerError::Lean(format!("process_module_with_info_tree: {e}")))
+    }
+
     fn do_describe_bulk(&mut self, names: Vec<String>, imports: Vec<String>) -> Result<Vec<DeclarationRow>> {
         if names.is_empty() {
             return Ok(Vec::new());
@@ -656,7 +694,7 @@ fn lean_toolchain_label(lake_root: &std::path::Path) -> String {
         .map_or_else(|| "unknown".into(), |s| s.trim().to_owned())
 }
 
-fn project_failure(failure: &LeanElabFailure) -> ElabFailure {
+pub(crate) fn project_failure(failure: &LeanElabFailure) -> ElabFailure {
     ElabFailure {
         diagnostics: failure
             .diagnostics()

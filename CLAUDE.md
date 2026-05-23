@@ -13,10 +13,11 @@ is the deeper layering write-up. This file captures what's relevant only to work
 
 Tools fall into four groups by shared plumbing: session-backed handlers (`src/tools/lean.rs`), the filesystem sweep
 (`src/tools/scan.rs`), SQLite-indexed lookups (`src/tools/index.rs`), and cursor-driven position tools
-(`src/tools/position.rs`). The position tools project the upstream `ProcessedFile` (four info-tree arrays plus
-diagnostics) through a content-hashed in-memory cache (`src/cache.rs`); the underlying `process_with_info_tree`
-capability shim is optional, so each position tool returns `{ "status": "unsupported" }` cleanly when the loaded dylib
-lacks it.
+(`src/tools/position.rs`). The position tools drive `lean-rs` 0.1.4's `process_module_with_info_tree`
+(header-aware), projecting the upstream `ProcessedFile` (four info-tree arrays plus diagnostics) through a
+content-hashed in-memory cache (`src/cache.rs`). The shim is optional, so each position tool returns
+`{ "status": "unsupported" }` cleanly when the loaded dylib lacks it. Missing imports become an envelope warning;
+header parse failures short-circuit to a `header_parse_failed` status variant.
 
 ## Common commands
 

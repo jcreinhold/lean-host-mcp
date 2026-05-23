@@ -122,12 +122,13 @@ Name-prefix listing, ordered by name. Omit `module_prefix` to walk the whole tab
 
 ## Position tools (`src/tools/position.rs`)
 
-The three position tools share a content-hashed in-memory cache of `ProcessedFile` projections (see
-[`architecture.md`](architecture.md)). The first call against a file triggers `IO.processCommands` with info collection;
-subsequent calls against the same bytes reuse the cached projection. The `next_actions` hint signals when a fresh
-process was run.
+The three position tools drive `process_module_with_info_tree`: they read the file, hand the full source (header +
+body) to Lean's frontend, and project the resulting info tree. The file's own `import` declarations are parsed by Lean
+and validated against the server's open env; mismatch surfaces as an envelope `warnings` entry (single-file tools) or
+a result sidebar (`references_of_name`). The projection is cached against `(file_path, sha256(contents))`, so repeat
+calls on the same bytes reuse it; an edit invalidates structurally.
 
-`process_with_info_tree` is an **optional** capability shim. When the loaded dylib was built against a pre-0.1.3
+`process_module_with_info_tree` is an **optional** capability shim. When the loaded dylib was built against pre-0.1.4
 `lean-rs-host`, every position tool answers `{ "status": "unsupported" }` cleanly; the tools never raise.
 
 All line and column inputs are **1-indexed**. Result spans use the same convention.
@@ -149,12 +150,17 @@ All line and column inputs are **1-indexed**. Result spans use the same conventi
 // result: no tactic at cursor
 { "status": "no_tactic_context" }
 
+// result: file's header did not parse
+{ "status": "header_parse_failed",
+  "diagnostics": { "diagnostics": [...], "truncated": false } }
+
 // result: capability dylib missing the shim
 { "status": "unsupported" }
 ```
 
 `file` resolves relative to `lake_root` when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal` inside the
-elaboration context; the strings are diagnostic text only.
+elaboration context; the strings are diagnostic text only. When the file's header imports modules the server's open
+env doesn't have, the result is still returned but the envelope's `warnings` array names the missing modules.
 
 ### `type_at_position`
 
@@ -174,12 +180,17 @@ elaboration context; the strings are diagnostic text only.
 // result: no term recorded
 { "status": "no_term" }
 
+// result: file's header did not parse
+{ "status": "header_parse_failed",
+  "diagnostics": { "diagnostics": [...], "truncated": false } }
+
 // result: capability dylib missing the shim
 { "status": "unsupported" }
 ```
 
 `expr` and `type_str` use `Expr.toString` (raw notation). `expected_type` is set only at sites where the elaborator
-recorded one, such as coercion sites. When inference did not produce a type, `type_str` is the empty string.
+recorded one, such as coercion sites. When inference did not produce a type, `type_str` is the empty string. The same
+`MissingImports` warning behavior as `goal_at_position`.
 
 ### `references_of_name`
 
@@ -199,6 +210,7 @@ recorded one, such as coercion sites. When inference did not produce a type, `ty
 }
 ```
 
-`kind` is `"def"` at binder sites, `"ref"` at use sites. Hits cap at 1000 (sets `truncated: true`). Files whose dylib
-reports `Unsupported` accumulate in `unsupported_files` and are skipped. Results are sorted by `(file, line, column)`.
-Name matching is exact: pass the fully-qualified form Lean records.
+`kind` is `"def"` at binder sites, `"ref"` at use sites. Hits cap at 1000 (sets `truncated: true`). The walk continues
+past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib lacks the
+shim), `header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...] }`).
+Results are sorted by `(file, line, column)`. Name matching is exact: pass the fully-qualified form Lean records.

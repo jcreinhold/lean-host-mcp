@@ -80,8 +80,10 @@ project is unusable.
 ## Capability shims and the three position tools
 
 `goal_at_position`, `type_at_position`, and `references_of_name` depend on an optional
-`lean_rs_host_process_with_info_tree` shim. A capability dylib built without it answers `{ "status": "unsupported" }`
-per call; the tools never raise.
+`lean_rs_host_process_module_with_info_tree` shim. A capability dylib built without it answers
+`{ "status": "unsupported" }` per call; the tools never raise. Files whose header imports modules the server's open
+env doesn't have are still processed; missing imports surface as an envelope warning (single-file tools) or a result
+sidebar (`references_of_name`). A header that doesn't parse short-circuits to `header_parse_failed`.
 
 ## Build, test, lint
 
@@ -95,7 +97,7 @@ LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs` / `lean-rs-host` 0.1.3, which pins Lean toolchain
+`lean-host-mcp` 0.1.0 targets `lean-rs` / `lean-rs-host` 0.1.4, which pins Lean toolchain
 `leanprover/lean4:v4.30.0-rc2`. Bumping the supported toolchain is a `lean-rs` change first, then a version bump here.
 The MCP server inherits whichever toolchain the consumer's Lake project pins, provided it sits inside the `lean-rs`
 support window declared by [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain).

@@ -98,15 +98,15 @@ fn position_requests_round_trip() {
     let g: GoalAtPositionRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
     assert_eq!(g.line, 7);
     assert_eq!(g.column, 3);
-    assert!(g.imports.is_empty());
 
+    // A caller may still send an `imports` field; serde silently ignores
+    // unknown fields by default. The schema no longer publishes it.
     let t: TypeAtPositionRequest =
         serde_json::from_str(r#"{"file":"X.lean","line":1,"column":1,"imports":["A.B"]}"#).unwrap();
-    assert_eq!(t.imports, vec!["A.B".to_owned()]);
+    assert_eq!(t.line, 1);
 
     let r_default: ReferencesOfNameRequest = serde_json::from_str(r#"{"name":"Nat.add"}"#).unwrap();
     assert!(r_default.files.is_empty());
-    assert!(r_default.imports.is_empty());
 
     let r_full: ReferencesOfNameRequest =
         serde_json::from_str(r#"{"name":"Nat.add","files":["A.lean","B.lean"]}"#).unwrap();
@@ -121,6 +121,8 @@ fn references_result_skips_empty_fields() {
         references: Vec::new(),
         truncated: false,
         unsupported_files: Vec::new(),
+        header_parse_failed_files: Vec::new(),
+        missing_imports_files: Vec::new(),
     };
     let s = serde_json::to_string(&empty).unwrap();
     assert!(!s.contains("truncated"), "truncated=false must be omitted: {s}");
@@ -128,11 +130,21 @@ fn references_result_skips_empty_fields() {
         !s.contains("unsupported_files"),
         "empty unsupported_files must be omitted: {s}"
     );
+    assert!(
+        !s.contains("header_parse_failed_files"),
+        "empty header_parse_failed_files must be omitted: {s}"
+    );
+    assert!(
+        !s.contains("missing_imports_files"),
+        "empty missing_imports_files must be omitted: {s}"
+    );
 
     let with_flags = ReferencesOfNameResult {
         references: Vec::new(),
         truncated: true,
         unsupported_files: vec!["A.lean".into()],
+        header_parse_failed_files: Vec::new(),
+        missing_imports_files: Vec::new(),
     };
     let s = serde_json::to_string(&with_flags).unwrap();
     assert!(s.contains("\"truncated\":true"));
@@ -166,6 +178,38 @@ async fn hover_by_name_populates_type_signature() {
         row.type_signature.is_some(),
         "expr_to_string_raw should yield a type for Nat.add_zero"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn process_module_projects_real_file_with_header() {
+    use lean_rs_host::host::process::ProcessModuleOutcome;
+
+    let Some((root, pkg, lib)) = fixture_env() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let host = SessionHost::spawn(root.clone(), pkg, lib, vec!["LeanRsFixture.Handles".into()]).expect("spawn");
+
+    // The same file that returned 0 tactics through `process_file` (because
+    // it carries an `import Lean` header) must now project a populated
+    // info-tree through `process_module`.
+    let source = std::fs::read_to_string(root.join("LeanRsFixture/SourceRanges.lean")).expect("read fixture");
+    let outcome = host.process_module(source).await.expect("process_module");
+
+    match outcome {
+        ProcessModuleOutcome::Ok { file, imports } | ProcessModuleOutcome::MissingImports { file, imports, .. } => {
+            assert!(!file.tactics.is_empty(), "fixture file must record at least one tactic");
+            assert!(!file.terms.is_empty(), "fixture file must record at least one term");
+            assert!(imports.iter().any(|m| m == "Lean"), "header must include `import Lean`");
+        }
+        ProcessModuleOutcome::HeaderParseFailed { diagnostics } => {
+            panic!("fixture file header should parse; got {diagnostics:?}");
+        }
+        ProcessModuleOutcome::Unsupported => {
+            panic!("fixture capability dylib must export process_module_with_info_tree");
+        }
+        _ => panic!("unknown ProcessModuleOutcome variant"),
+    }
 }
 
 #[tokio::test]
