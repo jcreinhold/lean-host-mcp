@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-lru = "0.12"
+lru = "0.16"
 parking_lot = "0.12"
 regex = "1"
 rmcp = { version = "1.7", features = ["macros", "schemars", "server", "transport-io"] }
