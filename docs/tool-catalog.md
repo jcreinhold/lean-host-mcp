@@ -42,8 +42,8 @@ Full elaborate plus `addDecl`. Returns Lean's `LeanKernelOutcome`, projected.
 ```
 
 `rendered` is pretty-printed via the optional `pp_expr` shim. If the loaded capability dylib lacks
-`lean_rs_host_meta_pp_expr`, the server falls back to `Expr.toString` and attaches a warning to the envelope; the field
-is still populated either way.
+`lean_rs_host_meta_pp_expr`, the worker falls back to `Expr.toString` (signalled by `LeanWorkerRendering::Raw`) and the
+server attaches a warning to the envelope; the field is still populated either way.
 
 ### `is_def_eq`
 
@@ -70,8 +70,8 @@ reducibility view `Meta.isDefEq` runs under: the same two terms can be def-eq un
 { "status": "missing", "name": "Nat.foo_bar" }
 ```
 
-`type_signature` uses `Expr.toString`: cheap and deterministic, but no notation. For the user-visible pretty form, call
-`infer_type` on the declaration's term.
+`type_signature` is the pretty-printed declaration type as the worker's `LeanWorkerDeclarationRow` reports it
+(notation-aware where available).
 
 ## Project scan (`src/tools/scan.rs`)
 

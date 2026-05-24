@@ -1,49 +1,43 @@
-//! `SessionHost` — single owner of all `lean-rs` state.
+//! `SessionHost` — closure-channel actor over a supervised
+//! `lean-rs-worker` child.
 //!
-//! `lean-rs` types (`LeanRuntime`, `LeanHost`, `LeanCapabilities`,
-//! `LeanSession`, `SessionPool`) are `!Send` and carry a `'lean` lifetime
-//! anchored to a process-global runtime. They cannot cross `tokio` task
-//! boundaries, and they cannot live inside an `Arc<Mutex<…>>` accessed from
-//! multiple async tasks.
+//! The Lean runtime lives in a child process the supervisor restarts when a
+//! tactic wedges, a typeclass loop runs away, or the child OOMs. The parent
+//! sees only `LeanWorkerCapability` (Send) and short-lived
+//! `LeanWorkerSession<'_>` borrows; the `'lean` lifetime tangle of the
+//! original in-process implementation is gone.
 //!
-//! The pattern used here: one dedicated OS thread owns all Lean state.
-//! Async tool handlers submit `Request` enum values over an
-//! [`mpsc`](tokio::sync::mpsc) channel and await a `oneshot` reply. From the
-//! caller's perspective the host looks like an async actor; the lifetime
-//! tangle stays hidden inside the worker thread.
+//! One owner of the capability at a time is enforced by parking it on a
+//! dedicated OS thread named `"lean-host-mcp/session"`. Each public method
+//! ships a typed closure to the thread over a `tokio::mpsc` channel; the
+//! closure opens a fresh session inside the thread's stack frame, calls the
+//! worker, projects the worker's Serialize+Deserialize result type into the
+//! MCP-stable wire shape, and replies via `oneshot`.
 //!
 //! All public methods on [`SessionHost`] return [`crate::error::Result`].
-//! Errors flow only for infrastructure failures (worker thread gone, Lean
-//! runtime init failed, Lake project unusable) — Lean-domain failures
-//! (parse, elaboration, kernel rejection, meta timeout) are part of the
-//! `Ok` payload.
+//! Errors flow only for infrastructure failures (worker thread gone, worker
+//! child unreachable, Lake project unusable) — Lean-domain failures (parse,
+//! elaboration, kernel rejection, meta timeout) are part of the `Ok`
+//! payload.
 
-// `let _ = reply.send(…)` / `let _ = init_reply.send(…)` are the canonical
-// "ignore failure when the receiver dropped" pattern; the dropped value is
-// a oneshot::Sender whose only destructor is "wake the receiver if any".
-// `needless_pass_by_value` flags actor-style closure args and the
-// `worker_main` ownership transfer; both intentionally take ownership.
 #![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::thread;
+use std::time::Duration;
 
-use lean_rs::LeanRuntime;
-use lean_rs_host::host::process::{ProcessFileOutcome, ProcessModuleOutcome};
-use lean_rs_host::meta::{
-    LeanMetaOptions, LeanMetaResponse, LeanMetaTransparency, infer_type as meta_infer_type,
-    is_def_eq as meta_is_def_eq, pp_expr as meta_pp_expr, whnf as meta_whnf,
-};
-use lean_rs_host::{
-    LeanCapabilities, LeanDeclarationFilter, LeanElabFailure, LeanElabOptions, LeanHost, LeanKernelOutcome,
-    LeanSession, LeanSeverity, LeanSourceRange, ProofSummary,
+use lean_rs_worker::{
+    LeanWorkerCapability, LeanWorkerCapabilityBuilder, LeanWorkerChild, LeanWorkerDeclarationFilter,
+    LeanWorkerDeclarationRow, LeanWorkerElabFailure, LeanWorkerElabOptions, LeanWorkerElabResult, LeanWorkerError,
+    LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerMetaTransparency,
+    LeanWorkerProcessFileOutcome, LeanWorkerProcessModuleOutcome, LeanWorkerRendered, LeanWorkerRendering,
+    LeanWorkerSourceRange,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, ServerError};
 
-/// Source-range projection — public fields mirroring `LeanSourceRange`.
+/// Source-range projection — public fields mirroring `LeanWorkerSourceRange`.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct SourceRange {
     pub file: String,
@@ -73,13 +67,13 @@ pub enum Severity {
 }
 
 impl Severity {
-    /// `LeanSeverity` is `#[non_exhaustive]`; a future variant falls back
-    /// to `Info` rather than blocking the response.
-    pub fn from_lean(s: LeanSeverity) -> Self {
+    /// The worker layer emits severity as a snake-case string; unknown
+    /// values map to `Info` rather than blocking the response.
+    fn from_worker(s: &str) -> Self {
         match s {
-            LeanSeverity::Error => Self::Error,
-            LeanSeverity::Warning => Self::Warning,
-            LeanSeverity::Info | _ => Self::Info,
+            "error" => Self::Error,
+            "warning" => Self::Warning,
+            _ => Self::Info,
         }
     }
 }
@@ -96,9 +90,9 @@ pub struct Diagnostic {
     pub file: Option<String>,
 }
 
-/// Structured failure payload — the projection of `LeanElabFailure` we send
-/// over JSON. Failure is part of a successful tool call; this is never an
-/// MCP error.
+/// Structured failure payload — the projection of `LeanWorkerElabFailure` we
+/// send over JSON. Failure is part of a successful tool call; this is never
+/// an MCP error.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct ElabFailure {
     pub diagnostics: Vec<Diagnostic>,
@@ -112,8 +106,7 @@ pub struct ElabSuccess {
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct KernelOutcome {
-    /// One of `Checked`, `Rejected`, `Unavailable`, `Unsupported`, or
-    /// `Unknown` (for non-exhaustive future variants).
+    /// One of `Checked`, `Rejected`, `Unavailable`, or `Unsupported`.
     pub status: String,
     pub summary: Option<KernelSummary>,
     pub failure: Option<ElabFailure>,
@@ -123,20 +116,24 @@ pub struct KernelOutcome {
 pub struct KernelSummary {
     pub declaration_name: String,
     pub kind: String,
+    /// Pretty-printed declaration type via Lean's `PrettyPrinter`
+    /// (notation-aware), as the worker's `LeanWorkerKernelSummary` reports
+    /// it.
     pub type_signature: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct MetaOutcome {
-    /// One of `Ok`, `Failed`, `TimeoutOrHeartbeat`, `Unsupported`, or
-    /// `Unknown` (for non-exhaustive future variants).
+    /// One of `Ok`, `Failed`, `TimeoutOrHeartbeat`, or `Unsupported`.
     pub status: String,
     pub rendered: Option<String>,
     pub definitionally_equal: Option<bool>,
     pub failure: Option<ElabFailure>,
-    /// Set when the optional `meta_pp_expr` shim was missing and rendering
-    /// fell back to `Expr.toString`. Internal — tool handlers translate
-    /// this into an envelope warning; the field never serialises.
+    /// Set when the worker reported `LeanWorkerRendering::Raw` — the
+    /// optional `meta_pp_expr` shim was missing or reported `Unsupported`,
+    /// and the rendering fell back to `Expr.toString`. Internal — tool
+    /// handlers translate this into an envelope warning; the field never
+    /// serialises.
     #[serde(skip)]
     #[schemars(skip)]
     pub raw_fallback_used: bool,
@@ -146,38 +143,51 @@ pub struct MetaOutcome {
 pub struct DeclarationRow {
     pub name: String,
     pub kind: String,
-    /// Pretty-printed type signature via `Expr.toString` (cheap, no notation,
-    /// deterministic). `None` only when the declaration has no recoverable
-    /// type — typically internal artifacts or non-definitional entries.
+    /// Pretty-printed type signature as the worker's
+    /// `LeanWorkerDeclarationRow` reports it. `None` only when the
+    /// declaration has no recoverable type — typically internal artifacts.
     pub type_signature: Option<String>,
     pub source: Option<SourceRange>,
 }
 
+type Job = Box<dyn FnOnce(&mut LeanWorkerCapability) + Send + 'static>;
+
 #[derive(Debug, Clone)]
 pub struct SessionHost {
-    tx: mpsc::Sender<Request>,
+    tx: mpsc::Sender<Job>,
     lake_root: String,
     lean_toolchain: String,
+    default_imports: Vec<String>,
 }
 
 impl SessionHost {
-    /// Spawn the dedicated session thread, init Lean, open the Lake project,
-    /// load capabilities. Blocks on the worker's readiness signal.
+    /// Spawn the dedicated session thread, start the worker child, open the
+    /// Lake project, and capture the toolchain label.
     ///
     /// # Errors
     ///
-    /// Returns `ServerError::Lean` if the Lean runtime fails to initialise,
-    /// or `ServerError::BadProject` if the Lake project at `lake_root` does
-    /// not open or its capability dylib does not export the required
-    /// `lean_rs_host_*` symbols.
+    /// Returns `ServerError::BadProject` if the worker bootstrap check
+    /// reports a blocking finding (worker child unresolvable, capability
+    /// preflight failing, handshake failing, …); `ServerError::Lean` if the
+    /// supervisor reports a runtime failure during the initial session
+    /// open; or `ServerError::Internal` if the OS rejects the thread.
     pub fn spawn(lake_root: PathBuf, package: String, library: String, default_imports: Vec<String>) -> Result<Self> {
-        type InitMsg = std::result::Result<(String, mpsc::Sender<Request>), ServerError>;
+        type InitMsg = std::result::Result<(String, mpsc::Sender<Job>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
+        let toolchain_label = lean_toolchain_label(&lake_root);
         let lake_root_owned = lake_root.clone();
+        let default_imports_for_builder = default_imports.clone();
         thread::Builder::new()
             .name("lean-host-mcp/session".to_owned())
             .spawn(move || {
-                worker_main(lake_root_owned, package, library, default_imports, init_tx);
+                worker_main(
+                    lake_root_owned,
+                    package,
+                    library,
+                    default_imports_for_builder,
+                    toolchain_label,
+                    init_tx,
+                );
             })
             .map_err(|e| ServerError::Internal(format!("spawn worker thread: {e}")))?;
 
@@ -189,6 +199,7 @@ impl SessionHost {
             tx,
             lake_root: lake_root.to_string_lossy().into_owned(),
             lean_toolchain: toolchain,
+            default_imports,
         })
     }
 
@@ -200,26 +211,47 @@ impl SessionHost {
         &self.lean_toolchain
     }
 
-    async fn submit<T: Send + 'static>(&self, build: impl FnOnce(oneshot::Sender<Result<T>>) -> Request) -> Result<T> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(build(resp_tx))
-            .await
-            .map_err(|_| ServerError::SessionGone)?;
-        resp_rx.await.map_err(|_| ServerError::SessionGone)?
+    fn effective_imports(&self, imports: Vec<String>) -> Vec<String> {
+        if imports.is_empty() {
+            self.default_imports.clone()
+        } else {
+            imports
+        }
+    }
+
+    async fn submit<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut LeanWorkerCapability) -> Result<T> + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let job: Job = Box::new(move |cap| {
+            let _ = reply_tx.send(f(cap));
+        });
+        self.tx.send(job).await.map_err(|_| ServerError::SessionGone)?;
+        reply_rx.await.map_err(|_| ServerError::SessionGone)?
     }
 
     /// # Errors
     ///
-    /// Infrastructure failures only (worker thread gone, Lean call panicked);
-    /// Lean-reported elaboration failures travel in the inner `Err` variant
-    /// without becoming a [`ServerError`].
+    /// Infrastructure failures only; Lean-reported elaboration failures
+    /// travel in the inner `Err` variant.
     pub async fn elaborate(
         &self,
         source: String,
         imports: Vec<String>,
     ) -> Result<std::result::Result<ElabSuccess, ElabFailure>> {
-        self.submit(|reply| Request::Elaborate { source, imports, reply }).await
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            let result = session
+                .elaborate(&source, &elab_opts(), None, None)
+                .map_err(map_worker_err)?;
+            Ok(project_elab_result(result))
+        })
+        .await
     }
 
     /// # Errors
@@ -227,22 +259,51 @@ impl SessionHost {
     /// Infrastructure failures only; kernel rejections travel via
     /// [`KernelOutcome::status`].
     pub async fn kernel_check(&self, source: String, imports: Vec<String>) -> Result<KernelOutcome> {
-        self.submit(|reply| Request::KernelCheck { source, imports, reply })
-            .await
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            let result = session
+                .kernel_check(&source, &elab_opts(), None, None)
+                .map_err(map_worker_err)?;
+            Ok(project_kernel_result(result))
+        })
+        .await
     }
 
     /// # Errors
     ///
     /// Infrastructure failures only.
     pub async fn infer_type(&self, source: String, imports: Vec<String>) -> Result<MetaOutcome> {
-        self.submit(|reply| Request::InferType { source, imports, reply }).await
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            let result = session
+                .infer_type(&source, &elab_opts(), None, None)
+                .map_err(map_worker_err)?;
+            Ok(project_meta_rendered(result))
+        })
+        .await
     }
 
     /// # Errors
     ///
     /// Infrastructure failures only.
     pub async fn whnf(&self, source: String, imports: Vec<String>) -> Result<MetaOutcome> {
-        self.submit(|reply| Request::Whnf { source, imports, reply }).await
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            let result = session
+                .whnf(&source, &elab_opts(), None, None)
+                .map_err(map_worker_err)?;
+            Ok(project_meta_rendered(result))
+        })
+        .await
     }
 
     /// # Errors
@@ -253,31 +314,42 @@ impl SessionHost {
         lhs: String,
         rhs: String,
         imports: Vec<String>,
-        transparency: LeanMetaTransparency,
+        transparency: LeanWorkerMetaTransparency,
     ) -> Result<MetaOutcome> {
-        self.submit(|reply| Request::IsDefEq {
-            lhs,
-            rhs,
-            imports,
-            transparency,
-            reply,
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            let result = session
+                .is_def_eq(&lhs, &rhs, transparency, &elab_opts(), None, None)
+                .map_err(map_worker_err)?;
+            Ok(project_meta_bool(result))
         })
         .await
     }
 
     /// Look up a declaration by fully-qualified name. Returns `None` when
-    /// Lean reports the declaration as `"missing"`. Used by `hover_by_name`.
+    /// the name is not in the session's open environment.
     ///
     /// # Errors
     ///
     /// Infrastructure failures only.
     pub async fn describe(&self, name: String, imports: Vec<String>) -> Result<Option<DeclarationRow>> {
-        self.submit(|reply| Request::Describe { name, imports, reply }).await
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            let row = session.describe(&name, None, None).map_err(map_worker_err)?;
+            Ok(row.map(project_declaration_row))
+        })
+        .await
     }
 
     /// List every declaration in the open environment as a Vec of fully-
     /// qualified strings. Filter controls private / generated / internal
-    /// inclusion (use [`LeanDeclarationFilter::default()`] for the
+    /// inclusion (use [`LeanWorkerDeclarationFilter::default()`] for the
     /// declaration-browser preset).
     ///
     /// # Errors
@@ -285,52 +357,80 @@ impl SessionHost {
     /// Infrastructure failures only.
     pub async fn list_declarations_strings(
         &self,
-        filter: LeanDeclarationFilter,
+        filter: LeanWorkerDeclarationFilter,
         imports: Vec<String>,
     ) -> Result<Vec<String>> {
-        self.submit(|reply| Request::ListDeclarationStrings { filter, imports, reply })
-            .await
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            session
+                .list_declarations_strings(&filter, None, None)
+                .map_err(map_worker_err)
+        })
+        .await
     }
 
     /// Bulk-describe every declaration in `names`. Output order matches
-    /// input order; entries Lean reports as `"missing"` are omitted.
-    /// Uses upstream's bulk `declaration_kind` / `declaration_type` shims
-    /// to keep the rebuild affordable on six-figure environments.
+    /// input order; entries the worker reports as `kind == "missing"` are
+    /// omitted from the output.
     ///
     /// # Errors
     ///
     /// Infrastructure failures only.
     pub async fn describe_bulk(&self, names: Vec<String>, imports: Vec<String>) -> Result<Vec<DeclarationRow>> {
-        self.submit(|reply| Request::DescribeBulk { names, imports, reply })
-            .await
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let rows = session.describe_bulk(&refs, None, None).map_err(map_worker_err)?;
+            Ok(rows
+                .into_iter()
+                .filter(|r| r.kind != "missing")
+                .map(project_declaration_row)
+                .collect())
+        })
+        .await
     }
 
-    /// Run `IO.processCommands` over body-only `source` with info collection
-    /// enabled and return the upstream [`ProcessFileOutcome`]. The source
-    /// must **not** carry an `import` header — see [`Self::process_module`]
-    /// for the header-aware sibling that drives the
-    /// `goal_at_position` / `type_at_position` / `references_of_name` tools.
+    /// Run elaboration over body-only `source` with info collection
+    /// enabled and return the worker's outcome. The source must **not**
+    /// carry an `import` header — see [`Self::process_module`] for the
+    /// header-aware sibling.
     ///
     /// # Errors
     ///
     /// Infrastructure failures only.
-    pub async fn process_file(&self, source: String, imports: Vec<String>) -> Result<ProcessFileOutcome> {
-        self.submit(|reply| Request::ProcessFile { source, imports, reply })
-            .await
+    pub async fn process_file(&self, source: String, imports: Vec<String>) -> Result<LeanWorkerProcessFileOutcome> {
+        let imports = self.effective_imports(imports);
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            session
+                .process_file(&source, &elab_opts(), None, None)
+                .map_err(map_worker_err)
+        })
+        .await
     }
 
-    /// Run a full Lean source file (header + body) through Lean's frontend
-    /// pipeline with info collection enabled. The header is parsed via
-    /// `Lean.Parser.parseHeader`; `IO.processCommands` resumes from the
-    /// parser state the header produced, so info-tree positions come back
-    /// in the original file's coordinate system.
+    /// Run a full Lean source file (header + body) through the worker's
+    /// frontend pipeline with info collection enabled. The header is
+    /// parsed by Lean; `process_module` resumes from the parsed state, so
+    /// info-tree positions come back in the original file's coordinate
+    /// system.
     ///
-    /// The returned [`ProcessModuleOutcome`] has four arms: `Ok`
-    /// (header parsed, env satisfies imports, body processed),
-    /// `MissingImports` (body still ran but some imports aren't in the
-    /// session's open env — soft warning), `HeaderParseFailed`
-    /// (header didn't parse, body never ran), and `Unsupported`
-    /// (capability dylib lacks the shim).
+    /// The returned outcome has four arms: `Ok` (header parsed, env
+    /// satisfies imports, body processed), `MissingImports` (body still
+    /// ran but some imports aren't in the session's open env — soft
+    /// warning), `HeaderParseFailed` (header didn't parse, body never
+    /// ran), and `Unsupported` (capability dylib lacks the shim).
     ///
     /// Routes to the **default** session — the env the file's parsed
     /// header is validated against. Per-call import selection is not
@@ -340,65 +440,19 @@ impl SessionHost {
     /// # Errors
     ///
     /// Infrastructure failures only; every Lean-domain outcome is a
-    /// variant of [`ProcessModuleOutcome`].
-    pub async fn process_module(&self, source: String) -> Result<ProcessModuleOutcome> {
-        self.submit(|reply| Request::ProcessModule { source, reply }).await
+    /// variant of [`LeanWorkerProcessModuleOutcome`].
+    pub async fn process_module(&self, source: String) -> Result<LeanWorkerProcessModuleOutcome> {
+        let imports = self.default_imports.clone();
+        self.submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            session
+                .process_module(&source, &elab_opts(), None, None)
+                .map_err(map_worker_err)
+        })
+        .await
     }
-}
-
-#[derive(Debug)]
-enum Request {
-    Elaborate {
-        source: String,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<std::result::Result<ElabSuccess, ElabFailure>>>,
-    },
-    KernelCheck {
-        source: String,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<KernelOutcome>>,
-    },
-    InferType {
-        source: String,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<MetaOutcome>>,
-    },
-    Whnf {
-        source: String,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<MetaOutcome>>,
-    },
-    IsDefEq {
-        lhs: String,
-        rhs: String,
-        imports: Vec<String>,
-        transparency: LeanMetaTransparency,
-        reply: oneshot::Sender<Result<MetaOutcome>>,
-    },
-    Describe {
-        name: String,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<Option<DeclarationRow>>>,
-    },
-    ListDeclarationStrings {
-        filter: LeanDeclarationFilter,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<String>>>,
-    },
-    DescribeBulk {
-        names: Vec<String>,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<Vec<DeclarationRow>>>,
-    },
-    ProcessFile {
-        source: String,
-        imports: Vec<String>,
-        reply: oneshot::Sender<Result<ProcessFileOutcome>>,
-    },
-    ProcessModule {
-        source: String,
-        reply: oneshot::Sender<Result<ProcessModuleOutcome>>,
-    },
 }
 
 fn worker_main(
@@ -406,311 +460,62 @@ fn worker_main(
     package: String,
     library: String,
     default_imports: Vec<String>,
-    init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<Request>), ServerError>>,
+    toolchain_label: String,
+    init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<Job>), ServerError>>,
 ) {
-    let runtime = match LeanRuntime::init() {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = init_reply.send(Err(ServerError::Lean(format!("runtime init: {e}"))));
-            return;
-        }
-    };
+    let builder = LeanWorkerCapabilityBuilder::new(&lake_root, &package, &library, default_imports.iter())
+        .worker_child(LeanWorkerChild::sibling("lean-host-mcp-worker"))
+        .startup_timeout(Duration::from_secs(30))
+        .long_running_requests();
 
-    let host = match LeanHost::from_lake_project(runtime, &lake_root) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = init_reply.send(Err(ServerError::BadProject(format!(
-                "open lake project at {}: {e}",
-                lake_root.display()
-            ))));
-            return;
-        }
-    };
-
-    let caps = match host.load_capabilities(&package, &library) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = init_reply.send(Err(ServerError::BadProject(format!(
-                "load capabilities {package}/{library}: {e} (does this Lake project depend on lean-rs-host shims?)"
-            ))));
-            return;
-        }
-    };
-
-    let toolchain = lean_toolchain_label(&lake_root);
-    let (tx, mut rx) = mpsc::channel::<Request>(64);
-    if init_reply.send(Ok((toolchain, tx))).is_err() {
+    let report = builder.check();
+    if let Some(first) = report.first_error() {
+        let _ = init_reply.send(Err(ServerError::BadProject(format!(
+            "{}: {}",
+            first.code(),
+            first.message()
+        ))));
         return;
     }
 
-    let mut state = WorkerState {
-        caps: &caps,
-        sessions: HashMap::new(),
-        default_imports,
+    let mut capability = match builder.open() {
+        Ok(cap) => cap,
+        Err(err) => {
+            let _ = init_reply.send(Err(map_worker_err(err)));
+            return;
+        }
     };
 
-    while let Some(req) = rx.blocking_recv() {
-        state.handle(req);
+    let runtime_toolchain = capability.runtime_metadata().lean_version.unwrap_or(toolchain_label);
+
+    let (tx, mut rx) = mpsc::channel::<Job>(64);
+    if init_reply.send(Ok((runtime_toolchain, tx))).is_err() {
+        return;
+    }
+
+    while let Some(job) = rx.blocking_recv() {
+        job(&mut capability);
     }
 }
 
-struct WorkerState<'lean, 'h> {
-    caps: &'h LeanCapabilities<'lean, 'h>,
-    sessions: HashMap<Vec<String>, LeanSession<'lean, 'h>>,
-    default_imports: Vec<String>,
+fn elab_opts() -> LeanWorkerElabOptions {
+    LeanWorkerElabOptions::new()
 }
 
-impl<'lean, 'h> WorkerState<'lean, 'h> {
-    fn session_for(&mut self, imports: Vec<String>) -> Result<&mut LeanSession<'lean, 'h>> {
-        let key = if imports.is_empty() {
-            self.default_imports.clone()
-        } else {
-            imports
-        };
-        if let std::collections::hash_map::Entry::Vacant(slot) = self.sessions.entry(key.clone()) {
-            let module_refs: Vec<&str> = key.iter().map(String::as_str).collect();
-            let session = self
-                .caps
-                .session(&module_refs, None, None)
-                .map_err(|e| ServerError::Lean(format!("import {key:?}: {e}")))?;
-            slot.insert(session);
-        }
-        self.sessions
-            .get_mut(&key)
-            .ok_or_else(|| ServerError::Internal("session vanished after insert".into()))
-    }
-
-    fn handle(&mut self, req: Request) {
-        match req {
-            Request::Elaborate { source, imports, reply } => {
-                let _ = reply.send(self.do_elaborate(&source, imports));
-            }
-            Request::KernelCheck { source, imports, reply } => {
-                let _ = reply.send(self.do_kernel_check(&source, imports));
-            }
-            Request::InferType { source, imports, reply } => {
-                let _ = reply.send(self.do_infer_type(&source, imports));
-            }
-            Request::Whnf { source, imports, reply } => {
-                let _ = reply.send(self.do_whnf(&source, imports));
-            }
-            Request::IsDefEq {
-                lhs,
-                rhs,
-                imports,
-                transparency,
-                reply,
-            } => {
-                let _ = reply.send(self.do_is_def_eq(&lhs, &rhs, imports, transparency));
-            }
-            Request::Describe { name, imports, reply } => {
-                let _ = reply.send(self.do_describe(&name, imports));
-            }
-            Request::ListDeclarationStrings { filter, imports, reply } => {
-                let _ = reply.send(self.do_list_declaration_strings(filter, imports));
-            }
-            Request::DescribeBulk { names, imports, reply } => {
-                let _ = reply.send(self.do_describe_bulk(names, imports));
-            }
-            Request::ProcessFile { source, imports, reply } => {
-                let _ = reply.send(self.do_process_file(&source, imports));
-            }
-            Request::ProcessModule { source, reply } => {
-                let _ = reply.send(self.do_process_module(&source));
-            }
-        }
-    }
-
-    fn do_elaborate(
-        &mut self,
-        source: &str,
-        imports: Vec<String>,
-    ) -> Result<std::result::Result<ElabSuccess, ElabFailure>> {
-        let session = self.session_for(imports)?;
-        let opts = LeanElabOptions::new();
-        match session.elaborate(source, None, &opts, None) {
-            Ok(Ok(_expr)) => Ok(Ok(ElabSuccess { ok: true })),
-            Ok(Err(failure)) => Ok(Err(project_failure(&failure))),
-            Err(e) => Err(ServerError::Lean(format!("elaborate: {e}"))),
-        }
-    }
-
-    fn do_kernel_check(&mut self, source: &str, imports: Vec<String>) -> Result<KernelOutcome> {
-        let session = self.session_for(imports)?;
-        let opts = LeanElabOptions::new();
-        let outcome = session
-            .kernel_check(source, &opts, None, None)
-            .map_err(|e| ServerError::Lean(format!("kernel_check: {e}")))?;
-        Ok(project_kernel_outcome(session, outcome))
-    }
-
-    // Two meta hops per call: one to compute the expression (infer_type /
-    // whnf), one to pretty-print it via pp_expr. The optional pp_expr shim
-    // may be absent on older capability dylibs; fall back to expr_to_string_raw
-    // and flag the response so the tool handler can emit a warning.
-    fn do_infer_type(&mut self, source: &str, imports: Vec<String>) -> Result<MetaOutcome> {
-        let session = self.session_for(imports)?;
-        let opts = LeanElabOptions::new();
-        let expr = match session.elaborate(source, None, &opts, None) {
-            Ok(Ok(expr)) => expr,
-            Ok(Err(failure)) => return Ok(failure_meta(failure)),
-            Err(e) => return Err(ServerError::Lean(format!("elaborate for infer_type: {e}"))),
-        };
-        let meta_opts = LeanMetaOptions::new();
-        let response = session
-            .run_meta(&meta_infer_type(), expr, &meta_opts, None)
-            .map_err(|e| ServerError::Lean(format!("run_meta infer_type: {e}")))?;
-        render_meta_response(session, response, &meta_opts)
-    }
-
-    fn do_whnf(&mut self, source: &str, imports: Vec<String>) -> Result<MetaOutcome> {
-        let session = self.session_for(imports)?;
-        let opts = LeanElabOptions::new();
-        let expr = match session.elaborate(source, None, &opts, None) {
-            Ok(Ok(expr)) => expr,
-            Ok(Err(failure)) => return Ok(failure_meta(failure)),
-            Err(e) => return Err(ServerError::Lean(format!("elaborate for whnf: {e}"))),
-        };
-        let meta_opts = LeanMetaOptions::new();
-        let response = session
-            .run_meta(&meta_whnf(), expr, &meta_opts, None)
-            .map_err(|e| ServerError::Lean(format!("run_meta whnf: {e}")))?;
-        render_meta_response(session, response, &meta_opts)
-    }
-
-    fn do_is_def_eq(
-        &mut self,
-        lhs: &str,
-        rhs: &str,
-        imports: Vec<String>,
-        transparency: LeanMetaTransparency,
-    ) -> Result<MetaOutcome> {
-        let session = self.session_for(imports)?;
-        let opts = LeanElabOptions::new();
-        let lhs_expr = match session.elaborate(lhs, None, &opts, None) {
-            Ok(Ok(e)) => e,
-            Ok(Err(failure)) => return Ok(failure_meta(failure)),
-            Err(e) => return Err(ServerError::Lean(format!("elaborate lhs: {e}"))),
-        };
-        let rhs_expr = match session.elaborate(rhs, None, &opts, None) {
-            Ok(Ok(e)) => e,
-            Ok(Err(failure)) => return Ok(failure_meta(failure)),
-            Err(e) => return Err(ServerError::Lean(format!("elaborate rhs: {e}"))),
-        };
-        let meta_opts = LeanMetaOptions::new();
-        let response = session
-            .run_meta(&meta_is_def_eq(), (lhs_expr, rhs_expr, transparency), &meta_opts, None)
-            .map_err(|e| ServerError::Lean(format!("run_meta is_def_eq: {e}")))?;
-        Ok(project_meta_bool(response))
-    }
-
-    fn do_describe(&mut self, name: &str, imports: Vec<String>) -> Result<Option<DeclarationRow>> {
-        let session = self.session_for(imports)?;
-        let kind = match session.declaration_kind(name, None) {
-            Ok(k) if k == "missing" => return Ok(None),
-            Ok(k) => k,
-            Err(e) => return Err(ServerError::Lean(format!("declaration_kind {name}: {e}"))),
-        };
-        let type_signature = render_type_signature(session, name)?;
-        let source = session
-            .declaration_source_range(name, None)
-            .ok()
-            .flatten()
-            .map(project_source_range);
-        Ok(Some(DeclarationRow {
-            name: name.to_owned(),
-            kind,
-            type_signature,
-            source,
-        }))
-    }
-
-    fn do_list_declaration_strings(
-        &mut self,
-        filter: LeanDeclarationFilter,
-        imports: Vec<String>,
-    ) -> Result<Vec<String>> {
-        let session = self.session_for(imports)?;
-        session
-            .list_declarations_strings(&filter, None, None)
-            .map_err(|e| ServerError::Lean(format!("list_declarations_strings: {e}")))
-    }
-
-    fn do_process_file(&mut self, source: &str, imports: Vec<String>) -> Result<ProcessFileOutcome> {
-        let session = self.session_for(imports)?;
-        let opts = LeanElabOptions::new();
-        session
-            .process_with_info_tree(source, &opts, None)
-            .map_err(|e| ServerError::Lean(format!("process_with_info_tree: {e}")))
-    }
-
-    fn do_process_module(&mut self, source: &str) -> Result<ProcessModuleOutcome> {
-        let session = self.session_for(Vec::new())?;
-        let opts = LeanElabOptions::new();
-        session
-            .process_module_with_info_tree(source, &opts, None)
-            .map_err(|e| ServerError::Lean(format!("process_module_with_info_tree: {e}")))
-    }
-
-    fn do_describe_bulk(&mut self, names: Vec<String>, imports: Vec<String>) -> Result<Vec<DeclarationRow>> {
-        if names.is_empty() {
-            return Ok(Vec::new());
-        }
-        let session = self.session_for(imports)?;
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-
-        let kinds = session
-            .declaration_kind_bulk(&refs, None, None)
-            .map_err(|e| ServerError::Lean(format!("declaration_kind_bulk: {e}")))?;
-        let types = session
-            .declaration_type_bulk(&refs, None, None)
-            .map_err(|e| ServerError::Lean(format!("declaration_type_bulk: {e}")))?;
-
-        let mut out = Vec::with_capacity(names.len());
-        for (idx, name) in names.iter().enumerate() {
-            let kind = kinds.get(idx).cloned().unwrap_or_else(|| "missing".to_owned());
-            if kind == "missing" {
-                continue;
-            }
-            let ty_expr = types.get(idx).and_then(Option::as_ref);
-            let type_signature = match ty_expr {
-                Some(expr) => Some(
-                    session
-                        .expr_to_string_raw(expr, None)
-                        .map_err(|e| ServerError::Lean(format!("expr_to_string_raw {name}: {e}")))?,
-                ),
-                None => None,
-            };
-            let source = session
-                .declaration_source_range(name, None)
-                .ok()
-                .flatten()
-                .map(project_source_range);
-            out.push(DeclarationRow {
-                name: name.clone(),
-                kind,
-                type_signature,
-                source,
-            });
-        }
-        Ok(out)
-    }
-}
-
-/// Render a declaration's type via `Expr.toString`. `Ok(None)` means the
-/// declaration has no recoverable type expression (Lean returned `none`).
-fn render_type_signature(session: &mut LeanSession<'_, '_>, name: &str) -> Result<Option<String>> {
-    let ty = session
-        .declaration_type(name, None)
-        .map_err(|e| ServerError::Lean(format!("declaration_type {name}: {e}")))?;
-    match ty {
-        Some(expr) => {
-            let rendered = session
-                .expr_to_string_raw(&expr, None)
-                .map_err(|e| ServerError::Lean(format!("expr_to_string_raw {name}: {e}")))?;
-            Ok(Some(rendered))
-        }
-        None => Ok(None),
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "LeanWorkerError is upstream-evolving; everything outside the bootstrap-classification set maps to Lean for the MCP wire"
+)]
+fn map_worker_err(err: LeanWorkerError) -> ServerError {
+    match err {
+        LeanWorkerError::WorkerChildUnresolved { .. }
+        | LeanWorkerError::WorkerChildNotExecutable { .. }
+        | LeanWorkerError::Bootstrap { .. }
+        | LeanWorkerError::CapabilityBuild { .. }
+        | LeanWorkerError::Setup { .. }
+        | LeanWorkerError::Handshake { .. }
+        | LeanWorkerError::CapabilityMetadataMismatch { .. } => ServerError::BadProject(err.to_string()),
+        _ => ServerError::Lean(err.to_string()),
     }
 }
 
@@ -721,24 +526,37 @@ fn lean_toolchain_label(lake_root: &std::path::Path) -> String {
         .map_or_else(|| "unknown".into(), |s| s.trim().to_owned())
 }
 
-pub(crate) fn project_failure(failure: &LeanElabFailure) -> ElabFailure {
+// --- projection helpers -------------------------------------------------
+
+pub(crate) fn project_diagnostic(d: &lean_rs_worker::LeanWorkerDiagnostic) -> Diagnostic {
+    let position = d.line.map(|line| Position {
+        line,
+        column: d.column.unwrap_or(0),
+        end_line: d.end_line,
+        end_column: d.end_column,
+    });
+    Diagnostic {
+        severity: Severity::from_worker(&d.severity),
+        message: d.message.clone(),
+        position,
+        file: meaningful_file_label(&d.file_label),
+    }
+}
+
+pub(crate) fn project_failure(failure: &LeanWorkerElabFailure) -> ElabFailure {
     ElabFailure {
-        diagnostics: failure
-            .diagnostics()
-            .iter()
-            .map(|d| Diagnostic {
-                severity: Severity::from_lean(d.severity()),
-                message: d.message().to_owned(),
-                position: d.position().map(|p| Position {
-                    line: p.line(),
-                    column: p.column(),
-                    end_line: p.end_line(),
-                    end_column: p.end_column(),
-                }),
-                file: meaningful_file_label(d.file_label()),
-            })
-            .collect(),
-        truncated: failure.truncated(),
+        diagnostics: failure.diagnostics.iter().map(project_diagnostic).collect(),
+        truncated: failure.truncated,
+    }
+}
+
+fn project_source_range(range: LeanWorkerSourceRange) -> SourceRange {
+    SourceRange {
+        file: range.file,
+        start_line: range.start_line,
+        start_column: range.start_column,
+        end_line: range.end_line,
+        end_column: range.end_column,
     }
 }
 
@@ -753,194 +571,93 @@ fn meaningful_file_label(label: &str) -> Option<String> {
     }
 }
 
-fn project_kernel_outcome<'lean>(
-    session: &mut LeanSession<'lean, '_>,
-    outcome: LeanKernelOutcome<'lean>,
-) -> KernelOutcome {
-    match outcome {
-        LeanKernelOutcome::Checked(evidence) => {
-            let summary = session.summarize_evidence(&evidence, None).ok().map(project_summary);
-            KernelOutcome {
-                status: "Checked".into(),
-                summary,
-                failure: None,
-            }
-        }
-        LeanKernelOutcome::Rejected(failure) => KernelOutcome {
-            status: "Rejected".into(),
-            summary: None,
-            failure: Some(project_failure(&failure)),
-        },
-        LeanKernelOutcome::Unavailable(failure) => KernelOutcome {
-            status: "Unavailable".into(),
-            summary: None,
-            failure: Some(project_failure(&failure)),
-        },
-        LeanKernelOutcome::Unsupported(failure) => KernelOutcome {
-            status: "Unsupported".into(),
-            summary: None,
-            failure: Some(project_failure(&failure)),
-        },
-        _ => KernelOutcome {
-            status: "Unknown".into(),
-            summary: None,
-            failure: None,
-        },
+fn project_elab_result(result: LeanWorkerElabResult) -> std::result::Result<ElabSuccess, ElabFailure> {
+    if result.success {
+        Ok(ElabSuccess { ok: true })
+    } else {
+        Err(ElabFailure {
+            diagnostics: result.diagnostics.iter().map(project_diagnostic).collect(),
+            truncated: result.truncated,
+        })
     }
 }
 
-fn project_summary(summary: ProofSummary) -> KernelSummary {
-    KernelSummary {
-        declaration_name: summary.declaration_name().to_owned(),
-        kind: summary.kind().to_owned(),
-        type_signature: summary.type_signature().to_owned(),
-    }
-}
-
-fn project_source_range(range: LeanSourceRange) -> SourceRange {
-    SourceRange {
-        file: range.file,
-        start_line: range.start_line,
-        start_column: range.start_column,
-        end_line: range.end_line,
-        end_column: range.end_column,
-    }
-}
-
-/// Pretty-print the `Ok` payload of an infer-type / whnf response. Falls
-/// back to `Expr.toString` when the optional `meta_pp_expr` shim is missing
-/// on the loaded capability dylib, setting `raw_fallback_used` so the tool
-/// handler can attach a warning to the envelope.
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "LeanMetaResponse is #[non_exhaustive] upstream; the wildcard forwards future variants to project_meta_unit, which handles them"
-)]
-fn render_meta_response<'lean>(
-    session: &mut LeanSession<'lean, '_>,
-    response: LeanMetaResponse<lean_rs::LeanExpr<'lean>>,
-    meta_opts: &LeanMetaOptions,
-) -> Result<MetaOutcome> {
-    let expr = match response {
-        LeanMetaResponse::Ok(expr) => expr,
-        non_ok => return Ok(project_meta_unit(non_ok)),
+fn project_kernel_result(result: LeanWorkerKernelResult) -> KernelOutcome {
+    let status = match result.status {
+        LeanWorkerKernelStatus::Checked => "Checked",
+        LeanWorkerKernelStatus::Rejected => "Rejected",
+        LeanWorkerKernelStatus::Unavailable => "Unavailable",
+        LeanWorkerKernelStatus::Unsupported => "Unsupported",
     };
-    let pp = session
-        .run_meta(&meta_pp_expr(), expr.clone(), meta_opts, None)
-        .map_err(|e| ServerError::Lean(format!("run_meta pp_expr: {e}")))?;
-    match pp {
-        LeanMetaResponse::Ok(rendered) => Ok(MetaOutcome {
-            status: "Ok".into(),
-            rendered: Some(rendered),
-            definitionally_equal: None,
-            failure: None,
-            raw_fallback_used: false,
-        }),
-        LeanMetaResponse::Unsupported(_) => {
-            let raw = session
-                .expr_to_string_raw(&expr, None)
-                .map_err(|e| ServerError::Lean(format!("expr_to_string_raw: {e}")))?;
-            Ok(MetaOutcome {
-                status: "Ok".into(),
-                rendered: Some(raw),
-                definitionally_equal: None,
-                failure: None,
-                raw_fallback_used: true,
-            })
-        }
-        non_ok => Ok(project_meta_unit(non_ok)),
+    let summary = result.summary.map(|s| KernelSummary {
+        declaration_name: s.declaration_name,
+        kind: s.kind,
+        type_signature: s.type_signature,
+    });
+    let failure = if matches!(result.status, LeanWorkerKernelStatus::Checked) {
+        None
+    } else {
+        Some(ElabFailure {
+            diagnostics: result.diagnostics.iter().map(project_diagnostic).collect(),
+            truncated: result.truncated,
+        })
+    };
+    KernelOutcome {
+        status: status.to_owned(),
+        summary,
+        failure,
     }
 }
 
-/// Project a `LeanMetaResponse<T>` whose `Ok` payload we don't expose.
-/// After [`render_meta_response`] takes the `Ok(expr)` branch this only
-/// fires for non-Ok variants, but stays generic so callers don't need to
-/// duplicate the failure projection.
-fn project_meta_unit<T>(response: LeanMetaResponse<T>) -> MetaOutcome {
-    match response {
-        LeanMetaResponse::Ok(_) => MetaOutcome {
+fn project_meta_rendered(result: LeanWorkerMetaResult<LeanWorkerRendered>) -> MetaOutcome {
+    match result {
+        LeanWorkerMetaResult::Ok { value } => MetaOutcome {
             status: "Ok".into(),
-            rendered: None,
+            rendered: Some(value.value),
             definitionally_equal: None,
             failure: None,
-            raw_fallback_used: false,
+            raw_fallback_used: matches!(value.rendering, LeanWorkerRendering::Raw),
         },
-        LeanMetaResponse::Failed(failure) => MetaOutcome {
-            status: "Failed".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: Some(project_failure(&failure)),
-            raw_fallback_used: false,
-        },
-        LeanMetaResponse::TimeoutOrHeartbeat(failure) => MetaOutcome {
-            status: "TimeoutOrHeartbeat".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: Some(project_failure(&failure)),
-            raw_fallback_used: false,
-        },
-        LeanMetaResponse::Unsupported(failure) => MetaOutcome {
-            status: "Unsupported".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: Some(project_failure(&failure)),
-            raw_fallback_used: false,
-        },
-        _ => MetaOutcome {
-            status: "Unknown".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: None,
-            raw_fallback_used: false,
-        },
+        LeanWorkerMetaResult::Failed { failure } => meta_failure("Failed", &failure),
+        LeanWorkerMetaResult::TimeoutOrHeartbeat { failure } => meta_failure("TimeoutOrHeartbeat", &failure),
+        LeanWorkerMetaResult::Unsupported { failure } => meta_failure("Unsupported", &failure),
     }
 }
 
-fn project_meta_bool(response: LeanMetaResponse<bool>) -> MetaOutcome {
-    match response {
-        LeanMetaResponse::Ok(b) => MetaOutcome {
+fn project_meta_bool(result: LeanWorkerMetaResult<bool>) -> MetaOutcome {
+    match result {
+        LeanWorkerMetaResult::Ok { value } => MetaOutcome {
             status: "Ok".into(),
             rendered: None,
-            definitionally_equal: Some(b),
+            definitionally_equal: Some(value),
             failure: None,
             raw_fallback_used: false,
         },
-        LeanMetaResponse::Failed(failure) => MetaOutcome {
-            status: "Failed".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: Some(project_failure(&failure)),
-            raw_fallback_used: false,
-        },
-        LeanMetaResponse::TimeoutOrHeartbeat(failure) => MetaOutcome {
-            status: "TimeoutOrHeartbeat".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: Some(project_failure(&failure)),
-            raw_fallback_used: false,
-        },
-        LeanMetaResponse::Unsupported(failure) => MetaOutcome {
-            status: "Unsupported".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: Some(project_failure(&failure)),
-            raw_fallback_used: false,
-        },
-        _ => MetaOutcome {
-            status: "Unknown".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: None,
-            raw_fallback_used: false,
-        },
+        LeanWorkerMetaResult::Failed { failure } => meta_failure("Failed", &failure),
+        LeanWorkerMetaResult::TimeoutOrHeartbeat { failure } => meta_failure("TimeoutOrHeartbeat", &failure),
+        LeanWorkerMetaResult::Unsupported { failure } => meta_failure("Unsupported", &failure),
     }
 }
 
-fn failure_meta(failure: LeanElabFailure) -> MetaOutcome {
+fn meta_failure(status: &str, failure: &LeanWorkerElabFailure) -> MetaOutcome {
     MetaOutcome {
-        status: "Failed".into(),
+        status: status.to_owned(),
         rendered: None,
         definitionally_equal: None,
-        failure: Some(project_failure(&failure)),
+        failure: Some(project_failure(failure)),
         raw_fallback_used: false,
     }
 }
+
+fn project_declaration_row(row: LeanWorkerDeclarationRow) -> DeclarationRow {
+    DeclarationRow {
+        name: row.name,
+        kind: row.kind,
+        type_signature: row.type_signature,
+        source: row.source.map(project_source_range),
+    }
+}
+
+/// Re-export of [`LeanWorkerProcessedFile`] so callers that hold a cached
+/// projection can pattern-match without importing `lean-rs-worker` directly.
+pub use lean_rs_worker::LeanWorkerProcessedFile as ProcessedFile;

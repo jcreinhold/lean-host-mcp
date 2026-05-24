@@ -11,9 +11,9 @@
 //!   over the SQLite-backed [`DeclarationIndex`](crate::DeclarationIndex);
 //!   rebuild on Lake-manifest change.
 //! - [`position`] — `goal_at_position`, `type_at_position`,
-//!   `references_of_name`. Thin lookups over a `ProcessedFileCache`-backed
-//!   [`ProcessedFile`](lean_rs_host::host::process::ProcessedFile)
-//!   projection; the cache is keyed on path + content hash.
+//!   `references_of_name`, `file_diagnostics`. Thin lookups over a
+//!   `ProcessedFileCache`-backed `LeanWorkerProcessedFile` projection from
+//!   `lean-rs-worker`; the cache is keyed on path + content hash.
 
 use std::sync::Arc;
 

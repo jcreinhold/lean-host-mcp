@@ -30,12 +30,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lean_rs_host::host::process::{NameRefNode, ProcessModuleOutcome, ProcessedFile};
+use lean_rs_worker::{
+    LeanWorkerNameRef, LeanWorkerProcessModuleOutcome, LeanWorkerProcessedFile, LeanWorkerTacticInfo,
+    LeanWorkerTermInfo,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::cache::{ProcessedFileCache, hash_bytes};
+use crate::cache::{self, ProcessedFileCache, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::session::{Diagnostic, ElabFailure, Severity, project_failure};
@@ -105,7 +108,7 @@ pub async fn goal_at_position(ctx: &ToolContext, req: GoalAtPositionRequest) -> 
             return Ok(Response::ok(GoalAtPositionResult::Unsupported, freshness));
         }
     };
-    let result = match file.tactic_at(req.line, req.column) {
+    let result = match cache::tactic_at(&file, req.line, req.column) {
         Some(node) => GoalAtPositionResult::Goal {
             goals_before: node.goals_before.clone(),
             goals_after: node.goals_after.clone(),
@@ -168,7 +171,7 @@ pub async fn type_at_position(ctx: &ToolContext, req: TypeAtPositionRequest) -> 
             return Ok(Response::ok(TypeAtPositionResult::Unsupported, freshness));
         }
     };
-    let result = match file.term_at(req.line, req.column) {
+    let result = match cache::term_at(&file, req.line, req.column) {
         Some(node) => TypeAtPositionResult::Term {
             expr: node.expr_str.clone(),
             type_str: node.type_str.clone(),
@@ -283,7 +286,7 @@ pub async fn references_of_name(
                         missing: missing_imports,
                     });
                 }
-                for node in file.references_of(&req.name) {
+                for node in cache::references_of(&file, &req.name) {
                     if hits.len() >= MAX_REFERENCES {
                         truncated = true;
                         break 'outer;
@@ -442,7 +445,7 @@ fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 /// Outcome of running a file through the cache-or-process flow.
 enum EnsureOutcome {
     Ready {
-        file: Arc<ProcessedFile>,
+        file: Arc<LeanWorkerProcessedFile>,
         freshly_processed: bool,
         /// Header imports the session's open env does not have. Empty in
         /// the clean case. The body still ran against the env; the
@@ -472,7 +475,7 @@ async fn ensure_processed(ctx: &ToolContext, path: &Path) -> Result<EnsureOutcom
     }
     let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
     match ctx.host.process_module(source).await? {
-        ProcessModuleOutcome::Ok { file, .. } => {
+        LeanWorkerProcessModuleOutcome::Ok { file, .. } => {
             let arc = Arc::new(file);
             cache.insert(resolved, hash, Arc::clone(&arc));
             Ok(EnsureOutcome::Ready {
@@ -481,7 +484,7 @@ async fn ensure_processed(ctx: &ToolContext, path: &Path) -> Result<EnsureOutcom
                 missing_imports: Vec::new(),
             })
         }
-        ProcessModuleOutcome::MissingImports { file, missing, .. } => {
+        LeanWorkerProcessModuleOutcome::MissingImports { file, missing, .. } => {
             let arc = Arc::new(file);
             cache.insert(resolved, hash, Arc::clone(&arc));
             Ok(EnsureOutcome::Ready {
@@ -490,13 +493,10 @@ async fn ensure_processed(ctx: &ToolContext, path: &Path) -> Result<EnsureOutcom
                 missing_imports: missing,
             })
         }
-        ProcessModuleOutcome::HeaderParseFailed { diagnostics } => Ok(EnsureOutcome::HeaderParseFailed {
+        LeanWorkerProcessModuleOutcome::HeaderParseFailed { diagnostics } => Ok(EnsureOutcome::HeaderParseFailed {
             diagnostics: project_failure(&diagnostics),
         }),
-        ProcessModuleOutcome::Unsupported => Ok(EnsureOutcome::Unsupported),
-        _ => Err(ServerError::Lean(
-            "process_module_with_info_tree returned an unknown outcome variant".into(),
-        )),
+        LeanWorkerProcessModuleOutcome::Unsupported => Ok(EnsureOutcome::Unsupported),
     }
 }
 
@@ -512,7 +512,7 @@ fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
 }
 
-fn span_of_tactic(node: &lean_rs_host::host::process::TacticInfoNode) -> SourceSpan {
+fn span_of_tactic(node: &LeanWorkerTacticInfo) -> SourceSpan {
     SourceSpan {
         start_line: node.start_line,
         start_column: node.start_column,
@@ -521,7 +521,7 @@ fn span_of_tactic(node: &lean_rs_host::host::process::TacticInfoNode) -> SourceS
     }
 }
 
-fn span_of_term(node: &lean_rs_host::host::process::TermInfoNode) -> SourceSpan {
+fn span_of_term(node: &LeanWorkerTermInfo) -> SourceSpan {
     SourceSpan {
         start_line: node.start_line,
         start_column: node.start_column,
@@ -530,7 +530,7 @@ fn span_of_term(node: &lean_rs_host::host::process::TermInfoNode) -> SourceSpan 
     }
 }
 
-fn project_reference(file: &str, node: &NameRefNode) -> ReferenceHit {
+fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
     ReferenceHit {
         file: file.to_owned(),
         line: node.start_line,

@@ -1,8 +1,10 @@
 # lean-host-mcp
 
-A Model Context Protocol server that hosts Lean 4 in-process through [`lean-rs`](https://crates.io/crates/lean-rs). It
-owns a `LeanRuntime` and a `LeanCapabilities` dylib directly, so tool calls run as in-process Meta and kernel operations
-rather than as messages to an external LSP. That's the difference from `lean-lsp-mcp`.
+A Model Context Protocol server that hosts Lean 4 in a supervised worker child via
+[`lean-rs-worker`](https://crates.io/crates/lean-rs-worker). The parent process owns a `LeanWorkerCapability`; the
+worker child owns the `LeanRuntime` and `LeanCapabilities` dylib. Tool calls run as Meta and kernel operations inside
+that child rather than as messages to an external LSP — and when a tactic wedges or a typeclass loop runs away, the
+supervisor restarts the child instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
 Fourteen tools are exposed: six session-backed Lean operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`,
 `is_def_eq`, `hover_by_name`), a filesystem sweep (`project_scan`), three SQLite-indexed lookups (`find_symbol`,
@@ -24,9 +26,12 @@ doubles as a starting point you can adapt.
 cd /path/to/lean-rs/fixtures/lean
 lake build
 
-# 2. Build the MCP server.
+# 2. Build the MCP server. `--bins` builds both the server and its sibling
+#    worker child (`lean-host-mcp-worker`), which the parent resolves via
+#    `LeanWorkerChild::sibling`; both end up next to each other in
+#    `target/release/`.
 cd /path/to/lean-host-mcp
-cargo build --release
+cargo build --release --bins
 
 # 3. Launch, pointed at the built Lake project.
 ./target/release/lean-host-mcp \
@@ -97,10 +102,10 @@ LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs` / `lean-rs-host` 0.1.4, which pins Lean toolchain
-`leanprover/lean4:v4.30.0-rc2`. Bumping the supported toolchain is a `lean-rs` change first, then a version bump here.
-The MCP server inherits whichever toolchain the consumer's Lake project pins, provided it sits inside the `lean-rs`
-support window declared by [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain).
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker` 0.1.7 (which transitively pins `lean-rs` / `lean-rs-host` 0.1.7). The MCP
+server inherits whichever toolchain the consumer's Lake project pins, provided it sits inside the `lean-rs` support
+window declared by [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping
+the supported toolchain is a `lean-rs` change first, then a version bump here.
 
 ## License
 

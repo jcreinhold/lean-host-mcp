@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use lean_rs_host::LeanDeclarationFilter;
+use lean_rs_worker::LeanWorkerDeclarationFilter;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -150,7 +150,7 @@ impl DeclarationIndex {
     /// `SQLite` failures.
     pub async fn rebuild(&self, host: &SessionHost, imports: Vec<String>, fingerprint: String) -> Result<usize> {
         let names = host
-            .list_declarations_strings(LeanDeclarationFilter::default(), imports.clone())
+            .list_declarations_strings(LeanWorkerDeclarationFilter::default(), imports.clone())
             .await?;
         let rows = host.describe_bulk(names, imports).await?;
         self.replace_all(&rows, &fingerprint)

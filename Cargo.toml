@@ -19,6 +19,26 @@ path = "src/lib.rs"
 name = "lean-host-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "lean-host-mcp-worker"
+path = "src/bin/worker.rs"
+
+[[bench]]
+name = "worker_roundtrip"
+harness = false
+
+[[bench]]
+name = "worker_cold_spawn"
+harness = false
+
+[[bench]]
+name = "process_module_owned"
+harness = false
+
+[[bench]]
+name = "position_lookup_after_cache_warm"
+harness = false
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -38,10 +58,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
-lean-rs = "0.1"
-lean-rs-host = "0.1"
+lean-rs-worker = "0.1.7"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
 

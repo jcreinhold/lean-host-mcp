@@ -12,7 +12,7 @@
 // pass-by-value flag is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
-use lean_rs_host::meta::LeanMetaTransparency;
+use lean_rs_worker::LeanWorkerMetaTransparency;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -21,9 +21,9 @@ use crate::error::Result;
 use crate::session::{DeclarationRow, ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome};
 use crate::tools::{ToolContext, new_session_id};
 
-/// Reducibility view for `is_def_eq`. Mirrors `LeanMetaTransparency`
-/// upstream; kept local so the `#[non_exhaustive]` upstream enum doesn't
-/// leak through the wire schema.
+/// Reducibility view for `is_def_eq`. Mirrors `LeanWorkerMetaTransparency`
+/// from the worker layer; kept local so the wire schema doesn't depend on
+/// `lean-rs-worker` derives.
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Transparency {
@@ -35,12 +35,12 @@ pub enum Transparency {
 }
 
 impl Transparency {
-    fn to_lean(self) -> LeanMetaTransparency {
+    fn to_worker(self) -> LeanWorkerMetaTransparency {
         match self {
-            Self::Default => LeanMetaTransparency::Default,
-            Self::Reducible => LeanMetaTransparency::Reducible,
-            Self::Instances => LeanMetaTransparency::Instances,
-            Self::All => LeanMetaTransparency::All,
+            Self::Default => LeanWorkerMetaTransparency::Default,
+            Self::Reducible => LeanWorkerMetaTransparency::Reducible,
+            Self::Instances => LeanWorkerMetaTransparency::Instances,
+            Self::All => LeanWorkerMetaTransparency::All,
         }
     }
 }
@@ -161,7 +161,7 @@ pub struct IsDefEqRequest {
 /// Infrastructure failures only.
 pub async fn is_def_eq(ctx: &ToolContext, req: IsDefEqRequest) -> Result<Response<MetaOutcome>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let transparency = req.transparency.unwrap_or_default().to_lean();
+    let transparency = req.transparency.unwrap_or_default().to_worker();
     let outcome = ctx.host.is_def_eq(req.lhs, req.rhs, req.imports, transparency).await?;
     Ok(Response::ok(outcome, freshness))
 }

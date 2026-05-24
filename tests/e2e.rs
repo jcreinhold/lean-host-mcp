@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 
 use lean_host_mcp::SessionHost;
-use lean_rs_host as _;
 
 fn fixture_env() -> Option<(PathBuf, String, String)> {
     let root = std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok()?;
@@ -225,7 +224,7 @@ async fn hover_by_name_populates_type_signature() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn process_module_projects_real_file_with_header() {
-    use lean_rs_host::host::process::ProcessModuleOutcome;
+    use lean_rs_worker::LeanWorkerProcessModuleOutcome;
 
     let Some((root, pkg, lib)) = fixture_env() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -239,25 +238,25 @@ async fn process_module_projects_real_file_with_header() {
     let outcome = host.process_module(source).await.expect("process_module");
 
     match outcome {
-        ProcessModuleOutcome::Ok { file, imports } | ProcessModuleOutcome::MissingImports { file, imports, .. } => {
+        LeanWorkerProcessModuleOutcome::Ok { file, imports }
+        | LeanWorkerProcessModuleOutcome::MissingImports { file, imports, .. } => {
             assert!(!file.tactics.is_empty(), "fixture file must record at least one tactic");
             assert!(!file.terms.is_empty(), "fixture file must record at least one term");
             assert!(imports.iter().any(|m| m == "Lean"), "header must include `import Lean`");
         }
-        ProcessModuleOutcome::HeaderParseFailed { diagnostics } => {
+        LeanWorkerProcessModuleOutcome::HeaderParseFailed { diagnostics } => {
             panic!("fixture file header should parse; got {diagnostics:?}");
         }
-        ProcessModuleOutcome::Unsupported => {
+        LeanWorkerProcessModuleOutcome::Unsupported => {
             panic!("fixture capability dylib must export process_module_with_info_tree");
         }
-        _ => panic!("unknown ProcessModuleOutcome variant"),
     }
 }
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn process_file_projects_tactic_and_term_info() {
-    use lean_rs_host::host::process::ProcessFileOutcome;
+    use lean_rs_worker::LeanWorkerProcessFileOutcome;
 
     let Some((root, pkg, lib)) = fixture_env() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -277,7 +276,7 @@ async fn process_file_projects_tactic_and_term_info() {
         .process_file(source.to_owned(), vec!["LeanRsFixture.Handles".into()])
         .await
         .expect("process_file");
-    let ProcessFileOutcome::Processed(file) = outcome else {
+    let LeanWorkerProcessFileOutcome::Processed { file } = outcome else {
         panic!("fixture capability dylib must export process_with_info_tree");
     };
 
@@ -312,8 +311,7 @@ async fn process_file_projects_tactic_and_term_info() {
     // robust than hardcoding cursor positions against the elaborator's
     // exact recording strategy.
     let tactic = file.tactics.first().expect("at least one tactic node in fixture");
-    let hit = file
-        .tactic_at(tactic.start_line, tactic.start_column)
+    let hit = lean_host_mcp::cache::tactic_at(&file, tactic.start_line, tactic.start_column)
         .expect("tactic_at must find a node at its own start position");
     assert_eq!(hit.start_line, tactic.start_line);
     assert!(
@@ -323,7 +321,7 @@ async fn process_file_projects_tactic_and_term_info() {
 
     let term = file.terms.first().expect("at least one term node in fixture");
     assert!(
-        file.term_at(term.start_line, term.start_column).is_some(),
+        lean_host_mcp::cache::term_at(&file, term.start_line, term.start_column).is_some(),
         "term_at must find a node at the first recorded term position"
     );
 

@@ -14,6 +14,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/bin/worker.rs");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=LEAN_SYSROOT");
     println!("cargo:rerun-if-env-changed=PATH");
