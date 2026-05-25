@@ -37,17 +37,11 @@ pub struct ToolContext {
     pub broker: Arc<ProjectBroker>,
 }
 
-/// Stamp a freshly generated session id onto a project-derived
-/// [`Freshness`]. Kept here so every tool's body opens with the same
-/// one-liner instead of repeating the field mutation.
+/// Build the [`Freshness`] envelope for a tool response. `session_id` is
+/// the project actor's stable identity — two calls to the same project see
+/// the same value; eviction or manifest invalidation changes it.
 pub(crate) fn freshness_for(project: &LeanProject, imports: &[String]) -> Freshness {
-    let mut fr = project.freshness(imports);
-    fr.session_id = new_session_id();
-    fr
-}
-
-pub fn new_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    project.freshness(imports)
 }
 
 /// Directory names skipped during `.lean` file enumeration. Shared between

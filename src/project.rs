@@ -24,7 +24,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lean_rs_worker::{LeanWorkerCapability, LeanWorkerCapabilityBuilder, LeanWorkerChild};
 use parking_lot::Mutex;
@@ -57,10 +57,16 @@ pub struct LeanProject {
     library: String,
     manifest_hash: String,
     default_imports: Vec<String>,
+    /// Identity of *this* spawned project actor. Allocated once in
+    /// [`Self::open`] and surfaced via [`Freshness::session_id`]. Constant
+    /// across every tool call routed to this project; changes only when the
+    /// broker evicts and re-spawns. Clients compare against the previous
+    /// `session_id` to detect a silent re-spawn (LRU eviction, idle reaper,
+    /// manifest invalidation).
+    session_id: String,
     actor_tx: Mutex<Option<mpsc::Sender<Job>>>,
     index: Arc<DeclarationIndex>,
     cache: ProcessedFileCache,
-    last_used: Mutex<Instant>,
 }
 
 impl std::fmt::Debug for LeanProject {
@@ -131,10 +137,10 @@ impl LeanProject {
             library: meta.library,
             manifest_hash: meta.manifest_hash,
             default_imports: meta.default_imports,
+            session_id: uuid::Uuid::new_v4().to_string(),
             actor_tx: Mutex::new(Some(actor_tx)),
             index,
             cache: ProcessedFileCache::with_capacity(cache_cap),
-            last_used: Mutex::new(Instant::now()),
         }))
     }
 
@@ -152,7 +158,6 @@ impl LeanProject {
         F: FnOnce(&mut LeanWorkerCapability) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        *self.last_used.lock() = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
         let boxed: Job = Box::new(move |cap| {
             let _ = reply_tx.send(job(cap));
@@ -187,6 +192,12 @@ impl LeanProject {
         &self.manifest_hash
     }
 
+    /// Stable identity of this project actor. See [`Self::session_id`] field
+    /// docs for the semantics.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     pub fn default_imports(&self) -> &[String] {
         &self.default_imports
     }
@@ -216,15 +227,17 @@ impl LeanProject {
         }
     }
 
-    /// Build a [`Freshness`] for a request. The `session_id` field is
-    /// filled in by the caller (each tool call generates its own UUID).
+    /// Build a [`Freshness`] for a request. `session_id` is this project's
+    /// stable identity (see [`Self::session_id`]); two calls routed to the
+    /// same project see the same value, and it changes only when the broker
+    /// evicts and re-spawns.
     #[must_use]
     pub fn freshness(&self, request_imports: &[String]) -> Freshness {
         Freshness {
             project_root: self.canonical_root.to_string_lossy().into_owned(),
             project_hash: self.manifest_hash.clone(),
             imports: self.effective_imports(request_imports),
-            session_id: String::new(),
+            session_id: self.session_id.clone(),
             lean_toolchain: self.toolchain.clone(),
         }
     }

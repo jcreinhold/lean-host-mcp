@@ -33,6 +33,8 @@ fn open_ctx() -> ToolContext {
         config_default: None,
         env_default: Some(root.clone()),
         cwd: root,
+        max_projects: BrokerConfig::default_max_projects(),
+        idle_timeout: BrokerConfig::default_idle_timeout(),
     });
     ToolContext { broker }
 }

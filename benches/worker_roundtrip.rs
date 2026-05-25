@@ -33,6 +33,8 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
         config_default: None,
         env_default: Some(root.clone()),
         cwd: root,
+        max_projects: BrokerConfig::default_max_projects(),
+        idle_timeout: BrokerConfig::default_idle_timeout(),
     });
     let ctx = ToolContext { broker };
     let term = "Nat.succ Nat.zero".to_owned();

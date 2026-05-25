@@ -2,11 +2,18 @@
 
 Every tool returns the same outer envelope (see the README). Only `result` differs; that's what this document records.
 
+The envelope's `freshness.session_id` is the **stable identity of the project actor that served the call** — two
+responses with the same `(project_root, session_id)` pair were served by the same in-process worker. `session_id` only
+changes when the broker re-spawns a project: LRU eviction (pool full, project not used recently), idle eviction
+(`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`), or manifest invalidation (`lake-manifest.json` changed on disk). Clients can detect
+"my project was restarted between these two calls" by comparing `session_id` alone.
+
 ## Per-tool routing field
 
-Every request schema accepts an optional `project` field — an absolute path to a Lake-project root. When set, the server
-routes that single call to that project (the broker hot-swaps the underlying `LeanProject` if it differs from the
-current default). When omitted, the server resolves the project via the standard chain
+Every request schema accepts an optional `project` field — an absolute path to a Lake-project root. When set, the
+server routes that single call to that project; the broker keeps up to `LEAN_HOST_MCP_MAX_PROJECTS` (default 4)
+projects resident concurrently, so per-call routing does not cost a re-spawn unless the pool is full and the requested
+project was recently evicted. When omitted, the server resolves the project via the standard chain
 *env (`LEAN_HOST_MCP_PROJECT`) → cwd-walk → `~/.config/lean-host-mcp/config.toml` `primary_project`*.
 
 ```jsonc

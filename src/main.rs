@@ -63,12 +63,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let env_default = cli.lake_root;
     let config_default = read_config_default();
     let cwd = std::env::current_dir()?;
+    let (max_projects, idle_timeout) = BrokerConfig::pool_from_env()?;
 
     tracing::info!(
         env_default = ?env_default,
         config_default = ?config_default,
         cwd = %cwd.display(),
         cache_dir = %cache_dir.display(),
+        max_projects = %max_projects,
+        idle_timeout_secs = idle_timeout.as_secs(),
         "starting lean-host-mcp",
     );
 
@@ -77,6 +80,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         config_default,
         env_default,
         cwd,
+        max_projects,
+        idle_timeout,
     });
     let service = LeanHostService::new(broker);
     let server = service.serve(stdio()).await?;

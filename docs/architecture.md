@@ -18,8 +18,30 @@ bin/worker.rs   2-line entry: lean_rs_worker::run_worker_child_stdio()
 
 `project.rs` is the only path to `lean-rs-worker` (the parent never sees `lean-rs` or `lean-rs-host` directly — those
 live inside the worker child). `index.rs` and `cache.rs` are owned by `LeanProject` and serve the tools that don't want
-to round-trip through Lean on every call. There is one `LeanProject` per server today; the abstraction is shaped for
-later multi-project dispatch through a broker layer.
+to round-trip through Lean on every call. A `ProjectBroker` (`broker.rs`) maintains an LRU pool of `Arc<LeanProject>`
+so one server can multiplex several Lake projects in the same Claude session.
+
+## The broker: pool, invalidation, identity
+
+`ProjectBroker` is the only thing the tool layer touches when it needs a `LeanProject`. Three knobs:
+
+- **`max_projects`** (`LEAN_HOST_MCP_MAX_PROJECTS`, default 4). The pool is an `lru::LruCache<PathBuf,
+  Arc<LeanProject>>`; a miss when the cache is full evicts the LRU entry, which is `shutdown()`'d before the new project
+  is spawned.
+- **`idle_timeout`** (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`, default 600). A `tokio::spawn`'d reaper task held by `Weak`
+  fires every 60 s and drops entries whose `last_used` is past the window. Set to 0 to disable.
+- **Manifest invalidation.** Every cache hit re-fingerprints `lake-manifest.json`; a mismatch evicts and re-opens. Cost
+  is one ≤ 50 KB SHA-256 per tool call.
+
+**The mutex is never held across `LeanProject::open` or `project.submit`.** The miss path drops the broker lock,
+spawns the new project, then reacquires the lock briefly to insert. Concurrent misses for the same path race on insert
+and the loser's project is shut down on the dispatch path; concurrent calls against different projects parallelize
+fully.
+
+Identity travels through `Freshness.session_id`: it's the project actor's UUID, allocated once at `LeanProject::open`
+and stable for that actor's lifetime. The only events that change it are the three eviction triggers above. Clients can
+detect "my project was silently restarted" by comparing `session_id` across calls — that's the one observable
+side-effect of the pool decisions, and the multi-project tests use it as their identity signal.
 
 ## Toolchain linkage
 

@@ -53,7 +53,14 @@ Project resolution chain (used by every tool call that does not pass its own `pr
 Per call, an MCP client can pass `project="/abs/path/to/other/lake/root"` to route that single call elsewhere — useful
 when a single client surveys several projects.
 
-Environment vars: `LEAN_HOST_MCP_PROJECT`, `LEAN_HOST_MCP_CACHE_DIR`.
+Environment vars:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `LEAN_HOST_MCP_PROJECT` | Default Lake root for calls without a `project=` argument. | unset |
+| `LEAN_HOST_MCP_CACHE_DIR` | SQLite declaration-index store. | `$XDG_CACHE_HOME/lean-host-mcp` |
+| `LEAN_HOST_MCP_MAX_PROJECTS` | Max [`LeanProject`]s kept resident; oldest is evicted on overflow. | `4` |
+| `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Window after which an unused project is reaped. `0` disables. | `600` |
 
 ## Wiring into Claude Code
 
@@ -80,7 +87,7 @@ Every tool returns the same outer shape; only `result` varies.
     "project_root":   "/abs/path",
     "project_hash":   "sha256-hex of lake-manifest.json",
     "imports":        ["Mod.A", "..."],
-    "session_id":     "uuid",
+    "session_id":     "uuid",          // stable identity of the project actor; changes only on re-spawn (LRU/idle/manifest)
     "lean_toolchain": "leanprover/lean4:v4.29.1"
   },
   "warnings":     ["..."],     // omitted when empty

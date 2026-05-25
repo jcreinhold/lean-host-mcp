@@ -33,6 +33,8 @@ fn open_ctx(root: &std::path::Path) -> ToolContext {
         config_default: None,
         env_default: Some(root.to_path_buf()),
         cwd: root.to_path_buf(),
+        max_projects: BrokerConfig::default_max_projects(),
+        idle_timeout: BrokerConfig::default_idle_timeout(),
     });
     ToolContext { broker }
 }
