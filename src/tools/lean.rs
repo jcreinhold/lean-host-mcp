@@ -12,17 +12,21 @@
 // pass-by-value flag is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
+use std::sync::Arc;
+
 use lean_rs_worker::{LeanWorkerDeclarationFilter, LeanWorkerElabOptions, LeanWorkerMetaTransparency};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::Result;
+use crate::project::LeanProject;
 use crate::projections::{
     DeclarationRow, ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome, map_worker_err, project_declaration_row,
     project_elab_result, project_kernel_result, project_meta_bool, project_meta_rendered,
 };
-use crate::tools::{ToolContext, new_session_id};
+use crate::tools::{ToolContext, freshness_for};
 
 /// Reducibility view for `is_def_eq`. Mirrors `LeanWorkerMetaTransparency`
 /// from the worker layer; kept local so the wire schema doesn't depend on
@@ -56,6 +60,11 @@ pub struct ElaborateRequest {
     /// Module imports to elaborate against. Empty = use server defaults.
     #[serde(default)]
     pub imports: Vec<String>,
+    /// Optional explicit project (absolute path to Lake root). When
+    /// omitted, the server resolves the project via
+    /// env → cwd-walk → config default.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -71,26 +80,30 @@ pub enum ElaborateResult {
 /// not reachable). Lean-reported elaboration failures travel in the
 /// `Failed` variant of the result.
 pub async fn elaborate(ctx: &ToolContext, req: ElaborateRequest) -> Result<Response<ElaborateResult>> {
-    let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let imports = ctx.project.effective_imports(&req.imports);
-    let source = req.source;
-    let outcome = ctx
-        .project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let result = session
-                .elaborate(&source, &elab_opts(), None, None)
-                .map_err(map_worker_err)?;
-            Ok(project_elab_result(result))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &req.imports);
+            let imports = project.effective_imports(&req.imports);
+            let source = req.source;
+            let outcome = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(imports, None, None)
+                        .map_err(map_worker_err)?;
+                    let result = session
+                        .elaborate(&source, &elab_opts(), None, None)
+                        .map_err(map_worker_err)?;
+                    Ok(project_elab_result(result))
+                })
+                .await?;
+            let result = match outcome {
+                Ok(success) => ElaborateResult::Ok(success),
+                Err(failure) => ElaborateResult::Failed(failure),
+            };
+            Ok(Response::ok(result, freshness))
         })
-        .await?;
-    let result = match outcome {
-        Ok(success) => ElaborateResult::Ok(success),
-        Err(failure) => ElaborateResult::Failed(failure),
-    };
-    Ok(Response::ok(result, freshness))
+        .await
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -99,28 +112,34 @@ pub struct KernelCheckRequest {
     pub source: String,
     #[serde(default)]
     pub imports: Vec<String>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// # Errors
 ///
 /// Infrastructure failures only; Lean rejections travel as `KernelOutcome::status`.
 pub async fn kernel_check(ctx: &ToolContext, req: KernelCheckRequest) -> Result<Response<KernelOutcome>> {
-    let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let imports = ctx.project.effective_imports(&req.imports);
-    let source = req.source;
-    let outcome = ctx
-        .project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let result = session
-                .kernel_check(&source, &elab_opts(), None, None)
-                .map_err(map_worker_err)?;
-            Ok(project_kernel_result(result))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &req.imports);
+            let imports = project.effective_imports(&req.imports);
+            let source = req.source;
+            let outcome = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(imports, None, None)
+                        .map_err(map_worker_err)?;
+                    let result = session
+                        .kernel_check(&source, &elab_opts(), None, None)
+                        .map_err(map_worker_err)?;
+                    Ok(project_kernel_result(result))
+                })
+                .await?;
+            Ok(Response::ok(outcome, freshness))
         })
-        .await?;
-    Ok(Response::ok(outcome, freshness))
+        .await
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -129,31 +148,37 @@ pub struct InferTypeRequest {
     pub term: String,
     #[serde(default)]
     pub imports: Vec<String>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// # Errors
 ///
 /// Infrastructure failures only; meta-domain failures travel as `MetaOutcome::status`.
 pub async fn infer_type(ctx: &ToolContext, req: InferTypeRequest) -> Result<Response<MetaOutcome>> {
-    let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let imports = ctx.project.effective_imports(&req.imports);
-    let term = req.term;
-    let outcome = ctx
-        .project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let result = session
-                .infer_type(&term, &elab_opts(), None, None)
-                .map_err(map_worker_err)?;
-            Ok(project_meta_rendered(result))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &req.imports);
+            let imports = project.effective_imports(&req.imports);
+            let term = req.term;
+            let outcome = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(imports, None, None)
+                        .map_err(map_worker_err)?;
+                    let result = session
+                        .infer_type(&term, &elab_opts(), None, None)
+                        .map_err(map_worker_err)?;
+                    Ok(project_meta_rendered(result))
+                })
+                .await?;
+            Ok(attach_render_warning(
+                Response::ok(outcome.clone(), freshness),
+                &outcome,
+            ))
         })
-        .await?;
-    Ok(attach_render_warning(
-        Response::ok(outcome.clone(), freshness),
-        &outcome,
-    ))
+        .await
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -162,31 +187,37 @@ pub struct WhnfRequest {
     pub term: String,
     #[serde(default)]
     pub imports: Vec<String>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// # Errors
 ///
 /// Infrastructure failures only.
 pub async fn whnf(ctx: &ToolContext, req: WhnfRequest) -> Result<Response<MetaOutcome>> {
-    let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let imports = ctx.project.effective_imports(&req.imports);
-    let term = req.term;
-    let outcome = ctx
-        .project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let result = session
-                .whnf(&term, &elab_opts(), None, None)
-                .map_err(map_worker_err)?;
-            Ok(project_meta_rendered(result))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &req.imports);
+            let imports = project.effective_imports(&req.imports);
+            let term = req.term;
+            let outcome = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(imports, None, None)
+                        .map_err(map_worker_err)?;
+                    let result = session
+                        .whnf(&term, &elab_opts(), None, None)
+                        .map_err(map_worker_err)?;
+                    Ok(project_meta_rendered(result))
+                })
+                .await?;
+            Ok(attach_render_warning(
+                Response::ok(outcome.clone(), freshness),
+                &outcome,
+            ))
         })
-        .await?;
-    Ok(attach_render_warning(
-        Response::ok(outcome.clone(), freshness),
-        &outcome,
-    ))
+        .await
 }
 
 /// Propagate the worker's `raw_fallback_used` flag into an envelope
@@ -210,30 +241,36 @@ pub struct IsDefEqRequest {
     /// `instances` | `all`.
     #[serde(default)]
     pub transparency: Option<Transparency>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// # Errors
 ///
 /// Infrastructure failures only.
 pub async fn is_def_eq(ctx: &ToolContext, req: IsDefEqRequest) -> Result<Response<MetaOutcome>> {
-    let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let transparency = req.transparency.unwrap_or_default().to_worker();
-    let imports = ctx.project.effective_imports(&req.imports);
-    let lhs = req.lhs;
-    let rhs = req.rhs;
-    let outcome = ctx
-        .project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let result = session
-                .is_def_eq(&lhs, &rhs, transparency, &elab_opts(), None, None)
-                .map_err(map_worker_err)?;
-            Ok(project_meta_bool(result))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &req.imports);
+            let transparency = req.transparency.unwrap_or_default().to_worker();
+            let imports = project.effective_imports(&req.imports);
+            let lhs = req.lhs;
+            let rhs = req.rhs;
+            let outcome = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(imports, None, None)
+                        .map_err(map_worker_err)?;
+                    let result = session
+                        .is_def_eq(&lhs, &rhs, transparency, &elab_opts(), None, None)
+                        .map_err(map_worker_err)?;
+                    Ok(project_meta_bool(result))
+                })
+                .await?;
+            Ok(Response::ok(outcome, freshness))
         })
-        .await?;
-    Ok(Response::ok(outcome, freshness))
+        .await
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -242,6 +279,8 @@ pub struct HoverByNameRequest {
     pub name: String,
     #[serde(default)]
     pub imports: Vec<String>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -255,24 +294,28 @@ pub enum HoverByNameResult {
 ///
 /// Infrastructure failures only; missing names return `HoverByNameResult::Missing`.
 pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result<Response<HoverByNameResult>> {
-    let freshness = ctx.freshness(&req.imports, &new_session_id());
-    let imports = ctx.project.effective_imports(&req.imports);
-    let name = req.name.clone();
-    let row = ctx
-        .project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let row = session.describe(&name, None, None).map_err(map_worker_err)?;
-            Ok(row.map(project_declaration_row))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &req.imports);
+            let imports = project.effective_imports(&req.imports);
+            let name = req.name.clone();
+            let row = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(imports, None, None)
+                        .map_err(map_worker_err)?;
+                    let row = session.describe(&name, None, None).map_err(map_worker_err)?;
+                    Ok(row.map(project_declaration_row))
+                })
+                .await?;
+            let result = match row {
+                Some(row) => HoverByNameResult::Found(row),
+                None => HoverByNameResult::Missing { name: req.name },
+            };
+            Ok(Response::ok(result, freshness))
         })
-        .await?;
-    let result = match row {
-        Some(row) => HoverByNameResult::Found(row),
-        None => HoverByNameResult::Missing { name: req.name },
-    };
-    Ok(Response::ok(result, freshness))
+        .await
 }
 
 // --- index-tool helpers (called from `tools::index::ensure_index`) ------
@@ -284,11 +327,11 @@ pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result
 ///
 /// Infrastructure failures only.
 pub(crate) async fn list_declarations_strings(
-    ctx: &ToolContext,
+    project: &Arc<LeanProject>,
     filter: LeanWorkerDeclarationFilter,
     imports: Vec<String>,
 ) -> Result<Vec<String>> {
-    ctx.project
+    project
         .submit(move |cap| {
             let mut session = cap
                 .open_session_with_imports(imports, None, None)
@@ -307,14 +350,14 @@ pub(crate) async fn list_declarations_strings(
 ///
 /// Infrastructure failures only.
 pub(crate) async fn describe_bulk(
-    ctx: &ToolContext,
+    project: &Arc<LeanProject>,
     names: Vec<String>,
     imports: Vec<String>,
 ) -> Result<Vec<DeclarationRow>> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    ctx.project
+    project
         .submit(move |cap| {
             let mut session = cap
                 .open_session_with_imports(imports, None, None)

@@ -221,7 +221,8 @@ impl LeanProject {
     #[must_use]
     pub fn freshness(&self, request_imports: &[String]) -> Freshness {
         Freshness {
-            lake_root: self.canonical_root.to_string_lossy().into_owned(),
+            project_root: self.canonical_root.to_string_lossy().into_owned(),
+            project_hash: self.manifest_hash.clone(),
             imports: self.effective_imports(request_imports),
             session_id: String::new(),
             lean_toolchain: self.toolchain.clone(),

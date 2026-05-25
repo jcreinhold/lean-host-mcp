@@ -37,11 +37,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use crate::broker::ProjectHint;
 use crate::cache::{self, ProcessedFileCache, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
+use crate::project::LeanProject;
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
-use crate::tools::{ToolContext, is_ignored_dir, new_session_id};
+use crate::tools::{ToolContext, freshness_for, is_ignored_dir};
 
 /// Hard cap on the number of references aggregated in
 /// [`references_of_name`]. Matches `project_scan`'s cap so the two
@@ -60,12 +62,17 @@ pub struct SourceSpan {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GoalAtPositionRequest {
-    /// Path to a `.lean` file. Resolved against `lake_root` if relative.
+    /// Path to a `.lean` file. Resolved against the resolved project root
+    /// if relative.
     pub file: PathBuf,
     /// 1-indexed line.
     pub line: u32,
     /// 1-indexed column.
     pub column: u32,
+    /// Optional explicit project (absolute path to Lake root). When
+    /// omitted, the server resolves via env → cwd-walk → config default.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -89,33 +96,38 @@ pub enum GoalAtPositionResult {
 /// Returns `ServerError::Io` when the file cannot be read, and propagates
 /// `ServerError::Lean` from the underlying `process_module` call.
 pub async fn goal_at_position(ctx: &ToolContext, req: GoalAtPositionRequest) -> Result<Response<GoalAtPositionResult>> {
-    let freshness = ctx.freshness(&[], &new_session_id());
-    let outcome = ensure_processed(ctx, &req.file).await?;
-    let (file, fresh, missing) = match outcome {
-        EnsureOutcome::Ready {
-            file,
-            freshly_processed,
-            missing_imports,
-        } => (file, freshly_processed, missing_imports),
-        EnsureOutcome::HeaderParseFailed { diagnostics } => {
-            return Ok(Response::ok(
-                GoalAtPositionResult::HeaderParseFailed { diagnostics },
-                freshness,
-            ));
-        }
-        EnsureOutcome::Unsupported => {
-            return Ok(Response::ok(GoalAtPositionResult::Unsupported, freshness));
-        }
-    };
-    let result = match cache::tactic_at(&file, req.line, req.column) {
-        Some(node) => GoalAtPositionResult::Goal {
-            goals_before: node.goals_before.clone(),
-            goals_after: node.goals_after.clone(),
-            span: span_of_tactic(node),
-        },
-        None => GoalAtPositionResult::NoTacticContext,
-    };
-    Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &[]);
+            let outcome = ensure_processed(&project, &req.file).await?;
+            let (file, fresh, missing) = match outcome {
+                EnsureOutcome::Ready {
+                    file,
+                    freshly_processed,
+                    missing_imports,
+                } => (file, freshly_processed, missing_imports),
+                EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                    return Ok(Response::ok(
+                        GoalAtPositionResult::HeaderParseFailed { diagnostics },
+                        freshness,
+                    ));
+                }
+                EnsureOutcome::Unsupported => {
+                    return Ok(Response::ok(GoalAtPositionResult::Unsupported, freshness));
+                }
+            };
+            let result = match cache::tactic_at(&file, req.line, req.column) {
+                Some(node) => GoalAtPositionResult::Goal {
+                    goals_before: node.goals_before.clone(),
+                    goals_after: node.goals_after.clone(),
+                    span: span_of_tactic(node),
+                },
+                None => GoalAtPositionResult::NoTacticContext,
+            };
+            Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+        })
+        .await
 }
 
 // --- type_at_position --------------------------------------------------
@@ -125,6 +137,8 @@ pub struct TypeAtPositionRequest {
     pub file: PathBuf,
     pub line: u32,
     pub column: u32,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -152,34 +166,39 @@ pub enum TypeAtPositionResult {
 ///
 /// As [`goal_at_position`].
 pub async fn type_at_position(ctx: &ToolContext, req: TypeAtPositionRequest) -> Result<Response<TypeAtPositionResult>> {
-    let freshness = ctx.freshness(&[], &new_session_id());
-    let outcome = ensure_processed(ctx, &req.file).await?;
-    let (file, fresh, missing) = match outcome {
-        EnsureOutcome::Ready {
-            file,
-            freshly_processed,
-            missing_imports,
-        } => (file, freshly_processed, missing_imports),
-        EnsureOutcome::HeaderParseFailed { diagnostics } => {
-            return Ok(Response::ok(
-                TypeAtPositionResult::HeaderParseFailed { diagnostics },
-                freshness,
-            ));
-        }
-        EnsureOutcome::Unsupported => {
-            return Ok(Response::ok(TypeAtPositionResult::Unsupported, freshness));
-        }
-    };
-    let result = match cache::term_at(&file, req.line, req.column) {
-        Some(node) => TypeAtPositionResult::Term {
-            expr: node.expr_str.clone(),
-            type_str: node.type_str.clone(),
-            expected_type: node.expected_type_str.clone(),
-            span: span_of_term(node),
-        },
-        None => TypeAtPositionResult::NoTerm,
-    };
-    Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &[]);
+            let outcome = ensure_processed(&project, &req.file).await?;
+            let (file, fresh, missing) = match outcome {
+                EnsureOutcome::Ready {
+                    file,
+                    freshly_processed,
+                    missing_imports,
+                } => (file, freshly_processed, missing_imports),
+                EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                    return Ok(Response::ok(
+                        TypeAtPositionResult::HeaderParseFailed { diagnostics },
+                        freshness,
+                    ));
+                }
+                EnsureOutcome::Unsupported => {
+                    return Ok(Response::ok(TypeAtPositionResult::Unsupported, freshness));
+                }
+            };
+            let result = match cache::term_at(&file, req.line, req.column) {
+                Some(node) => TypeAtPositionResult::Term {
+                    expr: node.expr_str.clone(),
+                    type_str: node.type_str.clone(),
+                    expected_type: node.expected_type_str.clone(),
+                    span: span_of_term(node),
+                },
+                None => TypeAtPositionResult::NoTerm,
+            };
+            Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+        })
+        .await
 }
 
 // --- references_of_name ------------------------------------------------
@@ -189,9 +208,12 @@ pub struct ReferencesOfNameRequest {
     /// Fully-qualified Lean name as the elaborator records it
     /// (e.g. `"Nat.add"`). No normalisation.
     pub name: String,
-    /// Files to search. Empty = walk every `.lean` file under `lake_root`.
+    /// Files to search. Empty = walk every `.lean` file under the
+    /// resolved project root.
     #[serde(default)]
     pub files: Vec<PathBuf>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -253,89 +275,97 @@ pub async fn references_of_name(
     ctx: &ToolContext,
     req: ReferencesOfNameRequest,
 ) -> Result<Response<ReferencesOfNameResult>> {
-    let freshness = ctx.freshness(&[], &new_session_id());
-    let root = ctx.project.canonical_root().to_path_buf();
-    let files = if req.files.is_empty() {
-        enumerate_lean_files(&root)
-    } else {
-        req.files.iter().map(|p| resolve_path(&root, p)).collect()
-    };
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &[]);
+            let root = project.canonical_root().to_path_buf();
+            let files = if req.files.is_empty() {
+                enumerate_lean_files(&root)
+            } else {
+                req.files.iter().map(|p| resolve_path(&root, p)).collect()
+            };
 
-    let mut hits: Vec<ReferenceHit> = Vec::new();
-    let mut unsupported_files: Vec<String> = Vec::new();
-    let mut header_parse_failed_files: Vec<HeaderParseFailedFile> = Vec::new();
-    let mut missing_imports_files: Vec<MissingImportsFile> = Vec::new();
-    let mut truncated = false;
-    let mut any_freshly_processed = false;
+            let mut hits: Vec<ReferenceHit> = Vec::new();
+            let mut unsupported_files: Vec<String> = Vec::new();
+            let mut header_parse_failed_files: Vec<HeaderParseFailedFile> = Vec::new();
+            let mut missing_imports_files: Vec<MissingImportsFile> = Vec::new();
+            let mut truncated = false;
+            let mut any_freshly_processed = false;
 
-    'outer: for path in files {
-        let display = display_path(&root, &path);
-        match ensure_processed(ctx, &path).await? {
-            EnsureOutcome::Ready {
-                file,
-                freshly_processed,
-                missing_imports,
-            } => {
-                if freshly_processed {
-                    any_freshly_processed = true;
-                }
-                if !missing_imports.is_empty() {
-                    missing_imports_files.push(MissingImportsFile {
-                        file: display.clone(),
-                        missing: missing_imports,
-                    });
-                }
-                for node in cache::references_of(&file, &req.name) {
-                    if hits.len() >= MAX_REFERENCES {
-                        truncated = true;
-                        break 'outer;
+            'outer: for path in files {
+                let display = display_path(&root, &path);
+                match ensure_processed(&project, &path).await? {
+                    EnsureOutcome::Ready {
+                        file,
+                        freshly_processed,
+                        missing_imports,
+                    } => {
+                        if freshly_processed {
+                            any_freshly_processed = true;
+                        }
+                        if !missing_imports.is_empty() {
+                            missing_imports_files.push(MissingImportsFile {
+                                file: display.clone(),
+                                missing: missing_imports,
+                            });
+                        }
+                        for node in cache::references_of(&file, &req.name) {
+                            if hits.len() >= MAX_REFERENCES {
+                                truncated = true;
+                                break 'outer;
+                            }
+                            hits.push(project_reference(&display, node));
+                        }
                     }
-                    hits.push(project_reference(&display, node));
+                    EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                        header_parse_failed_files.push(HeaderParseFailedFile {
+                            file: display,
+                            diagnostics,
+                        });
+                    }
+                    EnsureOutcome::Unsupported => {
+                        unsupported_files.push(display);
+                    }
                 }
             }
-            EnsureOutcome::HeaderParseFailed { diagnostics } => {
-                header_parse_failed_files.push(HeaderParseFailedFile {
-                    file: display,
-                    diagnostics,
-                });
-            }
-            EnsureOutcome::Unsupported => {
-                unsupported_files.push(display);
-            }
-        }
-    }
 
-    hits.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then(a.line.cmp(&b.line))
-            .then(a.column.cmp(&b.column))
-    });
+            hits.sort_by(|a, b| {
+                a.file
+                    .cmp(&b.file)
+                    .then(a.line.cmp(&b.line))
+                    .then(a.column.cmp(&b.column))
+            });
 
-    let result = ReferencesOfNameResult {
-        references: hits,
-        truncated,
-        unsupported_files,
-        header_parse_failed_files,
-        missing_imports_files,
-    };
-    // `references_of_name` accumulates per-file `MissingImports` into the
-    // result sidebar rather than the envelope warnings—the single-file
-    // tools surface it as a warning, but a project-wide walk against a
-    // dozen mismatched files would drown the envelope.
-    Ok(attach_envelope_notes(
-        Response::ok(result, freshness),
-        any_freshly_processed,
-        &[],
-    ))
+            let result = ReferencesOfNameResult {
+                references: hits,
+                truncated,
+                unsupported_files,
+                header_parse_failed_files,
+                missing_imports_files,
+            };
+            // `references_of_name` accumulates per-file `MissingImports` into the
+            // result sidebar rather than the envelope warnings—the single-file
+            // tools surface it as a warning, but a project-wide walk against a
+            // dozen mismatched files would drown the envelope.
+            Ok(attach_envelope_notes(
+                Response::ok(result, freshness),
+                any_freshly_processed,
+                &[],
+            ))
+        })
+        .await
 }
 
 // --- file_diagnostics --------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FileDiagnosticsRequest {
-    /// Path to a `.lean` file. Resolved against `lake_root` if relative.
+    /// Path to a `.lean` file. Resolved against the resolved project root
+    /// if relative.
     pub file: PathBuf,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Per-severity counts attached to every diagnostics-bearing variant. The
@@ -396,40 +426,45 @@ pub async fn file_diagnostics(
     ctx: &ToolContext,
     req: FileDiagnosticsRequest,
 ) -> Result<Response<FileDiagnosticsResult>> {
-    let freshness = ctx.freshness(&[], &new_session_id());
-    let outcome = ensure_processed(ctx, &req.file).await?;
-    let (file, fresh, missing) = match outcome {
-        EnsureOutcome::Ready {
-            file,
-            freshly_processed,
-            missing_imports,
-        } => (file, freshly_processed, missing_imports),
-        EnsureOutcome::HeaderParseFailed { diagnostics } => {
-            let ElabFailure { diagnostics, truncated } = diagnostics;
-            let diagnostics = sort_diagnostics(diagnostics);
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &[]);
+            let outcome = ensure_processed(&project, &req.file).await?;
+            let (file, fresh, missing) = match outcome {
+                EnsureOutcome::Ready {
+                    file,
+                    freshly_processed,
+                    missing_imports,
+                } => (file, freshly_processed, missing_imports),
+                EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                    let ElabFailure { diagnostics, truncated } = diagnostics;
+                    let diagnostics = sort_diagnostics(diagnostics);
+                    let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
+                    return Ok(Response::ok(
+                        FileDiagnosticsResult::HeaderParseFailed {
+                            summary,
+                            diagnostics,
+                            truncated,
+                        },
+                        freshness,
+                    ));
+                }
+                EnsureOutcome::Unsupported => {
+                    return Ok(Response::ok(FileDiagnosticsResult::Unsupported, freshness));
+                }
+            };
+            let projected = project_failure(&file.diagnostics);
+            let diagnostics = sort_diagnostics(projected.diagnostics);
             let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
-            return Ok(Response::ok(
-                FileDiagnosticsResult::HeaderParseFailed {
-                    summary,
-                    diagnostics,
-                    truncated,
-                },
-                freshness,
-            ));
-        }
-        EnsureOutcome::Unsupported => {
-            return Ok(Response::ok(FileDiagnosticsResult::Unsupported, freshness));
-        }
-    };
-    let projected = project_failure(&file.diagnostics);
-    let diagnostics = sort_diagnostics(projected.diagnostics);
-    let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
-    let result = FileDiagnosticsResult::Elaborated {
-        summary,
-        diagnostics,
-        truncated: projected.truncated,
-    };
-    Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+            let result = FileDiagnosticsResult::Elaborated {
+                summary,
+                diagnostics,
+                truncated: projected.truncated,
+            };
+            Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+        })
+        .await
 }
 
 /// Sort diagnostics by `(line, column)` so the wire order is deterministic
@@ -460,11 +495,11 @@ enum EnsureOutcome {
 /// Read `path` from disk, hash, hit-or-fill the cache. On miss, dispatch
 /// `process_module` to the project's worker actor and route the four-arm
 /// outcome.
-async fn ensure_processed(ctx: &ToolContext, path: &Path) -> Result<EnsureOutcome> {
-    let resolved = resolve_path(ctx.project.canonical_root(), path);
+async fn ensure_processed(project: &Arc<LeanProject>, path: &Path) -> Result<EnsureOutcome> {
+    let resolved = resolve_path(project.canonical_root(), path);
     let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
     let hash = hash_bytes(&bytes);
-    let cache: &ProcessedFileCache = ctx.project.cache();
+    let cache: &ProcessedFileCache = project.cache();
     if let Some(file) = cache.get(&resolved, hash) {
         return Ok(EnsureOutcome::Ready {
             file,
@@ -473,7 +508,7 @@ async fn ensure_processed(ctx: &ToolContext, path: &Path) -> Result<EnsureOutcom
         });
     }
     let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
-    match process_module(ctx, source).await? {
+    match process_module(project, source).await? {
         LeanWorkerProcessModuleOutcome::Ok { file, .. } => {
             let arc = Arc::new(file);
             cache.insert(resolved, hash, Arc::clone(&arc));
@@ -543,9 +578,9 @@ fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
 /// Header-aware module processing. Submits a closure to the project's
 /// worker actor that opens a session against the project's default
 /// imports, runs `process_module`, and returns the four-arm outcome.
-async fn process_module(ctx: &ToolContext, source: String) -> Result<LeanWorkerProcessModuleOutcome> {
-    let imports = ctx.project.default_imports().to_vec();
-    ctx.project
+async fn process_module(project: &Arc<LeanProject>, source: String) -> Result<LeanWorkerProcessModuleOutcome> {
+    let imports = project.default_imports().to_vec();
+    project
         .submit(move |cap| {
             let mut session = cap
                 .open_session_with_imports(imports, None, None)

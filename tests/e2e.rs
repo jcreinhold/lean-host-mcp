@@ -19,35 +19,37 @@ use std::path::PathBuf;
 
 use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::lean::{ElaborateRequest, ElaborateResult, HoverByNameRequest, HoverByNameResult, elaborate, hover_by_name};
-use lean_host_mcp::{LakeProjectMeta, LeanProject};
+use lean_host_mcp::{BrokerConfig, ProjectBroker};
 
-fn fixture_env() -> Option<(PathBuf, String, String)> {
-    let root = std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok()?;
-    let pkg = std::env::var("LEAN_HOST_MCP_TEST_PACKAGE").unwrap_or_else(|_| "lean_rs_fixture".into());
-    let lib = std::env::var("LEAN_HOST_MCP_TEST_LIBRARY").unwrap_or_else(|_| "LeanRsFixture".into());
-    Some((PathBuf::from(root), pkg, lib))
+fn fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
 }
 
-fn open_ctx(root: &std::path::Path, pkg: String, lib: String, imports: Vec<String>) -> ToolContext {
-    let meta = LakeProjectMeta::from_cli(root, pkg, lib, imports).expect("meta");
+fn open_ctx(root: &std::path::Path) -> ToolContext {
     let cache_dir = tempfile::tempdir().expect("tempdir");
     let cache_path = cache_dir.keep();
-    let project = LeanProject::open(meta, &cache_path).expect("open");
-    ToolContext { project }
+    let broker = ProjectBroker::new(BrokerConfig {
+        cache_dir: cache_path,
+        config_default: None,
+        env_default: Some(root.to_path_buf()),
+        cwd: root.to_path_buf(),
+    });
+    ToolContext { broker }
 }
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn elaborate_prelude_term() {
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx(&root);
     let resp = elaborate(
         &ctx,
         ElaborateRequest {
             source: "(Nat.succ 0 : Nat)".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -62,15 +64,16 @@ async fn elaborate_prelude_term() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn describe_prelude_name() {
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx(&root);
     let resp = hover_by_name(
         &ctx,
         HoverByNameRequest {
             name: "Nat.add_zero".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -233,15 +236,16 @@ fn file_diagnostics_result_serialises_status_tag() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn hover_by_name_populates_type_signature() {
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx(&root);
     let resp = hover_by_name(
         &ctx,
         HoverByNameRequest {
             name: "Nat.add_zero".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -260,14 +264,15 @@ async fn hover_by_name_populates_type_signature() {
 async fn file_diagnostics_returns_clean_file_empty() {
     use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
 
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx(&root);
     let resp = file_diagnostics(
         &ctx,
         FileDiagnosticsRequest {
             file: PathBuf::from("LeanRsFixture/SourceRanges.lean"),
+            project: None,
         },
     )
     .await
@@ -292,10 +297,10 @@ async fn file_diagnostics_returns_real_errors() {
     use lean_host_mcp::Severity;
     use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
 
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx(&root);
 
     // Two-line file so the error's line number is unambiguous.
     let mut tmp = tempfile::NamedTempFile::with_suffix(".lean").expect("tempfile");
@@ -307,6 +312,7 @@ async fn file_diagnostics_returns_real_errors() {
         &ctx,
         FileDiagnosticsRequest {
             file: tmp.path().to_path_buf(),
+            project: None,
         },
     )
     .await
@@ -338,14 +344,20 @@ async fn file_diagnostics_cache_warm() {
 
     const HINT_FRAGMENT: &str = "file processed and cached";
 
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx(&root);
     let file = PathBuf::from("LeanRsFixture/SourceRanges.lean");
 
     // Cold: must record the cache-and-process hint.
-    let cold = file_diagnostics(&ctx, FileDiagnosticsRequest { file: file.clone() })
+    let cold = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file: file.clone(),
+            project: None,
+        },
+    )
         .await
         .expect("cold file_diagnostics");
     assert!(
@@ -361,6 +373,7 @@ async fn file_diagnostics_cache_warm() {
             file: file.clone(),
             line: 1,
             column: 1,
+            project: None,
         },
     )
     .await
@@ -372,7 +385,13 @@ async fn file_diagnostics_cache_warm() {
     );
 
     // Warm: same tool, still cached.
-    let warm = file_diagnostics(&ctx, FileDiagnosticsRequest { file })
+    let warm = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file,
+            project: None,
+        },
+    )
         .await
         .expect("warm file_diagnostics");
     assert!(
@@ -387,16 +406,17 @@ async fn file_diagnostics_cache_warm() {
 async fn index_rebuilds_and_finds_prelude_theorem() {
     use lean_host_mcp::tools::index::{FindLemmaRequest, find_lemma};
 
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx(&root);
     let resp = find_lemma(
         &ctx,
         FindLemmaRequest {
             query: "add_zero".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
             limit: Some(50),
+            project: None,
         },
     )
     .await
@@ -413,7 +433,8 @@ fn envelope_serialises() {
     let r = Response::ok(
         serde_json::json!({"foo": 1}),
         Freshness {
-            lake_root: "/tmp/x".into(),
+            project_root: "/tmp/x".into(),
+            project_hash: "deadbeef".into(),
             imports: vec!["A.B".into()],
             session_id: "abc".into(),
             lean_toolchain: "leanprover/lean4:v4.29.1".into(),
@@ -421,6 +442,7 @@ fn envelope_serialises() {
     );
     let s = serde_json::to_string(&r).unwrap();
     assert!(s.contains("\"foo\":1"));
-    assert!(s.contains("\"lake_root\":\"/tmp/x\""));
+    assert!(s.contains("\"project_root\":\"/tmp/x\""));
+    assert!(s.contains("\"project_hash\":\"deadbeef\""));
     assert!(!s.contains("\"warnings\""), "empty warnings should be omitted");
 }

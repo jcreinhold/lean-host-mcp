@@ -8,20 +8,18 @@ use std::path::PathBuf;
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::lean::{InferTypeRequest, infer_type};
-use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, default_cache_dir};
 use tokio::runtime::Runtime;
 
-fn fixture_env() -> Option<(PathBuf, String, String)> {
-    let root = std::env::var("LEAN_HOST_MCP_BENCH_FIXTURE")
+fn fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_BENCH_FIXTURE")
         .or_else(|_| std::env::var("LEAN_HOST_MCP_TEST_FIXTURE"))
-        .ok()?;
-    let pkg = std::env::var("LEAN_HOST_MCP_TEST_PACKAGE").unwrap_or_else(|_| "lean_rs_fixture".into());
-    let lib = std::env::var("LEAN_HOST_MCP_TEST_LIBRARY").unwrap_or_else(|_| "LeanRsFixture".into());
-    Some((PathBuf::from(root), pkg, lib))
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn bench_worker_cold_spawn(c: &mut Criterion) {
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         eprintln!("skipping worker_cold_spawn; set LEAN_HOST_MCP_BENCH_FIXTURE");
         return;
     };
@@ -31,15 +29,22 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
     group.bench_function("spawn_plus_first_infer", |b| {
         b.iter(|| {
             let imports = vec!["LeanRsFixture.Handles".to_owned()];
-            let meta = LakeProjectMeta::from_cli(&root, pkg.clone(), lib.clone(), imports.clone()).expect("meta");
-            let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
-            let ctx = ToolContext { project };
+            // Fresh broker per iteration so each one pays the project open
+            // cost (the point of this bench).
+            let broker = ProjectBroker::new(BrokerConfig {
+                cache_dir: default_cache_dir(),
+                config_default: None,
+                env_default: Some(root.clone()),
+                cwd: root.clone(),
+            });
+            let ctx = ToolContext { broker };
             rt.block_on(async {
                 infer_type(
                     &ctx,
                     InferTypeRequest {
                         term: "Nat.succ Nat.zero".into(),
                         imports,
+                        project: None,
                     },
                 )
                 .await

@@ -14,8 +14,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
+use crate::broker::ProjectBroker;
 use crate::envelope::Response;
-use crate::project::LeanProject;
 use crate::tools::{self, ToolContext};
 
 // Deliberately not `use crate::error::Result;` here—the `#[tool_handler]`
@@ -32,8 +32,8 @@ pub struct LeanHostService {
 }
 
 impl LeanHostService {
-    pub fn new(project: Arc<LeanProject>) -> Self {
-        let ctx = ToolContext { project };
+    pub fn new(broker: Arc<ProjectBroker>) -> Self {
+        let ctx = ToolContext { broker };
         Self {
             ctx,
             tool_router: Self::tool_router(),
@@ -102,7 +102,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::scan::ProjectScanRequest>,
     ) -> std::result::Result<Json<Response<tools::scan::ProjectScanResult>>, McpError> {
-        wrap(tools::scan::project_scan(&self.ctx, req))
+        wrap(tools::scan::project_scan(&self.ctx, req).await)
     }
 
     #[tool(

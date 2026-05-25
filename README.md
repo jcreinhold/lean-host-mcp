@@ -15,9 +15,9 @@ and a file-scoped diagnostics query (`file_diagnostics`). Per-tool request and r
 ## Prerequisite: a Lake project linking the host shim
 
 `lean-rs-host` loads a Lean capability dylib that exports 28 mandatory and 6 optional `lean_rs_host_*` symbols. This
-crate does not ship one. Point `--lake-root` at a Lake project whose `lakefile.lean` already wires those interop shims;
-[`lean-rs/fixtures/lean/`](https://github.com/jcreinhold/lean-rs/tree/main/fixtures/lean) is the reference template and
-doubles as a starting point you can adapt.
+crate does not ship one. The server resolves a Lake project whose `lakefile.{toml,lean}` already wires those interop
+shims; [`lean-rs/fixtures/lean/`](https://github.com/jcreinhold/lean-rs/tree/main/fixtures/lean) is the reference
+template and doubles as a starting point you can adapt.
 
 ## Build and run
 
@@ -33,16 +33,27 @@ lake build
 cd /path/to/lean-host-mcp
 cargo build --release --bins
 
-# 3. Launch, pointed at the built Lake project.
-./target/release/lean-host-mcp \
-    --lake-root /path/to/lean-rs/fixtures/lean \
-    --package lean_rs_fixture \
-    --library LeanRsFixture \
-    --imports LeanRsFixture.Handles
+# 3a. Zero-config: launch from inside (or anywhere under) a Lake project
+#     that exposes the shims. The package, library, and umbrella import
+#     are auto-discovered from the lakefile.
+cd /path/to/lean-rs/fixtures/lean
+/path/to/target/release/lean-host-mcp
+
+# 3b. Explicit: pin the default project. Equivalent to setting
+#     LEAN_HOST_MCP_PROJECT.
+./target/release/lean-host-mcp --lake-root /path/to/lean-rs/fixtures/lean
 ```
 
-Every flag also reads from an environment variable: `LEAN_HOST_MCP_LAKE_ROOT`, `LEAN_HOST_MCP_PACKAGE`,
-`LEAN_HOST_MCP_LIBRARY`, `LEAN_HOST_MCP_IMPORTS`, `LEAN_HOST_MCP_CACHE_DIR`.
+Project resolution chain (used by every tool call that does not pass its own `project="..."` argument):
+
+1. `LEAN_HOST_MCP_PROJECT` (or `--lake-root`)
+2. Walk upward from the server's cwd looking for `lakefile.{toml,lean}`
+3. `~/.config/lean-host-mcp/config.toml` `primary_project = "/abs/path"`
+
+Per call, an MCP client can pass `project="/abs/path/to/other/lake/root"` to route that single call elsewhere — useful
+when a single client surveys several projects.
+
+Environment vars: `LEAN_HOST_MCP_PROJECT`, `LEAN_HOST_MCP_CACHE_DIR`.
 
 ## Wiring into Claude Code
 
@@ -50,11 +61,9 @@ Every flag also reads from an environment variable: `LEAN_HOST_MCP_LAKE_ROOT`, `
 {
   "mcpServers": {
     "lean-host": {
-      "command": "/abs/path/to/lean-host-mcp/target/release/lean-host-mcp",
-      "args": [
-        "--lake-root", "/abs/path/to/your/lake/project",
-        "--imports",   "Your.Main.Module"
-      ]
+      "command": "/abs/path/to/lean-host-mcp/target/release/lean-host-mcp"
+      // No args needed when the client launches the server inside the
+      // target Lake project; otherwise pass `--lake-root /abs/path`.
     }
   }
 }
@@ -68,7 +77,8 @@ Every tool returns the same outer shape; only `result` varies.
 {
   "result":   { /* tool-specific */ },
   "freshness": {
-    "lake_root":      "/abs/path",
+    "project_root":   "/abs/path",
+    "project_hash":   "sha256-hex of lake-manifest.json",
     "imports":        ["Mod.A", "..."],
     "session_id":     "uuid",
     "lean_toolchain": "leanprover/lean4:v4.29.1"

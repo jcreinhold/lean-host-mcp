@@ -8,6 +8,9 @@
 //!
 //! - [`envelope`]—the uniform `{result, freshness, warnings, next_actions}`
 //!   wrapper every tool returns.
+//! - [`broker`]—`ProjectBroker`, the mediator that resolves a per-call
+//!   project hint into an `Arc<LeanProject>` via the env / cwd-walk /
+//!   config-default chain.
 //! - [`project`]—`LeanProject`, the unit of multiplexing. Bundles the
 //!   worker-actor capability, the `SQLite` declaration index, and the
 //!   in-memory processed-file cache for one Lake project.
@@ -23,6 +26,7 @@
 //!   sweep, `index` for the SQLite-backed lookups).
 //! - [`server`]—rmcp glue.
 
+pub mod broker;
 pub mod cache;
 pub mod envelope;
 pub mod error;
@@ -33,6 +37,7 @@ pub mod projections;
 pub mod server;
 pub mod tools;
 
+pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
 pub use envelope::{Freshness, Response};
 pub use error::{Result, ServerError};
 pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};

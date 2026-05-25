@@ -22,23 +22,28 @@ pub mod lean;
 pub mod position;
 pub mod scan;
 
+use crate::broker::ProjectBroker;
 use crate::envelope::Freshness;
 use crate::project::LeanProject;
 
-/// Shared state every tool handler reads. A single `LeanProject` for now;
-/// once the broker lands this becomes the indirection through which a tool
-/// looks up the project to dispatch against.
+/// Shared state every tool handler reads.
+///
+/// Holds the broker; each tool's body resolves its
+/// [`ProjectHint`](crate::broker::ProjectHint) inside
+/// [`ProjectBroker::with_project`](crate::broker::ProjectBroker::with_project)
+/// and receives an `Arc<LeanProject>` for the duration of its closure.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
-    pub project: Arc<LeanProject>,
+    pub broker: Arc<ProjectBroker>,
 }
 
-impl ToolContext {
-    pub fn freshness(&self, imports: &[String], session_id: &str) -> Freshness {
-        let mut fr = self.project.freshness(imports);
-        session_id.clone_into(&mut fr.session_id);
-        fr
-    }
+/// Stamp a freshly generated session id onto a project-derived
+/// [`Freshness`]. Kept here so every tool's body opens with the same
+/// one-liner instead of repeating the field mutation.
+pub(crate) fn freshness_for(project: &LeanProject, imports: &[String]) -> Freshness {
+    let mut fr = project.freshness(imports);
+    fr.session_id = new_session_id();
+    fr
 }
 
 pub fn new_session_id() -> String {

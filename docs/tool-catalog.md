@@ -2,6 +2,20 @@
 
 Every tool returns the same outer envelope (see the README). Only `result` differs; that's what this document records.
 
+## Per-tool routing field
+
+Every request schema accepts an optional `project` field — an absolute path to a Lake-project root. When set, the server
+routes that single call to that project (the broker hot-swaps the underlying `LeanProject` if it differs from the
+current default). When omitted, the server resolves the project via the standard chain
+*env (`LEAN_HOST_MCP_PROJECT`) → cwd-walk → `~/.config/lean-host-mcp/config.toml` `primary_project`*.
+
+```jsonc
+// Any tool request, routed to a non-default project:
+{ "source": "(1 : Nat)", "imports": [], "project": "/abs/path/to/other/lake/root" }
+```
+
+The `project` field is omitted from the per-tool examples below for brevity; assume it on every request schema.
+
 ## Lean session tools (`src/tools/lean.rs`)
 
 ### `elaborate`
@@ -158,7 +172,7 @@ All line and column inputs are **1-indexed**. Result spans use the same conventi
 { "status": "unsupported" }
 ```
 
-`file` resolves relative to `lake_root` when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal` inside the
+`file` resolves relative to the resolved project root when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal` inside the
 elaboration context; the strings are diagnostic text only. When the file's header imports modules the server's open env
 doesn't have, the result is still returned but the envelope's `warnings` array names the missing modules.
 

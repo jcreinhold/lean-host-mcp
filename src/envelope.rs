@@ -6,15 +6,20 @@
 //! {
 //!   "result":   { /* tool-specific */ },
 //!   "freshness": {
-//!     "lake_root":  "/abs/path",
-//!     "imports":    ["Mod.A", "..."],
-//!     "session_id": "uuid",
+//!     "project_root":   "/abs/path",
+//!     "project_hash":   "sha256-hex",
+//!     "imports":        ["Mod.A", "..."],
+//!     "session_id":     "uuid",
 //!     "lean_toolchain": "leanprover/lean4:v4.x.y"
 //!   },
 //!   "warnings":     ["..."],     // omitted when empty
 //!   "next_actions": ["..."]      // omitted when empty
 //! }
 //! ```
+//!
+//! `project_hash` is the Lake-manifest SHA-256. Clients can branch on
+//! `(project_root, project_hash)` to detect dependency changes between
+//! tool calls without round-tripping `find_symbol` first.
 //!
 //! This module hides three volatile decisions behind one shape: what
 //! freshness means, how it's serialized, and what an MCP "warning" looks
@@ -26,7 +31,8 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Freshness {
-    pub lake_root: String,
+    pub project_root: String,
+    pub project_hash: String,
     pub imports: Vec<String>,
     pub session_id: String,
     pub lean_toolchain: String,

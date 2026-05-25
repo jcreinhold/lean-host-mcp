@@ -15,33 +15,38 @@ use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::lean::{
     ElaborateRequest, ElaborateResult, InferTypeRequest, KernelCheckRequest, elaborate, infer_type, kernel_check,
 };
-use lean_host_mcp::{LakeProjectMeta, LeanProject, Severity, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, Severity, default_cache_dir};
 
-fn fixture_env() -> Option<(PathBuf, String, String)> {
-    let root = std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok()?;
-    let pkg = std::env::var("LEAN_HOST_MCP_TEST_PACKAGE").unwrap_or_else(|_| "lean_rs_fixture".into());
-    let lib = std::env::var("LEAN_HOST_MCP_TEST_LIBRARY").unwrap_or_else(|_| "LeanRsFixture".into());
-    Some((PathBuf::from(root), pkg, lib))
+fn fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
 }
 
-fn open_ctx(imports: Vec<String>) -> ToolContext {
-    let Some((root, pkg, lib)) = fixture_env() else {
+/// Build a broker that resolves to the fixture root through its
+/// `env_default` slot. Tools still exercise the full broker dispatch
+/// path — the same code production hits.
+fn open_ctx() -> ToolContext {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let meta = LakeProjectMeta::from_cli(&root, pkg, lib, imports).expect("meta");
-    let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
-    ToolContext { project }
+    let broker = ProjectBroker::new(BrokerConfig {
+        cache_dir: default_cache_dir(),
+        config_default: None,
+        env_default: Some(root.clone()),
+        cwd: root,
+    });
+    ToolContext { broker }
 }
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn worker_spawns_against_fixture() {
-    let ctx = open_ctx(vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx();
     let resp = elaborate(
         &ctx,
         ElaborateRequest {
             source: "(Nat.succ 0 : Nat)".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -57,12 +62,13 @@ async fn worker_spawns_against_fixture() {
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn worker_honors_per_call_imports() {
     // Open with empty defaults; per-call imports must still take effect.
-    let ctx = open_ctx(Vec::new());
+    let ctx = open_ctx();
     let with_imports = elaborate(
         &ctx,
         ElaborateRequest {
             source: "(Nat.succ 0 : Nat)".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -78,6 +84,7 @@ async fn worker_honors_per_call_imports() {
         ElaborateRequest {
             source: "(0 : Nat)".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -92,12 +99,13 @@ async fn worker_honors_per_call_imports() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn worker_kernel_check_populates_summary() {
-    let ctx = open_ctx(vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx();
     let resp = kernel_check(
         &ctx,
         KernelCheckRequest {
             source: "theorem k_ok : 1 + 1 = 2 := rfl".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -115,12 +123,13 @@ async fn worker_kernel_check_populates_summary() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn worker_infer_type_marks_rendering_provenance() {
-    let ctx = open_ctx(vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx();
     let resp = infer_type(
         &ctx,
         InferTypeRequest {
             term: "Nat.succ Nat.zero".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -142,7 +151,7 @@ async fn worker_infer_type_marks_rendering_provenance() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn worker_surfaces_elaboration_failure_in_ok_envelope() {
-    let ctx = open_ctx(vec!["LeanRsFixture.Handles".into()]);
+    let ctx = open_ctx();
     // Deliberately invalid term. The supervisor must not crash; the
     // failure must be in the `Failed` arm of the elaborate result.
     let resp = elaborate(
@@ -150,6 +159,7 @@ async fn worker_surfaces_elaboration_failure_in_ok_envelope() {
         ElaborateRequest {
             source: "this_is_not_a_term".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await
@@ -171,6 +181,7 @@ async fn worker_surfaces_elaboration_failure_in_ok_envelope() {
         ElaborateRequest {
             source: "(0 : Nat)".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
         },
     )
     .await

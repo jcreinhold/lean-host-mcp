@@ -2,7 +2,9 @@
 //! supervised [`lean-rs-worker`] child.
 //!
 //! Stdio transport. Wire into Claude Code / any MCP client by pointing the
-//! `command` at the built binary and passing `--lake-root <path>`.
+//! `command` at the built binary. With a Lake project visible from the
+//! invocation directory (or one set via `LEAN_HOST_MCP_PROJECT` /
+//! `~/.config/lean-host-mcp/config.toml`), no flags are required.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -10,38 +12,23 @@ use std::process::ExitCode;
 use clap::Parser;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
+use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
-use lean_host_mcp::{LakeProjectMeta, LeanHostService, LeanProject, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, LeanHostService, ProjectBroker, default_cache_dir};
 
 /// Stdio MCP server that hosts a Lean 4 environment via a worker child.
 #[derive(Debug, Parser)]
 #[command(name = "lean-host-mcp", version, about)]
 struct Cli {
-    /// Lake project root. The project must depend on the `lean-rs-host` shim
-    /// library so the 26 + 4 `lean_rs_host_*` symbols are present in its
-    /// build output. v0.1 does not ship a self-contained shim; see the
-    /// repo README for the prerequisite.
-    #[arg(long, env = "LEAN_HOST_MCP_LAKE_ROOT")]
-    lake_root: PathBuf,
-
-    /// Lean package name to load capabilities from (the `package` keyword in
-    /// the Lake `lakefile.lean`). Defaults to the directory name of
-    /// `--lake-root`.
-    #[arg(long, env = "LEAN_HOST_MCP_PACKAGE")]
-    package: Option<String>,
-
-    /// Lean library name within the package whose dylib carries the
-    /// `lean_rs_host_*` symbols (the `lean_lib` declaration). Defaults to a
-    /// `PascalCase` of the package name.
-    #[arg(long, env = "LEAN_HOST_MCP_LIBRARY")]
-    library: Option<String>,
-
-    /// Module imports for every fresh session. Comma-separated. The package's
-    /// own modules are reachable here once Lake has built them.
-    #[arg(long, env = "LEAN_HOST_MCP_IMPORTS", value_delimiter = ',')]
-    imports: Vec<String>,
+    /// Default Lake project for tool calls that don't specify one.
+    /// Equivalent to `LEAN_HOST_MCP_PROJECT`. May be omitted; the server
+    /// will resolve from the invocation cwd's nearest lakefile, then from
+    /// `~/.config/lean-host-mcp/config.toml`. Per-call `project="..."`
+    /// arguments always win.
+    #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
+    lake_root: Option<PathBuf>,
 
     /// Directory for the `SQLite` declaration index. Defaults to
     /// `$XDG_CACHE_HOME/lean-host-mcp` (or `$HOME/.cache/lean-host-mcp`).
@@ -72,44 +59,62 @@ fn init_tracing() {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let package = cli.package.clone().unwrap_or_else(|| default_package(&cli.lake_root));
-    let library = cli.library.clone().unwrap_or_else(|| pascal_case(&package));
+    let cache_dir = cli.cache_dir.unwrap_or_else(default_cache_dir);
+    let env_default = cli.lake_root;
+    let config_default = read_config_default();
+    let cwd = std::env::current_dir()?;
 
     tracing::info!(
-        lake_root = %cli.lake_root.display(),
-        package = %package,
-        library = %library,
-        imports = ?cli.imports,
+        env_default = ?env_default,
+        config_default = ?config_default,
+        cwd = %cwd.display(),
+        cache_dir = %cache_dir.display(),
         "starting lean-host-mcp",
     );
 
-    let cache_dir = cli.cache_dir.clone().unwrap_or_else(default_cache_dir);
-    let meta = LakeProjectMeta::from_cli(&cli.lake_root, package, library, cli.imports)?;
-    let project = LeanProject::open(meta, &cache_dir)?;
-    let service = LeanHostService::new(project);
+    let broker = ProjectBroker::new(BrokerConfig {
+        cache_dir,
+        config_default,
+        env_default,
+        cwd,
+    });
+    let service = LeanHostService::new(broker);
     let server = service.serve(stdio()).await?;
     server.waiting().await?;
     Ok(())
 }
 
-fn default_package(lake_root: &std::path::Path) -> String {
-    lake_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("lean_project")
-        .replace('-', "_")
+/// Top-level config schema. Reserved keys (e.g. future per-project
+/// overrides) are accepted but ignored.
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    primary_project: Option<PathBuf>,
 }
 
-fn pascal_case(snake: &str) -> String {
-    snake
-        .split('_')
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let mut chars = s.chars();
-            chars
-                .next()
-                .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
-                .unwrap_or_default()
-        })
-        .collect()
+/// Read `<config-dir>/lean-host-mcp/config.toml` and return its
+/// `primary_project` if present. Missing file / missing key / parse
+/// failures are all silent — the broker's resolution chain treats this
+/// as "no default" and continues. The `LEAN_HOST_MCP_CONFIG_DIR` env
+/// override exists for the test suite so resolution tests don't read
+/// the developer's real config.
+fn read_config_default() -> Option<PathBuf> {
+    let dir = config_dir()?;
+    let path = dir.join("lean-host-mcp").join("config.toml");
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let parsed: ConfigFile = match toml::from_str(&contents) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "config.toml parse failed; ignoring");
+            return None;
+        }
+    };
+    parsed.primary_project
 }
+
+fn config_dir() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("LEAN_HOST_MCP_CONFIG_DIR") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::config_dir()
+}
+

@@ -10,20 +10,18 @@ use std::time::Duration;
 
 use lean_host_mcp::{LakeProjectMeta, LeanProject, ServerError, default_cache_dir};
 
-fn fixture_env() -> Option<(PathBuf, String, String)> {
+fn fixture_root() -> Option<PathBuf> {
     let root = std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok()?;
-    let pkg = std::env::var("LEAN_HOST_MCP_TEST_PACKAGE").unwrap_or_else(|_| "lean_rs_fixture".into());
-    let lib = std::env::var("LEAN_HOST_MCP_TEST_LIBRARY").unwrap_or_else(|_| "LeanRsFixture".into());
-    Some((PathBuf::from(root), pkg, lib))
+    Some(PathBuf::from(root))
 }
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn open_submit_shutdown_round_trip() {
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let meta = LakeProjectMeta::from_cli(&root, pkg, lib, vec!["LeanRsFixture.Handles".into()]).expect("meta");
+    let meta = LakeProjectMeta::from_explicit(&root).expect("meta");
     let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
 
     // Trivial closure: just confirm we can dispatch work to the actor and

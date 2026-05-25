@@ -11,28 +11,30 @@ use std::path::PathBuf;
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::lean::{InferTypeRequest, infer_type};
-use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, default_cache_dir};
 use tokio::runtime::Runtime;
 
-fn fixture_env() -> Option<(PathBuf, String, String)> {
-    let root = std::env::var("LEAN_HOST_MCP_BENCH_FIXTURE")
+fn fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_BENCH_FIXTURE")
         .or_else(|_| std::env::var("LEAN_HOST_MCP_TEST_FIXTURE"))
-        .ok()?;
-    let pkg = std::env::var("LEAN_HOST_MCP_TEST_PACKAGE").unwrap_or_else(|_| "lean_rs_fixture".into());
-    let lib = std::env::var("LEAN_HOST_MCP_TEST_LIBRARY").unwrap_or_else(|_| "LeanRsFixture".into());
-    Some((PathBuf::from(root), pkg, lib))
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn bench_worker_roundtrip(c: &mut Criterion) {
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         eprintln!("skipping worker_roundtrip; set LEAN_HOST_MCP_BENCH_FIXTURE");
         return;
     };
     let rt = Runtime::new().unwrap();
     let imports = vec!["LeanRsFixture.Handles".to_owned()];
-    let meta = LakeProjectMeta::from_cli(&root, pkg, lib, imports.clone()).expect("meta");
-    let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
-    let ctx = ToolContext { project };
+    let broker = ProjectBroker::new(BrokerConfig {
+        cache_dir: default_cache_dir(),
+        config_default: None,
+        env_default: Some(root.clone()),
+        cwd: root,
+    });
+    let ctx = ToolContext { broker };
     let term = "Nat.succ Nat.zero".to_owned();
     // Prime the import set so the first measured iteration doesn't pay the
     // module load cost.
@@ -43,6 +45,7 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
                 InferTypeRequest {
                     term: term.clone(),
                     imports: imports.clone(),
+                    project: None,
                 },
             )
             .await,
@@ -57,6 +60,7 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
                     InferTypeRequest {
                         term: term.clone(),
                         imports: imports.clone(),
+                        project: None,
                     },
                 )
                 .await

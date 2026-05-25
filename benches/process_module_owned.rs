@@ -10,23 +10,21 @@ use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
 use lean_rs_worker::LeanWorkerElabOptions;
 use tokio::runtime::Runtime;
 
-fn fixture_env() -> Option<(PathBuf, String, String)> {
-    let root = std::env::var("LEAN_HOST_MCP_BENCH_FIXTURE")
+fn fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_BENCH_FIXTURE")
         .or_else(|_| std::env::var("LEAN_HOST_MCP_TEST_FIXTURE"))
-        .ok()?;
-    let pkg = std::env::var("LEAN_HOST_MCP_TEST_PACKAGE").unwrap_or_else(|_| "lean_rs_fixture".into());
-    let lib = std::env::var("LEAN_HOST_MCP_TEST_LIBRARY").unwrap_or_else(|_| "LeanRsFixture".into());
-    Some((PathBuf::from(root), pkg, lib))
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn bench_process_module(c: &mut Criterion) {
-    let Some((root, pkg, lib)) = fixture_env() else {
+    let Some(root) = fixture_root() else {
         eprintln!("skipping process_module_owned; set LEAN_HOST_MCP_BENCH_FIXTURE");
         return;
     };
     let rt = Runtime::new().unwrap();
     let imports = vec!["LeanRsFixture.Handles".to_owned()];
-    let meta = LakeProjectMeta::from_cli(&root, pkg, lib, imports.clone()).expect("meta");
+    let meta = LakeProjectMeta::from_explicit(&root).expect("meta");
     let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
     let source = std::fs::read_to_string(root.join("LeanRsFixture/SourceRanges.lean")).expect("read fixture");
 
