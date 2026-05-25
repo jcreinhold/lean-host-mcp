@@ -343,8 +343,20 @@ pub(crate) async fn list_declarations_strings(
         .await
 }
 
+/// Per-batch size for [`describe_bulk`]. The upstream IPC frame cap is
+/// 1 MiB (`MAX_FRAME_BYTES` in `lean-rs-worker-protocol`); a typical
+/// `LeanWorkerDeclarationRow` JSON-encodes at ~3-4 KB, so 256 rows
+/// stays comfortably under the cap with room for long type signatures.
+const INDEX_REBUILD_BATCH: usize = 256;
+
 /// Bulk-describe every declaration in `names`. Output order matches input
 /// order; entries the worker reports as `kind == "missing"` are omitted.
+///
+/// Splits `names` into [`INDEX_REBUILD_BATCH`]-sized chunks and issues one
+/// `describe_bulk` round-trip per chunk, all inside a single session so the
+/// imports are elaborated once. Each chunk's worker response stays under
+/// the IPC frame cap; the result is concatenated and returned as if the
+/// call had been a single round trip.
 ///
 /// # Errors
 ///
@@ -362,13 +374,13 @@ pub(crate) async fn describe_bulk(
             let mut session = cap
                 .open_session_with_imports(imports, None, None)
                 .map_err(map_worker_err)?;
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let rows = session.describe_bulk(&refs, None, None).map_err(map_worker_err)?;
-            Ok(rows
-                .into_iter()
-                .filter(|r| r.kind != "missing")
-                .map(project_declaration_row)
-                .collect())
+            let mut out = Vec::with_capacity(names.len());
+            for chunk in names.chunks(INDEX_REBUILD_BATCH) {
+                let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                let rows = session.describe_bulk(&refs, None, None).map_err(map_worker_err)?;
+                out.extend(rows.into_iter().filter(|r| r.kind != "missing").map(project_declaration_row));
+            }
+            Ok(out)
         })
         .await
 }

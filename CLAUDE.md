@@ -101,6 +101,13 @@ the exact `lean-host-mcp install-worker --toolchain <id>` command to fix it. Eac
 `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` so the worker crate's `build.rs` bakes the matching `lib/lean` directory into
 its rpath.
 
+The MCP client must set `LEAN_SYSROOT` in the server's `env` block to the same toolchain root (e.g.
+`~/.elan/toolchains/leanprover--lean4---v4.30.0-rc2`). Lean's runtime reads it at load time to locate `Init.olean`;
+without it the rpath-baked `libleanshared` mismatches whatever `lean` is first on `PATH`. Since `LEAN_SYSROOT` lives
+on the parent process env and is inherited by every worker spawn, **a single server instance serves one toolchain**.
+Multi-toolchain in one process needs an upstream `LeanWorkerCapabilityBuilder::env(...)` so the parent can set
+`LEAN_SYSROOT` per spawn — tracked as a follow-up.
+
 The "one owner of the capability at a time" invariant is enforced by parking it on a dedicated OS thread named
 `"lean-host-mcp/session"`. The channel carries a closure type, not a Request enum:
 

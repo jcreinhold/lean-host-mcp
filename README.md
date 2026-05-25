@@ -76,13 +76,33 @@ Environment vars:
 {
   "mcpServers": {
     "lean-host": {
-      "command": "/abs/path/to/lean-host-mcp/target/release/lean-host-mcp"
+      "command": "/abs/path/to/lean-host-mcp/target/release/lean-host-mcp",
       // No args needed when the client launches the server inside the
       // target Lake project; otherwise pass `--lake-root /abs/path`.
+      "env": {
+        // Required. Set to the elan toolchain root that matches the
+        // worker binary you installed (the same `--toolchain <id>` you
+        // passed to `install-worker`). Lean's runtime reads this at
+        // load time to find `Init.olean`; without it the worker loads
+        // the rpath-baked `libleanshared` but reads stdlib oleans from
+        // whatever `lean` is first on `PATH` — an ABI mismatch that
+        // aborts the bootstrap with "incompatible header".
+        "LEAN_SYSROOT": "/Users/you/.elan/toolchains/leanprover--lean4---v4.30.0-rc2"
+      }
     }
   }
 }
 ```
+
+**One toolchain per server process.** `LEAN_SYSROOT` is set in the
+parent's environment and inherited by every spawned worker, so a single
+running `lean-host-mcp` can serve only projects on the toolchain its
+`LEAN_SYSROOT` names. If you work across toolchains, run one MCP server
+entry per toolchain (e.g. `lean-host-v4-30` and `lean-host-v4-29`),
+each pointing at its own `LEAN_SYSROOT`. Lifting this to one-server-
+serves-all-toolchains needs an upstream
+`LeanWorkerCapabilityBuilder::env(...)` so the parent can set
+`LEAN_SYSROOT` per spawned worker; that's tracked as a follow-up.
 
 ## Response envelope
 
