@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lean_host_mcp::SessionHost;
+use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
+use lean_rs_worker::LeanWorkerElabOptions;
 use tokio::runtime::Runtime;
 
 fn fixture_env() -> Option<(PathBuf, String, String)> {
@@ -25,15 +26,28 @@ fn bench_process_module(c: &mut Criterion) {
     };
     let rt = Runtime::new().unwrap();
     let imports = vec!["LeanRsFixture.Handles".to_owned()];
-    let host = SessionHost::spawn(root.clone(), pkg, lib, imports).expect("spawn");
+    let meta = LakeProjectMeta::from_cli(&root, pkg, lib, imports.clone()).expect("meta");
+    let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
     let source = std::fs::read_to_string(root.join("LeanRsFixture/SourceRanges.lean")).expect("read fixture");
 
     let mut group = c.benchmark_group("process_module_owned");
     group.sample_size(20);
     group.bench_function("source_ranges", |b| {
         b.iter(|| {
+            let source = source.clone();
+            let imports = imports.clone();
             rt.block_on(async {
-                host.process_module(source.clone()).await.expect("process_module");
+                project
+                    .submit(move |cap| {
+                        let mut session = cap
+                            .open_session_with_imports(imports, None, None)
+                            .map_err(lean_host_mcp::projections::map_worker_err)?;
+                        session
+                            .process_module(&source, &LeanWorkerElabOptions::new(), None, None)
+                            .map_err(lean_host_mcp::projections::map_worker_err)
+                    })
+                    .await
+                    .expect("process_module");
             });
         });
     });

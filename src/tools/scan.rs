@@ -4,8 +4,6 @@
 // Same ownership rationale as `tools::lean`.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::path::Path;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -71,7 +69,7 @@ pub fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<Respon
     };
     let re = regex::Regex::new(&pattern).map_err(|e| ServerError::Internal(format!("regex {pattern}: {e}")))?;
     let limit = req.limit.unwrap_or(MAX_HITS).min(MAX_HITS);
-    let root = Path::new(&ctx.lake_root);
+    let root = ctx.project.canonical_root();
     let mut hits = Vec::new();
     let mut truncated = false;
     'walk: for entry in WalkDir::new(root)

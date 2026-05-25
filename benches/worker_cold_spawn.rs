@@ -1,4 +1,4 @@
-//! Cold spawn cost: `SessionHost::spawn` + first `infer_type`. Recorded for
+//! Cold spawn cost: `LeanProject::open` + first `infer_type`. Recorded for
 //! visibility; no hard threshold (cold spawn is one-off per server start).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lean_host_mcp::SessionHost;
+use lean_host_mcp::tools::ToolContext;
+use lean_host_mcp::tools::lean::{InferTypeRequest, infer_type};
+use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
 use tokio::runtime::Runtime;
 
 fn fixture_env() -> Option<(PathBuf, String, String)> {
@@ -29,11 +31,19 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
     group.bench_function("spawn_plus_first_infer", |b| {
         b.iter(|| {
             let imports = vec!["LeanRsFixture.Handles".to_owned()];
-            let host = SessionHost::spawn(root.clone(), pkg.clone(), lib.clone(), imports.clone()).expect("spawn");
+            let meta = LakeProjectMeta::from_cli(&root, pkg.clone(), lib.clone(), imports.clone()).expect("meta");
+            let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
+            let ctx = ToolContext { project };
             rt.block_on(async {
-                host.infer_type("Nat.succ Nat.zero".into(), imports)
-                    .await
-                    .expect("infer");
+                infer_type(
+                    &ctx,
+                    InferTypeRequest {
+                        term: "Nat.succ Nat.zero".into(),
+                        imports,
+                    },
+                )
+                .await
+                .expect("infer");
             });
         });
     });

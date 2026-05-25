@@ -1,5 +1,5 @@
 //! Warm-session worker round-trip cost. Pins per-request `open_session +
-//! infer_type` time against [`SessionHost`]. Target: ≤ 2 ms per call.
+//! infer_type` time against [`LeanProject`]. Target: ≤ 2 ms per call.
 //!
 //! Gated on `LEAN_HOST_MCP_BENCH_FIXTURE` (same shape as the e2e env var):
 //! the bench is a no-op when unset so `cargo bench` still runs in CI.
@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lean_host_mcp::SessionHost;
+use lean_host_mcp::tools::ToolContext;
+use lean_host_mcp::tools::lean::{InferTypeRequest, infer_type};
+use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
 use tokio::runtime::Runtime;
 
 fn fixture_env() -> Option<(PathBuf, String, String)> {
@@ -28,19 +30,37 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
     };
     let rt = Runtime::new().unwrap();
     let imports = vec!["LeanRsFixture.Handles".to_owned()];
-    let host = SessionHost::spawn(root, pkg, lib, imports.clone()).expect("spawn");
+    let meta = LakeProjectMeta::from_cli(&root, pkg, lib, imports.clone()).expect("meta");
+    let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
+    let ctx = ToolContext { project };
+    let term = "Nat.succ Nat.zero".to_owned();
     // Prime the import set so the first measured iteration doesn't pay the
     // module load cost.
     rt.block_on(async {
-        drop(host.infer_type("Nat.succ Nat.zero".into(), imports.clone()).await);
+        drop(
+            infer_type(
+                &ctx,
+                InferTypeRequest {
+                    term: term.clone(),
+                    imports: imports.clone(),
+                },
+            )
+            .await,
+        );
     });
 
     c.bench_function("worker_roundtrip/infer_type", |b| {
         b.iter(|| {
             rt.block_on(async {
-                host.infer_type("Nat.succ Nat.zero".into(), imports.clone())
-                    .await
-                    .expect("infer_type")
+                infer_type(
+                    &ctx,
+                    InferTypeRequest {
+                        term: term.clone(),
+                        imports: imports.clone(),
+                    },
+                )
+                .await
+                .expect("infer_type")
             });
         });
     });

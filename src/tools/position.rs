@@ -2,7 +2,7 @@
 //! `references_of_name`, `file_diagnostics`.
 //!
 //! All four project the same upstream value —
-//! [`ProcessedFile`](lean_rs_host::host::process::ProcessedFile) — into a
+//! [`ProcessedFile`](lean_rs_host::host::process::ProcessedFile)—into a
 //! tool-specific result enum. Repeated calls against the same source bytes
 //! reuse a cached projection (see [`crate::cache::ProcessedFileCache`]).
 //!
@@ -11,9 +11,8 @@
 //! typical "what's wrong; then probe the problem site" loop pays for the
 //! elaboration once.
 //!
-//! The tools drive
-//! [`SessionHost::process_module`](crate::SessionHost::process_module) — the
-//! header-aware shim. The file's own `import` declarations are parsed by
+//! The tools drive `LeanProject`'s worker actor with `process_module` —
+//! the header-aware shim. The file's own `import` declarations are parsed by
 //! Lean and validated against the server's open env; mismatch surfaces as a
 //! `warnings` entry on the envelope, not as a silent empty result. A header
 //! that fails to parse short-circuits to a `header_parse_failed` status
@@ -24,7 +23,7 @@
 //! `Unsupported` result variant.
 
 // Tool handlers consume their request structs (owned strings into the
-// SessionHost channel); pass-by-value is intentional.
+// worker-actor channel); pass-by-value is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
 use std::path::{Path, PathBuf};
@@ -41,7 +40,7 @@ use walkdir::WalkDir;
 use crate::cache::{self, ProcessedFileCache, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
-use crate::session::{Diagnostic, ElabFailure, Severity, project_failure};
+use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
 use crate::tools::{ToolContext, is_ignored_dir, new_session_id};
 
 /// Hard cap on the number of references aggregated in
@@ -248,14 +247,14 @@ pub struct ReferencesOfNameResult {
 ///
 /// Returns `ServerError::Lean` if the underlying `process_module` call
 /// fails for a non-`Unsupported`, non-`HeaderParseFailed`, non-`MissingImports`
-/// reason. Files that cannot be read are skipped silently — same policy
+/// reason. Files that cannot be read are skipped silently—same policy
 /// as [`crate::tools::scan::project_scan`].
 pub async fn references_of_name(
     ctx: &ToolContext,
     req: ReferencesOfNameRequest,
 ) -> Result<Response<ReferencesOfNameResult>> {
     let freshness = ctx.freshness(&[], &new_session_id());
-    let root = PathBuf::from(&ctx.lake_root);
+    let root = ctx.project.canonical_root().to_path_buf();
     let files = if req.files.is_empty() {
         enumerate_lean_files(&root)
     } else {
@@ -321,7 +320,7 @@ pub async fn references_of_name(
         missing_imports_files,
     };
     // `references_of_name` accumulates per-file `MissingImports` into the
-    // result sidebar rather than the envelope warnings — the single-file
+    // result sidebar rather than the envelope warnings—the single-file
     // tools surface it as a warning, but a project-wide walk against a
     // dozen mismatched files would drown the envelope.
     Ok(attach_envelope_notes(
@@ -434,7 +433,7 @@ pub async fn file_diagnostics(
 }
 
 /// Sort diagnostics by `(line, column)` so the wire order is deterministic
-/// — Lean's source order is usually but not always position-ordered.
+///—Lean's source order is usually but not always position-ordered.
 fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
     diagnostics.sort_by_key(|d| d.position.as_ref().map_or((u32::MAX, u32::MAX), |p| (p.line, p.column)));
     diagnostics
@@ -459,13 +458,13 @@ enum EnsureOutcome {
 }
 
 /// Read `path` from disk, hash, hit-or-fill the cache. On miss, dispatch
-/// to [`SessionHost::process_module`](crate::SessionHost::process_module)
-/// and route the four-arm outcome.
+/// `process_module` to the project's worker actor and route the four-arm
+/// outcome.
 async fn ensure_processed(ctx: &ToolContext, path: &Path) -> Result<EnsureOutcome> {
-    let resolved = resolve_path(Path::new(&ctx.lake_root), path);
+    let resolved = resolve_path(ctx.project.canonical_root(), path);
     let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
     let hash = hash_bytes(&bytes);
-    let cache: &ProcessedFileCache = &ctx.processed_files;
+    let cache: &ProcessedFileCache = ctx.project.cache();
     if let Some(file) = cache.get(&resolved, hash) {
         return Ok(EnsureOutcome::Ready {
             file,
@@ -474,7 +473,7 @@ async fn ensure_processed(ctx: &ToolContext, path: &Path) -> Result<EnsureOutcom
         });
     }
     let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
-    match ctx.host.process_module(source).await? {
+    match process_module(ctx, source).await? {
         LeanWorkerProcessModuleOutcome::Ok { file, .. } => {
             let arc = Arc::new(file);
             cache.insert(resolved, hash, Arc::clone(&arc));
@@ -541,6 +540,23 @@ fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
     }
 }
 
+/// Header-aware module processing. Submits a closure to the project's
+/// worker actor that opens a session against the project's default
+/// imports, runs `process_module`, and returns the four-arm outcome.
+async fn process_module(ctx: &ToolContext, source: String) -> Result<LeanWorkerProcessModuleOutcome> {
+    let imports = ctx.project.default_imports().to_vec();
+    ctx.project
+        .submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(crate::projections::map_worker_err)?;
+            session
+                .process_module(&source, &lean_rs_worker::LeanWorkerElabOptions::new(), None, None)
+                .map_err(crate::projections::map_worker_err)
+        })
+        .await
+}
+
 fn enumerate_lean_files(root: &Path) -> Vec<PathBuf> {
     WalkDir::new(root)
         .follow_links(false)
@@ -570,7 +586,7 @@ where
         resp
     } else {
         resp.warn(format!(
-            "file imports modules the server's open env does not have: [{}] — projection may be partial; \
+            "file imports modules the server's open env does not have: [{}]—projection may be partial; \
              relaunch the server with --imports to fix",
             missing_imports.join(", ")
         ))

@@ -1,4 +1,4 @@
-//! Persistent declaration index — one `SQLite` database per Lake project.
+//! Persistent declaration index—one `SQLite` database per Lake project.
 //!
 //! The index is the only path through which `find_symbol`, `find_lemma`,
 //! and `outline` answer their queries. It hides:
@@ -10,7 +10,7 @@
 //! - the Lake-manifest fingerprint that decides when a rebuild is due.
 //!
 //! Nothing past this module's boundary should know about `rusqlite` or
-//! `sha2` — if a fourth caller needs a new query, add a method here.
+//! `sha2`—if a fourth caller needs a new query, add a method here.
 //!
 //! The struct is `Send + Sync` so it lives behind an `Arc` on
 //! [`crate::tools::ToolContext`].
@@ -19,14 +19,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use lean_rs_worker::LeanWorkerDeclarationFilter;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use schemars::JsonSchema;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, ServerError};
-use crate::session::{DeclarationRow, SessionHost, SourceRange};
+use crate::projections::{DeclarationRow, SourceRange};
 
 /// One row of the declaration index, projected for JSON.
 ///
@@ -43,10 +42,10 @@ pub struct IndexedDeclaration {
 }
 
 /// `SQLite`-backed declaration index. Owns one connection guarded by a
-/// `Mutex` — `SQLite`'s single-writer model means short critical sections
+/// `Mutex`—`SQLite`'s single-writer model means short critical sections
 /// are fine, and we avoid re-running `PRAGMA` per query.
 //
-// Every method holds the `MutexGuard` for the duration of its query — that
+// Every method holds the `MutexGuard` for the duration of its query—that
 // is the intended granularity (queries are short, the lock protects the
 // connection across `prepare` + `query_map` + iterator drain). Clippy's
 // "tightening" suggestion fragments the API for no benefit.
@@ -136,24 +135,6 @@ impl DeclarationIndex {
             .optional()
             .map_err(|e| ServerError::Index(format!("read fingerprint: {e}")))?;
         Ok(stored.as_deref() == Some(fingerprint))
-    }
-
-    /// Wipe and rebuild the index from the live session, then store
-    /// `fingerprint` last so a crash mid-rebuild leaves the index
-    /// detectably stale. Returns the number of rows written.
-    ///
-    /// # Errors
-    ///
-    /// Forwards session errors from
-    /// [`SessionHost::list_declarations_strings`] /
-    /// [`SessionHost::describe_bulk`] and [`ServerError::Index`] for
-    /// `SQLite` failures.
-    pub async fn rebuild(&self, host: &SessionHost, imports: Vec<String>, fingerprint: String) -> Result<usize> {
-        let names = host
-            .list_declarations_strings(LeanWorkerDeclarationFilter::default(), imports.clone())
-            .await?;
-        let rows = host.describe_bulk(names, imports).await?;
-        self.replace_all(&rows, &fingerprint)
     }
 
     /// Case-insensitive substring match on `name`.

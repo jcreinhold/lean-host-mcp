@@ -2,15 +2,15 @@
 //!
 //! Split by what plumbing they share rather than one file per tool:
 //!
-//! - [`lean`] — `elaborate`, `kernel_check`, `infer_type`, `whnf`,
-//!   `is_def_eq`, `hover_by_name`. All six drive a `SessionHost` and
-//!   project Lean responses into the JSON envelope.
-//! - [`scan`] — `project_scan`. No Lean dependency; pure filesystem walk
+//! - [`lean`]—`elaborate`, `kernel_check`, `infer_type`, `whnf`,
+//!   `is_def_eq`, `hover_by_name`. All six drive the project's worker actor
+//!   and project Lean responses into the JSON envelope.
+//! - [`scan`]—`project_scan`. No Lean dependency; pure filesystem walk
 //!   with a configurable regex.
-//! - [`index`] — `find_symbol`, `find_lemma`, `outline`. Thin wrappers
+//! - [`index`]—`find_symbol`, `find_lemma`, `outline`. Thin wrappers
 //!   over the SQLite-backed [`DeclarationIndex`](crate::DeclarationIndex);
 //!   rebuild on Lake-manifest change.
-//! - [`position`] — `goal_at_position`, `type_at_position`,
+//! - [`position`]—`goal_at_position`, `type_at_position`,
 //!   `references_of_name`, `file_diagnostics`. Thin lookups over a
 //!   `ProcessedFileCache`-backed `LeanWorkerProcessedFile` projection from
 //!   `lean-rs-worker`; the cache is keyed on path + content hash.
@@ -22,34 +22,22 @@ pub mod lean;
 pub mod position;
 pub mod scan;
 
-use crate::cache::ProcessedFileCache;
 use crate::envelope::Freshness;
-use crate::index::DeclarationIndex;
-use crate::session::SessionHost;
+use crate::project::LeanProject;
 
-/// Shared state every tool handler reads.
+/// Shared state every tool handler reads. A single `LeanProject` for now;
+/// once the broker lands this becomes the indirection through which a tool
+/// looks up the project to dispatch against.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
-    pub host: SessionHost,
-    pub index: Arc<DeclarationIndex>,
-    pub processed_files: Arc<ProcessedFileCache>,
-    pub lake_root: String,
-    pub default_imports: Vec<String>,
+    pub project: Arc<LeanProject>,
 }
 
 impl ToolContext {
     pub fn freshness(&self, imports: &[String], session_id: &str) -> Freshness {
-        let imports = if imports.is_empty() {
-            self.default_imports.clone()
-        } else {
-            imports.to_vec()
-        };
-        Freshness {
-            lake_root: self.lake_root.clone(),
-            imports,
-            session_id: session_id.to_owned(),
-            lean_toolchain: self.host.lean_toolchain().to_owned(),
-        }
+        let mut fr = self.project.freshness(imports);
+        session_id.clone_into(&mut fr.session_id);
+        fr
     }
 }
 

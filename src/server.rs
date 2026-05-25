@@ -2,11 +2,10 @@
 //! [`tools`](crate::tools) module.
 //!
 //! Each `#[tool]` handler is a thin call into the implementation function;
-//! all real work happens in `crate::tools` and `crate::session`. Returns
+//! all real work happens in `crate::tools` and `crate::project`. Returns
 //! `Json<Response<T>>` so rmcp generates structured-content output and a
 //! schema downstream clients can introspect.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use rmcp::Json;
@@ -15,18 +14,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
-use crate::cache::ProcessedFileCache;
 use crate::envelope::Response;
-use crate::index::DeclarationIndex;
-use crate::session::SessionHost;
+use crate::project::LeanProject;
 use crate::tools::{self, ToolContext};
 
-/// LRU capacity for the in-memory `ProcessedFile` cache. Sized for a normal
-/// multi-file proof session — large enough that twenty cursor moves across
-/// a handful of files all hit, small enough to keep memory bounded.
-const PROCESSED_FILE_CACHE_CAPACITY: usize = 16;
-
-// Deliberately not `use crate::error::Result;` here — the `#[tool_handler]`
+// Deliberately not `use crate::error::Result;` here—the `#[tool_handler]`
 // macro emits bare `Result<...>` references that must resolve to the std
 // `Result`. We use `crate::error::Result` only via fully-qualified paths.
 
@@ -40,22 +32,8 @@ pub struct LeanHostService {
 }
 
 impl LeanHostService {
-    pub fn new(host: SessionHost, index: Arc<DeclarationIndex>) -> Self {
-        // The constant is non-zero by construction; `NonZeroUsize::MIN`
-        // ([`NonZeroUsize::new(1)`]) is a safe fallback the type system
-        // can verify, so we do not need an `unwrap` here.
-        #[allow(
-            clippy::missing_const_for_fn,
-            reason = "NonZeroUsize::new is const but `or` is not yet on stable for NonZeroUsize"
-        )]
-        let cache_cap = NonZeroUsize::new(PROCESSED_FILE_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
-        let ctx = ToolContext {
-            lake_root: host.lake_root().to_owned(),
-            default_imports: Vec::new(),
-            processed_files: Arc::new(ProcessedFileCache::with_capacity(cache_cap)),
-            host,
-            index,
-        };
+    pub fn new(project: Arc<LeanProject>) -> Self {
+        let ctx = ToolContext { project };
         Self {
             ctx,
             tool_router: Self::tool_router(),
@@ -81,7 +59,7 @@ impl LeanHostService {
     async fn kernel_check(
         &self,
         Parameters(req): Parameters<tools::lean::KernelCheckRequest>,
-    ) -> std::result::Result<Json<Response<crate::session::KernelOutcome>>, McpError> {
+    ) -> std::result::Result<Json<Response<crate::projections::KernelOutcome>>, McpError> {
         wrap(tools::lean::kernel_check(&self.ctx, req).await)
     }
 
@@ -89,7 +67,7 @@ impl LeanHostService {
     async fn infer_type(
         &self,
         Parameters(req): Parameters<tools::lean::InferTypeRequest>,
-    ) -> std::result::Result<Json<Response<crate::session::MetaOutcome>>, McpError> {
+    ) -> std::result::Result<Json<Response<crate::projections::MetaOutcome>>, McpError> {
         wrap(tools::lean::infer_type(&self.ctx, req).await)
     }
 
@@ -97,7 +75,7 @@ impl LeanHostService {
     async fn whnf(
         &self,
         Parameters(req): Parameters<tools::lean::WhnfRequest>,
-    ) -> std::result::Result<Json<Response<crate::session::MetaOutcome>>, McpError> {
+    ) -> std::result::Result<Json<Response<crate::projections::MetaOutcome>>, McpError> {
         wrap(tools::lean::whnf(&self.ctx, req).await)
     }
 
@@ -105,7 +83,7 @@ impl LeanHostService {
     async fn is_def_eq(
         &self,
         Parameters(req): Parameters<tools::lean::IsDefEqRequest>,
-    ) -> std::result::Result<Json<Response<crate::session::MetaOutcome>>, McpError> {
+    ) -> std::result::Result<Json<Response<crate::projections::MetaOutcome>>, McpError> {
         wrap(tools::lean::is_def_eq(&self.ctx, req).await)
     }
 
@@ -199,7 +177,7 @@ impl LeanHostService {
 #[tool_handler]
 impl ServerHandler for LeanHostService {
     fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]` from rmcp — struct literal
+        // `ServerInfo` is `#[non_exhaustive]` from rmcp—struct literal
         // syntax (even with `..default`) is forbidden across crates. Build
         // via Default + field mutation.
         let mut info = ServerInfo::default();

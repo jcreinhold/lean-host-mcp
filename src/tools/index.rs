@@ -1,24 +1,24 @@
 //! Tools that read the `SQLite`-backed [`DeclarationIndex`]: `find_symbol`,
 //! `find_lemma`, `outline`.
 //!
-//! Each handler is intentionally thin — shape the request, ensure the
+//! Each handler is intentionally thin—shape the request, ensure the
 //! index is fresh, call one `DeclarationIndex` method, return. The index
-//! itself owns `SQLite`, schema, and the rebuild pipeline; this module
-//! never touches `rusqlite`.
+//! itself owns `SQLite`, schema, and storage; the rebuild pipeline
+//! (filter → list → bulk-describe → insert) is orchestrated here so the
+//! index module stays free of `lean-rs-worker` types.
 
 #![allow(clippy::needless_pass_by_value)]
 
-use std::path::Path;
-
+use lean_rs_worker::LeanWorkerDeclarationFilter;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::envelope::Response;
 use crate::error::Result;
 use crate::index::{IndexedDeclaration, fingerprint_lake_project};
-use crate::tools::{ToolContext, new_session_id};
+use crate::tools::{ToolContext, lean as lean_tools, new_session_id};
 
-/// Default + cap for the `limit` request field — handlers clamp to this
+/// Default + cap for the `limit` request field—handlers clamp to this
 /// range so a missing or oversized value can't return more than 500 rows.
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
@@ -61,13 +61,13 @@ pub struct OutlineRequest {
 ///
 /// # Errors
 ///
-/// Infrastructure failures only — session errors during rebuild, or
+/// Infrastructure failures only—session errors during rebuild, or
 /// `SQLite` errors during the search.
 pub async fn find_symbol(ctx: &ToolContext, req: FindSymbolRequest) -> Result<Response<Vec<IndexedDeclaration>>> {
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let rebuilt = ensure_index(ctx, req.imports).await?;
     let limit = clamp_limit(req.limit);
-    let hits = ctx.index.search(&req.query, limit)?;
+    let hits = ctx.project.index().search(&req.query, limit)?;
     Ok(attach_rebuild_hint(Response::ok(hits, freshness), rebuilt))
 }
 
@@ -81,12 +81,12 @@ pub async fn find_lemma(ctx: &ToolContext, req: FindLemmaRequest) -> Result<Resp
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let rebuilt = ensure_index(ctx, req.imports).await?;
     let limit = clamp_limit(req.limit);
-    let hits = ctx.index.search_theorems(&req.query, limit)?;
+    let hits = ctx.project.index().search_theorems(&req.query, limit)?;
     Ok(attach_rebuild_hint(Response::ok(hits, freshness), rebuilt))
 }
 
 /// Name-prefix listing. With no prefix, returns the first `limit` rows
-/// ordered by name — useful for cold-cache exploration.
+/// ordered by name—useful for cold-cache exploration.
 ///
 /// # Errors
 ///
@@ -95,7 +95,7 @@ pub async fn outline(ctx: &ToolContext, req: OutlineRequest) -> Result<Response<
     let freshness = ctx.freshness(&req.imports, &new_session_id());
     let rebuilt = ensure_index(ctx, req.imports).await?;
     let limit = clamp_limit(req.limit);
-    let hits = ctx.index.outline(req.module_prefix.as_deref(), limit)?;
+    let hits = ctx.project.index().outline(req.module_prefix.as_deref(), limit)?;
     Ok(attach_rebuild_hint(Response::ok(hits, freshness), rebuilt))
 }
 
@@ -103,16 +103,15 @@ pub async fn outline(ctx: &ToolContext, req: OutlineRequest) -> Result<Response<
 /// when they diverge. Returns `true` when a rebuild fired, so callers
 /// can attach a hint.
 async fn ensure_index(ctx: &ToolContext, imports: Vec<String>) -> Result<bool> {
-    let fp = fingerprint_lake_project(Path::new(&ctx.lake_root))?;
-    if ctx.index.is_fresh(&fp)? {
+    let fp = fingerprint_lake_project(ctx.project.canonical_root())?;
+    if ctx.project.index().is_fresh(&fp)? {
         return Ok(false);
     }
-    let imports = if imports.is_empty() {
-        ctx.default_imports.clone()
-    } else {
-        imports
-    };
-    ctx.index.rebuild(&ctx.host, imports, fp).await?;
+    let imports = ctx.project.effective_imports(&imports);
+    let names = lean_tools::list_declarations_strings(ctx, LeanWorkerDeclarationFilter::default(), imports.clone())
+        .await?;
+    let rows = lean_tools::describe_bulk(ctx, names, imports).await?;
+    ctx.project.index().replace_all(&rows, &fp)?;
     Ok(true)
 }
 

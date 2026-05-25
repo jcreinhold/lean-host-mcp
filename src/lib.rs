@@ -6,30 +6,40 @@
 //!
 //! Layout:
 //!
-//! - [`envelope`] — the uniform `{result, freshness, warnings, next_actions}`
+//! - [`envelope`]—the uniform `{result, freshness, warnings, next_actions}`
 //!   wrapper every tool returns.
-//! - [`session`] — `SessionHost`, the single owner of all `lean-rs`
-//!   `LeanRuntime` / `LeanHost` / `LeanCapabilities` / `LeanSession` state.
-//!   Tools talk to it through a channel because `LeanSession` is `!Send`.
-//! - [`index`] — `DeclarationIndex`, the SQLite-backed projection of the
+//! - [`project`]—`LeanProject`, the unit of multiplexing. Bundles the
+//!   worker-actor capability, the `SQLite` declaration index, and the
+//!   in-memory processed-file cache for one Lake project.
+//! - [`projections`]—pure data-shuffle projection types and helpers from
+//!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.
+//! - [`lake_meta`]—`LakeProjectMeta`, the minimal description of a Lake
+//!   project that `LeanProject::open` consumes.
+//! - [`index`]—`DeclarationIndex`, the SQLite-backed projection of the
 //!   environment the three index tools query.
-//! - [`error`] — `ServerError`, the one error type tool handlers return.
-//! - [`tools`] — tool implementations, grouped by what plumbing they share
+//! - [`error`]—`ServerError`, the one error type tool handlers return.
+//! - [`tools`]—tool implementations, grouped by what plumbing they share
 //!   (`lean` for session-backed tools, `scan` for the filesystem regex
 //!   sweep, `index` for the SQLite-backed lookups).
-//! - [`server`] — rmcp glue.
+//! - [`server`]—rmcp glue.
 
 pub mod cache;
 pub mod envelope;
 pub mod error;
 pub mod index;
+pub mod lake_meta;
+pub mod project;
+pub mod projections;
 pub mod server;
-pub mod session;
 pub mod tools;
 
-pub use cache::ProcessedFileCache;
 pub use envelope::{Freshness, Response};
 pub use error::{Result, ServerError};
 pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};
+pub use lake_meta::LakeProjectMeta;
+pub use project::LeanProject;
+pub use projections::{
+    DeclarationRow, Diagnostic, ElabFailure, ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome, Position,
+    ProcessedFile, Severity, SourceRange,
+};
 pub use server::LeanHostService;
-pub use session::SessionHost;

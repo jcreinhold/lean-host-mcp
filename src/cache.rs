@@ -3,15 +3,17 @@
 //!
 //! Position-based tools (`goal_at_position`, `type_at_position`,
 //! `references_of_name`, `file_diagnostics`) want cheap repeat lookups against
-//! the same source file — a cursor that moves twenty times per minute should
+//! the same source file—a cursor that moves twenty times per minute should
 //! not re-elaborate the file twenty times. The cache lives on
 //! [`ToolContext`](crate::tools::ToolContext) and is consulted on every call.
 //!
 //! Keying invariant: the SHA-256 of the file contents is part of the key, so
 //! any edit (even a whitespace change) misses and re-processes. Imports are
-//! deliberately *not* in the key — within a server session callers reuse the
-//! same `default_imports`, and re-processing on import drift would defeat the
-//! purpose.
+//! deliberately *not* in the key—the cache lives *inside* a single
+//! [`LeanProject`](crate::project::LeanProject), and that project is uniquely
+//! identified by `(canonical_root, package, library, default_imports)`. So
+//! import-collision safety is structural: two requests against the same
+//! cache instance necessarily agree on imports.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -61,7 +63,7 @@ impl ProcessedFileCache {
     }
 }
 
-/// SHA-256 the file contents — used to build cache keys without holding the
+/// SHA-256 the file contents—used to build cache keys without holding the
 /// raw source.
 pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -74,7 +76,7 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
 ///
 /// Mirrors the in-process `ProcessedFile::tactic_at` containment test:
 /// `(start, end]` on the start side and `[end, end)` on the end side. Linear
-/// scan is fine for typical Lean files (well under 1000 tactic nodes) — see
+/// scan is fine for typical Lean files (well under 1000 tactic nodes)—see
 /// the `position_lookup_after_cache_warm` bench.
 #[must_use]
 pub fn tactic_at(file: &LeanWorkerProcessedFile, line: u32, column: u32) -> Option<&LeanWorkerTacticInfo> {

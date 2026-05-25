@@ -1,12 +1,11 @@
-//! `lean-host-mcp` — Model Context Protocol server hosting Lean 4 in-process
-//! via [`lean-rs`].
+//! `lean-host-mcp`—Model Context Protocol server hosting Lean 4 via a
+//! supervised [`lean-rs-worker`] child.
 //!
 //! Stdio transport. Wire into Claude Code / any MCP client by pointing the
 //! `command` at the built binary and passing `--lake-root <path>`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::Parser;
 use rmcp::ServiceExt;
@@ -14,9 +13,9 @@ use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
-use lean_host_mcp::{DeclarationIndex, LeanHostService, SessionHost, default_cache_dir};
+use lean_host_mcp::{LakeProjectMeta, LeanHostService, LeanProject, default_cache_dir};
 
-/// Stdio MCP server that hosts a Lean 4 environment in-process.
+/// Stdio MCP server that hosts a Lean 4 environment via a worker child.
 #[derive(Debug, Parser)]
 #[command(name = "lean-host-mcp", version, about)]
 struct Cli {
@@ -85,11 +84,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     );
 
     let cache_dir = cli.cache_dir.clone().unwrap_or_else(default_cache_dir);
-    let lake_root_str = cli.lake_root.to_string_lossy().into_owned();
-    let index = Arc::new(DeclarationIndex::open(&cache_dir, &lake_root_str)?);
-
-    let host = SessionHost::spawn(cli.lake_root, package, library, cli.imports)?;
-    let service = LeanHostService::new(host, index);
+    let meta = LakeProjectMeta::from_cli(&cli.lake_root, package, library, cli.imports)?;
+    let project = LeanProject::open(meta, &cache_dir)?;
+    let service = LeanHostService::new(project);
     let server = service.serve(stdio()).await?;
     server.waiting().await?;
     Ok(())
