@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
-use lean_rs_worker::LeanWorkerElabOptions;
+use lean_rs_worker_parent::LeanWorkerElabOptions;
 use tokio::runtime::Runtime;
 
 fn fixture_root() -> Option<PathBuf> {

@@ -43,18 +43,45 @@ and stable for that actor's lifetime. The only events that change it are the thr
 detect "my project was silently restarted" by comparing `session_id` across calls — that's the one observable
 side-effect of the pool decisions, and the multi-project tests use it as their identity signal.
 
-## Toolchain linkage
+## Multi-toolchain dispatch
 
-The parent binary (`lean-host-mcp`) transitively links `libleanshared` through `lean-rs-worker` → `lean-rs` →
-`lean-rs-sys`; `otool -L target/release/lean-host-mcp` shows `@rpath/libleanshared.dylib`. `build.rs`'s rpath emission
-is therefore load-bearing for the parent, not only the worker child. Multi-toolchain support has to either thread
-per-toolchain launchers around the parent or split the parent off the worker crate to drop the transitive link.
+The workspace is split into two members so the parent stays free of `libleanshared`:
+
+- `crates/lean-host-mcp/` depends on `lean-rs-worker-parent`, which carries no `lean-rs` / `lean-rs-host` /
+  `lean-rs-sys` link in its closure (`lean-toolchain`'s `lean-rs-sys` dep uses `metadata-only`, whose `build.rs` exits
+  before emitting link directives). `otool -L target/release/lean-host-mcp` shows only `libSystem` + `libiconv`.
+- `crates/lean-host-mcp-worker/` depends on `lean-rs-worker-child` and is the only crate that links `libleanshared`.
+  Its `build.rs` reads `LEAN_HOST_MCP_TARGET_TOOLCHAIN` (set by `lean-host-mcp install-worker`) and bakes
+  `~/.elan/toolchains/leanprover--lean4---<id>/lib/lean` into the binary's rpath.
+
+`crates/lean-host-mcp/src/toolchain.rs` resolves a project's `lean-toolchain` pin to one of the per-toolchain worker
+binaries installed under `~/.local/share/lean-host-mcp/workers/<id>/lean-host-mcp-worker`.
+`LeanProject::open` invokes `WorkerBinary::resolve_for` up front and passes the result to
+`LeanWorkerChild::path(...)`; a missing worker surfaces as `ServerError::BadProject` whose message includes the exact
+`lean-host-mcp install-worker --toolchain <id>` command needed.
+
+**Feature unification caveat.** `cargo build --workspace` would unify `lean-rs-sys`'s features across both members and
+silently relink `libleanshared` into the parent. Always build per-member (`cargo build -p lean-host-mcp` /
+`cargo build -p lean-host-mcp-worker`); CI runs them as separate jobs and asserts
+`! otool -L target/release/lean-host-mcp | grep -q libleanshared`.
+
+### Manual smoke test
+
+```sh
+lean-host-mcp install-worker --toolchain v4.30.0-rc2
+lean-host-mcp install-worker --list                                          # see one row
+LEAN_HOST_MCP_PROJECT=/path/to/project-on-v4.30 lean-host-mcp                # serves
+LEAN_HOST_MCP_PROJECT=/path/to/project-on-v4.29 lean-host-mcp                # error includes install_cmd
+lean-host-mcp install-worker --toolchain v4.29.1
+# same server, both projects work
+```
 
 ## A supervised worker child for all Lean state
 
-Lean lives in a child process—the `lean-host-mcp-worker` binary, resolved sibling-to-the-parent by
-`LeanWorkerChild::sibling("lean-host-mcp-worker")`. A wedged tactic, a typeclass loop, or OOM mid-elaboration kills that
-child; the supervisor restarts it on the next request rather than taking down the MCP server.
+Lean lives in a child process—the `lean-host-mcp-worker` binary, resolved per-toolchain by `WorkerBinary::resolve_for`
+and handed to the supervisor as `LeanWorkerChild::path(...)`. A wedged tactic, a typeclass loop, or OOM
+mid-elaboration kills that child; the supervisor restarts it on the next request rather than taking down the MCP
+server.
 
 The parent sees only `LeanWorkerCapability` (Send) and short-lived `LeanWorkerSession<'_>` borrows that don't escape
 their owning stack frame. The `'lean` lifetime tangle the in-process implementation had to navigate is gone, but the

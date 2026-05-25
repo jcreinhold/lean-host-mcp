@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use lean_rs_worker::LeanWorkerDeclarationFilter;
+use lean_rs_worker_parent::LeanWorkerDeclarationFilter;
 use schemars::JsonSchema;
 use serde::Deserialize;
 

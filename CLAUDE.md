@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-MCP (Model Context Protocol) server that hosts Lean 4 in a supervised **worker child** via `lean-rs-worker`. The "host"
-in the name distinguishes it from `lean-lsp-mcp`: the parent owns a `LeanWorkerCapability`, and the worker child owns
-the `LeanRuntime` + `LeanCapabilities` dylib — calls reach Lean's elaborator and kernel directly rather than going
-through an external LSP. A wedged tactic, typeclass loop, or OOM kills the *child*, which the supervisor restarts.
-Single crate, library + two binaries (`lean-host-mcp` and the tiny `lean-host-mcp-worker` child), stdio transport.
+MCP (Model Context Protocol) server that hosts Lean 4 in a supervised **worker child** via `lean-rs-worker-parent` +
+`lean-rs-worker-child`. The "host" in the name distinguishes it from `lean-lsp-mcp`: the parent owns a
+`LeanWorkerCapability`, and the worker child owns the `LeanRuntime` + `LeanCapabilities` dylib — calls reach Lean's
+elaborator and kernel directly rather than going through an external LSP. A wedged tactic, typeclass loop, or OOM kills
+the *child*, which the supervisor restarts.
+
+Two-member Cargo workspace: `crates/lean-host-mcp/` (library + parent binary; does **not** link `libleanshared`) and
+`crates/lean-host-mcp-worker/` (the per-toolchain worker binary; the only crate that links `libleanshared`). The split
+is deliberate — see "Multi-toolchain dispatch" below.
 
 Reader-facing references live under `docs/`: `tool-catalog.md` is the per-tool request/result schema, `architecture.md`
 is the deeper layering write-up. This file captures what's relevant only to working on the code itself.
@@ -26,38 +30,76 @@ parse failures short-circuit to a `header_parse_failed` status variant.
 ## Common commands
 
 ```sh
-cargo build                                   # debug build (both binaries)
-cargo build --release --bins                  # release: lean-host-mcp + lean-host-mcp-worker (sibling resolution)
-cargo clippy --all-targets -- -D warnings     # the lint gate (config is strict; see Cargo.toml [lints.clippy])
-cargo test                                    # unit tests; no Lean fixture required
-cargo test <name>                             # single test by name substring
+cargo build -p lean-host-mcp                            # debug build, parent only
+cargo build -p lean-host-mcp-worker                     # debug build, worker only
+cargo build --release -p lean-host-mcp                  # release parent (no libleanshared link)
+cargo build --release -p lean-host-mcp-worker           # release worker (links libleanshared)
+cargo clippy --workspace --all-targets -- -D warnings   # lints; --workspace is safe (clippy doesn't link)
+cargo test -p lean-host-mcp                             # parent tests (no Lean fixture required)
+cargo test -p lean-host-mcp <name>                      # single test by name substring
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
-    cargo test --test e2e --test worker -- --ignored   # opt-in E2E + worker integration
-cargo bench --bench worker_roundtrip                   # gated on LEAN_HOST_MCP_BENCH_FIXTURE
+    cargo test -p lean-host-mcp --test e2e --test worker -- --ignored   # opt-in E2E + worker integration
+cargo bench -p lean-host-mcp --bench worker_roundtrip                   # gated on LEAN_HOST_MCP_BENCH_FIXTURE
 ```
+
+### Always build per-member, never `--workspace`
+
+`cargo build --workspace` unifies the `lean-rs-sys` feature set across the parent and worker crates, silently re-linking
+`libleanshared` into the parent binary. The whole multi-toolchain story depends on the parent staying free of
+`libleanshared`, so always use `-p <member>`. The link-set assertion below catches regressions:
+
+```sh
+! otool -L target/release/lean-host-mcp | grep -q libleanshared    # macOS
+! ldd  target/release/lean-host-mcp | grep -q libleanshared        # Linux
+```
+
+`cargo clippy --workspace` is *safe* (no linking happens). Workspace-wide `cargo test` is correctness-safe but masks
+the link-set invariant — keep link assertions on `-p`-scoped release builds.
+
+### Running from a development checkout
+
+The parent resolves the worker binary from `~/.local/share/lean-host-mcp/workers/<toolchain>/lean-host-mcp-worker`,
+populated by `lean-host-mcp install-worker`. During development you can shortcut this with `LEAN_HOST_MCP_WORKERS_DIR`:
+
+```sh
+cargo build --release -p lean-host-mcp-worker
+LEAN_HOST_MCP_WORKERS_DIR=$PWD/target/release \
+    cargo run --release -p lean-host-mcp -- ...
+```
+
+When `LEAN_HOST_MCP_WORKERS_DIR` is set, resolution looks for `<dir>/lean-host-mcp-worker` first (bare developer
+layout matching `target/release/`), then `<dir>/<toolchain>/lean-host-mcp-worker`.
 
 E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY` (defaults `lean_rs_fixture` /
 `LeanRsFixture`).
 
-Running the server requires a Lake project that links the `lean-rs-host` shim (mandatory plus optional `lean_rs_host_*`
-symbols; the exact symbol set is pinned by the `lean-rs` version in `Cargo.toml`). This crate does not bundle one; the
-canonical template is `lean-rs/fixtures/lean/`. After `lake build` in that fixture, run:
+Running the server requires a Lake project that links the `lean-rs-host` shim (mandatory plus optional
+`lean_rs_host_*` symbols; the exact symbol set is pinned by the `lean-rs` version in `crates/lean-host-mcp-worker/Cargo.toml`).
+This workspace does not bundle one; the canonical template is `lean-rs/fixtures/lean/`. Each project's
+`lean-toolchain` pin selects the worker binary; install one first with `lean-host-mcp install-worker --toolchain <id>`
+(or `--auto` to scan `~/.elan/toolchains`). Then point the server at a project:
 
 ```sh
-./target/release/lean-host-mcp \
-    --lake-root /path/to/lake/project \
-    --package <pkg> --library <Lib> \
-    --imports Your.Main.Module
+./target/release/lean-host-mcp --lake-root /path/to/lake/project
 ```
 
-All flags also read from `LEAN_HOST_MCP_{LAKE_ROOT,PACKAGE,LIBRARY,IMPORTS,CACHE_DIR}`.
+`LEAN_HOST_MCP_{PROJECT,CACHE_DIR}` provide the corresponding environment overrides.
 
 ## Architecture: closure-channel actor over a worker child
 
 The parent process never sees `lean-rs` or `lean-rs-host` types directly — those live inside the worker child
-(`src/bin/worker.rs`, a 2-line entry that calls `lean_rs_worker::run_worker_child_stdio()`). The parent owns a
-`LeanWorkerCapability` (Send) and short-lived `LeanWorkerSession<'_>` borrows that don't escape their owning stack
-frame.
+(`crates/lean-host-mcp-worker/src/main.rs`, a 2-line entry that calls `lean_rs_worker_child::run_worker_child_stdio()`).
+The parent owns a `LeanWorkerCapability` (re-exported from `lean-rs-worker-parent`) and short-lived
+`LeanWorkerSession<'_>` borrows that don't escape their owning stack frame.
+
+## Multi-toolchain dispatch
+
+`crates/lean-host-mcp/src/toolchain.rs` resolves a Lake project's `lean-toolchain` pin to a per-toolchain worker
+binary under `~/.local/share/lean-host-mcp/workers/<id>/lean-host-mcp-worker`. `LeanProject::open` calls
+`WorkerBinary::resolve_for` up front; a missing binary surfaces as `ServerError::BadProject` whose message includes
+the exact `lean-host-mcp install-worker --toolchain <id>` command to fix it. Each worker binary is built with
+`LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` so the worker crate's `build.rs` bakes the matching `lib/lean` directory into
+its rpath.
 
 The "one owner of the capability at a time" invariant is enforced by parking it on a dedicated OS thread named
 `"lean-host-mcp/session"`. The channel carries a closure type, not a Request enum:
@@ -85,22 +127,30 @@ handles to manage, unlike the original in-process design.
 ## Module layout
 
 ```
-src/
-  main.rs        clap CLI + rmcp stdio entry
-  bin/worker.rs  2-line worker child entry (lean_rs_worker::run_worker_child_stdio)
-  lib.rs         re-exports (LeanHostService, SessionHost, DeclarationIndex, …)
-  server.rs      rmcp glue (LeanHostService)
-  session.rs     SessionHost closure-channel actor + projection structs (Diagnostic, ElabFailure, …)
-  index.rs       DeclarationIndex: SQLite-backed deep module behind the three index tools
-  cache.rs       ProcessedFileCache: LRU<Arc<LeanWorkerProcessedFile>> + position-lookup helpers
-  envelope.rs    Response<T> = { result, freshness, warnings, next_actions }
-  error.rs       ServerError
-  tools/
-    mod.rs       ToolContext (host + index + processed_files + lake_root + default_imports)
-    lean.rs      six session-backed handlers
-    scan.rs      project_scan: pure filesystem regex sweep, no Lean dependency
-    index.rs     find_symbol / find_lemma / outline: thin wrappers over DeclarationIndex
-    position.rs  goal_at_position / type_at_position / references_of_name / file_diagnostics: cache-backed
+crates/
+  lean-host-mcp/                # parent crate (no libleanshared link)
+    src/
+      main.rs        clap CLI: `serve` (default) + `install-worker`
+      lib.rs         re-exports (LeanHostService, LeanProject, DeclarationIndex, ToolchainId, …)
+      server.rs      rmcp glue (LeanHostService)
+      project.rs     LeanProject closure-channel actor + worker resolution
+      broker.rs      ProjectBroker: per-project pool, idle reaper, hint resolution
+      toolchain.rs   ToolchainId / WorkerBinary / ToolchainError
+      cli/install_worker.rs   `install-worker` subcommand
+      index.rs       DeclarationIndex: SQLite-backed deep module behind the three index tools
+      cache.rs       ProcessedFileCache: LRU<Arc<LeanWorkerProcessedFile>> + position-lookup helpers
+      envelope.rs    Response<T> = { result, freshness, warnings, next_actions }
+      error.rs       ServerError
+      lake_meta.rs   LakeProjectMeta + lakefile discovery
+      tools/
+        mod.rs       ToolContext (broker + processed_files + ...)
+        lean.rs      six session-backed handlers
+        scan.rs      project_scan: pure filesystem regex sweep, no Lean dependency
+        index.rs     find_symbol / find_lemma / outline: thin wrappers over DeclarationIndex
+        position.rs  goal_at_position / type_at_position / references_of_name / file_diagnostics: cache-backed
+  lean-host-mcp-worker/         # worker child binary (only crate that links libleanshared)
+    build.rs         emits rpath; honors LEAN_HOST_MCP_TARGET_TOOLCHAIN
+    src/main.rs      2-line entry: lean_rs_worker_child::run_worker_child_stdio()
 ```
 
 Tools are grouped by **shared plumbing**, not one-file-per-tool. The six `lean.rs` handlers all hit `SessionHost`; the
@@ -127,10 +177,10 @@ Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are pa
 
 ## build.rs note
 
-`build.rs` bakes the Lean toolchain's `lib/lean` directory into the binary rpath so `libleanshared.{dylib,so}` loads at
-runtime. `lean-rs-sys`'s build script does this for its own binaries but `cargo:rustc-link-arg` doesn't propagate, so
-every crate that ships an executable loading Lean must repeat the dance. Discovery uses `$LEAN_SYSROOT` then falls back
-to `lean --print-prefix`. macOS/Linux only.
+`crates/lean-host-mcp-worker/build.rs` bakes the Lean toolchain's `lib/lean` directory into the worker binary's rpath
+so `libleanshared.{dylib,so}` loads at runtime. The parent crate has **no** `build.rs` — it does not link
+`libleanshared`. Discovery order: `LEAN_HOST_MCP_TARGET_TOOLCHAIN` (resolved as
+`~/.elan/toolchains/leanprover--lean4---<id>`), then `LEAN_SYSROOT`, then `lean --print-prefix`. macOS/Linux only.
 
 ## Lint posture
 

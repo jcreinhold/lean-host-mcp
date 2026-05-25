@@ -16,7 +16,7 @@
 // projection helpers consume their argument; the lint is noise here.
 #![allow(clippy::needless_pass_by_value)]
 
-use lean_rs_worker::{
+use lean_rs_worker_parent::{
     LeanWorkerDeclarationRow, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerElabResult, LeanWorkerError,
     LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerRendered, LeanWorkerRendering,
     LeanWorkerSourceRange,
@@ -139,7 +139,7 @@ pub struct DeclarationRow {
 
 /// Re-export of [`LeanWorkerProcessedFile`] so callers that hold a cached
 /// projection can pattern-match without importing `lean-rs-worker` directly.
-pub use lean_rs_worker::LeanWorkerProcessedFile as ProcessedFile;
+pub use lean_rs_worker_parent::LeanWorkerProcessedFile as ProcessedFile;
 
 // --- projection helpers -------------------------------------------------
 
@@ -208,6 +208,7 @@ pub fn project_kernel_result(result: LeanWorkerKernelResult) -> KernelOutcome {
         LeanWorkerKernelStatus::Rejected => "Rejected",
         LeanWorkerKernelStatus::Unavailable => "Unavailable",
         LeanWorkerKernelStatus::Unsupported => "Unsupported",
+        _ => "Unsupported",
     };
     let summary = result.summary.map(|s| KernelSummary {
         declaration_name: s.declaration_name,
@@ -241,6 +242,13 @@ pub fn project_meta_rendered(result: LeanWorkerMetaResult<LeanWorkerRendered>) -
         LeanWorkerMetaResult::Failed { failure } => meta_failure("Failed", &failure),
         LeanWorkerMetaResult::TimeoutOrHeartbeat { failure } => meta_failure("TimeoutOrHeartbeat", &failure),
         LeanWorkerMetaResult::Unsupported { failure } => meta_failure("Unsupported", &failure),
+        _ => MetaOutcome {
+            status: "Unsupported".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: None,
+            raw_fallback_used: false,
+        },
     }
 }
 
@@ -256,6 +264,13 @@ pub fn project_meta_bool(result: LeanWorkerMetaResult<bool>) -> MetaOutcome {
         LeanWorkerMetaResult::Failed { failure } => meta_failure("Failed", &failure),
         LeanWorkerMetaResult::TimeoutOrHeartbeat { failure } => meta_failure("TimeoutOrHeartbeat", &failure),
         LeanWorkerMetaResult::Unsupported { failure } => meta_failure("Unsupported", &failure),
+        _ => MetaOutcome {
+            status: "Unsupported".into(),
+            rendered: None,
+            definitionally_equal: None,
+            failure: None,
+            raw_fallback_used: false,
+        },
     }
 }
 

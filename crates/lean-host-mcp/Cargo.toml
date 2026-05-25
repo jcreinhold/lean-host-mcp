@@ -1,0 +1,71 @@
+[package]
+authors.workspace = true
+categories = ["development-tools"]
+description = "MCP server hosting Lean 4 via a supervised lean-rs-worker child"
+edition.workspace = true
+keywords = ["lean", "lean4", "mcp", "model-context-protocol"]
+license.workspace = true
+name = "lean-host-mcp"
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "lean_host_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lean-host-mcp"
+path = "src/main.rs"
+
+[[bench]]
+harness = false
+name = "worker_roundtrip"
+
+[[bench]]
+harness = false
+name = "worker_cold_spawn"
+
+[[bench]]
+harness = false
+name = "process_module_owned"
+
+[[bench]]
+harness = false
+name = "position_lookup_after_cache_warm"
+
+[[bench]]
+harness = false
+name = "multi_project_dispatch"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+lru = "0.18"
+parking_lot = "0.12"
+regex = "1"
+rmcp = { version = "1.7", features = ["macros", "schemars", "server", "transport-io"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+lean-rs-worker-parent = "0.1.8"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+insta = { version = "1", features = ["json"] }
+tempfile = "3"
+
+[lints]
+workspace = true

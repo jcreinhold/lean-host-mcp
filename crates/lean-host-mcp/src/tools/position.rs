@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lean_rs_worker::{
+use lean_rs_worker_parent::{
     LeanWorkerNameRef, LeanWorkerProcessModuleOutcome, LeanWorkerProcessedFile, LeanWorkerTacticInfo,
     LeanWorkerTermInfo,
 };
@@ -531,6 +531,7 @@ async fn ensure_processed(project: &Arc<LeanProject>, path: &Path) -> Result<Ens
             diagnostics: project_failure(&diagnostics),
         }),
         LeanWorkerProcessModuleOutcome::Unsupported => Ok(EnsureOutcome::Unsupported),
+        _ => Ok(EnsureOutcome::Unsupported),
     }
 }
 
@@ -586,7 +587,7 @@ async fn process_module(project: &Arc<LeanProject>, source: String) -> Result<Le
                 .open_session_with_imports(imports, None, None)
                 .map_err(crate::projections::map_worker_err)?;
             session
-                .process_module(&source, &lean_rs_worker::LeanWorkerElabOptions::new(), None, None)
+                .process_module(&source, &lean_rs_worker_parent::LeanWorkerElabOptions::new(), None, None)
                 .map_err(crate::projections::map_worker_err)
         })
         .await

@@ -28,6 +28,7 @@
 
 pub mod broker;
 pub mod cache;
+pub mod cli;
 pub mod envelope;
 pub mod error;
 pub mod index;
@@ -35,6 +36,7 @@ pub mod lake_meta;
 pub mod project;
 pub mod projections;
 pub mod server;
+pub mod toolchain;
 pub mod tools;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
@@ -48,3 +50,4 @@ pub use projections::{
     ProcessedFile, Severity, SourceRange,
 };
 pub use server::LeanHostService;
+pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};

@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Worker-child binary for lean-host-mcp (links libleanshared; spawned by the parent)"
+edition.workspace = true
+license.workspace = true
+name = "lean-host-mcp-worker"
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "lean-host-mcp-worker"
+path = "src/main.rs"
+
+[dependencies]
+lean-rs-worker-child = "0.1.8"
+
+[lints]
+workspace = true

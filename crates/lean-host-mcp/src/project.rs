@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use lean_rs_worker::{LeanWorkerCapability, LeanWorkerCapabilityBuilder, LeanWorkerChild};
+use lean_rs_worker_parent::{LeanWorkerCapability, LeanWorkerCapabilityBuilder, LeanWorkerChild};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
@@ -36,6 +36,7 @@ use crate::error::{Result, ServerError};
 use crate::index::DeclarationIndex;
 use crate::lake_meta::LakeProjectMeta;
 use crate::projections::map_worker_err;
+use crate::toolchain::{ToolchainId, WorkerBinary};
 
 /// LRU capacity for the in-memory `ProcessedFile` cache. Sized for a normal
 /// multi-file proof session—large enough that twenty cursor moves across
@@ -95,6 +96,16 @@ impl LeanProject {
     /// cannot be created or the `SQLite` database cannot be opened;
     /// `ServerError::Internal` if the OS rejects the actor thread.
     pub fn open(meta: LakeProjectMeta, cache_dir: &Path) -> Result<Arc<Self>> {
+        // Resolve the toolchain pin to a concrete worker binary before
+        // spawning the actor, so the install error surfaces synchronously
+        // and includes the `install-worker` command in its message.
+        // TODO(prompt 15): swap this for a structured `NeedsWorker`
+        // envelope status rather than embedding the command in a string.
+        let toolchain_id =
+            ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
+        let worker = WorkerBinary::resolve_for(&toolchain_id)
+            .map_err(|e| ServerError::BadProject(e.to_string()))?;
+
         let index = Arc::new(DeclarationIndex::open(
             cache_dir,
             &meta.canonical_root.to_string_lossy(),
@@ -108,12 +119,21 @@ impl LeanProject {
         let library = meta.library.clone();
         let default_imports = meta.default_imports.clone();
         let toolchain_label = meta.toolchain.clone();
+        let worker_path = worker.path;
         let thread_name = actor_thread_name(&meta.canonical_root);
 
         thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                actor_main(lake_root, package, library, default_imports, toolchain_label, init_tx);
+                actor_main(
+                    lake_root,
+                    package,
+                    library,
+                    default_imports,
+                    toolchain_label,
+                    worker_path,
+                    init_tx,
+                );
             })
             .map_err(|e| ServerError::Internal(format!("spawn project actor thread: {e}")))?;
 
@@ -270,10 +290,11 @@ fn actor_main(
     library: String,
     default_imports: Vec<String>,
     toolchain_label: String,
+    worker_path: PathBuf,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<Job>), ServerError>>,
 ) {
     let builder = LeanWorkerCapabilityBuilder::new(&lake_root, &package, &library, default_imports.iter())
-        .worker_child(LeanWorkerChild::sibling("lean-host-mcp-worker"))
+        .worker_child(LeanWorkerChild::path(worker_path))
         .startup_timeout(Duration::from_secs(30))
         .long_running_requests();
 

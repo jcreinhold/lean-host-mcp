@@ -9,19 +9,37 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
+use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
 use lean_host_mcp::{BrokerConfig, LeanHostService, ProjectBroker, default_cache_dir};
 
 /// Stdio MCP server that hosts a Lean 4 environment via a worker child.
 #[derive(Debug, Parser)]
 #[command(name = "lean-host-mcp", version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run the stdio MCP server (default when no subcommand is given).
+    Serve(ServeArgs),
+    /// Build and install a per-toolchain worker binary.
+    InstallWorker(InstallWorkerArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
     /// Default Lake project for tool calls that don't specify one.
     /// Equivalent to `LEAN_HOST_MCP_PROJECT`. May be omitted; the server
     /// will resolve from the invocation cwd's nearest lakefile, then from
@@ -36,11 +54,31 @@ struct Cli {
     cache_dir: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
-    match run(cli).await {
+    match cli.command {
+        Some(Command::InstallWorker(args)) => match install_worker::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("lean-host-mcp install-worker: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Serve(args)) => run_serve(args),
+        None => run_serve(cli.serve),
+    }
+}
+
+fn run_serve(args: ServeArgs) -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("failed to build tokio runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(serve(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %err, "lean-host-mcp exited with error");
@@ -58,9 +96,9 @@ fn init_tracing() {
     let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    let cache_dir = cli.cache_dir.unwrap_or_else(default_cache_dir);
-    let env_default = cli.lake_root;
+async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
+    let env_default = args.lake_root;
     let config_default = read_config_default();
     let cwd = std::env::current_dir()?;
     let (max_projects, idle_timeout) = BrokerConfig::pool_from_env()?;

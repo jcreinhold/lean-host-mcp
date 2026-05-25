@@ -15,7 +15,7 @@ use std::sync::Arc;
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::cache;
 use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
-use lean_rs_worker::{LeanWorkerElabOptions, LeanWorkerProcessModuleOutcome};
+use lean_rs_worker_parent::{LeanWorkerElabOptions, LeanWorkerProcessModuleOutcome};
 use tokio::runtime::Runtime;
 
 fn fixture_root() -> Option<PathBuf> {

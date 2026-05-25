@@ -1,77 +1,16 @@
-[package]
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
 authors = ["Jacob Reinhold <jcreinhold@gmail.com>"]
-categories = ["development-tools"]
-description = "MCP server hosting Lean 4 in-process via lean-rs"
 edition = "2024"
-keywords = ["lean", "lean4", "mcp", "model-context-protocol"]
 license = "MIT OR Apache-2.0"
-name = "lean-host-mcp"
-publish = false
 repository = "https://github.com/jcreinhold/lean-host-mcp"
 rust-version = "1.91"
 version = "0.1.0"
 
-[lib]
-name = "lean_host_mcp"
-path = "src/lib.rs"
-
-[[bin]]
-name = "lean-host-mcp"
-path = "src/main.rs"
-
-[[bin]]
-name = "lean-host-mcp-worker"
-path = "src/bin/worker.rs"
-
-[[bench]]
-harness = false
-name = "worker_roundtrip"
-
-[[bench]]
-harness = false
-name = "worker_cold_spawn"
-
-[[bench]]
-harness = false
-name = "process_module_owned"
-
-[[bench]]
-harness = false
-name = "position_lookup_after_cache_warm"
-
-[[bench]]
-harness = false
-name = "multi_project_dispatch"
-
-[dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
-dirs = "6"
-lru = "0.18"
-parking_lot = "0.12"
-regex = "1"
-rmcp = { version = "1.7", features = ["macros", "schemars", "server", "transport-io"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
-schemars = "1.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.11"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
-toml = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1", features = ["v4"] }
-walkdir = "2"
-
-lean-rs-worker = "0.1.7"
-
-[dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
-insta = { version = "1", features = ["json"] }
-tempfile = "3"
-
-[lints.rust]
+[workspace.lints.rust]
 future-incompatible = "warn"
 let-underscore = "warn"
 nonstandard-style = "warn"
@@ -84,9 +23,7 @@ unreachable_pub = "warn"
 unsafe-code = "forbid"
 unused = { level = "warn", priority = -1 }
 
-# Comprehensive Clippy configuration for correctness, performance, and style
-# (ported from ~/Code/lean-dup).
-[lints.clippy]
+[workspace.lints.clippy]
 # === CORRECTNESS & BUG PREVENTION ===
 all = { level = "warn", priority = -10 }
 complexity = { level = "warn", priority = -9 }

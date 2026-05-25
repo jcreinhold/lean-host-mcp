@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lean_rs_worker::{LeanWorkerNameRef, LeanWorkerProcessedFile, LeanWorkerTacticInfo, LeanWorkerTermInfo};
+use lean_rs_worker_parent::{LeanWorkerNameRef, LeanWorkerProcessedFile, LeanWorkerTacticInfo, LeanWorkerTermInfo};
 use lru::LruCache;
 use parking_lot::Mutex;
 

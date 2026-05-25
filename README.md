@@ -1,8 +1,10 @@
 # lean-host-mcp
 
-A Model Context Protocol server that hosts Lean 4 in a supervised worker child via
-[`lean-rs-worker`](https://crates.io/crates/lean-rs-worker). The parent process owns a `LeanWorkerCapability`; the
-worker child owns the `LeanRuntime` and `LeanCapabilities` dylib. Tool calls run as Meta and kernel operations inside
+A Model Context Protocol server that hosts Lean 4 in a supervised worker child via the `lean-rs-worker-parent` +
+`lean-rs-worker-child` crate pair. The parent process owns a `LeanWorkerCapability`; the worker child owns the
+`LeanRuntime` and `LeanCapabilities` dylib. The parent does **not** link `libleanshared`, which is how a single
+running `lean-host-mcp` can serve projects on different Lean toolchains: each toolchain has its own pre-built worker
+binary installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls run as Meta and kernel operations inside
 that child rather than as messages to an external LSP — and when a tactic wedges or a typeclass loop runs away, the
 supervisor restarts the child instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
@@ -26,22 +28,28 @@ template and doubles as a starting point you can adapt.
 cd /path/to/lean-rs/fixtures/lean
 lake build
 
-# 2. Build the MCP server. `--bins` builds both the server and its sibling
-#    worker child (`lean-host-mcp-worker`), which the parent resolves via
-#    `LeanWorkerChild::sibling`; both end up next to each other in
-#    `target/release/`.
+# 2. Install the parent binary. Build per-member, never `cargo build --workspace`
+#    (workspace builds unify feature flags and silently link libleanshared
+#    into the parent).
 cd /path/to/lean-host-mcp
-cargo build --release --bins
+cargo install --path crates/lean-host-mcp
 
-# 3a. Zero-config: launch from inside (or anywhere under) a Lake project
-#     that exposes the shims. The package, library, and umbrella import
-#     are auto-discovered from the lakefile.
+# 3. Install one worker binary per Lean toolchain you want to serve.
+#    --auto scans ~/.elan/toolchains and builds any missing ones; the
+#    target lands under ~/.local/share/lean-host-mcp/workers/<id>/.
+lean-host-mcp install-worker --toolchain v4.30.0-rc2
+lean-host-mcp install-worker --auto
+lean-host-mcp install-worker --list           # see what's installed
+
+# 4a. Zero-config: launch from inside (or anywhere under) a Lake project
+#     that exposes the shims. The package, library, umbrella import, and
+#     worker toolchain are all auto-discovered.
 cd /path/to/lean-rs/fixtures/lean
-/path/to/target/release/lean-host-mcp
+lean-host-mcp
 
-# 3b. Explicit: pin the default project. Equivalent to setting
+# 4b. Explicit: pin the default project. Equivalent to setting
 #     LEAN_HOST_MCP_PROJECT.
-./target/release/lean-host-mcp --lake-root /path/to/lean-rs/fixtures/lean
+lean-host-mcp --lake-root /path/to/lean-rs/fixtures/lean
 ```
 
 Project resolution chain (used by every tool call that does not pass its own `project="..."` argument):
@@ -110,16 +118,26 @@ doesn't have are still processed; missing imports surface as an envelope warning
 ## Build, test, lint
 
 ```sh
-cargo build
-cargo clippy --all-targets -- -D warnings
-cargo test                                # unit tests; no Lean fixture required
+cargo build -p lean-host-mcp                          # parent only
+cargo build -p lean-host-mcp-worker                   # worker only (links libleanshared)
+cargo clippy --workspace --all-targets -- -D warnings # safe; clippy doesn't link
+cargo test -p lean-host-mcp                           # unit tests; no Lean fixture required
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
-    cargo test --test e2e -- --ignored    # opt-in end-to-end
+    cargo test -p lean-host-mcp --test e2e -- --ignored   # opt-in end-to-end
+```
+
+Build per-member (`-p <name>`); avoid `cargo build --workspace`, which unifies the `lean-rs-sys` feature set across
+members and silently links `libleanshared` into the parent. The invariant is asserted by:
+
+```sh
+! otool -L target/release/lean-host-mcp | grep -q libleanshared    # macOS
+! ldd  target/release/lean-host-mcp | grep -q libleanshared        # Linux
 ```
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs-worker` 0.1.7 (which transitively pins `lean-rs` / `lean-rs-host` 0.1.7). The MCP
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.8 (which transitively pin
+`lean-rs` / `lean-rs-host` 0.1.8). The MCP
 server inherits whichever toolchain the consumer's Lake project pins, provided it sits inside the `lean-rs` support
 window declared by [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping
 the supported toolchain is a `lean-rs` change first, then a version bump here.
