@@ -18,14 +18,14 @@ and a file-scoped diagnostics query (`file_diagnostics`). Per-tool request and r
 
 `lean-rs-host` loads a Lean capability dylib that exports 28 mandatory and 6 optional `lean_rs_host_*` symbols. This
 crate does not ship one. The server resolves a Lake project whose `lakefile.{toml,lean}` already wires those interop
-shims; [`lean-rs/fixtures/lean/`](https://github.com/jcreinhold/lean-rs/tree/main/fixtures/lean) is the reference
+shims; the `fixtures/lean/` directory in this repo is the reference
 template and doubles as a starting point you can adapt.
 
 ## Build and run
 
 ```sh
 # 1. Build the reference shim (one-off).
-cd /path/to/lean-rs/fixtures/lean
+cd /path/to/lean-host-mcp/fixtures/lean
 lake build
 
 # 2. Install the parent binary. Build per-member, never `cargo build --workspace`
@@ -44,12 +44,12 @@ lean-host-mcp install-worker --list           # see what's installed
 # 4a. Zero-config: launch from inside (or anywhere under) a Lake project
 #     that exposes the shims. The package, library, umbrella import, and
 #     worker toolchain are all auto-discovered.
-cd /path/to/lean-rs/fixtures/lean
+cd /path/to/lean-host-mcp/fixtures/lean
 lean-host-mcp
 
 # 4b. Explicit: pin the default project. Equivalent to setting
 #     LEAN_HOST_MCP_PROJECT.
-lean-host-mcp --lake-root /path/to/lean-rs/fixtures/lean
+lean-host-mcp --lake-root /path/to/lean-host-mcp/fixtures/lean
 ```
 
 Project resolution chain (used by every tool call that does not pass its own `project="..."` argument):
@@ -122,7 +122,7 @@ cargo build -p lean-host-mcp                          # parent only
 cargo build -p lean-host-mcp-worker                   # worker only (links libleanshared)
 cargo clippy --workspace --all-targets -- -D warnings # safe; clippy doesn't link
 cargo test -p lean-host-mcp                           # unit tests; no Lean fixture required
-LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
+LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
     cargo test -p lean-host-mcp --test e2e -- --ignored   # opt-in end-to-end
 ```
 

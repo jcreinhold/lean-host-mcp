@@ -37,7 +37,7 @@ cargo build --release -p lean-host-mcp-worker           # release worker (links 
 cargo clippy --workspace --all-targets -- -D warnings   # lints; --workspace is safe (clippy doesn't link)
 cargo test -p lean-host-mcp                             # parent tests (no Lean fixture required)
 cargo test -p lean-host-mcp <name>                      # single test by name substring
-LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
+LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
     cargo test -p lean-host-mcp --test e2e --test worker -- --ignored   # opt-in E2E + worker integration
 cargo bench -p lean-host-mcp --bench worker_roundtrip                   # gated on LEAN_HOST_MCP_BENCH_FIXTURE
 ```
@@ -75,7 +75,7 @@ E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY`
 
 Running the server requires a Lake project that links the `lean-rs-host` shim (mandatory plus optional
 `lean_rs_host_*` symbols; the exact symbol set is pinned by the `lean-rs` version in `crates/lean-host-mcp-worker/Cargo.toml`).
-This workspace does not bundle one; the canonical template is `lean-rs/fixtures/lean/`. Each project's
+This workspace bundles one at `fixtures/lean/` (a self-contained Lake project that links the shim). Each project's
 `lean-toolchain` pin selects the worker binary; install one first with `lean-host-mcp install-worker --toolchain <id>`
 (or `--auto` to scan `~/.elan/toolchains`). Then point the server at a project:
 

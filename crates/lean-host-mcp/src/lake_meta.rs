@@ -19,7 +19,7 @@
 //! Lakefile parsing is intentionally minimal — `lakefile.toml` is parsed
 //! against a small `serde` shape; `lakefile.lean` falls back to a regex
 //! sniff for `package <name>` and `lean_lib <Name>`. The two existing
-//! fixtures (`lean-rs/fixtures/lean/lakefile.lean` and any TOML-based
+//! fixtures (`fixtures/lean/lakefile.lean` and any TOML-based
 //! project) are the calibration target. Anything more elaborate is the
 //! user's job to declare via the explicit hint.
 
@@ -172,9 +172,12 @@ fn parse_lakefile_toml(path: &Path) -> Result<LakefileParsed> {
 fn parse_lakefile_lean(path: &Path) -> Result<LakefileParsed> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| ServerError::BadProject(format!("read {}: {e}", path.display())))?;
-    let package_re = regex::Regex::new(r"(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)")
+    // Lake accepts both bare and french-quoted identifiers
+    // (`package foo` and `package «foo»`); guillemets are required when the
+    // name isn't a plain Lean identifier. Match either form.
+    let package_re = regex::Regex::new(r"(?m)^\s*package\s+«?([A-Za-z_][A-Za-z0-9_]*)»?")
         .map_err(|e| ServerError::Internal(format!("compile package regex: {e}")))?;
-    let lean_lib_re = regex::Regex::new(r"(?m)^\s*lean_lib\s+([A-Za-z_][A-Za-z0-9_]*)")
+    let lean_lib_re = regex::Regex::new(r"(?m)^\s*lean_lib\s+«?([A-Za-z_][A-Za-z0-9_]*)»?")
         .map_err(|e| ServerError::Internal(format!("compile lean_lib regex: {e}")))?;
     let package = package_re
         .captures(&contents)
@@ -297,6 +300,23 @@ mod tests {
             "import Lake\nopen Lake DSL\n\n\
              package lean_rs_fixture\n\
              lean_lib LeanRsFixture\n",
+        )
+        .unwrap();
+        let parsed = parse_lakefile_lean(&path).unwrap();
+        assert_eq!(parsed.package, "lean_rs_fixture");
+        assert_eq!(parsed.library.as_deref(), Some("LeanRsFixture"));
+    }
+
+    #[test]
+    fn parse_lakefile_lean_handles_french_quoted_identifiers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lakefile.lean");
+        fs::write(
+            &path,
+            "import Lake\nopen Lake DSL\n\n\
+             package «lean_rs_fixture»\n\
+             @[default_target]\n\
+             lean_lib «LeanRsFixture» where\n  defaultFacets := #[LeanLib.sharedFacet]\n",
         )
         .unwrap();
         let parsed = parse_lakefile_lean(&path).unwrap();

@@ -4,8 +4,8 @@
 //! enable.
 //!
 //! ```sh
-//! cd /path/to/lean-rs/fixtures/lean && lake build
-//! LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
+//! cd /path/to/lean-host-mcp/fixtures/lean && lake build
+//! LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
 //!     LEAN_HOST_MCP_TEST_PACKAGE=lean_rs_fixture \
 //!     LEAN_HOST_MCP_TEST_LIBRARY=LeanRsFixture \
 //!     cargo test --test e2e -- --ignored

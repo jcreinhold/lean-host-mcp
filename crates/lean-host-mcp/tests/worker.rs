@@ -3,7 +3,7 @@
 //! `lean-rs-host` shims and run:
 //!
 //! ```sh
-//! LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
+//! LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
 //!     cargo test --test worker -- --ignored
 //! ```
 

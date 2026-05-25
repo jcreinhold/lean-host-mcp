@@ -17,8 +17,8 @@
 //! synthetic project; they exercise broker dispatch and lifecycle only.
 //!
 //! ```sh
-//! cd /path/to/lean-rs/fixtures/lean && lake build
-//! LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-rs/fixtures/lean \
+//! cd /path/to/lean-host-mcp/fixtures/lean && lake build
+//! LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
 //!     cargo test --test multi_project -- --ignored
 //! ```
 
