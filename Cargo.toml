@@ -24,33 +24,33 @@ name = "lean-host-mcp-worker"
 path = "src/bin/worker.rs"
 
 [[bench]]
+harness = false
 name = "worker_roundtrip"
-harness = false
 
 [[bench]]
+harness = false
 name = "worker_cold_spawn"
-harness = false
 
 [[bench]]
+harness = false
 name = "process_module_owned"
-harness = false
 
 [[bench]]
-name = "position_lookup_after_cache_warm"
 harness = false
+name = "position_lookup_after_cache_warm"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-lru = "0.12"
+lru = "0.18"
 parking_lot = "0.12"
 regex = "1"
 rmcp = { version = "1.7", features = ["macros", "schemars", "server", "transport-io"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1"
@@ -61,7 +61,7 @@ walkdir = "2"
 lean-rs-worker = "0.1.7"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
 

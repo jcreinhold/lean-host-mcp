@@ -75,12 +75,12 @@ rather than partially populated.
 
 `goal_at_position`, `type_at_position`, `references_of_name`, and `file_diagnostics` project the worker's
 `LeanWorkerProcessedFile` value (four arrays of info-tree nodes plus diagnostics) into tool-specific results.
-Re-processing on every cursor move would be wasteful, so `cache.rs` ships a small LRU of
-`Arc<LeanWorkerProcessedFile>`, capacity 16, keyed on `(file_path, sha256(contents))`. Any edit to the source bytes
-misses structurally. The cache lives on `ToolContext` rather than as a global; `LeanWorkerProcessedFile` is owned data
-(`Send + Sync + 'static`), so cached entries are read by tool handlers without re-entering the actor thread. Position
-lookup helpers (`tactic_at`, `term_at`, `references_of`) are free functions on `cache.rs`; linear scan is fast enough at
-v0.2 file sizes (the `position_lookup_after_cache_warm` bench targets ≤ 50 µs per query).
+Re-processing on every cursor move would be wasteful, so `cache.rs` ships a small LRU of `Arc<LeanWorkerProcessedFile>`,
+capacity 16, keyed on `(file_path, sha256(contents))`. Any edit to the source bytes misses structurally. The cache lives
+on `ToolContext` rather than as a global; `LeanWorkerProcessedFile` is owned data (`Send + Sync + 'static`), so cached
+entries are read by tool handlers without re-entering the actor thread. Position lookup helpers (`tactic_at`, `term_at`,
+`references_of`) are free functions on `cache.rs`; linear scan is fast enough at v0.2 file sizes (the
+`position_lookup_after_cache_warm` bench targets ≤ 50 µs per query).
 
 The cache is populated through `SessionHost::process_module` (the header-aware worker shim). Files whose header
 references modules the session's open env doesn't have are still cached — the body's partial projection is real data,

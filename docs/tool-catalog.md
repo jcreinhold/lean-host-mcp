@@ -245,9 +245,9 @@ site" loop pays for the elaboration once.
 { "status": "unsupported" }
 ```
 
-`status: "elaborated"` only means we got far enough to collect diagnostics — `summary.errors > 0` is the real "does
-this file have problems?" signal. `severity` is lowercase (`"error" | "warning" | "info"`). `diagnostics` is sorted by
+`status: "elaborated"` only means we got far enough to collect diagnostics — `summary.errors > 0` is the real "does this
+file have problems?" signal. `severity` is lowercase (`"error" | "warning" | "info"`). `diagnostics` is sorted by
 `(line, column)`. The per-diagnostic `file` field is omitted for Lean's synthetic source labels (almost always).
 `truncated` is true only when Lean hit the diagnostic byte budget; the list is then a prefix. `Elaborated` and
-`HeaderParseFailed` share the same shape (`summary` + `diagnostics` + `truncated`) so callers render one structure.
-The same `MissingImports` envelope-warning behaviour as the cursor-driven tools applies.
+`HeaderParseFailed` share the same shape (`summary` + `diagnostics` + `truncated`) so callers render one structure. The
+same `MissingImports` envelope-warning behaviour as the cursor-driven tools applies.
