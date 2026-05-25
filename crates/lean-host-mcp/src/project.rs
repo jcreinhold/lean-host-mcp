@@ -105,6 +105,14 @@ impl LeanProject {
             ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
         let worker = WorkerBinary::resolve_for(&toolchain_id)
             .map_err(|e| ServerError::BadProject(e.to_string()))?;
+        // Each worker binary is built against one toolchain; its rpath and
+        // its `LEAN_SYSROOT` must match. The elan toolchain root is that
+        // sysroot. We pass it explicitly to `LeanWorkerChild::for_toolchain`
+        // below so the parent can host multiple workers with different
+        // toolchains from a single process.
+        let lean_sysroot = toolchain_id
+            .elan_dir()
+            .map_err(|e| ServerError::BadProject(e.to_string()))?;
 
         let index = Arc::new(DeclarationIndex::open(
             cache_dir,
@@ -132,6 +140,7 @@ impl LeanProject {
                     default_imports,
                     toolchain_label,
                     worker_path,
+                    lean_sysroot,
                     init_tx,
                 );
             })
@@ -291,10 +300,11 @@ fn actor_main(
     default_imports: Vec<String>,
     toolchain_label: String,
     worker_path: PathBuf,
+    lean_sysroot: PathBuf,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<Job>), ServerError>>,
 ) {
     let builder = LeanWorkerCapabilityBuilder::new(&lake_root, &package, &library, default_imports.iter())
-        .worker_child(LeanWorkerChild::path(worker_path))
+        .worker_child(LeanWorkerChild::for_toolchain(worker_path, lean_sysroot))
         .startup_timeout(Duration::from_secs(30))
         .long_running_requests();
 

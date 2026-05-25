@@ -14,42 +14,49 @@ Fourteen tools are exposed: six session-backed Lean operations (`elaborate`, `ke
 and a file-scoped diagnostics query (`file_diagnostics`). Per-tool request and result schemas live in
 [`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in [`docs/architecture.md`](docs/architecture.md).
 
-## Prerequisite: a Lake project linking the host shim
+## Prerequisite: any built Lake project
 
-`lean-rs-host` loads a Lean capability dylib that exports 28 mandatory and 6 optional `lean_rs_host_*` symbols. This
-crate does not ship one. The server resolves a Lake project whose `lakefile.{toml,lean}` already wires those interop
-shims; the `fixtures/lean/` directory in this repo is the reference
-template and doubles as a starting point you can adapt.
+A consumer project needs only:
+
+- A `lakefile.lean` or `lakefile.toml` (TOML lakefiles work end-to-end).
+- At least one `lean_lib` target whose `:shared` facet builds.
+- Having been built (`lake build`) so the `.olean` files exist on the
+  search path.
+
+The `lean-rs-host` shim that exports the 28 mandatory + 6 optional
+`lean_rs_host_*` symbols is **bundled inside `lean-rs-host` itself** —
+it's a vendored Lake package that the host builds once per toolchain
+(at first session open) and injects into every session before the
+consumer's dylib loads. Consumer projects do not declare it, link it,
+or `@[export]` its symbols. `fixtures/lean/` in this repo is a demo
+target the test suite hammers; it isn't a template you must mirror.
 
 ## Build and run
 
 ```sh
-# 1. Build the reference shim (one-off).
-cd /path/to/lean-host-mcp/fixtures/lean
-lake build
-
-# 2. Install the parent binary. Build per-member, never `cargo build --workspace`
+# 1. Install the parent binary. Build per-member, never `cargo build --workspace`
 #    (workspace builds unify feature flags and silently link libleanshared
 #    into the parent).
 cd /path/to/lean-host-mcp
 cargo install --path crates/lean-host-mcp
 
-# 3. Install one worker binary per Lean toolchain you want to serve.
+# 2. Install one worker binary per Lean toolchain you want to serve.
 #    --auto scans ~/.elan/toolchains and builds any missing ones; the
 #    target lands under ~/.local/share/lean-host-mcp/workers/<id>/.
 lean-host-mcp install-worker --toolchain v4.30.0-rc2
 lean-host-mcp install-worker --auto
 lean-host-mcp install-worker --list           # see what's installed
 
-# 4a. Zero-config: launch from inside (or anywhere under) a Lake project
-#     that exposes the shims. The package, library, umbrella import, and
-#     worker toolchain are all auto-discovered.
-cd /path/to/lean-host-mcp/fixtures/lean
-lean-host-mcp
+# 3a. Zero-config: launch from inside (or anywhere under) any built Lake
+#     project. The package, library, umbrella import, and worker
+#     toolchain are all auto-discovered from `lakefile.lean` and
+#     `lean-toolchain`.
+cd /path/to/your/lake/project
+lake build && lean-host-mcp
 
-# 4b. Explicit: pin the default project. Equivalent to setting
+# 3b. Explicit: pin the default project. Equivalent to setting
 #     LEAN_HOST_MCP_PROJECT.
-lean-host-mcp --lake-root /path/to/lean-host-mcp/fixtures/lean
+lean-host-mcp --lake-root /path/to/your/lake/project
 ```
 
 Project resolution chain (used by every tool call that does not pass its own `project="..."` argument):
@@ -76,33 +83,20 @@ Environment vars:
 {
   "mcpServers": {
     "lean-host": {
-      "command": "/abs/path/to/lean-host-mcp/target/release/lean-host-mcp",
+      "command": "/abs/path/to/lean-host-mcp/target/release/lean-host-mcp"
       // No args needed when the client launches the server inside the
       // target Lake project; otherwise pass `--lake-root /abs/path`.
-      "env": {
-        // Required. Set to the elan toolchain root that matches the
-        // worker binary you installed (the same `--toolchain <id>` you
-        // passed to `install-worker`). Lean's runtime reads this at
-        // load time to find `Init.olean`; without it the worker loads
-        // the rpath-baked `libleanshared` but reads stdlib oleans from
-        // whatever `lean` is first on `PATH` — an ABI mismatch that
-        // aborts the bootstrap with "incompatible header".
-        "LEAN_SYSROOT": "/Users/you/.elan/toolchains/leanprover--lean4---v4.30.0-rc2"
-      }
     }
   }
 }
 ```
 
-**One toolchain per server process.** `LEAN_SYSROOT` is set in the
-parent's environment and inherited by every spawned worker, so a single
-running `lean-host-mcp` can serve only projects on the toolchain its
-`LEAN_SYSROOT` names. If you work across toolchains, run one MCP server
-entry per toolchain (e.g. `lean-host-v4-30` and `lean-host-v4-29`),
-each pointing at its own `LEAN_SYSROOT`. Lifting this to one-server-
-serves-all-toolchains needs an upstream
-`LeanWorkerCapabilityBuilder::env(...)` so the parent can set
-`LEAN_SYSROOT` per spawned worker; that's tracked as a follow-up.
+**One server, multiple toolchains.** The server picks the worker binary
+for each project from its `lean-toolchain` pin and sets `LEAN_SYSROOT`
+invisibly per spawn (via `LeanWorkerChild::for_toolchain`). A single
+`lean-host-mcp` process can serve projects on every toolchain you have
+installed a worker for (`lean-host-mcp install-worker --toolchain <id>`).
+You do not need to set `LEAN_SYSROOT` in the MCP client config.
 
 ## Response envelope
 

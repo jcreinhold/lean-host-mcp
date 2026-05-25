@@ -73,11 +73,13 @@ layout matching `target/release/`), then `<dir>/<toolchain>/lean-host-mcp-worker
 E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY` (defaults `lean_rs_fixture` /
 `LeanRsFixture`).
 
-Running the server requires a Lake project that links the `lean-rs-host` shim (mandatory plus optional
-`lean_rs_host_*` symbols; the exact symbol set is pinned by the `lean-rs` version in `crates/lean-host-mcp-worker/Cargo.toml`).
-This workspace bundles one at `fixtures/lean/` (a self-contained Lake project that links the shim). Each project's
-`lean-toolchain` pin selects the worker binary; install one first with `lean-host-mcp install-worker --toolchain <id>`
-(or `--auto` to scan `~/.elan/toolchains`). Then point the server at a project:
+Running the server requires any *built* Lake project. The 28 mandatory + 6 optional `lean_rs_host_*` symbols come from
+the vendored shim Lake package inside `lean-rs-host` (`crates/lean-rs-host/shims/lean-rs-host-shims/`), which the host
+builds once per toolchain and injects into every session before the consumer's dylib loads — consumers don't declare or
+link it. Each project's `lean-toolchain` pin selects the worker binary; install one first with
+`lean-host-mcp install-worker --toolchain <id>` (or `--auto` to scan `~/.elan/toolchains`). The workspace's
+`fixtures/lean/` is a demo target the test suite uses; it isn't a template consumers must mirror. Then point the server
+at a project:
 
 ```sh
 ./target/release/lean-host-mcp --lake-root /path/to/lake/project
@@ -101,12 +103,11 @@ the exact `lean-host-mcp install-worker --toolchain <id>` command to fix it. Eac
 `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` so the worker crate's `build.rs` bakes the matching `lib/lean` directory into
 its rpath.
 
-The MCP client must set `LEAN_SYSROOT` in the server's `env` block to the same toolchain root (e.g.
-`~/.elan/toolchains/leanprover--lean4---v4.30.0-rc2`). Lean's runtime reads it at load time to locate `Init.olean`;
-without it the rpath-baked `libleanshared` mismatches whatever `lean` is first on `PATH`. Since `LEAN_SYSROOT` lives
-on the parent process env and is inherited by every worker spawn, **a single server instance serves one toolchain**.
-Multi-toolchain in one process needs an upstream `LeanWorkerCapabilityBuilder::env(...)` so the parent can set
-`LEAN_SYSROOT` per spawn — tracked as a follow-up.
+Each spawned worker inherits its `LEAN_SYSROOT` from the per-toolchain `LeanWorkerChild::for_toolchain(path, sysroot)`
+binding in `crates/lean-host-mcp/src/project.rs`. The sysroot comes from `ToolchainId::elan_dir()` — the same root
+that produced the worker binary's rpath. **A single server process can host workers for multiple toolchains**: each
+project resolves its own pinned toolchain, the parent spawns one worker per toolchain, and the supervisor sets
+`LEAN_SYSROOT` invisibly per spawn. The MCP client does not need to set `LEAN_SYSROOT` in the server's `env` block.
 
 The "one owner of the capability at a time" invariant is enforced by parking it on a dedicated OS thread named
 `"lean-host-mcp/session"`. The channel carries a closure type, not a Request enum:
