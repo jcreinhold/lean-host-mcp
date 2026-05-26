@@ -123,9 +123,9 @@ fn parse_pool_config(max: Option<&str>, idle: Option<&str>) -> Result<(NonZeroUs
     };
     let idle_timeout = match idle {
         Some(s) => {
-            let n: u64 = s.parse().map_err(|e| {
-                ServerError::Internal(format!("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS={s:?} not a u64: {e}"))
-            })?;
+            let n: u64 = s
+                .parse()
+                .map_err(|e| ServerError::Internal(format!("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS={s:?} not a u64: {e}")))?;
             Duration::from_secs(n)
         }
         None => BrokerConfig::default_idle_timeout(),

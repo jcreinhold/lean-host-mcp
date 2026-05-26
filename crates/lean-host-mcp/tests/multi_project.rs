@@ -86,7 +86,11 @@ async fn two_projects_coexist_in_pool() {
     };
     let canonical_root = root.canonicalize().expect("canonicalise fixture");
     let (_synth_keep, synth_root) = make_synthetic_project(&canonical_root);
-    let broker = make_broker(Some(canonical_root.clone()), NonZeroUsize::new(2).unwrap(), Duration::ZERO);
+    let broker = make_broker(
+        Some(canonical_root.clone()),
+        NonZeroUsize::new(2).unwrap(),
+        Duration::ZERO,
+    );
 
     let id_default_first = session_id_for(&broker, ProjectHint::Default).await;
     let id_explicit_first = session_id_for(&broker, ProjectHint::Explicit(synth_root.clone())).await;
@@ -122,7 +126,11 @@ async fn lru_eviction_respawns_evicted_project() {
     };
     let canonical_root = root.canonicalize().expect("canonicalise fixture");
     let (_synth_keep, synth_root) = make_synthetic_project(&canonical_root);
-    let broker = make_broker(Some(canonical_root.clone()), NonZeroUsize::new(1).unwrap(), Duration::ZERO);
+    let broker = make_broker(
+        Some(canonical_root.clone()),
+        NonZeroUsize::new(1).unwrap(),
+        Duration::ZERO,
+    );
 
     let id_a_first = session_id_for(&broker, ProjectHint::Default).await;
     // Touching B with capacity 1 must evict A.
@@ -160,10 +168,7 @@ async fn idle_reaper_evicts_stale_project() {
     );
 
     let id_second = session_id_for(&broker, ProjectHint::Default).await;
-    assert_ne!(
-        id_first, id_second,
-        "post-reaper request must re-spawn the project"
-    );
+    assert_ne!(id_first, id_second, "post-reaper request must re-spawn the project");
 }
 
 #[tokio::test]

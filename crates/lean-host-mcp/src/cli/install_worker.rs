@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use clap::Args;
 use sha2::{Digest, Sha256};
 
-use crate::toolchain::{ToolchainId, WorkerBinary, WORKER_FILE_NAME};
+use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WorkerBinary};
 
 /// Mutually-exclusive flags for `install-worker`.
 #[derive(Debug, Args)]
@@ -117,20 +117,17 @@ fn run_list() -> anyhow::Result<()> {
     println!("{:<28}  {:>10}  {:<24}  sha256", "toolchain", "size", "mtime");
     for row in &rows {
         let mtime = humantime::format_rfc3339_seconds_or_fallback(row.mtime);
-        println!(
-            "{:<28}  {:>10}  {:<24}  {}",
-            row.id,
-            row.size,
-            mtime,
-            row.sha,
-        );
+        println!("{:<28}  {:>10}  {:<24}  {}", row.id, row.size, mtime, row.sha);
     }
     Ok(())
 }
 
 struct ListRow {
     id: String,
-    #[allow(dead_code, reason = "path is informational; not yet printed but useful for future flags")]
+    #[allow(
+        dead_code,
+        reason = "path is informational; not yet printed but useful for future flags"
+    )]
     path: PathBuf,
     size: u64,
     mtime: SystemTime,

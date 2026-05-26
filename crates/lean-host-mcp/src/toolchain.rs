@@ -69,8 +69,8 @@ impl ToolchainId {
     /// or unreadable. Forwards [`Self::parse`]'s error otherwise.
     pub fn from_lake_root(root: &Path) -> Result<Self, ToolchainError> {
         let path = root.join("lean-toolchain");
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|_| ToolchainError::LeanToolchainFileMissing(path.clone()))?;
+        let contents =
+            std::fs::read_to_string(&path).map_err(|_| ToolchainError::LeanToolchainFileMissing(path.clone()))?;
         Self::parse(&contents)
     }
 
@@ -150,10 +150,7 @@ impl WorkerBinary {
     /// # Errors
     ///
     /// Same as [`Self::resolve_for`].
-    pub fn resolve_with_override(
-        toolchain: &ToolchainId,
-        override_dir: Option<&Path>,
-    ) -> Result<Self, ToolchainError> {
+    pub fn resolve_with_override(toolchain: &ToolchainId, override_dir: Option<&Path>) -> Result<Self, ToolchainError> {
         if let Some(dir) = override_dir {
             let bare = dir.join(WORKER_FILE_NAME);
             if bare.is_file() {
@@ -235,13 +232,9 @@ impl fmt::Display for ToolchainError {
                 toolchain,
                 elan_dir.display()
             ),
-            Self::WorkerNotInstalled {
-                toolchain,
-                install_cmd,
-            } => write!(
-                f,
-                "no worker binary for toolchain {toolchain}; run: {install_cmd}",
-            ),
+            Self::WorkerNotInstalled { toolchain, install_cmd } => {
+                write!(f, "no worker binary for toolchain {toolchain}; run: {install_cmd}")
+            }
         }
     }
 }
@@ -266,16 +259,15 @@ mod tests {
             ToolchainId::parse("leanprover/lean4:v4.30.0-rc2").unwrap().as_str(),
             "v4.30.0-rc2",
         );
-        assert_eq!(
-            ToolchainId::parse("v4.30.0-rc2").unwrap().as_str(),
-            "v4.30.0-rc2",
-        );
+        assert_eq!(ToolchainId::parse("v4.30.0-rc2").unwrap().as_str(), "v4.30.0-rc2",);
         assert_eq!(
             ToolchainId::parse("nightly-2026-05-20").unwrap().as_str(),
             "nightly-2026-05-20",
         );
         assert_eq!(
-            ToolchainId::parse("  leanprover/lean4:v4.30.0-rc2  \n").unwrap().as_str(),
+            ToolchainId::parse("  leanprover/lean4:v4.30.0-rc2  \n")
+                .unwrap()
+                .as_str(),
             "v4.30.0-rc2",
         );
     }

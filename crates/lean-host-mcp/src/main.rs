@@ -160,4 +160,3 @@ fn config_dir() -> Option<PathBuf> {
     }
     dirs::config_dir()
 }
-
