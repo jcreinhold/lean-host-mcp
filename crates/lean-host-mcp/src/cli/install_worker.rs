@@ -5,8 +5,8 @@
 //! Three modes:
 //!
 //! - `--toolchain <id>`: build for one toolchain.
-//! - `--auto`: scan `~/.elan/toolchains/leanprover--lean4---*` and build
-//!   for any missing ones.
+//! - no flag / `--auto`: scan `~/.elan/toolchains/leanprover--lean4---*`
+//!   and build for any missing ones.
 //! - `--list`: print a table of currently-installed workers.
 //!
 //! The build shells out to `cargo build --release -p lean-host-mcp-worker`
@@ -31,7 +31,6 @@ use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WorkerBinary};
 #[command(group(
     clap::ArgGroup::new("mode")
         .args(["toolchain", "auto", "list"])
-        .required(true),
 ))]
 pub struct InstallWorkerArgs {
     /// Build and install for a single toolchain (e.g. `v4.30.0-rc2` or
@@ -40,7 +39,8 @@ pub struct InstallWorkerArgs {
     pub toolchain: Option<String>,
 
     /// Scan `~/.elan/toolchains` and install for every Lean toolchain
-    /// that doesn't already have a worker.
+    /// that doesn't already have a worker. This is the default when no
+    /// mode flag is supplied.
     #[arg(long)]
     pub auto: bool,
 
@@ -60,7 +60,7 @@ pub struct InstallWorkerArgs {
 /// # Errors
 ///
 /// Bubbles up filesystem / `cargo` failures as `anyhow::Error`. Returns
-/// a non-zero exit-code-equivalent error when any `--auto` install fails.
+/// a non-zero exit-code-equivalent error when any auto install fails.
 pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     if args.list {
         return run_list();
@@ -73,11 +73,7 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
         install_one(&id, &source_dir)?;
         Ok(())
     } else {
-        // clap's ArgGroup enforces "required = true", so this is unreachable
-        // in practice. Surface a clear error if the invariant is violated.
-        Err(anyhow::anyhow!(
-            "install-worker requires one of --toolchain, --auto, or --list"
-        ))
+        run_auto(&source_dir)
     }
 }
 
@@ -308,5 +304,43 @@ mod humantime {
             }
             Err(_) => "before-epoch".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use clap::{Args as _, Command, FromArgMatches};
+
+    use super::InstallWorkerArgs;
+
+    fn parse(args: &[&str]) -> Result<InstallWorkerArgs, clap::Error> {
+        let matches = InstallWorkerArgs::augment_args(Command::new("install-worker")).try_get_matches_from(args)?;
+        InstallWorkerArgs::from_arg_matches(&matches)
+    }
+
+    #[test]
+    fn no_mode_flag_parses_as_default_auto_mode() {
+        let args = parse(&["install-worker"]).expect("no mode flag should parse");
+
+        assert!(args.toolchain.is_none());
+        assert!(!args.auto);
+        assert!(!args.list);
+    }
+
+    #[test]
+    fn source_dir_without_mode_still_parses() {
+        let args = parse(&["install-worker", "--source-dir", "."]).expect("source dir only should parse");
+
+        assert!(args.toolchain.is_none());
+        assert_eq!(args.source_dir.as_deref(), Some(std::path::Path::new(".")));
+    }
+
+    #[test]
+    fn mode_flags_remain_mutually_exclusive() {
+        let err = parse(&["install-worker", "--auto", "--list"]).expect_err("mode flags conflict");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

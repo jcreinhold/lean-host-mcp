@@ -77,7 +77,7 @@ Running the server requires any Lake project whose requested imports have built 
 optional `lean_rs_host_*` symbols come from the vendored shim Lake package inside `lean-rs-host`
 (`crates/lean-rs-host/shims/lean-rs-host-shims/`), which the host builds once per toolchain and loads without building
 the consumer's `:shared` facet—consumers don't declare or link it. Each project's `lean-toolchain` pin selects the worker binary; install one first with
-`lean-host-mcp install-worker --toolchain <id>` (or `--auto` to scan `~/.elan/toolchains`). The workspace's
+`lean-host-mcp install-worker --toolchain <id>` (or plain `lean-host-mcp install-worker` to scan `~/.elan/toolchains`). The workspace's
 `fixtures/lean/` is a demo target the test suite uses; it isn't a template consumers must mirror. Then point the server
 at a project:
 
