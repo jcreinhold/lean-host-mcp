@@ -277,6 +277,17 @@ impl LeanProject {
     pub fn shutdown(&self) {
         let _ = self.actor_tx.lock().take();
     }
+
+    /// Cheap liveness probe for the broker's fast path. `false` when the
+    /// actor thread has exited (its receiver dropped) or [`Self::shutdown`]
+    /// has been called. Used to evict dead projects from the registry before
+    /// every caller has to discover the corpse via `SessionGone`.
+    pub fn is_healthy(&self) -> bool {
+        self.actor_tx
+            .lock()
+            .as_ref()
+            .is_some_and(|tx| !tx.is_closed())
+    }
 }
 
 impl Drop for LeanProject {

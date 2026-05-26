@@ -241,6 +241,22 @@ impl ProjectBroker {
         )))
     }
 
+    /// Resolve the hint and load the project's [`LakeProjectMeta`] without
+    /// opening (or touching) a worker. Tools that only need filesystem-level
+    /// information about the project — e.g.
+    /// [`project_scan`](crate::tools::scan::project_scan) — call this
+    /// instead of [`Self::with_project`] so a broken worker bootstrap can't
+    /// block a pure filesystem operation.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve`], plus [`ServerError::BadProject`] when the
+    /// lakefile cannot be parsed or the manifest cannot be fingerprinted.
+    pub fn resolve_meta(&self, hint: &ProjectHint) -> Result<LakeProjectMeta> {
+        let root = self.resolve(hint)?;
+        LakeProjectMeta::from_explicit(&root)
+    }
+
     /// Resolve the hint, ensure a [`LeanProject`] is open for that root,
     /// and run `job` with a clone of the project's `Arc`. The registry
     /// mutex is released before `job` runs, and is never held across
@@ -272,11 +288,14 @@ impl ProjectBroker {
         };
         if let Some(project) = cached {
             let current_hash = fingerprint_lake_project(&root)?;
-            if project.manifest_hash() == current_hash {
+            if project.manifest_hash() == current_hash && project.is_healthy() {
                 self.inner.lock().last_used.insert(root, Instant::now());
                 return Ok(project);
             }
-            // Stale entry; evict and fall through to reopen.
+            // Stale entry (manifest changed or actor died); evict and fall
+            // through to reopen. Without the `is_healthy` check the next
+            // caller would receive a `SessionGone` for every tool call until
+            // the LRU happened to evict the corpse.
             let stale = {
                 let mut inner = self.inner.lock();
                 inner.last_used.remove(&root);

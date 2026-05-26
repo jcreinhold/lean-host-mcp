@@ -24,6 +24,7 @@ pub mod scan;
 
 use crate::broker::ProjectBroker;
 use crate::envelope::Freshness;
+use crate::lake_meta::LakeProjectMeta;
 use crate::project::LeanProject;
 
 /// Shared state every tool handler reads.
@@ -42,6 +43,22 @@ pub struct ToolContext {
 /// the same value; eviction or manifest invalidation changes it.
 pub(crate) fn freshness_for(project: &LeanProject, imports: &[String]) -> Freshness {
     project.freshness(imports)
+}
+
+/// Worker-free analogue of [`freshness_for`] for tools that resolve a project
+/// through [`ProjectBroker::resolve_meta`](crate::broker::ProjectBroker::resolve_meta).
+/// `session_id` is a fresh UUID per call: with no actor to identify, the
+/// field carries call-identity rather than actor-identity, and clients
+/// comparing `session_id` across calls should not treat a change between a
+/// worker-free tool and a worker-backed tool as evidence of a re-spawn.
+pub(crate) fn freshness_for_meta(meta: &LakeProjectMeta) -> Freshness {
+    Freshness {
+        project_root: meta.canonical_root.to_string_lossy().into_owned(),
+        project_hash: meta.manifest_hash.clone(),
+        imports: meta.default_imports.clone(),
+        session_id: uuid::Uuid::new_v4().to_string(),
+        lean_toolchain: meta.toolchain.clone(),
+    }
 }
 
 /// Directory names skipped during `.lean` file enumeration. Shared between
