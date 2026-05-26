@@ -1,6 +1,7 @@
 //! Worker-backed [`LeanProject`] integration tests. Gated on
-//! `LEAN_HOST_MCP_TEST_FIXTURE`—point at a built Lake fixture with the
-//! `lean-rs-host` shims and run:
+//! `LEAN_HOST_MCP_TEST_FIXTURE`—point at any built Lake project (the
+//! `lean-rs-host` shims are bundled in `lean-rs-host` and injected per
+//! session; consumers don't link them) and run:
 //!
 //! ```sh
 //! LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \

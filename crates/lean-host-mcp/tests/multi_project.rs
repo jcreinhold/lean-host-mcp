@@ -1,6 +1,7 @@
 //! Multi-project broker behavior: coexistence, LRU eviction, idle
 //! eviction, manifest invalidation. Gated on `LEAN_HOST_MCP_TEST_FIXTURE`
-//! pointing at a *built* Lake project with the `lean-rs-host` shims.
+//! pointing at any *built* Lake project (the `lean-rs-host` shims are
+//! bundled in `lean-rs-host`; consumers don't link them).
 //!
 //! Tests use the project's `session_id` (stamped into every
 //! [`Freshness`](lean_host_mcp::Freshness) envelope) as the identity

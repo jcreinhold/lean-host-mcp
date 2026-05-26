@@ -1,7 +1,8 @@
-//! Opt-in end-to-end test against a built Lake project with `lean-rs-host`
-//! shims. v0.1 does not ship a bundled fixture (the shim contract is
-//! non-trivial); point `LEAN_HOST_MCP_TEST_FIXTURE` at a built project to
-//! enable.
+//! Opt-in end-to-end test against any built Lake project (the
+//! `lean-rs-host` shims live inside `lean-rs-host` itself and are
+//! injected per session; consumers don't link them). Point
+//! `LEAN_HOST_MCP_TEST_FIXTURE` at a built project to enable;
+//! `fixtures/lean/` is the in-tree demo target.
 //!
 //! ```sh
 //! cd /path/to/lean-host-mcp/fixtures/lean && lake build
