@@ -2,11 +2,11 @@
 
 A Model Context Protocol server that hosts Lean 4 in a supervised worker child via the `lean-rs-worker-parent` +
 `lean-rs-worker-child` crate pair. The parent process owns a `LeanWorkerCapability`; the worker child owns the
-`LeanRuntime` and `LeanCapabilities` dylib. The parent does **not** link `libleanshared`, which is how a single
-running `lean-host-mcp` can serve projects on different Lean toolchains: each toolchain has its own pre-built worker
-binary installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls run as Meta and kernel operations inside
-that child rather than as messages to an external LSP — and when a tactic wedges or a typeclass loop runs away, the
-supervisor restarts the child instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
+`LeanRuntime` and `LeanCapabilities` dylib. The parent does **not** link `libleanshared`, which lets one running
+`lean-host-mcp` serve projects on different Lean toolchains: each toolchain has its own pre-built worker binary
+installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls run as Meta and kernel operations
+inside that child rather than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the
+child; the supervisor restarts it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
 Fourteen tools are exposed: six session-backed Lean operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`,
 `is_def_eq`, `hover_by_name`), a filesystem sweep (`project_scan`), three SQLite-indexed lookups (`find_symbol`,
@@ -18,18 +18,24 @@ and a file-scoped diagnostics query (`file_diagnostics`). Per-tool request and r
 
 A consumer project needs only:
 
-- A `lakefile.lean` or `lakefile.toml` (TOML lakefiles work end-to-end).
-- At least one `lean_lib` target whose `:shared` facet builds.
-- Having been built (`lake build`) so the `.olean` files exist on the
-  search path.
+- A `lakefile.lean` or `lakefile.toml`.
+- At least one `lean_lib` target whose `:shared` facet builds and resolves
+  every symbol it imports at link time. Projects that depend on mathlib
+  must explicitly link the transitive shared facets:
+  `lean_lib MyProj where defaultFacets := #[LeanLib.sharedFacet]` alone
+  is not enough if it `import`s a library compiled as static. If
+  `lake build :shared` produces a `.dylib`/`.so` that `dlopen` rejects
+  with `symbol not found`, the consumer's lakefile is the issue.
+- A successful `lake build` so the `.olean` files exist on the search
+  path.
 
 The `lean-rs-host` shim that exports the 28 mandatory + 6 optional
-`lean_rs_host_*` symbols is **bundled inside `lean-rs-host` itself** —
-it's a vendored Lake package that the host builds once per toolchain
-(at first session open) and injects into every session before the
-consumer's dylib loads. Consumer projects do not declare it, link it,
-or `@[export]` its symbols. `fixtures/lean/` in this repo is a demo
-target the test suite hammers; it isn't a template you must mirror.
+`lean_rs_host_*` symbols is **bundled inside `lean-rs-host` itself**—a
+vendored Lake package the host builds once per toolchain (at first
+session open) and injects into every session before the consumer's
+dylib loads. Consumer projects do not declare it, link it, or
+`@[export]` its symbols. `fixtures/lean/` in this repo is a demo target
+the test suite hammers; it isn't a template you must mirror.
 
 ## Build and run
 
@@ -65,7 +71,7 @@ Project resolution chain (used by every tool call that does not pass its own `pr
 2. Walk upward from the server's cwd looking for `lakefile.{toml,lean}`
 3. `~/.config/lean-host-mcp/config.toml` `primary_project = "/abs/path"`
 
-Per call, an MCP client can pass `project="/abs/path/to/other/lake/root"` to route that single call elsewhere — useful
+Per call, an MCP client can pass `project="/abs/path/to/other/lake/root"` to route that single call elsewhere—useful
 when a single client surveys several projects.
 
 Environment vars:
@@ -118,8 +124,8 @@ Every tool returns the same outer shape; only `result` varies.
 ```
 
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors.
-MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the Lake
-project is unusable.
+MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the
+Lake project is unusable.
 
 ## Capability shims and the position-tool cluster
 
@@ -150,11 +156,12 @@ members and silently links `libleanshared` into the parent. The invariant is ass
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.8 (which transitively pin
-`lean-rs` / `lean-rs-host` 0.1.8). The MCP
-server inherits whichever toolchain the consumer's Lake project pins, provided it sits inside the `lean-rs` support
-window declared by [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping
-the supported toolchain is a `lean-rs` change first, then a version bump here.
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.11 (which transitively pin
+`lean-rs` / `lean-rs-host` 0.1.11). The server inherits whichever Lean
+toolchain each consumer Lake project pins, provided it sits inside the
+`lean-rs` support window declared by [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain).
+Bumping the supported toolchain is a `lean-rs` change first, then a
+version bump here.
 
 ## License
 

@@ -21,10 +21,9 @@
 //! `(project_root, project_hash)` to detect dependency changes between
 //! tool calls without round-tripping `find_symbol` first.
 //!
-//! This module hides three volatile decisions behind one shape: what
-//! freshness means, how it's serialized, and what an MCP "warning" looks
-//! like. Tools don't pick the layout; they build a `Response<T>` and let
-//! rmcp serialize it.
+//! Three volatile decisions hide behind one shape: what freshness means,
+//! how it's serialized, and what an MCP "warning" looks like. Tools don't
+//! pick the layout; they build a `Response<T>` and let rmcp serialize it.
 
 use schemars::JsonSchema;
 use serde::Serialize;

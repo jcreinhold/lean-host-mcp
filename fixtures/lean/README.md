@@ -1,27 +1,27 @@
-# `LeanRsFixture`—ABI-boundary fixtures
+# `LeanRsFixture`
 
-In-tree Lake package the workspace's tests, benchmarks, and example binaries load. It exists so the `lean-rs` Rust
-crates have a stable set of compiled Lean symbols to call when exercising every distinct ABI behavior at the C boundary.
+Self-contained Lake package the `lean-host-mcp` end-to-end tests load.
+Doubles as a minimum-viable template: copy the layout, rename the
+package and library, and the host server can serve it.
 
-`lakefile.lean` here also doubles as a template for a consumer's own Lake package—the structure transfers verbatim.
-Rename the package and module to taste, then add your own `@[export]` declarations. `lean-rs-host` ships its host shims
-separately; consumer Lake packages do not require them.
+## What's here
 
-## What's exported
+```
+lakefile.lean         Lake DSL declaring the `lean_rs_fixture` package
+                      and the `LeanRsFixture` lean_lib (shared facet on)
+lean-toolchain        pins the Lean toolchain used to build and serve
+LeanRsFixture.lean    umbrella import; `lean-host-mcp` opens with
+                      this as `default_imports`
+LeanRsFixture/        one submodule per ABI category covered by the
+                      tests (Scalars, Strings, Containers, Effects,
+                      Evidence, Capability, SourceRanges)
+```
 
-Each submodule under `LeanRsFixture/` covers one ABI category:
-
-| Submodule | Covers |
-| --- | --- |
-| `Scalars` | `UInt8`/`16`/`32`/`64`, `USize`, `Nat`, `Int`, `Bool`, `Unit`, `Char`, `Float` |
-| `Strings` | `String`, `ByteArray` |
-| `Containers` | `Array String`, `Option Nat`, `Except String Nat`, a two-field structure |
-| `Effects` | `IO` success (`Unit`, `Nat`), `IO` inner `Except` failure, `IO` exception via `throw` |
-| `Evidence` | A structure carrying a `Prop` witness, surfaced to Rust as an opaque handle |
-| `Capability` | `CoreM`/`MetaM` declarations compiled (via `import Lean`) but never exported |
-
-Every exported symbol is prefixed `lean_rs_fixture_`. Renaming the prefix is a contract change, not a refactor—the
-workspace's `@[export]` declarations and Rust call sites are synchronised against it.
+The submodules each declare a few `@[export]`-style symbols against one
+Lean ABI shape (scalars, strings, containers, effects, evidence,
+capability state, source-range corner cases). The host's e2e suite
+opens this project, asks for declarations and diagnostics, and
+verifies the wire-shape contract.
 
 ## Build
 
@@ -32,19 +32,28 @@ lake build
 
 Artifacts land under `.lake/build/`:
 
-- `.lake/build/lib/liblean__rs__fixture_LeanRsFixture.{dylib,so}`—the shared library Rust will link.
-- `.lake/build/lib/lean/LeanRsFixture/*.olean` and `.lake/build/lib/lean/LeanRsFixture.olean`—per-submodule object
-  files.
+- `.lake/build/lib/liblean__rs__fixture_LeanRsFixture.{dylib,so}`: the
+  shared library the host worker `dlopen`s.
+- `.lake/build/lib/lean/LeanRsFixture/*.olean` and
+  `.lake/build/lib/lean/LeanRsFixture.olean`: per-submodule oleans the
+  worker walks for declarations and source ranges.
 
-Lake mangles each underscore in the package name to a double underscore in emitted symbol and filename strings; the
-module initializer is therefore `initialize_lean__rs__fixture_LeanRsFixture`. Rust callers derive these names
-mechanically from the package name via Lake's mangling rule (`s/_/__/g`).
+Lake mangles each underscore in the package name to a double
+underscore in emitted symbol and filename strings, so the module
+initializer is `initialize_lean__rs__fixture_LeanRsFixture`.
 
-`lake build` is also the verification command for the contract.
+## Using as a template
 
-## Why `Capability` has no exports
+Rename `package «lean_rs_fixture»` and `lean_lib «LeanRsFixture»` in
+`lakefile.lean`; rename the matching directory and the umbrella import.
+Keep `defaultFacets := #[LeanLib.sharedFacet]` on the `lean_lib`;
+that's what `lean-host-mcp` `dlopen`s. If your project depends on
+mathlib or other prebuilt libraries, make sure their `:shared` facets
+are on the link line; symbol-resolution failures at `dlopen` time
+surface as a `BadProject` error from the server with the missing
+symbol named verbatim.
 
-`MetaM` and `CoreM` carry compiler state (`Environment`, options, traces) that has no meaningful C ABI representation,
-so they cannot appear in an `@[export]` signature. The module exists so the package's module-initializer pipeline
-imports `Lean`; the `MetaM` capability is exposed to Rust through the bounded `lean_rs_host_meta_*` services declared in
-the bundled `lean-rs-host` shim package, not through direct `@[export]` here.
+Pointed at by the e2e tests via `LEAN_HOST_MCP_TEST_FIXTURE`
+(defaults `lean_rs_fixture` / `LeanRsFixture` for the package and
+library names; override with `LEAN_HOST_MCP_TEST_PACKAGE` and
+`LEAN_HOST_MCP_TEST_LIBRARY`).

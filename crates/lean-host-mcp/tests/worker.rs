@@ -24,7 +24,7 @@ fn fixture_root() -> Option<PathBuf> {
 
 /// Build a broker that resolves to the fixture root through its
 /// `env_default` slot. Tools still exercise the full broker dispatch
-/// path — the same code production hits.
+/// path—the same code production hits.
 fn open_ctx() -> ToolContext {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");

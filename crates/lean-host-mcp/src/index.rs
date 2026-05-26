@@ -1,4 +1,4 @@
-//! Persistent declaration index—one `SQLite` database per Lake project.
+//! Persistent declaration index: one `SQLite` database per Lake project.
 //!
 //! The index is the only path through which `find_symbol`, `find_lemma`,
 //! and `outline` answer their queries. It hides:
@@ -10,7 +10,7 @@
 //! - the Lake-manifest fingerprint that decides when a rebuild is due.
 //!
 //! Nothing past this module's boundary should know about `rusqlite` or
-//! `sha2`—if a fourth caller needs a new query, add a method here.
+//! `sha2`; if a fourth caller needs a new query, add a method here.
 //!
 //! The struct is `Send + Sync` so it lives behind an `Arc` on
 //! [`crate::tools::ToolContext`].
@@ -42,8 +42,8 @@ pub struct IndexedDeclaration {
 }
 
 /// `SQLite`-backed declaration index. Owns one connection guarded by a
-/// `Mutex`—`SQLite`'s single-writer model means short critical sections
-/// are fine, and we avoid re-running `PRAGMA` per query.
+/// `Mutex`: `SQLite`'s single-writer model makes short critical sections
+/// fine, and one connection avoids re-running `PRAGMA` per query.
 //
 // Every method holds the `MutexGuard` for the duration of its query—that
 // is the intended granularity (queries are short, the lock protects the

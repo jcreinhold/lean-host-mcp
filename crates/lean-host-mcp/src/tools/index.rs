@@ -1,11 +1,11 @@
 //! Tools that read the `SQLite`-backed [`DeclarationIndex`]: `find_symbol`,
 //! `find_lemma`, `outline`.
 //!
-//! Each handler is intentionally thin—shape the request, ensure the
-//! index is fresh, call one `DeclarationIndex` method, return. The index
-//! itself owns `SQLite`, schema, and storage; the rebuild pipeline
-//! (filter → list → bulk-describe → insert) is orchestrated here so the
-//! index module stays free of `lean-rs-worker` types.
+//! Each handler is thin: shape the request, ensure the index is fresh,
+//! call one `DeclarationIndex` method, return. The index itself owns
+//! `SQLite`, schema, and storage; the rebuild pipeline (filter → list →
+//! bulk-describe → insert) is orchestrated here so the index module stays
+//! free of `lean-rs-worker` types.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -22,7 +22,7 @@ use crate::index::{IndexedDeclaration, fingerprint_lake_project};
 use crate::project::LeanProject;
 use crate::tools::{ToolContext, freshness_for, lean as lean_tools};
 
-/// Default + cap for the `limit` request field—handlers clamp to this
+/// Default + cap for the `limit` request field. Handlers clamp to this
 /// range so a missing or oversized value can't return more than 500 rows.
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
@@ -73,7 +73,7 @@ pub struct OutlineRequest {
 ///
 /// # Errors
 ///
-/// Infrastructure failures only—session errors during rebuild, or
+/// Infrastructure failures only: session errors during rebuild, or
 /// `SQLite` errors during the search.
 pub async fn find_symbol(ctx: &ToolContext, req: FindSymbolRequest) -> Result<Response<Vec<IndexedDeclaration>>> {
     let hint = ProjectHint::from_request(req.project);
@@ -108,7 +108,7 @@ pub async fn find_lemma(ctx: &ToolContext, req: FindLemmaRequest) -> Result<Resp
 }
 
 /// Name-prefix listing. With no prefix, returns the first `limit` rows
-/// ordered by name—useful for cold-cache exploration.
+/// ordered by name; useful for cold-cache exploration.
 ///
 /// # Errors
 ///

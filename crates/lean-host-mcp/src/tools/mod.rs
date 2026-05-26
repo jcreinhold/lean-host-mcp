@@ -2,15 +2,15 @@
 //!
 //! Split by what plumbing they share rather than one file per tool:
 //!
-//! - [`lean`]—`elaborate`, `kernel_check`, `infer_type`, `whnf`,
+//! - [`lean`]: `elaborate`, `kernel_check`, `infer_type`, `whnf`,
 //!   `is_def_eq`, `hover_by_name`. All six drive the project's worker actor
 //!   and project Lean responses into the JSON envelope.
-//! - [`scan`]—`project_scan`. No Lean dependency; pure filesystem walk
+//! - [`scan`]: `project_scan`. No Lean dependency; pure filesystem walk
 //!   with a configurable regex.
-//! - [`index`]—`find_symbol`, `find_lemma`, `outline`. Thin wrappers
+//! - [`index`]: `find_symbol`, `find_lemma`, `outline`. Thin wrappers
 //!   over the SQLite-backed [`DeclarationIndex`](crate::DeclarationIndex);
 //!   rebuild on Lake-manifest change.
-//! - [`position`]—`goal_at_position`, `type_at_position`,
+//! - [`position`]: `goal_at_position`, `type_at_position`,
 //!   `references_of_name`, `file_diagnostics`. Thin lookups over a
 //!   `ProcessedFileCache`-backed `LeanWorkerProcessedFile` projection from
 //!   `lean-rs-worker`; the cache is keyed on path + content hash.
@@ -39,7 +39,7 @@ pub struct ToolContext {
 }
 
 /// Build the [`Freshness`] envelope for a tool response. `session_id` is
-/// the project actor's stable identity — two calls to the same project see
+/// the project actor's stable identity: two calls to the same project see
 /// the same value; eviction or manifest invalidation changes it.
 pub(crate) fn freshness_for(project: &LeanProject, imports: &[String]) -> Freshness {
     project.freshness(imports)

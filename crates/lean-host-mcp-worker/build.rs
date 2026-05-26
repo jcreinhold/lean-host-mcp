@@ -3,14 +3,14 @@
 //!
 //! Discovery order:
 //!
-//! 1. `LEAN_HOST_MCP_TARGET_TOOLCHAIN` — short toolchain id (e.g.
+//! 1. `LEAN_HOST_MCP_TARGET_TOOLCHAIN`: short toolchain id (e.g.
 //!    `v4.30.0-rc2`). Resolved as
 //!    `~/.elan/toolchains/leanprover--lean4---<id>`. Set by
 //!    `lean-host-mcp install-worker` when producing a toolchain-specific
 //!    worker binary.
-//! 2. `LEAN_SYSROOT` — explicit prefix (the matching `lean` toolchain
+//! 2. `LEAN_SYSROOT`: explicit prefix (the matching `lean` toolchain
 //!    root, containing `lib/lean/libleanshared`).
-//! 3. `lean --print-prefix` — fall back to whatever `lean` resolves to on
+//! 3. `lean --print-prefix`: fall back to whatever `lean` resolves to on
 //!    `PATH` (the developer's default toolchain).
 //!
 //! Only this crate needs the dance; the parent (`lean-host-mcp`) does not
@@ -38,7 +38,7 @@ fn main() {
     }
 
     let Some(prefix) = discover_prefix() else {
-        // Discovery failed — the link step in `lean-rs-sys` will surface
+        // Discovery failed; the link step in `lean-rs-sys` will surface
         // the underlying issue with a clearer error than we could here.
         return;
     };

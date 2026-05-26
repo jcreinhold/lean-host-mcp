@@ -136,10 +136,10 @@ struct ConfigFile {
 
 /// Read `<config-dir>/lean-host-mcp/config.toml` and return its
 /// `primary_project` if present. Missing file / missing key / parse
-/// failures are all silent — the broker's resolution chain treats this
-/// as "no default" and continues. The `LEAN_HOST_MCP_CONFIG_DIR` env
-/// override exists for the test suite so resolution tests don't read
-/// the developer's real config.
+/// failures are all silent: the broker's resolution chain treats this as
+/// "no default" and continues. The `LEAN_HOST_MCP_CONFIG_DIR` env override
+/// exists for the test suite so resolution tests don't read the
+/// developer's real config.
 fn read_config_default() -> Option<PathBuf> {
     let dir = config_dir()?;
     let path = dir.join("lean-host-mcp").join("config.toml");

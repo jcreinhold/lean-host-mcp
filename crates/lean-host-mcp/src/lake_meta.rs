@@ -10,18 +10,18 @@
 //!
 //! Two constructors:
 //!
-//! - [`LakeProjectMeta::from_explicit`] — caller already has a Lake-root
+//! - [`LakeProjectMeta::from_explicit`]: caller already has a Lake-root
 //!   path (e.g. resolved through the broker's [`ProjectHint::Explicit`]).
-//! - [`LakeProjectMeta::discover_from`] — start from a hint and walk
+//! - [`LakeProjectMeta::discover_from`]: start from a hint and walk
 //!   upward looking for `lakefile.{toml,lean}`. Used by the broker's
 //!   cwd-walk step.
 //!
-//! Lakefile parsing is intentionally minimal — `lakefile.toml` is parsed
-//! against a small `serde` shape; `lakefile.lean` falls back to a regex
-//! sniff for `package <name>` and `lean_lib <Name>`. The two existing
-//! fixtures (`fixtures/lean/lakefile.lean` and any TOML-based
-//! project) are the calibration target. Anything more elaborate is the
-//! user's job to declare via the explicit hint.
+//! Lakefile parsing is minimal: `lakefile.toml` is parsed against a small
+//! `serde` shape; `lakefile.lean` falls back to a regex sniff for
+//! `package <name>` and `lean_lib <Name>`. The two existing fixtures
+//! (`fixtures/lean/lakefile.lean` and any TOML-based project) are the
+//! calibration target. Anything more elaborate is the user's job to
+//! declare via the explicit hint.
 
 use std::path::{Path, PathBuf};
 
@@ -33,9 +33,8 @@ use crate::index::fingerprint_lake_project;
 /// Everything `LeanProject::open` needs to spawn a worker against one Lake
 /// project.
 ///
-/// Built from a directory by [`LakeProjectMeta::from_explicit`] or —
-/// when the caller only has a starting hint —
-/// [`LakeProjectMeta::discover_from`].
+/// Built from a directory by [`LakeProjectMeta::from_explicit`], or—when
+/// the caller only has a starting hint—[`LakeProjectMeta::discover_from`].
 #[derive(Debug, Clone)]
 pub struct LakeProjectMeta {
     pub canonical_root: PathBuf,
@@ -124,8 +123,8 @@ fn walk_up(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Parsed lakefile fields. `library` is optional — when absent we fall
-/// back to `pascal_case(package)`.
+/// Parsed lakefile fields. `library` is optional; when absent the fallback
+/// is `pascal_case(package)`.
 struct LakefileParsed {
     package: String,
     library: Option<String>,
@@ -211,8 +210,7 @@ fn umbrella_for(root: &Path, library: &str) -> Option<String> {
     }
 }
 
-/// Contents of `<root>/lean-toolchain`, trimmed. `"unknown"` if absent —
-/// matches the prior behaviour from `session.rs::lean_toolchain_label`.
+/// Contents of `<root>/lean-toolchain`, trimmed. `"unknown"` if absent.
 fn read_lean_toolchain(root: &Path) -> String {
     let path = root.join("lean-toolchain");
     std::fs::read_to_string(&path)

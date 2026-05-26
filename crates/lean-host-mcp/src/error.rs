@@ -1,7 +1,7 @@
 //! The one error type tool handlers return.
 //!
 //! Most "failures" Lean reports back (parse error, elaboration error, missing
-//! declaration) are *not* `ServerError` — they live in the tool's `result`
+//! declaration) are *not* `ServerError`; they live in the tool's `result`
 //! payload as structured data. `ServerError` is reserved for things the
 //! caller cannot meaningfully recover from: the Lean runtime failed to init,
 //! the Lake project does not exist, the session thread panicked.

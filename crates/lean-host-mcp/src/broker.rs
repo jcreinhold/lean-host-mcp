@@ -22,7 +22,7 @@
 //! to [`Duration::ZERO`] to disable idle eviction).
 //!
 //! **Manifest invalidation.** Every cache hit re-fingerprints
-//! `lake-manifest.json` and treats a mismatch as a miss — the project is
+//! `lake-manifest.json` and treats a mismatch as a miss: the project is
 //! shut down and re-spawned. The cost is one ≤ 50 KB SHA-256 per tool call.
 //!
 //! **Slow-path concurrency.** The registry mutex is never held across
@@ -243,10 +243,10 @@ impl ProjectBroker {
 
     /// Resolve the hint and load the project's [`LakeProjectMeta`] without
     /// opening (or touching) a worker. Tools that only need filesystem-level
-    /// information about the project — e.g.
-    /// [`project_scan`](crate::tools::scan::project_scan) — call this
-    /// instead of [`Self::with_project`] so a broken worker bootstrap can't
-    /// block a pure filesystem operation.
+    /// information about the project (e.g.
+    /// [`project_scan`](crate::tools::scan::project_scan)) call this instead
+    /// of [`Self::with_project`] so a broken worker bootstrap can't block a
+    /// pure filesystem operation.
     ///
     /// # Errors
     ///

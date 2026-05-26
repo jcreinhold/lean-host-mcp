@@ -5,7 +5,7 @@
 //! (parse errors, elaboration errors, kernel rejections, meta timeouts) are
 //! part of the *successful* tool result—clients branch on the `status`
 //! field. Only infrastructure failures (worker dead, runtime not initialised)
-//! escape as MCP errors—see [`crate::error::ServerError`].
+//! escape as MCP errors; see [`crate::error::ServerError`].
 
 // Tool handlers receive owned request structs by design (they consume the
 // request and forward owned strings into the worker actor); the
@@ -345,8 +345,8 @@ pub(crate) async fn list_declarations_strings(
 
 /// Per-batch size for [`describe_bulk`]. The upstream IPC frame cap is
 /// 1 MiB (`MAX_FRAME_BYTES` in `lean-rs-worker-protocol`); a typical
-/// `LeanWorkerDeclarationRow` JSON-encodes at ~3-4 KB, so 256 rows
-/// stays comfortably under the cap with room for long type signatures.
+/// `LeanWorkerDeclarationRow` JSON-encodes at ~3-4 KB, so 256 rows stays
+/// under the cap with room for long type signatures.
 const INDEX_REBUILD_BATCH: usize = 256;
 
 /// Bulk-describe every declaration in `names`. Output order matches input

@@ -1,8 +1,8 @@
 //! Position-based tools: `goal_at_position`, `type_at_position`,
 //! `references_of_name`, `file_diagnostics`.
 //!
-//! All four project the same upstream value —
-//! [`ProcessedFile`](lean_rs_host::host::process::ProcessedFile)—into a
+//! All four project the same upstream value
+//! ([`ProcessedFile`](lean_rs_host::host::process::ProcessedFile)) into a
 //! tool-specific result enum. Repeated calls against the same source bytes
 //! reuse a cached projection (see [`crate::cache::ProcessedFileCache`]).
 //!
@@ -11,15 +11,15 @@
 //! typical "what's wrong; then probe the problem site" loop pays for the
 //! elaboration once.
 //!
-//! The tools drive `LeanProject`'s worker actor with `process_module` —
-//! the header-aware shim. The file's own `import` declarations are parsed by
+//! The tools drive `LeanProject`'s worker actor with `process_module`, the
+//! header-aware shim. The file's own `import` declarations are parsed by
 //! Lean and validated against the server's open env; mismatch surfaces as a
 //! `warnings` entry on the envelope, not as a silent empty result. A header
 //! that fails to parse short-circuits to a `header_parse_failed` status
 //! variant carrying the parser diagnostics.
 //!
-//! The shim is optional. A capability dylib built before `lean-rs` 0.1.4
-//! lacks `process_module_with_info_tree`; each tool then answers with the
+//! The shim is optional. When the loaded dylib lacks
+//! `process_module_with_info_tree`, each tool answers with the
 //! `Unsupported` result variant.
 
 // Tool handlers consume their request structs (owned strings into the
@@ -269,8 +269,8 @@ pub struct ReferencesOfNameResult {
 ///
 /// Returns `ServerError::Lean` if the underlying `process_module` call
 /// fails for a non-`Unsupported`, non-`HeaderParseFailed`, non-`MissingImports`
-/// reason. Files that cannot be read are skipped silently—same policy
-/// as [`crate::tools::scan::project_scan`].
+/// reason. Files that cannot be read are skipped silently (same policy
+/// as [`crate::tools::scan::project_scan`]).
 pub async fn references_of_name(
     ctx: &ToolContext,
     req: ReferencesOfNameRequest,
@@ -344,10 +344,10 @@ pub async fn references_of_name(
                 header_parse_failed_files,
                 missing_imports_files,
             };
-            // `references_of_name` accumulates per-file `MissingImports` into the
-            // result sidebar rather than the envelope warnings—the single-file
-            // tools surface it as a warning, but a project-wide walk against a
-            // dozen mismatched files would drown the envelope.
+            // `references_of_name` accumulates per-file `MissingImports` into
+            // the result sidebar rather than the envelope warnings: the
+            // single-file tools surface it as a warning, but a project-wide
+            // walk against a dozen mismatched files would drown the envelope.
             Ok(attach_envelope_notes(
                 Response::ok(result, freshness),
                 any_freshly_processed,
@@ -401,7 +401,7 @@ pub enum FileDiagnosticsResult {
     /// by `(line, column)`. `truncated` is true only when Lean hit the
     /// diagnostic byte budget and the list is a prefix.
     ///
-    /// Note: `summary.errors > 0` means the file has elaboration errors —
+    /// Note: `summary.errors > 0` means the file has elaboration errors;
     /// `status: "elaborated"` only says we got far enough to collect them.
     Elaborated {
         summary: DiagnosticSummary,
@@ -467,8 +467,8 @@ pub async fn file_diagnostics(
         .await
 }
 
-/// Sort diagnostics by `(line, column)` so the wire order is deterministic
-///—Lean's source order is usually but not always position-ordered.
+/// Sort diagnostics by `(line, column)` so the wire order is deterministic;
+/// Lean's source order is usually but not always position-ordered.
 fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
     diagnostics.sort_by_key(|d| d.position.as_ref().map_or((u32::MAX, u32::MAX), |p| (p.line, p.column)));
     diagnostics

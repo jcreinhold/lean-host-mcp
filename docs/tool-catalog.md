@@ -2,7 +2,7 @@
 
 Every tool returns the same outer envelope (see the README). Only `result` differs; that's what this document records.
 
-The envelope's `freshness.session_id` is the **stable identity of the project actor that served the call** — two
+The envelope's `freshness.session_id` is the **stable identity of the project actor that served the call**: two
 responses with the same `(project_root, session_id)` pair were served by the same in-process worker. `session_id` only
 changes when the broker re-spawns a project: LRU eviction (pool full, project not used recently), idle eviction
 (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`), or manifest invalidation (`lake-manifest.json` changed on disk). Clients can detect
@@ -10,7 +10,7 @@ changes when the broker re-spawns a project: LRU eviction (pool full, project no
 
 ## Per-tool routing field
 
-Every request schema accepts an optional `project` field — an absolute path to a Lake-project root. When set, the
+Every request schema accepts an optional `project` field: an absolute path to a Lake-project root. When set, the
 server routes that single call to that project; the broker keeps up to `LEAN_HOST_MCP_MAX_PROJECTS` (default 4)
 projects resident concurrently, so per-call routing does not cost a re-spawn unless the pool is full and the requested
 project was recently evicted. When omitted, the server resolves the project via the standard chain
@@ -149,8 +149,9 @@ validated against the server's open env; mismatch surfaces as an envelope `warni
 result sidebar (`references_of_name`). The projection is cached against `(file_path, sha256(contents))`, so repeat calls
 on the same bytes reuse it; an edit invalidates structurally.
 
-`process_module_with_info_tree` is an **optional** capability shim. When the loaded dylib was built against pre-0.1.4
-`lean-rs-host`, every position tool answers `{ "status": "unsupported" }` cleanly; the tools never raise.
+`process_module_with_info_tree` is an **optional** capability shim. When the loaded dylib lacks the
+`process_module_with_info_tree` shim, every position tool answers `{ "status": "unsupported" }` cleanly; the tools
+never raise.
 
 All line and column inputs are **1-indexed**. Result spans use the same convention.
 
@@ -238,7 +239,7 @@ sorted by `(file, line, column)`. Name matching is exact: pass the fully-qualifi
 
 ### `file_diagnostics`
 
-Elaboration diagnostics — errors, warnings, info — for a `.lean` file. Same elaborator pass that backs
+Elaboration diagnostics—errors, warnings, info—for a `.lean` file. Same elaborator pass that backs
 `goal_at_position` / `type_at_position`, so the projection is cached and the typical "what's wrong; probe the problem
 site" loop pays for the elaboration once.
 
@@ -257,7 +258,7 @@ site" loop pays for the elaboration once.
   "truncated": false
 }
 
-// result: file's header did not parse — body never elaborated; diagnostics are the parser's
+// result: file's header did not parse; body never elaborated; diagnostics are the parser's
 { "status": "header_parse_failed",
   "summary": { "errors": 1, "warnings": 0, "info": 0 },
   "diagnostics": [...], "truncated": false }
@@ -266,7 +267,7 @@ site" loop pays for the elaboration once.
 { "status": "unsupported" }
 ```
 
-`status: "elaborated"` only means we got far enough to collect diagnostics — `summary.errors > 0` is the real "does this
+`status: "elaborated"` only means we got far enough to collect diagnostics; `summary.errors > 0` is the real "does this
 file have problems?" signal. `severity` is lowercase (`"error" | "warning" | "info"`). `diagnostics` is sorted by
 `(line, column)`. The per-diagnostic `file` field is omitted for Lean's synthetic source labels (almost always).
 `truncated` is true only when Lean hit the diagnostic byte budget; the list is then a prefix. `Elaborated` and

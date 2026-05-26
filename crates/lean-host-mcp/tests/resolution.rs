@@ -1,6 +1,6 @@
 //! Resolution-chain unit tests for [`ProjectBroker::resolve`]. These
 //! exercise the five-step chain (explicit → env → cwd-walk → config
-//! default → error) without opening a Lean worker — they construct fake
+//! default → error) without opening a Lean worker; they construct fake
 //! Lake-root layouts under `tempfile::tempdir()`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -53,7 +53,7 @@ fn env_default_wins_over_cwd_walk() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd_proj = make_lake_root(tmp.path(), "cwd_proj");
     let env_proj = make_lake_root(tmp.path(), "env_proj");
-    // cwd is inside cwd_proj — cwd-walk would otherwise find that root —
+    // cwd is inside cwd_proj (cwd-walk would otherwise find that root),
     // but env_default must short-circuit.
     let cwd = cwd_proj.join("sub");
     fs::create_dir_all(&cwd).unwrap();

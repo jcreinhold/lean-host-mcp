@@ -18,9 +18,9 @@ use crate::broker::ProjectBroker;
 use crate::envelope::Response;
 use crate::tools::{self, ToolContext};
 
-// Deliberately not `use crate::error::Result;` here—the `#[tool_handler]`
+// Deliberately not `use crate::error::Result;` here: the `#[tool_handler]`
 // macro emits bare `Result<...>` references that must resolve to the std
-// `Result`. We use `crate::error::Result` only via fully-qualified paths.
+// `Result`. `crate::error::Result` appears only via fully-qualified paths.
 
 #[derive(Debug, Clone)]
 pub struct LeanHostService {
@@ -177,7 +177,7 @@ impl LeanHostService {
 #[tool_handler]
 impl ServerHandler for LeanHostService {
     fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]` from rmcp—struct literal
+        // `ServerInfo` is `#[non_exhaustive]` from rmcp; struct literal
         // syntax (even with `..default`) is forbidden across crates. Build
         // via Default + field mutation.
         let mut info = ServerInfo::default();

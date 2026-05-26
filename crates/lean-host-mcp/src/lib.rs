@@ -6,25 +6,25 @@
 //!
 //! Layout:
 //!
-//! - [`envelope`]—the uniform `{result, freshness, warnings, next_actions}`
+//! - [`envelope`]: the uniform `{result, freshness, warnings, next_actions}`
 //!   wrapper every tool returns.
-//! - [`broker`]—`ProjectBroker`, the mediator that resolves a per-call
+//! - [`broker`]: `ProjectBroker`, the mediator that resolves a per-call
 //!   project hint into an `Arc<LeanProject>` via the env / cwd-walk /
 //!   config-default chain.
-//! - [`project`]—`LeanProject`, the unit of multiplexing. Bundles the
+//! - [`project`]: `LeanProject`, the unit of multiplexing. Bundles the
 //!   worker-actor capability, the `SQLite` declaration index, and the
 //!   in-memory processed-file cache for one Lake project.
-//! - [`projections`]—pure data-shuffle projection types and helpers from
+//! - [`projections`]: pure data-shuffle projection types and helpers from
 //!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.
-//! - [`lake_meta`]—`LakeProjectMeta`, the minimal description of a Lake
+//! - [`lake_meta`]: `LakeProjectMeta`, the minimal description of a Lake
 //!   project that `LeanProject::open` consumes.
-//! - [`index`]—`DeclarationIndex`, the SQLite-backed projection of the
+//! - [`index`]: `DeclarationIndex`, the SQLite-backed projection of the
 //!   environment the three index tools query.
-//! - [`error`]—`ServerError`, the one error type tool handlers return.
-//! - [`tools`]—tool implementations, grouped by what plumbing they share
+//! - [`error`]: `ServerError`, the one error type tool handlers return.
+//! - [`tools`]: tool implementations, grouped by what plumbing they share
 //!   (`lean` for session-backed tools, `scan` for the filesystem regex
 //!   sweep, `index` for the SQLite-backed lookups).
-//! - [`server`]—rmcp glue.
+//! - [`server`]: rmcp glue.
 
 pub mod broker;
 pub mod cache;

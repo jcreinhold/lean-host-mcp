@@ -24,7 +24,7 @@ use lean_rs_worker_parent::{
 
 use crate::error::ServerError;
 
-/// Source-range projection—public fields mirroring `LeanWorkerSourceRange`.
+/// Source-range projection with public fields mirroring `LeanWorkerSourceRange`.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct SourceRange {
     pub file: String,
@@ -71,14 +71,14 @@ pub struct Diagnostic {
     pub message: String,
     pub position: Option<Position>,
     /// Real source path when Lean attached one. Omitted for the synthetic
-    /// `<elaborate>` label that elaboration-buffer calls always produce —
+    /// `<elaborate>` label that elaboration-buffer calls always produce;
     /// the caller already knows which file they asked about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
 }
 
-/// Structured failure payload—the projection of `LeanWorkerElabFailure` we
-/// send over JSON. Failure is part of a successful tool call; this is never
+/// Structured failure payload: the projection of `LeanWorkerElabFailure`
+/// sent over JSON. Failure is part of a successful tool call; this is never
 /// an MCP error.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct ElabFailure {
@@ -116,11 +116,11 @@ pub struct MetaOutcome {
     pub rendered: Option<String>,
     pub definitionally_equal: Option<bool>,
     pub failure: Option<ElabFailure>,
-    /// Set when the worker reported `LeanWorkerRendering::Raw`—the
+    /// Set when the worker reported `LeanWorkerRendering::Raw`: the
     /// optional `meta_pp_expr` shim was missing or reported `Unsupported`,
-    /// and the rendering fell back to `Expr.toString`. Internal—tool
-    /// handlers translate this into an envelope warning; the field never
-    /// serialises.
+    /// and the rendering fell back to `Expr.toString`. Internal; tool
+    /// handlers translate this into an envelope warning, and the field
+    /// never serialises.
     #[serde(skip)]
     #[schemars(skip)]
     pub raw_fallback_used: bool,
@@ -132,7 +132,7 @@ pub struct DeclarationRow {
     pub kind: String,
     /// Pretty-printed type signature as the worker's
     /// `LeanWorkerDeclarationRow` reports it. `None` only when the
-    /// declaration has no recoverable type—typically internal artifacts.
+    /// declaration has no recoverable type (typically internal artifacts).
     pub type_signature: Option<String>,
     pub source: Option<SourceRange>,
 }
@@ -177,7 +177,7 @@ fn project_source_range(range: LeanWorkerSourceRange) -> SourceRange {
 
 /// Strip Lean's synthetic source label so it never reaches the wire. Every
 /// call that elaborates a string buffer (rather than a file on disk) gets
-/// labelled `<elaborate>`—it is never actionable for the caller.
+/// labelled `<elaborate>`, which is never actionable for the caller.
 fn meaningful_file_label(label: &str) -> Option<String> {
     if label.is_empty() || label == "<elaborate>" || label.starts_with('<') {
         None

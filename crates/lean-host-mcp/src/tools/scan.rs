@@ -1,4 +1,4 @@
-//! `project_scan` — filesystem regex sweep over the project's `.lean` files.
+//! `project_scan`: filesystem regex sweep over the project's `.lean` files.
 //! No Lean session involvement; cheapest tool in the catalogue.
 //!
 //! Routes through [`ProjectBroker::resolve_meta`] rather than
@@ -11,7 +11,7 @@
 // Same ownership rationale as `tools::lean`.
 #![allow(clippy::needless_pass_by_value)]
 // `project_scan` is worker-free, so the body has no `.await`. Keep `async`
-// for dispatcher symmetry with the other tool handlers in [`server.rs`] —
+// for dispatcher symmetry with the other tool handlers in [`server.rs`];
 // the cost of one suppressed lint is much smaller than the cost of a
 // special case in the rmcp glue.
 #![allow(clippy::unused_async)]

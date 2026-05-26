@@ -11,9 +11,9 @@
 //!   the corresponding Lean shared library.
 //!   [`Self::resolve_for`] consults (in order) the
 //!   `LEAN_HOST_MCP_WORKERS_DIR` developer override, then
-//!   `<install_root>/<id>/lean-host-mcp-worker`. Missing → an actionable
-//!   [`ToolchainError::WorkerNotInstalled`] whose `install_cmd` field
-//!   names the exact `install-worker` invocation that will produce it.
+//!   `<install_root>/<id>/lean-host-mcp-worker`. Missing produces an
+//!   actionable [`ToolchainError::WorkerNotInstalled`] whose `install_cmd`
+//!   field names the exact `install-worker` invocation that will produce it.
 //! - [`ToolchainError`] is the typed failure surface. Project-open code
 //!   maps it into [`crate::error::ServerError::BadProject`] so the install
 //!   command flows through to the client.
@@ -185,9 +185,9 @@ impl WorkerBinary {
     /// `~/.local/share/lean-host-mcp/workers` (or
     /// `$XDG_DATA_HOME/lean-host-mcp/workers`).
     ///
-    /// Falls back to the current directory if no data dir can be located —
-    /// in that situation the calling code will fail soon after with a
-    /// concrete `WorkerNotInstalled`.
+    /// Falls back to the current directory if no data dir can be located;
+    /// the calling code will then fail soon after with a concrete
+    /// `WorkerNotInstalled`.
     #[must_use]
     pub fn install_root() -> PathBuf {
         dirs::data_local_dir()

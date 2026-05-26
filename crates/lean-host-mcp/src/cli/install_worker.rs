@@ -1,4 +1,4 @@
-//! `lean-host-mcp install-worker` — build the worker binary against a
+//! `lean-host-mcp install-worker`: build the worker binary against a
 //! specific Lean toolchain and place it under
 //! [`WorkerBinary::install_root`].
 //!
@@ -200,7 +200,7 @@ fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
         fs::remove_file(&dest)?;
     }
     if fs::rename(&built, &dest).is_err() {
-        // Cross-device move — fall back to copy + remove.
+        // Cross-device move: fall back to copy + remove.
         fs::copy(&built, &dest)?;
         fs::remove_file(&built)?;
     }
@@ -303,7 +303,7 @@ mod humantime {
         match t.duration_since(SystemTime::UNIX_EPOCH) {
             Ok(d) => {
                 let secs = d.as_secs();
-                // Civil-time conversion — `chrono` would be nicer but we
+                // Civil-time conversion: `chrono` would be nicer but we
                 // don't want a new dep. Show seconds-since-epoch in a
                 // distinctive form so it's clear this is not a parsed
                 // calendar date.

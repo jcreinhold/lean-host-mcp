@@ -7,11 +7,11 @@
 //! (in-memory LRU), and the project metadata (canonical root, toolchain,
 //! package, library, manifest hash, default imports).
 //!
-//! The actor pattern matches the previous `SessionHost`: one owner of the
-//! capability at a time, enforced by parking it on a thread named
-//! `"lean-host-mcp/project/<basename>"`. Each call to [`LeanProject::submit`]
-//! ships a typed closure to that thread, which opens a fresh session,
-//! invokes the worker, and returns a `Send + 'static` result.
+//! `LeanWorkerCapability` has one owner at a time; the invariant holds by
+//! parking it on a thread named `"lean-host-mcp/project/<basename>"`. Each
+//! call to [`LeanProject::submit`] ships a typed closure to that thread,
+//! which opens a fresh session, invokes the worker, and returns a
+//! `Send + 'static` result.
 //!
 //! Lean-domain failures (parse, elaboration, kernel rejection, meta
 //! timeout) flow as `Ok` payloads through the closure. Only infrastructure
@@ -38,9 +38,9 @@ use crate::lake_meta::LakeProjectMeta;
 use crate::projections::map_worker_err;
 use crate::toolchain::{ToolchainId, WorkerBinary};
 
-/// LRU capacity for the in-memory `ProcessedFile` cache. Sized for a normal
-/// multi-file proof session—large enough that twenty cursor moves across
-/// a handful of files all hit, small enough to keep memory bounded.
+/// LRU capacity for the in-memory `ProcessedFile` cache. Large enough that
+/// twenty cursor moves across a handful of files all hit, small enough to
+/// keep memory bounded.
 const PROCESSED_FILE_CACHE_CAPACITY: usize = 16;
 
 type Job = Box<dyn FnOnce(&mut LeanWorkerCapability) + Send + 'static>;
@@ -50,9 +50,7 @@ type Job = Box<dyn FnOnce(&mut LeanWorkerCapability) + Send + 'static>;
 pub struct LeanProject {
     canonical_root: PathBuf,
     /// Raw contents of `<canonical_root>/lean-toolchain`, e.g.
-    /// `"leanprover/lean4:v4.30.0-rc2"`. Stored as a string for now; a
-    /// parsed `ToolchainId` type will arrive when multi-toolchain dispatch
-    /// lands.
+    /// `"leanprover/lean4:v4.30.0-rc2"`.
     toolchain: String,
     package: String,
     library: String,
@@ -99,17 +97,15 @@ impl LeanProject {
         // Resolve the toolchain pin to a concrete worker binary before
         // spawning the actor, so the install error surfaces synchronously
         // and includes the `install-worker` command in its message.
-        // TODO(prompt 15): swap this for a structured `NeedsWorker`
-        // envelope status rather than embedding the command in a string.
         let toolchain_id =
             ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
         let worker = WorkerBinary::resolve_for(&toolchain_id)
             .map_err(|e| ServerError::BadProject(e.to_string()))?;
         // Each worker binary is built against one toolchain; its rpath and
-        // its `LEAN_SYSROOT` must match. The elan toolchain root is that
-        // sysroot. We pass it explicitly to `LeanWorkerChild::for_toolchain`
-        // below so the parent can host multiple workers with different
-        // toolchains from a single process.
+        // `LEAN_SYSROOT` must match. The elan toolchain root is that
+        // sysroot. Passing it explicitly to `LeanWorkerChild::for_toolchain`
+        // lets the parent host multiple workers with different toolchains
+        // from a single process.
         let lean_sysroot = toolchain_id
             .elan_dir()
             .map_err(|e| ServerError::BadProject(e.to_string()))?;
@@ -150,9 +146,8 @@ impl LeanProject {
             .recv()
             .map_err(|_| ServerError::Internal("project actor thread died during init".into()))??;
 
-        // The constant is non-zero by construction; `NonZeroUsize::MIN`
-        // ([`NonZeroUsize::new(1)`]) is a safe fallback the type system
-        // can verify, so we do not need an `unwrap` here.
+        // Constant is non-zero by construction; `NonZeroUsize::MIN` is a
+        // type-checked fallback, so no `unwrap` is needed.
         #[allow(
             clippy::missing_const_for_fn,
             reason = "NonZeroUsize::new is const but `or` is not yet on stable for NonZeroUsize"
@@ -317,13 +312,12 @@ fn actor_main(
     let builder = LeanWorkerCapabilityBuilder::new(&lake_root, &package, &library, default_imports.iter())
         .worker_child(LeanWorkerChild::for_toolchain(worker_path, lean_sysroot))
         .startup_timeout(Duration::from_secs(30))
-        // 16 MiB: comfortable headroom for `outline` / `file_diagnostics`
-        // on Mathlib-scale modules where a single frame can carry
-        // thousands of pretty-printed declarations or diagnostics, with
-        // no natural chunking axis the tool layer can exploit. The
-        // upstream default (1 MiB) is appropriate for bulk tools that
-        // chunk their own pages (`describe_bulk`), not for tools whose
-        // single result is the frame.
+        // 16 MiB: headroom for `outline` / `file_diagnostics` on
+        // Mathlib-scale modules where a single frame can carry thousands
+        // of pretty-printed declarations or diagnostics, with no natural
+        // chunking axis the tool layer can exploit. The upstream default
+        // (1 MiB) suits bulk tools that chunk their own pages
+        // (`describe_bulk`), not tools whose single result is the frame.
         .max_frame_bytes(16 * 1024 * 1024)
         .long_running_requests();
 
