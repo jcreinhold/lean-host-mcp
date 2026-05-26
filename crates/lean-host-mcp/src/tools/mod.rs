@@ -45,6 +45,20 @@ pub(crate) fn freshness_for(project: &LeanProject, imports: &[String]) -> Freshn
     project.freshness(imports)
 }
 
+/// Imports passed to worker sessions: `Init` is the internal base
+/// environment, while the public freshness envelope records only the
+/// caller-supplied vector.
+pub(crate) fn session_imports(imports: Vec<String>) -> Vec<String> {
+    if imports.iter().any(|import| import == "Init") {
+        imports
+    } else {
+        let mut out = Vec::with_capacity(imports.len().saturating_add(1));
+        out.push("Init".to_owned());
+        out.extend(imports);
+        out
+    }
+}
+
 /// Worker-free analogue of [`freshness_for`] for tools that resolve a project
 /// through [`ProjectBroker::resolve_meta`](crate::broker::ProjectBroker::resolve_meta).
 /// `session_id` is a fresh UUID per call: with no actor to identify, the
@@ -55,7 +69,7 @@ pub(crate) fn freshness_for_meta(meta: &LakeProjectMeta) -> Freshness {
     Freshness {
         project_root: meta.canonical_root.to_string_lossy().into_owned(),
         project_hash: meta.manifest_hash.clone(),
-        imports: meta.default_imports.clone(),
+        imports: Vec::new(),
         session_id: uuid::Uuid::new_v4().to_string(),
         lean_toolchain: meta.toolchain.clone(),
     }

@@ -455,5 +455,8 @@ mod tests {
         idx.replace_all(&[], "fp1").unwrap();
         assert!(idx.is_fresh("fp1").unwrap());
         assert!(!idx.is_fresh("fp2").unwrap());
+        idx.replace_all(&[], "fp2").unwrap();
+        assert!(!idx.is_fresh("fp1").unwrap());
+        assert!(idx.is_fresh("fp2").unwrap());
     }
 }

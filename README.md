@@ -46,9 +46,9 @@ lean-host-mcp install-worker --auto
 lean-host-mcp install-worker --list           # see what's installed
 
 # 3a. Zero-config: launch from inside (or anywhere under) any built Lake
-#     project. The package, library, umbrella import, and worker
-#     toolchain are all auto-discovered from `lakefile.lean` and
-#     `lean-toolchain`.
+#     project. The toolchain pin is read from `lean-toolchain`, the project
+#     root from `lakefile.{lean,toml}`. Tool calls own their own `imports`;
+#     no project umbrella is imported unless a call passes it explicitly.
 cd /path/to/your/lake/project
 lake build && lean-host-mcp
 
@@ -112,6 +112,9 @@ Every tool returns the same outer shape; only `result` varies.
   "next_actions": ["..."]      // omitted when empty
 }
 ```
+
+`freshness.imports` is the import vector supplied for that call. An empty array means the caller asked for no extra
+imports beyond the worker's base environment.
 
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors.
 MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the Lake

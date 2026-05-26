@@ -127,11 +127,13 @@ Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) live i
 ## The `DeclarationIndex` boundary
 
 `find_symbol`, `find_lemma`, and `outline` all answer "what declarations match X" against the open Lake project. They
-share one piece of state: a SQLite database under the user's cache directory, keyed by Lake-manifest hash. `index.rs`
-owns that boundary in full—schema, fingerprinting, bulk rebuild, the seven read methods the tools consume. Nothing past
-the module sees `rusqlite` or `sha2`; a fourth caller adds a method here rather than writing SQL.
+share one piece of state: a SQLite database under the user's cache directory. `index.rs` owns that boundary in
+full—schema, fingerprinting, bulk rebuild, the seven read methods the tools consume. Nothing past the module sees
+`rusqlite` or `sha2`; a fourth caller adds a method here rather than writing SQL.
 
-Rebuilds are on-demand and gated by the SHA-256 of `lake-manifest.json`. The session walks the live environment via
+Rebuilds are on-demand and gated by a private environment fingerprint: the SHA-256 of `lake-manifest.json` plus the
+exact ordered import vector used for the index call. The table is still one replacement table per project. A different
+import vector makes the current table stale and rebuilds it. The session walks the live environment via
 `LeanSession::list_declarations_strings` followed by `declaration_kind_bulk` and `declaration_type_bulk`, the index
 commits in one transaction, and the fingerprint is stamped last so a crashed rebuild leaves the index detectably stale
 rather than partially populated.
@@ -141,10 +143,9 @@ rather than partially populated.
 `goal_at_position`, `type_at_position`, `references_of_name`, and `file_diagnostics` project the worker's
 `LeanWorkerProcessedFile` value (four arrays of info-tree nodes plus diagnostics) into tool-specific results.
 Re-processing on every cursor move would be wasteful, so `cache.rs` ships a small LRU of `Arc<LeanWorkerProcessedFile>`,
-capacity 16, keyed on `(file_path, sha256(contents))`. Any edit to the source bytes misses structurally. The cache lives
-inside `LeanProject`, so within one cache instance every entry necessarily shares the project's default-import context;
-import-collision safety is structural rather than enforced by the key. `LeanWorkerProcessedFile` is owned data
-(`Send + Sync + 'static`), so cached entries are read by tool handlers
+capacity 16, keyed on `(file_path, sha256(contents))`. Any edit to the source bytes misses structurally. Position tools
+derive imports from the file header, so changing the import context changes the file bytes and misses the cache.
+`LeanWorkerProcessedFile` is owned data (`Send + Sync + 'static`), so cached entries are read by tool handlers
 without re-entering the actor thread. Position lookup helpers (`tactic_at`, `term_at`, `references_of`) are free
 functions on `cache.rs`; linear scan is fast enough at typical file sizes (the `position_lookup_after_cache_warm` bench
 targets ≤ 50 µs per query).

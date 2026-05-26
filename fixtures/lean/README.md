@@ -9,8 +9,7 @@ layout, rename the package and library, and the host server can serve it.
 lakefile.lean         Lake DSL declaring the `lean_rs_fixture` package
                       and the `LeanRsFixture` lean_lib (shared facet on)
 lean-toolchain        pins the Lean toolchain used to build and serve
-LeanRsFixture.lean    umbrella import; `lean-host-mcp` opens with
-                      this as `default_imports`
+LeanRsFixture.lean    Lake umbrella module for the fixture library
 LeanRsFixture/        one submodule per ABI category covered by the
                       tests (Scalars, Strings, Containers, Effects,
                       Evidence, Capability, SourceRanges)
@@ -39,10 +38,8 @@ module initializer is `initialize_lean__rs__fixture_LeanRsFixture`.
 ## Using as a template
 
 Rename `package «lean_rs_fixture»` and `lean_lib «LeanRsFixture»` in `lakefile.lean`; rename the matching directory and
-the umbrella import. Keep `defaultFacets := #[LeanLib.sharedFacet]` on the `lean_lib`; that's what `lean-host-mcp`
-`dlopen`s. If your project depends on mathlib or other prebuilt libraries, make sure their `:shared` facets are on the
-link line; symbol-resolution failures at `dlopen` time surface as a `BadProject` error from the server with the missing
-symbol named verbatim.
+umbrella module. Tool calls pass their own `imports`; the server does not import the umbrella automatically. Keep
+`defaultFacets := #[LeanLib.sharedFacet]` on the `lean_lib` if you need a shared facet for other tooling.
 
 Pointed at by the e2e tests via `LEAN_HOST_MCP_TEST_FIXTURE` (defaults `lean_rs_fixture` / `LeanRsFixture` for the
 package and library names; override with `LEAN_HOST_MCP_TEST_PACKAGE` and `LEAN_HOST_MCP_TEST_LIBRARY`).

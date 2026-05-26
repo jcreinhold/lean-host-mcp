@@ -5,8 +5,7 @@
 //! [`LakeProjectMeta`] to spawn a worker. The struct carries every
 //! per-project field the worker / index / cache layers need: canonical
 //! root, toolchain label, package/library hints, the umbrella module Lake
-//! generates next to the library, manifest hash, and the default-import
-//! list every fresh session is opened against.
+//! generates next to the library, and manifest hash.
 //!
 //! Two constructors:
 //!
@@ -44,15 +43,13 @@ pub struct LakeProjectMeta {
     /// package dylib.
     pub package: Option<String>,
     /// Primary `lean_lib` name, or the package-derived Lake default when
-    /// there is no explicit `lean_lib`. Informational except for deriving
-    /// the umbrella default import.
+    /// there is no explicit `lean_lib`. Informational.
     pub library: Option<String>,
     /// Module name Lake exposes alongside the library (the file
-    /// `<root>/<Library>.lean` when present). Drives the default-import
-    /// list. `None` when no umbrella file exists on disk.
+    /// `<root>/<Library>.lean` when present). Informational; tool calls
+    /// choose their own imports. `None` when no umbrella file exists on disk.
     pub umbrella_module: Option<String>,
     pub manifest_hash: String,
-    pub default_imports: Vec<String>,
 }
 
 impl LakeProjectMeta {
@@ -103,7 +100,6 @@ impl LakeProjectMeta {
 
         let library = parsed.library.unwrap_or_else(|| pascal_case(&parsed.package));
         let umbrella_module = umbrella_for(&canonical_root, &library);
-        let default_imports = umbrella_module.clone().map_or_else(Vec::new, |m| vec![m]);
 
         Ok(Self {
             canonical_root,
@@ -112,7 +108,6 @@ impl LakeProjectMeta {
             library: Some(library),
             umbrella_module,
             manifest_hash,
-            default_imports,
         })
     }
 }

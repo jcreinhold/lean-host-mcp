@@ -25,7 +25,7 @@ use lean_host_mcp::tools::lean::{
     ElaborateRequest, ElaborateResult, HoverByNameRequest, HoverByNameResult, InferTypeRequest, elaborate,
     hover_by_name, infer_type,
 };
-use lean_host_mcp::{BrokerConfig, LakeProjectMeta, LeanProject, ProjectBroker, ServerError, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, ServerError};
 
 fn fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
@@ -363,7 +363,7 @@ async fn file_diagnostics_returns_real_errors() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn shims_only_project_opens_when_project_shared_facet_is_broken() {
+async fn per_call_imports_avoid_broken_project_umbrella_failure() {
     use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
 
     let Some(root) = fixture_root() else {
@@ -375,56 +375,63 @@ async fn shims_only_project_opens_when_project_shared_facet_is_broken() {
 
     let broken_file = project_root.join("LeanRsFixture/Broken.lean");
     fs::write(&broken_file, "theorem broken : True := sorry_that_doesnt_exist\n").expect("write broken module");
-    fs::write(
-        project_root.join("LeanRsFixture/LinkBroken.lean"),
-        "#eval Lean.versionString\n\n@[extern \"lean_host_mcp_missing_symbol_for_test\"]\nopaque linkBroken : Nat\n",
-    )
-    .expect("write shared-facet-broken module");
-    let umbrella = project_root.join("LeanRsFixture.lean");
-    let umbrella_source = fs::read_to_string(&umbrella).expect("read umbrella module");
-    fs::write(
-        &umbrella,
-        umbrella_source.replacen(
-            "import LeanRsFixture.Scalars",
-            "import LeanRsFixture.LinkBroken\nimport LeanRsFixture.Scalars",
-            1,
-        ),
-    )
-    .expect("add link-broken import to umbrella");
 
-    let shared = Command::new("lake")
-        .args(["build", "LeanRsFixture:shared"])
+    let broken_target = Command::new("lake")
+        .args(["build", "LeanRsFixture.Broken"])
         .current_dir(&project_root)
         .output()
-        .expect("run lake build LeanRsFixture:shared");
+        .expect("run lake build LeanRsFixture.Broken");
     assert!(
-        !shared.status.success(),
-        "broken project-local module must make :shared fail; stdout={}, stderr={}",
-        String::from_utf8_lossy(&shared.stdout),
-        String::from_utf8_lossy(&shared.stderr)
+        !broken_target.status.success(),
+        "broken project-local module must fail when built directly; stdout={}, stderr={}",
+        String::from_utf8_lossy(&broken_target.stdout),
+        String::from_utf8_lossy(&broken_target.stderr)
     );
 
-    let meta = LakeProjectMeta::from_explicit(&project_root).expect("metadata for copied fixture");
-    let project = LeanProject::open(meta, &default_cache_dir()).expect("shims-only project open");
-    project.shutdown();
-
     let ctx = open_ctx(&project_root);
-    let inferred = infer_type(
+    let inferred_without_imports = infer_type(
         &ctx,
         InferTypeRequest {
-            term: "fun (n : Nat) => n + 1".into(),
-            imports: vec!["LeanRsFixture.Handles".into()],
+            term: "fun (n : Nat) => Nat.succ n".into(),
+            imports: Vec::new(),
             project: None,
         },
     )
     .await
-    .expect("infer_type against unbroken import");
+    .expect("infer_type without project imports");
     assert_eq!(
-        inferred.result.status, "Ok",
-        "infer_type must succeed: {:?}",
-        inferred.result
+        inferred_without_imports.result.status, "Ok",
+        "infer_type with no caller imports must succeed: {:?}",
+        inferred_without_imports.result
     );
-    assert_eq!(inferred.result.rendered.as_deref(), Some("Nat → Nat"));
+    assert!(
+        matches!(
+            inferred_without_imports.result.rendered.as_deref(),
+            Some("Nat → Nat" | "Nat -> Nat")
+        ),
+        "expected Nat function type with no imports; got {:?}",
+        inferred_without_imports.result.rendered
+    );
+    assert!(
+        inferred_without_imports.freshness.imports.is_empty(),
+        "freshness imports must reflect the empty request"
+    );
+
+    let inferred_with_umbrella = infer_type(
+        &ctx,
+        InferTypeRequest {
+            term: "fun (n : Nat) => Nat.succ n".into(),
+            imports: vec!["LeanRsFixture".into()],
+            project: None,
+        },
+    )
+    .await
+    .expect("infer_type against umbrella import");
+    assert_eq!(
+        inferred_with_umbrella.result.status, "Ok",
+        "the unchanged umbrella must still import successfully: {:?}",
+        inferred_with_umbrella.result
+    );
 
     let diagnostics = file_diagnostics(
         &ctx,
@@ -463,6 +470,8 @@ async fn shims_only_project_opens_when_project_shared_facet_is_broken() {
         ServerError::Lean(msg) => {
             assert!(
                 msg.contains("lean_exception")
+                    || msg.contains("LeanRsFixture.Broken")
+                    || msg.contains("olean")
                     || msg.contains("sorry_that_doesnt_exist")
                     || msg.contains("unknown identifier"),
                 "expected Lean import failure, got: {msg}"
@@ -540,12 +549,29 @@ async fn file_diagnostics_cache_warm() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn index_rebuilds_and_finds_prelude_theorem() {
-    use lean_host_mcp::tools::index::{FindLemmaRequest, find_lemma};
+    use lean_host_mcp::tools::index::{FindLemmaRequest, FindSymbolRequest, find_lemma, find_symbol};
 
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
+
+    let init_resp = find_symbol(
+        &ctx,
+        FindSymbolRequest {
+            query: "Nat.add".into(),
+            imports: Vec::new(),
+            limit: Some(10),
+            project: None,
+        },
+    )
+    .await
+    .expect("find_symbol with no imports");
+    assert!(
+        init_resp.freshness.imports.is_empty(),
+        "freshness imports must reflect the empty request"
+    );
+
     let resp = find_lemma(
         &ctx,
         FindLemmaRequest {
@@ -557,6 +583,18 @@ async fn index_rebuilds_and_finds_prelude_theorem() {
     )
     .await
     .expect("find_lemma");
+    assert_eq!(
+        resp.freshness.imports,
+        vec!["LeanRsFixture.Handles".to_owned()],
+        "freshness imports must reflect the per-call request"
+    );
+    assert!(
+        resp.next_actions
+            .iter()
+            .any(|hint| hint.contains("declaration index was rebuilt")),
+        "different import vectors must force an index rebuild; next_actions={:?}",
+        resp.next_actions
+    );
     assert!(
         resp.result.iter().any(|d| d.name == "Nat.add_zero"),
         "Nat.add_zero must be reachable through find_lemma after rebuild"

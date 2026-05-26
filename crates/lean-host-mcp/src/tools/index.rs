@@ -14,13 +14,14 @@ use std::sync::Arc;
 use lean_rs_worker_parent::LeanWorkerDeclarationFilter;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::Result;
-use crate::index::{IndexedDeclaration, fingerprint_lake_project};
+use crate::index::IndexedDeclaration;
 use crate::project::LeanProject;
-use crate::tools::{ToolContext, freshness_for, lean as lean_tools};
+use crate::tools::{ToolContext, freshness_for, lean as lean_tools, session_imports};
 
 /// Default + cap for the `limit` request field. Handlers clamp to this
 /// range so a missing or oversized value can't return more than 500 rows.
@@ -31,8 +32,8 @@ const MAX_LIMIT: usize = 500;
 pub struct FindSymbolRequest {
     /// Substring to match against declaration names. Case-insensitive.
     pub query: String,
-    /// Imports the index was built against. Empty = server defaults.
-    /// Drives the rebuild that fires when the Lake manifest has changed.
+    /// Imports the index is built against. Empty = no caller-supplied imports.
+    /// Drives rebuilds alongside the Lake manifest fingerprint.
     #[serde(default)]
     pub imports: Vec<String>,
     /// Maximum rows to return. Defaults to 50, clamped to 500.
@@ -126,15 +127,15 @@ pub async fn outline(ctx: &ToolContext, req: OutlineRequest) -> Result<Response<
         .await
 }
 
-/// Compare the cached fingerprint to `lake-manifest.json` and rebuild
-/// when they diverge. Returns `true` when a rebuild fired, so callers
-/// can attach a hint.
+/// Compare the cached fingerprint to the environment fingerprint and
+/// rebuild when they diverge. Returns `true` when a rebuild fired, so
+/// callers can attach a hint.
 async fn ensure_index(project: &Arc<LeanProject>, imports: Vec<String>) -> Result<bool> {
-    let fp = fingerprint_lake_project(project.canonical_root())?;
+    let fp = index_fingerprint(project.manifest_hash(), &imports);
     if project.index().is_fresh(&fp)? {
         return Ok(false);
     }
-    let imports = project.effective_imports(&imports);
+    let session_imports_vec = session_imports(imports);
     // Shims-only sessions expose bundled host-shim implementation details.
     // Keep the public declaration index focused on caller-visible names and
     // avoid oversized declaration-list frames.
@@ -144,12 +145,39 @@ async fn ensure_index(project: &Arc<LeanProject>, imports: Vec<String>) -> Resul
             include_private: false,
             ..LeanWorkerDeclarationFilter::default()
         },
-        imports.clone(),
+        session_imports_vec.clone(),
     )
     .await?;
-    let rows = lean_tools::describe_bulk(project, names, imports).await?;
+    let rows = lean_tools::describe_bulk(project, names, session_imports_vec).await?;
     project.index().replace_all(&rows, &fp)?;
     Ok(true)
+}
+
+fn index_fingerprint(manifest_hash: &str, imports: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lean-host-mcp:index-v1\0");
+    update_len_prefixed(&mut hasher, manifest_hash.as_bytes());
+    hasher.update((imports.len() as u64).to_be_bytes());
+    for import in imports {
+        update_len_prefixed(&mut hasher, import.as_bytes());
+    }
+    let digest = hasher.finalize();
+    hex_digest(&digest)
+}
+
+fn update_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn clamp_limit(limit: Option<usize>) -> usize {
@@ -164,5 +192,35 @@ where
         resp.hint("declaration index was rebuilt; subsequent queries reuse the cache")
     } else {
         resp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_fingerprint;
+
+    #[test]
+    fn index_fingerprint_includes_ordered_import_vector() {
+        let empty = index_fingerprint("manifest", &[]);
+        let nat = index_fingerprint("manifest", &[String::from("Mathlib.Data.Nat.Basic")]);
+        let list = index_fingerprint("manifest", &[String::from("Mathlib.Data.List.Basic")]);
+        let reordered = index_fingerprint(
+            "manifest",
+            &[
+                String::from("Mathlib.Data.List.Basic"),
+                String::from("Mathlib.Data.Nat.Basic"),
+            ],
+        );
+        let original_order = index_fingerprint(
+            "manifest",
+            &[
+                String::from("Mathlib.Data.Nat.Basic"),
+                String::from("Mathlib.Data.List.Basic"),
+            ],
+        );
+
+        assert_ne!(empty, nat);
+        assert_ne!(nat, list);
+        assert_ne!(original_order, reordered);
     }
 }

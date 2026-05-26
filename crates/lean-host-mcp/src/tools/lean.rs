@@ -26,7 +26,7 @@ use crate::projections::{
     DeclarationRow, ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome, map_worker_err, project_declaration_row,
     project_elab_result, project_kernel_result, project_meta_bool, project_meta_rendered,
 };
-use crate::tools::{ToolContext, freshness_for};
+use crate::tools::{ToolContext, freshness_for, session_imports};
 
 /// Reducibility view for `is_def_eq`. Mirrors `LeanWorkerMetaTransparency`
 /// from the worker layer; kept local so the wire schema doesn't depend on
@@ -57,7 +57,7 @@ pub struct ElaborateRequest {
     /// Lean source for a single term, e.g. `"(Nat.succ 0 : Nat)"`. Must be
     /// a term, not a command.
     pub source: String,
-    /// Module imports to elaborate against. Empty = use server defaults.
+    /// Module imports to elaborate against. Empty = no caller-supplied imports.
     #[serde(default)]
     pub imports: Vec<String>,
     /// Optional explicit project (absolute path to Lake root). When
@@ -84,7 +84,7 @@ pub async fn elaborate(ctx: &ToolContext, req: ElaborateRequest) -> Result<Respo
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
-            let imports = project.effective_imports(&req.imports);
+            let imports = session_imports(req.imports);
             let source = req.source;
             let outcome = project
                 .submit(move |cap| {
@@ -124,7 +124,7 @@ pub async fn kernel_check(ctx: &ToolContext, req: KernelCheckRequest) -> Result<
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
-            let imports = project.effective_imports(&req.imports);
+            let imports = session_imports(req.imports);
             let source = req.source;
             let outcome = project
                 .submit(move |cap| {
@@ -160,7 +160,7 @@ pub async fn infer_type(ctx: &ToolContext, req: InferTypeRequest) -> Result<Resp
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
-            let imports = project.effective_imports(&req.imports);
+            let imports = session_imports(req.imports);
             let term = req.term;
             let outcome = project
                 .submit(move |cap| {
@@ -199,7 +199,7 @@ pub async fn whnf(ctx: &ToolContext, req: WhnfRequest) -> Result<Response<MetaOu
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
-            let imports = project.effective_imports(&req.imports);
+            let imports = session_imports(req.imports);
             let term = req.term;
             let outcome = project
                 .submit(move |cap| {
@@ -254,7 +254,7 @@ pub async fn is_def_eq(ctx: &ToolContext, req: IsDefEqRequest) -> Result<Respons
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
             let transparency = req.transparency.unwrap_or_default().to_worker();
-            let imports = project.effective_imports(&req.imports);
+            let imports = session_imports(req.imports);
             let lhs = req.lhs;
             let rhs = req.rhs;
             let outcome = project
@@ -298,20 +298,21 @@ pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
-            let imports = project.effective_imports(&req.imports);
-            let name = req.name.clone();
+            let imports = session_imports(req.imports);
+            let name = req.name;
+            let lookup_name = name.clone();
             let row = project
                 .submit(move |cap| {
                     let mut session = cap
                         .open_session_with_imports(imports, None, None)
                         .map_err(map_worker_err)?;
-                    let row = session.describe(&name, None, None).map_err(map_worker_err)?;
+                    let row = session.describe(&lookup_name, None, None).map_err(map_worker_err)?;
                     Ok(row.map(project_declaration_row))
                 })
                 .await?;
             let result = match row {
                 Some(row) => HoverByNameResult::Found(row),
-                None => HoverByNameResult::Missing { name: req.name },
+                None => HoverByNameResult::Missing { name },
             };
             Ok(Response::ok(result, freshness))
         })

@@ -5,7 +5,7 @@
 //! [`LeanWorkerHostHandle`] on a dedicated OS thread, the per-project
 //! `DeclarationIndex` (`SQLite`), the per-project [`ProcessedFileCache`]
 //! (in-memory LRU), and the project metadata (canonical root, toolchain,
-//! package/library hints, manifest hash, default imports).
+//! package/library hints, manifest hash).
 //!
 //! `LeanWorkerHostHandle` has one owner at a time; the invariant holds by
 //! parking it on a thread named `"lean-host-mcp/project/<basename>"`. Each
@@ -55,7 +55,6 @@ pub struct LeanProject {
     package: Option<String>,
     library: Option<String>,
     manifest_hash: String,
-    default_imports: Vec<String>,
     /// Identity of *this* spawned project actor. Allocated once in
     /// [`Self::open`] and surfaced via [`Freshness::session_id`]. Constant
     /// across every tool call routed to this project; changes only when the
@@ -76,7 +75,6 @@ impl std::fmt::Debug for LeanProject {
             .field("package", &self.package)
             .field("library", &self.library)
             .field("manifest_hash", &self.manifest_hash)
-            .field("default_imports", &self.default_imports)
             .finish_non_exhaustive()
     }
 }
@@ -117,7 +115,6 @@ impl LeanProject {
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
 
         let lake_root = meta.canonical_root.clone();
-        let default_imports = meta.default_imports.clone();
         let toolchain_label = meta.toolchain.clone();
         let worker_path = worker.path;
         let thread_name = actor_thread_name(&meta.canonical_root);
@@ -125,14 +122,7 @@ impl LeanProject {
         thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                actor_main(
-                    lake_root,
-                    default_imports,
-                    toolchain_label,
-                    worker_path,
-                    lean_sysroot,
-                    init_tx,
-                );
+                actor_main(lake_root, toolchain_label, worker_path, lean_sysroot, init_tx);
             })
             .map_err(|e| ServerError::Internal(format!("spawn project actor thread: {e}")))?;
 
@@ -154,7 +144,6 @@ impl LeanProject {
             package: meta.package,
             library: meta.library,
             manifest_hash: meta.manifest_hash,
-            default_imports: meta.default_imports,
             session_id: uuid::Uuid::new_v4().to_string(),
             actor_tx: Mutex::new(Some(actor_tx)),
             index,
@@ -211,10 +200,6 @@ impl LeanProject {
         &self.session_id
     }
 
-    pub fn default_imports(&self) -> &[String] {
-        &self.default_imports
-    }
-
     pub fn index(&self) -> &DeclarationIndex {
         &self.index
     }
@@ -229,17 +214,6 @@ impl LeanProject {
         &self.cache
     }
 
-    /// Effective import set for a request: empty input means "use the
-    /// project's default imports".
-    #[must_use]
-    pub fn effective_imports(&self, request_imports: &[String]) -> Vec<String> {
-        if request_imports.is_empty() {
-            self.default_imports.clone()
-        } else {
-            request_imports.to_vec()
-        }
-    }
-
     /// Build a [`Freshness`] for a request. `session_id` is this project's
     /// stable identity (see [`Self::session_id`]); two calls routed to the
     /// same project see the same value, and it changes only when the broker
@@ -249,7 +223,7 @@ impl LeanProject {
         Freshness {
             project_root: self.canonical_root.to_string_lossy().into_owned(),
             project_hash: self.manifest_hash.clone(),
-            imports: self.effective_imports(request_imports),
+            imports: request_imports.to_vec(),
             session_id: self.session_id.clone(),
             lean_toolchain: self.toolchain.clone(),
         }
@@ -284,13 +258,12 @@ fn actor_thread_name(canonical_root: &Path) -> String {
 
 fn actor_main(
     lake_root: PathBuf,
-    default_imports: Vec<String>,
     toolchain_label: String,
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<Job>), ServerError>>,
 ) {
-    let builder = LeanWorkerHostHandleBuilder::shims_only(&lake_root, default_imports.iter())
+    let builder = LeanWorkerHostHandleBuilder::shims_only(&lake_root, std::iter::empty::<String>())
         .worker_child(LeanWorkerChild::for_toolchain(worker_path, lean_sysroot))
         .startup_timeout(Duration::from_secs(30))
         // 16 MiB: headroom for `outline` / `file_diagnostics` on

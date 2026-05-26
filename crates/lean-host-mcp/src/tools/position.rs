@@ -43,7 +43,7 @@ use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::project::LeanProject;
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
-use crate::tools::{ToolContext, freshness_for, is_ignored_dir};
+use crate::tools::{ToolContext, freshness_for, is_ignored_dir, session_imports};
 
 /// Hard cap on the number of references aggregated in
 /// [`references_of_name`]. Matches `project_scan`'s cap so the two
@@ -578,11 +578,10 @@ fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
 
 /// Header-aware module processing. Submits a closure to the project's
 /// worker actor that opens a session with the file's header imports, runs
-/// `process_module`, and returns the four-arm outcome. Pre-importing the
-/// project umbrella can make project files re-declare constants already
-/// present in the session.
+/// `process_module`, and returns the four-arm outcome. The file header is
+/// the import source for this operation.
 async fn process_module(project: &Arc<LeanProject>, source: String) -> Result<LeanWorkerProcessModuleOutcome> {
-    let imports = header_imports(&source);
+    let imports = session_imports(header_imports(&source));
     project
         .submit(move |cap| {
             let mut session = cap
@@ -639,8 +638,8 @@ where
         resp
     } else {
         resp.warn(format!(
-            "file imports modules the server's open env does not have: [{}]—projection may be partial; \
-             relaunch the server with --imports to fix",
+            "file imports modules that are not available in this session: [{}]—projection may be partial; \
+             build or fix those imports to resolve this",
             missing_imports.join(", ")
         ))
     }

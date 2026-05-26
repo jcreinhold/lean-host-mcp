@@ -23,6 +23,9 @@ was recently evicted. When omitted, the server resolves the project via the stan
 
 The `project` field is omitted from the per-tool examples below for brevity; assume it on every request schema.
 
+Lean session and index tools also accept an `imports` field. It is the complete per-call import vector. An empty array
+means the call asks for no extra imports beyond the worker's base environment.
+
 ## Lean session tools (`src/tools/lean.rs`)
 
 ### `elaborate`
@@ -83,7 +86,7 @@ reducibility view `Meta.isDefEq` runs under: the same two terms can be def-eq un
 
 ```jsonc
 // request
-{ "name": "Nat.add_zero" }
+{ "name": "Nat.add_zero", "imports": [] }
 
 // result
 { "status": "found",   "name": "Nat.add_zero", "kind": "theorem",
@@ -99,7 +102,7 @@ reducibility view `Meta.isDefEq` runs under: the same two terms can be def-eq un
 ### `project_scan`
 
 Filesystem regex sweep over the project's `.lean` files. No Lean dependency; results are textual matches, not elaborator
-output.
+output. Its freshness envelope reports `imports: []`.
 
 ```jsonc
 { "preset": "sorry" }
@@ -111,7 +114,8 @@ Presets: `sorry | admit | axiom | set_option | custom`.
 ## Index tools (`src/tools/index.rs`)
 
 The three index tools share one piece of state: a SQLite-backed declaration index, rebuilt on the first call after the
-Lake manifest changes and otherwise reused. Limits default to 50 and clamp at 500. Each result row has shape:
+Lake manifest or per-call import vector changes and otherwise reused. Limits default to 50 and clamp at 500. Each
+result row has shape:
 
 ```jsonc
 { "name": "...", "kind": "...", "type_signature": "..." | null, "source": { ... } | null }
@@ -122,7 +126,7 @@ Lake manifest changes and otherwise reused. Limits default to 50 and clamp at 50
 Case-insensitive substring on declaration names.
 
 ```jsonc
-{ "query": "add_zero", "limit": 20 }
+{ "query": "add_zero", "imports": [], "limit": 20 }
 ```
 
 ### `find_lemma`
@@ -130,7 +134,7 @@ Case-insensitive substring on declaration names.
 As `find_symbol`, restricted to `kind = "theorem"`.
 
 ```jsonc
-{ "query": "add_zero" }
+{ "query": "add_zero", "imports": [] }
 ```
 
 ### `outline`
@@ -138,7 +142,7 @@ As `find_symbol`, restricted to `kind = "theorem"`.
 Name-prefix listing, ordered by name. Omit `module_prefix` to walk the whole table.
 
 ```jsonc
-{ "module_prefix": "Nat.", "limit": 200 }
+{ "module_prefix": "Nat.", "imports": [], "limit": 200 }
 ```
 
 ## Position tools (`src/tools/position.rs`)
