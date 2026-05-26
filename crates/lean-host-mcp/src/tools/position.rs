@@ -253,7 +253,7 @@ pub struct ReferencesOfNameResult {
     pub references: Vec<ReferenceHit>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// Files whose capability dylib lacked the shim. Omitted when empty.
+    /// Files whose worker host shims lacked the info-tree shim. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsupported_files: Vec<String>,
     /// Files whose header did not parse. Omitted when empty.
@@ -415,7 +415,7 @@ pub enum FileDiagnosticsResult {
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
     },
-    /// Capability dylib lacks `process_module_with_info_tree`.
+    /// Worker host shims lack `process_module_with_info_tree`.
     Unsupported,
 }
 
@@ -577,20 +577,37 @@ fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
 }
 
 /// Header-aware module processing. Submits a closure to the project's
-/// worker actor that opens a session against the project's default
-/// imports, runs `process_module`, and returns the four-arm outcome.
+/// worker actor that opens a session with the file's header imports, runs
+/// `process_module`, and returns the four-arm outcome. Pre-importing the
+/// project umbrella can make project files re-declare constants already
+/// present in the session.
 async fn process_module(project: &Arc<LeanProject>, source: String) -> Result<LeanWorkerProcessModuleOutcome> {
-    let imports = project.default_imports().to_vec();
+    let imports = header_imports(&source);
     project
         .submit(move |cap| {
             let mut session = cap
                 .open_session_with_imports(imports, None, None)
                 .map_err(crate::projections::map_worker_err)?;
             session
-                .process_module(&source, &lean_rs_worker_parent::LeanWorkerElabOptions::new(), None, None)
+                .process_module(
+                    &source,
+                    &lean_rs_worker_parent::LeanWorkerElabOptions::new(),
+                    None,
+                    None,
+                )
                 .map_err(crate::projections::map_worker_err)
         })
         .await
+}
+
+fn header_imports(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("import "))
+        .flat_map(str::split_whitespace)
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn enumerate_lean_files(root: &Path) -> Vec<PathBuf> {

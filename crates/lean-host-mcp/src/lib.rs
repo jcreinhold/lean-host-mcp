@@ -12,7 +12,7 @@
 //!   project hint into an `Arc<LeanProject>` via the env / cwd-walk /
 //!   config-default chain.
 //! - [`project`]: `LeanProject`, the unit of multiplexing. Bundles the
-//!   worker-actor capability, the `SQLite` declaration index, and the
+//!   shims-only worker host handle, the `SQLite` declaration index, and the
 //!   in-memory processed-file cache for one Lake project.
 //! - [`projections`]: pure data-shuffle projection types and helpers from
 //!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.

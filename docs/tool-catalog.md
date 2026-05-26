@@ -10,11 +10,11 @@ changes when the broker re-spawns a project: LRU eviction (pool full, project no
 
 ## Per-tool routing field
 
-Every request schema accepts an optional `project` field: an absolute path to a Lake-project root. When set, the
-server routes that single call to that project; the broker keeps up to `LEAN_HOST_MCP_MAX_PROJECTS` (default 4)
-projects resident concurrently, so per-call routing does not cost a re-spawn unless the pool is full and the requested
-project was recently evicted. When omitted, the server resolves the project via the standard chain
-*env (`LEAN_HOST_MCP_PROJECT`) → cwd-walk → `~/.config/lean-host-mcp/config.toml` `primary_project`*.
+Every request schema accepts an optional `project` field: an absolute path to a Lake-project root. When set, the server
+routes that single call to that project; the broker keeps up to `LEAN_HOST_MCP_MAX_PROJECTS` (default 4) projects
+resident concurrently, so per-call routing does not cost a re-spawn unless the pool is full and the requested project
+was recently evicted. When omitted, the server resolves the project via the standard chain *env
+(`LEAN_HOST_MCP_PROJECT`) → cwd-walk → `~/.config/lean-host-mcp/config.toml` `primary_project`*.
 
 ```jsonc
 // Any tool request, routed to a non-default project:
@@ -62,7 +62,7 @@ Full elaborate plus `addDecl`. Returns Lean's `LeanKernelOutcome`, projected.
 { "term": "Nat.succ 0", "imports": [] }
 ```
 
-`rendered` is pretty-printed via the optional `pp_expr` shim. If the loaded capability dylib lacks
+`rendered` is pretty-printed via the optional `pp_expr` shim. If the loaded worker host shims lack
 `lean_rs_host_meta_pp_expr`, the worker falls back to `Expr.toString` (signalled by `LeanWorkerRendering::Raw`) and the
 server attaches a warning to the envelope; the field is still populated either way.
 
@@ -150,8 +150,8 @@ result sidebar (`references_of_name`). The projection is cached against `(file_p
 on the same bytes reuse it; an edit invalidates structurally.
 
 `process_module_with_info_tree` is an **optional** capability shim. When the loaded dylib lacks the
-`process_module_with_info_tree` shim, every position tool answers `{ "status": "unsupported" }` cleanly; the tools
-never raise.
+`process_module_with_info_tree` shim, every position tool answers `{ "status": "unsupported" }` cleanly; the tools never
+raise.
 
 All line and column inputs are **1-indexed**. Result spans use the same convention.
 
@@ -176,13 +176,14 @@ All line and column inputs are **1-indexed**. Result spans use the same conventi
 { "status": "header_parse_failed",
   "diagnostics": { "diagnostics": [...], "truncated": false } }
 
-// result: capability dylib missing the shim
+// result: worker host shims missing the shim
 { "status": "unsupported" }
 ```
 
-`file` resolves relative to the resolved project root when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal` inside the
-elaboration context; the strings are diagnostic text only. When the file's header imports modules the server's open env
-doesn't have, the result is still returned but the envelope's `warnings` array names the missing modules.
+`file` resolves relative to the resolved project root when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal`
+inside the elaboration context; the strings are diagnostic text only. When the file's header imports modules the
+server's open env doesn't have, the result is still returned but the envelope's `warnings` array names the missing
+modules.
 
 ### `type_at_position`
 
@@ -206,7 +207,7 @@ doesn't have, the result is still returned but the envelope's `warnings` array n
 { "status": "header_parse_failed",
   "diagnostics": { "diagnostics": [...], "truncated": false } }
 
-// result: capability dylib missing the shim
+// result: worker host shims missing the shim
 { "status": "unsupported" }
 ```
 
@@ -239,9 +240,9 @@ sorted by `(file, line, column)`. Name matching is exact: pass the fully-qualifi
 
 ### `file_diagnostics`
 
-Elaboration diagnostics—errors, warnings, info—for a `.lean` file. Same elaborator pass that backs
-`goal_at_position` / `type_at_position`, so the projection is cached and the typical "what's wrong; probe the problem
-site" loop pays for the elaboration once.
+Elaboration diagnostics—errors, warnings, info—for a `.lean` file. Same elaborator pass that backs `goal_at_position` /
+`type_at_position`, so the projection is cached and the typical "what's wrong; probe the problem site" loop pays for the
+elaboration once.
 
 ```jsonc
 // request
@@ -263,7 +264,7 @@ site" loop pays for the elaboration once.
   "summary": { "errors": 1, "warnings": 0, "info": 0 },
   "diagnostics": [...], "truncated": false }
 
-// result: capability dylib missing the info-tree shim
+// result: worker host shims missing the info-tree shim
 { "status": "unsupported" }
 ```
 

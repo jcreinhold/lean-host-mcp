@@ -206,9 +206,7 @@ pub async fn whnf(ctx: &ToolContext, req: WhnfRequest) -> Result<Response<MetaOu
                     let mut session = cap
                         .open_session_with_imports(imports, None, None)
                         .map_err(map_worker_err)?;
-                    let result = session
-                        .whnf(&term, &elab_opts(), None, None)
-                        .map_err(map_worker_err)?;
+                    let result = session.whnf(&term, &elab_opts(), None, None).map_err(map_worker_err)?;
                     Ok(project_meta_rendered(result))
                 })
                 .await?;
@@ -224,7 +222,9 @@ pub async fn whnf(ctx: &ToolContext, req: WhnfRequest) -> Result<Response<MetaOu
 /// warning. Keeps the projection layer free of warning vocabulary.
 fn attach_render_warning(resp: Response<MetaOutcome>, outcome: &MetaOutcome) -> Response<MetaOutcome> {
     if outcome.raw_fallback_used {
-        resp.warn("optional `meta_pp_expr` shim missing on the capability dylib; rendered via `Expr.toString` fallback")
+        resp.warn(
+            "optional `meta_pp_expr` shim missing on the worker host shims; rendered via `Expr.toString` fallback",
+        )
     } else {
         resp
     }
@@ -378,7 +378,11 @@ pub(crate) async fn describe_bulk(
             for chunk in names.chunks(INDEX_REBUILD_BATCH) {
                 let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
                 let rows = session.describe_bulk(&refs, None, None).map_err(map_worker_err)?;
-                out.extend(rows.into_iter().filter(|r| r.kind != "missing").map(project_declaration_row));
+                out.extend(
+                    rows.into_iter()
+                        .filter(|r| r.kind != "missing")
+                        .map(project_declaration_row),
+                );
             }
             Ok(out)
         })

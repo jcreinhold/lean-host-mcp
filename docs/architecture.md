@@ -6,7 +6,7 @@ One crate, library plus two binaries (the MCP server and a tiny worker child). L
 main.rs         clap CLI, rmcp stdio entry
 server.rs       LeanHostService (rmcp glue)
 tools/          lean.rs (6), index.rs (3), position.rs (4), scan.rs (1)
-project.rs      LeanProject—closure-channel actor; owns the LeanWorkerCapability,
+project.rs      LeanProject—closure-channel actor; owns the LeanWorkerHostHandle,
                 the DeclarationIndex, and the ProcessedFileCache for one Lake project
 projections.rs  pure data-shuffle helpers from lean-rs-worker shapes into the MCP wire
 lake_meta.rs    LakeProjectMeta: minimal Lake-project description
@@ -16,10 +16,10 @@ envelope.rs     Response<T> = { result, freshness, warnings, next_actions }
 bin/worker.rs   2-line entry: lean_rs_worker::run_worker_child_stdio()
 ```
 
-`project.rs` is the only path to `lean-rs-worker` (the parent never sees `lean-rs` or `lean-rs-host` directly—those
-live inside the worker child). `index.rs` and `cache.rs` are owned by `LeanProject` and serve the tools that don't want
-to round-trip through Lean on every call. A `ProjectBroker` (`broker.rs`) maintains an LRU pool of `Arc<LeanProject>`
-so one server can multiplex several Lake projects in the same Claude session.
+`project.rs` is the only path to `lean-rs-worker` (the parent never sees `lean-rs` or `lean-rs-host` directly—those live
+inside the worker child). `index.rs` and `cache.rs` are owned by `LeanProject` and serve the tools that don't want to
+round-trip through Lean on every call. A `ProjectBroker` (`broker.rs`) maintains an LRU pool of `Arc<LeanProject>` so
+one server can multiplex several Lake projects in the same Claude session.
 
 ## The broker: pool, invalidation, identity
 
@@ -33,15 +33,14 @@ so one server can multiplex several Lake projects in the same Claude session.
 - **Manifest invalidation.** Every cache hit re-fingerprints `lake-manifest.json`; a mismatch evicts and re-opens. Cost
   is one ≤ 50 KB SHA-256 per tool call.
 
-**The mutex is never held across `LeanProject::open` or `project.submit`.** The miss path drops the broker lock,
-spawns the new project, then reacquires the lock briefly to insert. Concurrent misses for the same path race on insert
-and the loser's project is shut down on the dispatch path; concurrent calls against different projects parallelize
-fully.
+**The mutex is never held across `LeanProject::open` or `project.submit`.** The miss path drops the broker lock, spawns
+the new project, then reacquires the lock briefly to insert. Concurrent misses for the same path race on insert and the
+loser's project is shut down on the dispatch path; concurrent calls against different projects parallelize fully.
 
 Identity travels through `Freshness.session_id`: the project actor's UUID, allocated once at `LeanProject::open` and
 stable for that actor's lifetime. The only events that change it are the three eviction triggers above. Clients can
-detect "my project was silently restarted" by comparing `session_id` across calls—that's the one observable
-side-effect of the pool decisions, and the multi-project tests use it as their identity signal.
+detect "my project was silently restarted" by comparing `session_id` across calls—that's the one observable side-effect
+of the pool decisions, and the multi-project tests use it as their identity signal.
 
 ## Multi-toolchain dispatch
 
@@ -50,15 +49,15 @@ The workspace is split into two members so the parent stays free of `libleanshar
 - `crates/lean-host-mcp/` depends on `lean-rs-worker-parent`, which carries no `lean-rs` / `lean-rs-host` /
   `lean-rs-sys` link in its closure (`lean-toolchain`'s `lean-rs-sys` dep uses `metadata-only`, whose `build.rs` exits
   before emitting link directives). `otool -L target/release/lean-host-mcp` shows only `libSystem` + `libiconv`.
-- `crates/lean-host-mcp-worker/` depends on `lean-rs-worker-child` and is the only crate that links `libleanshared`.
-  Its `build.rs` reads `LEAN_HOST_MCP_TARGET_TOOLCHAIN` (set by `lean-host-mcp install-worker`) and bakes
+- `crates/lean-host-mcp-worker/` depends on `lean-rs-worker-child` and is the only crate that links `libleanshared`. Its
+  `build.rs` reads `LEAN_HOST_MCP_TARGET_TOOLCHAIN` (set by `lean-host-mcp install-worker`) and bakes
   `~/.elan/toolchains/leanprover--lean4---<id>/lib/lean` into the binary's rpath.
 
 `crates/lean-host-mcp/src/toolchain.rs` resolves a project's `lean-toolchain` pin to one of the per-toolchain worker
-binaries installed under `~/.local/share/lean-host-mcp/workers/<id>/lean-host-mcp-worker`.
-`LeanProject::open` invokes `WorkerBinary::resolve_for` up front and passes the result to
-`LeanWorkerChild::path(...)`; a missing worker surfaces as `ServerError::BadProject` whose message includes the exact
-`lean-host-mcp install-worker --toolchain <id>` command needed.
+binaries installed under `~/.local/share/lean-host-mcp/workers/<id>/lean-host-mcp-worker`. `LeanProject::open` invokes
+`WorkerBinary::resolve_for` up front and passes the result to `LeanWorkerChild::path(...)`; a missing worker surfaces as
+`ServerError::BadProject` whose message includes the exact `lean-host-mcp install-worker --toolchain <id>` command
+needed.
 
 **Feature unification caveat.** `cargo build --workspace` would unify `lean-rs-sys`'s features across both members and
 silently relink `libleanshared` into the parent. Always build per-member (`cargo build -p lean-host-mcp` /
@@ -82,36 +81,41 @@ Lean lives in a child process—the `lean-host-mcp-worker` binary, resolved per-
 and handed to the supervisor as `LeanWorkerChild::path(...)`. A wedged tactic, typeclass loop, or OOM mid-elaboration
 kills that child; the supervisor restarts it on the next request rather than taking down the MCP server.
 
-The parent sees only `LeanWorkerCapability` (Send) and short-lived `LeanWorkerSession<'_>` borrows that don't escape
-their owning stack frame. The "one owner at a time" invariant holds: `LeanWorkerCapability` cannot be shared across
-tokio tasks.
+The parent sees only `LeanWorkerHostHandle` (Send) and short-lived `LeanWorkerSession<'_>` borrows that don't escape
+their owning stack frame. The "one owner at a time" invariant holds: the host handle is parked on one actor thread and
+is not shared across tokio tasks.
 
-`LeanProject::open` parks the capability on a dedicated OS thread named
+`LeanProject::open` opens a shims-only host handle with `LeanWorkerHostHandleBuilder::shims_only(...)`, then parks that
+handle on a dedicated OS thread named
 `"lean-host-mcp/project/<canonical_root_basename>"` and serves a `tokio::mpsc::Receiver<Job>` in a blocking loop. Each
-tool handler calls `project.submit(|cap| { ... })` to ship a typed closure to that thread; the closure opens a fresh
-session via `cap.open_session_with_imports(...)`, calls the worker, projects the worker's wire-stable result type into
+tool handler calls `project.submit(|handle| { ... })` to ship a typed closure to that thread; the closure opens a fresh
+session via `handle.open_session_with_imports(...)`, calls the worker, projects the worker's wire-stable result type into
 the MCP-stable wire shape via `projections.rs`, and replies via `oneshot`. No `Request` enum, no `WorkerState`—adding a
 new tool is one closure dispatched through `project.submit`.
 
 ```rust
-type Job = Box<dyn FnOnce(&mut LeanWorkerCapability) + Send + 'static>;
+type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
 
 // dispatch loop on the dedicated thread:
 while let Some(job) = rx.blocking_recv() {
-    job(&mut capability);
+    job(&mut handle);
 }
 ```
 
-Per-request session-open is fine: subsequent opens with the same import set reuse the child's module cache, so only
-the first open per import set pays the load cost. The `worker_roundtrip` bench pins this.
+The shims-only bootstrap loads the bundled host shim/interoperability dylibs and never builds or `dlopen`s the
+consumer project's `:shared` facet. A broken project module can still fail a session that explicitly imports it, but it
+does not prevent the MCP from opening sessions for unrelated imports or collecting diagnostics for the broken file.
+
+Per-request session-open is fine: subsequent opens with the same import set reuse the child's module cache, so only the
+first open per import set pays the load cost. The `worker_roundtrip` bench pins this.
 
 ## The envelope contract
 
 Every tool wraps its result in `Response<T>` from `envelope.rs`. That struct is the only thing the entire tool layer
 agrees on, and it hides three decisions that are still in motion:
 
-1. **What "freshness" means.** Today: lake root, imports, session id, toolchain label. May grow file-version vectors
-   or build ids.
+1. **What "freshness" means.** Today: lake root, imports, session id, toolchain label. May grow file-version vectors or
+   build ids.
 2. **What a warning looks like.** A plain string today; possibly a structured `{ code, message }` once there's a stable
    warning catalogue.
 3. **Whether `next_actions` are present.** A hint surface for the LLM client. Tools sprinkle them; the envelope decides
@@ -138,9 +142,9 @@ rather than partially populated.
 `LeanWorkerProcessedFile` value (four arrays of info-tree nodes plus diagnostics) into tool-specific results.
 Re-processing on every cursor move would be wasteful, so `cache.rs` ships a small LRU of `Arc<LeanWorkerProcessedFile>`,
 capacity 16, keyed on `(file_path, sha256(contents))`. Any edit to the source bytes misses structurally. The cache lives
-inside `LeanProject`, so within one cache instance every entry necessarily shares the project's
-`(canonical_root, package, library, default_imports)`; import-collision safety is structural rather than enforced by the
-key. `LeanWorkerProcessedFile` is owned data (`Send + Sync + 'static`), so cached entries are read by tool handlers
+inside `LeanProject`, so within one cache instance every entry necessarily shares the project's default-import context;
+import-collision safety is structural rather than enforced by the key. `LeanWorkerProcessedFile` is owned data
+(`Send + Sync + 'static`), so cached entries are read by tool handlers
 without re-entering the actor thread. Position lookup helpers (`tactic_at`, `term_at`, `references_of`) are free
 functions on `cache.rs`; linear scan is fast enough at typical file sizes (the `position_lookup_after_cache_warm` bench
 targets ≤ 50 µs per query).
@@ -150,5 +154,5 @@ Files whose header references modules the session's open env doesn't have are st
 is real data, and the `MissingImports` signal travels alongside on the envelope. Header parse failures and `Unsupported`
 outcomes are not cached.
 
-The cache does **not** track the Lean environment. Environment churn (re-import, capability reload) is the
+The cache does **not** track the Lean environment. Environment churn (re-import, actor re-open) is the
 `LeanHostService::new` boundary; the file cache is invalidated only by content change.

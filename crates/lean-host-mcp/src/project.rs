@@ -1,13 +1,13 @@
 //! `LeanProject`—the unit of multiplexing.
 //!
 //! Bundles the four resources that share lifetime and invalidation for one
-//! Lake project: a closure-channel actor that parks a single
-//! [`LeanWorkerCapability`] on a dedicated OS thread, the per-project
+//! Lake project: a closure-channel actor that parks a single shims-only
+//! [`LeanWorkerHostHandle`] on a dedicated OS thread, the per-project
 //! `DeclarationIndex` (`SQLite`), the per-project [`ProcessedFileCache`]
 //! (in-memory LRU), and the project metadata (canonical root, toolchain,
-//! package, library, manifest hash, default imports).
+//! package/library hints, manifest hash, default imports).
 //!
-//! `LeanWorkerCapability` has one owner at a time; the invariant holds by
+//! `LeanWorkerHostHandle` has one owner at a time; the invariant holds by
 //! parking it on a thread named `"lean-host-mcp/project/<basename>"`. Each
 //! call to [`LeanProject::submit`] ships a typed closure to that thread,
 //! which opens a fresh session, invokes the worker, and returns a
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use lean_rs_worker_parent::{LeanWorkerCapability, LeanWorkerCapabilityBuilder, LeanWorkerChild};
+use lean_rs_worker_parent::{LeanWorkerChild, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
@@ -43,7 +43,7 @@ use crate::toolchain::{ToolchainId, WorkerBinary};
 /// keep memory bounded.
 const PROCESSED_FILE_CACHE_CAPACITY: usize = 16;
 
-type Job = Box<dyn FnOnce(&mut LeanWorkerCapability) + Send + 'static>;
+type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
 
 /// One Lake project, one worker actor, one in-memory cache, one `SQLite`
 /// index. Cheap to clone via `Arc`.
@@ -52,8 +52,8 @@ pub struct LeanProject {
     /// Raw contents of `<canonical_root>/lean-toolchain`, e.g.
     /// `"leanprover/lean4:v4.30.0-rc2"`.
     toolchain: String,
-    package: String,
-    library: String,
+    package: Option<String>,
+    library: Option<String>,
     manifest_hash: String,
     default_imports: Vec<String>,
     /// Identity of *this* spawned project actor. Allocated once in
@@ -89,7 +89,7 @@ impl LeanProject {
     /// # Errors
     ///
     /// `ServerError::BadProject` for unresolvable worker child / failing
-    /// capability preflight / handshake failure; `ServerError::Lean` for
+    /// shims-only bootstrap / handshake failure; `ServerError::Lean` for
     /// runtime open failures; `ServerError::Index` if the cache directory
     /// cannot be created or the `SQLite` database cannot be opened;
     /// `ServerError::Internal` if the OS rejects the actor thread.
@@ -97,10 +97,8 @@ impl LeanProject {
         // Resolve the toolchain pin to a concrete worker binary before
         // spawning the actor, so the install error surfaces synchronously
         // and includes the `install-worker` command in its message.
-        let toolchain_id =
-            ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
-        let worker = WorkerBinary::resolve_for(&toolchain_id)
-            .map_err(|e| ServerError::BadProject(e.to_string()))?;
+        let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
+        let worker = WorkerBinary::resolve_for(&toolchain_id).map_err(|e| ServerError::BadProject(e.to_string()))?;
         // Each worker binary is built against one toolchain; its rpath and
         // `LEAN_SYSROOT` must match. The elan toolchain root is that
         // sysroot. Passing it explicitly to `LeanWorkerChild::for_toolchain`
@@ -119,8 +117,6 @@ impl LeanProject {
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
 
         let lake_root = meta.canonical_root.clone();
-        let package = meta.package.clone();
-        let library = meta.library.clone();
         let default_imports = meta.default_imports.clone();
         let toolchain_label = meta.toolchain.clone();
         let worker_path = worker.path;
@@ -131,8 +127,6 @@ impl LeanProject {
             .spawn(move || {
                 actor_main(
                     lake_root,
-                    package,
-                    library,
                     default_imports,
                     toolchain_label,
                     worker_path,
@@ -170,7 +164,7 @@ impl LeanProject {
 
     /// Dispatch a closure to the project's worker actor. The closure runs
     /// on the actor thread with exclusive access to the
-    /// `LeanWorkerCapability`; its return value is sent back via a
+    /// shims-only host handle; its return value is sent back via a
     /// `oneshot`.
     ///
     /// # Errors
@@ -179,19 +173,14 @@ impl LeanProject {
     /// otherwise whatever the closure itself returns.
     pub async fn submit<F, R>(&self, job: F) -> Result<R>
     where
-        F: FnOnce(&mut LeanWorkerCapability) -> Result<R> + Send + 'static,
+        F: FnOnce(&mut LeanWorkerHostHandle) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
         let boxed: Job = Box::new(move |cap| {
             let _ = reply_tx.send(job(cap));
         });
-        let tx = self
-            .actor_tx
-            .lock()
-            .as_ref()
-            .cloned()
-            .ok_or(ServerError::SessionGone)?;
+        let tx = self.actor_tx.lock().as_ref().cloned().ok_or(ServerError::SessionGone)?;
         tx.send(boxed).await.map_err(|_| ServerError::SessionGone)?;
         reply_rx.await.map_err(|_| ServerError::SessionGone)?
     }
@@ -200,12 +189,12 @@ impl LeanProject {
         &self.canonical_root
     }
 
-    pub fn package(&self) -> &str {
-        &self.package
+    pub fn package(&self) -> Option<&str> {
+        self.package.as_deref()
     }
 
-    pub fn library(&self) -> &str {
-        &self.library
+    pub fn library(&self) -> Option<&str> {
+        self.library.as_deref()
     }
 
     pub fn toolchain(&self) -> &str {
@@ -278,10 +267,7 @@ impl LeanProject {
     /// has been called. Used to evict dead projects from the registry before
     /// every caller has to discover the corpse via `SessionGone`.
     pub fn is_healthy(&self) -> bool {
-        self.actor_tx
-            .lock()
-            .as_ref()
-            .is_some_and(|tx| !tx.is_closed())
+        self.actor_tx.lock().as_ref().is_some_and(|tx| !tx.is_closed())
     }
 }
 
@@ -292,24 +278,19 @@ impl Drop for LeanProject {
 }
 
 fn actor_thread_name(canonical_root: &Path) -> String {
-    let basename = canonical_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("project");
+    let basename = canonical_root.file_name().and_then(|s| s.to_str()).unwrap_or("project");
     format!("lean-host-mcp/project/{basename}")
 }
 
 fn actor_main(
     lake_root: PathBuf,
-    package: String,
-    library: String,
     default_imports: Vec<String>,
     toolchain_label: String,
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<Job>), ServerError>>,
 ) {
-    let builder = LeanWorkerCapabilityBuilder::new(&lake_root, &package, &library, default_imports.iter())
+    let builder = LeanWorkerHostHandleBuilder::shims_only(&lake_root, default_imports.iter())
         .worker_child(LeanWorkerChild::for_toolchain(worker_path, lean_sysroot))
         .startup_timeout(Duration::from_secs(30))
         // 16 MiB: headroom for `outline` / `file_diagnostics` on
@@ -331,15 +312,15 @@ fn actor_main(
         return;
     }
 
-    let mut capability = match builder.open() {
-        Ok(cap) => cap,
+    let mut handle = match builder.open() {
+        Ok(handle) => handle,
         Err(err) => {
             let _ = init_reply.send(Err(map_worker_err(err)));
             return;
         }
     };
 
-    let runtime_toolchain = capability.runtime_metadata().lean_version.unwrap_or(toolchain_label);
+    let runtime_toolchain = handle.runtime_metadata().lean_version.unwrap_or(toolchain_label);
 
     let (tx, mut rx) = mpsc::channel::<Job>(64);
     if init_reply.send(Ok((runtime_toolchain, tx))).is_err() {
@@ -347,6 +328,6 @@ fn actor_main(
     }
 
     while let Some(job) = rx.blocking_recv() {
-        job(&mut capability);
+        job(&mut handle);
     }
 }

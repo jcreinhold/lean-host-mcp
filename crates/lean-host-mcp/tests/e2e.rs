@@ -16,11 +16,16 @@
 // surface test failures and unreachable setup branches.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use lean_host_mcp::tools::ToolContext;
-use lean_host_mcp::tools::lean::{ElaborateRequest, ElaborateResult, HoverByNameRequest, HoverByNameResult, elaborate, hover_by_name};
-use lean_host_mcp::{BrokerConfig, ProjectBroker};
+use lean_host_mcp::tools::lean::{
+    ElaborateRequest, ElaborateResult, HoverByNameRequest, HoverByNameResult, InferTypeRequest, elaborate,
+    hover_by_name, infer_type,
+};
+use lean_host_mcp::{BrokerConfig, LakeProjectMeta, LeanProject, ProjectBroker, ServerError, default_cache_dir};
 
 fn fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
@@ -38,6 +43,24 @@ fn open_ctx(root: &std::path::Path) -> ToolContext {
         idle_timeout: BrokerConfig::default_idle_timeout(),
     });
     ToolContext { broker }
+}
+
+fn copy_dir_all(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create destination dir");
+    for entry in fs::read_dir(from).expect("read source dir") {
+        let entry = entry.expect("read source entry");
+        let file_type = entry.file_type().expect("entry file type");
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&src, &dst);
+        } else if file_type.is_file() {
+            fs::copy(&src, &dst).expect("copy fixture file");
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&src).expect("read symlink");
+            std::os::unix::fs::symlink(target, &dst).expect("copy symlink");
+        }
+    }
 }
 
 #[tokio::test]
@@ -340,6 +363,122 @@ async fn file_diagnostics_returns_real_errors() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn shims_only_project_opens_when_project_shared_facet_is_broken() {
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
+
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path().join("fixture-copy");
+    copy_dir_all(&root, &project_root);
+
+    let broken_file = project_root.join("LeanRsFixture/Broken.lean");
+    fs::write(&broken_file, "theorem broken : True := sorry_that_doesnt_exist\n").expect("write broken module");
+    fs::write(
+        project_root.join("LeanRsFixture/LinkBroken.lean"),
+        "#eval Lean.versionString\n\n@[extern \"lean_host_mcp_missing_symbol_for_test\"]\nopaque linkBroken : Nat\n",
+    )
+    .expect("write shared-facet-broken module");
+    let umbrella = project_root.join("LeanRsFixture.lean");
+    let umbrella_source = fs::read_to_string(&umbrella).expect("read umbrella module");
+    fs::write(
+        &umbrella,
+        umbrella_source.replacen(
+            "import LeanRsFixture.Scalars",
+            "import LeanRsFixture.LinkBroken\nimport LeanRsFixture.Scalars",
+            1,
+        ),
+    )
+    .expect("add link-broken import to umbrella");
+
+    let shared = Command::new("lake")
+        .args(["build", "LeanRsFixture:shared"])
+        .current_dir(&project_root)
+        .output()
+        .expect("run lake build LeanRsFixture:shared");
+    assert!(
+        !shared.status.success(),
+        "broken project-local module must make :shared fail; stdout={}, stderr={}",
+        String::from_utf8_lossy(&shared.stdout),
+        String::from_utf8_lossy(&shared.stderr)
+    );
+
+    let meta = LakeProjectMeta::from_explicit(&project_root).expect("metadata for copied fixture");
+    let project = LeanProject::open(meta, &default_cache_dir()).expect("shims-only project open");
+    project.shutdown();
+
+    let ctx = open_ctx(&project_root);
+    let inferred = infer_type(
+        &ctx,
+        InferTypeRequest {
+            term: "fun (n : Nat) => n + 1".into(),
+            imports: vec!["LeanRsFixture.Handles".into()],
+            project: None,
+        },
+    )
+    .await
+    .expect("infer_type against unbroken import");
+    assert_eq!(
+        inferred.result.status, "Ok",
+        "infer_type must succeed: {:?}",
+        inferred.result
+    );
+    assert_eq!(inferred.result.rendered.as_deref(), Some("Nat → Nat"));
+
+    let diagnostics = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file: PathBuf::from("LeanRsFixture/Broken.lean"),
+            project: None,
+        },
+    )
+    .await
+    .expect("file_diagnostics on broken project-local module");
+    let FileDiagnosticsResult::Elaborated {
+        summary, diagnostics, ..
+    } = diagnostics.result
+    else {
+        panic!("expected real diagnostics for broken file");
+    };
+    assert!(summary.errors >= 1, "broken file must report an error: {diagnostics:?}");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("sorry_that_doesnt_exist")),
+        "diagnostics should name the broken identifier: {diagnostics:?}"
+    );
+
+    let import_err = elaborate(
+        &ctx,
+        ElaborateRequest {
+            source: "(0 : Nat)".into(),
+            imports: vec!["LeanRsFixture.Broken".into()],
+            project: None,
+        },
+    )
+    .await
+    .expect_err("explicitly importing the broken module must fail");
+    match &import_err {
+        ServerError::Lean(msg) => {
+            assert!(
+                msg.contains("lean_exception")
+                    || msg.contains("sorry_that_doesnt_exist")
+                    || msg.contains("unknown identifier"),
+                "expected Lean import failure, got: {msg}"
+            );
+        }
+        ServerError::BadProject(msg) => {
+            panic!("broken explicit import should not be a bootstrap failure: {msg}")
+        }
+        ServerError::SessionGone | ServerError::Index(_) | ServerError::Io(_) | ServerError::Internal(_) => {
+            panic!("broken explicit import should be a Lean failure, got: {import_err:?}")
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn file_diagnostics_cache_warm() {
     use lean_host_mcp::tools::position::{
         FileDiagnosticsRequest, GoalAtPositionRequest, file_diagnostics, goal_at_position,
@@ -361,8 +500,8 @@ async fn file_diagnostics_cache_warm() {
             project: None,
         },
     )
-        .await
-        .expect("cold file_diagnostics");
+    .await
+    .expect("cold file_diagnostics");
     assert!(
         cold.next_actions.iter().any(|n| n.contains(HINT_FRAGMENT)),
         "cold call should attach the cache hint; next_actions={:?}",
@@ -388,13 +527,7 @@ async fn file_diagnostics_cache_warm() {
     );
 
     // Warm: same tool, still cached.
-    let warm = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file,
-            project: None,
-        },
-    )
+    let warm = file_diagnostics(&ctx, FileDiagnosticsRequest { file, project: None })
         .await
         .expect("warm file_diagnostics");
     assert!(

@@ -1,12 +1,12 @@
 # lean-host-mcp
 
 A Model Context Protocol server that hosts Lean 4 in a supervised worker child via the `lean-rs-worker-parent` +
-`lean-rs-worker-child` crate pair. The parent process owns a `LeanWorkerCapability`; the worker child owns the
-`LeanRuntime` and `LeanCapabilities` dylib. The parent does **not** link `libleanshared`, which lets one running
-`lean-host-mcp` serve projects on different Lean toolchains: each toolchain has its own pre-built worker binary
-installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls run as Meta and kernel operations
-inside that child rather than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the
-child; the supervisor restarts it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
+`lean-rs-worker-child` crate pair. The parent process owns a shims-only `LeanWorkerHostHandle`; the worker child owns
+the `LeanRuntime` and bundled host-shim capabilities. The parent does **not** link `libleanshared`, which lets one
+running `lean-host-mcp` serve projects on different Lean toolchains: each toolchain has its own pre-built worker binary
+installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls run as Meta and kernel operations inside
+that child rather than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child; the
+supervisor restarts it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
 Fourteen tools are exposed: six session-backed Lean operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`,
 `is_def_eq`, `hover_by_name`), a filesystem sweep (`project_scan`), three SQLite-indexed lookups (`find_symbol`,
@@ -19,22 +19,14 @@ and a file-scoped diagnostics query (`file_diagnostics`). Per-tool request and r
 A consumer project needs only:
 
 - A `lakefile.lean` or `lakefile.toml`.
-- At least one `lean_lib` target whose `:shared` facet builds and resolves
-  every symbol it imports at link time. Projects that depend on mathlib
-  must explicitly link the transitive shared facets:
-  `lean_lib MyProj where defaultFacets := #[LeanLib.sharedFacet]` alone
-  is not enough if it `import`s a library compiled as static. If
-  `lake build :shared` produces a `.dylib`/`.so` that `dlopen` rejects
-  with `symbol not found`, the consumer's lakefile is the issue.
-- A successful `lake build` so the `.olean` files exist on the search
-  path.
+- A successful `lake build` for the modules the tools will import, so their `.olean` files exist on the search path.
+  The default `lake build` with no target is the usual setup step.
 
-The `lean-rs-host` shim that exports the 28 mandatory + 6 optional
-`lean_rs_host_*` symbols is **bundled inside `lean-rs-host` itself**—a
-vendored Lake package the host builds once per toolchain (at first
-session open) and injects into every session before the consumer's
-dylib loads. Consumer projects do not declare it, link it, or
-`@[export]` its symbols. `fixtures/lean/` in this repo is a demo target
+The `lean-rs-host` shim that exports the 28 mandatory + 6 optional `lean_rs_host_*` symbols is **bundled inside
+`lean-rs-host` itself**—a vendored Lake package the host builds once per toolchain (at first session open) and loads
+without touching the consumer project's `:shared` facet. Consumer projects do not declare it, link it, or `@[export]`
+its symbols. If a specific module fails to import, run `lake build That.Module` and fix that module's transitive imports;
+mathlib-dependent modules may still need their dependency oleans built. `fixtures/lean/` in this repo is a demo target
 the test suite hammers; it isn't a template you must mirror.
 
 ## Build and run
@@ -97,12 +89,10 @@ Environment vars:
 }
 ```
 
-**One server, multiple toolchains.** The server picks the worker binary
-for each project from its `lean-toolchain` pin and sets `LEAN_SYSROOT`
-invisibly per spawn (via `LeanWorkerChild::for_toolchain`). A single
-`lean-host-mcp` process can serve projects on every toolchain you have
-installed a worker for (`lean-host-mcp install-worker --toolchain <id>`).
-You do not need to set `LEAN_SYSROOT` in the MCP client config.
+**One server, multiple toolchains.** The server picks the worker binary for each project from its `lean-toolchain` pin
+and sets `LEAN_SYSROOT` invisibly per spawn (via `LeanWorkerChild::for_toolchain`). A single `lean-host-mcp` process can
+serve projects on every toolchain you have installed a worker for (`lean-host-mcp install-worker --toolchain <id>`). You
+do not need to set `LEAN_SYSROOT` in the MCP client config.
 
 ## Response envelope
 
@@ -124,16 +114,20 @@ Every tool returns the same outer shape; only `result` varies.
 ```
 
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors.
-MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the
-Lake project is unusable.
+MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the Lake
+project is unusable.
 
 ## Capability shims and the position-tool cluster
 
 `goal_at_position`, `type_at_position`, `references_of_name`, and `file_diagnostics` depend on an optional
-`lean_rs_host_process_module_with_info_tree` shim. A capability dylib built without it answers
+`lean_rs_host_process_module_with_info_tree` shim. A worker whose bundled shims do not expose it answers
 `{ "status": "unsupported" }` per call; the tools never raise. Files whose header imports modules the server's open env
 doesn't have are still processed; missing imports surface as an envelope warning (single-file tools) or a result sidebar
 (`references_of_name`). A header that doesn't parse short-circuits to `header_parse_failed`.
+
+Unlike an external LSP process, the host can still start when unrelated project modules are broken. Calls whose imports
+avoid the broken module continue to work, and `file_diagnostics` on the broken file reports Lean diagnostics instead of
+a bootstrap failure.
 
 ## Build, test, lint
 
@@ -156,12 +150,11 @@ members and silently links `libleanshared` into the parent. The invariant is ass
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.11 (which transitively pin
-`lean-rs` / `lean-rs-host` 0.1.11). The server inherits whichever Lean
-toolchain each consumer Lake project pins, provided it sits inside the
-`lean-rs` support window declared by [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain).
-Bumping the supported toolchain is a `lean-rs` change first, then a
-version bump here.
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.12 (which transitively pin `lean-rs`
+/ `lean-rs-host` 0.1.12). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
+inside the `lean-rs` support window declared by
+[`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping the supported
+toolchain is a `lean-rs` change first, then a version bump here.
 
 ## License
 

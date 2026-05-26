@@ -142,11 +142,11 @@ async fn worker_infer_type_marks_rendering_provenance() {
     assert!(outcome.rendered.is_some(), "rendered must carry a string");
     // The MetaOutcome's `raw_fallback_used` is a non-serialised internal
     // flag; the tool layer translates it into an envelope warning when set.
-    // The fixture's capability dylib should ship `meta_pp_expr`, so the
+    // The bundled worker host shims should ship `meta_pp_expr`, so the
     // warnings list must be empty for the standard rendered path.
     assert!(
         resp.warnings.is_empty(),
-        "fixture capability should expose meta_pp_expr; got warnings: {:?}",
+        "worker host shims should expose meta_pp_expr; got warnings: {:?}",
         resp.warnings
     );
 }

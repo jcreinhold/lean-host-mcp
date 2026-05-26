@@ -10,10 +10,9 @@
 //! Keying invariant: the SHA-256 of the file contents is part of the key, so
 //! any edit (even a whitespace change) misses and re-processes. Imports are
 //! deliberately *not* in the key—the cache lives *inside* a single
-//! [`LeanProject`](crate::project::LeanProject), and that project is uniquely
-//! identified by `(canonical_root, package, library, default_imports)`. So
-//! import-collision safety is structural: two requests against the same
-//! cache instance necessarily agree on imports.
+//! [`LeanProject`](crate::project::LeanProject), so import-collision safety
+//! is structural: two requests against the same cache instance necessarily
+//! agree on the project's default imports.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};

@@ -135,8 +135,18 @@ async fn ensure_index(project: &Arc<LeanProject>, imports: Vec<String>) -> Resul
         return Ok(false);
     }
     let imports = project.effective_imports(&imports);
-    let names = lean_tools::list_declarations_strings(project, LeanWorkerDeclarationFilter::default(), imports.clone())
-        .await?;
+    // Shims-only sessions expose bundled host-shim implementation details.
+    // Keep the public declaration index focused on caller-visible names and
+    // avoid oversized declaration-list frames.
+    let names = lean_tools::list_declarations_strings(
+        project,
+        LeanWorkerDeclarationFilter {
+            include_private: false,
+            ..LeanWorkerDeclarationFilter::default()
+        },
+        imports.clone(),
+    )
+    .await?;
     let rows = lean_tools::describe_bulk(project, names, imports).await?;
     project.index().replace_all(&rows, &fp)?;
     Ok(true)

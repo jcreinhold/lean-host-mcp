@@ -4,7 +4,7 @@
 //! [`LeanProject::open`](crate::project::LeanProject::open) consumes a
 //! [`LakeProjectMeta`] to spawn a worker. The struct carries every
 //! per-project field the worker / index / cache layers need: canonical
-//! root, toolchain label, package/library names, the umbrella module Lake
+//! root, toolchain label, package/library hints, the umbrella module Lake
 //! generates next to the library, manifest hash, and the default-import
 //! list every fresh session is opened against.
 //!
@@ -39,8 +39,14 @@ use crate::index::fingerprint_lake_project;
 pub struct LakeProjectMeta {
     pub canonical_root: PathBuf,
     pub toolchain: String,
-    pub package: String,
-    pub library: String,
+    /// Lake package name when it can be discovered from the lakefile.
+    /// Informational only; shims-only worker bootstrap does not load a user
+    /// package dylib.
+    pub package: Option<String>,
+    /// Primary `lean_lib` name, or the package-derived Lake default when
+    /// there is no explicit `lean_lib`. Informational except for deriving
+    /// the umbrella default import.
+    pub library: Option<String>,
     /// Module name Lake exposes alongside the library (the file
     /// `<root>/<Library>.lean` when present). Drives the default-import
     /// list. `None` when no umbrella file exists on disk.
@@ -82,7 +88,10 @@ impl LakeProjectMeta {
                 .map_err(|e| ServerError::BadProject(format!("cannot read current directory: {e}")))?,
         };
         let found = walk_up(&start).ok_or_else(|| {
-            ServerError::BadProject(format!("no lakefile.toml or lakefile.lean found from {}", start.display()))
+            ServerError::BadProject(format!(
+                "no lakefile.toml or lakefile.lean found from {}",
+                start.display()
+            ))
         })?;
         Self::from_explicit(&found)
     }
@@ -92,17 +101,15 @@ impl LakeProjectMeta {
         let toolchain = read_lean_toolchain(&canonical_root);
         let manifest_hash = fingerprint_lake_project(&canonical_root)?;
 
-        let library = parsed
-            .library
-            .unwrap_or_else(|| pascal_case(&parsed.package));
+        let library = parsed.library.unwrap_or_else(|| pascal_case(&parsed.package));
         let umbrella_module = umbrella_for(&canonical_root, &library);
         let default_imports = umbrella_module.clone().map_or_else(Vec::new, |m| vec![m]);
 
         Ok(Self {
             canonical_root,
             toolchain,
-            package: parsed.package,
-            library,
+            package: Some(parsed.package),
+            library: Some(library),
             umbrella_module,
             manifest_hash,
             default_imports,
@@ -158,10 +165,10 @@ struct LeanLibShape {
 }
 
 fn parse_lakefile_toml(path: &Path) -> Result<LakefileParsed> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| ServerError::BadProject(format!("read {}: {e}", path.display())))?;
-    let shape: LakefileTomlShape = toml::from_str(&contents)
-        .map_err(|e| ServerError::BadProject(format!("parse {}: {e}", path.display())))?;
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| ServerError::BadProject(format!("read {}: {e}", path.display())))?;
+    let shape: LakefileTomlShape =
+        toml::from_str(&contents).map_err(|e| ServerError::BadProject(format!("parse {}: {e}", path.display())))?;
     Ok(LakefileParsed {
         package: shape.name,
         library: shape.lean_lib.into_iter().next().map(|l| l.name),
@@ -169,8 +176,8 @@ fn parse_lakefile_toml(path: &Path) -> Result<LakefileParsed> {
 }
 
 fn parse_lakefile_lean(path: &Path) -> Result<LakefileParsed> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| ServerError::BadProject(format!("read {}: {e}", path.display())))?;
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| ServerError::BadProject(format!("read {}: {e}", path.display())))?;
     // Lake accepts both bare and french-quoted identifiers
     // (`package foo` and `package «foo»`); guillemets are required when the
     // name isn't a plain Lean identifier. Match either form.
