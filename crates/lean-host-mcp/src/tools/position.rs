@@ -602,9 +602,25 @@ async fn process_module(project: &Arc<LeanProject>, source: String) -> Result<Le
 fn header_imports(source: &str) -> Vec<String> {
     source
         .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("import "))
-        .flat_map(str::split_whitespace)
+        .filter_map(|line| {
+            let line = line.split_once("--").map_or(line, |(before, _)| before);
+            let mut words = line.split_whitespace();
+            let mut token = words.next()?;
+            if token == "public" {
+                token = words.next()?;
+            }
+            if token == "meta" {
+                token = words.next()?;
+            }
+            if token != "import" {
+                return None;
+            }
+            if words.clone().next() == Some("all") {
+                let _ = words.next();
+            }
+            Some(words)
+        })
+        .flatten()
         .map(ToOwned::to_owned)
         .collect()
 }
@@ -642,5 +658,36 @@ where
              build or fix those imports to resolve this",
             missing_imports.join(", ")
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::header_imports;
+
+    #[test]
+    fn header_imports_ignores_module_system_modifiers() {
+        let source = r"
+module
+
+public import Public.Surface
+import Internal.Support
+import all Internal.Private
+meta import Macro.Support
+public meta import Public.Meta
+
+def body := 1
+";
+
+        assert_eq!(
+            header_imports(source),
+            vec![
+                "Public.Surface",
+                "Internal.Support",
+                "Internal.Private",
+                "Macro.Support",
+                "Public.Meta",
+            ]
+        );
     }
 }

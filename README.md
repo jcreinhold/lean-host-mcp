@@ -25,9 +25,12 @@ A consumer project needs only:
 The `lean-rs-host` shim that exports the 28 mandatory + 6 optional `lean_rs_host_*` symbols is **bundled inside
 `lean-rs-host` itself**—a vendored Lake package the host builds once per toolchain (at first session open) and loads
 without touching the consumer project's `:shared` facet. Consumer projects do not declare it, link it, or `@[export]`
-its symbols. If a specific module fails to import, run `lake build That.Module` and fix that module's transitive imports;
-mathlib-dependent modules may still need their dependency oleans built. `fixtures/lean/` in this repo is a demo target
-the test suite hammers; it isn't a template you must mirror.
+its symbols. Lake's `lake-manifest.json` lists every transitive package the project depends on; the server walks it to
+find each package's `.lake/packages/<name>/.lake/build/lib/lean` and adds those directories to the importer's search
+path. Projects with mathlib or other dependencies work without extra configuration as long as those dependencies' own
+`lake build` has run. For mathlib, the standard `lake exe cache get` pulls precompiled oleans; use the equivalent setup
+for other dependencies. `fixtures/lean/` in this repo is a demo target the test suite hammers; it isn't a template you
+must mirror.
 
 ## Build and run
 
@@ -38,11 +41,12 @@ the test suite hammers; it isn't a template you must mirror.
 cd /path/to/lean-host-mcp
 cargo install --path crates/lean-host-mcp
 
-# 2. Install one worker binary per Lean toolchain you want to serve.
-#    --auto scans ~/.elan/toolchains and builds any missing ones; the
-#    target lands under ~/.local/share/lean-host-mcp/workers/<id>/.
+# 2. Install worker binaries for your local Lean toolchains.
+#    With no mode flag, install-worker scans ~/.elan/toolchains and builds
+#    any missing workers; each target lands under
+#    ~/.local/share/lean-host-mcp/workers/<id>/.
+lean-host-mcp install-worker
 lean-host-mcp install-worker --toolchain v4.30.0-rc2
-lean-host-mcp install-worker --auto
 lean-host-mcp install-worker --list           # see what's installed
 
 # 3a. Zero-config: launch from inside (or anywhere under) any built Lake
@@ -126,7 +130,8 @@ project is unusable.
 `lean_rs_host_process_module_with_info_tree` shim. A worker whose bundled shims do not expose it answers
 `{ "status": "unsupported" }` per call; the tools never raise. Files whose header imports modules the server's open env
 doesn't have are still processed; missing imports surface as an envelope warning (single-file tools) or a result sidebar
-(`references_of_name`). A header that doesn't parse short-circuits to `header_parse_failed`.
+(`references_of_name`). Files using Lean 4's module-system header syntax, including `module`, `public import`,
+`import all`, and `meta import`, are supported. A header that doesn't parse short-circuits to `header_parse_failed`.
 
 Unlike an external LSP process, the host can still start when unrelated project modules are broken. Calls whose imports
 avoid the broken module continue to work, and `file_diagnostics` on the broken file reports Lean diagnostics instead of
@@ -153,8 +158,8 @@ members and silently links `libleanshared` into the parent. The invariant is ass
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.12 (which transitively pin `lean-rs`
-/ `lean-rs-host` 0.1.12). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.14 (which transitively pin `lean-rs`
+/ `lean-rs-host` 0.1.14). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
 inside the `lean-rs` support window declared by
 [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping the supported
 toolchain is a `lean-rs` change first, then a version bump here.

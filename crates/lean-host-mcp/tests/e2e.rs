@@ -31,6 +31,18 @@ fn fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
 }
 
+fn mathlib_fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_TEST_MATHLIB_FIXTURE")
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn module_syntax_fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_TEST_MODULE_SYNTAX_FIXTURE")
+        .ok()
+        .map(PathBuf::from)
+}
+
 fn open_ctx(root: &std::path::Path) -> ToolContext {
     let cache_dir = tempfile::tempdir().expect("tempdir");
     let cache_path = cache_dir.keep();
@@ -61,6 +73,38 @@ fn copy_dir_all(from: &Path, to: &Path) {
             std::os::unix::fs::symlink(target, &dst).expect("copy symlink");
         }
     }
+}
+
+fn find_module_syntax_file(root: &Path) -> Option<PathBuf> {
+    const SKIP_DIRS: &[&str] = &[".git", ".lake", "target"];
+
+    fn visit(dir: &Path, skip_dirs: &[&str]) -> Option<PathBuf> {
+        for entry in fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                if skip_dirs.iter().any(|skip| name == *skip) {
+                    continue;
+                }
+                if let Some(found) = visit(&path, skip_dirs) {
+                    return Some(found);
+                }
+            } else if file_type.is_file()
+                && path.extension().is_some_and(|ext| ext == "lean")
+                && fs::read_to_string(&path).is_ok_and(|source| {
+                    source.lines().any(|line| line.trim() == "module")
+                        && source.lines().any(|line| line.trim_start().starts_with("import all "))
+                })
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    visit(root, SKIP_DIRS)
 }
 
 #[tokio::test]
@@ -257,6 +301,150 @@ fn file_diagnostics_result_serialises_status_tag() {
         s,
         r#"{"status":"header_parse_failed","summary":{"errors":0,"warnings":0,"info":0},"diagnostics":[],"truncated":false}"#
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a built mathlib-dependent Lake fixture; set LEAN_HOST_MCP_TEST_MATHLIB_FIXTURE to enable"]
+async fn mathlib_fixture_uses_transitive_package_search_paths() {
+    use std::io::Write as _;
+
+    use lean_host_mcp::tools::index::{FindSymbolRequest, find_symbol};
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
+
+    let Some(root) = mathlib_fixture_root() else {
+        eprintln!("skipping: LEAN_HOST_MCP_TEST_MATHLIB_FIXTURE not set");
+        return;
+    };
+    let ctx = open_ctx(&root);
+
+    let inferred = infer_type(
+        &ctx,
+        InferTypeRequest {
+            term: "fun (n : Nat) => n + 1".into(),
+            imports: vec!["Mathlib".into()],
+            project: None,
+        },
+    )
+    .await
+    .expect("infer_type with Mathlib import");
+    assert_eq!(
+        inferred.result.status, "Ok",
+        "infer_type must import Mathlib through transitive package paths: {:?}",
+        inferred.result
+    );
+    assert!(
+        matches!(inferred.result.rendered.as_deref(), Some("Nat → Nat" | "ℕ → ℕ")),
+        "Mathlib import should still infer the Nat function type; got {:?}",
+        inferred.result.rendered
+    );
+
+    let symbols = find_symbol(
+        &ctx,
+        FindSymbolRequest {
+            query: "pow_left_injective".into(),
+            imports: vec!["Mathlib.Data.Nat.Basic".into()],
+            limit: Some(500),
+            project: None,
+        },
+    )
+    .await
+    .expect("find_symbol with Mathlib import");
+    assert!(
+        symbols.result.iter().any(|row| {
+            row.name.starts_with("Mathlib.")
+                || row.source.as_ref().is_some_and(|source| {
+                    source.file.contains(".lake/packages/mathlib")
+                        || source.file.contains("Mathlib/")
+                        || source.file.starts_with("Mathlib.")
+                })
+        }),
+        "pow_left_injective search should include a declaration from mathlib; got {:?}",
+        symbols.result
+    );
+
+    let mut file = tempfile::Builder::new()
+        .prefix("lean_host_mcp_mathlib_")
+        .suffix(".lean")
+        .tempfile_in(&root)
+        .expect("create temporary Mathlib-importing project file");
+    writeln!(file, "import Mathlib").unwrap();
+    writeln!(file).unwrap();
+    writeln!(file, "example : (0 : Nat) + 1 = 1 := by norm_num").unwrap();
+    file.flush().unwrap();
+
+    let diagnostics = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file: file.path().to_path_buf(),
+            project: None,
+        },
+    )
+    .await
+    .expect("file_diagnostics on Mathlib-importing file");
+    assert!(
+        diagnostics
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("missing imports") && !warning.contains("open env does not have")),
+        "Mathlib imports should resolve without missing-import envelope warnings for {:?}: {:?}",
+        file.path(),
+        diagnostics.warnings
+    );
+    let FileDiagnosticsResult::Elaborated { summary, .. } = diagnostics.result else {
+        panic!("file_diagnostics must elaborate a Mathlib-importing project file");
+    };
+    assert_eq!(
+        summary.errors, 0,
+        "Mathlib-importing project file should elaborate cleanly"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built module-syntax Lake fixture; set LEAN_HOST_MCP_TEST_MODULE_SYNTAX_FIXTURE to enable"]
+async fn module_syntax_file_diagnostics_elaborates_import_all_header() {
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
+
+    let Some(root) = module_syntax_fixture_root() else {
+        eprintln!("skipping: LEAN_HOST_MCP_TEST_MODULE_SYNTAX_FIXTURE not set");
+        return;
+    };
+    let file = find_module_syntax_file(&root).unwrap_or_else(|| {
+        panic!(
+            "fixture must contain a .lean file with a standalone `module` line and an `import all` header: {}",
+            root.display()
+        )
+    });
+    let ctx = open_ctx(&root);
+
+    let diagnostics = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file: file.clone(),
+            project: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|err| {
+        panic!(
+            "file_diagnostics must not propagate an import-prefix error for {}: {err:?}",
+            file.display()
+        )
+    });
+    assert!(
+        diagnostics
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("unknown module prefix 'all'")),
+        "module-syntax diagnostics must not warn about `all` as a module prefix for {}: {:?}",
+        file.display(),
+        diagnostics.warnings
+    );
+    let FileDiagnosticsResult::Elaborated { .. } = diagnostics.result else {
+        panic!(
+            "module-syntax file should elaborate far enough to return diagnostics for {}",
+            file.display()
+        );
+    };
 }
 
 #[tokio::test]
