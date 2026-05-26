@@ -310,21 +310,9 @@ pub fn map_worker_err(err: LeanWorkerError) -> ServerError {
         | LeanWorkerError::CapabilityBuild { .. }
         | LeanWorkerError::Setup { .. }
         | LeanWorkerError::Handshake { .. }
+        | LeanWorkerError::ChildPanicOrAbort { .. }
+        | LeanWorkerError::ChildExited { .. }
         | LeanWorkerError::CapabilityMetadataMismatch { .. } => ServerError::BadProject(err.to_string()),
-        // 0.1.10's `wait_with_stderr` captures stderr onto `exit.diagnostics`,
-        // but the upstream `Display` impl for these two variants only writes
-        // the exit status. Pull the diagnostics out by hand so a child that
-        // dies before handshake (bad sysroot, dlopen failure, missing
-        // bundled shim) surfaces an actionable BadProject message instead
-        // of an opaque "worker exited fatally with exit status: 1".
-        LeanWorkerError::ChildExited { ref exit } | LeanWorkerError::ChildPanicOrAbort { ref exit } => {
-            let tail = exit.diagnostics.trim();
-            if tail.is_empty() {
-                ServerError::BadProject(err.to_string())
-            } else {
-                ServerError::BadProject(format!("{err}: {tail}"))
-            }
-        }
         _ => ServerError::Lean(err.to_string()),
     }
 }
