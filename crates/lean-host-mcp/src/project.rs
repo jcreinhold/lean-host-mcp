@@ -317,6 +317,14 @@ fn actor_main(
     let builder = LeanWorkerCapabilityBuilder::new(&lake_root, &package, &library, default_imports.iter())
         .worker_child(LeanWorkerChild::for_toolchain(worker_path, lean_sysroot))
         .startup_timeout(Duration::from_secs(30))
+        // 16 MiB: comfortable headroom for `outline` / `file_diagnostics`
+        // on Mathlib-scale modules where a single frame can carry
+        // thousands of pretty-printed declarations or diagnostics, with
+        // no natural chunking axis the tool layer can exploit. The
+        // upstream default (1 MiB) is appropriate for bulk tools that
+        // chunk their own pages (`describe_bulk`), not for tools whose
+        // single result is the frame.
+        .max_frame_bytes(16 * 1024 * 1024)
         .long_running_requests();
 
     let report = builder.check();

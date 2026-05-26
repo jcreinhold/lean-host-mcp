@@ -310,6 +310,14 @@ pub fn map_worker_err(err: LeanWorkerError) -> ServerError {
         | LeanWorkerError::CapabilityBuild { .. }
         | LeanWorkerError::Setup { .. }
         | LeanWorkerError::Handshake { .. }
+        // 0.1.10 reroutes the handshake-error path through
+        // `wait_with_stderr`, so a child that dies before the handshake
+        // surfaces as `ChildPanicOrAbort` / `ChildExited` with
+        // `exit.diagnostics` populated. `err.to_string()` carries that
+        // stderr tail, so downstream sees an actionable BadProject
+        // message instead of an opaque "Lean error: exit status: 1".
+        | LeanWorkerError::ChildPanicOrAbort { .. }
+        | LeanWorkerError::ChildExited { .. }
         | LeanWorkerError::CapabilityMetadataMismatch { .. } => ServerError::BadProject(err.to_string()),
         _ => ServerError::Lean(err.to_string()),
     }
