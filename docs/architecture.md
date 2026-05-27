@@ -5,15 +5,15 @@ One crate, library plus two binaries (the MCP server and a tiny worker child). L
 ```
 main.rs         clap CLI, rmcp stdio entry
 server.rs       LeanHostService (rmcp glue)
-tools/          lean.rs (6), index.rs (3), position.rs (4), scan.rs (1)
+tools/          lean.rs (6), index.rs (3), position.rs (5), scan.rs (1)
 project.rs      LeanProject—closure-channel actor; owns the LeanWorkerHostHandle,
-                the DeclarationIndex, and the ProcessedFileCache for one Lake project
+                the DeclarationIndex, and the ModuleQueryCache for one Lake project
 projections.rs  pure data-shuffle helpers from lean-rs-worker shapes into the MCP wire
 lake_meta.rs    LakeProjectMeta: minimal Lake-project description
 index.rs        DeclarationIndex (SQLite, behind the three index tools)
-cache.rs        ProcessedFileCache (LRU, behind the four position tools)
+cache.rs        ModuleQueryCache (LRU, behind the bounded position tools)
 envelope.rs     Response<T> = { result, freshness, warnings, next_actions }
-bin/worker.rs   2-line entry: lean_rs_worker::run_worker_child_stdio()
+bin/worker.rs   2-line entry: lean_rs_worker_child::run_worker_child_stdio()
 ```
 
 `project.rs` is the only path to `lean-rs-worker` (the parent never sees `lean-rs` or `lean-rs-host` directly—those live
@@ -124,36 +124,31 @@ agrees on, and it hides three decisions that are still in motion:
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) live inside `result`, not as MCP errors.
 `ServerError` is reserved for infrastructure: worker thread gone, runtime init failed, Lake project unusable.
 
-## The `DeclarationIndex` boundary
+## Bounded declaration lookup
 
-`find_symbol`, `find_lemma`, and `outline` all answer "what declarations match X" against the open Lake project. They
-share one piece of state: a SQLite database under the user's cache directory. `index.rs` owns that boundary in
-full—schema, fingerprinting, bulk rebuild, the seven read methods the tools consume. Nothing past the module sees
-`rusqlite` or `sha2`; a fourth caller adds a method here rather than writing SQL.
+Declaration lookup is worker-backed and bounded by query shape. `search_declarations` searches names and returns
+metadata-only rows; it never renders declaration types or rebuilds a whole-environment SQLite cache. `type_of_name`
+renders the type of one explicit declaration under a byte cap and reports whether the text was truncated.
 
-Rebuilds are on-demand and gated by a private environment fingerprint: the SHA-256 of `lake-manifest.json` plus the
-exact ordered import vector used for the index call. The table is still one replacement table per project. A different
-import vector makes the current table stale and rebuilds it. The session walks the live environment via
-`LeanSession::list_declarations_strings` followed by `declaration_kind_bulk` and `declaration_type_bulk`, the index
-commits in one transaction, and the fingerprint is stamped last so a crashed rebuild leaves the index detectably stale
-rather than partially populated.
+The old synchronous index rebuild path was deliberately removed from the MCP surface. A model-controlled tool should
+not be able to trigger a full environment walk plus bulk type rendering just to answer a small name search.
 
-## The file-processing cache
+## The module-query cache
 
-`goal_at_position`, `type_at_position`, `references_of_name`, and `file_diagnostics` project the worker's
-`LeanWorkerProcessedFile` value (four arrays of info-tree nodes plus diagnostics) into tool-specific results.
-Re-processing on every cursor move would be wasteful, so `cache.rs` ships a small LRU of `Arc<LeanWorkerProcessedFile>`,
-capacity 16, keyed on `(file_path, sha256(contents))`. Any edit to the source bytes misses structurally. Position tools
-derive imports from the file header, so changing the import context changes the file bytes and misses the cache.
-`LeanWorkerProcessedFile` is owned data (`Send + Sync + 'static`), so cached entries are read by tool handlers
-without re-entering the actor thread. Position lookup helpers (`tactic_at`, `term_at`, `references_of`) are free
-functions on `cache.rs`; linear scan is fast enough at typical file sizes (the `position_lookup_after_cache_warm` bench
-targets ≤ 50 µs per query).
+`goal_at_position`, `type_at_position`, `references_in_file`, `references_in_project`, and `file_diagnostics` call the
+worker's `process_module_query` capability. There is no whole-file info-tree result in the parent. Each request asks
+Lean for one bounded projection: diagnostics only, the selected term type, the selected tactic context, or references to
+one name without expression/type renderings.
 
-The cache is populated through `LeanProject`'s worker actor calling `process_module` (the header-aware worker shim).
-Files whose header references modules the session's open env doesn't have are still cached—the body's partial projection
-is real data, and the `MissingImports` signal travels alongside on the envelope. Header parse failures and `Unsupported`
-outcomes are not cached.
+Re-processing an identical cursor query would still be wasteful, so `cache.rs` ships a small LRU of
+`LeanWorkerModuleQueryOutcome` values, capacity 256, keyed on `(file_path, sha256(contents), query_kind)`. Any edit to
+the source bytes misses structurally. The query kind includes the cursor position or reference name, so a type query at
+one cursor cannot be mistaken for diagnostics or a reference query.
 
-The cache does **not** track the Lean environment. Environment churn (re-import, actor re-open) is the
-`LeanHostService::new` boundary; the file cache is invalidated only by content change.
+The cache is populated through `LeanProject`'s worker actor. The tool reads the file, derives session imports from its
+header, opens a short-lived worker session, and calls `process_module_query`. Files whose header references modules the
+session's open env does not have still return a bounded result; the `MissingImports` signal travels as an envelope
+warning for single-file tools or a result sidebar for `references_in_project`.
+
+Frame size is controlled by query shape, not transport tuning. The project actor uses the upstream worker frame cap, and
+the tool layer has no fallback that requests rendered `exprStr` / `typeStr` for every term in a file.

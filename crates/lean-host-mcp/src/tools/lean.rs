@@ -12,19 +12,19 @@
 // pass-by-value flag is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::sync::Arc;
-
-use lean_rs_worker_parent::{LeanWorkerDeclarationFilter, LeanWorkerElabOptions, LeanWorkerMetaTransparency};
+use lean_rs_worker_parent::{
+    LeanWorkerDeclarationFilter, LeanWorkerDeclarationSearch, LeanWorkerElabOptions, LeanWorkerMetaTransparency,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::Result;
-use crate::project::LeanProject;
 use crate::projections::{
-    DeclarationRow, ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome, map_worker_err, project_declaration_row,
-    project_elab_result, project_kernel_result, project_meta_bool, project_meta_rendered,
+    DeclarationSearchResult, DeclarationTypeResult, ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome,
+    map_worker_err, project_declaration_search, project_declaration_type, project_elab_result, project_kernel_result,
+    project_meta_bool, project_meta_rendered,
 };
 use crate::tools::{ToolContext, freshness_for, session_imports};
 
@@ -279,6 +279,9 @@ pub struct HoverByNameRequest {
     pub name: String,
     #[serde(default)]
     pub imports: Vec<String>,
+    /// Maximum rendered type bytes. Defaults to 8192, clamped to 65536.
+    #[serde(default)]
+    pub max_type_bytes: Option<usize>,
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -286,7 +289,7 @@ pub struct HoverByNameRequest {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum HoverByNameResult {
-    Found(DeclarationRow),
+    Found(DeclarationTypeResult),
     Missing { name: String },
 }
 
@@ -294,6 +297,39 @@ pub enum HoverByNameResult {
 ///
 /// Infrastructure failures only; missing names return `HoverByNameResult::Missing`.
 pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result<Response<HoverByNameResult>> {
+    type_of_name_inner(
+        ctx,
+        TypeOfNameRequest {
+            name: req.name,
+            imports: req.imports,
+            max_type_bytes: req.max_type_bytes,
+            project: req.project,
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct TypeOfNameRequest {
+    /// Fully-qualified Lean declaration name, e.g. `Nat.add_zero`.
+    pub name: String,
+    #[serde(default)]
+    pub imports: Vec<String>,
+    /// Maximum rendered type bytes. Defaults to 8192, clamped to 65536.
+    #[serde(default)]
+    pub max_type_bytes: Option<usize>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// # Errors
+///
+/// Infrastructure failures only; missing names return `HoverByNameResult::Missing`.
+pub async fn type_of_name(ctx: &ToolContext, req: TypeOfNameRequest) -> Result<Response<HoverByNameResult>> {
+    type_of_name_inner(ctx, req).await
+}
+
+async fn type_of_name_inner(ctx: &ToolContext, req: TypeOfNameRequest) -> Result<Response<HoverByNameResult>> {
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
@@ -301,13 +337,16 @@ pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result
             let imports = session_imports(req.imports);
             let name = req.name;
             let lookup_name = name.clone();
+            let max_type_bytes = req.max_type_bytes.unwrap_or(8 * 1024).clamp(256, 64 * 1024);
             let row = project
                 .submit(move |cap| {
                     let mut session = cap
                         .open_session_with_imports(imports, None, None)
                         .map_err(map_worker_err)?;
-                    let row = session.describe(&lookup_name, None, None).map_err(map_worker_err)?;
-                    Ok(row.map(project_declaration_row))
+                    let row = session
+                        .declaration_type(&lookup_name, max_type_bytes, None, None)
+                        .map_err(map_worker_err)?;
+                    Ok(row.map(project_declaration_type))
                 })
                 .await?;
             let result = match row {
@@ -319,75 +358,68 @@ pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result
         .await
 }
 
-// --- index-tool helpers (called from `tools::index::ensure_index`) ------
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SearchDeclarationsRequest {
+    /// Case-insensitive substring to match against fully-qualified names.
+    pub query: String,
+    /// Optional kind filter such as `theorem`, `definition`, or `axiom`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Module imports to search against. Empty = `Init` only.
+    #[serde(default)]
+    pub imports: Vec<String>,
+    /// Maximum rows to return. Defaults to 20, clamped to 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include source ranges when Lean can resolve them. Defaults to true.
+    #[serde(default = "default_include_source")]
+    pub include_source: bool,
+    #[serde(default)]
+    pub project: Option<String>,
+}
 
-/// List every declaration in the open environment as a Vec of fully-
-/// qualified strings.
-///
 /// # Errors
 ///
-/// Infrastructure failures only.
-pub(crate) async fn list_declarations_strings(
-    project: &Arc<LeanProject>,
-    filter: LeanWorkerDeclarationFilter,
-    imports: Vec<String>,
-) -> Result<Vec<String>> {
-    project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            session
-                .list_declarations_strings(&filter, None, None)
-                .map_err(map_worker_err)
+/// Infrastructure failures only. Broad queries return bounded metadata and
+/// set `truncated`; they do not rebuild or render a whole-environment index.
+pub async fn search_declarations(
+    ctx: &ToolContext,
+    req: SearchDeclarationsRequest,
+) -> Result<Response<DeclarationSearchResult>> {
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &req.imports);
+            let imports = session_imports(req.imports);
+            let search = LeanWorkerDeclarationSearch {
+                query: req.query,
+                kind: req.kind,
+                limit: req.limit.unwrap_or(20).clamp(1, 100),
+                filter: LeanWorkerDeclarationFilter {
+                    include_private: false,
+                    include_generated: false,
+                    include_internal: false,
+                },
+                include_source: req.include_source,
+            };
+            let result = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(imports, None, None)
+                        .map_err(map_worker_err)?;
+                    session
+                        .search_declarations(&search, None, None)
+                        .map(project_declaration_search)
+                        .map_err(map_worker_err)
+                })
+                .await?;
+            Ok(Response::ok(result, freshness))
         })
         .await
 }
 
-/// Per-batch size for [`describe_bulk`]. The upstream IPC frame cap is
-/// 1 MiB (`MAX_FRAME_BYTES` in `lean-rs-worker-protocol`); a typical
-/// `LeanWorkerDeclarationRow` JSON-encodes at ~3-4 KB, so 256 rows stays
-/// under the cap with room for long type signatures.
-const INDEX_REBUILD_BATCH: usize = 256;
-
-/// Bulk-describe every declaration in `names`. Output order matches input
-/// order; entries the worker reports as `kind == "missing"` are omitted.
-///
-/// Splits `names` into [`INDEX_REBUILD_BATCH`]-sized chunks and issues one
-/// `describe_bulk` round-trip per chunk, all inside a single session so the
-/// imports are elaborated once. Each chunk's worker response stays under
-/// the IPC frame cap; the result is concatenated and returned as if the
-/// call had been a single round trip.
-///
-/// # Errors
-///
-/// Infrastructure failures only.
-pub(crate) async fn describe_bulk(
-    project: &Arc<LeanProject>,
-    names: Vec<String>,
-    imports: Vec<String>,
-) -> Result<Vec<DeclarationRow>> {
-    if names.is_empty() {
-        return Ok(Vec::new());
-    }
-    project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let mut out = Vec::with_capacity(names.len());
-            for chunk in names.chunks(INDEX_REBUILD_BATCH) {
-                let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-                let rows = session.describe_bulk(&refs, None, None).map_err(map_worker_err)?;
-                out.extend(
-                    rows.into_iter()
-                        .filter(|r| r.kind != "missing")
-                        .map(project_declaration_row),
-                );
-            }
-            Ok(out)
-        })
-        .await
+const fn default_include_source() -> bool {
+    true
 }
 
 fn elab_opts() -> LeanWorkerElabOptions {

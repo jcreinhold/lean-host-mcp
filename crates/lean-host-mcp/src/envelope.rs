@@ -19,7 +19,7 @@
 //!
 //! `project_hash` is the Lake-manifest SHA-256. Clients can branch on
 //! `(project_root, project_hash)` to detect dependency changes between
-//! tool calls without round-tripping `find_symbol` first.
+//! tool calls without a separate declaration search first.
 //!
 //! Three volatile decisions hide behind one shape: what freshness means,
 //! how it's serialized, and what an MCP "warning" looks like. Tools don't

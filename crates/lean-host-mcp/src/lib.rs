@@ -12,22 +12,22 @@
 //!   project hint into an `Arc<LeanProject>` via the env / cwd-walk /
 //!   config-default chain.
 //! - [`project`]: `LeanProject`, the unit of multiplexing. Bundles the
-//!   shims-only worker host handle, the `SQLite` declaration index, and the
-//!   in-memory processed-file cache for one Lake project.
+//!   shims-only worker host handle and the bounded module-query cache for one
+//!   Lake project.
 //! - [`projections`]: pure data-shuffle projection types and helpers from
 //!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.
 //! - [`lake_meta`]: `LakeProjectMeta`, the minimal description of a Lake
 //!   project that `LeanProject::open` consumes.
-//! - [`index`]: `DeclarationIndex`, the SQLite-backed projection of the
-//!   environment the three index tools query.
+//! - [`index`]: legacy `DeclarationIndex` storage retained for internal tests
+//!   and migration; MCP declaration lookup now uses bounded worker queries.
 //! - [`error`]: `ServerError`, the one error type tool handlers return.
 //! - [`tools`]: tool implementations, grouped by what plumbing they share
-//!   (`lean` for session-backed tools, `scan` for the filesystem regex
-//!   sweep, `index` for the SQLite-backed lookups).
+//!   (`lean` for session-backed tools and declaration lookup, `scan` for the
+//!   filesystem regex sweep).
 //! - [`server`]: rmcp glue.
 
 pub mod broker;
-pub mod cache;
+mod cache;
 pub mod cli;
 pub mod envelope;
 pub mod error;
@@ -46,8 +46,8 @@ pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerp
 pub use lake_meta::LakeProjectMeta;
 pub use project::LeanProject;
 pub use projections::{
-    DeclarationRow, Diagnostic, ElabFailure, ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome, Position,
-    ProcessedFile, Severity, SourceRange,
+    DeclarationRow, DeclarationSearchResult, DeclarationSummary, DeclarationTypeResult, Diagnostic, ElabFailure,
+    ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome, Position, RenderedText, Severity, SourceRange,
 };
 pub use server::LeanHostService;
 pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};

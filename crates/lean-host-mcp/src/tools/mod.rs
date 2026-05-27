@@ -2,22 +2,18 @@
 //!
 //! Split by what plumbing they share rather than one file per tool:
 //!
-//! - [`lean`]: `elaborate`, `kernel_check`, `infer_type`, `whnf`,
-//!   `is_def_eq`, `hover_by_name`. All six drive the project's worker actor
-//!   and project Lean responses into the JSON envelope.
+//! - [`lean`]: term/meta tools plus bounded declaration search/type lookup.
+//!   These drive the project's worker actor and project Lean responses into
+//!   the JSON envelope.
 //! - [`scan`]: `project_scan`. No Lean dependency; pure filesystem walk
 //!   with a configurable regex.
-//! - [`index`]: `find_symbol`, `find_lemma`, `outline`. Thin wrappers
-//!   over the SQLite-backed [`DeclarationIndex`](crate::DeclarationIndex);
-//!   rebuild on Lake-manifest change.
 //! - [`position`]: `goal_at_position`, `type_at_position`,
-//!   `references_of_name`, `file_diagnostics`. Thin lookups over a
-//!   `ProcessedFileCache`-backed `LeanWorkerProcessedFile` projection from
-//!   `lean-rs-worker`; the cache is keyed on path + content hash.
+//!   `references_in_file`, `references_in_project`, `file_diagnostics`.
+//!   Bounded module queries from `lean-rs-worker`; the cache is keyed on
+//!   path + content hash + query kind.
 
 use std::sync::Arc;
 
-pub mod index;
 pub mod lean;
 pub mod position;
 pub mod scan;
@@ -76,8 +72,8 @@ pub(crate) fn freshness_for_meta(meta: &LakeProjectMeta) -> Freshness {
 }
 
 /// Directory names skipped during `.lean` file enumeration. Shared between
-/// [`scan::project_scan`] and [`position::references_of_name`] so both tools
-/// agree on what counts as "the project".
+/// [`scan::project_scan`] and [`position::references_in_project`] so both
+/// tools agree on what counts as "the project".
 pub(crate) fn is_ignored_dir(name: &str) -> bool {
     matches!(name, ".lake" | ".git" | "target" | "build" | "node_modules" | ".direnv")
 }

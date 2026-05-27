@@ -17,9 +17,10 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use lean_rs_worker_parent::{
-    LeanWorkerDeclarationRow, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerElabResult, LeanWorkerError,
-    LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerRendered, LeanWorkerRendering,
-    LeanWorkerSourceRange,
+    LeanWorkerDeclarationRow, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationSummary,
+    LeanWorkerDeclarationType, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerElabResult, LeanWorkerError,
+    LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerRendered, LeanWorkerRenderedInfo,
+    LeanWorkerRendering, LeanWorkerSourceRange,
 };
 
 use crate::error::ServerError;
@@ -137,9 +138,32 @@ pub struct DeclarationRow {
     pub source: Option<SourceRange>,
 }
 
-/// Re-export of [`LeanWorkerProcessedFile`] so callers that hold a cached
-/// projection can pattern-match without importing `lean-rs-worker` directly.
-pub use lean_rs_worker_parent::LeanWorkerProcessedFile as ProcessedFile;
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct RenderedText {
+    pub value: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationSummary {
+    pub name: String,
+    pub kind: String,
+    pub source: Option<SourceRange>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationSearchResult {
+    pub declarations: Vec<DeclarationSummary>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationTypeResult {
+    pub name: String,
+    pub kind: String,
+    pub type_signature: Option<RenderedText>,
+    pub source: Option<SourceRange>,
+}
 
 // --- projection helpers -------------------------------------------------
 
@@ -289,6 +313,41 @@ pub fn project_declaration_row(row: LeanWorkerDeclarationRow) -> DeclarationRow 
         name: row.name,
         kind: row.kind,
         type_signature: row.type_signature,
+        source: row.source.map(project_source_range),
+    }
+}
+
+fn project_rendered_info(info: LeanWorkerRenderedInfo) -> RenderedText {
+    RenderedText {
+        value: info.value,
+        truncated: info.truncated,
+    }
+}
+
+fn project_declaration_summary(row: LeanWorkerDeclarationSummary) -> DeclarationSummary {
+    DeclarationSummary {
+        name: row.name,
+        kind: row.kind,
+        source: row.source.map(project_source_range),
+    }
+}
+
+pub fn project_declaration_search(result: LeanWorkerDeclarationSearchResult) -> DeclarationSearchResult {
+    DeclarationSearchResult {
+        declarations: result
+            .declarations
+            .into_iter()
+            .map(project_declaration_summary)
+            .collect(),
+        truncated: result.truncated,
+    }
+}
+
+pub fn project_declaration_type(row: LeanWorkerDeclarationType) -> DeclarationTypeResult {
+    DeclarationTypeResult {
+        name: row.name,
+        kind: row.kind,
+        type_signature: row.type_signature.map(project_rendered_info),
         source: row.source.map(project_source_range),
     }
 }

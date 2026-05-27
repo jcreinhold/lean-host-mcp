@@ -1,10 +1,9 @@
 //! `LeanProject`—the unit of multiplexing.
 //!
-//! Bundles the four resources that share lifetime and invalidation for one
-//! Lake project: a closure-channel actor that parks a single shims-only
-//! [`LeanWorkerHostHandle`] on a dedicated OS thread, the per-project
-//! `DeclarationIndex` (`SQLite`), the per-project [`ProcessedFileCache`]
-//! (in-memory LRU), and the project metadata (canonical root, toolchain,
+//! Bundles the resources that share lifetime and invalidation for one Lake
+//! project: a closure-channel actor that parks a single shims-only
+//! [`LeanWorkerHostHandle`] on a dedicated OS thread, the per-project bounded
+//! module-query cache, and the project metadata (canonical root, toolchain,
 //! package/library hints, manifest hash).
 //!
 //! `LeanWorkerHostHandle` has one owner at a time; the invariant holds by
@@ -26,22 +25,25 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use lean_rs_worker_parent::{LeanWorkerChild, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder};
+use lean_rs_worker_parent::{
+    LeanWorkerChild, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder, LeanWorkerRestartPolicy,
+};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cache::ProcessedFileCache;
+use crate::cache::ModuleQueryCache;
 use crate::envelope::Freshness;
 use crate::error::{Result, ServerError};
-use crate::index::DeclarationIndex;
 use crate::lake_meta::LakeProjectMeta;
 use crate::projections::map_worker_err;
 use crate::toolchain::{ToolchainId, WorkerBinary};
 
-/// LRU capacity for the in-memory `ProcessedFile` cache. Large enough that
-/// twenty cursor moves across a handful of files all hit, small enough to
-/// keep memory bounded.
-const PROCESSED_FILE_CACHE_CAPACITY: usize = 16;
+/// LRU capacity for exact bounded module query results. Query results are
+/// intentionally small, so this can hold more cursor probes than the old
+/// whole-file cache without creating a large memory resident set.
+const MODULE_QUERY_CACHE_CAPACITY: usize = 256;
+const WORKER_RSS_RESTART_KIB: u64 = 3 * 1024 * 1024;
+const WORKER_REQUEST_RESTARTS: u64 = 64;
 
 type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
 
@@ -63,8 +65,7 @@ pub struct LeanProject {
     /// manifest invalidation).
     session_id: String,
     actor_tx: Mutex<Option<mpsc::Sender<Job>>>,
-    index: Arc<DeclarationIndex>,
-    cache: ProcessedFileCache,
+    module_queries: ModuleQueryCache,
 }
 
 impl std::fmt::Debug for LeanProject {
@@ -91,7 +92,7 @@ impl LeanProject {
     /// runtime open failures; `ServerError::Index` if the cache directory
     /// cannot be created or the `SQLite` database cannot be opened;
     /// `ServerError::Internal` if the OS rejects the actor thread.
-    pub fn open(meta: LakeProjectMeta, cache_dir: &Path) -> Result<Arc<Self>> {
+    pub fn open(meta: LakeProjectMeta, _cache_dir: &Path) -> Result<Arc<Self>> {
         // Resolve the toolchain pin to a concrete worker binary before
         // spawning the actor, so the install error surfaces synchronously
         // and includes the `install-worker` command in its message.
@@ -105,11 +106,6 @@ impl LeanProject {
         let lean_sysroot = toolchain_id
             .elan_dir()
             .map_err(|e| ServerError::BadProject(e.to_string()))?;
-
-        let index = Arc::new(DeclarationIndex::open(
-            cache_dir,
-            &meta.canonical_root.to_string_lossy(),
-        )?);
 
         type InitMsg = std::result::Result<(String, mpsc::Sender<Job>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
@@ -136,7 +132,7 @@ impl LeanProject {
             clippy::missing_const_for_fn,
             reason = "NonZeroUsize::new is const but `or` is not yet on stable for NonZeroUsize"
         )]
-        let cache_cap = NonZeroUsize::new(PROCESSED_FILE_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+        let cache_cap = NonZeroUsize::new(MODULE_QUERY_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
 
         Ok(Arc::new(Self {
             canonical_root: meta.canonical_root,
@@ -146,8 +142,7 @@ impl LeanProject {
             manifest_hash: meta.manifest_hash,
             session_id: uuid::Uuid::new_v4().to_string(),
             actor_tx: Mutex::new(Some(actor_tx)),
-            index,
-            cache: ProcessedFileCache::with_capacity(cache_cap),
+            module_queries: ModuleQueryCache::with_capacity(cache_cap),
         }))
     }
 
@@ -171,7 +166,11 @@ impl LeanProject {
         });
         let tx = self.actor_tx.lock().as_ref().cloned().ok_or(ServerError::SessionGone)?;
         tx.send(boxed).await.map_err(|_| ServerError::SessionGone)?;
-        reply_rx.await.map_err(|_| ServerError::SessionGone)?
+        let result = reply_rx.await.map_err(|_| ServerError::SessionGone)?;
+        if result.as_ref().is_err_and(project_actor_error_is_fatal) {
+            self.shutdown();
+        }
+        result
     }
 
     pub fn canonical_root(&self) -> &Path {
@@ -200,18 +199,8 @@ impl LeanProject {
         &self.session_id
     }
 
-    pub fn index(&self) -> &DeclarationIndex {
-        &self.index
-    }
-
-    /// Cheap `Arc` clone for callers that need an owned handle (e.g.
-    /// background tasks that outlive the borrow).
-    pub fn index_arc(&self) -> Arc<DeclarationIndex> {
-        Arc::clone(&self.index)
-    }
-
-    pub fn cache(&self) -> &ProcessedFileCache {
-        &self.cache
+    pub(crate) fn module_query_cache(&self) -> &ModuleQueryCache {
+        &self.module_queries
     }
 
     /// Build a [`Freshness`] for a request. `session_id` is this project's
@@ -245,6 +234,20 @@ impl LeanProject {
     }
 }
 
+fn project_actor_error_is_fatal(err: &ServerError) -> bool {
+    match err {
+        ServerError::BadProject(message) | ServerError::Lean(message) => {
+            message.contains("ChildPanicOrAbort")
+                || message.contains("ChildExited")
+                || message.contains("child exited")
+                || message.contains("worker exited")
+                || message.contains("worker protocol")
+        }
+        ServerError::SessionGone => true,
+        ServerError::Index(_) | ServerError::Io(_) | ServerError::Internal(_) => false,
+    }
+}
+
 impl Drop for LeanProject {
     fn drop(&mut self) {
         self.shutdown();
@@ -266,14 +269,12 @@ fn actor_main(
     let builder = LeanWorkerHostHandleBuilder::shims_only(&lake_root, std::iter::empty::<String>())
         .worker_child(LeanWorkerChild::for_toolchain(worker_path, lean_sysroot))
         .startup_timeout(Duration::from_secs(30))
-        // 16 MiB: headroom for `outline` / `file_diagnostics` on
-        // Mathlib-scale modules where a single frame can carry thousands
-        // of pretty-printed declarations or diagnostics, with no natural
-        // chunking axis the tool layer can exploit. The upstream default
-        // (1 MiB) suits bulk tools that chunk their own pages
-        // (`describe_bulk`), not tools whose single result is the frame.
-        .max_frame_bytes(16 * 1024 * 1024)
-        .long_running_requests();
+        .long_running_requests()
+        .restart_policy(
+            LeanWorkerRestartPolicy::default()
+                .max_requests(WORKER_REQUEST_RESTARTS)
+                .max_rss_kib(WORKER_RSS_RESTART_KIB),
+        );
 
     let report = builder.check();
     if let Some(first) = report.first_error() {

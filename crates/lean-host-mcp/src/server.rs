@@ -87,12 +87,30 @@ impl LeanHostService {
         wrap(tools::lean::is_def_eq(&self.ctx, req).await)
     }
 
-    #[tool(description = "Look up a Lean declaration by fully-qualified name.")]
+    #[tool(description = "Look up one Lean declaration and return a bounded rendered type.")]
     async fn hover_by_name(
         &self,
         Parameters(req): Parameters<tools::lean::HoverByNameRequest>,
     ) -> std::result::Result<Json<Response<tools::lean::HoverByNameResult>>, McpError> {
         wrap(tools::lean::hover_by_name(&self.ctx, req).await)
+    }
+
+    #[tool(description = "Render the type of one fully-qualified Lean declaration under a strict byte cap.")]
+    async fn type_of_name(
+        &self,
+        Parameters(req): Parameters<tools::lean::TypeOfNameRequest>,
+    ) -> std::result::Result<Json<Response<tools::lean::HoverByNameResult>>, McpError> {
+        wrap(tools::lean::type_of_name(&self.ctx, req).await)
+    }
+
+    #[tool(
+        description = "Search declaration names against the imported environment. Returns bounded metadata only; use type_of_name for one type."
+    )]
+    async fn search_declarations(
+        &self,
+        Parameters(req): Parameters<tools::lean::SearchDeclarationsRequest>,
+    ) -> std::result::Result<Json<Response<crate::projections::DeclarationSearchResult>>, McpError> {
+        wrap(tools::lean::search_declarations(&self.ctx, req).await)
     }
 
     #[tool(
@@ -103,34 +121,6 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::scan::ProjectScanRequest>,
     ) -> std::result::Result<Json<Response<tools::scan::ProjectScanResult>>, McpError> {
         wrap(tools::scan::project_scan(&self.ctx, req).await)
-    }
-
-    #[tool(
-        description = "Find declarations by name (case-insensitive substring). Rebuilds the index when the Lake manifest changes."
-    )]
-    async fn find_symbol(
-        &self,
-        Parameters(req): Parameters<tools::index::FindSymbolRequest>,
-    ) -> std::result::Result<Json<Response<Vec<crate::index::IndexedDeclaration>>>, McpError> {
-        wrap(tools::index::find_symbol(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Find theorems by name (case-insensitive substring); kind is restricted to `theorem`.")]
-    async fn find_lemma(
-        &self,
-        Parameters(req): Parameters<tools::index::FindLemmaRequest>,
-    ) -> std::result::Result<Json<Response<Vec<crate::index::IndexedDeclaration>>>, McpError> {
-        wrap(tools::index::find_lemma(&self.ctx, req).await)
-    }
-
-    #[tool(
-        description = "List declarations by fully-qualified name prefix. Omit `module_prefix` to walk the full table."
-    )]
-    async fn outline(
-        &self,
-        Parameters(req): Parameters<tools::index::OutlineRequest>,
-    ) -> std::result::Result<Json<Response<Vec<crate::index::IndexedDeclaration>>>, McpError> {
-        wrap(tools::index::outline(&self.ctx, req).await)
     }
 
     #[tool(
@@ -154,13 +144,23 @@ impl LeanHostService {
     }
 
     #[tool(
-        description = "All binder and use-site occurrences of a fully-qualified Lean name across one or many .lean files (defaults to all project files)."
+        description = "Binder and use-site occurrences of a fully-qualified Lean name in one .lean file. Bounded and file-scoped."
     )]
-    async fn references_of_name(
+    async fn references_in_file(
         &self,
-        Parameters(req): Parameters<tools::position::ReferencesOfNameRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::ReferencesOfNameResult>>, McpError> {
-        wrap(tools::position::references_of_name(&self.ctx, req).await)
+        Parameters(req): Parameters<tools::position::ReferencesInFileRequest>,
+    ) -> std::result::Result<Json<Response<tools::position::ReferencesInFileResult>>, McpError> {
+        wrap(tools::position::references_in_file(&self.ctx, req).await)
+    }
+
+    #[tool(
+        description = "Explicit project-wide scan for binder and use-site occurrences of a fully-qualified Lean name. Optional files and limit bound the walk."
+    )]
+    async fn references_in_project(
+        &self,
+        Parameters(req): Parameters<tools::position::ReferencesInProjectRequest>,
+    ) -> std::result::Result<Json<Response<tools::position::ReferencesInProjectResult>>, McpError> {
+        wrap(tools::position::references_in_project(&self.ctx, req).await)
     }
 
     #[tool(

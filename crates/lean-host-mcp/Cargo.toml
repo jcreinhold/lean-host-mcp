@@ -29,11 +29,7 @@ name = "worker_cold_spawn"
 
 [[bench]]
 harness = false
-name = "process_module_owned"
-
-[[bench]]
-harness = false
-name = "position_lookup_after_cache_warm"
+name = "module_query_roundtrip"
 
 [[bench]]
 harness = false
@@ -60,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
-lean-rs-worker-parent = "0.1.14"
+lean-rs-worker-parent = { path = "../../../lean-rs/crates/lean-rs-worker-parent" }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

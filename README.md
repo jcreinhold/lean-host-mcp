@@ -8,10 +8,11 @@ installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls 
 that child rather than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child; the
 supervisor restarts it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
-Fourteen tools are exposed: six session-backed Lean operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`,
-`is_def_eq`, `hover_by_name`), a filesystem sweep (`project_scan`), three SQLite-indexed lookups (`find_symbol`,
-`find_lemma`, `outline`), three cursor-driven queries (`goal_at_position`, `type_at_position`, `references_of_name`),
-and a file-scoped diagnostics query (`file_diagnostics`). Per-tool request and result schemas live in
+Fourteen tools are exposed: term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`),
+bounded declaration lookup (`search_declarations`, `type_of_name`, `hover_by_name`), a filesystem sweep
+(`project_scan`), two cursor-driven queries (`goal_at_position`, `type_at_position`), a file-scoped diagnostics query
+(`file_diagnostics`), and explicit file/project reference queries (`references_in_file`, `references_in_project`).
+Per-tool request and result schemas live in
 [`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in [`docs/architecture.md`](docs/architecture.md).
 
 ## Prerequisite: any built Lake project
@@ -126,12 +127,14 @@ project is unusable.
 
 ## Capability shims and the position-tool cluster
 
-`goal_at_position`, `type_at_position`, `references_of_name`, and `file_diagnostics` depend on an optional
-`lean_rs_host_process_module_with_info_tree` shim. A worker whose bundled shims do not expose it answers
-`{ "status": "unsupported" }` per call; the tools never raise. Files whose header imports modules the server's open env
-doesn't have are still processed; missing imports surface as an envelope warning (single-file tools) or a result sidebar
-(`references_of_name`). Files using Lean 4's module-system header syntax, including `module`, `public import`,
-`import all`, and `meta import`, are supported. A header that doesn't parse short-circuits to `header_parse_failed`.
+`goal_at_position`, `type_at_position`, `references_in_file`, `references_in_project`, and `file_diagnostics` depend on
+the optional bounded `lean_rs_host_process_module_query` shim. A worker whose bundled shims do not expose it answers
+`{ "status": "unsupported" }` per call; the tools never raise. Each call asks Lean for one narrow projection:
+diagnostics, the selected term type, the selected tactic goals, or name references without raw expression/type strings.
+Files whose header imports modules the server's open env doesn't have are still processed; missing imports surface as an
+envelope warning (single-file tools) or a result sidebar (`references_in_project`). Files using Lean 4's module-system
+header syntax, including `module`, `public import`, `import all`, and `meta import`, are supported. A header that
+doesn't parse short-circuits to `header_parse_failed` where the tool has that status.
 
 Unlike an external LSP process, the host can still start when unrelated project modules are broken. Calls whose imports
 avoid the broken module continue to work, and `file_diagnostics` on the broken file reports Lean diagnostics instead of
@@ -158,8 +161,8 @@ members and silently links `libleanshared` into the parent. The invariant is ass
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.14 (which transitively pin `lean-rs`
-/ `lean-rs-host` 0.1.14). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.15 (which transitively pin `lean-rs`
+/ `lean-rs-host` 0.1.15). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
 inside the `lean-rs` support window declared by
 [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping the supported
 toolchain is a `lean-rs` change first, then a version bump here.

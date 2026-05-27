@@ -1,19 +1,17 @@
-//! Persistent declaration index: one `SQLite` database per Lake project.
+//! Legacy persistent declaration index utilities.
 //!
-//! The index is the only path through which `find_symbol`, `find_lemma`,
-//! and `outline` answer their queries. It hides:
+//! MCP declaration lookup no longer uses a whole-environment `SQLite` index;
+//! the active tools call bounded worker declaration queries instead. This
+//! module remains for the shared Lake-manifest fingerprint helper and for
+//! tests around the old storage shape while migration settles. It hides:
 //!
 //! - the `SQLite` schema (one `declarations` table + a `meta` key/value
 //!   sidecar for the freshness fingerprint),
 //! - the cache-directory layout (`$XDG_CACHE_HOME/lean-host-mcp/…`),
-//! - the rebuild pipeline (filter → list → bulk-describe → insert),
+//! - the legacy rebuild pipeline (filter → list → bulk-describe → insert),
 //! - the Lake-manifest fingerprint that decides when a rebuild is due.
 //!
-//! Nothing past this module's boundary should know about `rusqlite` or
-//! `sha2`; if a fourth caller needs a new query, add a method here.
-//!
-//! The struct is `Send + Sync` so it lives behind an `Arc` on
-//! [`crate::tools::ToolContext`].
+//! New MCP tools should not add callers here.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

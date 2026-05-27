@@ -43,6 +43,12 @@ fn module_syntax_fixture_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn kanproofs_fixture_root() -> Option<PathBuf> {
+    std::env::var("LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE")
+        .ok()
+        .map(PathBuf::from)
+}
+
 fn open_ctx(root: &std::path::Path) -> ToolContext {
     let cache_dir = tempfile::tempdir().expect("tempdir");
     let cache_path = cache_dir.keep();
@@ -143,6 +149,7 @@ async fn describe_prelude_name() {
         HoverByNameRequest {
             name: "Nat.add_zero".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            max_type_bytes: None,
             project: None,
         },
     )
@@ -166,33 +173,39 @@ fn is_def_eq_request_round_trips_transparency() {
 }
 
 #[test]
-fn find_symbol_request_round_trips() {
-    use lean_host_mcp::tools::index::FindSymbolRequest;
+fn search_declarations_request_round_trips() {
+    use lean_host_mcp::tools::lean::SearchDeclarationsRequest;
 
-    let minimal: FindSymbolRequest = serde_json::from_str(r#"{"query":"add_zero"}"#).unwrap();
+    let minimal: SearchDeclarationsRequest = serde_json::from_str(r#"{"query":"add_zero"}"#).unwrap();
     assert_eq!(minimal.query, "add_zero");
     assert!(minimal.imports.is_empty());
     assert!(minimal.limit.is_none());
+    assert!(minimal.include_source);
 
-    let full: FindSymbolRequest = serde_json::from_str(r#"{"query":"map","imports":["List"],"limit":25}"#).unwrap();
+    let full: SearchDeclarationsRequest =
+        serde_json::from_str(r#"{"query":"map","kind":"theorem","imports":["List"],"limit":25}"#).unwrap();
     assert_eq!(full.limit, Some(25));
+    assert_eq!(full.kind.as_deref(), Some("theorem"));
     assert_eq!(full.imports, vec!["List".to_owned()]);
 }
 
 #[test]
-fn outline_request_accepts_module_prefix() {
-    use lean_host_mcp::tools::index::OutlineRequest;
+fn type_of_name_request_accepts_byte_cap() {
+    use lean_host_mcp::tools::lean::TypeOfNameRequest;
 
-    let nat: OutlineRequest = serde_json::from_str(r#"{"module_prefix":"Nat."}"#).unwrap();
-    assert_eq!(nat.module_prefix.as_deref(), Some("Nat."));
+    let nat: TypeOfNameRequest = serde_json::from_str(r#"{"name":"Nat.add_zero","max_type_bytes":4096}"#).unwrap();
+    assert_eq!(nat.name, "Nat.add_zero");
+    assert_eq!(nat.max_type_bytes, Some(4096));
 
-    let none: OutlineRequest = serde_json::from_str("{}").unwrap();
-    assert!(none.module_prefix.is_none());
+    let none: TypeOfNameRequest = serde_json::from_str(r#"{"name":"Nat.add_zero"}"#).unwrap();
+    assert!(none.max_type_bytes.is_none());
 }
 
 #[test]
 fn position_requests_round_trip() {
-    use lean_host_mcp::tools::position::{GoalAtPositionRequest, ReferencesOfNameRequest, TypeAtPositionRequest};
+    use lean_host_mcp::tools::position::{
+        GoalAtPositionRequest, ReferencesInFileRequest, ReferencesInProjectRequest, TypeAtPositionRequest,
+    };
 
     let g: GoalAtPositionRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
     assert_eq!(g.line, 7);
@@ -204,21 +217,23 @@ fn position_requests_round_trip() {
         serde_json::from_str(r#"{"file":"X.lean","line":1,"column":1,"imports":["A.B"]}"#).unwrap();
     assert_eq!(t.line, 1);
 
-    let r_default: ReferencesOfNameRequest = serde_json::from_str(r#"{"name":"Nat.add"}"#).unwrap();
-    assert!(r_default.files.is_empty());
+    let r_file: ReferencesInFileRequest = serde_json::from_str(r#"{"file":"A.lean","name":"Nat.add"}"#).unwrap();
+    assert_eq!(r_file.file, PathBuf::from("A.lean"));
 
-    let r_full: ReferencesOfNameRequest =
-        serde_json::from_str(r#"{"name":"Nat.add","files":["A.lean","B.lean"]}"#).unwrap();
-    assert_eq!(r_full.files.len(), 2);
+    let r_project: ReferencesInProjectRequest =
+        serde_json::from_str(r#"{"name":"Nat.add","files":["A.lean","B.lean"],"limit":25}"#).unwrap();
+    assert_eq!(r_project.files.len(), 2);
+    assert_eq!(r_project.limit, Some(25));
 }
 
 #[test]
 fn references_result_skips_empty_fields() {
-    use lean_host_mcp::tools::position::ReferencesOfNameResult;
+    use lean_host_mcp::tools::position::ReferencesInProjectResult;
 
-    let empty = ReferencesOfNameResult {
+    let empty = ReferencesInProjectResult {
         references: Vec::new(),
         truncated: false,
+        files_scanned: 0,
         unsupported_files: Vec::new(),
         header_parse_failed_files: Vec::new(),
         missing_imports_files: Vec::new(),
@@ -238,9 +253,10 @@ fn references_result_skips_empty_fields() {
         "empty missing_imports_files must be omitted: {s}"
     );
 
-    let with_flags = ReferencesOfNameResult {
+    let with_flags = ReferencesInProjectResult {
         references: Vec::new(),
         truncated: true,
+        files_scanned: 1,
         unsupported_files: vec!["A.lean".into()],
         header_parse_failed_files: Vec::new(),
         missing_imports_files: Vec::new(),
@@ -308,7 +324,7 @@ fn file_diagnostics_result_serialises_status_tag() {
 async fn mathlib_fixture_uses_transitive_package_search_paths() {
     use std::io::Write as _;
 
-    use lean_host_mcp::tools::index::{FindSymbolRequest, find_symbol};
+    use lean_host_mcp::tools::lean::{SearchDeclarationsRequest, search_declarations};
     use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
 
     let Some(root) = mathlib_fixture_root() else {
@@ -338,19 +354,21 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
         inferred.result.rendered
     );
 
-    let symbols = find_symbol(
+    let symbols = search_declarations(
         &ctx,
-        FindSymbolRequest {
+        SearchDeclarationsRequest {
             query: "pow_left_injective".into(),
+            kind: None,
             imports: vec!["Mathlib.Data.Nat.Basic".into()],
             limit: Some(500),
+            include_source: true,
             project: None,
         },
     )
     .await
-    .expect("find_symbol with Mathlib import");
+    .expect("search_declarations with Mathlib import");
     assert!(
-        symbols.result.iter().any(|row| {
+        symbols.result.declarations.iter().any(|row| {
             row.name.starts_with("Mathlib.")
                 || row.source.as_ref().is_some_and(|source| {
                     source.file.contains(".lake/packages/mathlib")
@@ -359,7 +377,7 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
                 })
         }),
         "pow_left_injective search should include a declaration from mathlib; got {:?}",
-        symbols.result
+        symbols.result.declarations
     );
 
     let mut file = tempfile::Builder::new()
@@ -459,6 +477,7 @@ async fn hover_by_name_populates_type_signature() {
         HoverByNameRequest {
             name: "Nat.add_zero".into(),
             imports: vec!["LeanRsFixture.Handles".into()],
+            max_type_bytes: None,
             project: None,
         },
     )
@@ -547,6 +566,141 @@ async fn file_diagnostics_returns_real_errors() {
         .expect("at least one error-severity diagnostic for `1 + 1 = 3 := rfl`");
     let pos = error.position.as_ref().expect("error diagnostic has a position");
     assert_eq!(pos.line, 2, "error must be reported on the theorem line (got {pos:?})");
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn module_query_position_tools_return_bounded_results() {
+    use lean_host_mcp::tools::position::{
+        GoalAtPositionRequest, GoalAtPositionResult, ReferencesInFileRequest, ReferencesInProjectRequest,
+        TypeAtPositionRequest, TypeAtPositionResult, goal_at_position, references_in_file, references_in_project,
+        type_at_position,
+    };
+
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let file = PathBuf::from("LeanRsFixture/SourceRanges.lean");
+
+    let type_resp = type_at_position(
+        &ctx,
+        TypeAtPositionRequest {
+            file: file.clone(),
+            line: 7,
+            column: 9,
+            project: None,
+        },
+    )
+    .await
+    .expect("type_at_position");
+    let TypeAtPositionResult::Term { type_str, .. } = type_resp.result else {
+        panic!("expected a term at theorem name");
+    };
+    assert!(
+        !type_str.value.is_empty(),
+        "type_at_position should render only the selected term type"
+    );
+
+    let goal_resp = goal_at_position(
+        &ctx,
+        GoalAtPositionRequest {
+            file: file.clone(),
+            line: 8,
+            column: 3,
+            project: None,
+        },
+    )
+    .await
+    .expect("goal_at_position");
+    let GoalAtPositionResult::Goal {
+        goals_before,
+        truncated,
+        ..
+    } = goal_resp.result
+    else {
+        panic!("expected a tactic context at `trivial`");
+    };
+    assert!(!truncated, "small fixture goal should not truncate");
+    assert!(
+        goals_before.iter().any(|goal| goal.contains("True")),
+        "goal context should mention True: {goals_before:?}"
+    );
+
+    let name = "LeanRsFixture.SourceRanges.knownTheorem".to_owned();
+    let file_refs = references_in_file(
+        &ctx,
+        ReferencesInFileRequest {
+            file: file.clone(),
+            name: name.clone(),
+            project: None,
+        },
+    )
+    .await
+    .expect("references_in_file");
+    assert!(
+        file_refs.result.references.iter().any(|hit| hit.kind == "def"),
+        "file-local references should include the binder for {name}: {:?}",
+        file_refs.result.references
+    );
+
+    let project_refs = references_in_project(
+        &ctx,
+        ReferencesInProjectRequest {
+            name,
+            files: vec![file],
+            limit: Some(1),
+            project: None,
+        },
+    )
+    .await
+    .expect("references_in_project");
+    assert_eq!(project_refs.result.files_scanned, 1);
+    assert!(
+        project_refs.result.references.len() <= 1,
+        "project reference scan must obey the requested limit"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires built KanProofs; set LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE to enable"]
+async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
+
+    let Some(root) = kanproofs_fixture_root() else {
+        eprintln!("skipping: LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE not set");
+        return;
+    };
+    let file = std::env::var("LEAN_HOST_MCP_TEST_KANPROOFS_FILE").map_or_else(
+        |_| PathBuf::from("KanProofs/AlgebraicGeometry/Sites/FiniteEtale/Quotient/BaseChange/Restrict.lean"),
+        PathBuf::from,
+    );
+    let ctx = open_ctx(&root);
+
+    let diagnostics = file_diagnostics(
+        &ctx,
+        FileDiagnosticsRequest {
+            file: file.clone(),
+            project: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|err| panic!("bounded file_diagnostics must not fail for {}: {err:?}", file.display()));
+    assert!(
+        diagnostics
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("worker protocol frame too large")),
+        "bounded diagnostics should not surface frame-size warnings: {:?}",
+        diagnostics.warnings
+    );
+    assert!(
+        matches!(
+            diagnostics.result,
+            FileDiagnosticsResult::Elaborated { .. } | FileDiagnosticsResult::HeaderParseFailed { .. }
+        ),
+        "KanProofs smoke should return a structured diagnostics result"
+    );
 }
 
 #[tokio::test]
@@ -677,11 +831,9 @@ async fn per_call_imports_avoid_broken_project_umbrella_failure() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn file_diagnostics_cache_warm() {
-    use lean_host_mcp::tools::position::{
-        FileDiagnosticsRequest, GoalAtPositionRequest, file_diagnostics, goal_at_position,
-    };
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, file_diagnostics};
 
-    const HINT_FRAGMENT: &str = "file processed and cached";
+    const HINT_FRAGMENT: &str = "module query result cached";
 
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -705,25 +857,7 @@ async fn file_diagnostics_cache_warm() {
         cold.next_actions
     );
 
-    // Different tool, same file: must hit the shared cache (no hint).
-    let probe = goal_at_position(
-        &ctx,
-        GoalAtPositionRequest {
-            file: file.clone(),
-            line: 1,
-            column: 1,
-            project: None,
-        },
-    )
-    .await
-    .expect("goal_at_position");
-    assert!(
-        probe.next_actions.iter().all(|n| !n.contains(HINT_FRAGMENT)),
-        "second tool call against the cached file must not re-process; next_actions={:?}",
-        probe.next_actions
-    );
-
-    // Warm: same tool, still cached.
+    // Warm: same bounded query, same file contents.
     let warm = file_diagnostics(&ctx, FileDiagnosticsRequest { file, project: None })
         .await
         .expect("warm file_diagnostics");
@@ -736,41 +870,45 @@ async fn file_diagnostics_cache_warm() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn index_rebuilds_and_finds_prelude_theorem() {
-    use lean_host_mcp::tools::index::{FindLemmaRequest, FindSymbolRequest, find_lemma, find_symbol};
+async fn declaration_search_finds_prelude_theorem_without_index_rebuild() {
+    use lean_host_mcp::tools::lean::{SearchDeclarationsRequest, search_declarations};
 
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
 
-    let init_resp = find_symbol(
+    let init_resp = search_declarations(
         &ctx,
-        FindSymbolRequest {
+        SearchDeclarationsRequest {
             query: "Nat.add".into(),
+            kind: None,
             imports: Vec::new(),
             limit: Some(10),
+            include_source: true,
             project: None,
         },
     )
     .await
-    .expect("find_symbol with no imports");
+    .expect("search_declarations with no imports");
     assert!(
         init_resp.freshness.imports.is_empty(),
         "freshness imports must reflect the empty request"
     );
 
-    let resp = find_lemma(
+    let resp = search_declarations(
         &ctx,
-        FindLemmaRequest {
+        SearchDeclarationsRequest {
             query: "add_zero".into(),
+            kind: Some("theorem".into()),
             imports: vec!["LeanRsFixture.Handles".into()],
             limit: Some(50),
+            include_source: true,
             project: None,
         },
     )
     .await
-    .expect("find_lemma");
+    .expect("search_declarations theorem filter");
     assert_eq!(
         resp.freshness.imports,
         vec!["LeanRsFixture.Handles".to_owned()],
@@ -779,13 +917,13 @@ async fn index_rebuilds_and_finds_prelude_theorem() {
     assert!(
         resp.next_actions
             .iter()
-            .any(|hint| hint.contains("declaration index was rebuilt")),
-        "different import vectors must force an index rebuild; next_actions={:?}",
+            .all(|hint| !hint.contains("declaration index was rebuilt")),
+        "declaration search must not rebuild a SQLite index; next_actions={:?}",
         resp.next_actions
     );
     assert!(
-        resp.result.iter().any(|d| d.name == "Nat.add_zero"),
-        "Nat.add_zero must be reachable through find_lemma after rebuild"
+        resp.result.declarations.iter().any(|d| d.name == "Nat.add_zero"),
+        "Nat.add_zero must be reachable through bounded declaration search"
     );
 }
 

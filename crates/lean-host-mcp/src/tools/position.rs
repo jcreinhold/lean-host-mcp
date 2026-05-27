@@ -1,26 +1,9 @@
-//! Position-based tools: `goal_at_position`, `type_at_position`,
-//! `references_of_name`, `file_diagnostics`.
+//! Bounded module-query tools: `file_diagnostics`, `goal_at_position`,
+//! `type_at_position`, `references_in_file`, and `references_in_project`.
 //!
-//! All four project the same upstream value
-//! ([`ProcessedFile`](lean_rs_host::host::process::ProcessedFile)) into a
-//! tool-specific result enum. Repeated calls against the same source bytes
-//! reuse a cached projection (see [`crate::cache::ProcessedFileCache`]).
-//!
-//! `file_diagnostics` is grouped here despite not taking a cursor: it shares
-//! the cache-and-projection plumbing with its three siblings, so an agent's
-//! typical "what's wrong; then probe the problem site" loop pays for the
-//! elaboration once.
-//!
-//! The tools drive `LeanProject`'s worker actor with `process_module`, the
-//! header-aware shim. The file's own `import` declarations are parsed by
-//! Lean and validated against the server's open env; mismatch surfaces as a
-//! `warnings` entry on the envelope, not as a silent empty result. A header
-//! that fails to parse short-circuits to a `header_parse_failed` status
-//! variant carrying the parser diagnostics.
-//!
-//! The shim is optional. When the loaded dylib lacks
-//! `process_module_with_info_tree`, each tool answers with the
-//! `Unsupported` result variant.
+//! Each tool calls `LeanWorkerSession::process_module_query` with the
+//! narrow projection it needs. The server never requests, transports, or
+//! caches a whole-file info tree.
 
 // Tool handlers consume their request structs (owned strings into the
 // worker-actor channel); pass-by-value is intentional.
@@ -30,24 +13,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lean_rs_worker_parent::{
-    LeanWorkerNameRef, LeanWorkerProcessModuleOutcome, LeanWorkerProcessedFile, LeanWorkerTacticInfo,
-    LeanWorkerTermInfo,
+    LeanWorkerElabOptions, LeanWorkerGoalAtResult, LeanWorkerModuleQuery, LeanWorkerModuleQueryOutcome,
+    LeanWorkerModuleQueryResult, LeanWorkerModuleSourceSpan, LeanWorkerNameRef, LeanWorkerRenderedInfo,
+    LeanWorkerTypeAtResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
-use crate::cache::{self, ProcessedFileCache, hash_bytes};
+use crate::cache::{ModuleQueryKey, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::project::LeanProject;
-use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
+use crate::projections::{Diagnostic, ElabFailure, Severity, map_worker_err, project_failure};
 use crate::tools::{ToolContext, freshness_for, is_ignored_dir, session_imports};
 
-/// Hard cap on the number of references aggregated in
-/// [`references_of_name`]. Matches `project_scan`'s cap so the two
-/// project-walking tools agree on the bound.
+/// Hard cap on project-wide reference aggregation. File-local reference
+/// queries are also bounded by the upstream projection.
 const MAX_REFERENCES: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -56,6 +39,12 @@ pub struct SourceSpan {
     pub start_column: u32,
     pub end_line: u32,
     pub end_column: u32,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RenderedText {
+    pub value: String,
+    pub truncated: bool,
 }
 
 // --- goal_at_position --------------------------------------------------
@@ -70,7 +59,7 @@ pub struct GoalAtPositionRequest {
     /// 1-indexed column.
     pub column: u32,
     /// Optional explicit project (absolute path to Lake root). When
-    /// omitted, the server resolves via env → cwd-walk → config default.
+    /// omitted, the server resolves via env -> cwd-walk -> config default.
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -82,9 +71,9 @@ pub enum GoalAtPositionResult {
         goals_before: Vec<String>,
         goals_after: Vec<String>,
         span: SourceSpan,
+        truncated: bool,
     },
     NoTacticContext,
-    /// The file's header did not parse; the body was never elaborated.
     HeaderParseFailed {
         diagnostics: ElabFailure,
     },
@@ -94,38 +83,56 @@ pub enum GoalAtPositionResult {
 /// # Errors
 ///
 /// Returns `ServerError::Io` when the file cannot be read, and propagates
-/// `ServerError::Lean` from the underlying `process_module` call.
+/// `ServerError::Lean` from the underlying `process_module_query` call.
 pub async fn goal_at_position(ctx: &ToolContext, req: GoalAtPositionRequest) -> Result<Response<GoalAtPositionResult>> {
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &[]);
-            let outcome = ensure_processed(&project, &req.file).await?;
-            let (file, fresh, missing) = match outcome {
-                EnsureOutcome::Ready {
-                    file,
+            let query = LeanWorkerModuleQuery::GoalAt {
+                line: req.line,
+                column: req.column,
+            };
+            let outcome = run_module_query(&project, &req.file, query).await?;
+            let (result, fresh, missing) = match outcome {
+                ModuleQueryRun::Ready {
+                    result: LeanWorkerModuleQueryResult::GoalAt(result),
                     freshly_processed,
                     missing_imports,
-                } => (file, freshly_processed, missing_imports),
-                EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                } => {
+                    let projected = match result {
+                        LeanWorkerGoalAtResult::Goal {
+                            span,
+                            goals_before,
+                            goals_after,
+                            truncated,
+                        } => GoalAtPositionResult::Goal {
+                            goals_before,
+                            goals_after,
+                            span: span_of_module(span),
+                            truncated,
+                        },
+                        LeanWorkerGoalAtResult::NoTacticContext => GoalAtPositionResult::NoTacticContext,
+                        _ => GoalAtPositionResult::Unsupported,
+                    };
+                    (projected, freshly_processed, missing_imports)
+                }
+                ModuleQueryRun::Ready {
+                    freshly_processed,
+                    missing_imports,
+                    ..
+                } => (GoalAtPositionResult::Unsupported, freshly_processed, missing_imports),
+                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
                     return Ok(Response::ok(
                         GoalAtPositionResult::HeaderParseFailed { diagnostics },
                         freshness,
                     ));
                 }
-                EnsureOutcome::Unsupported => {
+                ModuleQueryRun::Unsupported => {
                     return Ok(Response::ok(GoalAtPositionResult::Unsupported, freshness));
                 }
             };
-            let result = match cache::tactic_at(&file, req.line, req.column) {
-                Some(node) => GoalAtPositionResult::Goal {
-                    goals_before: node.goals_before.clone(),
-                    goals_after: node.goals_after.clone(),
-                    span: span_of_tactic(node),
-                },
-                None => GoalAtPositionResult::NoTacticContext,
-            };
-            Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+            Ok(attach_query_notes(Response::ok(result, freshness), fresh, &missing))
         })
         .await
 }
@@ -145,14 +152,12 @@ pub struct TypeAtPositionRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TypeAtPositionResult {
     Term {
-        /// `Expr.toString` of the elaborated expression at the cursor.
-        expr: String,
-        /// `Expr.toString` of the inferred type. Empty when Lean recorded
-        /// the term but inference did not produce a type at that site.
-        type_str: String,
-        /// Set when the elaborator recorded an expected type (e.g., a
-        /// coercion site).
-        expected_type: Option<String>,
+        /// Bounded rendering of the elaborated expression at the cursor.
+        expr: RenderedText,
+        /// Bounded rendering of the inferred type.
+        type_str: RenderedText,
+        /// Set when the elaborator recorded an expected type.
+        expected_type: Option<RenderedText>,
         span: SourceSpan,
     },
     NoTerm,
@@ -170,48 +175,81 @@ pub async fn type_at_position(ctx: &ToolContext, req: TypeAtPositionRequest) -> 
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &[]);
-            let outcome = ensure_processed(&project, &req.file).await?;
-            let (file, fresh, missing) = match outcome {
-                EnsureOutcome::Ready {
-                    file,
+            let query = LeanWorkerModuleQuery::TypeAt {
+                line: req.line,
+                column: req.column,
+            };
+            let outcome = run_module_query(&project, &req.file, query).await?;
+            let (result, fresh, missing) = match outcome {
+                ModuleQueryRun::Ready {
+                    result: LeanWorkerModuleQueryResult::TypeAt(result),
                     freshly_processed,
                     missing_imports,
-                } => (file, freshly_processed, missing_imports),
-                EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                } => {
+                    let projected = match result {
+                        LeanWorkerTypeAtResult::Term {
+                            span,
+                            expr,
+                            type_str,
+                            expected_type,
+                        } => TypeAtPositionResult::Term {
+                            expr: rendered_text(expr),
+                            type_str: rendered_text(type_str),
+                            expected_type: expected_type.map(rendered_text),
+                            span: span_of_module(span),
+                        },
+                        LeanWorkerTypeAtResult::NoTerm => TypeAtPositionResult::NoTerm,
+                        _ => TypeAtPositionResult::Unsupported,
+                    };
+                    (projected, freshly_processed, missing_imports)
+                }
+                ModuleQueryRun::Ready {
+                    freshly_processed,
+                    missing_imports,
+                    ..
+                } => (TypeAtPositionResult::Unsupported, freshly_processed, missing_imports),
+                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
                     return Ok(Response::ok(
                         TypeAtPositionResult::HeaderParseFailed { diagnostics },
                         freshness,
                     ));
                 }
-                EnsureOutcome::Unsupported => {
+                ModuleQueryRun::Unsupported => {
                     return Ok(Response::ok(TypeAtPositionResult::Unsupported, freshness));
                 }
             };
-            let result = match cache::term_at(&file, req.line, req.column) {
-                Some(node) => TypeAtPositionResult::Term {
-                    expr: node.expr_str.clone(),
-                    type_str: node.type_str.clone(),
-                    expected_type: node.expected_type_str.clone(),
-                    span: span_of_term(node),
-                },
-                None => TypeAtPositionResult::NoTerm,
-            };
-            Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+            Ok(attach_query_notes(Response::ok(result, freshness), fresh, &missing))
         })
         .await
 }
 
-// --- references_of_name ------------------------------------------------
+// --- references --------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct ReferencesOfNameRequest {
+pub struct ReferencesInFileRequest {
+    /// Path to a `.lean` file. Resolved against the resolved project root
+    /// if relative.
+    pub file: PathBuf,
     /// Fully-qualified Lean name as the elaborator records it
     /// (e.g. `"Nat.add"`). No normalisation.
     pub name: String,
-    /// Files to search. Empty = walk every `.lean` file under the
-    /// resolved project root.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReferencesInProjectRequest {
+    /// Fully-qualified Lean name as the elaborator records it
+    /// (e.g. `"Nat.add"`). No normalisation.
+    pub name: String,
+    /// Files to search. Empty = explicitly walk every `.lean` file under
+    /// the resolved project root.
     #[serde(default)]
     pub files: Vec<PathBuf>,
+    /// Maximum references to return. Values above the server cap are
+    /// clamped to the cap.
+    #[serde(default)]
+    pub limit: Option<usize>,
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -227,21 +265,12 @@ pub struct ReferenceHit {
     pub kind: &'static str,
 }
 
-/// Per-file sidebar entry for header parse failures during a walk.
-///
-/// The walk continues past these files; their diagnostics are surfaced here
-/// so the caller can decide whether to act.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct HeaderParseFailedFile {
     pub file: String,
     pub diagnostics: ElabFailure,
 }
 
-/// Per-file sidebar entry for missing-import diagnostics during a walk.
-///
-/// The header parsed but referenced modules the session's open env does not
-/// have. The file's body was still processed and any references it produced
-/// are in the top-level `references` list.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct MissingImportsFile {
     pub file: String,
@@ -249,32 +278,114 @@ pub struct MissingImportsFile {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ReferencesOfNameResult {
+pub struct ReferencesInFileResult {
+    pub references: Vec<ReferenceHit>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReferencesInProjectResult {
     pub references: Vec<ReferenceHit>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// Files whose worker host shims lacked the info-tree shim. Omitted when empty.
+    pub files_scanned: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsupported_files: Vec<String>,
-    /// Files whose header did not parse. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub header_parse_failed_files: Vec<HeaderParseFailedFile>,
-    /// Files with imports the server's env does not satisfy. Omitted when
-    /// empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing_imports_files: Vec<MissingImportsFile>,
 }
 
 /// # Errors
 ///
-/// Returns `ServerError::Lean` if the underlying `process_module` call
-/// fails for a non-`Unsupported`, non-`HeaderParseFailed`, non-`MissingImports`
-/// reason. Files that cannot be read are skipped silently (same policy
-/// as [`crate::tools::scan::project_scan`]).
-pub async fn references_of_name(
+/// As [`goal_at_position`].
+pub async fn references_in_file(
     ctx: &ToolContext,
-    req: ReferencesOfNameRequest,
-) -> Result<Response<ReferencesOfNameResult>> {
+    req: ReferencesInFileRequest,
+) -> Result<Response<ReferencesInFileResult>> {
+    let hint = ProjectHint::from_request(req.project);
+    ctx.broker
+        .with_project(hint, move |project| async move {
+            let freshness = freshness_for(&project, &[]);
+            let root = project.canonical_root().to_path_buf();
+            let resolved = resolve_path(&root, &req.file);
+            let display = display_path(&root, &resolved);
+            let query = LeanWorkerModuleQuery::References { name: req.name };
+            let outcome = run_module_query(&project, &resolved, query).await?;
+            match outcome {
+                ModuleQueryRun::Ready {
+                    result: LeanWorkerModuleQueryResult::References(result),
+                    freshly_processed,
+                    missing_imports,
+                } => {
+                    let references = result
+                        .references
+                        .iter()
+                        .map(|node| project_reference(&display, node))
+                        .collect();
+                    let response = Response::ok(
+                        ReferencesInFileResult {
+                            references,
+                            truncated: result.truncated,
+                        },
+                        freshness,
+                    );
+                    Ok(attach_query_notes(response, freshly_processed, &missing_imports))
+                }
+                ModuleQueryRun::Ready {
+                    freshly_processed,
+                    missing_imports,
+                    ..
+                } => Ok(attach_query_notes(
+                    Response::ok(
+                        ReferencesInFileResult {
+                            references: Vec::new(),
+                            truncated: false,
+                        },
+                        freshness,
+                    ),
+                    freshly_processed,
+                    &missing_imports,
+                )),
+                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
+                    let mut response = Response::ok(
+                        ReferencesInFileResult {
+                            references: Vec::new(),
+                            truncated: false,
+                        },
+                        freshness,
+                    );
+                    response
+                        .warnings
+                        .push("file header did not parse; no references were collected".to_owned());
+                    response.warnings.push(format!(
+                        "header diagnostics available from file_diagnostics: {}",
+                        diagnostics.diagnostics.len()
+                    ));
+                    Ok(response)
+                }
+                ModuleQueryRun::Unsupported => Ok(Response::ok(
+                    ReferencesInFileResult {
+                        references: Vec::new(),
+                        truncated: false,
+                    },
+                    freshness,
+                )),
+            }
+        })
+        .await
+}
+
+/// # Errors
+///
+/// Returns `ServerError::Lean` if an underlying file query fails for an
+/// infrastructure reason. Files that cannot be read are skipped silently
+/// (same policy as [`crate::tools::scan::project_scan`]).
+pub async fn references_in_project(
+    ctx: &ToolContext,
+    req: ReferencesInProjectRequest,
+) -> Result<Response<ReferencesInProjectResult>> {
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
@@ -285,48 +396,69 @@ pub async fn references_of_name(
             } else {
                 req.files.iter().map(|p| resolve_path(&root, p)).collect()
             };
+            let limit = req.limit.unwrap_or(MAX_REFERENCES).min(MAX_REFERENCES);
 
             let mut hits: Vec<ReferenceHit> = Vec::new();
             let mut unsupported_files: Vec<String> = Vec::new();
             let mut header_parse_failed_files: Vec<HeaderParseFailedFile> = Vec::new();
             let mut missing_imports_files: Vec<MissingImportsFile> = Vec::new();
             let mut truncated = false;
+            let mut files_scanned = 0usize;
             let mut any_freshly_processed = false;
 
             'outer: for path in files {
                 let display = display_path(&root, &path);
-                match ensure_processed(&project, &path).await? {
-                    EnsureOutcome::Ready {
-                        file,
+                let query = LeanWorkerModuleQuery::References { name: req.name.clone() };
+                match run_module_query(&project, &path, query).await {
+                    Ok(ModuleQueryRun::Ready {
+                        result: LeanWorkerModuleQueryResult::References(result),
                         freshly_processed,
                         missing_imports,
-                    } => {
-                        if freshly_processed {
-                            any_freshly_processed = true;
-                        }
+                    }) => {
+                        files_scanned = files_scanned.saturating_add(1);
+                        any_freshly_processed |= freshly_processed;
                         if !missing_imports.is_empty() {
                             missing_imports_files.push(MissingImportsFile {
                                 file: display.clone(),
                                 missing: missing_imports,
                             });
                         }
-                        for node in cache::references_of(&file, &req.name) {
-                            if hits.len() >= MAX_REFERENCES {
+                        if result.truncated {
+                            truncated = true;
+                        }
+                        for node in &result.references {
+                            if hits.len() >= limit {
                                 truncated = true;
                                 break 'outer;
                             }
                             hits.push(project_reference(&display, node));
                         }
                     }
-                    EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                    Ok(ModuleQueryRun::Ready {
+                        freshly_processed,
+                        missing_imports,
+                        ..
+                    }) => {
+                        files_scanned = files_scanned.saturating_add(1);
+                        any_freshly_processed |= freshly_processed;
+                        if !missing_imports.is_empty() {
+                            missing_imports_files.push(MissingImportsFile {
+                                file: display,
+                                missing: missing_imports,
+                            });
+                        }
+                    }
+                    Ok(ModuleQueryRun::HeaderParseFailed { diagnostics }) => {
                         header_parse_failed_files.push(HeaderParseFailedFile {
                             file: display,
                             diagnostics,
                         });
                     }
-                    EnsureOutcome::Unsupported => {
+                    Ok(ModuleQueryRun::Unsupported) => {
                         unsupported_files.push(display);
                     }
+                    Err(ServerError::Io(_)) => {}
+                    Err(err) => return Err(err),
                 }
             }
 
@@ -337,18 +469,15 @@ pub async fn references_of_name(
                     .then(a.column.cmp(&b.column))
             });
 
-            let result = ReferencesOfNameResult {
+            let result = ReferencesInProjectResult {
                 references: hits,
                 truncated,
+                files_scanned,
                 unsupported_files,
                 header_parse_failed_files,
                 missing_imports_files,
             };
-            // `references_of_name` accumulates per-file `MissingImports` into
-            // the result sidebar rather than the envelope warnings: the
-            // single-file tools surface it as a warning, but a project-wide
-            // walk against a dozen mismatched files would drown the envelope.
-            Ok(attach_envelope_notes(
+            Ok(attach_query_notes(
                 Response::ok(result, freshness),
                 any_freshly_processed,
                 &[],
@@ -368,9 +497,7 @@ pub struct FileDiagnosticsRequest {
     pub project: Option<String>,
 }
 
-/// Per-severity counts attached to every diagnostics-bearing variant. The
-/// first read most callers do is "are there errors?"; surfacing the totals
-/// here saves them iterating the list to find out.
+/// Per-severity counts attached to every diagnostics-bearing variant.
 #[derive(Debug, Clone, Copy, Default, Serialize, JsonSchema)]
 pub struct DiagnosticSummary {
     pub errors: usize,
@@ -400,22 +527,17 @@ pub enum FileDiagnosticsResult {
     /// errors/warnings/info tally; `diagnostics` is the full list, sorted
     /// by `(line, column)`. `truncated` is true only when Lean hit the
     /// diagnostic byte budget and the list is a prefix.
-    ///
-    /// Note: `summary.errors > 0` means the file has elaboration errors;
-    /// `status: "elaborated"` only says we got far enough to collect them.
     Elaborated {
         summary: DiagnosticSummary,
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
     },
     /// The file's header did not parse; the body was never elaborated.
-    /// Same shape as `Elaborated` so callers render one structure, not two.
     HeaderParseFailed {
         summary: DiagnosticSummary,
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
     },
-    /// Worker host shims lack `process_module_with_info_tree`.
     Unsupported,
 }
 
@@ -430,14 +552,32 @@ pub async fn file_diagnostics(
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &[]);
-            let outcome = ensure_processed(&project, &req.file).await?;
-            let (file, fresh, missing) = match outcome {
-                EnsureOutcome::Ready {
-                    file,
+            let outcome = run_module_query(&project, &req.file, LeanWorkerModuleQuery::Diagnostics).await?;
+            let (result, fresh, missing) = match outcome {
+                ModuleQueryRun::Ready {
+                    result: LeanWorkerModuleQueryResult::Diagnostics(diagnostics),
                     freshly_processed,
                     missing_imports,
-                } => (file, freshly_processed, missing_imports),
-                EnsureOutcome::HeaderParseFailed { diagnostics } => {
+                } => {
+                    let projected = project_failure(&diagnostics);
+                    let diagnostics = sort_diagnostics(projected.diagnostics);
+                    let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
+                    (
+                        FileDiagnosticsResult::Elaborated {
+                            summary,
+                            diagnostics,
+                            truncated: projected.truncated,
+                        },
+                        freshly_processed,
+                        missing_imports,
+                    )
+                }
+                ModuleQueryRun::Ready {
+                    freshly_processed,
+                    missing_imports,
+                    ..
+                } => (FileDiagnosticsResult::Unsupported, freshly_processed, missing_imports),
+                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
                     let ElabFailure { diagnostics, truncated } = diagnostics;
                     let diagnostics = sort_diagnostics(diagnostics);
                     let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
@@ -450,25 +590,15 @@ pub async fn file_diagnostics(
                         freshness,
                     ));
                 }
-                EnsureOutcome::Unsupported => {
+                ModuleQueryRun::Unsupported => {
                     return Ok(Response::ok(FileDiagnosticsResult::Unsupported, freshness));
                 }
             };
-            let projected = project_failure(&file.diagnostics);
-            let diagnostics = sort_diagnostics(projected.diagnostics);
-            let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
-            let result = FileDiagnosticsResult::Elaborated {
-                summary,
-                diagnostics,
-                truncated: projected.truncated,
-            };
-            Ok(attach_envelope_notes(Response::ok(result, freshness), fresh, &missing))
+            Ok(attach_query_notes(Response::ok(result, freshness), fresh, &missing))
         })
         .await
 }
 
-/// Sort diagnostics by `(line, column)` so the wire order is deterministic;
-/// Lean's source order is usually but not always position-ordered.
 fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
     diagnostics.sort_by_key(|d| d.position.as_ref().map_or((u32::MAX, u32::MAX), |p| (p.line, p.column)));
     diagnostics
@@ -476,14 +606,10 @@ fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 
 // --- shared plumbing ---------------------------------------------------
 
-/// Outcome of running a file through the cache-or-process flow.
-enum EnsureOutcome {
+enum ModuleQueryRun {
     Ready {
-        file: Arc<LeanWorkerProcessedFile>,
+        result: LeanWorkerModuleQueryResult,
         freshly_processed: bool,
-        /// Header imports the session's open env does not have. Empty in
-        /// the clean case. The body still ran against the env; the
-        /// projection in `file` is real (possibly partial) data.
         missing_imports: Vec<String>,
     },
     HeaderParseFailed {
@@ -492,47 +618,63 @@ enum EnsureOutcome {
     Unsupported,
 }
 
-/// Read `path` from disk, hash, hit-or-fill the cache. On miss, dispatch
-/// `process_module` to the project's worker actor and route the four-arm
-/// outcome.
-async fn ensure_processed(project: &Arc<LeanProject>, path: &Path) -> Result<EnsureOutcome> {
+async fn run_module_query(
+    project: &Arc<LeanProject>,
+    path: &Path,
+    query: LeanWorkerModuleQuery,
+) -> Result<ModuleQueryRun> {
     let resolved = resolve_path(project.canonical_root(), path);
     let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
     let hash = hash_bytes(&bytes);
-    let cache: &ProcessedFileCache = project.cache();
-    if let Some(file) = cache.get(&resolved, hash) {
-        return Ok(EnsureOutcome::Ready {
-            file,
-            freshly_processed: false,
-            missing_imports: Vec::new(),
-        });
+    let key = ModuleQueryKey::from_query(&query);
+    if let Some(outcome) = project.module_query_cache().get(&resolved, hash, &key) {
+        return Ok(route_query_outcome(outcome, false));
     }
+
     let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
-    match process_module(project, source).await? {
-        LeanWorkerProcessModuleOutcome::Ok { file, .. } => {
-            let arc = Arc::new(file);
-            cache.insert(resolved, hash, Arc::clone(&arc));
-            Ok(EnsureOutcome::Ready {
-                file: arc,
-                freshly_processed: true,
-                missing_imports: Vec::new(),
-            })
-        }
-        LeanWorkerProcessModuleOutcome::MissingImports { file, missing, .. } => {
-            let arc = Arc::new(file);
-            cache.insert(resolved, hash, Arc::clone(&arc));
-            Ok(EnsureOutcome::Ready {
-                file: arc,
-                freshly_processed: true,
-                missing_imports: missing,
-            })
-        }
-        LeanWorkerProcessModuleOutcome::HeaderParseFailed { diagnostics } => Ok(EnsureOutcome::HeaderParseFailed {
+    let outcome = process_module_query(project, source, query).await?;
+    project
+        .module_query_cache()
+        .insert(resolved, hash, key, outcome.clone());
+    Ok(route_query_outcome(outcome, true))
+}
+
+fn route_query_outcome(outcome: LeanWorkerModuleQueryOutcome, freshly_processed: bool) -> ModuleQueryRun {
+    match outcome {
+        LeanWorkerModuleQueryOutcome::Ok { result, .. } => ModuleQueryRun::Ready {
+            result,
+            freshly_processed,
+            missing_imports: Vec::new(),
+        },
+        LeanWorkerModuleQueryOutcome::MissingImports { result, missing, .. } => ModuleQueryRun::Ready {
+            result,
+            freshly_processed,
+            missing_imports: missing,
+        },
+        LeanWorkerModuleQueryOutcome::HeaderParseFailed { diagnostics } => ModuleQueryRun::HeaderParseFailed {
             diagnostics: project_failure(&diagnostics),
-        }),
-        LeanWorkerProcessModuleOutcome::Unsupported => Ok(EnsureOutcome::Unsupported),
-        _ => Ok(EnsureOutcome::Unsupported),
+        },
+        LeanWorkerModuleQueryOutcome::Unsupported => ModuleQueryRun::Unsupported,
+        _ => ModuleQueryRun::Unsupported,
     }
+}
+
+async fn process_module_query(
+    project: &Arc<LeanProject>,
+    source: String,
+    query: LeanWorkerModuleQuery,
+) -> Result<LeanWorkerModuleQueryOutcome> {
+    let imports = session_imports(header_imports(&source));
+    project
+        .submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            session
+                .process_module_query(&source, query, &LeanWorkerElabOptions::new(), None, None)
+                .map_err(map_worker_err)
+        })
+        .await
 }
 
 fn resolve_path(root: &Path, path: &Path) -> PathBuf {
@@ -547,21 +689,19 @@ fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
 }
 
-fn span_of_tactic(node: &LeanWorkerTacticInfo) -> SourceSpan {
+fn span_of_module(span: LeanWorkerModuleSourceSpan) -> SourceSpan {
     SourceSpan {
-        start_line: node.start_line,
-        start_column: node.start_column,
-        end_line: node.end_line,
-        end_column: node.end_column,
+        start_line: span.start_line,
+        start_column: span.start_column,
+        end_line: span.end_line,
+        end_column: span.end_column,
     }
 }
 
-fn span_of_term(node: &LeanWorkerTermInfo) -> SourceSpan {
-    SourceSpan {
-        start_line: node.start_line,
-        start_column: node.start_column,
-        end_line: node.end_line,
-        end_column: node.end_column,
+fn rendered_text(info: LeanWorkerRenderedInfo) -> RenderedText {
+    RenderedText {
+        value: info.value,
+        truncated: info.truncated,
     }
 }
 
@@ -576,27 +716,32 @@ fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
     }
 }
 
-/// Header-aware module processing. Submits a closure to the project's
-/// worker actor that opens a session with the file's header imports, runs
-/// `process_module`, and returns the four-arm outcome. The file header is
-/// the import source for this operation.
-async fn process_module(project: &Arc<LeanProject>, source: String) -> Result<LeanWorkerProcessModuleOutcome> {
-    let imports = session_imports(header_imports(&source));
-    project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(crate::projections::map_worker_err)?;
-            session
-                .process_module(
-                    &source,
-                    &lean_rs_worker_parent::LeanWorkerElabOptions::new(),
-                    None,
-                    None,
-                )
-                .map_err(crate::projections::map_worker_err)
-        })
-        .await
+fn attach_query_notes<T>(mut response: Response<T>, freshly_processed: bool, missing_imports: &[String]) -> Response<T>
+where
+    T: Serialize + JsonSchema,
+{
+    if freshly_processed {
+        response.next_actions.push(
+            "module query result cached; repeating the same query against the same file contents reuses it".to_owned(),
+        );
+    }
+    if !missing_imports.is_empty() {
+        response.warnings.push(format!(
+            "file header referenced imports not present in the opened session: {}",
+            missing_imports.join(", ")
+        ));
+    }
+    response
+}
+
+fn enumerate_lean_files(root: &Path) -> Vec<PathBuf> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| entry.file_name().to_str().is_none_or(|name| !is_ignored_dir(name)))
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "lean"))
+        .map(|entry| entry.into_path())
+        .collect()
 }
 
 fn header_imports(source: &str) -> Vec<String> {
@@ -618,47 +763,9 @@ fn header_imports(source: &str) -> Vec<String> {
             if words.clone().next() == Some("all") {
                 let _ = words.next();
             }
-            Some(words)
+            words.next().map(str::to_owned)
         })
-        .flatten()
-        .map(ToOwned::to_owned)
         .collect()
-}
-
-fn enumerate_lean_files(root: &Path) -> Vec<PathBuf> {
-    WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| !is_ignored_dir(e.file_name().to_str().unwrap_or("")))
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("lean"))
-        .map(|e| e.into_path())
-        .collect()
-}
-
-/// Attach a cache-hint hint (if the file was freshly processed) and a
-/// `MissingImports` warning (if non-empty). Used by `goal_at_position` and
-/// `type_at_position`; `references_of_name` surfaces missing imports in
-/// the result sidebar instead.
-fn attach_envelope_notes<T>(resp: Response<T>, freshly_processed: bool, missing_imports: &[String]) -> Response<T>
-where
-    T: serde::Serialize + schemars::JsonSchema,
-{
-    let resp = if freshly_processed {
-        resp.hint("file processed and cached; subsequent position queries against the same contents reuse the cache")
-    } else {
-        resp
-    };
-    if missing_imports.is_empty() {
-        resp
-    } else {
-        resp.warn(format!(
-            "file imports modules that are not available in this session: [{}]—projection may be partial; \
-             build or fix those imports to resolve this",
-            missing_imports.join(", ")
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -666,27 +773,22 @@ mod tests {
     use super::header_imports;
 
     #[test]
-    fn header_imports_ignores_module_system_modifiers() {
-        let source = r"
+    fn header_imports_handles_public_meta_and_all() {
+        let source = "\
 module
 
-public import Public.Surface
-import Internal.Support
-import all Internal.Private
-meta import Macro.Support
-public meta import Public.Meta
-
-def body := 1
+public import Foo.Bar
+meta import Baz.Qux
+import all Project.Internal
+import Init -- comment
 ";
-
         assert_eq!(
             header_imports(source),
             vec![
-                "Public.Surface",
-                "Internal.Support",
-                "Internal.Private",
-                "Macro.Support",
-                "Public.Meta",
+                "Foo.Bar".to_owned(),
+                "Baz.Qux".to_owned(),
+                "Project.Internal".to_owned(),
+                "Init".to_owned(),
             ]
         );
     }

@@ -23,7 +23,7 @@ was recently evicted. When omitted, the server resolves the project via the stan
 
 The `project` field is omitted from the per-tool examples below for brevity; assume it on every request schema.
 
-Lean session and index tools also accept an `imports` field. It is the complete per-call import vector. An empty array
+Lean session and declaration tools also accept an `imports` field. It is the complete per-call import vector. An empty array
 means the call asks for no extra imports beyond the worker's base environment.
 
 ## Lean session tools (`src/tools/lean.rs`)
@@ -86,16 +86,46 @@ reducibility view `Meta.isDefEq` runs under: the same two terms can be def-eq un
 
 ```jsonc
 // request
-{ "name": "Nat.add_zero", "imports": [] }
+{ "name": "Nat.add_zero", "imports": [], "max_type_bytes": 8192 }
 
 // result
 { "status": "found",   "name": "Nat.add_zero", "kind": "theorem",
-  "type_signature": "∀ (n : Nat), n + 0 = n", "source": { ... } }
+  "type_signature": { "value": "∀ (n : Nat), n + 0 = n", "truncated": false },
+  "source": { ... } }
 { "status": "missing", "name": "Nat.foo_bar" }
 ```
 
-`type_signature` is the pretty-printed declaration type as the worker's `LeanWorkerDeclarationRow` reports it
-(notation-aware where available).
+`hover_by_name` is a compatibility alias for `type_of_name`: it returns one declaration's type under a hard byte cap.
+
+### `type_of_name`
+
+```jsonc
+// request
+{ "name": "Nat.add_zero", "imports": [], "max_type_bytes": 8192 }
+
+// result
+{ "status": "found", "name": "Nat.add_zero", "kind": "theorem",
+  "type_signature": { "value": "∀ (n : Nat), n + 0 = n", "truncated": false },
+  "source": { ... } }
+{ "status": "missing", "name": "Nat.foo_bar" }
+```
+
+`max_type_bytes` defaults to 8192 and clamps to 65536. This tool is the only declaration-name tool that renders a type.
+
+### `search_declarations`
+
+Case-insensitive substring search over declaration names. Results are metadata-only; no declaration types are rendered
+or indexed.
+
+```jsonc
+// request
+{ "query": "add_zero", "kind": "theorem", "imports": [], "limit": 20, "include_source": true }
+
+// result
+{ "declarations": [{ "name": "Nat.add_zero", "kind": "theorem", "source": { ... } }], "truncated": false }
+```
+
+`kind` is optional. Limits default to 20 and clamp to 100.
 
 ## Project scan (`src/tools/scan.rs`)
 
@@ -111,50 +141,16 @@ output. Its freshness envelope reports `imports: []`.
 
 Presets: `sorry | admit | axiom | set_option | custom`.
 
-## Index tools (`src/tools/index.rs`)
-
-The three index tools share one piece of state: a SQLite-backed declaration index, rebuilt on the first call after the
-Lake manifest or per-call import vector changes and otherwise reused. Limits default to 50 and clamp at 500. Each
-result row has shape:
-
-```jsonc
-{ "name": "...", "kind": "...", "type_signature": "..." | null, "source": { ... } | null }
-```
-
-### `find_symbol`
-
-Case-insensitive substring on declaration names.
-
-```jsonc
-{ "query": "add_zero", "imports": [], "limit": 20 }
-```
-
-### `find_lemma`
-
-As `find_symbol`, restricted to `kind = "theorem"`.
-
-```jsonc
-{ "query": "add_zero", "imports": [] }
-```
-
-### `outline`
-
-Name-prefix listing, ordered by name. Omit `module_prefix` to walk the whole table.
-
-```jsonc
-{ "module_prefix": "Nat.", "imports": [], "limit": 200 }
-```
-
 ## Position tools (`src/tools/position.rs`)
 
-The three position tools drive `process_module_with_info_tree`: they read the file, hand the full source (header + body)
-to Lean's frontend, and project the resulting info tree. The file's own `import` declarations are parsed by Lean and
-validated against the server's open env; mismatch surfaces as an envelope `warnings` entry (single-file tools) or a
-result sidebar (`references_of_name`). The projection is cached against `(file_path, sha256(contents))`, so repeat calls
-on the same bytes reuse it; an edit invalidates structurally.
+The position tools drive `process_module_query`: they read the file, hand the full source (header + body) to Lean's
+frontend, and ask for one bounded projection. The file's own `import` declarations are parsed by Lean and validated
+against the server's open env; mismatch surfaces as an envelope `warnings` entry for single-file tools or a result
+sidebar for `references_in_project`. Query results are cached against `(file_path, sha256(contents), query_kind)`, so an
+identical repeated query on the same bytes reuses the bounded response; an edit invalidates structurally.
 
-`process_module_with_info_tree` is an **optional** capability shim. When the loaded dylib lacks the
-`process_module_with_info_tree` shim, every position tool answers `{ "status": "unsupported" }` cleanly; the tools never
+`process_module_query` is an **optional** capability shim. When the loaded dylib lacks the
+`lean_rs_host_process_module_query` shim, position tools answer `{ "status": "unsupported" }` cleanly; the tools never
 raise.
 
 All line and column inputs are **1-indexed**. Result spans use the same convention.
@@ -170,7 +166,8 @@ All line and column inputs are **1-indexed**. Result spans use the same conventi
   "status": "goal",
   "goals_before": ["⊢ True"],
   "goals_after":  [],
-  "span": { "start_line": 8, "start_column": 3, "end_line": 8, "end_column": 10 }
+  "span": { "start_line": 8, "start_column": 3, "end_line": 8, "end_column": 10 },
+  "truncated": false
 }
 
 // result: no tactic at cursor
@@ -198,8 +195,8 @@ modules.
 // result: innermost term found
 {
   "status": "term",
-  "expr":          "True",
-  "type_str":      "Prop",
+  "expr":          { "value": "True", "truncated": false },
+  "type_str":      { "value": "Prop", "truncated": false },
   "expected_type": null,
   "span": { "start_line": 7, "start_column": 24, "end_line": 7, "end_column": 28 }
 }
@@ -215,18 +212,14 @@ modules.
 { "status": "unsupported" }
 ```
 
-`expr` and `type_str` use `Expr.toString` (raw notation). `expected_type` is set only at sites where the elaborator
-recorded one, such as coercion sites. When inference did not produce a type, `type_str` is the empty string. The same
-`MissingImports` warning behavior as `goal_at_position`.
+`expr`, `type_str`, and `expected_type` are bounded rendered text objects. `expected_type` is set only at sites where the
+elaborator recorded one, such as coercion sites. The same `MissingImports` warning behavior as `goal_at_position`.
 
-### `references_of_name`
+### `references_in_file`
 
 ```jsonc
-// request: search every project .lean file
-{ "name": "Nat.add" }
-
-// request: restrict to specific files
-{ "name": "Nat.add", "files": ["LeanRsFixture/Scalars.lean"] }
+// request
+{ "file": "LeanRsFixture/Scalars.lean", "name": "Nat.add" }
 
 // result
 {
@@ -237,16 +230,37 @@ recorded one, such as coercion sites. When inference did not produce a type, `ty
 }
 ```
 
-`kind` is `"def"` at binder sites, `"ref"` at use sites. Hits cap at 1000 (sets `truncated: true`). The walk continues
-past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib lacks the shim),
-`header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...] }`). Results are
-sorted by `(file, line, column)`. Name matching is exact: pass the fully-qualified form Lean records.
+`kind` is `"def"` at binder sites, `"ref"` at use sites. Name matching is exact: pass the fully-qualified form Lean
+records. The result includes `truncated` when the upstream reference projection hit its per-file budget.
+
+### `references_in_project`
+
+```jsonc
+// request: explicitly search every project .lean file
+{ "name": "Nat.add", "limit": 1000 }
+
+// request: restrict to specific files
+{ "name": "Nat.add", "files": ["LeanRsFixture/Scalars.lean"], "limit": 100 }
+
+// result
+{
+  "references": [
+    { "file": "LeanRsFixture/Scalars.lean", "line": 12, "column": 7,
+      "end_line": 12, "end_column": 14, "kind": "ref" }
+  ],
+  "files_scanned": 1
+}
+```
+
+Hits cap at `min(limit, 1000)` and set `truncated: true` when the scan stops early or a per-file query truncates. The
+walk continues past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib
+lacks the shim), `header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...]
+}`). Results are sorted by `(file, line, column)`.
 
 ### `file_diagnostics`
 
-Elaboration diagnostics—errors, warnings, info—for a `.lean` file. Same elaborator pass that backs `goal_at_position` /
-`type_at_position`, so the projection is cached and the typical "what's wrong; probe the problem site" loop pays for the
-elaboration once.
+Elaboration diagnostics—errors, warnings, info—for a `.lean` file. This is a diagnostics-only projection: term/type,
+tactic, and name-reference payloads are not rendered or transported.
 
 ```jsonc
 // request
@@ -268,7 +282,7 @@ elaboration once.
   "summary": { "errors": 1, "warnings": 0, "info": 0 },
   "diagnostics": [...], "truncated": false }
 
-// result: worker host shims missing the info-tree shim
+// result: worker host shims missing the module-query shim
 { "status": "unsupported" }
 ```
 

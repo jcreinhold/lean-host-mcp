@@ -811,9 +811,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "914794b2e6afaa9c256a48eaf2bd04321f63fe896690ba78d89e3a5eae46ef63"
+version = "0.1.15"
 dependencies = [
  "lean-rs-sys",
  "lean-toolchain",
@@ -826,9 +824,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-host"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60a462564bfd7b922c183b6f002d53548f222ebb25f34781bdbb9dee6f50ca48"
+version = "0.1.15"
 dependencies = [
  "lean-rs",
  "lean-rs-sys",
@@ -839,18 +835,14 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-sys"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f32dd434e6ceb1b6a2e61f852bac655d7cc7392d4998c9be2d737d6440f417ca"
+version = "0.1.15"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "lean-rs-worker-child"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41a1d8ae4e7442cb5ca85b39d08bc21bac3f337d118bc28b452b5da3620a3c2c"
+version = "0.1.15"
 dependencies = [
  "lean-rs",
  "lean-rs-host",
@@ -863,9 +855,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-worker-parent"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd35b52ff4ed57ad789c5c07de3205bec292f93b82fb0a580caf2ecf5f0de130"
+version = "0.1.15"
 dependencies = [
  "lean-rs-worker-protocol",
  "lean-toolchain",
@@ -876,9 +866,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-worker-protocol"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6907467278189a1e3f24f8bcbfd3f48ff13069e243dd493e1846e41380bc052e"
+version = "0.1.15"
 dependencies = [
  "lean-toolchain",
  "serde",
@@ -887,9 +875,7 @@ dependencies = [
 
 [[package]]
 name = "lean-toolchain"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46ded09fdaae6f148a64d884147639a7bfda481ba302300134a8ba2f841d2cfe"
+version = "0.1.15"
 dependencies = [
  "lean-rs-sys",
  "serde_json",
