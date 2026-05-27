@@ -62,6 +62,7 @@ lean-rs-worker-parent = { path = "../../../lean-rs/crates/lean-rs-worker-parent"
 criterion = { version = "0.8", features = ["html_reports"] }
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
+tokio = { version = "1", features = ["process"] }
 
 [lints]
 workspace = true

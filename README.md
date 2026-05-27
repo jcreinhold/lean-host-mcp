@@ -159,6 +159,29 @@ members and silently links `libleanshared` into the parent. The invariant is ass
 ! ldd  target/release/lean-host-mcp | grep -q libleanshared        # Linux
 ```
 
+## Smoke/perf baseline
+
+The ignored `smoke_perf` integration test is the black-box baseline harness for proof-agent work. It starts the compiled
+stdio MCP server, calls `tools/list`, runs representative tool calls, and emits JSONL rows with wall time, serialized
+response bytes, 32 KiB / 64 KiB budget flags, status, warning count, observable project-session changes, and process RSS
+when the platform exposes it. The budget constants are test-only guardrails: ordinary model-facing responses should aim
+for 16-32 KiB, with 64 KiB as the default hard ceiling. Production truncation is still tool-specific policy.
+
+```sh
+cargo build -p lean-host-mcp
+cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
+
+LEAN_HOST_MCP_SMOKE_PROJECT=/Users/jcreinhold/Code/kan-proofs \
+  LEAN_HOST_MCP_SMOKE_FILE=KanProofs/AlgebraicGeometry/Sites/FiniteEtale/Quotient/BaseChange/Restrict.lean \
+  cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
+
+LEAN_HOST_MCP_SMOKE_KANPROOFS=1 \
+  cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
+```
+
+The harness deliberately does not claim speedups. Keep its JSONL output with any performance change so later comparisons
+use the same workload, byte accounting, and cold/warm worker behaviour.
+
 ## Versions
 
 `lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.15 (which transitively pin `lean-rs`
