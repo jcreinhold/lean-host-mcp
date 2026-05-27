@@ -8,10 +8,10 @@ installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls 
 that child rather than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child; the
 supervisor restarts it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
-Fourteen tools are exposed: term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`),
+Thirteen tools are exposed: term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`),
 bounded declaration lookup (`search_declarations`, `type_of_name`, `hover_by_name`), a filesystem sweep
-(`project_scan`), two cursor-driven queries (`goal_at_position`, `type_at_position`), a file-scoped diagnostics query
-(`file_diagnostics`), and explicit file/project reference queries (`references_in_file`, `references_in_project`).
+(`project_scan`), proof-agent module queries (`proof_state`, `lean_query`), and explicit file/project reference queries
+(`references_in_file`, `references_in_project`).
 Per-tool request and result schemas live in
 [`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in [`docs/architecture.md`](docs/architecture.md).
 
@@ -47,7 +47,7 @@ cargo install --path crates/lean-host-mcp
 #    any missing workers; each target lands under
 #    ~/.local/share/lean-host-mcp/workers/<id>/.
 lean-host-mcp install-worker
-lean-host-mcp install-worker --toolchain v4.30.0-rc2
+lean-host-mcp install-worker --toolchain v4.30.0
 lean-host-mcp install-worker --list           # see what's installed
 
 # 3a. Zero-config: launch from inside (or anywhere under) any built Lake
@@ -118,27 +118,30 @@ Every tool returns the same outer shape; only `result` varies.
 }
 ```
 
-`freshness.imports` is the import vector supplied for that call. An empty array means the caller asked for no extra
-imports beyond the worker's base environment.
+`freshness.imports` is the import vector used for that call: explicit request imports for term/declaration tools and
+file-header imports for module-query tools. An empty array means the call used no extra imports beyond the worker's base
+environment.
 
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors.
 MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the Lake
 project is unusable.
 
-## Capability shims and the position-tool cluster
+## Capability shims and proof-agent module queries
 
-`goal_at_position`, `type_at_position`, `references_in_file`, `references_in_project`, and `file_diagnostics` depend on
-the optional bounded `lean_rs_host_process_module_query` shim. A worker whose bundled shims do not expose it answers
-`{ "status": "unsupported" }` per call; the tools never raise. Each call asks Lean for one narrow projection:
-diagnostics, the selected term type, the selected tactic goals, or name references without raw expression/type strings.
+`proof_state` and `lean_query` depend on the optional bounded `lean_rs_host_process_module_query_batch` shim.
+`proof_state` is the common proof-agent call: one request returns diagnostics, goals, locals, expected type, target
+declaration, surrounding declaration, and a safe edit span when Lean can determine one. `lean_query` is the composable
+form: callers pass typed selectors for diagnostics, proof state, term type, references, declaration target, or
+surrounding declaration and receive results keyed by selector id. A worker whose bundled shims do not expose the batch
+capability answers `{ "status": "unsupported" }`; the tools never request or cache whole-file info trees.
+
 Files whose header imports modules the server's open env doesn't have are still processed; missing imports surface as an
-envelope warning (single-file tools) or a result sidebar (`references_in_project`). Files using Lean 4's module-system
-header syntax, including `module`, `public import`, `import all`, and `meta import`, are supported. A header that
-doesn't parse short-circuits to `header_parse_failed` where the tool has that status.
+envelope warning. Files using Lean 4's module-system header syntax, including `module`, `public import`, `import all`,
+and `meta import`, are supported. A header that doesn't parse short-circuits to `header_parse_failed`.
 
 Unlike an external LSP process, the host can still start when unrelated project modules are broken. Calls whose imports
-avoid the broken module continue to work, and `file_diagnostics` on the broken file reports Lean diagnostics instead of
-a bootstrap failure.
+avoid the broken module continue to work, and `lean_query` diagnostics on the broken file reports Lean diagnostics
+instead of a bootstrap failure.
 
 ## Build, test, lint
 

@@ -12,7 +12,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -144,6 +144,22 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
+    let tool_names = tools_response
+        .json
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    assert!(tool_names.contains("lean_query"), "tools/list must expose lean_query");
+    assert!(tool_names.contains("proof_state"), "tools/list must expose proof_state");
+    for removed in ["file_diagnostics", "goal_at_position", "type_at_position"] {
+        assert!(
+            !tool_names.contains(removed),
+            "tools/list must not expose removed position tool {removed}"
+        );
+    }
     let tools_record = ToolListRecord {
         event: "tools_list",
         scenario: scenario.label.to_owned(),
@@ -307,24 +323,21 @@ fn fixture_calls() -> Vec<ToolCall> {
             arguments: json!({ "preset": "sorry", "limit": 20 }),
         },
         ToolCall {
-            label: "file_diagnostics_source_ranges",
-            tool_name: "file_diagnostics",
-            category: "position",
-            arguments: json!({ "file": "LeanRsFixture/SourceRanges.lean" }),
-        },
-        ToolCall {
-            label: "type_at_known_theorem",
-            tool_name: "type_at_position",
+            label: "lean_query_source_ranges",
+            tool_name: "lean_query",
             category: "position",
             arguments: json!({
                 "file": "LeanRsFixture/SourceRanges.lean",
-                "line": 7,
-                "column": 9
+                "selectors": [
+                    { "selector": "diagnostics", "id": "diagnostics" },
+                    { "selector": "type_at", "id": "type", "line": 7, "column": 9 },
+                    { "selector": "proof_state", "id": "proof", "line": 8, "column": 3 }
+                ]
             }),
         },
         ToolCall {
-            label: "goal_at_trivial",
-            tool_name: "goal_at_position",
+            label: "proof_state_trivial",
+            tool_name: "proof_state",
             category: "position",
             arguments: json!({
                 "file": "LeanRsFixture/SourceRanges.lean",
@@ -377,10 +390,13 @@ fn external_project_calls() -> Vec<ToolCall> {
     ];
     if let Ok(file) = std::env::var("LEAN_HOST_MCP_SMOKE_FILE") {
         calls.push(ToolCall {
-            label: "file_diagnostics_env_file",
-            tool_name: "file_diagnostics",
+            label: "lean_query_env_file_diagnostics",
+            tool_name: "lean_query",
             category: "position",
-            arguments: json!({ "file": file }),
+            arguments: json!({
+                "file": file,
+                "selectors": [{ "selector": "diagnostics", "id": "diagnostics" }]
+            }),
         });
     }
     calls
@@ -395,14 +411,17 @@ fn kanproofs_calls() -> Vec<ToolCall> {
 
     vec![
         ToolCall {
-            label: "file_diagnostics_basechange_restrict",
-            tool_name: "file_diagnostics",
+            label: "lean_query_basechange_restrict_diagnostics",
+            tool_name: "lean_query",
             category: "kanproofs-position",
-            arguments: json!({ "file": file }),
+            arguments: json!({
+                "file": file,
+                "selectors": [{ "selector": "diagnostics", "id": "diagnostics" }]
+            }),
         },
         ToolCall {
-            label: "type_at_basechange_restrict_cursor",
-            tool_name: "type_at_position",
+            label: "proof_state_basechange_restrict_cursor",
+            tool_name: "proof_state",
             category: "kanproofs-position",
             arguments: json!({
                 "file": std::env::var("LEAN_HOST_MCP_SMOKE_KANPROOFS_FILE").unwrap_or_else(|_| {

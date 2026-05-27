@@ -33,8 +33,8 @@ use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WorkerBinary};
         .args(["toolchain", "auto", "list"])
 ))]
 pub struct InstallWorkerArgs {
-    /// Build and install for a single toolchain (e.g. `v4.30.0-rc2` or
-    /// `leanprover/lean4:v4.30.0-rc2`).
+    /// Build and install for a single toolchain (e.g. `v4.30.0` or
+    /// `leanprover/lean4:v4.30.0`).
     #[arg(long, value_name = "ID")]
     pub toolchain: Option<String>,
 

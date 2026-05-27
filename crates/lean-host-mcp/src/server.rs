@@ -1,4 +1,4 @@
-//! rmcp server glue. Registers fourteen tools and wires them to the
+//! rmcp server glue. Registers model-facing Lean tools and wires them to the
 //! [`tools`](crate::tools) module.
 //!
 //! Each `#[tool]` handler is a thin call into the implementation function;
@@ -123,24 +123,20 @@ impl LeanHostService {
         wrap(tools::scan::project_scan(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Proof goal at a cursor (1-indexed line/column) in a .lean file. Returns Goal / NoTacticContext / Unsupported."
-    )]
-    async fn goal_at_position(
+    #[tool(description = "Inspect the current Lean proof context at a cursor position.")]
+    async fn proof_state(
         &self,
-        Parameters(req): Parameters<tools::position::GoalAtPositionRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::GoalAtPositionResult>>, McpError> {
-        wrap(tools::position::goal_at_position(&self.ctx, req).await)
+        Parameters(req): Parameters<tools::position::ProofStateRequest>,
+    ) -> std::result::Result<Json<Response<tools::position::ProofStateResult>>, McpError> {
+        wrap(tools::position::proof_state(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Type and expected type of the innermost term at a cursor in a .lean file. Returns Term / NoTerm / Unsupported."
-    )]
-    async fn type_at_position(
+    #[tool(description = "Run a bounded batch of Lean semantic projections against one file.")]
+    async fn lean_query(
         &self,
-        Parameters(req): Parameters<tools::position::TypeAtPositionRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::TypeAtPositionResult>>, McpError> {
-        wrap(tools::position::type_at_position(&self.ctx, req).await)
+        Parameters(req): Parameters<tools::position::LeanQueryRequest>,
+    ) -> std::result::Result<Json<Response<tools::position::LeanQueryResult>>, McpError> {
+        wrap(tools::position::lean_query(&self.ctx, req).await)
     }
 
     #[tool(
@@ -162,16 +158,6 @@ impl LeanHostService {
     ) -> std::result::Result<Json<Response<tools::position::ReferencesInProjectResult>>, McpError> {
         wrap(tools::position::references_in_project(&self.ctx, req).await)
     }
-
-    #[tool(
-        description = "Elaboration diagnostics for a .lean file (errors, warnings, info). Returns Ok / HeaderParseFailed / Unsupported."
-    )]
-    async fn file_diagnostics(
-        &self,
-        Parameters(req): Parameters<tools::position::FileDiagnosticsRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::FileDiagnosticsResult>>, McpError> {
-        wrap(tools::position::file_diagnostics(&self.ctx, req).await)
-    }
 }
 
 #[tool_handler]
@@ -188,8 +174,8 @@ impl ServerHandler for LeanHostService {
         info.instructions = Some(
             "MCP server hosting Lean 4 in-process via lean-rs. \
              Tools elaborate / kernel-check terms, run bounded MetaM ops, \
-             look up declarations by name, scan .lean files, and answer \
-             cursor-driven goal / type / references queries."
+             look up declarations by name, scan .lean files, and run \
+             bounded proof-context and semantic file queries."
                 .to_owned(),
         );
         info

@@ -1,37 +1,47 @@
-//! Bounded module-query tools: `file_diagnostics`, `goal_at_position`,
-//! `type_at_position`, `references_in_file`, and `references_in_project`.
+//! Bounded module-query tools: `proof_state`, `lean_query`, and reference
+//! queries.
 //!
-//! Each tool calls `LeanWorkerSession::process_module_query` with the
-//! narrow projection it needs. The server never requests, transports, or
-//! caches a whole-file info tree.
+//! The public proof-agent path uses one batched worker call per file probe.
+//! The server caches only exact bounded query outcomes keyed by file bytes
+//! and selector shape; it never stores or exposes a whole-file info tree.
 
-// Tool handlers consume their request structs (owned strings into the
-// worker-actor channel); pass-by-value is intentional.
+// Tool handlers consume request structs so owned strings can cross the
+// worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lean_rs_worker_parent::{
-    LeanWorkerElabOptions, LeanWorkerGoalAtResult, LeanWorkerModuleQuery, LeanWorkerModuleQueryOutcome,
-    LeanWorkerModuleQueryResult, LeanWorkerModuleSourceSpan, LeanWorkerNameRef, LeanWorkerRenderedInfo,
-    LeanWorkerTypeAtResult,
+    LeanWorkerDeclarationTargetInfo, LeanWorkerDeclarationTargetResult, LeanWorkerElabOptions, LeanWorkerLocalInfo,
+    LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchItem, LeanWorkerModuleQueryBatchOutcome,
+    LeanWorkerModuleQueryBatchResult, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQueryResult,
+    LeanWorkerModuleQuerySelector, LeanWorkerModuleSourceSpan, LeanWorkerNameRef, LeanWorkerOutputBudgets,
+    LeanWorkerProofStateInfo, LeanWorkerProofStateResult, LeanWorkerRenderedInfo,
+    LeanWorkerSurroundingDeclarationResult, LeanWorkerTypeAtResult,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
-use crate::cache::{ModuleQueryKey, hash_bytes};
+use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::project::LeanProject;
 use crate::projections::{Diagnostic, ElabFailure, Severity, map_worker_err, project_failure};
-use crate::tools::{ToolContext, freshness_for, is_ignored_dir, session_imports};
+use crate::tools::{ToolContext, is_ignored_dir, session_imports};
 
 /// Hard cap on project-wide reference aggregation. File-local reference
 /// queries are also bounded by the upstream projection.
 const MAX_REFERENCES: usize = 1000;
+
+const PROOF_STATE_DIAGNOSTICS_ID: &str = "diagnostics";
+const PROOF_STATE_CONTEXT_ID: &str = "proof_state";
+const PROOF_STATE_TARGET_ID: &str = "declaration_target";
+const PROOF_STATE_SURROUNDING_ID: &str = "surrounding_declaration";
+const PROOF_STATE_TERM_ID: &str = "term";
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SourceSpan {
@@ -47,10 +57,132 @@ pub struct RenderedText {
     pub truncated: bool,
 }
 
-// --- goal_at_position --------------------------------------------------
+/// Per-severity counts attached to every diagnostics-bearing variant.
+#[derive(Debug, Clone, Copy, Default, Serialize, JsonSchema)]
+pub struct DiagnosticSummary {
+    pub errors: usize,
+    pub warnings: usize,
+    pub info: usize,
+}
+
+impl DiagnosticSummary {
+    fn from_diagnostics(diagnostics: &[Diagnostic]) -> Self {
+        let mut summary = Self::default();
+        for diagnostic in diagnostics {
+            let bucket = match diagnostic.severity {
+                Severity::Error => &mut summary.errors,
+                Severity::Warning => &mut summary.warnings,
+                Severity::Info => &mut summary.info,
+            };
+            *bucket = bucket.saturating_add(1);
+        }
+        summary
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DiagnosticsBlock {
+    pub summary: DiagnosticSummary,
+    pub diagnostics: Vec<Diagnostic>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LocalInfo {
+    pub name: String,
+    pub binder_info: String,
+    pub type_str: RenderedText,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<RenderedText>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DeclarationTargetInfo {
+    pub short_name: String,
+    pub declaration_name: String,
+    pub namespace_name: String,
+    pub declaration_kind: String,
+    pub declaration_span: SourceSpan,
+    pub name_span: SourceSpan,
+    pub body_span: SourceSpan,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DeclarationTargetProjection {
+    Target { info: DeclarationTargetInfo },
+    NotFound,
+    Ambiguous { candidates: Vec<DeclarationTargetInfo> },
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SurroundingDeclarationProjection {
+    Declaration { info: DeclarationTargetInfo },
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ProofStateContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_name: Option<String>,
+    pub namespace_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_edit: Option<DeclarationTargetInfo>,
+    pub span: SourceSpan,
+    pub goals_before: Vec<String>,
+    pub goals_after: Vec<String>,
+    pub locals: Vec<LocalInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_type: Option<RenderedText>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProofStateProjection {
+    State { info: Box<ProofStateContext> },
+    Unavailable { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TypeAtProjection {
+    Term {
+        expr: RenderedText,
+        type_str: RenderedText,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_type: Option<RenderedText>,
+        span: SourceSpan,
+    },
+    NoTerm,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReferenceHit {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    /// `"def"` for binder occurrences, `"ref"` for use sites.
+    pub kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReferencesInFileResult {
+    pub references: Vec<ReferenceHit>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReferencesProjection {
+    pub references: Vec<ReferenceHit>,
+    pub truncated: bool,
+}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GoalAtPositionRequest {
+pub struct ProofStateRequest {
     /// Path to a `.lean` file. Resolved against the resolved project root
     /// if relative.
     pub file: PathBuf,
@@ -58,167 +190,351 @@ pub struct GoalAtPositionRequest {
     pub line: u32,
     /// 1-indexed column.
     pub column: u32,
-    /// Optional explicit project (absolute path to Lake root). When
-    /// omitted, the server resolves via env -> cwd-walk -> config default.
+    /// Optional explicit project root for this call.
     #[serde(default)]
     pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SelectorMessage {
+    pub id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum GoalAtPositionResult {
-    Goal {
-        goals_before: Vec<String>,
-        goals_after: Vec<String>,
-        span: SourceSpan,
-        truncated: bool,
+pub enum ProofStateResult {
+    Context {
+        diagnostics: DiagnosticsBlock,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        proof_state: Option<Box<ProofStateProjection>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        term: Option<Box<TypeAtProjection>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        declaration_target: Option<Box<DeclarationTargetProjection>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        surrounding_declaration: Option<Box<SurroundingDeclarationProjection>>,
+        total_truncated: bool,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        unavailable: Vec<SelectorMessage>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        budget_exceeded: Vec<SelectorMessage>,
     },
-    NoTacticContext,
     HeaderParseFailed {
-        diagnostics: ElabFailure,
+        summary: DiagnosticSummary,
+        diagnostics: Vec<Diagnostic>,
+        truncated: bool,
     },
     Unsupported,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LeanQueryRequest {
+    /// Path to a `.lean` file. Resolved against the resolved project root
+    /// if relative.
+    pub file: PathBuf,
+    /// Bounded semantic projections to run against the file in one
+    /// elaboration.
+    pub selectors: Vec<LeanQuerySelector>,
+    /// Optional explicit project root for this call.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "selector", rename_all = "snake_case")]
+pub enum LeanQuerySelector {
+    Diagnostics {
+        id: String,
+    },
+    ProofState {
+        id: String,
+        line: u32,
+        column: u32,
+    },
+    TypeAt {
+        id: String,
+        line: u32,
+        column: u32,
+    },
+    References {
+        id: String,
+        name: String,
+    },
+    DeclarationTarget {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        line: Option<u32>,
+        #[serde(default)]
+        column: Option<u32>,
+    },
+    SurroundingDeclaration {
+        id: String,
+        line: u32,
+        column: u32,
+    },
+}
+
+impl LeanQuerySelector {
+    fn id(&self) -> &str {
+        match self {
+            Self::Diagnostics { id }
+            | Self::ProofState { id, .. }
+            | Self::TypeAt { id, .. }
+            | Self::References { id, .. }
+            | Self::DeclarationTarget { id, .. }
+            | Self::SurroundingDeclaration { id, .. } => id,
+        }
+    }
+
+    fn into_worker(self) -> LeanWorkerModuleQuerySelector {
+        match self {
+            Self::Diagnostics { id } => LeanWorkerModuleQuerySelector::Diagnostics { id },
+            Self::ProofState { id, line, column } => LeanWorkerModuleQuerySelector::ProofState { id, line, column },
+            Self::TypeAt { id, line, column } => LeanWorkerModuleQuerySelector::TypeAt { id, line, column },
+            Self::References { id, name } => LeanWorkerModuleQuerySelector::References { id, name },
+            Self::DeclarationTarget { id, name, line, column } => {
+                LeanWorkerModuleQuerySelector::DeclarationTarget { id, name, line, column }
+            }
+            Self::SurroundingDeclaration { id, line, column } => {
+                LeanWorkerModuleQuerySelector::SurroundingDeclaration { id, line, column }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LeanQueryProjection {
+    Diagnostics(DiagnosticsBlock),
+    ProofState(ProofStateProjection),
+    TypeAt(TypeAtProjection),
+    References(ReferencesProjection),
+    DeclarationTarget(DeclarationTargetProjection),
+    SurroundingDeclaration(SurroundingDeclarationProjection),
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LeanQueryItem {
+    Ok { result: LeanQueryProjection },
+    Unavailable { message: String },
+    BudgetExceeded { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LeanQueryResult {
+    Results {
+        items: BTreeMap<String, LeanQueryItem>,
+        total_truncated: bool,
+    },
+    HeaderParseFailed {
+        summary: DiagnosticSummary,
+        diagnostics: Vec<Diagnostic>,
+        truncated: bool,
+    },
+    InvalidSelectors {
+        message: String,
+    },
+    Unsupported,
+}
+
+/// Inspect the current Lean proof context at a cursor position.
+///
 /// # Errors
 ///
-/// Returns `ServerError::Io` when the file cannot be read, and propagates
-/// `ServerError::Lean` from the underlying `process_module_query` call.
-pub async fn goal_at_position(ctx: &ToolContext, req: GoalAtPositionRequest) -> Result<Response<GoalAtPositionResult>> {
+/// Returns `ServerError::Io` when the file cannot be read and
+/// `ServerError::Lean` for worker infrastructure failures.
+pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Response<ProofStateResult>> {
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
-            let freshness = freshness_for(&project, &[]);
-            let query = LeanWorkerModuleQuery::GoalAt {
-                line: req.line,
-                column: req.column,
-            };
-            let outcome = run_module_query(&project, &req.file, query).await?;
-            let (result, fresh, missing) = match outcome {
-                ModuleQueryRun::Ready {
-                    result: LeanWorkerModuleQueryResult::GoalAt(result),
+            let selectors = vec![
+                LeanWorkerModuleQuerySelector::Diagnostics {
+                    id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
+                },
+                LeanWorkerModuleQuerySelector::ProofState {
+                    id: PROOF_STATE_CONTEXT_ID.to_owned(),
+                    line: req.line,
+                    column: req.column,
+                },
+                LeanWorkerModuleQuerySelector::DeclarationTarget {
+                    id: PROOF_STATE_TARGET_ID.to_owned(),
+                    name: None,
+                    line: Some(req.line),
+                    column: Some(req.column),
+                },
+                LeanWorkerModuleQuerySelector::SurroundingDeclaration {
+                    id: PROOF_STATE_SURROUNDING_ID.to_owned(),
+                    line: req.line,
+                    column: req.column,
+                },
+                LeanWorkerModuleQuerySelector::TypeAt {
+                    id: PROOF_STATE_TERM_ID.to_owned(),
+                    line: req.line,
+                    column: req.column,
+                },
+            ];
+            let budgets = LeanWorkerOutputBudgets::default();
+            let run = run_module_query_batch(&project, &req.file, selectors, budgets).await?;
+            let freshness = project.freshness(&run.imports);
+
+            match run.outcome {
+                BatchQueryRun::Ready {
+                    result,
                     freshly_processed,
                     missing_imports,
                 } => {
-                    let projected = match result {
-                        LeanWorkerGoalAtResult::Goal {
-                            span,
-                            goals_before,
-                            goals_after,
-                            truncated,
-                        } => GoalAtPositionResult::Goal {
-                            goals_before,
-                            goals_after,
-                            span: span_of_module(span),
-                            truncated,
-                        },
-                        LeanWorkerGoalAtResult::NoTacticContext => GoalAtPositionResult::NoTacticContext,
-                        _ => GoalAtPositionResult::Unsupported,
+                    let mut diagnostics = DiagnosticsBlock {
+                        summary: DiagnosticSummary::default(),
+                        diagnostics: Vec::new(),
+                        truncated: false,
                     };
-                    (projected, freshly_processed, missing_imports)
-                }
-                ModuleQueryRun::Ready {
-                    freshly_processed,
-                    missing_imports,
-                    ..
-                } => (GoalAtPositionResult::Unsupported, freshly_processed, missing_imports),
-                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
-                    return Ok(Response::ok(
-                        GoalAtPositionResult::HeaderParseFailed { diagnostics },
+                    let mut proof_state = None;
+                    let mut term = None;
+                    let mut declaration_target = None;
+                    let mut surrounding_declaration = None;
+                    let mut unavailable = Vec::new();
+                    let mut budget_exceeded = Vec::new();
+
+                    for item in result.items {
+                        match project_batch_item(item, None) {
+                            ProjectedBatchItem::Ok { id, result } => match (id.as_str(), result) {
+                                (PROOF_STATE_DIAGNOSTICS_ID, LeanQueryProjection::Diagnostics(block)) => {
+                                    diagnostics = block;
+                                }
+                                (PROOF_STATE_CONTEXT_ID, LeanQueryProjection::ProofState(value)) => {
+                                    proof_state = Some(Box::new(value));
+                                }
+                                (PROOF_STATE_TARGET_ID, LeanQueryProjection::DeclarationTarget(value)) => {
+                                    declaration_target = Some(Box::new(value));
+                                }
+                                (PROOF_STATE_SURROUNDING_ID, LeanQueryProjection::SurroundingDeclaration(value)) => {
+                                    surrounding_declaration = Some(Box::new(value));
+                                }
+                                (PROOF_STATE_TERM_ID, LeanQueryProjection::TypeAt(value)) => {
+                                    term = Some(Box::new(value));
+                                }
+                                _ => {}
+                            },
+                            ProjectedBatchItem::Unavailable { id, message } => {
+                                unavailable.push(SelectorMessage { id, message });
+                            }
+                            ProjectedBatchItem::BudgetExceeded { id, message } => {
+                                budget_exceeded.push(SelectorMessage { id, message });
+                            }
+                        }
+                    }
+
+                    let response = Response::ok(
+                        ProofStateResult::Context {
+                            diagnostics,
+                            proof_state,
+                            term,
+                            declaration_target,
+                            surrounding_declaration,
+                            total_truncated: result.total_truncated,
+                            unavailable,
+                            budget_exceeded,
+                        },
                         freshness,
-                    ));
+                    );
+                    Ok(attach_query_notes(response, freshly_processed, &missing_imports, true))
                 }
-                ModuleQueryRun::Unsupported => {
-                    return Ok(Response::ok(GoalAtPositionResult::Unsupported, freshness));
+                BatchQueryRun::HeaderParseFailed { diagnostics } => {
+                    let block = diagnostics_block(diagnostics);
+                    Ok(Response::ok(
+                        ProofStateResult::HeaderParseFailed {
+                            summary: block.summary,
+                            diagnostics: block.diagnostics,
+                            truncated: block.truncated,
+                        },
+                        freshness,
+                    ))
                 }
-            };
-            Ok(attach_query_notes(Response::ok(result, freshness), fresh, &missing))
+                BatchQueryRun::Unsupported => Ok(Response::ok(ProofStateResult::Unsupported, freshness)),
+            }
         })
         .await
 }
 
-// --- type_at_position --------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct TypeAtPositionRequest {
-    pub file: PathBuf,
-    pub line: u32,
-    pub column: u32,
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum TypeAtPositionResult {
-    Term {
-        /// Bounded rendering of the elaborated expression at the cursor.
-        expr: RenderedText,
-        /// Bounded rendering of the inferred type.
-        type_str: RenderedText,
-        /// Set when the elaborator recorded an expected type.
-        expected_type: Option<RenderedText>,
-        span: SourceSpan,
-    },
-    NoTerm,
-    HeaderParseFailed {
-        diagnostics: ElabFailure,
-    },
-    Unsupported,
-}
-
+/// Run a bounded batch of Lean semantic projections against one file.
+///
 /// # Errors
 ///
-/// As [`goal_at_position`].
-pub async fn type_at_position(ctx: &ToolContext, req: TypeAtPositionRequest) -> Result<Response<TypeAtPositionResult>> {
+/// Returns `ServerError::Io` when the file cannot be read and
+/// `ServerError::Lean` for worker infrastructure failures.
+pub async fn lean_query(ctx: &ToolContext, req: LeanQueryRequest) -> Result<Response<LeanQueryResult>> {
+    let duplicate = duplicate_selector_id(&req.selectors);
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
-            let freshness = freshness_for(&project, &[]);
-            let query = LeanWorkerModuleQuery::TypeAt {
-                line: req.line,
-                column: req.column,
-            };
-            let outcome = run_module_query(&project, &req.file, query).await?;
-            let (result, fresh, missing) = match outcome {
-                ModuleQueryRun::Ready {
-                    result: LeanWorkerModuleQueryResult::TypeAt(result),
+            if let Some(id) = duplicate {
+                return Ok(Response::ok(
+                    LeanQueryResult::InvalidSelectors {
+                        message: format!("selector id `{id}` appears more than once"),
+                    },
+                    project.freshness(&[]),
+                ));
+            }
+            if req.selectors.is_empty() {
+                return Ok(Response::ok(
+                    LeanQueryResult::InvalidSelectors {
+                        message: "selectors must not be empty".to_owned(),
+                    },
+                    project.freshness(&[]),
+                ));
+            }
+
+            let selectors = req
+                .selectors
+                .into_iter()
+                .map(LeanQuerySelector::into_worker)
+                .collect::<Vec<_>>();
+            let budgets = LeanWorkerOutputBudgets::default();
+            let run = run_module_query_batch(&project, &req.file, selectors, budgets).await?;
+            let freshness = project.freshness(&run.imports);
+
+            match run.outcome {
+                BatchQueryRun::Ready {
+                    result,
                     freshly_processed,
                     missing_imports,
                 } => {
-                    let projected = match result {
-                        LeanWorkerTypeAtResult::Term {
-                            span,
-                            expr,
-                            type_str,
-                            expected_type,
-                        } => TypeAtPositionResult::Term {
-                            expr: rendered_text(expr),
-                            type_str: rendered_text(type_str),
-                            expected_type: expected_type.map(rendered_text),
-                            span: span_of_module(span),
+                    let root = project.canonical_root().to_path_buf();
+                    let resolved = resolve_path(&root, &req.file);
+                    let display = display_path(&root, &resolved);
+                    let mut items = BTreeMap::new();
+                    for item in result.items {
+                        let projected = project_batch_item(item, Some(&display));
+                        let (id, value) = projected.into_item();
+                        items.insert(id, value);
+                    }
+                    let response = Response::ok(
+                        LeanQueryResult::Results {
+                            items,
+                            total_truncated: result.total_truncated,
                         },
-                        LeanWorkerTypeAtResult::NoTerm => TypeAtPositionResult::NoTerm,
-                        _ => TypeAtPositionResult::Unsupported,
-                    };
-                    (projected, freshly_processed, missing_imports)
-                }
-                ModuleQueryRun::Ready {
-                    freshly_processed,
-                    missing_imports,
-                    ..
-                } => (TypeAtPositionResult::Unsupported, freshly_processed, missing_imports),
-                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
-                    return Ok(Response::ok(
-                        TypeAtPositionResult::HeaderParseFailed { diagnostics },
                         freshness,
-                    ));
+                    );
+                    Ok(attach_query_notes(response, freshly_processed, &missing_imports, true))
                 }
-                ModuleQueryRun::Unsupported => {
-                    return Ok(Response::ok(TypeAtPositionResult::Unsupported, freshness));
+                BatchQueryRun::HeaderParseFailed { diagnostics } => {
+                    let block = diagnostics_block(diagnostics);
+                    Ok(Response::ok(
+                        LeanQueryResult::HeaderParseFailed {
+                            summary: block.summary,
+                            diagnostics: block.diagnostics,
+                            truncated: block.truncated,
+                        },
+                        freshness,
+                    ))
                 }
-            };
-            Ok(attach_query_notes(Response::ok(result, freshness), fresh, &missing))
+                BatchQueryRun::Unsupported => Ok(Response::ok(LeanQueryResult::Unsupported, freshness)),
+            }
         })
         .await
 }
@@ -255,17 +571,6 @@ pub struct ReferencesInProjectRequest {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ReferenceHit {
-    pub file: String,
-    pub line: u32,
-    pub column: u32,
-    pub end_line: u32,
-    pub end_column: u32,
-    /// `"def"` for binder occurrences, `"ref"` for use sites.
-    pub kind: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct HeaderParseFailedFile {
     pub file: String,
     pub diagnostics: ElabFailure,
@@ -275,12 +580,6 @@ pub struct HeaderParseFailedFile {
 pub struct MissingImportsFile {
     pub file: String,
     pub missing: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ReferencesInFileResult {
-    pub references: Vec<ReferenceHit>,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -299,7 +598,8 @@ pub struct ReferencesInProjectResult {
 
 /// # Errors
 ///
-/// As [`goal_at_position`].
+/// Returns `ServerError::Io` when the file cannot be read, and propagates
+/// `ServerError::Lean` from the underlying worker call.
 pub async fn references_in_file(
     ctx: &ToolContext,
     req: ReferencesInFileRequest,
@@ -307,13 +607,13 @@ pub async fn references_in_file(
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
-            let freshness = freshness_for(&project, &[]);
             let root = project.canonical_root().to_path_buf();
             let resolved = resolve_path(&root, &req.file);
             let display = display_path(&root, &resolved);
             let query = LeanWorkerModuleQuery::References { name: req.name };
             let outcome = run_module_query(&project, &resolved, query).await?;
-            match outcome {
+            let freshness = project.freshness(&outcome.imports);
+            match outcome.outcome {
                 ModuleQueryRun::Ready {
                     result: LeanWorkerModuleQueryResult::References(result),
                     freshly_processed,
@@ -331,7 +631,7 @@ pub async fn references_in_file(
                         },
                         freshness,
                     );
-                    Ok(attach_query_notes(response, freshly_processed, &missing_imports))
+                    Ok(attach_query_notes(response, freshly_processed, &missing_imports, false))
                 }
                 ModuleQueryRun::Ready {
                     freshly_processed,
@@ -347,6 +647,7 @@ pub async fn references_in_file(
                     ),
                     freshly_processed,
                     &missing_imports,
+                    false,
                 )),
                 ModuleQueryRun::HeaderParseFailed { diagnostics } => {
                     let mut response = Response::ok(
@@ -360,7 +661,7 @@ pub async fn references_in_file(
                         .warnings
                         .push("file header did not parse; no references were collected".to_owned());
                     response.warnings.push(format!(
-                        "header diagnostics available from file_diagnostics: {}",
+                        "header diagnostics available from lean_query: {}",
                         diagnostics.diagnostics.len()
                     ));
                     Ok(response)
@@ -389,7 +690,7 @@ pub async fn references_in_project(
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
-            let freshness = freshness_for(&project, &[]);
+            let freshness = project.freshness(&[]);
             let root = project.canonical_root().to_path_buf();
             let files = if req.files.is_empty() {
                 enumerate_lean_files(&root)
@@ -410,10 +711,14 @@ pub async fn references_in_project(
                 let display = display_path(&root, &path);
                 let query = LeanWorkerModuleQuery::References { name: req.name.clone() };
                 match run_module_query(&project, &path, query).await {
-                    Ok(ModuleQueryRun::Ready {
-                        result: LeanWorkerModuleQueryResult::References(result),
-                        freshly_processed,
-                        missing_imports,
+                    Ok(QueryRun {
+                        outcome:
+                            ModuleQueryRun::Ready {
+                                result: LeanWorkerModuleQueryResult::References(result),
+                                freshly_processed,
+                                missing_imports,
+                            },
+                        ..
                     }) => {
                         files_scanned = files_scanned.saturating_add(1);
                         any_freshly_processed |= freshly_processed;
@@ -434,9 +739,13 @@ pub async fn references_in_project(
                             hits.push(project_reference(&display, node));
                         }
                     }
-                    Ok(ModuleQueryRun::Ready {
-                        freshly_processed,
-                        missing_imports,
+                    Ok(QueryRun {
+                        outcome:
+                            ModuleQueryRun::Ready {
+                                freshly_processed,
+                                missing_imports,
+                                ..
+                            },
                         ..
                     }) => {
                         files_scanned = files_scanned.saturating_add(1);
@@ -448,13 +757,19 @@ pub async fn references_in_project(
                             });
                         }
                     }
-                    Ok(ModuleQueryRun::HeaderParseFailed { diagnostics }) => {
+                    Ok(QueryRun {
+                        outcome: ModuleQueryRun::HeaderParseFailed { diagnostics },
+                        ..
+                    }) => {
                         header_parse_failed_files.push(HeaderParseFailedFile {
                             file: display,
                             diagnostics,
                         });
                     }
-                    Ok(ModuleQueryRun::Unsupported) => {
+                    Ok(QueryRun {
+                        outcome: ModuleQueryRun::Unsupported,
+                        ..
+                    }) => {
                         unsupported_files.push(display);
                     }
                     Err(ServerError::Io(_)) => {}
@@ -481,130 +796,18 @@ pub async fn references_in_project(
                 Response::ok(result, freshness),
                 any_freshly_processed,
                 &[],
+                false,
             ))
         })
         .await
 }
 
-// --- file_diagnostics --------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct FileDiagnosticsRequest {
-    /// Path to a `.lean` file. Resolved against the resolved project root
-    /// if relative.
-    pub file: PathBuf,
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-/// Per-severity counts attached to every diagnostics-bearing variant.
-#[derive(Debug, Clone, Copy, Default, Serialize, JsonSchema)]
-pub struct DiagnosticSummary {
-    pub errors: usize,
-    pub warnings: usize,
-    pub info: usize,
-}
-
-impl DiagnosticSummary {
-    fn from_diagnostics(diagnostics: &[Diagnostic]) -> Self {
-        let mut s = Self::default();
-        for d in diagnostics {
-            let bucket = match d.severity {
-                Severity::Error => &mut s.errors,
-                Severity::Warning => &mut s.warnings,
-                Severity::Info => &mut s.info,
-            };
-            *bucket = bucket.saturating_add(1);
-        }
-        s
-    }
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum FileDiagnosticsResult {
-    /// Elaboration ran to completion. `summary` is the up-front
-    /// errors/warnings/info tally; `diagnostics` is the full list, sorted
-    /// by `(line, column)`. `truncated` is true only when Lean hit the
-    /// diagnostic byte budget and the list is a prefix.
-    Elaborated {
-        summary: DiagnosticSummary,
-        diagnostics: Vec<Diagnostic>,
-        truncated: bool,
-    },
-    /// The file's header did not parse; the body was never elaborated.
-    HeaderParseFailed {
-        summary: DiagnosticSummary,
-        diagnostics: Vec<Diagnostic>,
-        truncated: bool,
-    },
-    Unsupported,
-}
-
-/// # Errors
-///
-/// As [`goal_at_position`].
-pub async fn file_diagnostics(
-    ctx: &ToolContext,
-    req: FileDiagnosticsRequest,
-) -> Result<Response<FileDiagnosticsResult>> {
-    let hint = ProjectHint::from_request(req.project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let freshness = freshness_for(&project, &[]);
-            let outcome = run_module_query(&project, &req.file, LeanWorkerModuleQuery::Diagnostics).await?;
-            let (result, fresh, missing) = match outcome {
-                ModuleQueryRun::Ready {
-                    result: LeanWorkerModuleQueryResult::Diagnostics(diagnostics),
-                    freshly_processed,
-                    missing_imports,
-                } => {
-                    let projected = project_failure(&diagnostics);
-                    let diagnostics = sort_diagnostics(projected.diagnostics);
-                    let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
-                    (
-                        FileDiagnosticsResult::Elaborated {
-                            summary,
-                            diagnostics,
-                            truncated: projected.truncated,
-                        },
-                        freshly_processed,
-                        missing_imports,
-                    )
-                }
-                ModuleQueryRun::Ready {
-                    freshly_processed,
-                    missing_imports,
-                    ..
-                } => (FileDiagnosticsResult::Unsupported, freshly_processed, missing_imports),
-                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
-                    let ElabFailure { diagnostics, truncated } = diagnostics;
-                    let diagnostics = sort_diagnostics(diagnostics);
-                    let summary = DiagnosticSummary::from_diagnostics(&diagnostics);
-                    return Ok(Response::ok(
-                        FileDiagnosticsResult::HeaderParseFailed {
-                            summary,
-                            diagnostics,
-                            truncated,
-                        },
-                        freshness,
-                    ));
-                }
-                ModuleQueryRun::Unsupported => {
-                    return Ok(Response::ok(FileDiagnosticsResult::Unsupported, freshness));
-                }
-            };
-            Ok(attach_query_notes(Response::ok(result, freshness), fresh, &missing))
-        })
-        .await
-}
-
-fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    diagnostics.sort_by_key(|d| d.position.as_ref().map_or((u32::MAX, u32::MAX), |p| (p.line, p.column)));
-    diagnostics
-}
-
 // --- shared plumbing ---------------------------------------------------
+
+struct QueryRun {
+    outcome: ModuleQueryRun,
+    imports: Vec<String>,
+}
 
 enum ModuleQueryRun {
     Ready {
@@ -618,25 +821,90 @@ enum ModuleQueryRun {
     Unsupported,
 }
 
-async fn run_module_query(
-    project: &Arc<LeanProject>,
-    path: &Path,
-    query: LeanWorkerModuleQuery,
-) -> Result<ModuleQueryRun> {
-    let resolved = resolve_path(project.canonical_root(), path);
-    let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
-    let hash = hash_bytes(&bytes);
+struct BatchRun {
+    outcome: BatchQueryRun,
+    imports: Vec<String>,
+}
+
+enum BatchQueryRun {
+    Ready {
+        result: lean_rs_worker_parent::LeanWorkerModuleQueryBatchEnvelope,
+        freshly_processed: bool,
+        missing_imports: Vec<String>,
+    },
+    HeaderParseFailed {
+        diagnostics: ElabFailure,
+    },
+    Unsupported,
+}
+
+async fn run_module_query(project: &Arc<LeanProject>, path: &Path, query: LeanWorkerModuleQuery) -> Result<QueryRun> {
+    let input = read_query_file(project.canonical_root(), path)?;
     let key = ModuleQueryKey::from_query(&query);
-    if let Some(outcome) = project.module_query_cache().get(&resolved, hash, &key) {
-        return Ok(route_query_outcome(outcome, false));
+    if let Some(outcome) = project.module_query_cache().get(&input.resolved, input.hash, &key) {
+        return Ok(QueryRun {
+            outcome: route_query_outcome(outcome, false),
+            imports: input.imports,
+        });
     }
 
-    let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
-    let outcome = process_module_query(project, source, query).await?;
+    let outcome = process_module_query(project, input.source, query).await?;
     project
         .module_query_cache()
-        .insert(resolved, hash, key, outcome.clone());
-    Ok(route_query_outcome(outcome, true))
+        .insert(input.resolved, input.hash, key, outcome.clone());
+    Ok(QueryRun {
+        outcome: route_query_outcome(outcome, true),
+        imports: input.imports,
+    })
+}
+
+async fn run_module_query_batch(
+    project: &Arc<LeanProject>,
+    path: &Path,
+    selectors: Vec<LeanWorkerModuleQuerySelector>,
+    budgets: LeanWorkerOutputBudgets,
+) -> Result<BatchRun> {
+    let input = read_query_file(project.canonical_root(), path)?;
+    let key = ModuleQueryBatchKey::from_selectors(&selectors, &budgets);
+    if let Some(outcome) = project
+        .module_query_cache()
+        .get_batch(&input.resolved, input.hash, &key)
+    {
+        return Ok(BatchRun {
+            outcome: route_batch_outcome(outcome, false),
+            imports: input.imports,
+        });
+    }
+
+    let outcome = process_module_query_batch(project, input.source, selectors, budgets).await?;
+    project
+        .module_query_cache()
+        .insert_batch(input.resolved, input.hash, key, outcome.clone());
+    Ok(BatchRun {
+        outcome: route_batch_outcome(outcome, true),
+        imports: input.imports,
+    })
+}
+
+struct QueryFile {
+    resolved: PathBuf,
+    hash: [u8; 32],
+    imports: Vec<String>,
+    source: String,
+}
+
+fn read_query_file(root: &Path, path: &Path) -> Result<QueryFile> {
+    let resolved = resolve_path(root, path);
+    let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
+    let hash = hash_bytes(&bytes);
+    let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
+    let imports = header_imports(&source);
+    Ok(QueryFile {
+        resolved,
+        hash,
+        imports,
+        source,
+    })
 }
 
 fn route_query_outcome(outcome: LeanWorkerModuleQueryOutcome, freshly_processed: bool) -> ModuleQueryRun {
@@ -659,6 +927,26 @@ fn route_query_outcome(outcome: LeanWorkerModuleQueryOutcome, freshly_processed:
     }
 }
 
+fn route_batch_outcome(outcome: LeanWorkerModuleQueryBatchOutcome, freshly_processed: bool) -> BatchQueryRun {
+    match outcome {
+        LeanWorkerModuleQueryBatchOutcome::Ok { result, .. } => BatchQueryRun::Ready {
+            result,
+            freshly_processed,
+            missing_imports: Vec::new(),
+        },
+        LeanWorkerModuleQueryBatchOutcome::MissingImports { result, missing, .. } => BatchQueryRun::Ready {
+            result,
+            freshly_processed,
+            missing_imports: missing,
+        },
+        LeanWorkerModuleQueryBatchOutcome::HeaderParseFailed { diagnostics, .. } => BatchQueryRun::HeaderParseFailed {
+            diagnostics: project_failure(&diagnostics),
+        },
+        LeanWorkerModuleQueryBatchOutcome::Unsupported => BatchQueryRun::Unsupported,
+        _ => BatchQueryRun::Unsupported,
+    }
+}
+
 async fn process_module_query(
     project: &Arc<LeanProject>,
     source: String,
@@ -675,6 +963,208 @@ async fn process_module_query(
                 .map_err(map_worker_err)
         })
         .await
+}
+
+async fn process_module_query_batch(
+    project: &Arc<LeanProject>,
+    source: String,
+    selectors: Vec<LeanWorkerModuleQuerySelector>,
+    budgets: LeanWorkerOutputBudgets,
+) -> Result<LeanWorkerModuleQueryBatchOutcome> {
+    let imports = session_imports(header_imports(&source));
+    project
+        .submit(move |cap| {
+            let mut session = cap
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            session
+                .process_module_query_batch(&source, &selectors, &budgets, &LeanWorkerElabOptions::new(), None, None)
+                .map_err(map_worker_err)
+        })
+        .await
+}
+
+enum ProjectedBatchItem {
+    Ok { id: String, result: LeanQueryProjection },
+    Unavailable { id: String, message: String },
+    BudgetExceeded { id: String, message: String },
+}
+
+impl ProjectedBatchItem {
+    fn into_item(self) -> (String, LeanQueryItem) {
+        match self {
+            Self::Ok { id, result } => (id, LeanQueryItem::Ok { result }),
+            Self::Unavailable { id, message } => (id, LeanQueryItem::Unavailable { message }),
+            Self::BudgetExceeded { id, message } => (id, LeanQueryItem::BudgetExceeded { message }),
+        }
+    }
+}
+
+fn project_batch_item(item: LeanWorkerModuleQueryBatchItem, file: Option<&str>) -> ProjectedBatchItem {
+    match item {
+        LeanWorkerModuleQueryBatchItem::Ok { id, result } => ProjectedBatchItem::Ok {
+            id,
+            result: project_batch_result(*result, file),
+        },
+        LeanWorkerModuleQueryBatchItem::Unavailable { id, message } => ProjectedBatchItem::Unavailable { id, message },
+        LeanWorkerModuleQueryBatchItem::BudgetExceeded { id, message } => {
+            ProjectedBatchItem::BudgetExceeded { id, message }
+        }
+        _ => ProjectedBatchItem::Unavailable {
+            id: "<unknown>".to_owned(),
+            message: "worker returned an unknown selector item".to_owned(),
+        },
+    }
+}
+
+fn project_batch_result(result: LeanWorkerModuleQueryBatchResult, file: Option<&str>) -> LeanQueryProjection {
+    match result {
+        LeanWorkerModuleQueryBatchResult::Diagnostics(failure) => {
+            LeanQueryProjection::Diagnostics(diagnostics_block(project_failure(&failure)))
+        }
+        LeanWorkerModuleQueryBatchResult::ProofState(result) => {
+            LeanQueryProjection::ProofState(project_proof_state_result(result))
+        }
+        LeanWorkerModuleQueryBatchResult::TypeAt(result) => LeanQueryProjection::TypeAt(project_type_at_result(result)),
+        LeanWorkerModuleQueryBatchResult::References(result) => {
+            let display = file.unwrap_or("");
+            LeanQueryProjection::References(ReferencesProjection {
+                references: result
+                    .references
+                    .iter()
+                    .map(|node| project_reference(display, node))
+                    .collect(),
+                truncated: result.truncated,
+            })
+        }
+        LeanWorkerModuleQueryBatchResult::DeclarationTarget(result) => {
+            LeanQueryProjection::DeclarationTarget(project_declaration_target_result(result))
+        }
+        LeanWorkerModuleQueryBatchResult::SurroundingDeclaration(result) => {
+            LeanQueryProjection::SurroundingDeclaration(project_surrounding_declaration_result(result))
+        }
+        _ => LeanQueryProjection::Diagnostics(DiagnosticsBlock {
+            summary: DiagnosticSummary::default(),
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+    }
+}
+
+fn project_proof_state_result(result: LeanWorkerProofStateResult) -> ProofStateProjection {
+    match result {
+        LeanWorkerProofStateResult::State { info } => ProofStateProjection::State {
+            info: Box::new(project_proof_state_info(*info)),
+        },
+        LeanWorkerProofStateResult::Unavailable { message } => ProofStateProjection::Unavailable { message },
+        _ => ProofStateProjection::Unavailable {
+            message: "worker returned an unknown proof-state result".to_owned(),
+        },
+    }
+}
+
+fn project_proof_state_info(info: LeanWorkerProofStateInfo) -> ProofStateContext {
+    ProofStateContext {
+        declaration_name: info.declaration_name,
+        namespace_name: info.namespace_name,
+        safe_edit: info.safe_edit.map(project_declaration_target_info),
+        span: span_of_module(info.span),
+        goals_before: info.goals_before,
+        goals_after: info.goals_after,
+        locals: info.locals.into_iter().map(project_local_info).collect(),
+        expected_type: info.expected_type.map(rendered_text),
+        truncated: info.truncated,
+    }
+}
+
+fn project_local_info(info: LeanWorkerLocalInfo) -> LocalInfo {
+    LocalInfo {
+        name: info.name,
+        binder_info: info.binder_info,
+        type_str: rendered_text(info.type_str),
+        value: info.value.map(rendered_text),
+    }
+}
+
+fn project_type_at_result(result: LeanWorkerTypeAtResult) -> TypeAtProjection {
+    match result {
+        LeanWorkerTypeAtResult::Term {
+            span,
+            expr,
+            type_str,
+            expected_type,
+        } => TypeAtProjection::Term {
+            expr: rendered_text(expr),
+            type_str: rendered_text(type_str),
+            expected_type: expected_type.map(rendered_text),
+            span: span_of_module(span),
+        },
+        LeanWorkerTypeAtResult::NoTerm => TypeAtProjection::NoTerm,
+        _ => TypeAtProjection::NoTerm,
+    }
+}
+
+fn project_declaration_target_result(result: LeanWorkerDeclarationTargetResult) -> DeclarationTargetProjection {
+    match result {
+        LeanWorkerDeclarationTargetResult::Target { info } => DeclarationTargetProjection::Target {
+            info: project_declaration_target_info(info),
+        },
+        LeanWorkerDeclarationTargetResult::NotFound => DeclarationTargetProjection::NotFound,
+        LeanWorkerDeclarationTargetResult::Ambiguous { candidates } => DeclarationTargetProjection::Ambiguous {
+            candidates: candidates.into_iter().map(project_declaration_target_info).collect(),
+        },
+        _ => DeclarationTargetProjection::NotFound,
+    }
+}
+
+fn project_surrounding_declaration_result(
+    result: LeanWorkerSurroundingDeclarationResult,
+) -> SurroundingDeclarationProjection {
+    match result {
+        LeanWorkerSurroundingDeclarationResult::Declaration { info } => SurroundingDeclarationProjection::Declaration {
+            info: project_declaration_target_info(info),
+        },
+        LeanWorkerSurroundingDeclarationResult::None => SurroundingDeclarationProjection::None,
+        _ => SurroundingDeclarationProjection::None,
+    }
+}
+
+fn project_declaration_target_info(info: LeanWorkerDeclarationTargetInfo) -> DeclarationTargetInfo {
+    DeclarationTargetInfo {
+        short_name: info.short_name,
+        declaration_name: info.declaration_name,
+        namespace_name: info.namespace_name,
+        declaration_kind: info.declaration_kind,
+        declaration_span: span_of_module(info.declaration_span),
+        name_span: span_of_module(info.name_span),
+        body_span: span_of_module(info.body_span),
+    }
+}
+
+fn diagnostics_block(failure: ElabFailure) -> DiagnosticsBlock {
+    let ElabFailure { diagnostics, truncated } = failure;
+    let diagnostics = sort_diagnostics(diagnostics);
+    DiagnosticsBlock {
+        summary: DiagnosticSummary::from_diagnostics(&diagnostics),
+        diagnostics,
+        truncated,
+    }
+}
+
+fn duplicate_selector_id(selectors: &[LeanQuerySelector]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    for selector in selectors {
+        let id = selector.id();
+        if !seen.insert(id.to_owned()) {
+            return Some(id.to_owned());
+        }
+    }
+    None
+}
+
+fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    diagnostics.sort_by_key(|d| d.position.as_ref().map_or((u32::MAX, u32::MAX), |p| (p.line, p.column)));
+    diagnostics
 }
 
 fn resolve_path(root: &Path, path: &Path) -> PathBuf {
@@ -716,14 +1206,20 @@ fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
     }
 }
 
-fn attach_query_notes<T>(mut response: Response<T>, freshly_processed: bool, missing_imports: &[String]) -> Response<T>
+fn attach_query_notes<T>(
+    mut response: Response<T>,
+    freshly_processed: bool,
+    missing_imports: &[String],
+    batch: bool,
+) -> Response<T>
 where
     T: Serialize + JsonSchema,
 {
     if freshly_processed {
-        response.next_actions.push(
-            "module query result cached; repeating the same query against the same file contents reuses it".to_owned(),
-        );
+        let kind = if batch { "module query batch" } else { "module query" };
+        response.next_actions.push(format!(
+            "{kind} result cached; repeating the same query against the same file contents reuses it"
+        ));
     }
     if !missing_imports.is_empty() {
         response.warnings.push(format!(
@@ -769,8 +1265,13 @@ fn header_imports(source: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "unit tests should fail directly when literal JSON fixtures stop matching the schema"
+)]
 mod tests {
-    use super::header_imports;
+    use super::{LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ProofStateRequest, header_imports};
 
     #[test]
     fn header_imports_handles_public_meta_and_all() {
@@ -790,6 +1291,46 @@ import Init -- comment
                 "Project.Internal".to_owned(),
                 "Init".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn proof_state_request_round_trips() {
+        let request: ProofStateRequest =
+            serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
+        assert_eq!(request.line, 7);
+        assert_eq!(request.column, 3);
+    }
+
+    #[test]
+    fn lean_query_request_round_trips_typed_selectors() {
+        let request: LeanQueryRequest = serde_json::from_str(
+            r#"{"file":"Foo.lean","selectors":[
+                {"selector":"diagnostics","id":"d"},
+                {"selector":"proof_state","id":"p","line":4,"column":2},
+                {"selector":"type_at","id":"t","line":5,"column":9},
+                {"selector":"references","id":"r","name":"Nat.add"},
+                {"selector":"declaration_target","id":"target","line":5,"column":9},
+                {"selector":"surrounding_declaration","id":"around","line":5,"column":9}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(request.selectors.len(), 6);
+        assert!(matches!(request.selectors[0], LeanQuerySelector::Diagnostics { .. }));
+    }
+
+    #[test]
+    fn lean_query_result_serialises_status_tag() {
+        let unsupported = serde_json::to_string(&LeanQueryResult::Unsupported).unwrap();
+        assert_eq!(unsupported, r#"{"status":"unsupported"}"#);
+
+        let invalid = serde_json::to_string(&LeanQueryResult::InvalidSelectors {
+            message: "selectors must not be empty".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            invalid,
+            r#"{"status":"invalid_selectors","message":"selectors must not be empty"}"#
         );
     }
 }

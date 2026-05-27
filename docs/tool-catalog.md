@@ -141,79 +141,89 @@ output. Its freshness envelope reports `imports: []`.
 
 Presets: `sorry | admit | axiom | set_option | custom`.
 
-## Position tools (`src/tools/position.rs`)
+## Proof-agent module tools (`src/tools/position.rs`)
 
-The position tools drive `process_module_query`: they read the file, hand the full source (header + body) to Lean's
-frontend, and ask for one bounded projection. The file's own `import` declarations are parsed by Lean and validated
-against the server's open env; mismatch surfaces as an envelope `warnings` entry for single-file tools or a result
-sidebar for `references_in_project`. Query results are cached against `(file_path, sha256(contents), query_kind)`, so an
-identical repeated query on the same bytes reuses the bounded response; an edit invalidates structurally.
+`proof_state` and `lean_query` drive `process_module_query_batch`: they read one file, hand the full source
+(header + body) to Lean's frontend, and ask for bounded semantic projections. The file's own `import` declarations are
+parsed by Lean and validated against the server's open env; mismatch surfaces as an envelope `warnings` entry. Query
+results are cached against `(file_path, sha256(contents), selector_set, budgets)`, so an identical repeated query on the
+same bytes reuses the bounded response; an edit invalidates structurally.
 
-`process_module_query` is an **optional** capability shim. When the loaded dylib lacks the
-`lean_rs_host_process_module_query` shim, position tools answer `{ "status": "unsupported" }` cleanly; the tools never
-raise.
+`process_module_query_batch` is an **optional** capability shim. When the loaded dylib lacks it, these tools answer
+`{ "status": "unsupported" }` cleanly; the tools never raise and never request a whole-file info tree.
 
 All line and column inputs are **1-indexed**. Result spans use the same convention.
 
-### `goal_at_position`
+### `proof_state`
+
+Inspect the current Lean proof context at a cursor position. This is the default tool before editing a proof.
 
 ```jsonc
 // request
 { "file": "LeanRsFixture/SourceRanges.lean", "line": 8, "column": 3 }
 
-// result: tactic context found
+// result
 {
-  "status": "goal",
-  "goals_before": ["⊢ True"],
-  "goals_after":  [],
-  "span": { "start_line": 8, "start_column": 3, "end_line": 8, "end_column": 10 },
-  "truncated": false
+  "status": "context",
+  "diagnostics": { "summary": { "errors": 0, "warnings": 0, "info": 0 }, "diagnostics": [], "truncated": false },
+  "proof_state": {
+    "status": "state",
+    "info": {
+      "declaration_name": "LeanRsFixture.SourceRanges.proofGoal",
+      "namespace_name": "LeanRsFixture.SourceRanges",
+      "safe_edit": { "declaration_name": "...", "body_span": { ... } },
+      "span": { "start_line": 8, "start_column": 3, "end_line": 8, "end_column": 10 },
+      "goals_before": ["⊢ True"],
+      "goals_after": [],
+      "locals": [],
+      "truncated": false
+    }
+  },
+  "term": { "status": "term", "type_str": { "value": "TacticM Unit", "truncated": false }, "...": "..." },
+  "declaration_target": { "status": "target", "info": { "...": "..." } },
+  "surrounding_declaration": { "status": "declaration", "info": { "...": "..." } },
+  "total_truncated": false
 }
-
-// result: no tactic at cursor
-{ "status": "no_tactic_context" }
-
-// result: file's header did not parse
-{ "status": "header_parse_failed",
-  "diagnostics": { "diagnostics": [...], "truncated": false } }
-
-// result: worker host shims missing the shim
-{ "status": "unsupported" }
 ```
 
-`file` resolves relative to the resolved project root when not absolute. Goals are pre-rendered by Lean's `Meta.ppGoal`
-inside the elaboration context; the strings are diagnostic text only. When the file's header imports modules the
-server's open env doesn't have, the result is still returned but the envelope's `warnings` array names the missing
-modules.
+Header parse failures return `status: "header_parse_failed"` with the same diagnostics block shape. Selector-level
+unavailability and budget exhaustion are reported in `unavailable` / `budget_exceeded` sidebars instead of failing the
+whole tool call.
 
-### `type_at_position`
+### `lean_query`
+
+Run a bounded batch of Lean semantic projections against one file. Selectors are typed objects and each selector has a
+caller-chosen `id`; results are returned in an object keyed by those ids.
 
 ```jsonc
 // request
-{ "file": "LeanRsFixture/SourceRanges.lean", "line": 7, "column": 24 }
-
-// result: innermost term found
 {
-  "status": "term",
-  "expr":          { "value": "True", "truncated": false },
-  "type_str":      { "value": "Prop", "truncated": false },
-  "expected_type": null,
-  "span": { "start_line": 7, "start_column": 24, "end_line": 7, "end_column": 28 }
+  "file": "LeanRsFixture/SourceRanges.lean",
+  "selectors": [
+    { "selector": "diagnostics", "id": "diag" },
+    { "selector": "proof_state", "id": "state", "line": 8, "column": 3 },
+    { "selector": "type_at", "id": "term", "line": 7, "column": 24 },
+    { "selector": "references", "id": "refs", "name": "LeanRsFixture.SourceRanges.knownTheorem" },
+    { "selector": "declaration_target", "id": "target", "line": 7, "column": 9 },
+    { "selector": "surrounding_declaration", "id": "around", "line": 8, "column": 3 }
+  ]
 }
 
-// result: no term recorded
-{ "status": "no_term" }
-
-// result: file's header did not parse
-{ "status": "header_parse_failed",
-  "diagnostics": { "diagnostics": [...], "truncated": false } }
-
-// result: worker host shims missing the shim
-{ "status": "unsupported" }
+// result
+{
+  "status": "results",
+  "items": {
+    "diag": { "status": "ok", "result": { "kind": "diagnostics", "summary": { ... }, "diagnostics": [] } },
+    "state": { "status": "ok", "result": { "kind": "proof_state", "status": "state", "info": { ... } } },
+    "term": { "status": "ok", "result": { "kind": "type_at", "status": "term", "type_str": { ... } } }
+  },
+  "total_truncated": false
+}
 ```
 
-`expr`, `type_str`, and `expected_type` are bounded rendered text objects. `expected_type` is set only at sites where the
-elaborator recorded one, such as coercion sites. The same `MissingImports` warning behavior as `goal_at_position`.
+Duplicate selector ids and empty selector arrays return `status: "invalid_selectors"`. Text fields use bounded
+`{ value, truncated }` objects where rendering can grow. `total_truncated` means the batch-level response budget was
+hit; selector-level budget exhaustion returns an item with `status: "budget_exceeded"`.
 
 ### `references_in_file`
 
@@ -256,39 +266,3 @@ Hits cap at `min(limit, 1000)` and set `truncated: true` when the scan stops ear
 walk continues past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib
 lacks the shim), `header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...]
 }`). Results are sorted by `(file, line, column)`.
-
-### `file_diagnostics`
-
-Elaboration diagnostics—errors, warnings, info—for a `.lean` file. This is a diagnostics-only projection: term/type,
-tactic, and name-reference payloads are not rendered or transported.
-
-```jsonc
-// request
-{ "file": "LeanRsFixture/SourceRanges.lean" }
-
-// result: elaboration completed; diagnostics may be empty, info-only, or carry errors
-{
-  "status": "elaborated",
-  "summary": { "errors": 1, "warnings": 0, "info": 0 },
-  "diagnostics": [
-    { "severity": "error", "message": "type mismatch ...",
-      "position": { "line": 12, "column": 9, "end_line": 12, "end_column": 13 } }
-  ],
-  "truncated": false
-}
-
-// result: file's header did not parse; body never elaborated; diagnostics are the parser's
-{ "status": "header_parse_failed",
-  "summary": { "errors": 1, "warnings": 0, "info": 0 },
-  "diagnostics": [...], "truncated": false }
-
-// result: worker host shims missing the module-query shim
-{ "status": "unsupported" }
-```
-
-`status: "elaborated"` only means we got far enough to collect diagnostics; `summary.errors > 0` is the real "does this
-file have problems?" signal. `severity` is lowercase (`"error" | "warning" | "info"`). `diagnostics` is sorted by
-`(line, column)`. The per-diagnostic `file` field is omitted for Lean's synthetic source labels (almost always).
-`truncated` is true only when Lean hit the diagnostic byte budget; the list is then a prefix. `Elaborated` and
-`HeaderParseFailed` share the same shape (`summary` + `diagnostics` + `truncated`) so callers render one structure. The
-same `MissingImports` envelope-warning behaviour as the cursor-driven tools applies.

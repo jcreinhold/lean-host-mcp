@@ -67,7 +67,7 @@ silently relink `libleanshared` into the parent. Always build per-member (`cargo
 ### Manual smoke test
 
 ```sh
-lean-host-mcp install-worker --toolchain v4.30.0-rc2
+lean-host-mcp install-worker --toolchain v4.30.0
 lean-host-mcp install-worker --list                                          # see one row
 LEAN_HOST_MCP_PROJECT=/path/to/project-on-v4.30 lean-host-mcp                # serves
 LEAN_HOST_MCP_PROJECT=/path/to/project-on-v4.29 lean-host-mcp                # error includes install_cmd
@@ -135,20 +135,20 @@ not be able to trigger a full environment walk plus bulk type rendering just to 
 
 ## The module-query cache
 
-`goal_at_position`, `type_at_position`, `references_in_file`, `references_in_project`, and `file_diagnostics` call the
-worker's `process_module_query` capability. There is no whole-file info-tree result in the parent. Each request asks
-Lean for one bounded projection: diagnostics only, the selected term type, the selected tactic context, or references to
-one name without expression/type renderings.
+`proof_state` and `lean_query` call the worker's `process_module_query_batch` capability. There is no whole-file
+info-tree result in the parent. Each request asks Lean for bounded projections selected by intent: diagnostics, proof
+state, selected term type, references to one name, declaration target, or surrounding declaration. The reference tools
+still use the older single-query capability until the later source/reference redesign replaces them.
 
-Re-processing an identical cursor query would still be wasteful, so `cache.rs` ships a small LRU of
-`LeanWorkerModuleQueryOutcome` values, capacity 256, keyed on `(file_path, sha256(contents), query_kind)`. Any edit to
-the source bytes misses structurally. The query kind includes the cursor position or reference name, so a type query at
-one cursor cannot be mistaken for diagnostics or a reference query.
+Re-processing an identical query would still be wasteful, so `cache.rs` ships small LRUs keyed on
+`(file_path, sha256(contents), query_shape)`. Single-query references store `LeanWorkerModuleQueryOutcome`; batched proof
+queries store `LeanWorkerModuleQueryBatchOutcome`. Any edit to the source bytes misses structurally. Batch keys include
+selector ids and budgets, so a proof-state request cannot be mistaken for diagnostics or a different selector bundle.
 
 The cache is populated through `LeanProject`'s worker actor. The tool reads the file, derives session imports from its
-header, opens a short-lived worker session, and calls `process_module_query`. Files whose header references modules the
-session's open env does not have still return a bounded result; the `MissingImports` signal travels as an envelope
-warning for single-file tools or a result sidebar for `references_in_project`.
+header, opens a short-lived worker session, and calls the batch or single-query worker method. Files whose header
+references modules the session's open env does not have still return a bounded result; the `MissingImports` signal
+travels as an envelope warning for single-file tools or a result sidebar for `references_in_project`.
 
 Frame size is controlled by query shape, not transport tuning. The project actor uses the upstream worker frame cap, and
 the tool layer has no fallback that requests rendered `exprStr` / `typeStr` for every term in a file.

@@ -4,7 +4,7 @@
 //! Two value types and one error live here:
 //!
 //! - [`ToolchainId`] is the canonical short form of a toolchain pin
-//!   (e.g. `v4.30.0-rc2`, `nightly-2026-05-20`). [`Self::parse`] accepts
+//!   (e.g. `v4.30.0`, `nightly-2026-05-20`). [`Self::parse`] accepts
 //!   either the bare short form or the elan-style `leanprover/lean4:<id>`.
 //!   [`Self::from_lake_root`] reads `<root>/lean-toolchain` and parses it.
 //! - [`WorkerBinary`] is the resolved path to a worker binary that links
@@ -21,7 +21,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Canonical short form of a Lean toolchain pin (e.g. `v4.30.0-rc2`,
+/// Canonical short form of a Lean toolchain pin (e.g. `v4.30.0`,
 /// `nightly-2026-05-20`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ToolchainId(String);
@@ -256,19 +256,17 @@ mod tests {
     #[test]
     fn parse_accepts_elan_prefix_and_bare_short_form() {
         assert_eq!(
-            ToolchainId::parse("leanprover/lean4:v4.30.0-rc2").unwrap().as_str(),
-            "v4.30.0-rc2",
+            ToolchainId::parse("leanprover/lean4:v4.30.0").unwrap().as_str(),
+            "v4.30.0",
         );
-        assert_eq!(ToolchainId::parse("v4.30.0-rc2").unwrap().as_str(), "v4.30.0-rc2",);
+        assert_eq!(ToolchainId::parse("v4.30.0").unwrap().as_str(), "v4.30.0",);
         assert_eq!(
             ToolchainId::parse("nightly-2026-05-20").unwrap().as_str(),
             "nightly-2026-05-20",
         );
         assert_eq!(
-            ToolchainId::parse("  leanprover/lean4:v4.30.0-rc2  \n")
-                .unwrap()
-                .as_str(),
-            "v4.30.0-rc2",
+            ToolchainId::parse("  leanprover/lean4:v4.30.0  \n").unwrap().as_str(),
+            "v4.30.0",
         );
     }
 
@@ -292,9 +290,9 @@ mod tests {
     #[test]
     fn from_lake_root_reads_lean_toolchain_file() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("lean-toolchain"), "leanprover/lean4:v4.30.0-rc2\n").unwrap();
+        fs::write(tmp.path().join("lean-toolchain"), "leanprover/lean4:v4.30.0\n").unwrap();
         let id = ToolchainId::from_lake_root(tmp.path()).unwrap();
-        assert_eq!(id.as_str(), "v4.30.0-rc2");
+        assert_eq!(id.as_str(), "v4.30.0");
     }
 
     #[test]
@@ -309,11 +307,11 @@ mod tests {
     #[test]
     fn worker_binary_missing_under_override_returns_install_cmd() {
         let tmp = tempfile::tempdir().unwrap();
-        let id = ToolchainId::parse("v4.30.0-rc2").unwrap();
+        let id = ToolchainId::parse("v4.30.0").unwrap();
         let err = WorkerBinary::resolve_with_override(&id, Some(tmp.path())).unwrap_err();
         match err {
             ToolchainError::WorkerNotInstalled { install_cmd, .. } => {
-                assert!(install_cmd.contains("v4.30.0-rc2"), "got: {install_cmd}");
+                assert!(install_cmd.contains("v4.30.0"), "got: {install_cmd}");
             }
             ToolchainError::UnparseableToolchainString(_)
             | ToolchainError::LeanToolchainFileMissing(_)
@@ -326,8 +324,8 @@ mod tests {
     #[test]
     fn worker_binary_with_id_subdir_wins() {
         let tmp = tempfile::tempdir().unwrap();
-        let id = ToolchainId::parse("v4.30.0-rc2").unwrap();
-        let nested = tmp.path().join("v4.30.0-rc2");
+        let id = ToolchainId::parse("v4.30.0").unwrap();
+        let nested = tmp.path().join("v4.30.0");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
         let resolved = WorkerBinary::resolve_with_override(&id, Some(tmp.path())).unwrap();
@@ -337,7 +335,7 @@ mod tests {
     #[test]
     fn worker_binary_bare_developer_fallback_wins() {
         let tmp = tempfile::tempdir().unwrap();
-        let id = ToolchainId::parse("v4.30.0-rc2").unwrap();
+        let id = ToolchainId::parse("v4.30.0").unwrap();
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
         let resolved = WorkerBinary::resolve_with_override(&id, Some(tmp.path())).unwrap();
         assert_eq!(resolved.path, tmp.path().join(WORKER_FILE_NAME));

@@ -7,10 +7,10 @@
 //!   the JSON envelope.
 //! - [`scan`]: `project_scan`. No Lean dependency; pure filesystem walk
 //!   with a configurable regex.
-//! - [`position`]: `goal_at_position`, `type_at_position`,
-//!   `references_in_file`, `references_in_project`, `file_diagnostics`.
-//!   Bounded module queries from `lean-rs-worker`; the cache is keyed on
-//!   path + content hash + query kind.
+//! - [`position`]: `proof_state`, `lean_query`, `references_in_file`, and
+//!   `references_in_project`. Bounded module queries from
+//!   `lean-rs-worker`; the cache is keyed on path + content hash + query
+//!   shape.
 
 use std::sync::Arc;
 

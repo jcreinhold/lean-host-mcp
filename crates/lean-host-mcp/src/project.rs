@@ -42,7 +42,6 @@ use crate::toolchain::{ToolchainId, WorkerBinary};
 /// intentionally small, so this can hold more cursor probes than the old
 /// whole-file cache without creating a large memory resident set.
 const MODULE_QUERY_CACHE_CAPACITY: usize = 256;
-const WORKER_RSS_RESTART_KIB: u64 = 3 * 1024 * 1024;
 const WORKER_REQUEST_RESTARTS: u64 = 64;
 
 type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
@@ -52,7 +51,7 @@ type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
 pub struct LeanProject {
     canonical_root: PathBuf,
     /// Raw contents of `<canonical_root>/lean-toolchain`, e.g.
-    /// `"leanprover/lean4:v4.30.0-rc2"`.
+    /// `"leanprover/lean4:v4.30.0"`.
     toolchain: String,
     package: Option<String>,
     library: Option<String>,
@@ -270,11 +269,7 @@ fn actor_main(
         .worker_child(LeanWorkerChild::for_toolchain(worker_path, lean_sysroot))
         .startup_timeout(Duration::from_secs(30))
         .long_running_requests()
-        .restart_policy(
-            LeanWorkerRestartPolicy::default()
-                .max_requests(WORKER_REQUEST_RESTARTS)
-                .max_rss_kib(WORKER_RSS_RESTART_KIB),
-        );
+        .restart_policy(LeanWorkerRestartPolicy::default().max_requests(WORKER_REQUEST_RESTARTS));
 
     let report = builder.check();
     if let Some(first) = report.first_error() {

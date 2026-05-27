@@ -25,7 +25,11 @@ use lean_host_mcp::tools::lean::{
     ElaborateRequest, ElaborateResult, HoverByNameRequest, HoverByNameResult, InferTypeRequest, elaborate,
     hover_by_name, infer_type,
 };
-use lean_host_mcp::{BrokerConfig, ProjectBroker, ServerError};
+use lean_host_mcp::tools::position::{
+    DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ProofStateRequest,
+    ProofStateResult, TypeAtProjection, lean_query, proof_state,
+};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, Response, ServerError};
 
 fn fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
@@ -111,6 +115,44 @@ fn find_module_syntax_file(root: &Path) -> Option<PathBuf> {
     }
 
     visit(root, SKIP_DIRS)
+}
+
+enum DiagnosticsOutcome {
+    Elaborated(DiagnosticsBlock),
+    HeaderParseFailed,
+    Unsupported,
+}
+
+async fn query_diagnostics(ctx: &ToolContext, file: PathBuf) -> lean_host_mcp::Result<Response<LeanQueryResult>> {
+    lean_query(
+        ctx,
+        LeanQueryRequest {
+            file,
+            selectors: vec![LeanQuerySelector::Diagnostics {
+                id: "diagnostics".to_owned(),
+            }],
+            project: None,
+        },
+    )
+    .await
+}
+
+fn diagnostics_outcome(result: LeanQueryResult) -> DiagnosticsOutcome {
+    match result {
+        LeanQueryResult::Results { mut items, .. } => {
+            let item = items.remove("diagnostics").expect("diagnostics selector result");
+            let lean_host_mcp::tools::position::LeanQueryItem::Ok {
+                result: LeanQueryProjection::Diagnostics(block),
+            } = item
+            else {
+                panic!("diagnostics selector must return diagnostics");
+            };
+            DiagnosticsOutcome::Elaborated(block)
+        }
+        LeanQueryResult::HeaderParseFailed { .. } => DiagnosticsOutcome::HeaderParseFailed,
+        LeanQueryResult::Unsupported => DiagnosticsOutcome::Unsupported,
+        LeanQueryResult::InvalidSelectors { message } => panic!("unexpected invalid diagnostics query: {message}"),
+    }
 }
 
 #[tokio::test]
@@ -204,18 +246,17 @@ fn type_of_name_request_accepts_byte_cap() {
 #[test]
 fn position_requests_round_trip() {
     use lean_host_mcp::tools::position::{
-        GoalAtPositionRequest, ReferencesInFileRequest, ReferencesInProjectRequest, TypeAtPositionRequest,
+        LeanQueryRequest, ProofStateRequest, ReferencesInFileRequest, ReferencesInProjectRequest,
     };
 
-    let g: GoalAtPositionRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
+    let g: ProofStateRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
     assert_eq!(g.line, 7);
     assert_eq!(g.column, 3);
 
-    // A caller may still send an `imports` field; serde silently ignores
-    // unknown fields by default. The schema no longer publishes it.
-    let t: TypeAtPositionRequest =
-        serde_json::from_str(r#"{"file":"X.lean","line":1,"column":1,"imports":["A.B"]}"#).unwrap();
-    assert_eq!(t.line, 1);
+    let q: LeanQueryRequest =
+        serde_json::from_str(r#"{"file":"X.lean","selectors":[{"selector":"type_at","id":"t","line":1,"column":1}]}"#)
+            .unwrap();
+    assert_eq!(q.selectors.len(), 1);
 
     let r_file: ReferencesInFileRequest = serde_json::from_str(r#"{"file":"A.lean","name":"Nat.add"}"#).unwrap();
     assert_eq!(r_file.file, PathBuf::from("A.lean"));
@@ -267,47 +308,30 @@ fn references_result_skips_empty_fields() {
 }
 
 #[test]
-fn goal_result_serialises_status_tag() {
-    use lean_host_mcp::tools::position::GoalAtPositionResult;
+fn proof_state_result_serialises_status_tag() {
+    use lean_host_mcp::tools::position::ProofStateResult;
 
-    let s = serde_json::to_string(&GoalAtPositionResult::NoTacticContext).unwrap();
-    assert_eq!(s, r#"{"status":"no_tactic_context"}"#);
-
-    let s = serde_json::to_string(&GoalAtPositionResult::Unsupported).unwrap();
+    let s = serde_json::to_string(&ProofStateResult::Unsupported).unwrap();
     assert_eq!(s, r#"{"status":"unsupported"}"#);
 }
 
 #[test]
-fn file_diagnostics_request_round_trips() {
-    use lean_host_mcp::tools::position::FileDiagnosticsRequest;
+fn lean_query_diagnostics_request_round_trips() {
+    use lean_host_mcp::tools::position::LeanQueryRequest;
 
-    let r: FileDiagnosticsRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean"}"#).unwrap();
+    let r: LeanQueryRequest =
+        serde_json::from_str(r#"{"file":"Foo/Bar.lean","selectors":[{"selector":"diagnostics","id":"d"}]}"#).unwrap();
     assert_eq!(r.file, PathBuf::from("Foo/Bar.lean"));
-
-    // Unknown fields are ignored, same as the cursor-driven requests.
-    let r2: FileDiagnosticsRequest = serde_json::from_str(r#"{"file":"X.lean","line":1}"#).unwrap();
-    assert_eq!(r2.file, PathBuf::from("X.lean"));
 }
 
 #[test]
-fn file_diagnostics_result_serialises_status_tag() {
-    use lean_host_mcp::tools::position::{DiagnosticSummary, FileDiagnosticsResult};
+fn lean_query_result_serialises_status_tag() {
+    use lean_host_mcp::tools::position::{DiagnosticSummary, LeanQueryResult};
 
-    let s = serde_json::to_string(&FileDiagnosticsResult::Unsupported).unwrap();
+    let s = serde_json::to_string(&LeanQueryResult::Unsupported).unwrap();
     assert_eq!(s, r#"{"status":"unsupported"}"#);
 
-    let s = serde_json::to_string(&FileDiagnosticsResult::Elaborated {
-        summary: DiagnosticSummary::default(),
-        diagnostics: Vec::new(),
-        truncated: false,
-    })
-    .unwrap();
-    assert_eq!(
-        s,
-        r#"{"status":"elaborated","summary":{"errors":0,"warnings":0,"info":0},"diagnostics":[],"truncated":false}"#
-    );
-
-    let s = serde_json::to_string(&FileDiagnosticsResult::HeaderParseFailed {
+    let s = serde_json::to_string(&LeanQueryResult::HeaderParseFailed {
         summary: DiagnosticSummary::default(),
         diagnostics: Vec::new(),
         truncated: false,
@@ -325,7 +349,6 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
     use std::io::Write as _;
 
     use lean_host_mcp::tools::lean::{SearchDeclarationsRequest, search_declarations};
-    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
 
     let Some(root) = mathlib_fixture_root() else {
         eprintln!("skipping: LEAN_HOST_MCP_TEST_MATHLIB_FIXTURE not set");
@@ -390,15 +413,9 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
     writeln!(file, "example : (0 : Nat) + 1 = 1 := by norm_num").unwrap();
     file.flush().unwrap();
 
-    let diagnostics = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file: file.path().to_path_buf(),
-            project: None,
-        },
-    )
-    .await
-    .expect("file_diagnostics on Mathlib-importing file");
+    let diagnostics = query_diagnostics(&ctx, file.path().to_path_buf())
+        .await
+        .expect("lean_query diagnostics on Mathlib-importing file");
     assert!(
         diagnostics
             .warnings
@@ -408,11 +425,11 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
         file.path(),
         diagnostics.warnings
     );
-    let FileDiagnosticsResult::Elaborated { summary, .. } = diagnostics.result else {
-        panic!("file_diagnostics must elaborate a Mathlib-importing project file");
+    let DiagnosticsOutcome::Elaborated(block) = diagnostics_outcome(diagnostics.result) else {
+        panic!("lean_query diagnostics must elaborate a Mathlib-importing project file");
     };
     assert_eq!(
-        summary.errors, 0,
+        block.summary.errors, 0,
         "Mathlib-importing project file should elaborate cleanly"
     );
 }
@@ -420,8 +437,6 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
 #[tokio::test]
 #[ignore = "requires a built module-syntax Lake fixture; set LEAN_HOST_MCP_TEST_MODULE_SYNTAX_FIXTURE to enable"]
 async fn module_syntax_file_diagnostics_elaborates_import_all_header() {
-    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
-
     let Some(root) = module_syntax_fixture_root() else {
         eprintln!("skipping: LEAN_HOST_MCP_TEST_MODULE_SYNTAX_FIXTURE not set");
         return;
@@ -434,17 +449,9 @@ async fn module_syntax_file_diagnostics_elaborates_import_all_header() {
     });
     let ctx = open_ctx(&root);
 
-    let diagnostics = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file: file.clone(),
-            project: None,
-        },
-    )
-    .await
-    .unwrap_or_else(|err| {
+    let diagnostics = query_diagnostics(&ctx, file.clone()).await.unwrap_or_else(|err| {
         panic!(
-            "file_diagnostics must not propagate an import-prefix error for {}: {err:?}",
+            "lean_query diagnostics must not propagate an import-prefix error for {}: {err:?}",
             file.display()
         )
     });
@@ -457,7 +464,7 @@ async fn module_syntax_file_diagnostics_elaborates_import_all_header() {
         file.display(),
         diagnostics.warnings
     );
-    let FileDiagnosticsResult::Elaborated { .. } = diagnostics.result else {
+    let DiagnosticsOutcome::Elaborated(_) = diagnostics_outcome(diagnostics.result) else {
         panic!(
             "module-syntax file should elaborate far enough to return diagnostics for {}",
             file.display()
@@ -495,30 +502,20 @@ async fn hover_by_name_populates_type_signature() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn file_diagnostics_returns_clean_file_empty() {
-    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
-
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
-    let resp = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file: PathBuf::from("LeanRsFixture/SourceRanges.lean"),
-            project: None,
-        },
-    )
-    .await
-    .expect("file_diagnostics");
-    let FileDiagnosticsResult::Elaborated {
-        summary, diagnostics, ..
-    } = resp.result
-    else {
+    let resp = query_diagnostics(&ctx, PathBuf::from("LeanRsFixture/SourceRanges.lean"))
+        .await
+        .expect("lean_query diagnostics");
+    let DiagnosticsOutcome::Elaborated(block) = diagnostics_outcome(resp.result) else {
         panic!("expected Elaborated variant, got something else");
     };
     assert_eq!(
-        summary.errors, 0,
-        "clean fixture should record no error-severity diagnostics; got {diagnostics:?}"
+        block.summary.errors, 0,
+        "clean fixture should record no error-severity diagnostics; got {:?}",
+        block.diagnostics
     );
 }
 
@@ -528,7 +525,6 @@ async fn file_diagnostics_returns_real_errors() {
     use std::io::Write;
 
     use lean_host_mcp::Severity;
-    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
 
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -541,26 +537,19 @@ async fn file_diagnostics_returns_real_errors() {
     writeln!(tmp, "theorem broken : 1 + 1 = 3 := rfl").unwrap();
     tmp.flush().unwrap();
 
-    let resp = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file: tmp.path().to_path_buf(),
-            project: None,
-        },
-    )
-    .await
-    .expect("file_diagnostics");
-    let FileDiagnosticsResult::Elaborated {
-        summary, diagnostics, ..
-    } = resp.result
-    else {
+    let resp = query_diagnostics(&ctx, tmp.path().to_path_buf())
+        .await
+        .expect("lean_query diagnostics");
+    let DiagnosticsOutcome::Elaborated(block) = diagnostics_outcome(resp.result) else {
         panic!("expected Elaborated variant with diagnostics; got something else");
     };
     assert!(
-        summary.errors >= 1,
-        "summary.errors must reflect the deliberate failure; got {summary:?}"
+        block.summary.errors >= 1,
+        "summary.errors must reflect the deliberate failure; got {:?}",
+        block.summary
     );
-    let error = diagnostics
+    let error = block
+        .diagnostics
         .iter()
         .find(|d| matches!(d.severity, Severity::Error))
         .expect("at least one error-severity diagnostic for `1 + 1 = 3 := rfl`");
@@ -572,9 +561,7 @@ async fn file_diagnostics_returns_real_errors() {
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn module_query_position_tools_return_bounded_results() {
     use lean_host_mcp::tools::position::{
-        GoalAtPositionRequest, GoalAtPositionResult, ReferencesInFileRequest, ReferencesInProjectRequest,
-        TypeAtPositionRequest, TypeAtPositionResult, goal_at_position, references_in_file, references_in_project,
-        type_at_position,
+        LeanQueryItem, ReferencesInFileRequest, ReferencesInProjectRequest, references_in_file, references_in_project,
     };
 
     let Some(root) = fixture_root() else {
@@ -583,18 +570,27 @@ async fn module_query_position_tools_return_bounded_results() {
     let ctx = open_ctx(&root);
     let file = PathBuf::from("LeanRsFixture/SourceRanges.lean");
 
-    let type_resp = type_at_position(
+    let type_resp = lean_query(
         &ctx,
-        TypeAtPositionRequest {
+        LeanQueryRequest {
             file: file.clone(),
-            line: 7,
-            column: 9,
+            selectors: vec![LeanQuerySelector::TypeAt {
+                id: "type".to_owned(),
+                line: 7,
+                column: 9,
+            }],
             project: None,
         },
     )
     .await
-    .expect("type_at_position");
-    let TypeAtPositionResult::Term { type_str, .. } = type_resp.result else {
+    .expect("lean_query type_at");
+    let LeanQueryResult::Results { mut items, .. } = type_resp.result else {
+        panic!("expected lean_query results");
+    };
+    let LeanQueryItem::Ok {
+        result: LeanQueryProjection::TypeAt(TypeAtProjection::Term { type_str, .. }),
+    } = items.remove("type").expect("type selector result")
+    else {
         panic!("expected a term at theorem name");
     };
     assert!(
@@ -602,9 +598,9 @@ async fn module_query_position_tools_return_bounded_results() {
         "type_at_position should render only the selected term type"
     );
 
-    let goal_resp = goal_at_position(
+    let goal_resp = proof_state(
         &ctx,
-        GoalAtPositionRequest {
+        ProofStateRequest {
             file: file.clone(),
             line: 8,
             column: 3,
@@ -612,19 +608,22 @@ async fn module_query_position_tools_return_bounded_results() {
         },
     )
     .await
-    .expect("goal_at_position");
-    let GoalAtPositionResult::Goal {
-        goals_before,
-        truncated,
+    .expect("proof_state");
+    let ProofStateResult::Context {
+        proof_state: Some(proof_state),
         ..
     } = goal_resp.result
     else {
         panic!("expected a tactic context at `trivial`");
     };
-    assert!(!truncated, "small fixture goal should not truncate");
+    let lean_host_mcp::tools::position::ProofStateProjection::State { info } = *proof_state else {
+        panic!("expected a tactic context at `trivial`");
+    };
+    assert!(!info.truncated, "small fixture goal should not truncate");
     assert!(
-        goals_before.iter().any(|goal| goal.contains("True")),
-        "goal context should mention True: {goals_before:?}"
+        info.goals_before.iter().any(|goal| goal.contains("True")),
+        "goal context should mention True: {:?}",
+        info.goals_before
     );
 
     let name = "LeanRsFixture.SourceRanges.knownTheorem".to_owned();
@@ -665,8 +664,6 @@ async fn module_query_position_tools_return_bounded_results() {
 #[tokio::test]
 #[ignore = "requires built KanProofs; set LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE to enable"]
 async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
-    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
-
     let Some(root) = kanproofs_fixture_root() else {
         eprintln!("skipping: LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE not set");
         return;
@@ -677,15 +674,12 @@ async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
     );
     let ctx = open_ctx(&root);
 
-    let diagnostics = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file: file.clone(),
-            project: None,
-        },
-    )
-    .await
-    .unwrap_or_else(|err| panic!("bounded file_diagnostics must not fail for {}: {err:?}", file.display()));
+    let diagnostics = query_diagnostics(&ctx, file.clone()).await.unwrap_or_else(|err| {
+        panic!(
+            "bounded lean_query diagnostics must not fail for {}: {err:?}",
+            file.display()
+        )
+    });
     assert!(
         diagnostics
             .warnings
@@ -694,10 +688,11 @@ async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
         "bounded diagnostics should not surface frame-size warnings: {:?}",
         diagnostics.warnings
     );
+    let outcome = diagnostics_outcome(diagnostics.result);
     assert!(
         matches!(
-            diagnostics.result,
-            FileDiagnosticsResult::Elaborated { .. } | FileDiagnosticsResult::HeaderParseFailed { .. }
+            outcome,
+            DiagnosticsOutcome::Elaborated(_) | DiagnosticsOutcome::HeaderParseFailed
         ),
         "KanProofs smoke should return a structured diagnostics result"
     );
@@ -706,8 +701,6 @@ async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn per_call_imports_avoid_broken_project_umbrella_failure() {
-    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, FileDiagnosticsResult, file_diagnostics};
-
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
@@ -775,27 +768,24 @@ async fn per_call_imports_avoid_broken_project_umbrella_failure() {
         inferred_with_umbrella.result
     );
 
-    let diagnostics = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file: PathBuf::from("LeanRsFixture/Broken.lean"),
-            project: None,
-        },
-    )
-    .await
-    .expect("file_diagnostics on broken project-local module");
-    let FileDiagnosticsResult::Elaborated {
-        summary, diagnostics, ..
-    } = diagnostics.result
-    else {
+    let diagnostics = query_diagnostics(&ctx, PathBuf::from("LeanRsFixture/Broken.lean"))
+        .await
+        .expect("lean_query diagnostics on broken project-local module");
+    let DiagnosticsOutcome::Elaborated(block) = diagnostics_outcome(diagnostics.result) else {
         panic!("expected real diagnostics for broken file");
     };
-    assert!(summary.errors >= 1, "broken file must report an error: {diagnostics:?}");
     assert!(
-        diagnostics
+        block.summary.errors >= 1,
+        "broken file must report an error: {:?}",
+        block.diagnostics
+    );
+    assert!(
+        block
+            .diagnostics
             .iter()
             .any(|d| d.message.contains("sorry_that_doesnt_exist")),
-        "diagnostics should name the broken identifier: {diagnostics:?}"
+        "diagnostics should name the broken identifier: {:?}",
+        block.diagnostics
     );
 
     let import_err = elaborate(
@@ -831,9 +821,7 @@ async fn per_call_imports_avoid_broken_project_umbrella_failure() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn file_diagnostics_cache_warm() {
-    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, file_diagnostics};
-
-    const HINT_FRAGMENT: &str = "module query result cached";
+    const HINT_FRAGMENT: &str = "module query batch result cached";
 
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -842,15 +830,9 @@ async fn file_diagnostics_cache_warm() {
     let file = PathBuf::from("LeanRsFixture/SourceRanges.lean");
 
     // Cold: must record the cache-and-process hint.
-    let cold = file_diagnostics(
-        &ctx,
-        FileDiagnosticsRequest {
-            file: file.clone(),
-            project: None,
-        },
-    )
-    .await
-    .expect("cold file_diagnostics");
+    let cold = query_diagnostics(&ctx, file.clone())
+        .await
+        .expect("cold lean_query diagnostics");
     assert!(
         cold.next_actions.iter().any(|n| n.contains(HINT_FRAGMENT)),
         "cold call should attach the cache hint; next_actions={:?}",
@@ -858,9 +840,9 @@ async fn file_diagnostics_cache_warm() {
     );
 
     // Warm: same bounded query, same file contents.
-    let warm = file_diagnostics(&ctx, FileDiagnosticsRequest { file, project: None })
+    let warm = query_diagnostics(&ctx, file)
         .await
-        .expect("warm file_diagnostics");
+        .expect("warm lean_query diagnostics");
     assert!(
         warm.next_actions.iter().all(|n| !n.contains(HINT_FRAGMENT)),
         "warm file_diagnostics call must not re-process; next_actions={:?}",

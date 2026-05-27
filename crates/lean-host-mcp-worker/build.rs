@@ -4,7 +4,7 @@
 //! Discovery order:
 //!
 //! 1. `LEAN_HOST_MCP_TARGET_TOOLCHAIN`: short toolchain id (e.g.
-//!    `v4.30.0-rc2`). Resolved as
+//!    `v4.30.0`). Resolved as
 //!    `~/.elan/toolchains/leanprover--lean4---<id>`. Set by
 //!    `lean-host-mcp install-worker` when producing a toolchain-specific
 //!    worker binary.
