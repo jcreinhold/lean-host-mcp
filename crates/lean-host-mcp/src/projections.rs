@@ -20,9 +20,13 @@ use lean_rs_worker_parent::{
     LeanWorkerDeclarationFlags, LeanWorkerDeclarationInspection as WorkerDeclarationInspection,
     LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationProofSearchFacts, LeanWorkerDeclarationRow,
     LeanWorkerDeclarationSearchFacts, LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult,
-    LeanWorkerDeclarationSearchRow, LeanWorkerDeclarationSearchTimings, LeanWorkerDiagnostic, LeanWorkerElabFailure,
-    LeanWorkerElabResult, LeanWorkerError, LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult,
-    LeanWorkerRendered, LeanWorkerRenderedInfo, LeanWorkerRendering, LeanWorkerSourceRange,
+    LeanWorkerDeclarationSearchRow, LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationTargetInfo,
+    LeanWorkerDeclarationVerificationFacts, LeanWorkerDeclarationVerificationResult,
+    LeanWorkerDeclarationVerificationStatus, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerElabResult,
+    LeanWorkerError, LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerModuleSourceSpan,
+    LeanWorkerProofAttemptEnvelope, LeanWorkerProofAttemptResult, LeanWorkerProofAttemptRow,
+    LeanWorkerProofAttemptStatus, LeanWorkerRendered, LeanWorkerRenderedInfo, LeanWorkerRendering,
+    LeanWorkerSourceRange,
 };
 
 use crate::error::ServerError;
@@ -147,6 +151,25 @@ pub struct RenderedText {
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ModuleSourceSpan {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ProofActionDeclarationTarget {
+    pub short_name: String,
+    pub declaration_name: String,
+    pub namespace_name: String,
+    pub declaration_kind: String,
+    pub declaration_span: ModuleSourceSpan,
+    pub name_span: ModuleSourceSpan,
+    pub body_span: ModuleSourceSpan,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DeclarationFlags {
     pub is_private: bool,
     pub is_generated: bool,
@@ -243,6 +266,78 @@ pub enum DeclarationInspectionResult {
     },
     Ambiguous {
         candidates: Vec<DeclarationInspectionCandidate>,
+    },
+    Unsupported,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ProofAttemptCandidate {
+    pub id: String,
+    pub status: String,
+    pub diagnostics: ElabFailure,
+    pub goals: Vec<RenderedText>,
+    pub safe_edit: Option<ProofActionDeclarationTarget>,
+    pub output_truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ProofAttemptEnvelope {
+    pub candidates: Vec<ProofAttemptCandidate>,
+    pub candidate_limit: u32,
+    pub candidates_truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProofAttemptResult {
+    Ok {
+        result: ProofAttemptEnvelope,
+        imports: Vec<String>,
+    },
+    MissingImports {
+        result: ProofAttemptEnvelope,
+        imports: Vec<String>,
+        missing: Vec<String>,
+    },
+    HeaderParseFailed {
+        diagnostics: ElabFailure,
+    },
+    Unsupported,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "verification booleans mirror independent lean-rs wire facts for proof policy decisions"
+)]
+pub struct DeclarationVerificationFacts {
+    pub target: Option<ProofActionDeclarationTarget>,
+    pub diagnostics: ElabFailure,
+    pub unresolved_goals: Vec<RenderedText>,
+    pub contains_sorry: bool,
+    pub contains_admit: bool,
+    pub contains_sorry_ax: bool,
+    pub axioms: Vec<String>,
+    pub axioms_truncated: bool,
+    pub output_truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DeclarationVerificationResult {
+    Ok {
+        verification_status: String,
+        facts: Box<DeclarationVerificationFacts>,
+        imports: Vec<String>,
+    },
+    MissingImports {
+        verification_status: String,
+        facts: Box<DeclarationVerificationFacts>,
+        imports: Vec<String>,
+        missing: Vec<String>,
+    },
+    HeaderParseFailed {
+        diagnostics: ElabFailure,
     },
     Unsupported,
 }
@@ -406,6 +501,27 @@ pub(crate) fn project_rendered_info(info: LeanWorkerRenderedInfo) -> RenderedTex
     }
 }
 
+pub(crate) fn project_module_source_span(span: LeanWorkerModuleSourceSpan) -> ModuleSourceSpan {
+    ModuleSourceSpan {
+        start_line: span.start_line,
+        start_column: span.start_column,
+        end_line: span.end_line,
+        end_column: span.end_column,
+    }
+}
+
+pub(crate) fn project_proof_action_target(info: LeanWorkerDeclarationTargetInfo) -> ProofActionDeclarationTarget {
+    ProofActionDeclarationTarget {
+        short_name: info.short_name,
+        declaration_name: info.declaration_name,
+        namespace_name: info.namespace_name,
+        declaration_kind: info.declaration_kind,
+        declaration_span: project_module_source_span(info.declaration_span),
+        name_span: project_module_source_span(info.name_span),
+        body_span: project_module_source_span(info.body_span),
+    }
+}
+
 pub(crate) fn project_declaration_flags(flags: LeanWorkerDeclarationFlags) -> DeclarationFlags {
     DeclarationFlags {
         is_private: flags.is_private,
@@ -484,6 +600,133 @@ pub fn project_declaration_inspection(result: LeanWorkerDeclarationInspectionRes
         }
         LeanWorkerDeclarationInspectionResult::Unsupported => DeclarationInspectionResult::Unsupported,
         _ => DeclarationInspectionResult::Unsupported,
+    }
+}
+
+pub fn project_proof_attempt(result: LeanWorkerProofAttemptResult) -> ProofAttemptResult {
+    match result {
+        LeanWorkerProofAttemptResult::Ok { result, imports } => ProofAttemptResult::Ok {
+            result: project_proof_attempt_envelope(result),
+            imports,
+        },
+        LeanWorkerProofAttemptResult::MissingImports {
+            result,
+            imports,
+            missing,
+        } => ProofAttemptResult::MissingImports {
+            result: project_proof_attempt_envelope(result),
+            imports,
+            missing,
+        },
+        LeanWorkerProofAttemptResult::HeaderParseFailed { diagnostics } => ProofAttemptResult::HeaderParseFailed {
+            diagnostics: project_failure(&diagnostics),
+        },
+        LeanWorkerProofAttemptResult::Unsupported => ProofAttemptResult::Unsupported,
+        _ => ProofAttemptResult::Unsupported,
+    }
+}
+
+pub(crate) fn project_proof_attempt_envelope(envelope: LeanWorkerProofAttemptEnvelope) -> ProofAttemptEnvelope {
+    ProofAttemptEnvelope {
+        candidates: envelope.candidates.into_iter().map(project_proof_attempt_row).collect(),
+        candidate_limit: envelope.candidate_limit,
+        candidates_truncated: envelope.candidates_truncated,
+    }
+}
+
+pub(crate) fn project_proof_attempt_row(row: LeanWorkerProofAttemptRow) -> ProofAttemptCandidate {
+    ProofAttemptCandidate {
+        id: row.id,
+        status: proof_attempt_status(row.status).to_owned(),
+        diagnostics: project_failure(&row.diagnostics),
+        goals: row.goals.into_iter().map(project_rendered_info).collect(),
+        safe_edit: row.safe_edit.map(project_proof_action_target),
+        output_truncated: row.output_truncated,
+    }
+}
+
+fn proof_attempt_status(status: LeanWorkerProofAttemptStatus) -> &'static str {
+    match status {
+        LeanWorkerProofAttemptStatus::Closed => "closed",
+        LeanWorkerProofAttemptStatus::Progressed => "progressed",
+        LeanWorkerProofAttemptStatus::Failed => "failed",
+        LeanWorkerProofAttemptStatus::Timeout => "timeout",
+        LeanWorkerProofAttemptStatus::BudgetExceeded => "budget_exceeded",
+        LeanWorkerProofAttemptStatus::Unsupported => "unsupported",
+        _ => "unsupported",
+    }
+}
+
+pub fn project_declaration_verification(
+    result: LeanWorkerDeclarationVerificationResult,
+) -> DeclarationVerificationResult {
+    match result {
+        LeanWorkerDeclarationVerificationResult::Ok {
+            verification_status,
+            facts,
+            imports,
+        } => DeclarationVerificationResult::Ok {
+            verification_status: verification_status_label(verification_status, &facts).to_owned(),
+            facts: Box::new(project_declaration_verification_facts(*facts)),
+            imports,
+        },
+        LeanWorkerDeclarationVerificationResult::MissingImports {
+            verification_status,
+            facts,
+            imports,
+            missing,
+        } => DeclarationVerificationResult::MissingImports {
+            verification_status: verification_status_label(verification_status, &facts).to_owned(),
+            facts: Box::new(project_declaration_verification_facts(*facts)),
+            imports,
+            missing,
+        },
+        LeanWorkerDeclarationVerificationResult::HeaderParseFailed { diagnostics } => {
+            DeclarationVerificationResult::HeaderParseFailed {
+                diagnostics: project_failure(&diagnostics),
+            }
+        }
+        LeanWorkerDeclarationVerificationResult::Unsupported => DeclarationVerificationResult::Unsupported,
+        _ => DeclarationVerificationResult::Unsupported,
+    }
+}
+
+fn project_declaration_verification_facts(
+    facts: LeanWorkerDeclarationVerificationFacts,
+) -> DeclarationVerificationFacts {
+    DeclarationVerificationFacts {
+        target: facts.target.map(project_proof_action_target),
+        diagnostics: project_failure(&facts.diagnostics),
+        unresolved_goals: facts.unresolved_goals.into_iter().map(project_rendered_info).collect(),
+        contains_sorry: facts.contains_sorry,
+        contains_admit: facts.contains_admit,
+        contains_sorry_ax: facts.contains_sorry_ax,
+        axioms: facts.axioms,
+        axioms_truncated: facts.axioms_truncated,
+        output_truncated: facts.output_truncated,
+    }
+}
+
+fn verification_status_label(
+    status: LeanWorkerDeclarationVerificationStatus,
+    facts: &LeanWorkerDeclarationVerificationFacts,
+) -> &'static str {
+    match status {
+        LeanWorkerDeclarationVerificationStatus::Accepted => "verified",
+        LeanWorkerDeclarationVerificationStatus::Rejected if facts.contains_sorry => "has_sorry",
+        LeanWorkerDeclarationVerificationStatus::Rejected if !facts.unresolved_goals.is_empty() => {
+            "has_unresolved_goals"
+        }
+        LeanWorkerDeclarationVerificationStatus::Rejected if !facts.diagnostics.diagnostics.is_empty() => {
+            "has_diagnostics"
+        }
+        LeanWorkerDeclarationVerificationStatus::Rejected => "has_diagnostics",
+        LeanWorkerDeclarationVerificationStatus::NotFound => "not_found",
+        LeanWorkerDeclarationVerificationStatus::Ambiguous => "ambiguous",
+        LeanWorkerDeclarationVerificationStatus::Timeout => "timeout",
+        LeanWorkerDeclarationVerificationStatus::BudgetExceeded => "budget_exceeded",
+        LeanWorkerDeclarationVerificationStatus::Unsupported => "unsupported",
+        _ => "unsupported",
     }
 }
 

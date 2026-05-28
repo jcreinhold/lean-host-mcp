@@ -170,6 +170,14 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         tool_names.contains("search_for_proof"),
         "tools/list must expose search_for_proof"
     );
+    assert!(
+        tool_names.contains("try_proof_step"),
+        "tools/list must expose try_proof_step"
+    );
+    assert!(
+        tool_names.contains("verify_declaration"),
+        "tools/list must expose verify_declaration"
+    );
     for removed in [
         "file_diagnostics",
         "goal_at_position",
@@ -201,7 +209,18 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
 
     let mut last_session_id: Option<String> = None;
     for call in &scenario.calls {
+        let proof_action_file = scenario.project_root.join("LeanRsFixture/ProofActions.lean");
+        let before = (call.category == "proof_action" && proof_action_file.exists())
+            .then(|| std::fs::read(&proof_action_file).expect("read proof-action fixture before call"));
         let record = server.call_tool(scenario.label, call, &mut last_session_id).await;
+        if let Some(before) = before {
+            assert_eq!(
+                std::fs::read(&proof_action_file).expect("read proof-action fixture after call"),
+                before,
+                "{} must not mutate fixture source",
+                call.label
+            );
+        }
         summary.add(&record);
         println!("{}", serde_json::to_string(&record).expect("serialize smoke record"));
     }
@@ -344,6 +363,68 @@ fn fixture_calls() -> Vec<ToolCall> {
             tool_name: "project_scan",
             category: "source",
             arguments: json!({ "preset": "sorry", "limit": 20 }),
+        },
+        ToolCall {
+            label: "try_proof_step_trivial",
+            tool_name: "try_proof_step",
+            category: "proof_action",
+            arguments: json!({
+                "file": "LeanRsFixture/ProofActions.lean",
+                "line": 4,
+                "column": 3,
+                "snippet": "trivial"
+            }),
+        },
+        ToolCall {
+            label: "try_proof_step_bad",
+            tool_name: "try_proof_step",
+            category: "proof_action",
+            arguments: json!({
+                "file": "LeanRsFixture/ProofActions.lean",
+                "line": 4,
+                "column": 3,
+                "snippet": "exact missingIdentifier"
+            }),
+        },
+        ToolCall {
+            label: "try_proof_step_many",
+            tool_name: "try_proof_step",
+            category: "proof_action",
+            arguments: json!({
+                "file": "LeanRsFixture/ProofActions.lean",
+                "line": 4,
+                "column": 3,
+                "snippets": [
+                    "exact missingIdentifier",
+                    "trivial",
+                    "exact missingIdentifier",
+                    "exact missingIdentifier",
+                    "exact missingIdentifier",
+                    "exact missingIdentifier",
+                    "exact missingIdentifier",
+                    "exact missingIdentifier",
+                    "exact missingIdentifier"
+                ]
+            }),
+        },
+        ToolCall {
+            label: "verify_known_theorem",
+            tool_name: "verify_declaration",
+            category: "proof_action",
+            arguments: json!({
+                "file": "LeanRsFixture/ProofActions.lean",
+                "name": "LeanRsFixture.ProofActions.closedTheorem",
+                "report_axioms": true
+            }),
+        },
+        ToolCall {
+            label: "verify_sorry_theorem",
+            tool_name: "verify_declaration",
+            category: "proof_action",
+            arguments: json!({
+                "file": "LeanRsFixture/ProofActions.lean",
+                "name": "LeanRsFixture.ProofActions.sorryTheorem"
+            }),
         },
         ToolCall {
             label: "proof_state_trivial_cold",

@@ -108,6 +108,26 @@ impl LeanHostService {
     }
 
     #[tool(
+        description = "Try one or more proof snippets against an in-memory Lean source overlay. Never writes files."
+    )]
+    async fn try_proof_step(
+        &self,
+        Parameters(req): Parameters<tools::proof_action::TryProofStepRequest>,
+    ) -> std::result::Result<Json<Response<crate::projections::ProofAttemptResult>>, McpError> {
+        wrap(tools::proof_action::try_proof_step(&self.ctx, req).await)
+    }
+
+    #[tool(
+        description = "Verify one Lean declaration in an in-memory source snapshot under a sorry/axiom policy. Never writes files."
+    )]
+    async fn verify_declaration(
+        &self,
+        Parameters(req): Parameters<tools::proof_action::VerifyDeclarationRequest>,
+    ) -> std::result::Result<Json<Response<crate::projections::DeclarationVerificationResult>>, McpError> {
+        wrap(tools::proof_action::verify_declaration(&self.ctx, req).await)
+    }
+
+    #[tool(
         description = "Filesystem regex sweep over the project's .lean files. Presets: sorry, admit, axiom, set_option."
     )]
     async fn project_scan(
@@ -170,8 +190,9 @@ impl ServerHandler for LeanHostService {
         info.instructions = Some(
             "MCP server hosting Lean 4 in-process via lean-rs. \
              Tools elaborate / kernel-check terms, run bounded MetaM ops, \
-             inspect one selected declaration, scan .lean files, and run \
-             bounded proof-context and semantic file queries."
+             inspect one selected declaration, try and verify proof actions \
+             without writing files, scan .lean files, and run bounded \
+             proof-context and semantic file queries."
                 .to_owned(),
         );
         info

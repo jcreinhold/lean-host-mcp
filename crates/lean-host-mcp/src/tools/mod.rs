@@ -8,6 +8,8 @@
 //!   proof-work inspection tool.
 //! - [`proof_search`]: `search_for_proof`, the proof-agent retrieval tool
 //!   built from bounded proof-state and declaration-search calls.
+//! - [`proof_action`]: `try_proof_step` and `verify_declaration`, the
+//!   non-mutating proof action tools.
 //! - [`scan`]: `project_scan`. No Lean dependency; pure filesystem walk
 //!   with a configurable regex.
 //! - [`position`]: `proof_state`, `lean_query`, `references_in_file`, and
@@ -20,6 +22,7 @@ use std::sync::Arc;
 pub mod declaration;
 pub mod lean;
 pub mod position;
+pub mod proof_action;
 pub mod proof_search;
 pub mod scan;
 

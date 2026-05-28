@@ -48,8 +48,10 @@ pub use project::LeanProject;
 pub use projections::{
     DeclarationFlags, DeclarationInspection, DeclarationInspectionCandidate, DeclarationInspectionResult,
     DeclarationProofSearchFacts, DeclarationRow, DeclarationSearchFacts, DeclarationSearchPruning,
-    DeclarationSearchResult, DeclarationSearchTimings, DeclarationSummary, Diagnostic, ElabFailure, ElabSuccess,
-    KernelOutcome, KernelSummary, MetaOutcome, Position, RenderedText, Severity, SourceRange,
+    DeclarationSearchResult, DeclarationSearchTimings, DeclarationSummary, DeclarationVerificationFacts,
+    DeclarationVerificationResult, Diagnostic, ElabFailure, ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome,
+    ModuleSourceSpan, Position, ProofActionDeclarationTarget, ProofAttemptCandidate, ProofAttemptEnvelope,
+    ProofAttemptResult, RenderedText, Severity, SourceRange,
 };
 pub use server::LeanHostService;
 pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};

@@ -27,8 +27,14 @@ use lean_host_mcp::tools::position::{
     DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ModuleQueryFacts,
     ProofStateRequest, ProofStateResult, TypeAtProjection, lean_query, proof_state,
 };
+use lean_host_mcp::tools::proof_action::{
+    TryProofStepMode, TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
+};
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
-use lean_host_mcp::{BrokerConfig, ProjectBroker, Response, ServerError};
+use lean_host_mcp::{
+    BrokerConfig, DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProjectBroker,
+    ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, Response, ServerError,
+};
 
 fn fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
@@ -243,6 +249,67 @@ fn search_for_proof_request_round_trips() {
     assert_eq!(explicit.goal.as_deref(), Some("⊢ True"));
     assert!(explicit.file.is_none());
     assert!(explicit.mode.is_none());
+}
+
+#[test]
+fn proof_action_results_serialise_status_tags() {
+    let failure = ElabFailure {
+        diagnostics: Vec::new(),
+        truncated: false,
+    };
+    let attempt = ProofAttemptResult::Ok {
+        result: ProofAttemptEnvelope {
+            candidates: vec![ProofAttemptCandidate {
+                id: "candidate_1".into(),
+                status: "closed".into(),
+                diagnostics: failure.clone(),
+                goals: Vec::new(),
+                safe_edit: None,
+                output_truncated: false,
+            }],
+            candidate_limit: 8,
+            candidates_truncated: false,
+        },
+        imports: Vec::new(),
+    };
+    let value = serde_json::to_value(attempt).unwrap();
+    assert_eq!(value.pointer("/status").and_then(serde_json::Value::as_str), Some("ok"));
+    assert_eq!(
+        value
+            .pointer("/result/candidates/0/status")
+            .and_then(serde_json::Value::as_str),
+        Some("closed")
+    );
+
+    let verification = DeclarationVerificationResult::Ok {
+        verification_status: "has_sorry".into(),
+        facts: Box::new(DeclarationVerificationFacts {
+            target: None,
+            diagnostics: failure,
+            unresolved_goals: Vec::new(),
+            contains_sorry: true,
+            contains_admit: false,
+            contains_sorry_ax: false,
+            axioms: Vec::new(),
+            axioms_truncated: false,
+            output_truncated: false,
+        }),
+        imports: Vec::new(),
+    };
+    let value = serde_json::to_value(verification).unwrap();
+    assert_eq!(value.pointer("/status").and_then(serde_json::Value::as_str), Some("ok"));
+    assert_eq!(
+        value
+            .pointer("/verification_status")
+            .and_then(serde_json::Value::as_str),
+        Some("has_sorry")
+    );
+    assert_eq!(
+        value
+            .pointer("/facts/contains_sorry")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
 }
 
 #[test]
@@ -1188,6 +1255,232 @@ async fn search_for_proof_broad_goal_reports_pruning_without_type_text() {
         !serialized.contains("type_signature") && !serialized.contains("statement"),
         "Prompt 40 candidates must not include rendered declaration text: {serialized}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn try_proof_step_closes_simple_goal_without_mutating_file() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let file = root.join("LeanRsFixture/ProofActions.lean");
+    let before = fs::read(&file).expect("read fixture before");
+
+    let resp = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            line: 4,
+            column: 3,
+            project: None,
+            snippet: Some("trivial".into()),
+            snippets: Vec::new(),
+            mode: TryProofStepMode::SafeEdit,
+            max_field_bytes: None,
+            max_total_bytes: None,
+            heartbeat_limit: None,
+        },
+    )
+    .await
+    .expect("try_proof_step");
+
+    let ProofAttemptResult::Ok { result, .. } = resp.result else {
+        panic!("proof attempt should return ok");
+    };
+    assert_eq!(result.candidates.len(), 1);
+    let candidate = result.candidates.first().expect("one proof candidate row");
+    assert_eq!(candidate.status, "closed");
+    assert!(
+        candidate.safe_edit.is_some(),
+        "closed candidate should report the safe edit span"
+    );
+    assert_eq!(fs::read(&file).expect("read fixture after"), before);
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn try_proof_step_bad_snippet_returns_diagnostics_and_session_stays_healthy() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let file = root.join("LeanRsFixture/ProofActions.lean");
+    let before = fs::read(&file).expect("read fixture before");
+
+    let resp = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            line: 4,
+            column: 3,
+            project: None,
+            snippet: Some("exact missingIdentifier".into()),
+            snippets: Vec::new(),
+            mode: TryProofStepMode::SafeEdit,
+            max_field_bytes: None,
+            max_total_bytes: None,
+            heartbeat_limit: None,
+        },
+    )
+    .await
+    .expect("bad try_proof_step");
+
+    let ProofAttemptResult::Ok { result, .. } = resp.result else {
+        panic!("bad proof attempt should still return ok");
+    };
+    let candidate = result.candidates.first().expect("one failed proof candidate row");
+    assert_eq!(candidate.status, "failed");
+    assert!(
+        !candidate.diagnostics.diagnostics.is_empty() || !candidate.goals.is_empty(),
+        "bad candidate should return diagnostics or resulting goals"
+    );
+    assert_eq!(fs::read(&file).expect("read fixture after"), before);
+
+    let health = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: PathBuf::from("LeanRsFixture/SourceRanges.lean"),
+            line: 8,
+            column: 3,
+            project: None,
+        },
+    )
+    .await
+    .expect("proof_state after failed proof attempt");
+    assert!(
+        matches!(health.result, ProofStateResult::Context { .. }),
+        "failed proof attempt should not poison later proof_state"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn try_proof_step_multiple_candidates_are_capped() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let mut snippets = vec!["exact missingIdentifier".to_owned(); 9];
+    snippets.insert(1, "trivial".to_owned());
+
+    let resp = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            line: 4,
+            column: 3,
+            project: None,
+            snippet: None,
+            snippets,
+            mode: TryProofStepMode::SafeEdit,
+            max_field_bytes: None,
+            max_total_bytes: None,
+            heartbeat_limit: None,
+        },
+    )
+    .await
+    .expect("multi-candidate try_proof_step");
+
+    let ProofAttemptResult::Ok { result, .. } = resp.result else {
+        panic!("multi-candidate proof attempt should return ok");
+    };
+    assert_eq!(result.candidate_limit, 8);
+    assert_eq!(result.candidates.len(), 10);
+    assert!(
+        result.candidates.iter().any(|row| row.status == "closed"),
+        "one candidate should close the goal: {:?}",
+        result
+            .candidates
+            .iter()
+            .map(|row| (&row.id, &row.status))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .candidates
+            .iter()
+            .skip(8)
+            .all(|row| row.status == "budget_exceeded"),
+        "extra candidates should be capped rows"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn verify_declaration_accepts_closed_theorem() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = verify_declaration(
+        &ctx,
+        VerifyDeclarationRequest {
+            file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            project: None,
+            name: Some("LeanRsFixture.ProofActions.closedTheorem".into()),
+            line: None,
+            column: None,
+            allow_sorry: false,
+            report_axioms: true,
+            max_field_bytes: None,
+            max_total_bytes: None,
+            heartbeat_limit: None,
+        },
+    )
+    .await
+    .expect("verify closed theorem");
+
+    let DeclarationVerificationResult::Ok {
+        verification_status,
+        facts,
+        ..
+    } = resp.result
+    else {
+        panic!("closed theorem verification should return ok");
+    };
+    assert_eq!(verification_status, "verified");
+    assert!(!facts.contains_sorry);
+    assert!(facts.unresolved_goals.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn verify_declaration_detects_sorry() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = verify_declaration(
+        &ctx,
+        VerifyDeclarationRequest {
+            file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            project: None,
+            name: Some("LeanRsFixture.ProofActions.sorryTheorem".into()),
+            line: None,
+            column: None,
+            allow_sorry: false,
+            report_axioms: false,
+            max_field_bytes: None,
+            max_total_bytes: None,
+            heartbeat_limit: None,
+        },
+    )
+    .await
+    .expect("verify sorry theorem");
+
+    let DeclarationVerificationResult::Ok {
+        verification_status,
+        facts,
+        ..
+    } = resp.result
+    else {
+        panic!("sorry theorem verification should return ok");
+    };
+    assert_eq!(verification_status, "has_sorry");
+    assert!(facts.contains_sorry || facts.contains_sorry_ax);
 }
 
 #[test]

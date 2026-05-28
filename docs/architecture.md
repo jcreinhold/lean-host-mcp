@@ -135,6 +135,23 @@ goes through `search_for_proof`, and callers inspect one selected candidate by n
 declaration facts. The old synchronous index rebuild path remains out of the MCP surface: a model-controlled tool should
 not be able to trigger a full environment walk plus bulk type rendering.
 
+## Non-mutating proof actions
+
+Proof actions are worker-backed overlays, not edits. `try_proof_step` reads one file, resolves a safe proof edit from
+the cursor context, sends one capped candidate list to lean-rs, and reports per-candidate statuses plus bounded goals
+and diagnostics. `verify_declaration` reads one file, targets one declaration by name or cursor, and reports policy
+facts for diagnostics, unresolved goals, `sorry`/`admit`/`sorryAx`, and optional axioms.
+
+The normal proof-agent loop is:
+
+```text
+proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> verify_declaration
+```
+
+Every step is bounded before crossing the worker boundary. Failed snippets, missing imports, unsupported shims, and
+policy rejections are structured result statuses. `ServerError` remains reserved for infrastructure failures, and none
+of these tools writes source files or creates a sandbox copy.
+
 ## The module-query cache
 
 `proof_state` and `lean_query` call the worker's `process_module_query_batch` capability. There is no whole-file

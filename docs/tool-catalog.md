@@ -125,6 +125,83 @@ enabled. Rendered `statement` and `docstring` always carry `truncated`. `max_fie
 Use `search_for_proof` for proof-oriented retrieval. It returns bounded candidate metadata; inspect one selected
 candidate by name when statement text or declaration facts are needed.
 
+### `try_proof_step`
+
+Try one or more proof snippets against a file snapshot. The tool reads the file, resolves a safe proof edit at the
+cursor, sends an in-memory overlay to Lean, and never writes the source file.
+
+```jsonc
+// request
+{
+  "file": "LeanRsFixture/ProofActions.lean",
+  "line": 4,
+  "column": 3,
+  "snippet": "trivial"
+}
+
+// result
+{
+  "status": "ok",
+  "result": {
+    "candidate_limit": 8,
+    "candidates_truncated": false,
+    "candidates": [
+      {
+        "id": "candidate_1",
+        "status": "closed",
+        "diagnostics": { "diagnostics": [], "truncated": false },
+        "goals": [],
+        "safe_edit": { "declaration_name": "LeanRsFixture.ProofActions.closedTheorem", "...": "..." },
+        "output_truncated": false
+      }
+    ]
+  },
+  "imports": []
+}
+```
+
+`snippet` is a convenience for one candidate. `snippets` accepts a small list; the host sends at most 8 candidates to
+Lean and returns extra rows with `status: "budget_exceeded"`. Candidate statuses are `closed`, `progressed`, `failed`,
+`timeout`, `budget_exceeded`, or `unsupported`. Bad snippets are normal rows, not MCP errors. `mode` defaults to
+`safe_edit`; `insert_at` and `declaration_body` are available for narrower edit-target requests.
+
+### `verify_declaration`
+
+Verify one declaration in a file snapshot under a sorry/axiom policy. The tool never writes the source file.
+
+```jsonc
+// request
+{
+  "file": "LeanRsFixture/ProofActions.lean",
+  "name": "LeanRsFixture.ProofActions.closedTheorem",
+  "allow_sorry": false,
+  "report_axioms": true
+}
+
+// result
+{
+  "status": "ok",
+  "verification_status": "verified",
+  "facts": {
+    "target": { "declaration_name": "LeanRsFixture.ProofActions.closedTheorem", "...": "..." },
+    "diagnostics": { "diagnostics": [], "truncated": false },
+    "unresolved_goals": [],
+    "contains_sorry": false,
+    "contains_admit": false,
+    "contains_sorry_ax": false,
+    "axioms": [],
+    "axioms_truncated": false,
+    "output_truncated": false
+  },
+  "imports": []
+}
+```
+
+The target can be a declaration `name` or a cursor `line`/`column`. `verification_status` is one of `verified`,
+`has_diagnostics`, `has_sorry`, `has_unresolved_goals`, `not_found`, `ambiguous`, `timeout`, `budget_exceeded`, or
+`unsupported`. Policy failures are data in the result, so a theorem containing `sorry` returns a successful MCP response
+with `verification_status: "has_sorry"` when `allow_sorry` is false.
+
 ## Project scan (`src/tools/scan.rs`)
 
 ### `project_scan`
