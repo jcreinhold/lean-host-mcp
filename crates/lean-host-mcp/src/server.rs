@@ -123,7 +123,9 @@ impl LeanHostService {
         wrap(tools::scan::project_scan(&self.ctx, req).await)
     }
 
-    #[tool(description = "Inspect the current Lean proof context at a cursor position.")]
+    #[tool(
+        description = "Default proof-agent context at a cursor: diagnostics, goals, locals, expected type, and safe edit spans."
+    )]
     async fn proof_state(
         &self,
         Parameters(req): Parameters<tools::position::ProofStateRequest>,
@@ -131,7 +133,7 @@ impl LeanHostService {
         wrap(tools::position::proof_state(&self.ctx, req).await)
     }
 
-    #[tool(description = "Run a bounded batch of Lean semantic projections against one file.")]
+    #[tool(description = "Expert tool: run a bounded custom batch of Lean semantic projections against one file.")]
     async fn lean_query(
         &self,
         Parameters(req): Parameters<tools::position::LeanQueryRequest>,

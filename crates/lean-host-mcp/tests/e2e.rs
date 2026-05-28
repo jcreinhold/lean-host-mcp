@@ -632,21 +632,53 @@ async fn module_query_position_tools_return_bounded_results() {
     )
     .await
     .expect("proof_state");
+    let response_bytes = serde_json::to_vec(&goal_resp)
+        .expect("serialize proof_state response")
+        .len();
+    assert!(
+        response_bytes < 64 * 1024,
+        "fixture proof_state response should stay under the hard 64 KiB cap, got {response_bytes} bytes"
+    );
     let ProofStateResult::Context {
-        proof_state: Some(proof_state),
+        diagnostics,
+        goals_before,
+        locals,
+        expected_type,
+        safe_edit,
+        truncated,
+        span,
+        target_declaration,
+        surrounding_declaration,
+        query_facts,
         ..
     } = goal_resp.result
     else {
         panic!("expected a tactic context at `trivial`");
     };
-    let lean_host_mcp::tools::position::ProofStateProjection::State { info } = *proof_state else {
-        panic!("expected a tactic context at `trivial`");
-    };
-    assert!(!info.truncated, "small fixture goal should not truncate");
+    assert_eq!(diagnostics.summary.errors, 0);
+    assert!(span.is_some(), "proof_state should include the cursor context span");
+    assert!(locals.is_empty(), "fixture tactic context has no locals");
     assert!(
-        info.goals_before.iter().any(|goal| goal.contains("True")),
-        "goal context should mention True: {:?}",
-        info.goals_before
+        expected_type.as_ref().is_none_or(|text| !text.value.is_empty()),
+        "expected type should be omitted or non-empty"
+    );
+    assert!(safe_edit.is_some(), "fixture proof_state should include safe edit metadata");
+    assert!(
+        target_declaration.is_some(),
+        "proof_state should include target declaration status"
+    );
+    assert!(
+        surrounding_declaration.is_some(),
+        "proof_state should include surrounding declaration status"
+    );
+    assert!(!truncated, "small fixture goal should not truncate");
+    assert!(
+        goals_before.iter().any(|goal| goal.contains("True")),
+        "goal context should mention True: {goals_before:?}"
+    );
+    assert!(
+        ["hit", "miss", "rebuilt", "evicted"].contains(&query_facts.cache_status),
+        "proof_state should expose worker cache facts: {query_facts:?}"
     );
 
     let name = "LeanRsFixture.SourceRanges.knownTheorem".to_owned();

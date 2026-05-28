@@ -144,11 +144,13 @@ Presets: `sorry | admit | axiom | set_option | custom`.
 ## Proof-agent module tools (`src/tools/position.rs`)
 
 `proof_state` and `lean_query` drive `process_module_query_batch`: they read one file, hand the full source
-(header + body) to Lean's frontend, and ask for bounded semantic projections. The file's own `import` declarations are
-parsed by Lean and validated against the server's open env; mismatch surfaces as an envelope `warnings` entry. Query
-results include `query_facts`, the worker-reported cache/timing record for the module snapshot used by the batch. The
-host passes the canonical file path as Lean's file label but does not keep an exact batch-result cache for these tools;
-identical repeated calls reach the worker so cache hits, rebuilds, and evictions remain visible.
+(header + body) to Lean's frontend, and ask for bounded semantic projections. `proof_state` is the normal proof-agent
+entry point and returns one compact context object under a 64 KiB default batch cap. `lean_query` is the expert batch
+form for callers that need to choose selectors directly. The file's own `import` declarations are parsed by Lean and
+validated against the server's open env; mismatch surfaces as an envelope `warnings` entry. Query results include
+`query_facts`, the worker-reported cache/timing record for the module snapshot used by the batch. The host passes the
+canonical file path as Lean's file label but does not keep an exact batch-result cache for these tools; identical
+repeated calls reach the worker so cache hits, rebuilds, and evictions remain visible.
 
 `process_module_query_batch` is an **optional** capability shim. When the loaded dylib lacks it, these tools answer
 `{ "status": "unsupported" }` cleanly; the tools never raise and never request a whole-file info tree.
@@ -167,21 +169,15 @@ Inspect the current Lean proof context at a cursor position. This is the default
 {
   "status": "context",
   "diagnostics": { "summary": { "errors": 0, "warnings": 0, "info": 0 }, "diagnostics": [], "truncated": false },
-  "proof_state": {
-    "status": "state",
-    "info": {
-      "declaration_name": "LeanRsFixture.SourceRanges.proofGoal",
-      "namespace_name": "LeanRsFixture.SourceRanges",
-      "safe_edit": { "declaration_name": "...", "body_span": { ... } },
-      "span": { "start_line": 8, "start_column": 3, "end_line": 8, "end_column": 10 },
-      "goals_before": ["⊢ True"],
-      "goals_after": [],
-      "locals": [],
-      "truncated": false
-    }
-  },
+  "declaration_name": "LeanRsFixture.SourceRanges.proofGoal",
+  "namespace_name": "LeanRsFixture.SourceRanges",
+  "safe_edit": { "declaration_name": "...", "body_span": { ... } },
+  "span": { "start_line": 8, "start_column": 3, "end_line": 8, "end_column": 10 },
+  "goals_before": ["⊢ True"],
+  "goals_after": [],
+  "locals": [],
   "term": { "status": "term", "type_str": { "value": "TacticM Unit", "truncated": false }, "...": "..." },
-  "declaration_target": { "status": "target", "info": { "...": "..." } },
+  "target_declaration": { "status": "target", "info": { "...": "..." } },
   "surrounding_declaration": { "status": "declaration", "info": { "...": "..." } },
   "total_truncated": false,
   "query_facts": {
@@ -199,12 +195,13 @@ Inspect the current Lean proof context at a cursor position. This is the default
 
 Header parse failures return `status: "header_parse_failed"` with the same diagnostics block shape. Selector-level
 unavailability and budget exhaustion are reported in `unavailable` / `budget_exceeded` sidebars instead of failing the
-whole tool call.
+whole tool call. Optional context fields are omitted when Lean cannot identify that part of the cursor context.
 
 ### `lean_query`
 
-Run a bounded batch of Lean semantic projections against one file. Selectors are typed objects and each selector has a
-caller-chosen `id`; results are returned in an object keyed by those ids.
+Run a bounded batch of Lean semantic projections against one file. This is the expert/composable form; use
+`proof_state` for ordinary proof editing. Selectors are typed objects and each selector has a caller-chosen `id`;
+results are returned in an object keyed by those ids.
 
 ```jsonc
 // request

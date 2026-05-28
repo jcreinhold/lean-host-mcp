@@ -129,11 +129,12 @@ project is unusable.
 ## Capability shims and proof-agent module queries
 
 `proof_state` and `lean_query` depend on the optional bounded `lean_rs_host_process_module_query_batch` shim.
-`proof_state` is the common proof-agent call: one request returns diagnostics, goals, locals, expected type, target
-declaration, surrounding declaration, and a safe edit span when Lean can determine one. `lean_query` is the composable
-form: callers pass typed selectors for diagnostics, proof state, term type, references, declaration target, or
-surrounding declaration and receive results keyed by selector id. A worker whose bundled shims do not expose the batch
-capability answers `{ "status": "unsupported" }`; the tools never request or cache whole-file info trees.
+`proof_state` is the common proof-agent call: one request returns a compact context with diagnostics, goals, locals,
+expected type, target declaration, surrounding declaration, and a safe edit span when Lean can determine one.
+`lean_query` is the expert composable form: callers pass typed selectors for diagnostics, proof state, term type,
+references, declaration target, or surrounding declaration and receive results keyed by selector id. A worker whose
+bundled shims do not expose the batch capability answers `{ "status": "unsupported" }`; the tools never request or
+cache whole-file info trees.
 Successful batch responses include `query_facts` with worker cache status, output bytes, and phase timings. The host
 does not cache exact `proof_state` / `lean_query` batch results; repeated calls reach the worker snapshot cache so warm
 behavior is observable.

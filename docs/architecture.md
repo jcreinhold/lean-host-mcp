@@ -136,9 +136,10 @@ not be able to trigger a full environment walk plus bulk type rendering just to 
 ## The module-query cache
 
 `proof_state` and `lean_query` call the worker's `process_module_query_batch` capability. There is no whole-file
-info-tree result in the parent. Each request asks Lean for bounded projections selected by intent: diagnostics, proof
-state, selected term type, references to one name, declaration target, or surrounding declaration. The reference tools
-still use the older single-query capability until the later source/reference redesign replaces them.
+info-tree result in the parent. `proof_state` hides the selector batch behind one proof-agent context with conservative
+host-owned output budgets. `lean_query` keeps the selector model available for expert callers that need a custom
+projection batch. The reference tools still use the older single-query capability until the later source/reference
+redesign replaces them.
 
 The worker owns module snapshot reuse for batched proof-agent queries and reports cache status, output bytes, and phase
 timings in each batch outcome. The host deliberately does not keep an exact batch-result cache for `proof_state` or
