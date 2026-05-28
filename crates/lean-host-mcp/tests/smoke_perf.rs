@@ -162,6 +162,10 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         .collect::<BTreeSet<_>>();
     assert!(tool_names.contains("lean_query"), "tools/list must expose lean_query");
     assert!(tool_names.contains("proof_state"), "tools/list must expose proof_state");
+    assert!(
+        tool_names.contains("search_for_proof"),
+        "tools/list must expose search_for_proof"
+    );
     for removed in ["file_diagnostics", "goal_at_position", "type_at_position"] {
         assert!(
             !tool_names.contains(removed),
@@ -348,6 +352,28 @@ fn fixture_calls() -> Vec<ToolCall> {
                 "file": "LeanRsFixture/SourceRanges.lean",
                 "line": 8,
                 "column": 3
+            }),
+        },
+        ToolCall {
+            label: "search_for_proof_trivial_cursor",
+            tool_name: "search_for_proof",
+            category: "proof_search",
+            arguments: json!({
+                "file": "LeanRsFixture/SourceRanges.lean",
+                "line": 8,
+                "column": 3,
+                "limit": 10
+            }),
+        },
+        ToolCall {
+            label: "search_for_proof_explicit_true",
+            tool_name: "search_for_proof",
+            category: "proof_search",
+            arguments: json!({
+                "goal": "⊢ True",
+                "imports": ["LeanRsFixture.SourceRanges"],
+                "mode": "exact",
+                "limit": 10
             }),
         },
         ToolCall {

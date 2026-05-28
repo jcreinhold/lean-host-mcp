@@ -114,6 +114,16 @@ impl LeanHostService {
     }
 
     #[tool(
+        description = "Proof-agent retrieval: from a cursor or explicit goal/type text, return bounded ranked declarations likely to help the next proof step."
+    )]
+    async fn search_for_proof(
+        &self,
+        Parameters(req): Parameters<tools::proof_search::SearchForProofRequest>,
+    ) -> std::result::Result<Json<Response<tools::proof_search::SearchForProofResult>>, McpError> {
+        wrap(tools::proof_search::search_for_proof(&self.ctx, req).await)
+    }
+
+    #[tool(
         description = "Filesystem regex sweep over the project's .lean files. Presets: sorry, admit, axiom, set_option."
     )]
     async fn project_scan(

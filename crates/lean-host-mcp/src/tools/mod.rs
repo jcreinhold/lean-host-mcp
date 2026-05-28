@@ -5,6 +5,8 @@
 //! - [`lean`]: term/meta tools plus bounded declaration search/type lookup.
 //!   These drive the project's worker actor and project Lean responses into
 //!   the JSON envelope.
+//! - [`proof_search`]: `search_for_proof`, the proof-agent retrieval tool
+//!   built from bounded proof-state and declaration-search calls.
 //! - [`scan`]: `project_scan`. No Lean dependency; pure filesystem walk
 //!   with a configurable regex.
 //! - [`position`]: `proof_state`, `lean_query`, `references_in_file`, and
@@ -16,6 +18,7 @@ use std::sync::Arc;
 
 pub mod lean;
 pub mod position;
+pub mod proof_search;
 pub mod scan;
 
 use crate::broker::ProjectBroker;

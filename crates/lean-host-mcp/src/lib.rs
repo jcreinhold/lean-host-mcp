@@ -46,8 +46,9 @@ pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerp
 pub use lake_meta::LakeProjectMeta;
 pub use project::LeanProject;
 pub use projections::{
-    DeclarationRow, DeclarationSearchResult, DeclarationSummary, DeclarationTypeResult, Diagnostic, ElabFailure,
-    ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome, Position, RenderedText, Severity, SourceRange,
+    DeclarationFlags, DeclarationRow, DeclarationSearchFacts, DeclarationSearchPruning, DeclarationSearchResult,
+    DeclarationSearchTimings, DeclarationSummary, DeclarationTypeResult, Diagnostic, ElabFailure, ElabSuccess,
+    KernelOutcome, KernelSummary, MetaOutcome, Position, RenderedText, Severity, SourceRange,
 };
 pub use server::LeanHostService;
 pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};

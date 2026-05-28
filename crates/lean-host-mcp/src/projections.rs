@@ -17,10 +17,11 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use lean_rs_worker_parent::{
-    LeanWorkerDeclarationRow, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationSummary,
-    LeanWorkerDeclarationType, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerElabResult, LeanWorkerError,
-    LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerRendered, LeanWorkerRenderedInfo,
-    LeanWorkerRendering, LeanWorkerSourceRange,
+    LeanWorkerDeclarationFlags, LeanWorkerDeclarationRow, LeanWorkerDeclarationSearchFacts,
+    LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationSearchRow,
+    LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationType, LeanWorkerDiagnostic, LeanWorkerElabFailure,
+    LeanWorkerElabResult, LeanWorkerError, LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult,
+    LeanWorkerRendered, LeanWorkerRenderedInfo, LeanWorkerRendering, LeanWorkerSourceRange,
 };
 
 use crate::error::ServerError;
@@ -145,16 +146,57 @@ pub struct RenderedText {
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationFlags {
+    pub is_private: bool,
+    pub is_generated: bool,
+    pub is_internal: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DeclarationSummary {
     pub name: String,
     pub kind: String,
+    pub module: Option<String>,
     pub source: Option<SourceRange>,
+    pub match_reason: String,
+    pub score: i32,
+    pub rank: usize,
+    pub flags: DeclarationFlags,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationSearchPruning {
+    pub stage: String,
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationSearchTimings {
+    pub scan_micros: u64,
+    pub rank_micros: u64,
+    pub source_micros: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationSearchFacts {
+    pub declarations_scanned: usize,
+    pub after_name_filter: usize,
+    pub after_kind_filter: usize,
+    pub after_required_constants_filter: usize,
+    pub after_conclusion_filter: usize,
+    pub after_scope_filter: usize,
+    pub source_lookups: usize,
+    pub broad_pruning: Vec<DeclarationSearchPruning>,
+    pub truncated: bool,
+    pub timings: DeclarationSearchTimings,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DeclarationSearchResult {
     pub declarations: Vec<DeclarationSummary>,
     pub truncated: bool,
+    pub facts: DeclarationSearchFacts,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -324,11 +366,59 @@ fn project_rendered_info(info: LeanWorkerRenderedInfo) -> RenderedText {
     }
 }
 
-fn project_declaration_summary(row: LeanWorkerDeclarationSummary) -> DeclarationSummary {
+fn project_declaration_flags(flags: LeanWorkerDeclarationFlags) -> DeclarationFlags {
+    DeclarationFlags {
+        is_private: flags.is_private,
+        is_generated: flags.is_generated,
+        is_internal: flags.is_internal,
+    }
+}
+
+fn project_declaration_summary(row: LeanWorkerDeclarationSearchRow) -> DeclarationSummary {
     DeclarationSummary {
         name: row.name,
         kind: row.kind,
+        module: row.module,
         source: row.source.map(project_source_range),
+        match_reason: row.match_reason,
+        score: row.score,
+        rank: row.rank,
+        flags: project_declaration_flags(row.flags),
+    }
+}
+
+fn project_declaration_search_pruning(row: LeanWorkerDeclarationSearchPruning) -> DeclarationSearchPruning {
+    DeclarationSearchPruning {
+        stage: row.stage,
+        reason: row.reason,
+        count: row.count,
+    }
+}
+
+fn project_declaration_search_timings(timings: LeanWorkerDeclarationSearchTimings) -> DeclarationSearchTimings {
+    DeclarationSearchTimings {
+        scan_micros: timings.scan_micros,
+        rank_micros: timings.rank_micros,
+        source_micros: timings.source_micros,
+    }
+}
+
+fn project_declaration_search_facts(facts: LeanWorkerDeclarationSearchFacts) -> DeclarationSearchFacts {
+    DeclarationSearchFacts {
+        declarations_scanned: facts.declarations_scanned,
+        after_name_filter: facts.after_name_filter,
+        after_kind_filter: facts.after_kind_filter,
+        after_required_constants_filter: facts.after_required_constants_filter,
+        after_conclusion_filter: facts.after_conclusion_filter,
+        after_scope_filter: facts.after_scope_filter,
+        source_lookups: facts.source_lookups,
+        broad_pruning: facts
+            .broad_pruning
+            .into_iter()
+            .map(project_declaration_search_pruning)
+            .collect(),
+        truncated: facts.truncated,
+        timings: project_declaration_search_timings(facts.timings),
     }
 }
 
@@ -340,6 +430,7 @@ pub fn project_declaration_search(result: LeanWorkerDeclarationSearchResult) -> 
             .map(project_declaration_summary)
             .collect(),
         truncated: result.truncated,
+        facts: project_declaration_search_facts(result.facts),
     }
 }
 

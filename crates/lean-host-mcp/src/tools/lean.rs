@@ -13,7 +13,8 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use lean_rs_worker_parent::{
-    LeanWorkerDeclarationFilter, LeanWorkerDeclarationSearch, LeanWorkerElabOptions, LeanWorkerMetaTransparency,
+    LeanWorkerDeclarationFilter, LeanWorkerDeclarationNameMatch, LeanWorkerDeclarationSearch, LeanWorkerElabOptions,
+    LeanWorkerMetaTransparency,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -392,8 +393,12 @@ pub async fn search_declarations(
             let freshness = freshness_for(&project, &req.imports);
             let imports = session_imports(req.imports);
             let search = LeanWorkerDeclarationSearch {
-                query: req.query,
+                name_fragment: Some(req.query),
+                name_match: LeanWorkerDeclarationNameMatch::Contains,
                 kind: req.kind,
+                required_constants: Vec::new(),
+                conclusion_head: None,
+                scope_biases: Vec::new(),
                 limit: req.limit.unwrap_or(20).clamp(1, 100),
                 filter: LeanWorkerDeclarationFilter {
                     include_private: false,

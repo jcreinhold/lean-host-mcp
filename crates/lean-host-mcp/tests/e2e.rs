@@ -29,6 +29,7 @@ use lean_host_mcp::tools::position::{
     DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ModuleQueryFacts,
     ProofStateRequest, ProofStateResult, TypeAtProjection, lean_query, proof_state,
 };
+use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, Response, ServerError};
 
 fn fixture_root() -> Option<PathBuf> {
@@ -240,6 +241,22 @@ fn search_declarations_request_round_trips() {
     assert_eq!(full.limit, Some(25));
     assert_eq!(full.kind.as_deref(), Some("theorem"));
     assert_eq!(full.imports, vec!["List".to_owned()]);
+}
+
+#[test]
+fn search_for_proof_request_round_trips() {
+    let cursor: SearchForProofRequest =
+        serde_json::from_str(r#"{"file":"A.lean","line":4,"column":2,"mode":"apply","limit":200}"#).unwrap();
+    assert_eq!(cursor.file, Some(PathBuf::from("A.lean")));
+    assert_eq!(cursor.line, Some(4));
+    assert_eq!(cursor.column, Some(2));
+    assert_eq!(cursor.mode, Some(ProofSearchMode::Apply));
+    assert_eq!(cursor.limit, Some(200));
+
+    let explicit: SearchForProofRequest = serde_json::from_str(r#"{"goal":"⊢ True"}"#).unwrap();
+    assert_eq!(explicit.goal.as_deref(), Some("⊢ True"));
+    assert!(explicit.file.is_none());
+    assert!(explicit.mode.is_none());
 }
 
 #[test]
@@ -662,7 +679,10 @@ async fn module_query_position_tools_return_bounded_results() {
         expected_type.as_ref().is_none_or(|text| !text.value.is_empty()),
         "expected type should be omitted or non-empty"
     );
-    assert!(safe_edit.is_some(), "fixture proof_state should include safe edit metadata");
+    assert!(
+        safe_edit.is_some(),
+        "fixture proof_state should include safe edit metadata"
+    );
     assert!(
         target_declaration.is_some(),
         "proof_state should include target declaration status"
@@ -964,6 +984,145 @@ async fn declaration_search_finds_prelude_theorem_without_index_rebuild() {
     assert!(
         resp.result.declarations.iter().any(|d| d.name == "Nat.add_zero"),
         "Nat.add_zero must be reachable through bounded declaration search"
+    );
+    assert!(
+        resp.result
+            .declarations
+            .iter()
+            .all(|d| !d.match_reason.is_empty() && d.rank > 0),
+        "search v2 rows must expose match reason and rank: {:?}",
+        resp.result.declarations
+    );
+    assert!(
+        resp.result.facts.declarations_scanned > 0,
+        "search v2 facts should report scan counts: {:?}",
+        resp.result.facts
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn search_for_proof_explicit_goal_returns_bounded_candidates() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = search_for_proof(
+        &ctx,
+        SearchForProofRequest {
+            file: None,
+            line: None,
+            column: None,
+            goal: Some("⊢ True".into()),
+            type_text: None,
+            imports: vec!["LeanRsFixture.SourceRanges".into()],
+            mode: Some(ProofSearchMode::Exact),
+            limit: Some(5),
+            project: None,
+        },
+    )
+    .await
+    .expect("search_for_proof explicit goal");
+
+    let response_bytes = serde_json::to_vec(&resp)
+        .expect("serialize search_for_proof response")
+        .len();
+    assert!(
+        response_bytes < 64 * 1024,
+        "search_for_proof response should stay under hard budget, got {response_bytes}"
+    );
+    assert_eq!(resp.result.diagnostics.proof_state_status, "explicit_text");
+    assert!(resp.result.diagnostics.generated_count > 0);
+    assert!(
+        resp.result.candidates.iter().any(|candidate| {
+            candidate.name == "LeanRsFixture.SourceRanges.knownTheorem" || candidate.name.contains("True")
+        }),
+        "explicit True goal should retrieve a plausible theorem: {:?}",
+        resp.result.candidates
+    );
+    assert!(
+        resp.result
+            .candidates
+            .iter()
+            .all(|candidate| !candidate.match_reason.is_empty()),
+        "candidates should include deterministic match reasons"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn search_for_proof_cursor_goal_reports_cache_and_candidates() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = search_for_proof(
+        &ctx,
+        SearchForProofRequest {
+            file: Some(PathBuf::from("LeanRsFixture/SourceRanges.lean")),
+            line: Some(8),
+            column: Some(3),
+            goal: None,
+            type_text: None,
+            imports: Vec::new(),
+            mode: Some(ProofSearchMode::NextStep),
+            limit: Some(5),
+            project: None,
+        },
+    )
+    .await
+    .expect("search_for_proof cursor");
+
+    assert_eq!(resp.result.diagnostics.proof_state_status, "context");
+    assert!(
+        resp.result.diagnostics.cache_status.is_some(),
+        "cursor search should surface proof-state cache status"
+    );
+    assert!(
+        resp.result.diagnostics.returned_count <= 5,
+        "limit should cap returned candidates"
+    );
+    assert!(
+        resp.result.candidates.iter().all(|candidate| {
+            candidate.source.is_none() || candidate.source.as_ref().is_some_and(|source| !source.file.is_empty())
+        }),
+        "candidate source ranges, when present, must be bounded metadata only"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn search_for_proof_broad_goal_reports_pruning_without_type_text() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = search_for_proof(
+        &ctx,
+        SearchForProofRequest {
+            file: None,
+            line: None,
+            column: None,
+            goal: Some("⊢ a = b".into()),
+            type_text: None,
+            imports: vec!["Lean".into()],
+            mode: Some(ProofSearchMode::Rewrite),
+            limit: Some(3),
+            project: None,
+        },
+    )
+    .await
+    .expect("search_for_proof broad equality");
+
+    assert_eq!(resp.result.diagnostics.proof_state_status, "explicit_text");
+    assert!(resp.result.diagnostics.returned_count <= 3);
+    let serialized = serde_json::to_string(&resp).expect("serialize response");
+    assert!(
+        !serialized.contains("type_signature") && !serialized.contains("statement"),
+        "Prompt 40 candidates must not include rendered declaration text: {serialized}"
     );
 }
 
