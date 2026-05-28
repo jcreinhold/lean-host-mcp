@@ -87,30 +87,14 @@ impl LeanHostService {
         wrap(tools::lean::is_def_eq(&self.ctx, req).await)
     }
 
-    #[tool(description = "Look up one Lean declaration and return a bounded rendered type.")]
-    async fn hover_by_name(
-        &self,
-        Parameters(req): Parameters<tools::lean::HoverByNameRequest>,
-    ) -> std::result::Result<Json<Response<tools::lean::HoverByNameResult>>, McpError> {
-        wrap(tools::lean::hover_by_name(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Render the type of one fully-qualified Lean declaration under a strict byte cap.")]
-    async fn type_of_name(
-        &self,
-        Parameters(req): Parameters<tools::lean::TypeOfNameRequest>,
-    ) -> std::result::Result<Json<Response<tools::lean::HoverByNameResult>>, McpError> {
-        wrap(tools::lean::type_of_name(&self.ctx, req).await)
-    }
-
     #[tool(
-        description = "Search declaration names against the imported environment. Returns bounded metadata only; use type_of_name for one type."
+        description = "Inspect one Lean declaration by name or cursor position, returning bounded statement, documentation, source, and metadata useful for proof work."
     )]
-    async fn search_declarations(
+    async fn inspect_declaration(
         &self,
-        Parameters(req): Parameters<tools::lean::SearchDeclarationsRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::DeclarationSearchResult>>, McpError> {
-        wrap(tools::lean::search_declarations(&self.ctx, req).await)
+        Parameters(req): Parameters<tools::declaration::InspectDeclarationRequest>,
+    ) -> std::result::Result<Json<Response<crate::projections::DeclarationInspectionResult>>, McpError> {
+        wrap(tools::declaration::inspect_declaration(&self.ctx, req).await)
     }
 
     #[tool(
@@ -186,7 +170,7 @@ impl ServerHandler for LeanHostService {
         info.instructions = Some(
             "MCP server hosting Lean 4 in-process via lean-rs. \
              Tools elaborate / kernel-check terms, run bounded MetaM ops, \
-             look up declarations by name, scan .lean files, and run \
+             inspect one selected declaration, scan .lean files, and run \
              bounded proof-context and semantic file queries."
                 .to_owned(),
         );

@@ -163,10 +163,21 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
     assert!(tool_names.contains("lean_query"), "tools/list must expose lean_query");
     assert!(tool_names.contains("proof_state"), "tools/list must expose proof_state");
     assert!(
+        tool_names.contains("inspect_declaration"),
+        "tools/list must expose inspect_declaration"
+    );
+    assert!(
         tool_names.contains("search_for_proof"),
         "tools/list must expose search_for_proof"
     );
-    for removed in ["file_diagnostics", "goal_at_position", "type_at_position"] {
+    for removed in [
+        "file_diagnostics",
+        "goal_at_position",
+        "type_at_position",
+        "hover_by_name",
+        "type_of_name",
+        "search_declarations",
+    ] {
         assert!(
             !tool_names.contains(removed),
             "tools/list must not expose removed position tool {removed}"
@@ -300,8 +311,8 @@ fn fixture_calls() -> Vec<ToolCall> {
             }),
         },
         ToolCall {
-            label: "hover_nat_add_zero",
-            tool_name: "hover_by_name",
+            label: "inspect_nat_add_zero",
+            tool_name: "inspect_declaration",
             category: "declaration",
             arguments: json!({
                 "name": "Nat.add_zero",
@@ -309,23 +320,23 @@ fn fixture_calls() -> Vec<ToolCall> {
             }),
         },
         ToolCall {
-            label: "type_of_nat_add_zero",
-            tool_name: "type_of_name",
+            label: "inspect_cursor_known_theorem",
+            tool_name: "inspect_declaration",
             category: "declaration",
             arguments: json!({
-                "name": "Nat.add_zero",
-                "imports": ["LeanRsFixture.Handles"]
+                "file": "LeanRsFixture/SourceRanges.lean",
+                "line": 8,
+                "column": 3
             }),
         },
         ToolCall {
-            label: "search_add_zero",
-            tool_name: "search_declarations",
+            label: "inspect_large_statement_truncated",
+            tool_name: "inspect_declaration",
             category: "declaration",
             arguments: json!({
-                "query": "add_zero",
-                "kind": "theorem",
-                "imports": ["LeanRsFixture.Handles"],
-                "limit": 20
+                "name": "Lean.Meta.forallTelescopeReducing",
+                "imports": ["Lean"],
+                "max_field_bytes": 256
             }),
         },
         ToolCall {
@@ -420,10 +431,10 @@ fn external_project_calls() -> Vec<ToolCall> {
             arguments: json!({ "term": "fun (n : Nat) => n + 1", "imports": [] }),
         },
         ToolCall {
-            label: "search_add_zero_no_imports",
-            tool_name: "search_declarations",
+            label: "inspect_nat_add_zero_no_imports",
+            tool_name: "inspect_declaration",
             category: "declaration",
-            arguments: json!({ "query": "add_zero", "kind": "theorem", "imports": [], "limit": 20 }),
+            arguments: json!({ "name": "Nat.add_zero", "imports": [] }),
         },
         ToolCall {
             label: "project_scan_sorry",

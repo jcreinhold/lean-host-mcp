@@ -1,5 +1,5 @@
 //! Tools that drive the Lean session directly: `elaborate`, `kernel_check`,
-//! `infer_type`, `whnf`, `is_def_eq`, `hover_by_name`.
+//! `infer_type`, `whnf`, and `is_def_eq`.
 //!
 //! Every tool returns a [`Response`] envelope; failure modes Lean reports
 //! (parse errors, elaboration errors, kernel rejections, meta timeouts) are
@@ -12,10 +12,7 @@
 // pass-by-value flag is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
-use lean_rs_worker_parent::{
-    LeanWorkerDeclarationFilter, LeanWorkerDeclarationNameMatch, LeanWorkerDeclarationSearch, LeanWorkerElabOptions,
-    LeanWorkerMetaTransparency,
-};
+use lean_rs_worker_parent::{LeanWorkerElabOptions, LeanWorkerMetaTransparency};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +20,7 @@ use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::Result;
 use crate::projections::{
-    DeclarationSearchResult, DeclarationTypeResult, ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome,
-    map_worker_err, project_declaration_search, project_declaration_type, project_elab_result, project_kernel_result,
+    ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome, map_worker_err, project_elab_result, project_kernel_result,
     project_meta_bool, project_meta_rendered,
 };
 use crate::tools::{ToolContext, freshness_for, session_imports};
@@ -272,159 +268,6 @@ pub async fn is_def_eq(ctx: &ToolContext, req: IsDefEqRequest) -> Result<Respons
             Ok(Response::ok(outcome, freshness))
         })
         .await
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct HoverByNameRequest {
-    /// Fully-qualified Lean name, e.g. `Nat.add_zero`.
-    pub name: String,
-    #[serde(default)]
-    pub imports: Vec<String>,
-    /// Maximum rendered type bytes. Defaults to 8192, clamped to 65536.
-    #[serde(default)]
-    pub max_type_bytes: Option<usize>,
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum HoverByNameResult {
-    Found(DeclarationTypeResult),
-    Missing { name: String },
-}
-
-/// # Errors
-///
-/// Infrastructure failures only; missing names return `HoverByNameResult::Missing`.
-pub async fn hover_by_name(ctx: &ToolContext, req: HoverByNameRequest) -> Result<Response<HoverByNameResult>> {
-    type_of_name_inner(
-        ctx,
-        TypeOfNameRequest {
-            name: req.name,
-            imports: req.imports,
-            max_type_bytes: req.max_type_bytes,
-            project: req.project,
-        },
-    )
-    .await
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct TypeOfNameRequest {
-    /// Fully-qualified Lean declaration name, e.g. `Nat.add_zero`.
-    pub name: String,
-    #[serde(default)]
-    pub imports: Vec<String>,
-    /// Maximum rendered type bytes. Defaults to 8192, clamped to 65536.
-    #[serde(default)]
-    pub max_type_bytes: Option<usize>,
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-/// # Errors
-///
-/// Infrastructure failures only; missing names return `HoverByNameResult::Missing`.
-pub async fn type_of_name(ctx: &ToolContext, req: TypeOfNameRequest) -> Result<Response<HoverByNameResult>> {
-    type_of_name_inner(ctx, req).await
-}
-
-async fn type_of_name_inner(ctx: &ToolContext, req: TypeOfNameRequest) -> Result<Response<HoverByNameResult>> {
-    let hint = ProjectHint::from_request(req.project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let freshness = freshness_for(&project, &req.imports);
-            let imports = session_imports(req.imports);
-            let name = req.name;
-            let lookup_name = name.clone();
-            let max_type_bytes = req.max_type_bytes.unwrap_or(8 * 1024).clamp(256, 64 * 1024);
-            let row = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
-                    let row = session
-                        .declaration_type(&lookup_name, max_type_bytes, None, None)
-                        .map_err(map_worker_err)?;
-                    Ok(row.map(project_declaration_type))
-                })
-                .await?;
-            let result = match row {
-                Some(row) => HoverByNameResult::Found(row),
-                None => HoverByNameResult::Missing { name },
-            };
-            Ok(Response::ok(result, freshness))
-        })
-        .await
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct SearchDeclarationsRequest {
-    /// Case-insensitive substring to match against fully-qualified names.
-    pub query: String,
-    /// Optional kind filter such as `theorem`, `definition`, or `axiom`.
-    #[serde(default)]
-    pub kind: Option<String>,
-    /// Module imports to search against. Empty = `Init` only.
-    #[serde(default)]
-    pub imports: Vec<String>,
-    /// Maximum rows to return. Defaults to 20, clamped to 100.
-    #[serde(default)]
-    pub limit: Option<usize>,
-    /// Include source ranges when Lean can resolve them. Defaults to true.
-    #[serde(default = "default_include_source")]
-    pub include_source: bool,
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-/// # Errors
-///
-/// Infrastructure failures only. Broad queries return bounded metadata and
-/// set `truncated`; they do not rebuild or render a whole-environment index.
-pub async fn search_declarations(
-    ctx: &ToolContext,
-    req: SearchDeclarationsRequest,
-) -> Result<Response<DeclarationSearchResult>> {
-    let hint = ProjectHint::from_request(req.project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let freshness = freshness_for(&project, &req.imports);
-            let imports = session_imports(req.imports);
-            let search = LeanWorkerDeclarationSearch {
-                name_fragment: Some(req.query),
-                name_match: LeanWorkerDeclarationNameMatch::Contains,
-                kind: req.kind,
-                required_constants: Vec::new(),
-                conclusion_head: None,
-                scope_biases: Vec::new(),
-                limit: req.limit.unwrap_or(20).clamp(1, 100),
-                filter: LeanWorkerDeclarationFilter {
-                    include_private: false,
-                    include_generated: false,
-                    include_internal: false,
-                },
-                include_source: req.include_source,
-            };
-            let result = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
-                    session
-                        .search_declarations(&search, None, None)
-                        .map(project_declaration_search)
-                        .map_err(map_worker_err)
-                })
-                .await?;
-            Ok(Response::ok(result, freshness))
-        })
-        .await
-}
-
-const fn default_include_source() -> bool {
-    true
 }
 
 fn elab_opts() -> LeanWorkerElabOptions {

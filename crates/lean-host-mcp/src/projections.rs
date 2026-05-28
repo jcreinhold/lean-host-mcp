@@ -17,9 +17,10 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use lean_rs_worker_parent::{
-    LeanWorkerDeclarationFlags, LeanWorkerDeclarationRow, LeanWorkerDeclarationSearchFacts,
-    LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationSearchRow,
-    LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationType, LeanWorkerDiagnostic, LeanWorkerElabFailure,
+    LeanWorkerDeclarationFlags, LeanWorkerDeclarationInspection as WorkerDeclarationInspection,
+    LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationProofSearchFacts, LeanWorkerDeclarationRow,
+    LeanWorkerDeclarationSearchFacts, LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult,
+    LeanWorkerDeclarationSearchRow, LeanWorkerDeclarationSearchTimings, LeanWorkerDiagnostic, LeanWorkerElabFailure,
     LeanWorkerElabResult, LeanWorkerError, LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult,
     LeanWorkerRendered, LeanWorkerRenderedInfo, LeanWorkerRendering, LeanWorkerSourceRange,
 };
@@ -200,11 +201,50 @@ pub struct DeclarationSearchResult {
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct DeclarationTypeResult {
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "proof-search booleans mirror independent lean-rs wire facts"
+)]
+pub struct DeclarationProofSearchFacts {
+    pub is_simp: bool,
+    pub is_rw_candidate: bool,
+    pub is_instance: bool,
+    pub is_class: bool,
+    pub class_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationInspection {
     pub name: String,
     pub kind: String,
-    pub type_signature: Option<RenderedText>,
+    pub module: Option<String>,
     pub source: Option<SourceRange>,
+    pub statement: Option<RenderedText>,
+    pub docstring: Option<RenderedText>,
+    pub attributes: Vec<String>,
+    pub proof_search: DeclarationProofSearchFacts,
+    pub flags: DeclarationFlags,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DeclarationInspectionCandidate {
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DeclarationInspectionResult {
+    Found {
+        declaration: Box<DeclarationInspection>,
+    },
+    NotFound {
+        name: Option<String>,
+    },
+    Ambiguous {
+        candidates: Vec<DeclarationInspectionCandidate>,
+    },
+    Unsupported,
 }
 
 // --- projection helpers -------------------------------------------------
@@ -231,7 +271,7 @@ pub fn project_failure(failure: &LeanWorkerElabFailure) -> ElabFailure {
     }
 }
 
-fn project_source_range(range: LeanWorkerSourceRange) -> SourceRange {
+pub(crate) fn project_source_range(range: LeanWorkerSourceRange) -> SourceRange {
     SourceRange {
         file: range.file,
         start_line: range.start_line,
@@ -359,14 +399,14 @@ pub fn project_declaration_row(row: LeanWorkerDeclarationRow) -> DeclarationRow 
     }
 }
 
-fn project_rendered_info(info: LeanWorkerRenderedInfo) -> RenderedText {
+pub(crate) fn project_rendered_info(info: LeanWorkerRenderedInfo) -> RenderedText {
     RenderedText {
         value: info.value,
         truncated: info.truncated,
     }
 }
 
-fn project_declaration_flags(flags: LeanWorkerDeclarationFlags) -> DeclarationFlags {
+pub(crate) fn project_declaration_flags(flags: LeanWorkerDeclarationFlags) -> DeclarationFlags {
     DeclarationFlags {
         is_private: flags.is_private,
         is_generated: flags.is_generated,
@@ -434,12 +474,40 @@ pub fn project_declaration_search(result: LeanWorkerDeclarationSearchResult) -> 
     }
 }
 
-pub fn project_declaration_type(row: LeanWorkerDeclarationType) -> DeclarationTypeResult {
-    DeclarationTypeResult {
-        name: row.name,
-        kind: row.kind,
-        type_signature: row.type_signature.map(project_rendered_info),
-        source: row.source.map(project_source_range),
+pub fn project_declaration_inspection(result: LeanWorkerDeclarationInspectionResult) -> DeclarationInspectionResult {
+    match result {
+        LeanWorkerDeclarationInspectionResult::Found { declaration } => DeclarationInspectionResult::Found {
+            declaration: Box::new(project_inspection(*declaration)),
+        },
+        LeanWorkerDeclarationInspectionResult::NotFound { name } => {
+            DeclarationInspectionResult::NotFound { name: Some(name) }
+        }
+        LeanWorkerDeclarationInspectionResult::Unsupported => DeclarationInspectionResult::Unsupported,
+        _ => DeclarationInspectionResult::Unsupported,
+    }
+}
+
+pub(crate) fn project_inspection(declaration: WorkerDeclarationInspection) -> DeclarationInspection {
+    DeclarationInspection {
+        name: declaration.name,
+        kind: declaration.kind,
+        module: declaration.module,
+        source: declaration.source.map(project_source_range),
+        statement: declaration.statement.map(project_rendered_info),
+        docstring: declaration.docstring.map(project_rendered_info),
+        attributes: declaration.attributes,
+        proof_search: project_proof_search_facts(declaration.proof_search),
+        flags: project_declaration_flags(declaration.flags),
+    }
+}
+
+fn project_proof_search_facts(facts: LeanWorkerDeclarationProofSearchFacts) -> DeclarationProofSearchFacts {
+    DeclarationProofSearchFacts {
+        is_simp: facts.is_simp,
+        is_rw_candidate: facts.is_rw_candidate,
+        is_instance: facts.is_instance,
+        is_class: facts.is_class,
+        class_name: facts.class_name,
     }
 }
 

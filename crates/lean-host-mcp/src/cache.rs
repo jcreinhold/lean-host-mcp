@@ -86,7 +86,6 @@ impl ModuleQueryCache {
         };
         self.inner.lock().put(key, value);
     }
-
 }
 
 /// SHA-256 the file contents; used to build cache keys without holding the
@@ -114,5 +113,4 @@ mod tests {
             ModuleQueryKey::from_query(&LeanWorkerModuleQuery::References { name: "Nat.mul".into() })
         );
     }
-
 }

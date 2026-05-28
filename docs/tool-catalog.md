@@ -23,8 +23,8 @@ was recently evicted. When omitted, the server resolves the project via the stan
 
 The `project` field is omitted from the per-tool examples below for brevity; assume it on every request schema.
 
-Lean session and declaration tools also accept an `imports` field. It is the complete per-call import vector. An empty array
-means the call asks for no extra imports beyond the worker's base environment.
+Lean session and declaration tools also accept an `imports` field. It is the complete per-call import vector. An empty
+array means the call asks for no extra imports beyond the worker's base environment.
 
 ## Lean session tools (`src/tools/lean.rs`)
 
@@ -82,50 +82,48 @@ server attaches a warning to the envelope; the field is still populated either w
 `transparency` is optional and accepts `default | reducible | instances | all` (default `default`). It picks the
 reducibility view `Meta.isDefEq` runs under: the same two terms can be def-eq under one setting and not another.
 
-### `hover_by_name`
+### `inspect_declaration`
 
 ```jsonc
 // request
-{ "name": "Nat.add_zero", "imports": [], "max_type_bytes": 8192 }
+{ "name": "Nat.add_zero", "imports": [], "max_field_bytes": 8192, "max_total_bytes": 65536 }
 
 // result
-{ "status": "found",   "name": "Nat.add_zero", "kind": "theorem",
-  "type_signature": { "value": "∀ (n : Nat), n + 0 = n", "truncated": false },
-  "source": { ... } }
-{ "status": "missing", "name": "Nat.foo_bar" }
+{
+  "status": "found",
+  "declaration": {
+    "name": "Nat.add_zero",
+    "kind": "theorem",
+    "module": "Init.Prelude",
+    "source": { ... },
+    "statement": { "value": "∀ (n : Nat), n + 0 = n", "truncated": false },
+    "docstring": null,
+    "attributes": ["simp"],
+    "proof_search": {
+      "is_simp": true,
+      "is_rw_candidate": true,
+      "is_instance": false,
+      "is_class": false,
+      "class_name": null
+    },
+    "flags": { "is_private": false, "is_generated": false, "is_internal": false }
+  }
+}
+{ "status": "not_found", "name": "Nat.foo_bar" }
 ```
 
-`hover_by_name` is a compatibility alias for `type_of_name`: it returns one declaration's type under a hard byte cap.
-
-### `type_of_name`
+Cursor form resolves the declaration target first, then inspects that one declaration:
 
 ```jsonc
-// request
-{ "name": "Nat.add_zero", "imports": [], "max_type_bytes": 8192 }
-
-// result
-{ "status": "found", "name": "Nat.add_zero", "kind": "theorem",
-  "type_signature": { "value": "∀ (n : Nat), n + 0 = n", "truncated": false },
-  "source": { ... } }
-{ "status": "missing", "name": "Nat.foo_bar" }
+{ "file": "LeanRsFixture/SourceRanges.lean", "line": 8, "column": 3 }
 ```
 
-`max_type_bytes` defaults to 8192 and clamps to 65536. This tool is the only declaration-name tool that renders a type.
+`fields` can disable `source`, `statement`, `docstring`, `attributes`, or `flags`; omitted field switches default to
+enabled. Rendered `statement` and `docstring` always carry `truncated`. `max_field_bytes` defaults to 8192 and clamps to
+65536; `max_total_bytes` defaults to 65536. Cursor resolution can also return `ambiguous` or `unsupported`.
 
-### `search_declarations`
-
-Case-insensitive substring search over declaration names. Results are metadata-only; no declaration types are rendered
-or indexed.
-
-```jsonc
-// request
-{ "query": "add_zero", "kind": "theorem", "imports": [], "limit": 20, "include_source": true }
-
-// result
-{ "declarations": [{ "name": "Nat.add_zero", "kind": "theorem", "source": { ... } }], "truncated": false }
-```
-
-`kind` is optional. Limits default to 20 and clamp to 100.
+Use `search_for_proof` for proof-oriented retrieval. It returns bounded candidate metadata; inspect one selected
+candidate by name when statement text or declaration facts are needed.
 
 ## Project scan (`src/tools/scan.rs`)
 
@@ -143,14 +141,14 @@ Presets: `sorry | admit | axiom | set_option | custom`.
 
 ## Proof-agent module tools (`src/tools/position.rs`)
 
-`proof_state` and `lean_query` drive `process_module_query_batch`: they read one file, hand the full source
-(header + body) to Lean's frontend, and ask for bounded semantic projections. `proof_state` is the normal proof-agent
-entry point and returns one compact context object under a 64 KiB default batch cap. `lean_query` is the expert batch
-form for callers that need to choose selectors directly. The file's own `import` declarations are parsed by Lean and
-validated against the server's open env; mismatch surfaces as an envelope `warnings` entry. Query results include
-`query_facts`, the worker-reported cache/timing record for the module snapshot used by the batch. The host passes the
-canonical file path as Lean's file label but does not keep an exact batch-result cache for these tools; identical
-repeated calls reach the worker so cache hits, rebuilds, and evictions remain visible.
+`proof_state` and `lean_query` drive `process_module_query_batch`: they read one file, hand the full source (header +
+body) to Lean's frontend, and ask for bounded semantic projections. `proof_state` is the normal proof-agent entry point
+and returns one compact context object under a 64 KiB default batch cap. `lean_query` is the expert batch form for
+callers that need to choose selectors directly. The file's own `import` declarations are parsed by Lean and validated
+against the server's open env; mismatch surfaces as an envelope `warnings` entry. Query results include `query_facts`,
+the worker-reported cache/timing record for the module snapshot used by the batch. The host passes the canonical file
+path as Lean's file label but does not keep an exact batch-result cache for these tools; identical repeated calls reach
+the worker so cache hits, rebuilds, and evictions remain visible.
 
 `process_module_query_batch` is an **optional** capability shim. When the loaded dylib lacks it, these tools answer
 `{ "status": "unsupported" }` cleanly; the tools never raise and never request a whole-file info tree.
@@ -199,9 +197,9 @@ whole tool call. Optional context fields are omitted when Lean cannot identify t
 
 ### `lean_query`
 
-Run a bounded batch of Lean semantic projections against one file. This is the expert/composable form; use
-`proof_state` for ordinary proof editing. Selectors are typed objects and each selector has a caller-chosen `id`;
-results are returned in an object keyed by those ids.
+Run a bounded batch of Lean semantic projections against one file. This is the expert/composable form; use `proof_state`
+for ordinary proof editing. Selectors are typed objects and each selector has a caller-chosen `id`; results are returned
+in an object keyed by those ids.
 
 ```jsonc
 // request

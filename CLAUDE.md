@@ -76,10 +76,10 @@ E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY`
 Running the server requires any Lake project whose requested imports have built `.olean` files. The 28 mandatory + 6
 optional `lean_rs_host_*` symbols come from the vendored shim Lake package inside `lean-rs-host`
 (`crates/lean-rs-host/shims/lean-rs-host-shims/`), which the host builds once per toolchain and loads without building
-the consumer's `:shared` facet—consumers don't declare or link it. Each project's `lean-toolchain` pin selects the worker binary; install one first with
-`lean-host-mcp install-worker --toolchain <id>` (or plain `lean-host-mcp install-worker` to scan `~/.elan/toolchains`). The workspace's
-`fixtures/lean/` is a demo target the test suite uses; it isn't a template consumers must mirror. Then point the server
-at a project:
+the consumer's `:shared` facet—consumers don't declare or link it. Each project's `lean-toolchain` pin selects the
+worker binary; install one first with `lean-host-mcp install-worker --toolchain <id>` (or plain
+`lean-host-mcp install-worker` to scan `~/.elan/toolchains`). The workspace's `fixtures/lean/` is a demo target the test
+suite uses; it isn't a template consumers must mirror. Then point the server at a project:
 
 ```sh
 ./target/release/lean-host-mcp --lake-root /path/to/lake/project
@@ -118,10 +118,10 @@ type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
 while let Some(job) = rx.blocking_recv() { job(&mut handle); }
 ```
 
-Each public method on `SessionHost` is one inline closure that opens a session via `handle.open_session_with_imports(...)`,
-calls the typed worker method, projects the worker's wire-stable result into the MCP-stable wire shape, and replies via
-`oneshot`. Adding a new tool is **one method on `SessionHost`** plus maybe one projection helper—no `Request` variant +
-`WorkerState::handle` arm + `do_*` method coordination.
+Each public method on `SessionHost` is one inline closure that opens a session via
+`handle.open_session_with_imports(...)`, calls the typed worker method, projects the worker's wire-stable result into
+the MCP-stable wire shape, and replies via `oneshot`. Adding a new tool is **one method on `SessionHost`** plus maybe
+one projection helper—no `Request` variant + `WorkerState::handle` arm + `do_*` method coordination.
 
 **Do not** try to:
 - Hold a `LeanWorkerSession<'_>` across an `.await` (it borrows from `&mut LeanWorkerHostHandle`).

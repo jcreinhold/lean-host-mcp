@@ -2,9 +2,10 @@
 //!
 //! Split by what plumbing they share rather than one file per tool:
 //!
-//! - [`lean`]: term/meta tools plus bounded declaration search/type lookup.
-//!   These drive the project's worker actor and project Lean responses into
-//!   the JSON envelope.
+//! - [`lean`]: term/meta tools. These drive the project's worker actor and
+//!   project Lean responses into the JSON envelope.
+//! - [`declaration`]: `inspect_declaration`, the bounded single-declaration
+//!   proof-work inspection tool.
 //! - [`proof_search`]: `search_for_proof`, the proof-agent retrieval tool
 //!   built from bounded proof-state and declaration-search calls.
 //! - [`scan`]: `project_scan`. No Lean dependency; pure filesystem walk
@@ -16,6 +17,7 @@
 
 use std::sync::Arc;
 
+pub mod declaration;
 pub mod lean;
 pub mod position;
 pub mod proof_search;

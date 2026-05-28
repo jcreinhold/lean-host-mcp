@@ -86,12 +86,11 @@ their owning stack frame. The "one owner at a time" invariant holds: the host ha
 is not shared across tokio tasks.
 
 `LeanProject::open` opens a shims-only host handle with `LeanWorkerHostHandleBuilder::shims_only(...)`, then parks that
-handle on a dedicated OS thread named
-`"lean-host-mcp/project/<canonical_root_basename>"` and serves a `tokio::mpsc::Receiver<Job>` in a blocking loop. Each
-tool handler calls `project.submit(|handle| { ... })` to ship a typed closure to that thread; the closure opens a fresh
-session via `handle.open_session_with_imports(...)`, calls the worker, projects the worker's wire-stable result type into
-the MCP-stable wire shape via `projections.rs`, and replies via `oneshot`. No `Request` enum, no `WorkerState`—adding a
-new tool is one closure dispatched through `project.submit`.
+handle on a dedicated OS thread named `"lean-host-mcp/project/<canonical_root_basename>"` and serves a
+`tokio::mpsc::Receiver<Job>` in a blocking loop. Each tool handler calls `project.submit(|handle| { ... })` to ship a
+typed closure to that thread; the closure opens a fresh session via `handle.open_session_with_imports(...)`, calls the
+worker, projects the worker's wire-stable result type into the MCP-stable wire shape via `projections.rs`, and replies
+via `oneshot`. No `Request` enum, no `WorkerState`—adding a new tool is one closure dispatched through `project.submit`.
 
 ```rust
 type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
@@ -102,9 +101,9 @@ while let Some(job) = rx.blocking_recv() {
 }
 ```
 
-The shims-only bootstrap loads the bundled host shim/interoperability dylibs and never builds or `dlopen`s the
-consumer project's `:shared` facet. A broken project module can still fail a session that explicitly imports it, but it
-does not prevent the MCP from opening sessions for unrelated imports or collecting diagnostics for the broken file.
+The shims-only bootstrap loads the bundled host shim/interoperability dylibs and never builds or `dlopen`s the consumer
+project's `:shared` facet. A broken project module can still fail a session that explicitly imports it, but it does not
+prevent the MCP from opening sessions for unrelated imports or collecting diagnostics for the broken file.
 
 Per-request session-open is fine: subsequent opens with the same import set reuse the child's module cache, so only the
 first open per import set pays the load cost. The `worker_roundtrip` bench pins this.
@@ -124,14 +123,17 @@ agrees on, and it hides three decisions that are still in motion:
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) live inside `result`, not as MCP errors.
 `ServerError` is reserved for infrastructure: worker thread gone, runtime init failed, Lake project unusable.
 
-## Bounded declaration lookup
+## Bounded declaration inspection
 
-Declaration lookup is worker-backed and bounded by query shape. `search_declarations` searches names and returns
-metadata-only rows; it never renders declaration types or rebuilds a whole-environment SQLite cache. `type_of_name`
-renders the type of one explicit declaration under a byte cap and reports whether the text was truncated.
+Declaration inspection is worker-backed and intentionally single-name. `inspect_declaration` resolves either an explicit
+declaration name or one cursor-selected declaration, then returns bounded statement text, documentation, source/module
+metadata, cheap proof-search facts, and private/generated/internal flags. Rendered text fields carry their own
+truncation flags and are capped before they cross the worker boundary.
 
-The old synchronous index rebuild path was deliberately removed from the MCP surface. A model-controlled tool should
-not be able to trigger a full environment walk plus bulk type rendering just to answer a small name search.
+The public MCP declaration surface does not expose raw declaration search or type-only lookup. Proof-oriented retrieval
+goes through `search_for_proof`, and callers inspect one selected candidate by name when they need statement text or
+declaration facts. The old synchronous index rebuild path remains out of the MCP surface: a model-controlled tool should
+not be able to trigger a full environment walk plus bulk type rendering.
 
 ## The module-query cache
 

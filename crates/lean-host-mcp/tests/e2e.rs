@@ -21,10 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use lean_host_mcp::tools::ToolContext;
-use lean_host_mcp::tools::lean::{
-    ElaborateRequest, ElaborateResult, HoverByNameRequest, HoverByNameResult, InferTypeRequest, elaborate,
-    hover_by_name, infer_type,
-};
+use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
+use lean_host_mcp::tools::lean::{ElaborateRequest, ElaborateResult, InferTypeRequest, elaborate, infer_type};
 use lean_host_mcp::tools::position::{
     DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ModuleQueryFacts,
     ProofStateRequest, ProofStateResult, TypeAtProjection, lean_query, proof_state,
@@ -198,19 +196,24 @@ async fn describe_prelude_name() {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
-    let resp = hover_by_name(
+    let resp = inspect_declaration(
         &ctx,
-        HoverByNameRequest {
-            name: "Nat.add_zero".into(),
+        InspectDeclarationRequest {
+            name: Some("Nat.add_zero".into()),
+            file: None,
+            line: None,
+            column: None,
             imports: vec!["LeanRsFixture.Handles".into()],
-            max_type_bytes: None,
             project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: None,
+            max_total_bytes: None,
         },
     )
     .await
-    .expect("hover_by_name");
+    .expect("inspect_declaration");
     assert!(
-        matches!(resp.result, HoverByNameResult::Found(_)),
+        matches!(resp.result, lean_host_mcp::DeclarationInspectionResult::Found { .. }),
         "Nat.add_zero is part of the prelude"
     );
 }
@@ -227,23 +230,6 @@ fn is_def_eq_request_round_trips_transparency() {
 }
 
 #[test]
-fn search_declarations_request_round_trips() {
-    use lean_host_mcp::tools::lean::SearchDeclarationsRequest;
-
-    let minimal: SearchDeclarationsRequest = serde_json::from_str(r#"{"query":"add_zero"}"#).unwrap();
-    assert_eq!(minimal.query, "add_zero");
-    assert!(minimal.imports.is_empty());
-    assert!(minimal.limit.is_none());
-    assert!(minimal.include_source);
-
-    let full: SearchDeclarationsRequest =
-        serde_json::from_str(r#"{"query":"map","kind":"theorem","imports":["List"],"limit":25}"#).unwrap();
-    assert_eq!(full.limit, Some(25));
-    assert_eq!(full.kind.as_deref(), Some("theorem"));
-    assert_eq!(full.imports, vec!["List".to_owned()]);
-}
-
-#[test]
 fn search_for_proof_request_round_trips() {
     let cursor: SearchForProofRequest =
         serde_json::from_str(r#"{"file":"A.lean","line":4,"column":2,"mode":"apply","limit":200}"#).unwrap();
@@ -257,18 +243,6 @@ fn search_for_proof_request_round_trips() {
     assert_eq!(explicit.goal.as_deref(), Some("⊢ True"));
     assert!(explicit.file.is_none());
     assert!(explicit.mode.is_none());
-}
-
-#[test]
-fn type_of_name_request_accepts_byte_cap() {
-    use lean_host_mcp::tools::lean::TypeOfNameRequest;
-
-    let nat: TypeOfNameRequest = serde_json::from_str(r#"{"name":"Nat.add_zero","max_type_bytes":4096}"#).unwrap();
-    assert_eq!(nat.name, "Nat.add_zero");
-    assert_eq!(nat.max_type_bytes, Some(4096));
-
-    let none: TypeOfNameRequest = serde_json::from_str(r#"{"name":"Nat.add_zero"}"#).unwrap();
-    assert!(none.max_type_bytes.is_none());
 }
 
 #[test]
@@ -388,8 +362,6 @@ fn lean_query_result_serialises_status_tag() {
 async fn mathlib_fixture_uses_transitive_package_search_paths() {
     use std::io::Write as _;
 
-    use lean_host_mcp::tools::lean::{SearchDeclarationsRequest, search_declarations};
-
     let Some(root) = mathlib_fixture_root() else {
         eprintln!("skipping: LEAN_HOST_MCP_TEST_MATHLIB_FIXTURE not set");
         return;
@@ -417,30 +389,28 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
         inferred.result.rendered
     );
 
-    let symbols = search_declarations(
+    let inspected = inspect_declaration(
         &ctx,
-        SearchDeclarationsRequest {
-            query: "pow_left_injective".into(),
-            kind: None,
+        InspectDeclarationRequest {
+            name: Some("Nat.add_zero".into()),
+            file: None,
+            line: None,
+            column: None,
             imports: vec!["Mathlib.Data.Nat.Basic".into()],
-            limit: Some(500),
-            include_source: true,
             project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: None,
+            max_total_bytes: None,
         },
     )
     .await
-    .expect("search_declarations with Mathlib import");
+    .expect("inspect_declaration with Mathlib import");
     assert!(
-        symbols.result.declarations.iter().any(|row| {
-            row.name.starts_with("Mathlib.")
-                || row.source.as_ref().is_some_and(|source| {
-                    source.file.contains(".lake/packages/mathlib")
-                        || source.file.contains("Mathlib/")
-                        || source.file.starts_with("Mathlib.")
-                })
-        }),
-        "pow_left_injective search should include a declaration from mathlib; got {:?}",
-        symbols.result.declarations
+        matches!(
+            inspected.result,
+            lean_host_mcp::DeclarationInspectionResult::Found { .. }
+        ),
+        "declaration inspection should work under a Mathlib import"
     );
 
     let mut file = tempfile::Builder::new()
@@ -514,28 +484,33 @@ async fn module_syntax_file_diagnostics_elaborates_import_all_header() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn hover_by_name_populates_type_signature() {
+async fn inspect_declaration_by_name_populates_statement() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
-    let resp = hover_by_name(
+    let resp = inspect_declaration(
         &ctx,
-        HoverByNameRequest {
-            name: "Nat.add_zero".into(),
+        InspectDeclarationRequest {
+            name: Some("Nat.add_zero".into()),
+            file: None,
+            line: None,
+            column: None,
             imports: vec!["LeanRsFixture.Handles".into()],
-            max_type_bytes: None,
             project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: None,
+            max_total_bytes: None,
         },
     )
     .await
-    .expect("hover_by_name");
-    let HoverByNameResult::Found(row) = resp.result else {
+    .expect("inspect_declaration");
+    let lean_host_mcp::DeclarationInspectionResult::Found { declaration } = resp.result else {
         panic!("Nat.add_zero must be present");
     };
     assert!(
-        row.type_signature.is_some(),
-        "expr_to_string_raw should yield a type for Nat.add_zero"
+        declaration.statement.is_some(),
+        "inspect_declaration should yield a statement for Nat.add_zero"
     );
 }
 
@@ -930,73 +905,106 @@ async fn file_diagnostics_cache_warm() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn declaration_search_finds_prelude_theorem_without_index_rebuild() {
-    use lean_host_mcp::tools::lean::{SearchDeclarationsRequest, search_declarations};
-
+async fn inspect_declaration_by_cursor_resolves_target() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
 
-    let init_resp = search_declarations(
+    let resp = inspect_declaration(
         &ctx,
-        SearchDeclarationsRequest {
-            query: "Nat.add".into(),
-            kind: None,
+        InspectDeclarationRequest {
+            name: None,
+            file: Some(PathBuf::from("LeanRsFixture/SourceRanges.lean")),
+            line: Some(8),
+            column: Some(3),
             imports: Vec::new(),
-            limit: Some(10),
-            include_source: true,
             project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: None,
+            max_total_bytes: None,
         },
     )
     .await
-    .expect("search_declarations with no imports");
+    .expect("inspect_declaration cursor");
+    let lean_host_mcp::DeclarationInspectionResult::Found { declaration } = resp.result else {
+        panic!("cursor should resolve a declaration target");
+    };
+    assert_eq!(declaration.name, "LeanRsFixture.SourceRanges.knownTheorem");
     assert!(
-        init_resp.freshness.imports.is_empty(),
-        "freshness imports must reflect the empty request"
+        resp.next_actions
+            .iter()
+            .any(|hint| hint.contains("worker module snapshot cache status:")),
+        "cursor inspection should report module snapshot cache status: {:?}",
+        resp.next_actions
     );
+}
 
-    let resp = search_declarations(
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn inspect_declaration_unknown_returns_not_found() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = inspect_declaration(
         &ctx,
-        SearchDeclarationsRequest {
-            query: "add_zero".into(),
-            kind: Some("theorem".into()),
-            imports: vec!["LeanRsFixture.Handles".into()],
-            limit: Some(50),
-            include_source: true,
+        InspectDeclarationRequest {
+            name: Some("LeanRsFixture.SourceRanges.noSuchDeclaration".into()),
+            file: None,
+            line: None,
+            column: None,
+            imports: vec!["LeanRsFixture.SourceRanges".into()],
             project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: None,
+            max_total_bytes: None,
         },
     )
     .await
-    .expect("search_declarations theorem filter");
-    assert_eq!(
-        resp.freshness.imports,
-        vec!["LeanRsFixture.Handles".to_owned()],
-        "freshness imports must reflect the per-call request"
+    .expect("unknown declaration inspection");
+    assert!(
+        matches!(resp.result, lean_host_mcp::DeclarationInspectionResult::NotFound { .. }),
+        "unknown declaration should be a normal not_found result"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn inspect_declaration_small_cap_truncates_statement() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = inspect_declaration(
+        &ctx,
+        InspectDeclarationRequest {
+            name: Some("Lean.Meta.forallTelescopeReducing".into()),
+            file: None,
+            line: None,
+            column: None,
+            imports: vec!["Lean".into()],
+            project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: Some(256),
+            max_total_bytes: Some(1024),
+        },
+    )
+    .await
+    .expect("truncated declaration inspection");
+    let lean_host_mcp::DeclarationInspectionResult::Found { declaration } = resp.result else {
+        panic!("Lean.Meta.forallTelescopeReducing must be present");
+    };
+    let statement = declaration.statement.expect("statement should be rendered");
+    assert!(
+        statement.truncated,
+        "small cap should truncate the rendered statement: {statement:?}"
     );
     assert!(
-        resp.next_actions
-            .iter()
-            .all(|hint| !hint.contains("declaration index was rebuilt")),
-        "declaration search must not rebuild a SQLite index; next_actions={:?}",
-        resp.next_actions
-    );
-    assert!(
-        resp.result.declarations.iter().any(|d| d.name == "Nat.add_zero"),
-        "Nat.add_zero must be reachable through bounded declaration search"
-    );
-    assert!(
-        resp.result
-            .declarations
-            .iter()
-            .all(|d| !d.match_reason.is_empty() && d.rank > 0),
-        "search v2 rows must expose match reason and rank: {:?}",
-        resp.result.declarations
-    );
-    assert!(
-        resp.result.facts.declarations_scanned > 0,
-        "search v2 facts should report scan counts: {:?}",
-        resp.result.facts
+        statement.value.len() <= 256,
+        "statement should respect the requested cap: {statement:?}"
     );
 }
 
@@ -1089,6 +1097,62 @@ async fn search_for_proof_cursor_goal_reports_cache_and_candidates() {
             candidate.source.is_none() || candidate.source.as_ref().is_some_and(|source| !source.file.is_empty())
         }),
         "candidate source ranges, when present, must be bounded metadata only"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn search_for_proof_candidate_can_be_inspected() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let search = search_for_proof(
+        &ctx,
+        SearchForProofRequest {
+            file: None,
+            line: None,
+            column: None,
+            goal: Some("⊢ True".into()),
+            type_text: None,
+            imports: vec!["LeanRsFixture.SourceRanges".into()],
+            mode: Some(ProofSearchMode::Exact),
+            limit: Some(5),
+            project: None,
+        },
+    )
+    .await
+    .expect("search_for_proof explicit goal");
+    let candidate = search
+        .result
+        .candidates
+        .first()
+        .expect("search_for_proof should return at least one candidate");
+
+    let inspected = inspect_declaration(
+        &ctx,
+        InspectDeclarationRequest {
+            name: Some(candidate.name.clone()),
+            file: None,
+            line: None,
+            column: None,
+            imports: vec!["LeanRsFixture.SourceRanges".into()],
+            project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: None,
+            max_total_bytes: None,
+        },
+    )
+    .await
+    .expect("inspect search_for_proof candidate");
+    assert!(
+        matches!(
+            inspected.result,
+            lean_host_mcp::DeclarationInspectionResult::Found { .. }
+        ),
+        "candidate name should inspect cleanly: {}",
+        candidate.name
     );
 }
 

@@ -11,8 +11,7 @@ supervisor restarts it instead of taking down the MCP server. That's the differe
 Thirteen tools are exposed: term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`),
 bounded declaration lookup (`search_declarations`, `type_of_name`, `hover_by_name`), a filesystem sweep
 (`project_scan`), proof-agent module queries (`proof_state`, `lean_query`), and explicit file/project reference queries
-(`references_in_file`, `references_in_project`).
-Per-tool request and result schemas live in
+(`references_in_file`, `references_in_project`). Per-tool request and result schemas live in
 [`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in [`docs/architecture.md`](docs/architecture.md).
 
 ## Prerequisite: any built Lake project
@@ -20,8 +19,8 @@ Per-tool request and result schemas live in
 A consumer project needs only:
 
 - A `lakefile.lean` or `lakefile.toml`.
-- A successful `lake build` for the modules the tools will import, so their `.olean` files exist on the search path.
-  The default `lake build` with no target is the usual setup step.
+- A successful `lake build` for the modules the tools will import, so their `.olean` files exist on the search path. The
+  default `lake build` with no target is the usual setup step.
 
 The `lean-rs-host` shim that exports the 28 mandatory + 6 optional `lean_rs_host_*` symbols is **bundled inside
 `lean-rs-host` itself**—a vendored Lake package the host builds once per toolchain (at first session open) and loads
@@ -133,11 +132,10 @@ project is unusable.
 expected type, target declaration, surrounding declaration, and a safe edit span when Lean can determine one.
 `lean_query` is the expert composable form: callers pass typed selectors for diagnostics, proof state, term type,
 references, declaration target, or surrounding declaration and receive results keyed by selector id. A worker whose
-bundled shims do not expose the batch capability answers `{ "status": "unsupported" }`; the tools never request or
-cache whole-file info trees.
-Successful batch responses include `query_facts` with worker cache status, output bytes, and phase timings. The host
-does not cache exact `proof_state` / `lean_query` batch results; repeated calls reach the worker snapshot cache so warm
-behavior is observable.
+bundled shims do not expose the batch capability answers `{ "status": "unsupported" }`; the tools never request or cache
+whole-file info trees. Successful batch responses include `query_facts` with worker cache status, output bytes, and
+phase timings. The host does not cache exact `proof_state` / `lean_query` batch results; repeated calls reach the worker
+snapshot cache so warm behavior is observable.
 
 Files whose header imports modules the server's open env doesn't have are still processed; missing imports surface as an
 envelope warning. Files using Lean 4's module-system header syntax, including `module`, `public import`, `import all`,
