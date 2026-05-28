@@ -26,8 +26,8 @@ use lean_host_mcp::tools::lean::{
     hover_by_name, infer_type,
 };
 use lean_host_mcp::tools::position::{
-    DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ProofStateRequest,
-    ProofStateResult, TypeAtProjection, lean_query, proof_state,
+    DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ModuleQueryFacts,
+    ProofStateRequest, ProofStateResult, TypeAtProjection, lean_query, proof_state,
 };
 use lean_host_mcp::{BrokerConfig, ProjectBroker, Response, ServerError};
 
@@ -152,6 +152,17 @@ fn diagnostics_outcome(result: LeanQueryResult) -> DiagnosticsOutcome {
         LeanQueryResult::HeaderParseFailed { .. } => DiagnosticsOutcome::HeaderParseFailed,
         LeanQueryResult::Unsupported => DiagnosticsOutcome::Unsupported,
         LeanQueryResult::InvalidSelectors { message } => panic!("unexpected invalid diagnostics query: {message}"),
+    }
+}
+
+fn query_facts(result: &LeanQueryResult) -> &ModuleQueryFacts {
+    match result {
+        LeanQueryResult::Results { query_facts, .. } | LeanQueryResult::HeaderParseFailed { query_facts, .. } => {
+            query_facts
+        }
+        LeanQueryResult::InvalidSelectors { .. } | LeanQueryResult::Unsupported => {
+            panic!("expected query facts on processed query result")
+        }
     }
 }
 
@@ -326,7 +337,7 @@ fn lean_query_diagnostics_request_round_trips() {
 
 #[test]
 fn lean_query_result_serialises_status_tag() {
-    use lean_host_mcp::tools::position::{DiagnosticSummary, LeanQueryResult};
+    use lean_host_mcp::tools::position::{DiagnosticSummary, LeanQueryResult, ModuleQueryFacts, ModuleQueryTimings};
 
     let s = serde_json::to_string(&LeanQueryResult::Unsupported).unwrap();
     assert_eq!(s, r#"{"status":"unsupported"}"#);
@@ -335,11 +346,23 @@ fn lean_query_result_serialises_status_tag() {
         summary: DiagnosticSummary::default(),
         diagnostics: Vec::new(),
         truncated: false,
+        query_facts: ModuleQueryFacts {
+            cache_status: "miss",
+            output_bytes: 0,
+            cache_entry_count: None,
+            cache_approx_bytes: None,
+            timings: ModuleQueryTimings {
+                header_import_micros: 0,
+                elaboration_micros: 0,
+                projection_micros: 0,
+                rendering_micros: 0,
+            },
+        },
     })
     .unwrap();
     assert_eq!(
         s,
-        r#"{"status":"header_parse_failed","summary":{"errors":0,"warnings":0,"info":0},"diagnostics":[],"truncated":false}"#
+        r#"{"status":"header_parse_failed","summary":{"errors":0,"warnings":0,"info":0},"diagnostics":[],"truncated":false,"query_facts":{"cache_status":"miss","output_bytes":0,"timings":{"header_import_micros":0,"elaboration_micros":0,"projection_micros":0,"rendering_micros":0}}}"#
     );
 }
 
@@ -821,31 +844,34 @@ async fn per_call_imports_avoid_broken_project_umbrella_failure() {
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn file_diagnostics_cache_warm() {
-    const HINT_FRAGMENT: &str = "module query batch result cached";
-
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
     let file = PathBuf::from("LeanRsFixture/SourceRanges.lean");
 
-    // Cold: must record the cache-and-process hint.
+    // Cold: first worker query for this file/selector shape misses the worker snapshot cache.
     let cold = query_diagnostics(&ctx, file.clone())
         .await
         .expect("cold lean_query diagnostics");
-    assert!(
-        cold.next_actions.iter().any(|n| n.contains(HINT_FRAGMENT)),
-        "cold call should attach the cache hint; next_actions={:?}",
-        cold.next_actions
-    );
+    assert_eq!(query_facts(&cold.result).cache_status, "miss");
 
-    // Warm: same bounded query, same file contents.
+    // Repeat: same bounded query, same file contents reaches the worker and reports its cache behavior.
     let warm = query_diagnostics(&ctx, file)
         .await
         .expect("warm lean_query diagnostics");
+    let warm_facts = query_facts(&warm.result);
     assert!(
-        warm.next_actions.iter().all(|n| !n.contains(HINT_FRAGMENT)),
-        "warm file_diagnostics call must not re-process; next_actions={:?}",
+        ["hit", "miss", "rebuilt", "evicted"].contains(&warm_facts.cache_status),
+        "worker should report a known cache status, got {:?}",
+        warm_facts.cache_status
+    );
+    assert!(warm_facts.output_bytes > 0, "worker should report output bytes");
+    assert!(
+        warm.next_actions
+            .iter()
+            .any(|n| n.contains("worker module snapshot cache status:")),
+        "warm file_diagnostics call should report worker cache facts; next_actions={:?}",
         warm.next_actions
     );
 }

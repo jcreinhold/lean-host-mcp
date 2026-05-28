@@ -140,15 +140,16 @@ info-tree result in the parent. Each request asks Lean for bounded projections s
 state, selected term type, references to one name, declaration target, or surrounding declaration. The reference tools
 still use the older single-query capability until the later source/reference redesign replaces them.
 
-Re-processing an identical query would still be wasteful, so `cache.rs` ships small LRUs keyed on
-`(file_path, sha256(contents), query_shape)`. Single-query references store `LeanWorkerModuleQueryOutcome`; batched proof
-queries store `LeanWorkerModuleQueryBatchOutcome`. Any edit to the source bytes misses structurally. Batch keys include
-selector ids and budgets, so a proof-state request cannot be mistaken for diagnostics or a different selector bundle.
+The worker owns module snapshot reuse for batched proof-agent queries and reports cache status, output bytes, and phase
+timings in each batch outcome. The host deliberately does not keep an exact batch-result cache for `proof_state` or
+`lean_query`; repeated calls reach the worker so warm hits, rebuilds, and evictions are observable. `cache.rs` still
+ships a small LRU for the legacy single-query reference path, keyed on `(file_path, sha256(contents), query_shape)`.
 
 The cache is populated through `LeanProject`'s worker actor. The tool reads the file, derives session imports from its
-header, opens a short-lived worker session, and calls the batch or single-query worker method. Files whose header
-references modules the session's open env does not have still return a bounded result; the `MissingImports` signal
-travels as an envelope warning for single-file tools or a result sidebar for `references_in_project`.
+header, opens a short-lived worker session, passes the canonical file path as the worker `file_label`, and calls the
+batch or single-query worker method. Files whose header references modules the session's open env does not have still
+return a bounded result; the `MissingImports` signal travels as an envelope warning for single-file tools or a result
+sidebar for `references_in_project`.
 
 Frame size is controlled by query shape, not transport tuning. The project actor uses the upstream worker frame cap, and
 the tool layer has no fallback that requests rendered `exprStr` / `typeStr` for every term in a file.

@@ -134,6 +134,9 @@ declaration, surrounding declaration, and a safe edit span when Lean can determi
 form: callers pass typed selectors for diagnostics, proof state, term type, references, declaration target, or
 surrounding declaration and receive results keyed by selector id. A worker whose bundled shims do not expose the batch
 capability answers `{ "status": "unsupported" }`; the tools never request or cache whole-file info trees.
+Successful batch responses include `query_facts` with worker cache status, output bytes, and phase timings. The host
+does not cache exact `proof_state` / `lean_query` batch results; repeated calls reach the worker snapshot cache so warm
+behavior is observable.
 
 Files whose header imports modules the server's open env doesn't have are still processed; missing imports surface as an
 envelope warning. Files using Lean 4's module-system header syntax, including `module`, `public import`, `import all`,
@@ -167,8 +170,10 @@ members and silently links `libleanshared` into the parent. The invariant is ass
 The ignored `smoke_perf` integration test is the black-box baseline harness for proof-agent work. It starts the compiled
 stdio MCP server, calls `tools/list`, runs representative tool calls, and emits JSONL rows with wall time, serialized
 response bytes, 32 KiB / 64 KiB budget flags, status, warning count, observable project-session changes, and process RSS
-when the platform exposes it. The budget constants are test-only guardrails: ordinary model-facing responses should aim
-for 16-32 KiB, with 64 KiB as the default hard ceiling. Production truncation is still tool-specific policy.
+when the platform exposes it. For `proof_state` and `lean_query`, rows also include the worker module-cache status,
+worker-reported output bytes, phase timings, and optional worker cache size facts. The budget constants are test-only
+guardrails: ordinary model-facing responses should aim for 16-32 KiB, with 64 KiB as the default hard ceiling.
+Production truncation is still tool-specific policy.
 
 ```sh
 cargo build -p lean-host-mcp
@@ -187,8 +192,8 @@ use the same workload, byte accounting, and cold/warm worker behaviour.
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.15 (which transitively pin `lean-rs`
-/ `lean-rs-host` 0.1.15). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.16 (which transitively pin `lean-rs`
+/ `lean-rs-host` 0.1.16). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
 inside the `lean-rs` support window declared by
 [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping the supported
 toolchain is a `lean-rs` change first, then a version bump here.

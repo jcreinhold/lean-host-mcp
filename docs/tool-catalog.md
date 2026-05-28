@@ -146,8 +146,9 @@ Presets: `sorry | admit | axiom | set_option | custom`.
 `proof_state` and `lean_query` drive `process_module_query_batch`: they read one file, hand the full source
 (header + body) to Lean's frontend, and ask for bounded semantic projections. The file's own `import` declarations are
 parsed by Lean and validated against the server's open env; mismatch surfaces as an envelope `warnings` entry. Query
-results are cached against `(file_path, sha256(contents), selector_set, budgets)`, so an identical repeated query on the
-same bytes reuses the bounded response; an edit invalidates structurally.
+results include `query_facts`, the worker-reported cache/timing record for the module snapshot used by the batch. The
+host passes the canonical file path as Lean's file label but does not keep an exact batch-result cache for these tools;
+identical repeated calls reach the worker so cache hits, rebuilds, and evictions remain visible.
 
 `process_module_query_batch` is an **optional** capability shim. When the loaded dylib lacks it, these tools answer
 `{ "status": "unsupported" }` cleanly; the tools never raise and never request a whole-file info tree.
@@ -182,7 +183,17 @@ Inspect the current Lean proof context at a cursor position. This is the default
   "term": { "status": "term", "type_str": { "value": "TacticM Unit", "truncated": false }, "...": "..." },
   "declaration_target": { "status": "target", "info": { "...": "..." } },
   "surrounding_declaration": { "status": "declaration", "info": { "...": "..." } },
-  "total_truncated": false
+  "total_truncated": false,
+  "query_facts": {
+    "cache_status": "hit",
+    "output_bytes": 4096,
+    "timings": {
+      "header_import_micros": 0,
+      "elaboration_micros": 0,
+      "projection_micros": 210,
+      "rendering_micros": 75
+    }
+  }
 }
 ```
 
@@ -217,7 +228,8 @@ caller-chosen `id`; results are returned in an object keyed by those ids.
     "state": { "status": "ok", "result": { "kind": "proof_state", "status": "state", "info": { ... } } },
     "term": { "status": "ok", "result": { "kind": "type_at", "status": "term", "type_str": { ... } } }
   },
-  "total_truncated": false
+  "total_truncated": false,
+  "query_facts": { "cache_status": "miss", "output_bytes": 8192, "timings": { "...": "..." } }
 }
 ```
 

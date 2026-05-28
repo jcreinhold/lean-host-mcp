@@ -57,6 +57,14 @@ struct SmokeRecord {
     session_changed: bool,
     rss_before_kib: Option<u64>,
     rss_after_kib: Option<u64>,
+    worker_cache_status: Option<String>,
+    worker_output_bytes: Option<u64>,
+    worker_header_import_micros: Option<u64>,
+    worker_elaboration_micros: Option<u64>,
+    worker_projection_micros: Option<u64>,
+    worker_rendering_micros: Option<u64>,
+    worker_cache_entry_count: Option<u64>,
+    worker_cache_approx_bytes: Option<u64>,
     infrastructure_event: Option<String>,
 }
 
@@ -323,6 +331,26 @@ fn fixture_calls() -> Vec<ToolCall> {
             arguments: json!({ "preset": "sorry", "limit": 20 }),
         },
         ToolCall {
+            label: "proof_state_trivial_cold",
+            tool_name: "proof_state",
+            category: "position",
+            arguments: json!({
+                "file": "LeanRsFixture/SourceRanges.lean",
+                "line": 8,
+                "column": 3
+            }),
+        },
+        ToolCall {
+            label: "proof_state_trivial_warm_repeat",
+            tool_name: "proof_state",
+            category: "position",
+            arguments: json!({
+                "file": "LeanRsFixture/SourceRanges.lean",
+                "line": 8,
+                "column": 3
+            }),
+        },
+        ToolCall {
             label: "lean_query_source_ranges",
             tool_name: "lean_query",
             category: "position",
@@ -333,16 +361,6 @@ fn fixture_calls() -> Vec<ToolCall> {
                     { "selector": "type_at", "id": "type", "line": 7, "column": 9 },
                     { "selector": "proof_state", "id": "proof", "line": 8, "column": 3 }
                 ]
-            }),
-        },
-        ToolCall {
-            label: "proof_state_trivial",
-            tool_name: "proof_state",
-            category: "position",
-            arguments: json!({
-                "file": "LeanRsFixture/SourceRanges.lean",
-                "line": 8,
-                "column": 3
             }),
         },
         ToolCall {
@@ -543,6 +561,14 @@ impl McpServer {
                     session_changed,
                     rss_before_kib: rss_before,
                     rss_after_kib: rss_after,
+                    worker_cache_status: query_fact_str(&response.json, "cache_status"),
+                    worker_output_bytes: query_fact_u64(&response.json, "output_bytes"),
+                    worker_header_import_micros: query_timing_u64(&response.json, "header_import_micros"),
+                    worker_elaboration_micros: query_timing_u64(&response.json, "elaboration_micros"),
+                    worker_projection_micros: query_timing_u64(&response.json, "projection_micros"),
+                    worker_rendering_micros: query_timing_u64(&response.json, "rendering_micros"),
+                    worker_cache_entry_count: query_fact_u64(&response.json, "cache_entry_count"),
+                    worker_cache_approx_bytes: query_fact_u64(&response.json, "cache_approx_bytes"),
                     infrastructure_event,
                 }
             }
@@ -561,6 +587,14 @@ impl McpServer {
                 session_changed: false,
                 rss_before_kib: rss_before,
                 rss_after_kib: rss_after,
+                worker_cache_status: None,
+                worker_output_bytes: None,
+                worker_header_import_micros: None,
+                worker_elaboration_micros: None,
+                worker_projection_micros: None,
+                worker_rendering_micros: None,
+                worker_cache_entry_count: None,
+                worker_cache_approx_bytes: None,
                 infrastructure_event: Some(err),
             },
         }
@@ -727,6 +761,28 @@ fn session_id(response: &Value) -> Option<String> {
         .pointer("/result/structuredContent/freshness/session_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn query_facts(response: &Value) -> Option<&Value> {
+    response.pointer("/result/structuredContent/result/query_facts")
+}
+
+fn query_fact_str(response: &Value, field: &str) -> Option<String> {
+    query_facts(response)?
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn query_fact_u64(response: &Value, field: &str) -> Option<u64> {
+    query_facts(response)?.get(field).and_then(Value::as_u64)
+}
+
+fn query_timing_u64(response: &Value, field: &str) -> Option<u64> {
+    query_facts(response)?
+        .get("timings")?
+        .get(field)
+        .and_then(Value::as_u64)
 }
 
 fn infrastructure_event(response: &Value, session_changed: bool) -> Option<String> {

@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationTargetInfo, LeanWorkerDeclarationTargetResult, LeanWorkerElabOptions, LeanWorkerLocalInfo,
-    LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchItem, LeanWorkerModuleQueryBatchOutcome,
-    LeanWorkerModuleQueryBatchResult, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQueryResult,
-    LeanWorkerModuleQuerySelector, LeanWorkerModuleSourceSpan, LeanWorkerNameRef, LeanWorkerOutputBudgets,
+    LeanWorkerModuleCacheStatus, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchItem,
+    LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryBatchResult, LeanWorkerModuleQueryCacheFacts,
+    LeanWorkerModuleQueryOutcome, LeanWorkerModuleQueryResult, LeanWorkerModuleQuerySelector,
+    LeanWorkerModuleQueryTimings, LeanWorkerModuleSourceSpan, LeanWorkerNameRef, LeanWorkerOutputBudgets,
     LeanWorkerProofStateInfo, LeanWorkerProofStateResult, LeanWorkerRenderedInfo,
     LeanWorkerSurroundingDeclarationResult, LeanWorkerTypeAtResult,
 };
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
-use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey, hash_bytes};
+use crate::cache::{ModuleQueryKey, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::project::LeanProject;
@@ -85,6 +86,25 @@ pub struct DiagnosticsBlock {
     pub summary: DiagnosticSummary,
     pub diagnostics: Vec<Diagnostic>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModuleQueryTimings {
+    pub header_import_micros: u64,
+    pub elaboration_micros: u64,
+    pub projection_micros: u64,
+    pub rendering_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModuleQueryFacts {
+    pub cache_status: &'static str,
+    pub output_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_entry_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_approx_bytes: Option<u64>,
+    pub timings: ModuleQueryTimings,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -219,11 +239,13 @@ pub enum ProofStateResult {
         unavailable: Vec<SelectorMessage>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         budget_exceeded: Vec<SelectorMessage>,
+        query_facts: ModuleQueryFacts,
     },
     HeaderParseFailed {
         summary: DiagnosticSummary,
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
+        query_facts: ModuleQueryFacts,
     },
     Unsupported,
 }
@@ -330,11 +352,13 @@ pub enum LeanQueryResult {
     Results {
         items: BTreeMap<String, LeanQueryItem>,
         total_truncated: bool,
+        query_facts: ModuleQueryFacts,
     },
     HeaderParseFailed {
         summary: DiagnosticSummary,
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
+        query_facts: ModuleQueryFacts,
     },
     InvalidSelectors {
         message: String,
@@ -385,9 +409,10 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             match run.outcome {
                 BatchQueryRun::Ready {
                     result,
-                    freshly_processed,
+                    facts,
                     missing_imports,
                 } => {
+                    let query_facts = project_query_facts(facts);
                     let mut diagnostics = DiagnosticsBlock {
                         summary: DiagnosticSummary::default(),
                         diagnostics: Vec::new(),
@@ -439,18 +464,20 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                             total_truncated: result.total_truncated,
                             unavailable,
                             budget_exceeded,
+                            query_facts: query_facts.clone(),
                         },
                         freshness,
                     );
-                    Ok(attach_query_notes(response, freshly_processed, &missing_imports, true))
+                    Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
                 }
-                BatchQueryRun::HeaderParseFailed { diagnostics } => {
+                BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
                     let block = diagnostics_block(diagnostics);
                     Ok(Response::ok(
                         ProofStateResult::HeaderParseFailed {
                             summary: block.summary,
                             diagnostics: block.diagnostics,
                             truncated: block.truncated,
+                            query_facts: project_query_facts(facts),
                         },
                         freshness,
                     ))
@@ -501,9 +528,10 @@ pub async fn lean_query(ctx: &ToolContext, req: LeanQueryRequest) -> Result<Resp
             match run.outcome {
                 BatchQueryRun::Ready {
                     result,
-                    freshly_processed,
+                    facts,
                     missing_imports,
                 } => {
+                    let query_facts = project_query_facts(facts);
                     let root = project.canonical_root().to_path_buf();
                     let resolved = resolve_path(&root, &req.file);
                     let display = display_path(&root, &resolved);
@@ -517,18 +545,20 @@ pub async fn lean_query(ctx: &ToolContext, req: LeanQueryRequest) -> Result<Resp
                         LeanQueryResult::Results {
                             items,
                             total_truncated: result.total_truncated,
+                            query_facts: query_facts.clone(),
                         },
                         freshness,
                     );
-                    Ok(attach_query_notes(response, freshly_processed, &missing_imports, true))
+                    Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
                 }
-                BatchQueryRun::HeaderParseFailed { diagnostics } => {
+                BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
                     let block = diagnostics_block(diagnostics);
                     Ok(Response::ok(
                         LeanQueryResult::HeaderParseFailed {
                             summary: block.summary,
                             diagnostics: block.diagnostics,
                             truncated: block.truncated,
+                            query_facts: project_query_facts(facts),
                         },
                         freshness,
                     ))
@@ -829,11 +859,12 @@ struct BatchRun {
 enum BatchQueryRun {
     Ready {
         result: lean_rs_worker_parent::LeanWorkerModuleQueryBatchEnvelope,
-        freshly_processed: bool,
+        facts: LeanWorkerModuleQueryCacheFacts,
         missing_imports: Vec<String>,
     },
     HeaderParseFailed {
         diagnostics: ElabFailure,
+        facts: LeanWorkerModuleQueryCacheFacts,
     },
     Unsupported,
 }
@@ -865,23 +896,10 @@ async fn run_module_query_batch(
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<BatchRun> {
     let input = read_query_file(project.canonical_root(), path)?;
-    let key = ModuleQueryBatchKey::from_selectors(&selectors, &budgets);
-    if let Some(outcome) = project
-        .module_query_cache()
-        .get_batch(&input.resolved, input.hash, &key)
-    {
-        return Ok(BatchRun {
-            outcome: route_batch_outcome(outcome, false),
-            imports: input.imports,
-        });
-    }
-
-    let outcome = process_module_query_batch(project, input.source, selectors, budgets).await?;
-    project
-        .module_query_cache()
-        .insert_batch(input.resolved, input.hash, key, outcome.clone());
+    let file_label = input.resolved.to_string_lossy().into_owned();
+    let outcome = process_module_query_batch(project, input.source, file_label, selectors, budgets).await?;
     Ok(BatchRun {
-        outcome: route_batch_outcome(outcome, true),
+        outcome: route_batch_outcome(outcome),
         imports: input.imports,
     })
 }
@@ -894,7 +912,7 @@ struct QueryFile {
 }
 
 fn read_query_file(root: &Path, path: &Path) -> Result<QueryFile> {
-    let resolved = resolve_path(root, path);
+    let resolved = resolve_path(root, path).canonicalize().map_err(ServerError::Io)?;
     let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
     let hash = hash_bytes(&bytes);
     let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
@@ -927,20 +945,29 @@ fn route_query_outcome(outcome: LeanWorkerModuleQueryOutcome, freshly_processed:
     }
 }
 
-fn route_batch_outcome(outcome: LeanWorkerModuleQueryBatchOutcome, freshly_processed: bool) -> BatchQueryRun {
+fn route_batch_outcome(outcome: LeanWorkerModuleQueryBatchOutcome) -> BatchQueryRun {
     match outcome {
-        LeanWorkerModuleQueryBatchOutcome::Ok { result, .. } => BatchQueryRun::Ready {
+        LeanWorkerModuleQueryBatchOutcome::Ok { result, facts, .. } => BatchQueryRun::Ready {
             result,
-            freshly_processed,
+            facts,
             missing_imports: Vec::new(),
         },
-        LeanWorkerModuleQueryBatchOutcome::MissingImports { result, missing, .. } => BatchQueryRun::Ready {
+        LeanWorkerModuleQueryBatchOutcome::MissingImports {
             result,
-            freshly_processed,
+            missing,
+            facts,
+            ..
+        } => BatchQueryRun::Ready {
+            result,
+            facts,
             missing_imports: missing,
         },
-        LeanWorkerModuleQueryBatchOutcome::HeaderParseFailed { diagnostics, .. } => BatchQueryRun::HeaderParseFailed {
+        LeanWorkerModuleQueryBatchOutcome::HeaderParseFailed {
+            diagnostics,
+            facts,
+        } => BatchQueryRun::HeaderParseFailed {
             diagnostics: project_failure(&diagnostics),
+            facts,
         },
         LeanWorkerModuleQueryBatchOutcome::Unsupported => BatchQueryRun::Unsupported,
         _ => BatchQueryRun::Unsupported,
@@ -968,6 +995,7 @@ async fn process_module_query(
 async fn process_module_query_batch(
     project: &Arc<LeanProject>,
     source: String,
+    file_label: String,
     selectors: Vec<LeanWorkerModuleQuerySelector>,
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<LeanWorkerModuleQueryBatchOutcome> {
@@ -977,8 +1005,9 @@ async fn process_module_query_batch(
             let mut session = cap
                 .open_session_with_imports(imports, None, None)
                 .map_err(map_worker_err)?;
+            let options = LeanWorkerElabOptions::new().file_label(&file_label);
             session
-                .process_module_query_batch(&source, &selectors, &budgets, &LeanWorkerElabOptions::new(), None, None)
+                .process_module_query_batch(&source, &selectors, &budgets, &options, None, None)
                 .map_err(map_worker_err)
         })
         .await
@@ -1195,6 +1224,35 @@ fn rendered_text(info: LeanWorkerRenderedInfo) -> RenderedText {
     }
 }
 
+fn project_query_facts(facts: LeanWorkerModuleQueryCacheFacts) -> ModuleQueryFacts {
+    ModuleQueryFacts {
+        cache_status: cache_status_label(facts.cache_status),
+        output_bytes: facts.output_bytes,
+        cache_entry_count: facts.cache_entry_count,
+        cache_approx_bytes: facts.cache_approx_bytes,
+        timings: project_query_timings(facts.timings),
+    }
+}
+
+fn cache_status_label(status: LeanWorkerModuleCacheStatus) -> &'static str {
+    match status {
+        LeanWorkerModuleCacheStatus::Hit => "hit",
+        LeanWorkerModuleCacheStatus::Miss => "miss",
+        LeanWorkerModuleCacheStatus::Rebuilt => "rebuilt",
+        LeanWorkerModuleCacheStatus::Evicted => "evicted",
+        _ => "unknown",
+    }
+}
+
+fn project_query_timings(timings: LeanWorkerModuleQueryTimings) -> ModuleQueryTimings {
+    ModuleQueryTimings {
+        header_import_micros: timings.header_import_micros,
+        elaboration_micros: timings.elaboration_micros,
+        projection_micros: timings.projection_micros,
+        rendering_micros: timings.rendering_micros,
+    }
+}
+
 fn project_reference(file: &str, node: &LeanWorkerNameRef) -> ReferenceHit {
     ReferenceHit {
         file: file.to_owned(),
@@ -1221,6 +1279,26 @@ where
             "{kind} result cached; repeating the same query against the same file contents reuses it"
         ));
     }
+    if !missing_imports.is_empty() {
+        response.warnings.push(format!(
+            "file header referenced imports not present in the opened session: {}",
+            missing_imports.join(", ")
+        ));
+    }
+    response
+}
+
+fn attach_batch_query_notes<T>(
+    mut response: Response<T>,
+    facts: &ModuleQueryFacts,
+    missing_imports: &[String],
+) -> Response<T>
+where
+    T: Serialize + JsonSchema,
+{
+    response
+        .next_actions
+        .push(format!("worker module snapshot cache status: {}", facts.cache_status));
     if !missing_imports.is_empty() {
         response.warnings.push(format!(
             "file header referenced imports not present in the opened session: {}",
@@ -1267,11 +1345,35 @@ fn header_imports(source: &str) -> Vec<String> {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::panic,
     clippy::indexing_slicing,
     reason = "unit tests should fail directly when literal JSON fixtures stop matching the schema"
 )]
 mod tests {
-    use super::{LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ProofStateRequest, header_imports};
+    use lean_rs_worker_parent::{
+        LeanWorkerElabFailure, LeanWorkerModuleCacheStatus, LeanWorkerModuleQueryBatchEnvelope,
+        LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryCacheFacts, LeanWorkerModuleQueryTimings,
+    };
+
+    use super::{
+        BatchQueryRun, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ProofStateRequest, cache_status_label,
+        header_imports, project_query_facts, read_query_file, route_batch_outcome,
+    };
+
+    fn worker_facts(status: LeanWorkerModuleCacheStatus) -> LeanWorkerModuleQueryCacheFacts {
+        LeanWorkerModuleQueryCacheFacts {
+            cache_status: status,
+            timings: LeanWorkerModuleQueryTimings {
+                header_import_micros: 1,
+                elaboration_micros: 2,
+                projection_micros: 3,
+                rendering_micros: 4,
+            },
+            output_bytes: 123,
+            cache_entry_count: Some(2),
+            cache_approx_bytes: Some(4096),
+        }
+    }
 
     #[test]
     fn header_imports_handles_public_meta_and_all() {
@@ -1332,5 +1434,91 @@ import Init -- comment
             invalid,
             r#"{"status":"invalid_selectors","message":"selectors must not be empty"}"#
         );
+    }
+
+    #[test]
+    fn query_facts_project_cache_status_and_timings() {
+        let facts = project_query_facts(worker_facts(LeanWorkerModuleCacheStatus::Hit));
+
+        assert_eq!(facts.cache_status, "hit");
+        assert_eq!(facts.output_bytes, 123);
+        assert_eq!(facts.cache_entry_count, Some(2));
+        assert_eq!(facts.cache_approx_bytes, Some(4096));
+        assert_eq!(facts.timings.header_import_micros, 1);
+        assert_eq!(facts.timings.elaboration_micros, 2);
+        assert_eq!(facts.timings.projection_micros, 3);
+        assert_eq!(facts.timings.rendering_micros, 4);
+    }
+
+    #[test]
+    fn cache_status_labels_match_wire_strings() {
+        assert_eq!(cache_status_label(LeanWorkerModuleCacheStatus::Hit), "hit");
+        assert_eq!(cache_status_label(LeanWorkerModuleCacheStatus::Miss), "miss");
+        assert_eq!(cache_status_label(LeanWorkerModuleCacheStatus::Rebuilt), "rebuilt");
+        assert_eq!(cache_status_label(LeanWorkerModuleCacheStatus::Evicted), "evicted");
+    }
+
+    #[test]
+    fn read_query_file_uses_canonical_path_for_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let module_dir = dir.path().join("Demo");
+        std::fs::create_dir(&module_dir).unwrap();
+        std::fs::write(module_dir.join("Basic.lean"), "import Init\n#check Nat\n").unwrap();
+
+        let input = read_query_file(dir.path(), std::path::Path::new("Demo/../Demo/Basic.lean")).unwrap();
+
+        assert_eq!(input.resolved, module_dir.join("Basic.lean").canonicalize().unwrap());
+        assert_eq!(input.imports, vec!["Init".to_owned()]);
+        assert_eq!(input.source, "import Init\n#check Nat\n");
+    }
+
+    #[test]
+    fn route_batch_outcome_preserves_worker_facts() {
+        let result = LeanWorkerModuleQueryBatchEnvelope {
+            items: Vec::new(),
+            total_truncated: false,
+        };
+        let outcome = route_batch_outcome(LeanWorkerModuleQueryBatchOutcome::Ok {
+            result,
+            imports: Vec::new(),
+            facts: worker_facts(LeanWorkerModuleCacheStatus::Hit),
+        });
+
+        let BatchQueryRun::Ready { facts, .. } = outcome else {
+            panic!("expected ready batch outcome");
+        };
+        assert_eq!(cache_status_label(facts.cache_status), "hit");
+
+        let outcome = route_batch_outcome(LeanWorkerModuleQueryBatchOutcome::MissingImports {
+            result: LeanWorkerModuleQueryBatchEnvelope {
+                items: Vec::new(),
+                total_truncated: false,
+            },
+            imports: Vec::new(),
+            missing: vec!["Missing.Mod".to_owned()],
+            facts: worker_facts(LeanWorkerModuleCacheStatus::Rebuilt),
+        });
+        let BatchQueryRun::Ready {
+            facts,
+            missing_imports,
+            ..
+        } = outcome
+        else {
+            panic!("expected ready batch outcome with missing imports");
+        };
+        assert_eq!(cache_status_label(facts.cache_status), "rebuilt");
+        assert_eq!(missing_imports, vec!["Missing.Mod".to_owned()]);
+
+        let outcome = route_batch_outcome(LeanWorkerModuleQueryBatchOutcome::HeaderParseFailed {
+            diagnostics: LeanWorkerElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
+            facts: worker_facts(LeanWorkerModuleCacheStatus::Evicted),
+        });
+        let BatchQueryRun::HeaderParseFailed { facts, .. } = outcome else {
+            panic!("expected header-parse failure");
+        };
+        assert_eq!(cache_status_label(facts.cache_status), "evicted");
     }
 }
