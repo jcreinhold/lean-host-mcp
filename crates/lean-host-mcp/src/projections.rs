@@ -274,6 +274,7 @@ pub enum DeclarationInspectionResult {
 pub struct ProofAttemptCandidate {
     pub id: String,
     pub status: String,
+    pub snippet: RenderedText,
     pub diagnostics: ElabFailure,
     pub downstream_diagnostics: ElabFailure,
     pub goals: Vec<RenderedText>,
@@ -646,6 +647,7 @@ pub(crate) fn project_proof_attempt_row(row: LeanWorkerProofAttemptRow) -> Proof
     ProofAttemptCandidate {
         id: row.id,
         status: proof_attempt_status(row.status).to_owned(),
+        snippet: project_rendered_info(row.candidate_text),
         diagnostics: project_failure(&row.diagnostics),
         downstream_diagnostics: project_failure(&row.downstream_diagnostics),
         goals: row.goals.into_iter().map(project_rendered_info).collect(),
@@ -784,9 +786,10 @@ pub fn map_worker_err(err: LeanWorkerError) -> ServerError {
         | LeanWorkerError::CapabilityBuild { .. }
         | LeanWorkerError::Setup { .. }
         | LeanWorkerError::Handshake { .. }
-        | LeanWorkerError::ChildPanicOrAbort { .. }
-        | LeanWorkerError::ChildExited { .. }
         | LeanWorkerError::CapabilityMetadataMismatch { .. } => ServerError::BadProject(err.to_string()),
+        LeanWorkerError::ChildPanicOrAbort { .. } | LeanWorkerError::ChildExited { .. } => ServerError::Lean(format!(
+            "worker process exited; project worker will restart before the next request: {err}"
+        )),
         _ => ServerError::Lean(err.to_string()),
     }
 }

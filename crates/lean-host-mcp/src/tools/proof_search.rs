@@ -35,7 +35,7 @@ const MAX_LIMIT: usize = 20;
 const SEARCH_FANOUT: usize = 50;
 const MAX_SEARCHES: usize = 6;
 const MAX_REQUIRED_CONSTANTS: usize = 3;
-const MAX_NAME_FRAGMENTS: usize = 4;
+const MAX_NAME_FRAGMENTS: usize = 6;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -606,7 +606,7 @@ fn candidate_score(
     }
     for fragment in &profile.name_fragments {
         if row.name.to_lowercase().contains(fragment) {
-            score = score.saturating_add(5);
+            score = score.saturating_add(if is_structural_fragment(fragment) { 10 } else { 5 });
         }
     }
     if search_label == "required_constants" {
@@ -632,6 +632,13 @@ fn is_generic_candidate(name: &str) -> bool {
             || segment.starts_with("ndrec_")
     });
     name.starts_with("Acc.") || has_generic_segment
+}
+
+fn is_structural_fragment(fragment: &str) -> bool {
+    matches!(
+        fragment,
+        "den" | "num" | "denominator" | "cast" | "intcast" | "mul" | "dvd" | "pow"
+    ) || fragment.contains("cast")
 }
 
 fn pruned_from_facts(facts: &DeclarationSearchFacts, returned: usize) -> usize {
@@ -708,6 +715,24 @@ fn extract_heads(text: &str) -> Vec<String> {
 fn extract_name_fragments(text: &str, constants: &[String], heads: &[String]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    let mut broad_namespace_fragments = Vec::new();
+    for token in identifier_tokens(text) {
+        for segment in token.split('.') {
+            let fragment = segment.trim_matches('_').to_lowercase();
+            if fragment == "rat" {
+                if seen.insert(fragment.clone()) {
+                    broad_namespace_fragments.push(fragment);
+                }
+                continue;
+            }
+            if fragment.len() >= 3 && useful_lower_fragment(&fragment) && seen.insert(fragment.clone()) {
+                out.push(fragment);
+            }
+            if out.len() >= MAX_NAME_FRAGMENTS {
+                return out;
+            }
+        }
+    }
     for item in constants.iter().chain(heads.iter()) {
         if is_broad_head(item) {
             continue;
@@ -722,12 +747,9 @@ fn extract_name_fragments(text: &str, constants: &[String], heads: &[String]) ->
             }
         }
     }
-    for token in identifier_tokens(text) {
-        for segment in token.split('.') {
-            let fragment = segment.trim_matches('_').to_lowercase();
-            if fragment.len() >= 3 && useful_lower_fragment(&fragment) && seen.insert(fragment.clone()) {
-                out.push(fragment);
-            }
+    if out.is_empty() {
+        for fragment in broad_namespace_fragments {
+            out.push(fragment);
             if out.len() >= MAX_NAME_FRAGMENTS {
                 return out;
             }
@@ -739,7 +761,7 @@ fn extract_name_fragments(text: &str, constants: &[String], heads: &[String]) ->
 fn useful_lower_fragment(fragment: &str) -> bool {
     matches!(
         fragment,
-        "den" | "num" | "cast" | "intcast" | "rat" | "mul" | "dvd" | "pow" | "int" | "nat"
+        "den" | "num" | "denominator" | "cast" | "intcast" | "mul" | "dvd" | "pow" | "int" | "nat"
     ) || fragment.contains("cast")
 }
 
@@ -826,7 +848,7 @@ mod tests {
         );
         assert!(profile.heads.iter().any(|head| head == "Eq"));
         assert!(profile.constants.iter().any(|constant| constant == "Nat.succ"));
-        assert!(profile.name_fragments.iter().any(|fragment| fragment == "Nat"));
+        assert!(profile.name_fragments.iter().any(|fragment| fragment == "nat"));
     }
 
     #[test]
@@ -841,6 +863,10 @@ mod tests {
         );
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "den"));
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "num"));
+        assert!(
+            !profile.name_fragments.iter().any(|fragment| fragment == "rat"),
+            "namespace-only Rat fragment should not crowd out den/num/cast retrieval"
+        );
         assert!(
             !plan_searches(&profile, ProofSearchMode::NextStep)
                 .iter()

@@ -33,7 +33,7 @@ use lean_host_mcp::tools::proof_action::{
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
 use lean_host_mcp::{
     BrokerConfig, DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProjectBroker,
-    ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, Response, ServerError,
+    ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, RenderedText, Response, ServerError,
 };
 
 fn fixture_root() -> Option<PathBuf> {
@@ -48,12 +48,6 @@ fn mathlib_fixture_root() -> Option<PathBuf> {
 
 fn module_syntax_fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_TEST_MODULE_SYNTAX_FIXTURE")
-        .ok()
-        .map(PathBuf::from)
-}
-
-fn kanproofs_fixture_root() -> Option<PathBuf> {
-    std::env::var("LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE")
         .ok()
         .map(PathBuf::from)
 }
@@ -259,6 +253,10 @@ fn proof_action_results_serialise_status_tags() {
             candidates: vec![ProofAttemptCandidate {
                 id: "candidate_1".into(),
                 status: "closed".into(),
+                snippet: RenderedText {
+                    value: "trivial".into(),
+                    truncated: false,
+                },
                 diagnostics: failure.clone(),
                 downstream_diagnostics: failure.clone(),
                 goals: Vec::new(),
@@ -783,24 +781,17 @@ async fn module_query_position_tools_return_bounded_results() {
 }
 
 #[tokio::test]
-#[ignore = "requires built KanProofs; set LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE to enable"]
-async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
-    let Some(root) = kanproofs_fixture_root() else {
-        eprintln!("skipping: LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE not set");
-        return;
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn fixture_diagnostics_stays_bounded() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let file = std::env::var("LEAN_HOST_MCP_TEST_KANPROOFS_FILE").map_or_else(
-        |_| PathBuf::from("KanProofs/AlgebraicGeometry/Sites/FiniteEtale/Quotient/BaseChange/Restrict.lean"),
-        PathBuf::from,
-    );
+    let file = PathBuf::from("LeanRsFixture/SourceRanges.lean");
     let ctx = open_ctx(&root);
 
-    let diagnostics = query_diagnostics(&ctx, file.clone()).await.unwrap_or_else(|err| {
-        panic!(
-            "bounded lean_query diagnostics must not fail for {}: {err:?}",
-            file.display()
-        )
-    });
+    let diagnostics = query_diagnostics(&ctx, file.clone())
+        .await
+        .unwrap_or_else(|err| panic!("bounded diagnostics must not fail for {}: {err:?}", file.display()));
     assert!(
         diagnostics
             .warnings
@@ -815,27 +806,26 @@ async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
             outcome,
             DiagnosticsOutcome::Elaborated(_) | DiagnosticsOutcome::HeaderParseFailed
         ),
-        "KanProofs smoke should return a structured diagnostics result"
+        "fixture smoke should return a structured diagnostics result"
     );
 }
 
 #[tokio::test]
-#[ignore = "requires built KanProofs; set LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE to enable"]
-async fn kanproofs_rat_try_proof_step_returns_structured_candidate_failure() {
-    let Some(root) = kanproofs_fixture_root() else {
-        eprintln!("skipping: LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE not set");
-        return;
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn fixture_proof_step_returns_structured_candidate_failure() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let ctx = open_ctx(&root);
-    let file = PathBuf::from("KanProofs/Data/Rat/Lemmas.lean");
+    let file = PathBuf::from("LeanRsFixture/ProofAgent.lean");
 
     let resp = try_proof_step(
         &ctx,
         TryProofStepRequest {
             file: file.clone(),
-            declaration: "Rat.exists_intCast_eq_intCast_mul_of_den_dvd".into(),
+            declaration: "LeanRsFixture.ProofAgent.miniRatDenominatorStep".into(),
             proof_position: ProofPositionSelector::AfterText {
-                text: "refine ⟨c * q.num, ?_⟩".to_owned(),
+                text: "skip".to_owned(),
                 occurrence: None,
             },
             project: None,
@@ -847,12 +837,13 @@ async fn kanproofs_rat_try_proof_step_returns_structured_candidate_failure() {
         },
     )
     .await
-    .expect("KanProofs Rat try_proof_step should not kill the worker");
+    .expect("fixture try_proof_step should not kill the worker");
 
     let ProofAttemptResult::Ok { result, .. } = resp.result else {
-        panic!("KanProofs Rat proof attempt should return a structured ok result");
+        panic!("fixture proof attempt should return a structured ok result");
     };
     let candidate = result.candidates.first().expect("one proof candidate row");
+    assert_eq!(candidate.snippet.value, "exact definitely_missing_identifier");
     assert_eq!(candidate.status, "failed", "candidate row: {candidate:?}");
     assert!(
         candidate
@@ -879,16 +870,16 @@ async fn kanproofs_rat_try_proof_step_returns_structured_candidate_failure() {
         &ctx,
         ProofStateRequest {
             file,
-            declaration: "Rat.exists_intCast_eq_intCast_mul_of_den_dvd".into(),
+            declaration: "LeanRsFixture.ProofAgent.miniRatDenominatorStep".into(),
             proof_position: ProofPositionSelector::default(),
             project: None,
         },
     )
     .await
-    .expect("proof_state after failed KanProofs proof attempt");
+    .expect("proof_state after failed proof attempt");
     assert!(
         matches!(health.result, ProofStateResult::Context { .. }),
-        "failed KanProofs proof attempt should not poison later proof_state"
+        "failed proof attempt should not poison later proof_state"
     );
 }
 
@@ -1141,6 +1132,50 @@ async fn inspect_declaration_small_cap_truncates_statement() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn fixture_search_prioritizes_structural_denominator_candidates() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let resp = search_for_proof(
+        &ctx,
+        SearchForProofRequest {
+            file: Some(PathBuf::from("LeanRsFixture/ProofAgent.lean")),
+            declaration: Some("LeanRsFixture.ProofAgent.miniRatDenominatorStep".into()),
+            proof_position: ProofPositionSelector::Index { index: 0 },
+            goal: None,
+            type_text: None,
+            imports: Vec::new(),
+            mode: Some(ProofSearchMode::NextStep),
+            limit: Some(10),
+            project: None,
+        },
+    )
+    .await
+    .expect("fixture search_for_proof");
+
+    let names = resp
+        .result
+        .candidates
+        .iter()
+        .map(|candidate| candidate.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().any(|name| {
+            let lower = name.to_lowercase();
+            lower.contains("den") || lower.contains("num") || lower.contains("cast")
+        }),
+        "denominator-style search should surface structural candidates, got {names:?}",
+    );
+    assert!(
+        names.iter().take(5).all(|name| !name.starts_with("Acc.")),
+        "generic recursors should not dominate top Rat candidates: {names:?}",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn search_for_proof_explicit_goal_returns_bounded_candidates() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -1351,6 +1386,7 @@ async fn try_proof_step_closes_simple_goal_without_mutating_file() {
     };
     assert_eq!(result.candidates.len(), 1);
     let candidate = result.candidates.first().expect("one proof candidate row");
+    assert_eq!(candidate.snippet.value, "trivial");
     assert_eq!(candidate.status, "closed");
     assert!(
         candidate.declaration.is_some(),
@@ -1390,6 +1426,7 @@ async fn try_proof_step_bad_snippet_returns_diagnostics_and_session_stays_health
         panic!("bad proof attempt should still return ok");
     };
     let candidate = result.candidates.first().expect("one failed proof candidate row");
+    assert_eq!(candidate.snippet.value, "exact missingIdentifier");
     assert_eq!(candidate.status, "failed");
     assert!(
         !candidate.diagnostics.diagnostics.is_empty() || !candidate.goals.is_empty(),

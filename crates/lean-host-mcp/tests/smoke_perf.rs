@@ -257,18 +257,6 @@ fn scenarios() -> Vec<Scenario> {
         });
     }
 
-    if std::env::var("LEAN_HOST_MCP_SMOKE_KANPROOFS").is_ok_and(|value| value == "1") {
-        if let Some(project_root) = kanproofs_root() {
-            out.push(Scenario {
-                label: "kanproofs",
-                calls: kanproofs_calls(),
-                project_root,
-            });
-        } else {
-            eprintln!("smoke_perf: skipping KanProofs scenario; project root not found");
-        }
-    }
-
     out
 }
 
@@ -282,13 +270,6 @@ fn fixture_root() -> PathBuf {
         .parent()
         .expect("workspace has repository parent")
         .join("fixtures/lean")
-}
-
-fn kanproofs_root() -> Option<PathBuf> {
-    env_path("LEAN_HOST_MCP_SMOKE_KANPROOFS_PROJECT").or_else(|| {
-        let default = PathBuf::from("/Users/jcreinhold/Code/kan-proofs");
-        default.exists().then_some(default)
-    })
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -469,23 +450,6 @@ fn external_project_calls() -> Vec<ToolCall> {
         });
     }
     calls
-}
-
-fn kanproofs_calls() -> Vec<ToolCall> {
-    let file = std::env::var("LEAN_HOST_MCP_SMOKE_KANPROOFS_FILE").unwrap_or_else(|_| {
-        "KanProofs/AlgebraicGeometry/Sites/FiniteEtale/Quotient/BaseChange/Restrict.lean".to_owned()
-    });
-    let declaration = std::env::var("LEAN_HOST_MCP_SMOKE_KANPROOFS_DECLARATION").unwrap_or_else(|_| "dummy".to_owned());
-
-    vec![ToolCall {
-        label: "proof_state_kanproofs_declaration",
-        tool_name: "proof_state",
-        category: "kanproofs-position",
-        arguments: json!({
-            "file": file,
-            "declaration": declaration
-        }),
-    }]
 }
 
 struct McpServer {

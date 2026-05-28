@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
-use crate::cache::{ModuleQueryKey, hash_bytes};
+use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey, hash_bytes};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::project::LeanProject;
@@ -852,8 +852,22 @@ async fn run_module_query_batch(
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<BatchRun> {
     let input = read_query_file(project.canonical_root(), path)?;
+    let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
+    if let Some(outcome) = project
+        .module_query_cache()
+        .get_batch(&input.resolved, input.hash, &key)
+    {
+        return Ok(BatchRun {
+            outcome: route_batch_outcome(outcome),
+            imports: input.imports,
+        });
+    }
+
     let file_label = input.resolved.to_string_lossy().into_owned();
     let outcome = process_module_query_batch(project, input.source, file_label, selectors, budgets).await?;
+    project
+        .module_query_cache()
+        .insert_batch(input.resolved, input.hash, key, outcome.clone());
     Ok(BatchRun {
         outcome: route_batch_outcome(outcome),
         imports: input.imports,

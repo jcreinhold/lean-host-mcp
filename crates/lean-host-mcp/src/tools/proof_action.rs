@@ -277,9 +277,13 @@ fn capped_candidate_rows(req: &TryProofStepRequest) -> Vec<ProofAttemptCandidate
         .into_iter()
         .enumerate()
         .skip(MAX_CANDIDATES)
-        .map(|(idx, _)| ProofAttemptCandidate {
+        .map(|(idx, text)| ProofAttemptCandidate {
             id: format!("candidate_{}", idx.saturating_add(1)),
             status: "budget_exceeded".to_owned(),
+            snippet: crate::projections::RenderedText {
+                value: text,
+                truncated: false,
+            },
             diagnostics: ElabFailure {
                 diagnostics: Vec::new(),
                 truncated: false,

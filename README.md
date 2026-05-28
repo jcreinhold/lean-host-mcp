@@ -178,11 +178,9 @@ Production truncation is still tool-specific policy.
 cargo build -p lean-host-mcp
 cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
 
-LEAN_HOST_MCP_SMOKE_PROJECT=/Users/jcreinhold/Code/kan-proofs \
-  LEAN_HOST_MCP_SMOKE_FILE=KanProofs/AlgebraicGeometry/Sites/FiniteEtale/Quotient/BaseChange/Restrict.lean \
-  cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
-
-LEAN_HOST_MCP_SMOKE_KANPROOFS=1 \
+LEAN_HOST_MCP_SMOKE_PROJECT=/path/to/your/lake/project \
+  LEAN_HOST_MCP_SMOKE_FILE=Relative/Module/File.lean \
+  LEAN_HOST_MCP_SMOKE_DECLARATION=Your.Namespace.declaration \
   cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
 ```
 
