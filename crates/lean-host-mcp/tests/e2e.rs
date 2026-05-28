@@ -62,6 +62,7 @@ fn open_ctx(root: &std::path::Path) -> ToolContext {
         cwd: root.to_path_buf(),
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: BrokerConfig::default_idle_timeout(),
+        semantic_permits: BrokerConfig::default_semantic_permits(),
     });
     ToolContext { broker }
 }
@@ -997,7 +998,11 @@ async fn per_call_imports_avoid_broken_project_umbrella_failure() {
         ServerError::BadProject(msg) => {
             panic!("broken explicit import should not be a bootstrap failure: {msg}")
         }
-        ServerError::SessionGone | ServerError::Index(_) | ServerError::Io(_) | ServerError::Internal(_) => {
+        ServerError::SessionGone
+        | ServerError::WorkerUnavailable(_)
+        | ServerError::Index(_)
+        | ServerError::Io(_)
+        | ServerError::Internal(_) => {
             panic!("broken explicit import should be a Lean failure, got: {import_err:?}")
         }
     }
@@ -1573,6 +1578,86 @@ async fn verify_declaration_detects_sorry() {
     };
     assert_eq!(verification_status, "has_sorry");
     assert!(facts.contains_sorry || facts.contains_sorry_ax);
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn concurrent_semantic_tools_are_serialized_without_worker_death() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let proof = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            declaration: "LeanRsFixture.ProofActions.stepTheorem".to_owned(),
+            proof_position: ProofPositionSelector::default(),
+            project: None,
+        },
+    );
+    let inspect = inspect_declaration(
+        &ctx,
+        InspectDeclarationRequest {
+            name: "LeanRsFixture.ProofActions.closedTheorem".to_owned(),
+            file: Some(PathBuf::from("LeanRsFixture/ProofActions.lean")),
+            imports: Vec::new(),
+            project: None,
+            fields: InspectDeclarationFields::default(),
+            max_field_bytes: Some(512),
+            max_total_bytes: Some(2048),
+        },
+    );
+    let verify = verify_declaration(
+        &ctx,
+        VerifyDeclarationRequest {
+            file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            declaration: "LeanRsFixture.ProofActions.closedTheorem".to_owned(),
+            project: None,
+            allow_sorry: false,
+            report_axioms: false,
+            max_field_bytes: Some(512),
+            max_total_bytes: Some(2048),
+            heartbeat_limit: None,
+        },
+    );
+
+    let (proof, inspect, verify) = tokio::join!(proof, inspect, verify);
+    let proof = proof.expect("concurrent proof_state should not lose the worker");
+    let inspect = inspect.expect("concurrent inspect_declaration should not lose the worker");
+    let verify = verify.expect("concurrent verify_declaration should not lose the worker");
+
+    assert!(
+        matches!(proof.result, ProofStateResult::Context { .. }),
+        "proof_state should return context, got {:?}",
+        proof.result
+    );
+    assert!(
+        matches!(inspect.result, lean_host_mcp::DeclarationInspectionResult::Found { .. }),
+        "inspect_declaration should find the local theorem, got {:?}",
+        inspect.result
+    );
+    assert!(
+        matches!(
+            verify.result,
+            DeclarationVerificationResult::Ok {
+                ref verification_status,
+                ..
+            } if verification_status == "verified"
+        ),
+        "verify_declaration should verify the closed theorem, got {:?}",
+        verify.result
+    );
+    assert!(proof.runtime.is_some(), "proof_state should include runtime facts");
+    assert!(
+        inspect.runtime.is_some(),
+        "inspect_declaration should include runtime facts"
+    );
+    assert!(
+        verify.runtime.is_some(),
+        "verify_declaration should include runtime facts"
+    );
 }
 
 #[test]

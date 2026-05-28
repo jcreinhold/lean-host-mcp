@@ -22,8 +22,9 @@ use serde::{Deserialize, Serialize};
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::Result;
+use crate::project::ProjectWorkClass;
 use crate::projections::{
-    ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome, map_worker_err, project_elab_result, project_kernel_result,
+    ElabFailure, ElabSuccess, KernelOutcome, MetaOutcome, project_elab_result, project_kernel_result,
     project_meta_bool, project_meta_rendered,
 };
 use crate::tools::{ToolContext, freshness_for, session_imports};
@@ -85,23 +86,21 @@ pub async fn elaborate(ctx: &ToolContext, req: ElaborateRequest) -> Result<Respo
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
             let imports = session_imports(req.imports);
+            let call_imports = imports.clone();
             let source = req.source;
-            let outcome = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
-                    let result = session
-                        .elaborate(&source, &elab_opts(), None, None)
-                        .map_err(map_worker_err)?;
+            let call = project
+                .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+                    let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
+                    let result = session.elaborate(&source, &elab_opts(), None, None)?;
                     Ok(project_elab_result(result))
                 })
                 .await?;
+            let outcome = call.value;
             let result = match outcome {
                 Ok(success) => ElaborateResult::Ok(success),
                 Err(failure) => ElaborateResult::Failed(failure),
             };
-            Ok(Response::ok(result, freshness))
+            Ok(Response::ok(result, freshness).with_runtime(call.runtime))
         })
         .await
 }
@@ -125,19 +124,16 @@ pub async fn kernel_check(ctx: &ToolContext, req: KernelCheckRequest) -> Result<
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
             let imports = session_imports(req.imports);
+            let call_imports = imports.clone();
             let source = req.source;
-            let outcome = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
-                    let result = session
-                        .kernel_check(&source, &elab_opts(), None, None)
-                        .map_err(map_worker_err)?;
+            let call = project
+                .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+                    let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
+                    let result = session.kernel_check(&source, &elab_opts(), None, None)?;
                     Ok(project_kernel_result(result))
                 })
                 .await?;
-            Ok(Response::ok(outcome, freshness))
+            Ok(Response::ok(call.value, freshness).with_runtime(call.runtime))
         })
         .await
 }
@@ -161,20 +157,18 @@ pub async fn infer_type(ctx: &ToolContext, req: InferTypeRequest) -> Result<Resp
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
             let imports = session_imports(req.imports);
+            let call_imports = imports.clone();
             let term = req.term;
-            let outcome = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
-                    let result = session
-                        .infer_type(&term, &elab_opts(), None, None)
-                        .map_err(map_worker_err)?;
+            let call = project
+                .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+                    let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
+                    let result = session.infer_type(&term, &elab_opts(), None, None)?;
                     Ok(project_meta_rendered(result))
                 })
                 .await?;
+            let outcome = call.value;
             Ok(attach_render_warning(
-                Response::ok(outcome.clone(), freshness),
+                Response::ok(outcome.clone(), freshness).with_runtime(call.runtime),
                 &outcome,
             ))
         })
@@ -200,18 +194,18 @@ pub async fn whnf(ctx: &ToolContext, req: WhnfRequest) -> Result<Response<MetaOu
         .with_project(hint, move |project| async move {
             let freshness = freshness_for(&project, &req.imports);
             let imports = session_imports(req.imports);
+            let call_imports = imports.clone();
             let term = req.term;
-            let outcome = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
-                    let result = session.whnf(&term, &elab_opts(), None, None).map_err(map_worker_err)?;
+            let call = project
+                .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+                    let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
+                    let result = session.whnf(&term, &elab_opts(), None, None)?;
                     Ok(project_meta_rendered(result))
                 })
                 .await?;
+            let outcome = call.value;
             Ok(attach_render_warning(
-                Response::ok(outcome.clone(), freshness),
+                Response::ok(outcome.clone(), freshness).with_runtime(call.runtime),
                 &outcome,
             ))
         })
@@ -255,20 +249,17 @@ pub async fn is_def_eq(ctx: &ToolContext, req: IsDefEqRequest) -> Result<Respons
             let freshness = freshness_for(&project, &req.imports);
             let transparency = req.transparency.unwrap_or_default().to_worker();
             let imports = session_imports(req.imports);
+            let call_imports = imports.clone();
             let lhs = req.lhs;
             let rhs = req.rhs;
-            let outcome = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
-                    let result = session
-                        .is_def_eq(&lhs, &rhs, transparency, &elab_opts(), None, None)
-                        .map_err(map_worker_err)?;
+            let call = project
+                .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+                    let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
+                    let result = session.is_def_eq(&lhs, &rhs, transparency, &elab_opts(), None, None)?;
                     Ok(project_meta_bool(result))
                 })
                 .await?;
-            Ok(Response::ok(outcome, freshness))
+            Ok(Response::ok(call.value, freshness).with_runtime(call.runtime))
         })
         .await
 }

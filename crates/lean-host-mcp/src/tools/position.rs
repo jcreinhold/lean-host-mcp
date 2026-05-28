@@ -26,10 +26,10 @@ use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
 use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey, hash_bytes};
-use crate::envelope::Response;
+use crate::envelope::{Response, RuntimeFacts};
 use crate::error::{Result, ServerError};
-use crate::project::LeanProject;
-use crate::projections::{Diagnostic, ElabFailure, Severity, map_worker_err, project_failure};
+use crate::project::{LeanProject, ProjectCall, ProjectWorkClass};
+use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
 use crate::tools::{ToolContext, is_ignored_dir, session_imports};
 
 /// Hard cap on project-wide reference aggregation. File-local reference
@@ -481,7 +481,8 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                             query_facts: Box::new(query_facts.clone()),
                         },
                         freshness,
-                    );
+                    )
+                    .with_runtime(run.runtime.clone());
                     Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
                 }
                 BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
@@ -494,9 +495,12 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                             query_facts: project_query_facts(facts),
                         },
                         freshness,
-                    ))
+                    )
+                    .with_runtime(run.runtime))
                 }
-                BatchQueryRun::Unsupported => Ok(Response::ok(ProofStateResult::Unsupported, freshness)),
+                BatchQueryRun::Unsupported => {
+                    Ok(Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime))
+                }
             }
         })
         .await
@@ -552,7 +556,8 @@ pub async fn lean_query(ctx: &ToolContext, req: LeanQueryRequest) -> Result<Resp
                             query_facts: query_facts.clone(),
                         },
                         freshness,
-                    );
+                    )
+                    .with_runtime(run.runtime.clone());
                     Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
                 }
                 BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
@@ -565,9 +570,12 @@ pub async fn lean_query(ctx: &ToolContext, req: LeanQueryRequest) -> Result<Resp
                             query_facts: project_query_facts(facts),
                         },
                         freshness,
-                    ))
+                    )
+                    .with_runtime(run.runtime))
                 }
-                BatchQueryRun::Unsupported => Ok(Response::ok(LeanQueryResult::Unsupported, freshness)),
+                BatchQueryRun::Unsupported => {
+                    Ok(Response::ok(LeanQueryResult::Unsupported, freshness).with_runtime(run.runtime))
+                }
             }
         })
         .await
@@ -641,6 +649,7 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = project.freshness(&[]);
+            let mut runtime = project.runtime_facts();
             let root = project.canonical_root().to_path_buf();
             let files = match req.scope {
                 ReferenceScope::File => {
@@ -651,7 +660,8 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                                 semantic_based: true,
                             },
                             freshness,
-                        ));
+                        )
+                        .with_runtime(runtime));
                     };
                     if !req.files.is_empty() {
                         return Ok(Response::ok(
@@ -660,7 +670,8 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                                 semantic_based: true,
                             },
                             freshness,
-                        ));
+                        )
+                        .with_runtime(runtime));
                     }
                     vec![resolve_path(&root, file)]
                 }
@@ -672,7 +683,8 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                                 semantic_based: true,
                             },
                             freshness,
-                        ));
+                        )
+                        .with_runtime(runtime));
                     }
                     if req.files.is_empty() {
                         enumerate_lean_files(&root)
@@ -703,8 +715,9 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                                 freshly_processed,
                                 missing_imports,
                             },
-                        ..
+                        runtime: run_runtime,
                     }) => {
+                        runtime = run_runtime;
                         files_scanned = files_scanned.saturating_add(1);
                         any_freshly_processed |= freshly_processed;
                         if !missing_imports.is_empty() {
@@ -731,8 +744,9 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                                 missing_imports,
                                 ..
                             },
-                        ..
+                        runtime: run_runtime,
                     }) => {
+                        runtime = run_runtime;
                         files_scanned = files_scanned.saturating_add(1);
                         any_freshly_processed |= freshly_processed;
                         if !missing_imports.is_empty() {
@@ -744,8 +758,9 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                     }
                     Ok(QueryRun {
                         outcome: ModuleQueryRun::HeaderParseFailed { diagnostics },
-                        ..
+                        runtime: run_runtime,
                     }) => {
+                        runtime = run_runtime;
                         header_parse_failed_files.push(HeaderParseFailedFile {
                             file: display,
                             diagnostics,
@@ -753,8 +768,9 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                     }
                     Ok(QueryRun {
                         outcome: ModuleQueryRun::Unsupported,
-                        ..
+                        runtime: run_runtime,
                     }) => {
+                        runtime = run_runtime;
                         unsupported_files.push(display);
                     }
                     Err(ServerError::Io(_)) => {
@@ -782,7 +798,7 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
                 semantic_based: true,
             };
             Ok(attach_query_notes(
-                Response::ok(result, freshness),
+                Response::ok(result, freshness).with_runtime(runtime),
                 any_freshly_processed,
                 &[],
                 false,
@@ -795,6 +811,7 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
 
 struct QueryRun {
     outcome: ModuleQueryRun,
+    runtime: RuntimeFacts,
 }
 
 enum ModuleQueryRun {
@@ -812,6 +829,7 @@ enum ModuleQueryRun {
 struct BatchRun {
     outcome: BatchQueryRun,
     imports: Vec<String>,
+    runtime: RuntimeFacts,
 }
 
 enum BatchQueryRun {
@@ -833,15 +851,18 @@ async fn run_module_query(project: &Arc<LeanProject>, path: &Path, query: LeanWo
     if let Some(outcome) = project.module_query_cache().get(&input.resolved, input.hash, &key) {
         return Ok(QueryRun {
             outcome: route_query_outcome(outcome, false),
+            runtime: project.runtime_facts(),
         });
     }
 
-    let outcome = process_module_query(project, input.source, query).await?;
+    let call = process_module_query(project, input.source, query).await?;
+    let outcome = call.value;
     project
         .module_query_cache()
         .insert(input.resolved, input.hash, key, outcome.clone());
     Ok(QueryRun {
         outcome: route_query_outcome(outcome, true),
+        runtime: call.runtime,
     })
 }
 
@@ -860,17 +881,20 @@ async fn run_module_query_batch(
         return Ok(BatchRun {
             outcome: route_batch_outcome(outcome),
             imports: input.imports,
+            runtime: project.runtime_facts(),
         });
     }
 
     let file_label = input.resolved.to_string_lossy().into_owned();
-    let outcome = process_module_query_batch(project, input.source, file_label, selectors, budgets).await?;
+    let call = process_module_query_batch(project, input.source, file_label, selectors, budgets).await?;
+    let outcome = call.value;
     project
         .module_query_cache()
         .insert_batch(input.resolved, input.hash, key, outcome.clone());
     Ok(BatchRun {
         outcome: route_batch_outcome(outcome),
         imports: input.imports,
+        runtime: call.runtime,
     })
 }
 
@@ -966,16 +990,13 @@ async fn process_module_query(
     project: &Arc<LeanProject>,
     source: String,
     query: LeanWorkerModuleQuery,
-) -> Result<LeanWorkerModuleQueryOutcome> {
+) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
     let imports = session_imports(header_imports(&source));
+    let call_imports = imports.clone();
     project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            session
-                .process_module_query(&source, query, &LeanWorkerElabOptions::new(), None, None)
-                .map_err(map_worker_err)
+        .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+            let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
+            session.process_module_query(&source, query.clone(), &LeanWorkerElabOptions::new(), None, None)
         })
         .await
 }
@@ -986,17 +1007,14 @@ async fn process_module_query_batch(
     file_label: String,
     selectors: Vec<LeanWorkerModuleQuerySelector>,
     budgets: LeanWorkerOutputBudgets,
-) -> Result<LeanWorkerModuleQueryBatchOutcome> {
+) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
     let imports = session_imports(header_imports(&source));
+    let call_imports = imports.clone();
     project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
+        .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+            let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
             let options = LeanWorkerElabOptions::new().file_label(&file_label);
-            session
-                .process_module_query_batch(&source, &selectors, &budgets, &options, None, None)
-                .map_err(map_worker_err)
+            session.process_module_query_batch(&source, &selectors, &budgets, &options, None, None)
         })
         .await
 }

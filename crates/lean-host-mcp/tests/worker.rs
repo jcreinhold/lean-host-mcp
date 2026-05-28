@@ -36,6 +36,7 @@ fn open_ctx() -> ToolContext {
         cwd: root,
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: BrokerConfig::default_idle_timeout(),
+        semantic_permits: BrokerConfig::default_semantic_permits(),
     });
     ToolContext { broker }
 }

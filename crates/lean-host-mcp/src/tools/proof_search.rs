@@ -21,11 +21,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::ProjectHint;
-use crate::envelope::Response;
+use crate::envelope::{Response, RuntimeFacts};
 use crate::error::Result;
+use crate::project::{ProjectCall, ProjectWorkClass};
 use crate::projections::{
-    DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, map_worker_err,
-    project_declaration_search,
+    DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, project_declaration_search,
 };
 use crate::tools::position::{ProofPositionSelector, ProofStateRequest, ProofStateResult};
 use crate::tools::{ToolContext, freshness_for, session_imports};
@@ -162,16 +162,18 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
         return ctx
             .broker
             .with_project(hint, move |project| async move {
-                Ok(Response::ok(result, freshness_for(&project, &[])))
+                Ok(Response::ok(result, freshness_for(&project, &[])).with_runtime(project.runtime_facts()))
             })
             .await;
     }
 
     let mut search_results = Vec::new();
+    let mut runtime: Option<RuntimeFacts> = None;
     for search in searches.iter().take(MAX_SEARCHES) {
-        let result =
+        let call =
             run_declaration_search(ctx, project.clone(), profile.imports.clone(), search.request.clone()).await?;
-        search_results.push((search.label, result));
+        runtime = Some(call.runtime);
+        search_results.push((search.label, call.value));
     }
 
     let search_count = search_results.len();
@@ -180,7 +182,8 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let hint = ProjectHint::from_request(project);
     ctx.broker
         .with_project(hint, move |project| async move {
-            Ok(Response::ok(result, freshness_for(&project, &freshness_imports)))
+            let runtime = runtime.unwrap_or_else(|| project.runtime_facts());
+            Ok(Response::ok(result, freshness_for(&project, &freshness_imports)).with_runtime(runtime))
         })
         .await
 }
@@ -461,20 +464,18 @@ async fn run_declaration_search(
     project: Option<String>,
     imports: Vec<String>,
     search: LeanWorkerDeclarationSearch,
-) -> Result<DeclarationSearchResult> {
+) -> Result<ProjectCall<DeclarationSearchResult>> {
     let hint = ProjectHint::from_request(project);
     ctx.broker
         .with_project(hint, move |project| async move {
             let imports = session_imports(imports);
+            let call_imports = imports.clone();
             project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(imports, None, None)
-                        .map_err(map_worker_err)?;
+                .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
+                    let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
                     session
                         .search_declarations(&search, None, None)
                         .map(project_declaration_search)
-                        .map_err(map_worker_err)
                 })
                 .await
         })

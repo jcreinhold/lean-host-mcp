@@ -12,6 +12,13 @@
 //!     "session_id":     "uuid",
 //!     "lean_toolchain": "leanprover/lean4:v4.x.y"
 //!   },
+//!   "runtime": {
+//!     "worker_generation": 1,
+//!     "worker_restarted": false,
+//!     "retry_count": 0,
+//!     "queue_wait_millis": 0,
+//!     "restart_reason": null
+//!   },
 //!   "warnings":     ["..."],     // omitted when empty
 //!   "next_actions": ["..."]      // omitted when empty
 //! }
@@ -37,6 +44,16 @@ pub struct Freshness {
     pub lean_toolchain: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct RuntimeFacts {
+    pub worker_generation: u64,
+    pub worker_restarted: bool,
+    pub retry_count: u32,
+    pub queue_wait_millis: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Response<T>
 where
@@ -44,6 +61,8 @@ where
 {
     pub result: T,
     pub freshness: Freshness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeFacts>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -58,9 +77,16 @@ where
         Self {
             result,
             freshness,
+            runtime: None,
             warnings: Vec::new(),
             next_actions: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: RuntimeFacts) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     #[must_use]

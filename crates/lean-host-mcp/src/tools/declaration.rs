@@ -18,7 +18,8 @@ use serde::{Deserialize, Deserializer};
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
-use crate::projections::{DeclarationInspectionResult, map_worker_err, project_declaration_inspection};
+use crate::project::{ProjectCall, ProjectWorkClass};
+use crate::projections::{DeclarationInspectionResult, project_declaration_inspection};
 use crate::tools::{ToolContext, freshness_for, session_imports};
 
 const DEFAULT_FIELD_BYTES: u32 = 8 * 1024;
@@ -182,8 +183,12 @@ pub async fn inspect_declaration(
                     extend_unique(&mut imports, vec![module]);
                 }
             }
-            let result = inspect_name(&project, req.name.clone(), imports.clone(), fields, budgets).await?;
-            Ok(Response::ok(result, freshness_for(&project, &imports)))
+            let call = inspect_name(&project, req.name.clone(), imports.clone(), fields, budgets).await?;
+            Ok(Response::ok(
+                project_declaration_inspection(call.value),
+                freshness_for(&project, &imports),
+            )
+            .with_runtime(call.runtime))
         })
         .await
 }
@@ -194,17 +199,12 @@ async fn inspect_name(
     imports: Vec<String>,
     fields: LeanWorkerDeclarationInspectionFields,
     budgets: LeanWorkerOutputBudgets,
-) -> Result<DeclarationInspectionResult> {
+) -> Result<ProjectCall<lean_rs_worker_parent::LeanWorkerDeclarationInspectionResult>> {
     let request = LeanWorkerDeclarationInspectionRequest { name, fields, budgets };
     project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(session_imports(imports), None, None)
-                .map_err(map_worker_err)?;
-            session
-                .inspect_declaration(&request, None, None)
-                .map(project_declaration_inspection)
-                .map_err(map_worker_err)
+        .call(ProjectWorkClass::Semantic, imports.clone(), move |cap| {
+            let mut session = cap.open_session_with_imports(session_imports(imports.clone()), None, None)?;
+            session.inspect_declaration(&request, None, None)
         })
         .await
 }

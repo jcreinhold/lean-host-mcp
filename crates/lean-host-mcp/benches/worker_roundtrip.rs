@@ -35,6 +35,7 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
         cwd: root,
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: BrokerConfig::default_idle_timeout(),
+        semantic_permits: BrokerConfig::default_semantic_permits(),
     });
     let ctx = ToolContext { broker };
     let term = "Nat.succ Nat.zero".to_owned();

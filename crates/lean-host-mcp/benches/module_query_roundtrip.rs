@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use lean_host_mcp::project::ProjectWorkClass;
 use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
 use lean_rs_worker_parent::{LeanWorkerElabOptions, LeanWorkerModuleQuery};
 use tokio::runtime::Runtime;
@@ -52,13 +53,15 @@ fn bench_module_query(c: &mut Criterion) {
                 let query = query.clone();
                 rt.block_on(async {
                     project
-                        .submit(move |cap| {
-                            let mut session = cap
-                                .open_session_with_imports(imports, None, None)
-                                .map_err(lean_host_mcp::projections::map_worker_err)?;
-                            session
-                                .process_module_query(&source, query, &LeanWorkerElabOptions::new(), None, None)
-                                .map_err(lean_host_mcp::projections::map_worker_err)
+                        .call(ProjectWorkClass::Semantic, imports.clone(), move |cap| {
+                            let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
+                            session.process_module_query(
+                                &source,
+                                query.clone(),
+                                &LeanWorkerElabOptions::new(),
+                                None,
+                                None,
+                            )
                         })
                         .await
                         .expect("process_module_query");

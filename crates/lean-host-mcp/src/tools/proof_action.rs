@@ -21,9 +21,10 @@ use serde::Deserialize;
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
+use crate::project::ProjectWorkClass;
 use crate::projections::{
     DeclarationVerificationResult, ElabFailure, ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult,
-    map_worker_err, project_declaration_verification, project_proof_attempt,
+    project_declaration_verification, project_proof_attempt,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
 use crate::tools::{ToolContext, session_imports};
@@ -115,18 +116,18 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
                 candidates,
                 budgets,
             };
-            let result = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(session_imports(input.imports.clone()), None, None)
-                        .map_err(map_worker_err)?;
-                    session
-                        .attempt_proof(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
-                        .map(project_proof_attempt)
-                        .map_err(map_worker_err)
+            let call = project
+                .call(ProjectWorkClass::Semantic, input.imports.clone(), move |cap| {
+                    let mut session =
+                        cap.open_session_with_imports(session_imports(input.imports.clone()), None, None)?;
+                    session.attempt_proof(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
                 })
                 .await?;
-            let mut response = Response::ok(append_capped_rows(result, extra_rows), freshness);
+            let mut response = Response::ok(
+                append_capped_rows(project_proof_attempt(call.value), extra_rows),
+                freshness,
+            )
+            .with_runtime(call.runtime);
             response
                 .next_actions
                 .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
@@ -171,18 +172,15 @@ pub async fn verify_declaration(
                 report_axioms: req.report_axioms,
                 budgets,
             };
-            let result = project
-                .submit(move |cap| {
-                    let mut session = cap
-                        .open_session_with_imports(session_imports(input.imports.clone()), None, None)
-                        .map_err(map_worker_err)?;
-                    session
-                        .verify_declaration(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
-                        .map(project_declaration_verification)
-                        .map_err(map_worker_err)
+            let call = project
+                .call(ProjectWorkClass::Semantic, input.imports.clone(), move |cap| {
+                    let mut session =
+                        cap.open_session_with_imports(session_imports(input.imports.clone()), None, None)?;
+                    session.verify_declaration(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
                 })
                 .await?;
-            let mut response = Response::ok(result, freshness);
+            let mut response =
+                Response::ok(project_declaration_verification(call.value), freshness).with_runtime(call.runtime);
             response
                 .next_actions
                 .push("source file was not modified by verification".to_owned());

@@ -35,6 +35,7 @@ fn cfg(cwd: PathBuf, env_default: Option<PathBuf>, config_default: Option<PathBu
         cwd,
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: std::time::Duration::ZERO,
+        semantic_permits: BrokerConfig::default_semantic_permits(),
     }
 }
 

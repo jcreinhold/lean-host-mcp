@@ -9,6 +9,10 @@ proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> veri
 `find_references` is the companion semantic lookup tool. There are no public raw span, hover, type-at, source-grep,
 placement, or arbitrary query tools.
 
+Semantic responses include `runtime` facts with the project worker generation, queue wait, retry count, and restart
+status. A full project mailbox or restart-loop failure is reported as a retryable infrastructure error, not as a Lean
+diagnostic.
+
 ## `proof_state`
 
 Return the proof context for one declaration proof position.

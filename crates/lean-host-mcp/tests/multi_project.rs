@@ -46,6 +46,7 @@ fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize, idle_ti
         cwd,
         max_projects,
         idle_timeout,
+        semantic_permits: BrokerConfig::default_semantic_permits(),
     })
 }
 

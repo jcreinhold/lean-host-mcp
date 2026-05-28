@@ -28,18 +28,32 @@ bin/worker.rs   entry point for lean_rs_worker_child::run_worker_child_stdio()
 ```
 
 `server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when
-needed, and submit one typed closure to the project worker actor.
+needed, and send one typed read-only semantic job to the project worker actor.
 
 ## Project And Worker Boundary
 
 `ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction,
-manifest invalidation, and multi-project routing. `LeanProject` owns the supervised `lean-rs-worker` child and a
-dedicated actor thread. The parent binary never links `libleanshared`; the per-toolchain worker child does.
+manifest invalidation, multi-project routing, and coalescing concurrent opens for the same canonical root.
+`LeanProject` owns the supervised `lean-rs-worker` child and a dedicated actor thread. The actor has private state
+(`Ready`, `Restarting`, `Draining`, `Stopped`), a bounded mailbox, a worker generation counter, the last restart reason,
+the last import profile, and module-query cache handles. The parent binary never links `libleanshared`; the
+per-toolchain worker child does.
+
+Each project actor runs one semantic job at a time in FIFO mailbox order. The broker also owns a process-wide semantic
+permit gate, defaulting to one permit, so cross-project heavy calls are serialized unless the deployment explicitly
+raises `LEAN_HOST_MCP_SEMANTIC_PERMITS`. A full project mailbox is a structured retryable infrastructure error rather
+than unbounded memory growth.
+
+The actor samples worker RSS before import-profile switches. If the worker is above the configured soft ceiling, it
+cycles the child before opening the next session. Fatal child exits are caught inside the actor: the worker is rebuilt,
+the generation is bumped, and read-only semantic jobs are retried once. Responses carry runtime facts (`worker_generation`,
+`worker_restarted`, `retry_count`, `queue_wait_millis`, `restart_reason`) so clients can distinguish Lean-domain results
+from infrastructure recovery.
 
 Each semantic tool opens a short-lived worker session with imports derived from the source header or explicit request.
 Lean-domain failures such as parse errors, elaboration diagnostics, missing imports, unsupported shim exports, failed
 proof snippets, and sorry policy failures are structured tool results. MCP errors are reserved for infrastructure
-failures.
+failures such as a full mailbox, restart-loop exhaustion, or a project that cannot start.
 
 ## Declaration-Centric Proof API
 

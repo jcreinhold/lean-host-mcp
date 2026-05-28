@@ -27,9 +27,9 @@
 //!
 //! **Slow-path concurrency.** The registry mutex is never held across
 //! [`LeanProject::open`] (multi-second worker spawn) or
-//! [`LeanProject::submit`]. Concurrent calls against *different* projects
-//! parallelize; concurrent misses for the *same* project race, and the
-//! loser's [`LeanProject`] is shut down on the dispatch path.
+//! [`LeanProject::call`]. Concurrent misses for the same canonical root are
+//! coalesced so only one project actor is opened. Heavy semantic jobs are
+//! additionally gated by a process-wide permit owned by the broker.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -44,7 +44,7 @@ use parking_lot::Mutex;
 use crate::error::{Result, ServerError};
 use crate::index::fingerprint_lake_project;
 use crate::lake_meta::LakeProjectMeta;
-use crate::project::LeanProject;
+use crate::project::{LeanProject, SemanticGate};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
 pub const DEFAULT_MAX_PROJECTS: usize = 4;
@@ -56,6 +56,7 @@ pub const DEFAULT_MAX_PROJECTS: usize = 4;
 /// short enough that a forgotten project tab releases its worker child
 /// within a reasonable bound.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_SEMANTIC_PERMITS: usize = 1;
 
 const REAPER_TICK: Duration = Duration::from_mins(1);
 
@@ -74,6 +75,8 @@ pub struct BrokerConfig {
     /// Idle window after which a project is eligible for the reaper.
     /// [`Duration::ZERO`] disables idle eviction (LRU only).
     pub idle_timeout: Duration,
+    /// Process-wide permits for heavy Lean semantic work.
+    pub semantic_permits: NonZeroUsize,
 }
 
 impl BrokerConfig {
@@ -87,10 +90,11 @@ impl BrokerConfig {
     ///
     /// [`ServerError::Internal`] when an env var is set but unparseable
     /// (non-numeric, or `MAX_PROJECTS=0`).
-    pub fn pool_from_env() -> Result<(NonZeroUsize, Duration)> {
+    pub fn pool_from_env() -> Result<(NonZeroUsize, Duration, NonZeroUsize)> {
         parse_pool_config(
             std::env::var("LEAN_HOST_MCP_MAX_PROJECTS").ok().as_deref(),
             std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok().as_deref(),
+            std::env::var("LEAN_HOST_MCP_SEMANTIC_PERMITS").ok().as_deref(),
         )
     }
 
@@ -107,10 +111,20 @@ impl BrokerConfig {
     pub const fn default_idle_timeout() -> Duration {
         Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
     }
+
+    /// Convenience: default global semantic-work permit count.
+    #[must_use]
+    pub fn default_semantic_permits() -> NonZeroUsize {
+        NonZeroUsize::new(DEFAULT_SEMANTIC_PERMITS).unwrap_or(NonZeroUsize::MIN)
+    }
 }
 
 /// Pure parser shared by [`BrokerConfig::pool_from_env`] and unit tests.
-fn parse_pool_config(max: Option<&str>, idle: Option<&str>) -> Result<(NonZeroUsize, Duration)> {
+fn parse_pool_config(
+    max: Option<&str>,
+    idle: Option<&str>,
+    semantic: Option<&str>,
+) -> Result<(NonZeroUsize, Duration, NonZeroUsize)> {
     let max_projects = match max {
         Some(s) => {
             let n: usize = s
@@ -130,7 +144,18 @@ fn parse_pool_config(max: Option<&str>, idle: Option<&str>) -> Result<(NonZeroUs
         }
         None => BrokerConfig::default_idle_timeout(),
     };
-    Ok((max_projects, idle_timeout))
+    let semantic_permits = match semantic {
+        Some(s) => {
+            let n: usize = s
+                .parse()
+                .map_err(|e| ServerError::Internal(format!("LEAN_HOST_MCP_SEMANTIC_PERMITS={s:?} not a usize: {e}")))?;
+            NonZeroUsize::new(n).ok_or_else(|| {
+                ServerError::Internal("LEAN_HOST_MCP_SEMANTIC_PERMITS=0 would deadlock semantic work".into())
+            })?
+        }
+        None => BrokerConfig::default_semantic_permits(),
+    };
+    Ok((max_projects, idle_timeout, semantic_permits))
 }
 
 /// Per-call routing hint. `Default` runs the full resolution chain;
@@ -156,11 +181,13 @@ impl ProjectHint {
 struct BrokerInner {
     registry: LruCache<PathBuf, Arc<LeanProject>>,
     last_used: HashMap<PathBuf, Instant>,
+    opening_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
 }
 
 pub struct ProjectBroker {
     inner: Mutex<BrokerInner>,
     config: BrokerConfig,
+    semantic_gate: Arc<SemanticGate>,
 }
 
 impl std::fmt::Debug for ProjectBroker {
@@ -184,7 +211,9 @@ impl ProjectBroker {
             inner: Mutex::new(BrokerInner {
                 registry: LruCache::new(config.max_projects),
                 last_used: HashMap::new(),
+                opening_locks: HashMap::new(),
             }),
+            semantic_gate: SemanticGate::new(config.semantic_permits),
             config,
         });
         broker.spawn_reaper();
@@ -307,9 +336,40 @@ impl ProjectBroker {
             drop(project);
         }
 
-        // Slow path: open without holding the lock.
+        let open_lock = {
+            let mut inner = self.inner.lock();
+            Arc::clone(
+                inner
+                    .opening_locks
+                    .entry(root.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _open_guard = open_lock.lock();
+
+        let cached_after_wait = {
+            let mut inner = self.inner.lock();
+            inner.registry.get(&root).cloned()
+        };
+        if let Some(project) = cached_after_wait {
+            let current_hash = fingerprint_lake_project(&root)?;
+            if project.manifest_hash() == current_hash && project.is_healthy() {
+                self.inner.lock().last_used.insert(root, Instant::now());
+                return Ok(project);
+            }
+            let stale = {
+                let mut inner = self.inner.lock();
+                inner.last_used.remove(&root);
+                inner.registry.pop(&root)
+            };
+            if let Some(s) = stale {
+                s.shutdown();
+            }
+        }
+
+        // Slow path: open without holding the registry lock.
         let meta = LakeProjectMeta::from_explicit(&root)?;
-        let opened = LeanProject::open(meta, &self.config.cache_dir)?;
+        let opened = LeanProject::open_with_gate(meta, &self.config.cache_dir, Arc::clone(&self.semantic_gate))?;
 
         // Reacquire, race-resolve, insert with possible eviction.
         let mut inner = self.inner.lock();
@@ -426,6 +486,7 @@ mod tests {
             cwd,
             max_projects: BrokerConfig::default_max_projects(),
             idle_timeout: Duration::ZERO,
+            semantic_permits: NonZeroUsize::MIN,
         }
     }
 
@@ -449,33 +510,37 @@ mod tests {
 
     #[test]
     fn parse_pool_config_uses_defaults_when_unset() {
-        let (max, idle) = parse_pool_config(None, None).unwrap();
+        let (max, idle, semantic) = parse_pool_config(None, None, None).unwrap();
         assert_eq!(max.get(), DEFAULT_MAX_PROJECTS);
         assert_eq!(idle, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+        assert_eq!(semantic.get(), DEFAULT_SEMANTIC_PERMITS);
     }
 
     #[test]
     fn parse_pool_config_accepts_explicit_values() {
-        let (max, idle) = parse_pool_config(Some("8"), Some("30")).unwrap();
+        let (max, idle, semantic) = parse_pool_config(Some("8"), Some("30"), Some("2")).unwrap();
         assert_eq!(max.get(), 8);
         assert_eq!(idle, Duration::from_secs(30));
+        assert_eq!(semantic.get(), 2);
     }
 
     #[test]
     fn parse_pool_config_treats_zero_idle_as_disable() {
-        let (_, idle) = parse_pool_config(None, Some("0")).unwrap();
+        let (_, idle, _) = parse_pool_config(None, Some("0"), None).unwrap();
         assert_eq!(idle, Duration::ZERO);
     }
 
     #[test]
     fn parse_pool_config_rejects_max_projects_zero() {
-        let err = parse_pool_config(Some("0"), None).unwrap_err();
+        let err = parse_pool_config(Some("0"), None, None).unwrap_err();
         assert!(matches!(err, ServerError::Internal(_)), "{err:?}");
     }
 
     #[test]
     fn parse_pool_config_rejects_garbage() {
-        assert!(parse_pool_config(Some("seven"), None).is_err());
-        assert!(parse_pool_config(None, Some("forever")).is_err());
+        assert!(parse_pool_config(Some("seven"), None, None).is_err());
+        assert!(parse_pool_config(None, Some("forever"), None).is_err());
+        assert!(parse_pool_config(None, None, Some("many")).is_err());
+        assert!(parse_pool_config(None, None, Some("0")).is_err());
     }
 }

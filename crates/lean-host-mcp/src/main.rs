@@ -101,7 +101,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let env_default = args.lake_root;
     let config_default = read_config_default();
     let cwd = std::env::current_dir()?;
-    let (max_projects, idle_timeout) = BrokerConfig::pool_from_env()?;
+    let (max_projects, idle_timeout, semantic_permits) = BrokerConfig::pool_from_env()?;
 
     tracing::info!(
         env_default = ?env_default,
@@ -110,6 +110,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         cache_dir = %cache_dir.display(),
         max_projects = %max_projects,
         idle_timeout_secs = idle_timeout.as_secs(),
+        semantic_permits = %semantic_permits,
         "starting lean-host-mcp",
     );
 
@@ -120,6 +121,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         cwd,
         max_projects,
         idle_timeout,
+        semantic_permits,
     });
     let service = LeanHostService::new(broker);
     let server = service.serve(stdio()).await?;

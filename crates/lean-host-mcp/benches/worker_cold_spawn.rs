@@ -38,6 +38,7 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
                 cwd: root.clone(),
                 max_projects: BrokerConfig::default_max_projects(),
                 idle_timeout: BrokerConfig::default_idle_timeout(),
+                semantic_permits: BrokerConfig::default_semantic_permits(),
             });
             let ctx = ToolContext { broker };
             rt.block_on(async {
