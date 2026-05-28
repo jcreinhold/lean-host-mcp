@@ -8,18 +8,24 @@
 
 #![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use lean_rs_worker_parent::{
-    LeanWorkerChild, LeanWorkerError, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder, LeanWorkerModuleCacheLimits,
-    LeanWorkerRestartPolicy,
+    LeanWorkerChild, LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationInspectionResult,
+    LeanWorkerDeclarationSearch, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationVerificationRequest,
+    LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions, LeanWorkerError, LeanWorkerHostHandle,
+    LeanWorkerHostHandleBuilder, LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome,
+    LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets,
+    LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRestartPolicy,
 };
-use parking_lot::{Condvar, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use parking_lot::Mutex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::cache::ModuleQueryCache;
 use crate::envelope::{Freshness, RuntimeFacts};
@@ -36,14 +42,8 @@ const WORKER_RSS_CEILING_KIB: u64 = 3 * 1024 * 1024;
 const MODULE_CACHE_RSS_GUARD_KIB: u64 = 2 * 1024 * 1024;
 const MODULE_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_JOB_RETRIES: u32 = 1;
-
-type ActorMessage = Box<dyn FnOnce(&mut ProjectActorState) + Send + 'static>;
-
-/// Coarse work class for project-actor scheduling and observability.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProjectWorkClass {
-    Semantic,
-}
+const MAX_RESTARTS_PER_WINDOW: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_mins(1);
 
 /// Result of one project actor call.
 #[derive(Debug, Clone)]
@@ -52,53 +52,99 @@ pub struct ProjectCall<T> {
     pub runtime: RuntimeFacts,
 }
 
-/// Process-wide permit gate for heavy Lean semantic work.
-#[derive(Debug)]
-pub struct SemanticGate {
-    state: Mutex<SemanticGateState>,
-    wake: Condvar,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryPolicy {
+    RetryOnceReadOnly,
 }
 
-#[derive(Debug)]
-struct SemanticGateState {
-    available: usize,
+impl RetryPolicy {
+    fn retries(self) -> u32 {
+        match self {
+            Self::RetryOnceReadOnly => MAX_JOB_RETRIES,
+        }
+    }
 }
 
-impl SemanticGate {
+struct ActiveJobGuard {
+    active_jobs: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveJobGuard {
+    fn drop(&mut self) {
+        self.active_jobs.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct JobMeta {
+    imports: Vec<String>,
+    import_fingerprint: String,
+    _created_at: Instant,
+    queued_at: Instant,
+    admission_wait_millis: u64,
+    _correlation_id: uuid::Uuid,
+    retry_policy: RetryPolicy,
+    _active_job: ActiveJobGuard,
+    _semantic_permit: OwnedSemaphorePermit,
+}
+
+enum ProjectMessage {
+    ModuleQuery {
+        meta: JobMeta,
+        source: String,
+        query: LeanWorkerModuleQuery,
+        options: LeanWorkerElabOptions,
+        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerModuleQueryOutcome>>>,
+    },
+    ModuleQueryBatch {
+        meta: JobMeta,
+        source: String,
+        selectors: Vec<LeanWorkerModuleQuerySelector>,
+        budgets: LeanWorkerOutputBudgets,
+        options: LeanWorkerElabOptions,
+        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>>>,
+    },
+    DeclarationInspection {
+        meta: JobMeta,
+        request: LeanWorkerDeclarationInspectionRequest,
+        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationInspectionResult>>>,
+    },
+    DeclarationSearch {
+        meta: JobMeta,
+        request: LeanWorkerDeclarationSearch,
+        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationSearchResult>>>,
+    },
+    ProofAttempt {
+        meta: JobMeta,
+        request: LeanWorkerProofAttemptRequest,
+        options: LeanWorkerElabOptions,
+        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerProofAttemptResult>>>,
+    },
+    DeclarationVerification {
+        meta: JobMeta,
+        request: LeanWorkerDeclarationVerificationRequest,
+        options: LeanWorkerElabOptions,
+        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationVerificationResult>>>,
+    },
+}
+
+/// Process-wide async admission for heavy Lean semantic work.
+#[derive(Debug)]
+pub struct SemanticAdmission {
+    semaphore: Arc<Semaphore>,
+}
+
+impl SemanticAdmission {
     pub(crate) fn new(permits: NonZeroUsize) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(SemanticGateState {
-                available: permits.get(),
-            }),
-            wake: Condvar::new(),
+            semaphore: Arc::new(Semaphore::new(permits.get())),
         })
     }
 
-    fn acquire(self: &Arc<Self>) -> SemanticPermit {
-        let mut state = self.state.lock();
-        while state.available == 0 {
-            self.wake.wait(&mut state);
-        }
-        state.available = state.available.saturating_sub(1);
-        drop(state);
-        SemanticPermit { gate: Arc::clone(self) }
-    }
-
-    fn release(&self) {
-        let mut state = self.state.lock();
-        state.available = state.available.saturating_add(1);
-        drop(state);
-        self.wake.notify_one();
-    }
-}
-
-struct SemanticPermit {
-    gate: Arc<SemanticGate>,
-}
-
-impl Drop for SemanticPermit {
-    fn drop(&mut self) {
-        self.gate.release();
+    async fn acquire(self: &Arc<Self>) -> Result<OwnedSemaphorePermit> {
+        Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| ServerError::Internal("semantic admission semaphore closed".to_owned()))
     }
 }
 
@@ -114,6 +160,7 @@ impl RuntimeSnapshot {
             worker_generation: self.worker_generation,
             worker_restarted: false,
             retry_count: 0,
+            admission_wait_millis: 0,
             queue_wait_millis: 0,
             restart_reason: self.restart_reason.clone(),
         }
@@ -129,7 +176,10 @@ pub struct LeanProject {
     library: Option<String>,
     manifest_hash: String,
     session_id: String,
-    actor_tx: Mutex<Option<mpsc::Sender<ActorMessage>>>,
+    actor_tx: Mutex<Option<mpsc::Sender<ProjectMessage>>>,
+    admission: Arc<SemanticAdmission>,
+    active_jobs: Arc<AtomicUsize>,
+    healthy: Arc<AtomicBool>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     module_queries: ModuleQueryCache,
 }
@@ -156,21 +206,23 @@ impl LeanProject {
     /// runtime open failures; `ServerError::Internal` if the OS rejects the
     /// actor thread.
     pub fn open(meta: LakeProjectMeta, cache_dir: &Path) -> Result<Arc<Self>> {
-        Self::open_with_gate(meta, cache_dir, SemanticGate::new(NonZeroUsize::MIN))
+        Self::open_with_admission(meta, cache_dir, SemanticAdmission::new(NonZeroUsize::MIN))
     }
 
-    pub(crate) fn open_with_gate(
+    pub(crate) fn open_with_admission(
         meta: LakeProjectMeta,
         _cache_dir: &Path,
-        semantic_gate: Arc<SemanticGate>,
+        admission: Arc<SemanticAdmission>,
     ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
             worker_generation: 1,
             restart_reason: None,
         }));
-        let config = ActorConfig::from_meta(&meta, semantic_gate, session_id.clone(), Arc::clone(&runtime))?;
-        type InitMsg = std::result::Result<(String, mpsc::Sender<ActorMessage>), ServerError>;
+        let active_jobs = Arc::new(AtomicUsize::new(0));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let config = ActorConfig::from_meta(&meta, session_id.clone(), Arc::clone(&runtime), Arc::clone(&healthy))?;
+        type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
 
@@ -194,36 +246,177 @@ impl LeanProject {
             manifest_hash: meta.manifest_hash,
             session_id,
             actor_tx: Mutex::new(Some(actor_tx)),
+            admission,
+            active_jobs,
+            healthy,
             runtime,
             module_queries: ModuleQueryCache::with_capacity(cache_cap),
         }))
     }
 
-    /// Dispatch one retryable read-only semantic job to this project's actor.
-    ///
-    /// The job may be called twice when the first attempt loses the worker
-    /// child. It must therefore be idempotent and must not mutate user files.
+    /// Process one module query through this project's serialized worker actor.
     ///
     /// # Errors
     ///
-    /// `ServerError::WorkerUnavailable` when the mailbox is full, the actor is
-    /// gone, or worker restart recovery fails.
-    pub async fn call<F, R>(&self, work_class: ProjectWorkClass, imports: Vec<String>, job: F) -> Result<ProjectCall<R>>
-    where
-        F: Fn(&mut LeanWorkerHostHandle) -> std::result::Result<R, LeanWorkerError> + Send + 'static,
-        R: Send + 'static,
-    {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let queued_at = Instant::now();
-        let import_fingerprint = import_fingerprint(&imports);
-        let project_info = self.worker_error_context();
-        let boxed_job: Box<dyn Fn(&mut LeanWorkerHostHandle) -> std::result::Result<R, LeanWorkerError> + Send> =
-            Box::new(job);
-        let message: ActorMessage = Box::new(move |state| {
-            let result = state.run_job(work_class, import_fingerprint, queued_at, &*boxed_job);
-            let _ = reply_tx.send(result);
-        });
+    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// worker execution fails.
+    pub async fn process_module_query(
+        &self,
+        imports: Vec<String>,
+        source: String,
+        query: LeanWorkerModuleQuery,
+        options: LeanWorkerElabOptions,
+    ) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::ModuleQuery {
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            source,
+            query,
+            options,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
 
+    /// Process one module-query batch through this project's serialized worker actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// worker execution fails.
+    pub async fn process_module_query_batch(
+        &self,
+        imports: Vec<String>,
+        source: String,
+        selectors: Vec<LeanWorkerModuleQuerySelector>,
+        budgets: LeanWorkerOutputBudgets,
+        options: LeanWorkerElabOptions,
+    ) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::ModuleQueryBatch {
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            source,
+            selectors,
+            budgets,
+            options,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
+
+    /// Inspect one declaration through this project's serialized worker actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// worker execution fails.
+    pub async fn inspect_declaration(
+        &self,
+        imports: Vec<String>,
+        request: LeanWorkerDeclarationInspectionRequest,
+    ) -> Result<ProjectCall<LeanWorkerDeclarationInspectionResult>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::DeclarationInspection {
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            request,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
+
+    /// Run bounded declaration search through this project's serialized worker actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// worker execution fails.
+    pub async fn search_declarations(
+        &self,
+        imports: Vec<String>,
+        request: LeanWorkerDeclarationSearch,
+    ) -> Result<ProjectCall<LeanWorkerDeclarationSearchResult>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::DeclarationSearch {
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            request,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
+
+    /// Try proof fragments in-memory through this project's serialized worker actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// worker execution fails.
+    pub async fn attempt_proof(
+        &self,
+        imports: Vec<String>,
+        request: LeanWorkerProofAttemptRequest,
+        options: LeanWorkerElabOptions,
+    ) -> Result<ProjectCall<LeanWorkerProofAttemptResult>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::ProofAttempt {
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            request,
+            options,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
+
+    /// Verify one declaration in-memory through this project's serialized worker actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// worker execution fails.
+    pub async fn verify_declaration(
+        &self,
+        imports: Vec<String>,
+        request: LeanWorkerDeclarationVerificationRequest,
+        options: LeanWorkerElabOptions,
+    ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationResult>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::DeclarationVerification {
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            request,
+            options,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
+
+    async fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy) -> Result<JobMeta> {
+        let created_at = Instant::now();
+        let semantic_permit = self.admission.acquire().await?;
+        let admission_wait_millis = millis_u64(created_at.elapsed());
+        self.active_jobs.fetch_add(1, Ordering::AcqRel);
+        Ok(JobMeta {
+            import_fingerprint: import_fingerprint(&imports),
+            imports,
+            _created_at: created_at,
+            queued_at: Instant::now(),
+            admission_wait_millis,
+            _correlation_id: uuid::Uuid::new_v4(),
+            retry_policy,
+            _active_job: ActiveJobGuard {
+                active_jobs: Arc::clone(&self.active_jobs),
+            },
+            _semantic_permit: semantic_permit,
+        })
+    }
+
+    async fn enqueue<T>(
+        &self,
+        message: ProjectMessage,
+        reply_rx: oneshot::Receiver<Result<ProjectCall<T>>>,
+    ) -> Result<ProjectCall<T>>
+    where
+        T: Send + 'static,
+    {
+        let project_info = self.worker_error_context();
         let tx = self
             .actor_tx
             .lock()
@@ -236,7 +429,7 @@ impl LeanProject {
                 return Err(ServerError::WorkerUnavailable(WorkerUnavailable {
                     retryable: true,
                     worker_restarted: false,
-                    reason: "project worker mailbox is full".to_owned(),
+                    reason: "mailbox_full".to_owned(),
                     ..project_info
                 }));
             }
@@ -245,7 +438,7 @@ impl LeanProject {
                 return Err(ServerError::WorkerUnavailable(WorkerUnavailable {
                     retryable: true,
                     worker_restarted: false,
-                    reason: "project worker mailbox is closed".to_owned(),
+                    reason: "mailbox_closed".to_owned(),
                     ..project_info
                 }));
             }
@@ -255,7 +448,7 @@ impl LeanProject {
             Ok(result) => result,
             Err(_) => {
                 self.shutdown();
-                Err(self.unavailable("project actor stopped before replying", true, false))
+                Err(self.unavailable("mailbox_closed_before_reply", true, false))
             }
         }
     }
@@ -305,11 +498,16 @@ impl LeanProject {
     }
 
     pub fn shutdown(&self) {
+        self.healthy.store(false, Ordering::Release);
         let _ = self.actor_tx.lock().take();
     }
 
     pub fn is_healthy(&self) -> bool {
-        self.actor_tx.lock().as_ref().is_some_and(|tx| !tx.is_closed())
+        self.healthy.load(Ordering::Acquire) && self.actor_tx.lock().as_ref().is_some_and(|tx| !tx.is_closed())
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.active_jobs.load(Ordering::Acquire) == 0
     }
 
     fn unavailable(&self, reason: impl Into<String>, retryable: bool, worker_restarted: bool) -> ServerError {
@@ -346,21 +544,23 @@ struct ActorConfig {
     toolchain_label: String,
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
-    semantic_gate: Arc<SemanticGate>,
     session_id: String,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
+    healthy: Arc<AtomicBool>,
     worker_rss_ceiling_kib: u64,
     module_cache_rss_guard_kib: u64,
     module_cache_max_bytes: u64,
     mailbox_capacity: usize,
+    max_restarts_per_window: usize,
+    restart_window: Duration,
 }
 
 impl ActorConfig {
     fn from_meta(
         meta: &LakeProjectMeta,
-        semantic_gate: Arc<SemanticGate>,
         session_id: String,
         runtime: Arc<Mutex<RuntimeSnapshot>>,
+        healthy: Arc<AtomicBool>,
     ) -> Result<Self> {
         let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
         let worker = WorkerBinary::resolve_for(&toolchain_id).map_err(|e| ServerError::BadProject(e.to_string()))?;
@@ -372,18 +572,31 @@ impl ActorConfig {
             toolchain_label: meta.toolchain.clone(),
             worker_path: worker.path,
             lean_sysroot,
-            semantic_gate,
             session_id,
             runtime,
-            worker_rss_ceiling_kib: env_u64("LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB", WORKER_RSS_CEILING_KIB),
-            module_cache_rss_guard_kib: env_u64("LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB", MODULE_CACHE_RSS_GUARD_KIB),
-            module_cache_max_bytes: env_u64("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES", MODULE_CACHE_MAX_BYTES),
+            healthy,
+            worker_rss_ceiling_kib: env_u64("LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB", WORKER_RSS_CEILING_KIB)?,
+            module_cache_rss_guard_kib: env_u64(
+                "LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB",
+                MODULE_CACHE_RSS_GUARD_KIB,
+            )?,
+            module_cache_max_bytes: env_u64("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES", MODULE_CACHE_MAX_BYTES)?,
             mailbox_capacity: usize::try_from(env_u64(
                 "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
                 PROJECT_MAILBOX_CAPACITY as u64,
-            ))
+            )?)
             .unwrap_or(PROJECT_MAILBOX_CAPACITY)
             .max(1),
+            max_restarts_per_window: usize::try_from(env_u64(
+                "LEAN_HOST_MCP_WORKER_RESTART_LIMIT",
+                MAX_RESTARTS_PER_WINDOW as u64,
+            )?)
+            .unwrap_or(MAX_RESTARTS_PER_WINDOW)
+            .max(1),
+            restart_window: Duration::from_secs(env_u64(
+                "LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS",
+                RESTART_WINDOW.as_secs(),
+            )?),
         })
     }
 }
@@ -404,59 +617,132 @@ struct ProjectActorState {
     last_restart_reason: Option<String>,
     last_import_fingerprint: Option<String>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
+    restart_times: VecDeque<Instant>,
 }
 
 impl ProjectActorState {
+    fn handle_message(&mut self, message: ProjectMessage) {
+        match message {
+            ProjectMessage::ModuleQuery {
+                meta,
+                source,
+                query,
+                options,
+                reply,
+            } => {
+                let result = self.run_job(meta, |handle, imports| {
+                    handle.process_module_query_with_imports(imports, &source, &query, &options, None, None)
+                });
+                let _ = reply.send(result);
+            }
+            ProjectMessage::ModuleQueryBatch {
+                meta,
+                source,
+                selectors,
+                budgets,
+                options,
+                reply,
+            } => {
+                let result = self.run_job(meta, |handle, imports| {
+                    handle.process_module_query_batch_with_imports(
+                        imports, &source, &selectors, &budgets, &options, None, None,
+                    )
+                });
+                let _ = reply.send(result);
+            }
+            ProjectMessage::DeclarationInspection { meta, request, reply } => {
+                let result = self.run_job(meta, |handle, imports| {
+                    handle.inspect_declaration_with_imports(imports, &request, None, None)
+                });
+                let _ = reply.send(result);
+            }
+            ProjectMessage::DeclarationSearch { meta, request, reply } => {
+                let result = self.run_job(meta, |handle, imports| {
+                    handle.search_declarations_with_imports(imports, &request, None, None)
+                });
+                let _ = reply.send(result);
+            }
+            ProjectMessage::ProofAttempt {
+                meta,
+                request,
+                options,
+                reply,
+            } => {
+                let result = self.run_job(meta, |handle, imports| {
+                    handle.attempt_proof_with_imports(imports, &request, &options, None, None)
+                });
+                let _ = reply.send(result);
+            }
+            ProjectMessage::DeclarationVerification {
+                meta,
+                request,
+                options,
+                reply,
+            } => {
+                let result = self.run_job(meta, |handle, imports| {
+                    handle.verify_declaration_with_imports(imports, &request, &options, None, None)
+                });
+                let _ = reply.send(result);
+            }
+        }
+    }
+
     fn run_job<R>(
         &mut self,
-        _work_class: ProjectWorkClass,
-        import_fingerprint: String,
-        queued_at: Instant,
-        job: &(dyn Fn(&mut LeanWorkerHostHandle) -> std::result::Result<R, LeanWorkerError> + Send),
+        meta: JobMeta,
+        job: impl Fn(&mut LeanWorkerHostHandle, Vec<String>) -> std::result::Result<R, LeanWorkerError>,
     ) -> Result<ProjectCall<R>> {
         self.phase = ActorPhase::Ready;
-        let queue_wait_millis = millis_u64(queued_at.elapsed());
-        let _permit = self.config.semantic_gate.acquire();
+        let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
         let generation_before = self.observed_generation();
-        self.cycle_before_import_switch_if_needed(&import_fingerprint)?;
+        self.cycle_before_import_switch_if_needed(&meta.import_fingerprint)?;
 
-        match job(&mut self.handle) {
-            Ok(value) => {
-                self.last_import_fingerprint = Some(import_fingerprint);
-                let runtime = self.runtime_facts(generation_before, 0, queue_wait_millis);
-                self.publish_runtime(&runtime);
-                Ok(ProjectCall { value, runtime })
-            }
-            Err(err) if worker_error_is_recoverable_death(&err) => {
-                let first_reason = err.to_string();
-                self.rebuild_after_worker_death(first_reason.clone())?;
-                match job(&mut self.handle) {
-                    Ok(value) => {
-                        self.last_import_fingerprint = Some(import_fingerprint);
-                        let runtime = self.runtime_facts(generation_before, 1, queue_wait_millis);
-                        self.publish_runtime(&runtime);
-                        Ok(ProjectCall { value, runtime })
-                    }
-                    Err(second) if worker_error_is_recoverable_death(&second) => {
-                        let reason =
-                            format!("restart_limit_exceeded after worker death: {first_reason}; retry: {second}");
-                        let generation = self.observed_generation();
-                        self.last_restart_reason = Some(reason.clone());
-                        self.publish_runtime(&RuntimeFacts {
-                            worker_generation: generation,
-                            worker_restarted: generation > generation_before,
-                            retry_count: MAX_JOB_RETRIES,
-                            queue_wait_millis,
-                            restart_reason: Some(reason.clone()),
-                        });
-                        Err(self.worker_unavailable(reason, false, generation > generation_before))
-                    }
-                    Err(second) => Err(map_worker_err(second)),
+        let max_retries = meta.retry_policy.retries();
+        let mut retry_count = 0_u32;
+        loop {
+            match job(&mut self.handle, meta.imports.clone()) {
+                Ok(value) => {
+                    self.last_import_fingerprint = Some(meta.import_fingerprint.clone());
+                    let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
+                    self.publish_runtime(&runtime);
+                    return Ok(ProjectCall { value, runtime });
                 }
-            }
-            Err(err) => {
-                self.last_import_fingerprint = Some(import_fingerprint);
-                Err(map_worker_err(err))
+                Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
+                    let first_reason = err.to_string();
+                    self.rebuild_after_worker_death(first_reason)?;
+                    retry_count = retry_count.saturating_add(1);
+                }
+                Err(err) if worker_error_is_recoverable_death(&err) => {
+                    let reason = format!("worker_died_after_retry: {err}");
+                    let generation = self.observed_generation();
+                    let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
+                    self.publish_runtime(&runtime);
+                    return Err(self.worker_unavailable(reason, true, generation > generation_before));
+                }
+                Err(err) if worker_error_is_session_missing(&err) => {
+                    let generation = self.observed_generation();
+                    let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
+                    self.publish_runtime(&runtime);
+                    return Err(self.worker_unavailable(
+                        format!("session_missing: {err}"),
+                        true,
+                        generation > generation_before,
+                    ));
+                }
+                Err(err) if matches!(err, LeanWorkerError::Timeout { .. }) => {
+                    let generation = self.observed_generation();
+                    let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
+                    self.publish_runtime(&runtime);
+                    return Err(self.worker_unavailable(
+                        format!("timeout: {err}"),
+                        true,
+                        generation > generation_before,
+                    ));
+                }
+                Err(err) => {
+                    self.last_import_fingerprint = Some(meta.import_fingerprint.clone());
+                    return Err(map_worker_err(err));
+                }
             }
         }
     }
@@ -465,7 +751,7 @@ impl ProjectActorState {
         if self.last_import_fingerprint.as_deref() == Some(import_fingerprint) {
             return Ok(());
         }
-        let Some(current_kib) = self.handle.worker_mut().rss_kib() else {
+        let Some(current_kib) = self.handle.rss_kib() else {
             return Ok(());
         };
         if current_kib < self.config.worker_rss_ceiling_kib {
@@ -475,14 +761,16 @@ impl ProjectActorState {
             "rss_import_switch current_kib={current_kib} limit_kib={}",
             self.config.worker_rss_ceiling_kib
         );
+        self.record_restart_or_stop(&reason)?;
         self.phase = ActorPhase::Restarting;
-        self.handle.worker_mut().restart().map_err(map_worker_err)?;
+        self.handle.restart().map_err(map_worker_err)?;
         self.last_restart_reason = Some(reason);
         self.phase = ActorPhase::Ready;
         Ok(())
     }
 
     fn rebuild_after_worker_death(&mut self, reason: String) -> Result<()> {
+        self.record_restart_or_stop(&reason)?;
         self.phase = ActorPhase::Restarting;
         let next_generation = self.observed_generation().saturating_add(1);
         let (handle, _) = open_worker(&self.config, false)?;
@@ -493,16 +781,51 @@ impl ProjectActorState {
         Ok(())
     }
 
-    fn observed_generation(&self) -> u64 {
-        self.worker_generation_base
-            .saturating_add(self.handle.worker().stats().restarts)
+    fn record_restart_or_stop(&mut self, reason: &str) -> Result<()> {
+        let now = Instant::now();
+        while self
+            .restart_times
+            .front()
+            .is_some_and(|seen| now.saturating_duration_since(*seen) > self.config.restart_window)
+        {
+            self.restart_times.pop_front();
+        }
+        if self.restart_times.len() >= self.config.max_restarts_per_window {
+            self.phase = ActorPhase::Stopped;
+            self.config.healthy.store(false, Ordering::Release);
+            let message = format!(
+                "restart_limit_exceeded after {} restarts in {:?}; latest: {reason}",
+                self.config.max_restarts_per_window, self.config.restart_window
+            );
+            self.last_restart_reason = Some(message.clone());
+            self.publish_runtime(&RuntimeFacts {
+                worker_generation: self.observed_generation(),
+                worker_restarted: false,
+                retry_count: MAX_JOB_RETRIES,
+                admission_wait_millis: 0,
+                queue_wait_millis: 0,
+                restart_reason: Some(message.clone()),
+            });
+            return Err(self.worker_unavailable(message, false, false));
+        }
+        self.restart_times.push_back(now);
+        Ok(())
     }
 
-    fn runtime_facts(&self, generation_before: u64, retry_count: u32, queue_wait_millis: u64) -> RuntimeFacts {
+    fn observed_generation(&self) -> u64 {
+        self.worker_generation_base.saturating_add(self.handle.stats().restarts)
+    }
+
+    fn runtime_facts(
+        &self,
+        meta: &JobMeta,
+        generation_before: u64,
+        retry_count: u32,
+        queue_wait_millis: u64,
+    ) -> RuntimeFacts {
         let generation = self.observed_generation();
         let restart_reason = self
             .handle
-            .worker()
             .stats()
             .last_restart_reason
             .as_ref()
@@ -512,6 +835,7 @@ impl ProjectActorState {
             worker_generation: generation,
             worker_restarted: generation > generation_before,
             retry_count,
+            admission_wait_millis: meta.admission_wait_millis,
             queue_wait_millis,
             restart_reason,
         }
@@ -538,7 +862,7 @@ impl ProjectActorState {
 
 fn actor_main(
     config: ActorConfig,
-    init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<ActorMessage>), ServerError>>,
+    init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>>,
 ) {
     let (handle, runtime_toolchain) = match open_worker(&config, true) {
         Ok(value) => value,
@@ -555,16 +879,17 @@ fn actor_main(
         last_restart_reason: None,
         last_import_fingerprint: None,
         runtime: Arc::clone(&config.runtime),
+        restart_times: VecDeque::new(),
     };
 
-    let (tx, mut rx) = mpsc::channel::<ActorMessage>(config.mailbox_capacity);
+    let (tx, mut rx) = mpsc::channel::<ProjectMessage>(config.mailbox_capacity);
     if init_reply.send(Ok((runtime_toolchain, tx))).is_err() {
         state.phase = ActorPhase::Stopped;
         return;
     }
 
-    while let Some(job) = rx.blocking_recv() {
-        job(&mut state);
+    while let Some(message) = rx.blocking_recv() {
+        state.handle_message(message);
     }
     state.phase = ActorPhase::Draining;
     state.phase = ActorPhase::Stopped;
@@ -617,10 +942,11 @@ fn worker_error_is_recoverable_death(err: &LeanWorkerError) -> bool {
     matches!(
         err,
         LeanWorkerError::ChildExited { .. } | LeanWorkerError::ChildPanicOrAbort { .. }
-    ) || matches!(
-        err,
-        LeanWorkerError::Worker { code, .. } if code == "lean_rs.worker.session_missing"
     )
+}
+
+fn worker_error_is_session_missing(err: &LeanWorkerError) -> bool {
+    matches!(err, LeanWorkerError::Worker { code, .. } if code == "lean_rs.worker.session_missing")
 }
 
 fn import_fingerprint(imports: &[String]) -> String {
@@ -631,10 +957,18 @@ fn millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
+fn env_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|e| ServerError::Internal(format!("{name}={value:?} not a u64: {e}")))?;
+            if parsed == 0 {
+                return Err(ServerError::Internal(format!("{name}=0 is not allowed")));
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(ServerError::Internal(format!("{name} is not valid unicode: {e}"))),
+    }
 }

@@ -14,11 +14,10 @@
 use std::sync::Arc;
 
 pub mod declaration;
-#[doc(hidden)]
-pub mod lean;
 pub mod position;
 pub mod proof_action;
 pub mod proof_search;
+pub(crate) mod source_input;
 
 use crate::broker::ProjectBroker;
 use crate::envelope::Freshness;

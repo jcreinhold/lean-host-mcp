@@ -8,7 +8,7 @@
 // worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions,
@@ -20,13 +20,13 @@ use serde::Deserialize;
 
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
-use crate::error::{Result, ServerError};
-use crate::project::ProjectWorkClass;
+use crate::error::Result;
 use crate::projections::{
     DeclarationVerificationResult, ElabFailure, ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult,
     project_declaration_verification, project_proof_attempt,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
+use crate::tools::source_input::read_query_file;
 use crate::tools::{ToolContext, session_imports};
 
 const MAX_CANDIDATES: usize = 8;
@@ -117,11 +117,11 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
                 budgets,
             };
             let call = project
-                .call(ProjectWorkClass::Semantic, input.imports.clone(), move |cap| {
-                    let mut session =
-                        cap.open_session_with_imports(session_imports(input.imports.clone()), None, None)?;
-                    session.attempt_proof(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
-                })
+                .attempt_proof(
+                    session_imports(input.imports.clone()),
+                    request,
+                    elab_options(&file_label, req.heartbeat_limit),
+                )
                 .await?;
             let mut response = Response::ok(
                 append_capped_rows(project_proof_attempt(call.value), extra_rows),
@@ -173,11 +173,11 @@ pub async fn verify_declaration(
                 budgets,
             };
             let call = project
-                .call(ProjectWorkClass::Semantic, input.imports.clone(), move |cap| {
-                    let mut session =
-                        cap.open_session_with_imports(session_imports(input.imports.clone()), None, None)?;
-                    session.verify_declaration(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
-                })
+                .verify_declaration(
+                    session_imports(input.imports.clone()),
+                    request,
+                    elab_options(&file_label, req.heartbeat_limit),
+                )
                 .await?;
             let mut response =
                 Response::ok(project_declaration_verification(call.value), freshness).with_runtime(call.runtime);
@@ -187,56 +187,6 @@ pub async fn verify_declaration(
             Ok(response)
         })
         .await
-}
-
-struct QueryFile {
-    resolved: PathBuf,
-    imports: Vec<String>,
-    source: String,
-}
-
-fn read_query_file(root: &Path, path: &Path) -> Result<QueryFile> {
-    let resolved = resolve_path(root, path).canonicalize().map_err(ServerError::Io)?;
-    let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
-    let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
-    let imports = header_imports(&source);
-    Ok(QueryFile {
-        resolved,
-        imports,
-        source,
-    })
-}
-
-fn resolve_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
-fn header_imports(source: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let line = line.split_once("--").map_or(line, |(before, _)| before);
-            let mut words = line.split_whitespace();
-            let mut token = words.next()?;
-            if token == "public" {
-                token = words.next()?;
-            }
-            if token == "meta" {
-                token = words.next()?;
-            }
-            if token != "import" {
-                return None;
-            }
-            if words.clone().next() == Some("all") {
-                let _ = words.next();
-            }
-            words.next().map(str::to_owned)
-        })
-        .collect()
 }
 
 fn proof_action_budgets(max_field_bytes: Option<u32>, max_total_bytes: Option<u32>) -> LeanWorkerOutputBudgets {

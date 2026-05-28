@@ -3,7 +3,12 @@
 //! default → error) without opening a Lean worker; they construct fake
 //! Lake-root layouts under `tempfile::tempdir()`.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::significant_drop_tightening
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

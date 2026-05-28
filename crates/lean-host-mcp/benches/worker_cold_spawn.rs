@@ -1,13 +1,18 @@
-//! Cold spawn cost: `LeanProject::open` + first `infer_type`. Recorded for
-//! visibility; no hard threshold (cold spawn is one-off per server start).
+//! Cold spawn cost: project open + first declaration inspection. Recorded
+//! for visibility; no hard threshold (cold spawn is one-off per server start).
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::significant_drop_tightening
+)]
 
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::tools::ToolContext;
-use lean_host_mcp::tools::lean::{InferTypeRequest, infer_type};
+use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, default_cache_dir};
 use tokio::runtime::Runtime;
 
@@ -26,9 +31,8 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("worker_cold_spawn");
     group.sample_size(10);
-    group.bench_function("spawn_plus_first_infer", |b| {
+    group.bench_function("spawn_plus_first_inspect", |b| {
         b.iter(|| {
-            let imports = vec!["LeanRsFixture.Handles".to_owned()];
             // Fresh broker per iteration so each one pays the project open
             // cost (the point of this bench).
             let broker = ProjectBroker::new(BrokerConfig {
@@ -42,16 +46,20 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
             });
             let ctx = ToolContext { broker };
             rt.block_on(async {
-                infer_type(
+                inspect_declaration(
                     &ctx,
-                    InferTypeRequest {
-                        term: "Nat.succ Nat.zero".into(),
-                        imports,
+                    InspectDeclarationRequest {
+                        name: "Nat.add_zero".to_owned(),
+                        file: None,
+                        imports: vec!["LeanRsFixture.Handles".to_owned()],
                         project: None,
+                        fields: InspectDeclarationFields::default(),
+                        max_field_bytes: Some(512),
+                        max_total_bytes: Some(2048),
                     },
                 )
                 .await
-                .expect("infer");
+                .expect("inspect_declaration");
             });
         });
     });

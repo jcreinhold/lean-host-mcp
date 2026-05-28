@@ -1,16 +1,21 @@
-//! Warm-session worker round-trip cost. Pins per-request `open_session +
-//! infer_type` time against [`LeanProject`]. Target: ≤ 2 ms per call.
+//! Warm-session worker round-trip cost. Pins per-request declaration
+//! inspection time against the public proof-agent worker path.
 //!
 //! Gated on `LEAN_HOST_MCP_BENCH_FIXTURE` (same shape as the e2e env var):
 //! the bench is a no-op when unset so `cargo bench` still runs in CI.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::significant_drop_tightening
+)]
 
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::tools::ToolContext;
-use lean_host_mcp::tools::lean::{InferTypeRequest, infer_type};
+use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, default_cache_dir};
 use tokio::runtime::Runtime;
 
@@ -27,7 +32,6 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
         return;
     };
     let rt = Runtime::new().unwrap();
-    let imports = vec!["LeanRsFixture.Handles".to_owned()];
     let broker = ProjectBroker::new(BrokerConfig {
         cache_dir: default_cache_dir(),
         config_default: None,
@@ -38,36 +42,43 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
         semantic_permits: BrokerConfig::default_semantic_permits(),
     });
     let ctx = ToolContext { broker };
-    let term = "Nat.succ Nat.zero".to_owned();
     // Prime the import set so the first measured iteration doesn't pay the
     // module load cost.
     rt.block_on(async {
         drop(
-            infer_type(
+            inspect_declaration(
                 &ctx,
-                InferTypeRequest {
-                    term: term.clone(),
-                    imports: imports.clone(),
+                InspectDeclarationRequest {
+                    name: "Nat.add_zero".to_owned(),
+                    file: None,
+                    imports: vec!["LeanRsFixture.Handles".to_owned()],
                     project: None,
+                    fields: InspectDeclarationFields::default(),
+                    max_field_bytes: Some(512),
+                    max_total_bytes: Some(2048),
                 },
             )
             .await,
         );
     });
 
-    c.bench_function("worker_roundtrip/infer_type", |b| {
+    c.bench_function("worker_roundtrip/inspect_declaration", |b| {
         b.iter(|| {
             rt.block_on(async {
-                infer_type(
+                inspect_declaration(
                     &ctx,
-                    InferTypeRequest {
-                        term: term.clone(),
-                        imports: imports.clone(),
+                    InspectDeclarationRequest {
+                        name: "Nat.add_zero".to_owned(),
+                        file: None,
+                        imports: vec!["LeanRsFixture.Handles".to_owned()],
                         project: None,
+                        fields: InspectDeclarationFields::default(),
+                        max_field_bytes: Some(512),
+                        max_total_bytes: Some(2048),
                     },
                 )
                 .await
-                .expect("infer_type")
+                .expect("inspect_declaration")
             });
         });
     });

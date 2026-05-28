@@ -96,6 +96,7 @@ fn init_tracing() {
     let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
 }
 
+#[allow(clippy::significant_drop_tightening)]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
     let env_default = args.lake_root;

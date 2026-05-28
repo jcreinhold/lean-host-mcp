@@ -3,13 +3,20 @@
 //! thread stops accepting work. Gated on `LEAN_HOST_MCP_TEST_FIXTURE` for
 //! the same reason as `tests/worker.rs`.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::significant_drop_tightening
+)]
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use lean_host_mcp::project::ProjectWorkClass;
 use lean_host_mcp::{LakeProjectMeta, LeanProject, ServerError, default_cache_dir};
+use lean_rs_worker_parent::{
+    LeanWorkerDeclarationInspectionFields, LeanWorkerDeclarationInspectionRequest, LeanWorkerOutputBudgets,
+};
 
 fn fixture_root() -> Option<PathBuf> {
     let root = std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok()?;
@@ -27,23 +34,28 @@ async fn open_call_shutdown_round_trip() {
 
     // Trivial closure: just confirm we can dispatch work to the actor and
     // get a Send + 'static value back.
+    let request = LeanWorkerDeclarationInspectionRequest {
+        name: "Nat.add_zero".to_owned(),
+        fields: LeanWorkerDeclarationInspectionFields::default(),
+        budgets: LeanWorkerOutputBudgets::default(),
+    };
     let call = project
-        .call(ProjectWorkClass::Semantic, Vec::new(), |cap| {
-            Ok(cap.runtime_metadata().lean_version.unwrap_or_default())
-        })
+        .inspect_declaration(vec!["Init".to_owned()], request)
         .await
         .expect("call");
-    let toolchain: String = call.value;
-    assert!(!toolchain.is_empty(), "fixture worker must report a lean_version");
+    assert!(call.runtime.worker_generation >= 1);
 
     project.shutdown();
 
     // After shutdown, calls return WorkerUnavailable. Give the closed-channel
     // path a moment to propagate.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let post = project
-        .call(ProjectWorkClass::Semantic, Vec::new(), |_cap| Ok(()))
-        .await;
+    let request = LeanWorkerDeclarationInspectionRequest {
+        name: "Nat.add_zero".to_owned(),
+        fields: LeanWorkerDeclarationInspectionFields::default(),
+        budgets: LeanWorkerOutputBudgets::default(),
+    };
+    let post = project.inspect_declaration(vec!["Init".to_owned()], request).await;
     assert!(
         matches!(post, Err(ServerError::WorkerUnavailable(_))),
         "call after shutdown must return WorkerUnavailable; got {post:?}"

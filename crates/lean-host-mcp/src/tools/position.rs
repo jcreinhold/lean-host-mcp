@@ -25,11 +25,12 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
-use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey, hash_bytes};
+use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
 use crate::envelope::{Response, RuntimeFacts};
 use crate::error::{Result, ServerError};
-use crate::project::{LeanProject, ProjectCall, ProjectWorkClass};
+use crate::project::{LeanProject, ProjectCall};
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
+use crate::tools::source_input::{header_imports, read_query_file, resolve_path};
 use crate::tools::{ToolContext, is_ignored_dir, session_imports};
 
 /// Hard cap on project-wide reference aggregation. File-local reference
@@ -920,27 +921,6 @@ fn reference_query_budgets() -> LeanWorkerOutputBudgets {
     expert_query_budgets()
 }
 
-struct QueryFile {
-    resolved: PathBuf,
-    hash: [u8; 32],
-    imports: Vec<String>,
-    source: String,
-}
-
-fn read_query_file(root: &Path, path: &Path) -> Result<QueryFile> {
-    let resolved = resolve_path(root, path).canonicalize().map_err(ServerError::Io)?;
-    let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
-    let hash = hash_bytes(&bytes);
-    let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
-    let imports = header_imports(&source);
-    Ok(QueryFile {
-        resolved,
-        hash,
-        imports,
-        source,
-    })
-}
-
 fn route_query_outcome(outcome: LeanWorkerModuleQueryOutcome, freshly_processed: bool) -> ModuleQueryRun {
     match outcome {
         LeanWorkerModuleQueryOutcome::Ok { result, .. } => ModuleQueryRun::Ready {
@@ -992,12 +972,8 @@ async fn process_module_query(
     query: LeanWorkerModuleQuery,
 ) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
     let imports = session_imports(header_imports(&source));
-    let call_imports = imports.clone();
     project
-        .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
-            let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
-            session.process_module_query(&source, query.clone(), &LeanWorkerElabOptions::new(), None, None)
-        })
+        .process_module_query(imports, source, query, LeanWorkerElabOptions::new())
         .await
 }
 
@@ -1009,13 +985,9 @@ async fn process_module_query_batch(
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
     let imports = session_imports(header_imports(&source));
-    let call_imports = imports.clone();
+    let options = LeanWorkerElabOptions::new().file_label(&file_label);
     project
-        .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
-            let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
-            let options = LeanWorkerElabOptions::new().file_label(&file_label);
-            session.process_module_query_batch(&source, &selectors, &budgets, &options, None, None)
-        })
+        .process_module_query_batch(imports, source, selectors, budgets, options)
         .await
 }
 
@@ -1207,14 +1179,6 @@ fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn resolve_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
 fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
 }
@@ -1329,30 +1293,6 @@ fn enumerate_lean_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn header_imports(source: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let line = line.split_once("--").map_or(line, |(before, _)| before);
-            let mut words = line.split_whitespace();
-            let mut token = words.next()?;
-            if token == "public" {
-                token = words.next()?;
-            }
-            if token == "meta" {
-                token = words.next()?;
-            }
-            if token != "import" {
-                return None;
-            }
-            if words.clone().next() == Some("all") {
-                let _ = words.next();
-            }
-            words.next().map(str::to_owned)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1369,9 +1309,10 @@ mod tests {
     use super::{
         BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, LeanQueryRequest, LeanQueryResult, LeanQuerySelector,
         ProofPositionSelector, ProofStateRequest, ProofStateResult, RenderedText, cache_status_label,
-        duplicate_selector_id, expert_query_budgets, header_imports, project_query_facts, proof_agent_budgets,
-        read_query_file, reference_query_budgets, route_batch_outcome, validate_lean_query_selectors,
+        duplicate_selector_id, expert_query_budgets, project_query_facts, proof_agent_budgets, reference_query_budgets,
+        route_batch_outcome, validate_lean_query_selectors,
     };
+    use crate::tools::source_input::{header_imports, read_query_file};
 
     fn worker_facts(status: LeanWorkerModuleCacheStatus) -> LeanWorkerModuleQueryCacheFacts {
         LeanWorkerModuleQueryCacheFacts {

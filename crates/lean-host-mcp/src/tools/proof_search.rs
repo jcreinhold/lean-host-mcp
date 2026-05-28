@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::broker::ProjectHint;
 use crate::envelope::{Response, RuntimeFacts};
 use crate::error::Result;
-use crate::project::{ProjectCall, ProjectWorkClass};
+use crate::project::ProjectCall;
 use crate::projections::{
     DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, project_declaration_search,
 };
@@ -469,15 +469,11 @@ async fn run_declaration_search(
     ctx.broker
         .with_project(hint, move |project| async move {
             let imports = session_imports(imports);
-            let call_imports = imports.clone();
-            project
-                .call(ProjectWorkClass::Semantic, call_imports, move |cap| {
-                    let mut session = cap.open_session_with_imports(imports.clone(), None, None)?;
-                    session
-                        .search_declarations(&search, None, None)
-                        .map(project_declaration_search)
-                })
-                .await
+            let call = project.search_declarations(imports, search).await?;
+            Ok(ProjectCall {
+                value: project_declaration_search(call.value),
+                runtime: call.runtime,
+            })
         })
         .await
 }

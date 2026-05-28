@@ -7,7 +7,7 @@
 // worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationInspectionFields, LeanWorkerDeclarationInspectionRequest, LeanWorkerOutputBudgets,
@@ -17,9 +17,10 @@ use serde::{Deserialize, Deserializer};
 
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
-use crate::error::{Result, ServerError};
-use crate::project::{ProjectCall, ProjectWorkClass};
+use crate::error::Result;
+use crate::project::ProjectCall;
 use crate::projections::{DeclarationInspectionResult, project_declaration_inspection};
+use crate::tools::source_input::{module_name_for_file, read_query_file};
 use crate::tools::{ToolContext, freshness_for, session_imports};
 
 const DEFAULT_FIELD_BYTES: u32 = 8 * 1024;
@@ -201,70 +202,7 @@ async fn inspect_name(
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<ProjectCall<lean_rs_worker_parent::LeanWorkerDeclarationInspectionResult>> {
     let request = LeanWorkerDeclarationInspectionRequest { name, fields, budgets };
-    project
-        .call(ProjectWorkClass::Semantic, imports.clone(), move |cap| {
-            let mut session = cap.open_session_with_imports(session_imports(imports.clone()), None, None)?;
-            session.inspect_declaration(&request, None, None)
-        })
-        .await
-}
-
-struct QueryFile {
-    resolved: PathBuf,
-    imports: Vec<String>,
-}
-
-fn read_query_file(root: &Path, path: &Path) -> Result<QueryFile> {
-    let resolved = resolve_path(root, path).canonicalize().map_err(ServerError::Io)?;
-    let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
-    let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
-    let imports = header_imports(&source);
-    Ok(QueryFile { resolved, imports })
-}
-
-fn resolve_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
-fn module_name_for_file(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    if relative.extension()? != "lean" {
-        return None;
-    }
-    let stemmed = relative.with_extension("");
-    let parts = stemmed
-        .components()
-        .map(|component| component.as_os_str().to_str())
-        .collect::<Option<Vec<_>>>()?;
-    if parts.is_empty() { None } else { Some(parts.join(".")) }
-}
-
-fn header_imports(source: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let line = line.split_once("--").map_or(line, |(before, _)| before);
-            let mut words = line.split_whitespace();
-            let mut token = words.next()?;
-            if token == "public" {
-                token = words.next()?;
-            }
-            if token == "meta" {
-                token = words.next()?;
-            }
-            if token != "import" {
-                return None;
-            }
-            if words.clone().next() == Some("all") {
-                let _ = words.next();
-            }
-            words.next().map(str::to_owned)
-        })
-        .collect()
+    project.inspect_declaration(session_imports(imports), request).await
 }
 
 fn budgets_for(req: &InspectDeclarationRequest) -> LeanWorkerOutputBudgets {

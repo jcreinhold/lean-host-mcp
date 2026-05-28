@@ -23,7 +23,12 @@
 //!     cargo test --test multi_project -- --ignored
 //! ```
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::significant_drop_tightening
+)]
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};

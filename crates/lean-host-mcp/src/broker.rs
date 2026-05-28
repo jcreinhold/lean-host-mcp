@@ -44,7 +44,7 @@ use parking_lot::Mutex;
 use crate::error::{Result, ServerError};
 use crate::index::fingerprint_lake_project;
 use crate::lake_meta::LakeProjectMeta;
-use crate::project::{LeanProject, SemanticGate};
+use crate::project::{LeanProject, SemanticAdmission};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
 pub const DEFAULT_MAX_PROJECTS: usize = 4;
@@ -187,7 +187,7 @@ struct BrokerInner {
 pub struct ProjectBroker {
     inner: Mutex<BrokerInner>,
     config: BrokerConfig,
-    semantic_gate: Arc<SemanticGate>,
+    semantic_admission: Arc<SemanticAdmission>,
 }
 
 impl std::fmt::Debug for ProjectBroker {
@@ -213,7 +213,7 @@ impl ProjectBroker {
                 last_used: HashMap::new(),
                 opening_locks: HashMap::new(),
             }),
-            semantic_gate: SemanticGate::new(config.semantic_permits),
+            semantic_admission: SemanticAdmission::new(config.semantic_permits),
             config,
         });
         broker.spawn_reaper();
@@ -354,6 +354,7 @@ impl ProjectBroker {
         if let Some(project) = cached_after_wait {
             let current_hash = fingerprint_lake_project(&root)?;
             if project.manifest_hash() == current_hash && project.is_healthy() {
+                self.inner.lock().opening_locks.remove(&root);
                 self.inner.lock().last_used.insert(root, Instant::now());
                 return Ok(project);
             }
@@ -368,29 +369,59 @@ impl ProjectBroker {
         }
 
         // Slow path: open without holding the registry lock.
-        let meta = LakeProjectMeta::from_explicit(&root)?;
-        let opened = LeanProject::open_with_gate(meta, &self.config.cache_dir, Arc::clone(&self.semantic_gate))?;
+        let meta = match LakeProjectMeta::from_explicit(&root) {
+            Ok(meta) => meta,
+            Err(err) => {
+                self.inner.lock().opening_locks.remove(&root);
+                return Err(err);
+            }
+        };
+        let opened = match LeanProject::open_with_admission(
+            meta,
+            &self.config.cache_dir,
+            Arc::clone(&self.semantic_admission),
+        ) {
+            Ok(project) => project,
+            Err(err) => {
+                self.inner.lock().opening_locks.remove(&root);
+                return Err(err);
+            }
+        };
 
         // Reacquire, race-resolve, insert with possible eviction.
         let mut inner = self.inner.lock();
         let (project, victim) = if let Some(existing) = inner.registry.get(&root).cloned() {
             // Someone else won the race. Use theirs; our `opened` will
             // shut down when the local `Arc` drops.
-            inner.last_used.insert(root, Instant::now());
+            inner.last_used.insert(root.clone(), Instant::now());
             (existing, Some(opened))
         } else {
             let victim = if inner.registry.len() >= inner.registry.cap().get() {
-                inner.registry.pop_lru()
+                pop_idle_lru(&mut inner.registry)
             } else {
                 None
             };
+            if victim.is_none() && inner.registry.len() >= inner.registry.cap().get() {
+                inner.opening_locks.remove(&root);
+                drop(inner);
+                opened.shutdown();
+                return Err(ServerError::WorkerUnavailable(crate::error::WorkerUnavailable {
+                    retryable: true,
+                    worker_restarted: false,
+                    project_root: root.to_string_lossy().into_owned(),
+                    session_id: String::new(),
+                    worker_generation: 0,
+                    reason: "project_pool_busy_all_entries_active".to_owned(),
+                }));
+            }
             if let Some((ref evicted_path, _)) = victim {
                 inner.last_used.remove(evicted_path);
             }
             inner.registry.put(root.clone(), Arc::clone(&opened));
-            inner.last_used.insert(root, Instant::now());
+            inner.last_used.insert(root.clone(), Instant::now());
             (opened, victim.map(|(_, v)| v))
         };
+        inner.opening_locks.remove(&root);
         drop(inner);
         if let Some(v) = victim {
             v.shutdown();
@@ -416,6 +447,11 @@ impl ProjectBroker {
                 .collect();
             let mut out: Vec<Arc<LeanProject>> = Vec::with_capacity(expired.len());
             for p in &expired {
+                if let Some(proj) = inner.registry.peek(p)
+                    && !proj.is_idle()
+                {
+                    continue;
+                }
                 if let Some(proj) = inner.registry.pop(p) {
                     out.push(proj);
                 }
@@ -454,6 +490,15 @@ fn walk_up_for_lakefile(start: &Path) -> Option<PathBuf> {
         cur = dir.parent();
     }
     None
+}
+
+fn pop_idle_lru(registry: &mut LruCache<PathBuf, Arc<LeanProject>>) -> Option<(PathBuf, Arc<LeanProject>)> {
+    let key = registry
+        .iter()
+        .rev()
+        .find_map(|(path, project)| project.is_idle().then(|| path.clone()))?;
+    let project = registry.pop(&key)?;
+    Some((key, project))
 }
 
 #[cfg(test)]
@@ -503,8 +548,9 @@ mod tests {
     fn resolve_returns_canonicalised_path_when_no_resolution_needed() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "explicit");
-        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None, None));
-        let resolved = broker.resolve(&ProjectHint::Explicit(proj.clone())).unwrap();
+        let resolved = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None, None))
+            .resolve(&ProjectHint::Explicit(proj.clone()))
+            .unwrap();
         assert_eq!(resolved, proj);
     }
 
