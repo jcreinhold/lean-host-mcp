@@ -1,4 +1,4 @@
-//! `project_scan`: filesystem regex sweep over the project's `.lean` files.
+//! `source_search`: filesystem source sweep over the project's `.lean` files.
 //! No Lean session involvement; cheapest tool in the catalogue.
 //!
 //! Routes through [`ProjectBroker::resolve_meta`] rather than
@@ -10,7 +10,7 @@
 
 // Same ownership rationale as `tools::lean`.
 #![allow(clippy::needless_pass_by_value)]
-// `project_scan` is worker-free, so the body has no `.await`. Keep `async`
+// `source_search` is worker-free, so the body has no `.await`. Keep `async`
 // for dispatcher symmetry with the other tool handlers in [`server.rs`];
 // the cost of one suppressed lint is much smaller than the cost of a
 // special case in the rmcp glue.
@@ -25,22 +25,19 @@ use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::tools::{ToolContext, freshness_for_meta, is_ignored_dir};
 
-const MAX_HITS: usize = 1000;
+const MAX_MATCHES: usize = 1000;
+const DEFAULT_MAX_FILES_SCANNED: usize = 2000;
+const MAX_FILES_SCANNED: usize = 10_000;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct ProjectScanRequest {
-    /// Named preset or raw regex. Presets: `sorry`, `admit`, `axiom`,
-    /// `set_option`. Raw regex requires `preset = "custom"` and `pattern`
-    /// to be set.
+pub struct SourceSearchRequest {
     pub preset: Preset,
-    /// Required when `preset = "custom"`.
     #[serde(default)]
     pub pattern: Option<String>,
-    /// Cap the number of returned hits.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Optional explicit project (absolute path to Lake root). When
-    /// omitted, the server resolves via env → cwd-walk → config default.
+    #[serde(default)]
+    pub max_files_scanned: Option<usize>,
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -51,28 +48,34 @@ pub enum Preset {
     Sorry,
     Admit,
     Axiom,
-    SetOption,
+    Imports,
+    Namespaces,
+    DeclarationNames,
+    TheoremStatements,
     Custom,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ProjectScanHit {
+pub struct SourceSearchMatch {
     pub file: String,
     pub line: u32,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ProjectScanResult {
-    pub hits: Vec<ProjectScanHit>,
+pub struct SourceSearchResult {
+    pub matches: Vec<SourceSearchMatch>,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
     pub truncated: bool,
+    pub source_based: bool,
 }
 
 /// # Errors
 ///
 /// Returns `ServerError::Internal` if the custom preset omits a pattern or
 /// the supplied pattern fails to compile as a regex.
-pub async fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<Response<ProjectScanResult>> {
+pub async fn source_search(ctx: &ToolContext, req: SourceSearchRequest) -> Result<Response<SourceSearchResult>> {
     let hint = ProjectHint::from_request(req.project);
     let meta = ctx.broker.resolve_meta(&hint)?;
     let freshness = freshness_for_meta(&meta);
@@ -80,16 +83,27 @@ pub async fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<
         Preset::Sorry => r"\bsorry\b".to_owned(),
         Preset::Admit => r"\badmit\b".to_owned(),
         Preset::Axiom => r"^\s*axiom\s".to_owned(),
-        Preset::SetOption => r"^\s*set_option\s".to_owned(),
+        Preset::Imports => r"^\s*(?:public\s+)?import\s+\S+".to_owned(),
+        Preset::Namespaces => r"^\s*namespace\s+\S+".to_owned(),
+        Preset::DeclarationNames => {
+            r"^\s*(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+|partial\s+)*(?:def|theorem|lemma|class|structure|inductive|instance|axiom)\s+\S+".to_owned()
+        }
+        Preset::TheoremStatements => r"^\s*(?:theorem|lemma)\s+\S+".to_owned(),
         Preset::Custom => req
             .pattern
             .clone()
             .ok_or_else(|| ServerError::Internal("custom preset requires pattern".into()))?,
     };
     let re = regex::Regex::new(&pattern).map_err(|e| ServerError::Internal(format!("regex {pattern}: {e}")))?;
-    let limit = req.limit.unwrap_or(MAX_HITS).min(MAX_HITS);
+    let limit = req.limit.unwrap_or(MAX_MATCHES).min(MAX_MATCHES);
+    let max_files_scanned = req
+        .max_files_scanned
+        .unwrap_or(DEFAULT_MAX_FILES_SCANNED)
+        .clamp(1, MAX_FILES_SCANNED);
     let root = meta.canonical_root.as_path();
-    let mut hits = Vec::new();
+    let mut matches = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut files_skipped = 0usize;
     let mut truncated = false;
     'walk: for entry in WalkDir::new(root)
         .follow_links(false)
@@ -103,18 +117,25 @@ pub async fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<
         if entry.path().extension().and_then(|s| s.to_str()) != Some("lean") {
             continue;
         }
+        if files_scanned >= max_files_scanned {
+            files_skipped = files_skipped.saturating_add(1);
+            truncated = true;
+            break 'walk;
+        }
         let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            files_skipped = files_skipped.saturating_add(1);
             continue;
         };
+        files_scanned = files_scanned.saturating_add(1);
         for (idx, line) in contents.lines().enumerate() {
             if re.is_match(line) {
-                if hits.len() >= limit {
+                if matches.len() >= limit {
                     truncated = true;
                     break 'walk;
                 }
                 let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
                 let rel_path = entry.path().strip_prefix(root).unwrap_or_else(|_| entry.path());
-                hits.push(ProjectScanHit {
+                matches.push(SourceSearchMatch {
                     file: rel_path.to_string_lossy().into_owned(),
                     line: line_no,
                     text: line.trim_end().to_owned(),
@@ -122,5 +143,14 @@ pub async fn project_scan(ctx: &ToolContext, req: ProjectScanRequest) -> Result<
             }
         }
     }
-    Ok(Response::ok(ProjectScanResult { hits, truncated }, freshness))
+    Ok(Response::ok(
+        SourceSearchResult {
+            matches,
+            files_scanned,
+            files_skipped,
+            truncated,
+            source_based: true,
+        },
+        freshness,
+    ))
 }

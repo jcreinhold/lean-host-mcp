@@ -10,10 +10,12 @@
 //!   built from bounded proof-state and declaration-search calls.
 //! - [`proof_action`]: `try_proof_step` and `verify_declaration`, the
 //!   non-mutating proof action tools.
-//! - [`scan`]: `project_scan`. No Lean dependency; pure filesystem walk
-//!   with a configurable regex.
-//! - [`position`]: `proof_state`, `lean_query`, `references_in_file`, and
-//!   `references_in_project`. Bounded module queries from
+//! - [`scan`]: `source_search`. No Lean dependency; pure filesystem walk
+//!   with source-oriented presets.
+//! - [`placement`]: `mathlib_placement`, bounded source-based placement
+//!   advice for Mathlib-compatible declarations.
+//! - [`position`]: `proof_state`, `lean_query`, and `find_references`.
+//!   Bounded module queries from
 //!   `lean-rs-worker`; the cache is keyed on path + content hash + query
 //!   shape.
 
@@ -21,6 +23,7 @@ use std::sync::Arc;
 
 pub mod declaration;
 pub mod lean;
+pub mod placement;
 pub mod position;
 pub mod proof_action;
 pub mod proof_search;
@@ -80,8 +83,7 @@ pub(crate) fn freshness_for_meta(meta: &LakeProjectMeta) -> Freshness {
 }
 
 /// Directory names skipped during `.lean` file enumeration. Shared between
-/// [`scan::project_scan`] and [`position::references_in_project`] so both
-/// tools agree on what counts as "the project".
+/// source and reference tools so both agree on what counts as "the project".
 pub(crate) fn is_ignored_dir(name: &str) -> bool {
     matches!(name, ".lake" | ".git" | "target" | "build" | "node_modules" | ".direnv")
 }

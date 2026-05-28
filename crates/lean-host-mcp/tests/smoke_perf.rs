@@ -178,6 +178,18 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         tool_names.contains("verify_declaration"),
         "tools/list must expose verify_declaration"
     );
+    assert!(
+        tool_names.contains("source_search"),
+        "tools/list must expose source_search"
+    );
+    assert!(
+        tool_names.contains("find_references"),
+        "tools/list must expose find_references"
+    );
+    assert!(
+        tool_names.contains("mathlib_placement"),
+        "tools/list must expose mathlib_placement"
+    );
     for removed in [
         "file_diagnostics",
         "goal_at_position",
@@ -185,6 +197,9 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         "hover_by_name",
         "type_of_name",
         "search_declarations",
+        "project_scan",
+        "references_in_file",
+        "references_in_project",
     ] {
         assert!(
             !tool_names.contains(removed),
@@ -359,8 +374,8 @@ fn fixture_calls() -> Vec<ToolCall> {
             }),
         },
         ToolCall {
-            label: "project_scan_sorry",
-            tool_name: "project_scan",
+            label: "source_search_sorry",
+            tool_name: "source_search",
             category: "source",
             arguments: json!({ "preset": "sorry", "limit": 20 }),
         },
@@ -482,22 +497,35 @@ fn fixture_calls() -> Vec<ToolCall> {
             }),
         },
         ToolCall {
-            label: "references_in_file_known_theorem",
-            tool_name: "references_in_file",
+            label: "find_references_file_known_theorem",
+            tool_name: "find_references",
             category: "position",
             arguments: json!({
+                "scope": "file",
                 "file": "LeanRsFixture/SourceRanges.lean",
                 "name": "LeanRsFixture.SourceRanges.knownTheorem"
             }),
         },
         ToolCall {
-            label: "references_in_project_known_theorem",
-            tool_name: "references_in_project",
+            label: "find_references_project_known_theorem",
+            tool_name: "find_references",
             category: "position",
             arguments: json!({
+                "scope": "project",
                 "name": "LeanRsFixture.SourceRanges.knownTheorem",
                 "files": ["LeanRsFixture/SourceRanges.lean"],
                 "limit": 20
+            }),
+        },
+        ToolCall {
+            label: "mathlib_placement_missing_root",
+            tool_name: "mathlib_placement",
+            category: "source",
+            arguments: json!({
+                "statement": "theorem smokePlacementProbe : True",
+                "concepts": ["True"],
+                "proposed_name": "smokePlacementProbe",
+                "mathlib_root": "DefinitelyMissingMathlibRoot"
             }),
         },
     ]
@@ -518,8 +546,8 @@ fn external_project_calls() -> Vec<ToolCall> {
             arguments: json!({ "name": "Nat.add_zero", "imports": [] }),
         },
         ToolCall {
-            label: "project_scan_sorry",
-            tool_name: "project_scan",
+            label: "source_search_sorry",
+            tool_name: "source_search",
             category: "source",
             arguments: json!({ "preset": "sorry", "limit": 50 }),
         },

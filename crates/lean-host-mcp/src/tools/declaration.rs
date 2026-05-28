@@ -78,32 +78,22 @@ impl From<InspectDeclarationFields> for LeanWorkerDeclarationInspectionFields {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct InspectDeclarationRequest {
-    /// Fully-qualified Lean declaration name, e.g. `Nat.add_zero`.
     #[serde(default)]
     pub name: Option<String>,
-    /// Path to a `.lean` file for cursor-based declaration resolution.
     #[serde(default)]
     pub file: Option<PathBuf>,
-    /// 1-indexed line for cursor-based declaration resolution.
     #[serde(default)]
     pub line: Option<u32>,
-    /// 1-indexed column for cursor-based declaration resolution.
     #[serde(default)]
     pub column: Option<u32>,
-    /// Module imports used for name-based inspection. Cursor inspection also
-    /// includes imports from the target file header.
     #[serde(default)]
     pub imports: Vec<String>,
-    /// Optional explicit project root for this call.
     #[serde(default)]
     pub project: Option<String>,
-    /// Optional field selection. Omitted fields default to enabled.
     #[serde(default)]
     pub fields: InspectDeclarationFields,
-    /// Per rendered-field byte cap. Defaults to 8192, clamped to 256..65536.
     #[serde(default)]
     pub max_field_bytes: Option<u32>,
-    /// Total rendered-text byte cap. Defaults to 65536, clamped to 1024..65536.
     #[serde(default)]
     pub max_total_bytes: Option<u32>,
 }

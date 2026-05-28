@@ -194,12 +194,6 @@ pub struct ReferenceHit {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ReferencesInFileResult {
-    pub references: Vec<ReferenceHit>,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReferencesProjection {
     pub references: Vec<ReferenceHit>,
     pub truncated: bool,
@@ -611,29 +605,21 @@ pub async fn lean_query(ctx: &ToolContext, req: LeanQueryRequest) -> Result<Resp
 
 // --- references --------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct ReferencesInFileRequest {
-    /// Path to a `.lean` file. Resolved against the resolved project root
-    /// if relative.
-    pub file: PathBuf,
-    /// Fully-qualified Lean name as the elaborator records it
-    /// (e.g. `"Nat.add"`). No normalisation.
-    pub name: String,
-    #[serde(default)]
-    pub project: Option<String>,
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceScope {
+    File,
+    Project,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct ReferencesInProjectRequest {
-    /// Fully-qualified Lean name as the elaborator records it
-    /// (e.g. `"Nat.add"`). No normalisation.
+pub struct FindReferencesRequest {
     pub name: String,
-    /// Files to search. Empty = explicitly walk every `.lean` file under
-    /// the resolved project root.
+    pub scope: ReferenceScope,
+    #[serde(default)]
+    pub file: Option<PathBuf>,
     #[serde(default)]
     pub files: Vec<PathBuf>,
-    /// Maximum references to return. Values above the server cap are
-    /// clamped to the cap.
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -653,119 +639,77 @@ pub struct MissingImportsFile {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ReferencesInProjectResult {
-    pub references: Vec<ReferenceHit>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-    pub files_scanned: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unsupported_files: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub header_parse_failed_files: Vec<HeaderParseFailedFile>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub missing_imports_files: Vec<MissingImportsFile>,
-}
-
-/// # Errors
-///
-/// Returns `ServerError::Io` when the file cannot be read, and propagates
-/// `ServerError::Lean` from the underlying worker call.
-pub async fn references_in_file(
-    ctx: &ToolContext,
-    req: ReferencesInFileRequest,
-) -> Result<Response<ReferencesInFileResult>> {
-    let hint = ProjectHint::from_request(req.project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let root = project.canonical_root().to_path_buf();
-            let resolved = resolve_path(&root, &req.file);
-            let display = display_path(&root, &resolved);
-            let query = LeanWorkerModuleQuery::References { name: req.name };
-            let outcome = run_module_query(&project, &resolved, query).await?;
-            let freshness = project.freshness(&outcome.imports);
-            match outcome.outcome {
-                ModuleQueryRun::Ready {
-                    result: LeanWorkerModuleQueryResult::References(result),
-                    freshly_processed,
-                    missing_imports,
-                } => {
-                    let references = result
-                        .references
-                        .iter()
-                        .map(|node| project_reference(&display, node))
-                        .collect();
-                    let response = Response::ok(
-                        ReferencesInFileResult {
-                            references,
-                            truncated: result.truncated,
-                        },
-                        freshness,
-                    );
-                    Ok(attach_query_notes(response, freshly_processed, &missing_imports, false))
-                }
-                ModuleQueryRun::Ready {
-                    freshly_processed,
-                    missing_imports,
-                    ..
-                } => Ok(attach_query_notes(
-                    Response::ok(
-                        ReferencesInFileResult {
-                            references: Vec::new(),
-                            truncated: false,
-                        },
-                        freshness,
-                    ),
-                    freshly_processed,
-                    &missing_imports,
-                    false,
-                )),
-                ModuleQueryRun::HeaderParseFailed { diagnostics } => {
-                    let mut response = Response::ok(
-                        ReferencesInFileResult {
-                            references: Vec::new(),
-                            truncated: false,
-                        },
-                        freshness,
-                    );
-                    response
-                        .warnings
-                        .push("file header did not parse; no references were collected".to_owned());
-                    response.warnings.push(format!(
-                        "header diagnostics available from lean_query: {}",
-                        diagnostics.diagnostics.len()
-                    ));
-                    Ok(response)
-                }
-                ModuleQueryRun::Unsupported => Ok(Response::ok(
-                    ReferencesInFileResult {
-                        references: Vec::new(),
-                        truncated: false,
-                    },
-                    freshness,
-                )),
-            }
-        })
-        .await
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FindReferencesResult {
+    Ok {
+        references: Vec<ReferenceHit>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        files_scanned: usize,
+        files_skipped: usize,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        unsupported_files: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        header_parse_failed_files: Vec<HeaderParseFailedFile>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        missing_imports_files: Vec<MissingImportsFile>,
+        semantic_based: bool,
+    },
+    InvalidRequest {
+        message: String,
+        semantic_based: bool,
+    },
 }
 
 /// # Errors
 ///
 /// Returns `ServerError::Lean` if an underlying file query fails for an
 /// infrastructure reason. Files that cannot be read are skipped silently
-/// (same policy as [`crate::tools::scan::project_scan`]).
-pub async fn references_in_project(
-    ctx: &ToolContext,
-    req: ReferencesInProjectRequest,
-) -> Result<Response<ReferencesInProjectResult>> {
+/// (same policy as [`crate::tools::scan::source_search`]).
+pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> Result<Response<FindReferencesResult>> {
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
         .with_project(hint, move |project| async move {
             let freshness = project.freshness(&[]);
             let root = project.canonical_root().to_path_buf();
-            let files = if req.files.is_empty() {
-                enumerate_lean_files(&root)
-            } else {
-                req.files.iter().map(|p| resolve_path(&root, p)).collect()
+            let files = match req.scope {
+                ReferenceScope::File => {
+                    let Some(file) = req.file.as_ref() else {
+                        return Ok(Response::ok(
+                            FindReferencesResult::InvalidRequest {
+                                message: "find_references with scope=file requires `file`".to_owned(),
+                                semantic_based: true,
+                            },
+                            freshness,
+                        ));
+                    };
+                    if !req.files.is_empty() {
+                        return Ok(Response::ok(
+                            FindReferencesResult::InvalidRequest {
+                                message: "find_references with scope=file accepts `file`, not `files`".to_owned(),
+                                semantic_based: true,
+                            },
+                            freshness,
+                        ));
+                    }
+                    vec![resolve_path(&root, file)]
+                }
+                ReferenceScope::Project => {
+                    if req.file.is_some() {
+                        return Ok(Response::ok(
+                            FindReferencesResult::InvalidRequest {
+                                message: "find_references with scope=project accepts `files`, not `file`".to_owned(),
+                                semantic_based: true,
+                            },
+                            freshness,
+                        ));
+                    }
+                    if req.files.is_empty() {
+                        enumerate_lean_files(&root)
+                    } else {
+                        req.files.iter().map(|p| resolve_path(&root, p)).collect()
+                    }
+                }
             };
             let limit = req.limit.unwrap_or(MAX_REFERENCES).min(MAX_REFERENCES);
 
@@ -775,6 +719,7 @@ pub async fn references_in_project(
             let mut missing_imports_files: Vec<MissingImportsFile> = Vec::new();
             let mut truncated = false;
             let mut files_scanned = 0usize;
+            let mut files_skipped = 0usize;
             let mut any_freshly_processed = false;
 
             'outer: for path in files {
@@ -842,7 +787,9 @@ pub async fn references_in_project(
                     }) => {
                         unsupported_files.push(display);
                     }
-                    Err(ServerError::Io(_)) => {}
+                    Err(ServerError::Io(_)) => {
+                        files_skipped = files_skipped.saturating_add(1);
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -854,13 +801,15 @@ pub async fn references_in_project(
                     .then(a.column.cmp(&b.column))
             });
 
-            let result = ReferencesInProjectResult {
+            let result = FindReferencesResult::Ok {
                 references: hits,
                 truncated,
                 files_scanned,
+                files_skipped,
                 unsupported_files,
                 header_parse_failed_files,
                 missing_imports_files,
+                semantic_based: true,
             };
             Ok(attach_query_notes(
                 Response::ok(result, freshness),
@@ -876,7 +825,6 @@ pub async fn references_in_project(
 
 struct QueryRun {
     outcome: ModuleQueryRun,
-    imports: Vec<String>,
 }
 
 enum ModuleQueryRun {
@@ -915,7 +863,6 @@ async fn run_module_query(project: &Arc<LeanProject>, path: &Path, query: LeanWo
     if let Some(outcome) = project.module_query_cache().get(&input.resolved, input.hash, &key) {
         return Ok(QueryRun {
             outcome: route_query_outcome(outcome, false),
-            imports: input.imports,
         });
     }
 
@@ -925,7 +872,6 @@ async fn run_module_query(project: &Arc<LeanProject>, path: &Path, query: LeanWo
         .insert(input.resolved, input.hash, key, outcome.clone());
     Ok(QueryRun {
         outcome: route_query_outcome(outcome, true),
-        imports: input.imports,
     })
 }
 

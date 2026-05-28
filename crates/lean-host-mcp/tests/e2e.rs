@@ -23,6 +23,7 @@ use std::process::Command;
 use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::tools::lean::{ElaborateRequest, ElaborateResult, InferTypeRequest, elaborate, infer_type};
+use lean_host_mcp::tools::placement::{MathlibPlacementRequest, mathlib_placement};
 use lean_host_mcp::tools::position::{
     DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ModuleQueryFacts,
     ProofStateRequest, ProofStateResult, TypeAtProjection, lean_query, proof_state,
@@ -31,6 +32,7 @@ use lean_host_mcp::tools::proof_action::{
     TryProofStepMode, TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
 };
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
+use lean_host_mcp::tools::scan::{Preset, SourceSearchRequest, source_search};
 use lean_host_mcp::{
     BrokerConfig, DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProjectBroker,
     ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, Response, ServerError,
@@ -224,6 +226,114 @@ async fn describe_prelude_name() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn source_search_returns_bounded_fixture_matches() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let resp = source_search(
+        &ctx,
+        SourceSearchRequest {
+            preset: Preset::TheoremStatements,
+            pattern: None,
+            limit: Some(2),
+            max_files_scanned: Some(20),
+            project: None,
+        },
+    )
+    .await
+    .expect("source_search");
+    assert!(resp.result.source_based);
+    assert!(resp.result.files_scanned > 0);
+    assert!(resp.result.matches.len() <= 2);
+    assert!(
+        resp.result.matches.iter().any(|hit| hit.text.contains("theorem")),
+        "fixture source search should return theorem source lines: {:?}",
+        resp.result.matches
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn mathlib_placement_uses_explicit_fake_mathlib_root() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let temp = tempfile::tempdir().expect("fake mathlib tempdir");
+    let mathlib = temp.path().join("Mathlib");
+    let data = mathlib.join("Data/List");
+    fs::create_dir_all(&data).expect("create fake Mathlib/Data/List");
+    fs::write(
+        data.join("Basic.lean"),
+        r"
+namespace List
+
+theorem map_append_fakePlacementExample : True := by
+  trivial
+
+end List
+",
+    )
+    .expect("write fake mathlib file");
+
+    let resp = mathlib_placement(
+        &ctx,
+        MathlibPlacementRequest {
+            name: None,
+            file: None,
+            line: None,
+            column: None,
+            statement: Some("theorem map_append_new : True".to_owned()),
+            concepts: vec!["List".to_owned(), "map_append".to_owned()],
+            proposed_name: Some("map_append_new".to_owned()),
+            mathlib_root: Some(mathlib),
+            project: None,
+            limit: Some(5),
+        },
+    )
+    .await
+    .expect("mathlib_placement");
+    assert_eq!(resp.result.status, "placement");
+    assert_eq!(resp.result.likely_file.as_deref(), Some("Data/List/Basic.lean"));
+    assert_eq!(resp.result.suggested_imports, vec!["Mathlib.Data.List.Basic"]);
+    assert!(
+        resp.result
+            .source_facts
+            .as_ref()
+            .is_some_and(|facts| facts.source_based)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn mathlib_placement_reports_missing_root() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let resp = mathlib_placement(
+        &ctx,
+        MathlibPlacementRequest {
+            name: None,
+            file: None,
+            line: None,
+            column: None,
+            statement: Some("theorem missing_mathlib_root_probe : True".to_owned()),
+            concepts: vec!["True".to_owned()],
+            proposed_name: Some("missing_mathlib_root_probe".to_owned()),
+            mathlib_root: Some(root.join("DefinitelyMissingMathlibRoot")),
+            project: None,
+            limit: None,
+        },
+    )
+    .await
+    .expect("mathlib_placement missing root");
+    assert_eq!(resp.result.status, "missing_mathlib_root");
+}
+
 #[test]
 fn is_def_eq_request_round_trips_transparency() {
     use lean_host_mcp::tools::lean::{IsDefEqRequest, Transparency};
@@ -314,9 +424,7 @@ fn proof_action_results_serialise_status_tags() {
 
 #[test]
 fn position_requests_round_trip() {
-    use lean_host_mcp::tools::position::{
-        LeanQueryRequest, ProofStateRequest, ReferencesInFileRequest, ReferencesInProjectRequest,
-    };
+    use lean_host_mcp::tools::position::{FindReferencesRequest, ReferenceScope};
 
     let g: ProofStateRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
     assert_eq!(g.line, 7);
@@ -327,26 +435,31 @@ fn position_requests_round_trip() {
             .unwrap();
     assert_eq!(q.selectors.len(), 1);
 
-    let r_file: ReferencesInFileRequest = serde_json::from_str(r#"{"file":"A.lean","name":"Nat.add"}"#).unwrap();
-    assert_eq!(r_file.file, PathBuf::from("A.lean"));
+    let r_file: FindReferencesRequest =
+        serde_json::from_str(r#"{"scope":"file","file":"A.lean","name":"Nat.add"}"#).unwrap();
+    assert!(matches!(r_file.scope, ReferenceScope::File));
+    assert_eq!(r_file.file, Some(PathBuf::from("A.lean")));
 
-    let r_project: ReferencesInProjectRequest =
-        serde_json::from_str(r#"{"name":"Nat.add","files":["A.lean","B.lean"],"limit":25}"#).unwrap();
+    let r_project: FindReferencesRequest =
+        serde_json::from_str(r#"{"scope":"project","name":"Nat.add","files":["A.lean","B.lean"],"limit":25}"#).unwrap();
+    assert!(matches!(r_project.scope, ReferenceScope::Project));
     assert_eq!(r_project.files.len(), 2);
     assert_eq!(r_project.limit, Some(25));
 }
 
 #[test]
 fn references_result_skips_empty_fields() {
-    use lean_host_mcp::tools::position::ReferencesInProjectResult;
+    use lean_host_mcp::tools::position::FindReferencesResult;
 
-    let empty = ReferencesInProjectResult {
+    let empty = FindReferencesResult::Ok {
         references: Vec::new(),
         truncated: false,
         files_scanned: 0,
+        files_skipped: 0,
         unsupported_files: Vec::new(),
         header_parse_failed_files: Vec::new(),
         missing_imports_files: Vec::new(),
+        semantic_based: true,
     };
     let s = serde_json::to_string(&empty).unwrap();
     assert!(!s.contains("truncated"), "truncated=false must be omitted: {s}");
@@ -363,17 +476,43 @@ fn references_result_skips_empty_fields() {
         "empty missing_imports_files must be omitted: {s}"
     );
 
-    let with_flags = ReferencesInProjectResult {
+    let with_flags = FindReferencesResult::Ok {
         references: Vec::new(),
         truncated: true,
         files_scanned: 1,
+        files_skipped: 0,
         unsupported_files: vec!["A.lean".into()],
         header_parse_failed_files: Vec::new(),
         missing_imports_files: Vec::new(),
+        semantic_based: true,
     };
     let s = serde_json::to_string(&with_flags).unwrap();
     assert!(s.contains("\"truncated\":true"));
     assert!(s.contains("\"unsupported_files\":[\"A.lean\"]"));
+
+    let invalid = FindReferencesResult::InvalidRequest {
+        message: "scope=file requires file".to_owned(),
+        semantic_based: true,
+    };
+    let s = serde_json::to_string(&invalid).unwrap();
+    assert!(s.contains(r#""status":"invalid_request""#));
+}
+
+#[test]
+fn source_search_and_mathlib_placement_requests_round_trip() {
+    let source: SourceSearchRequest =
+        serde_json::from_str(r#"{"preset":"custom","pattern":"theorem","limit":5,"max_files_scanned":10}"#).unwrap();
+    assert!(matches!(source.preset, Preset::Custom));
+    assert_eq!(source.pattern.as_deref(), Some("theorem"));
+    assert_eq!(source.limit, Some(5));
+    assert_eq!(source.max_files_scanned, Some(10));
+
+    let placement: MathlibPlacementRequest =
+        serde_json::from_str(r#"{"statement":"theorem foo : True","concepts":["True"],"proposed_name":"foo"}"#)
+            .unwrap();
+    assert_eq!(placement.statement.as_deref(), Some("theorem foo : True"));
+    assert_eq!(placement.concepts, vec!["True"]);
+    assert_eq!(placement.proposed_name.as_deref(), Some("foo"));
 }
 
 #[test]
@@ -643,7 +782,7 @@ async fn file_diagnostics_returns_real_errors() {
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn module_query_position_tools_return_bounded_results() {
     use lean_host_mcp::tools::position::{
-        LeanQueryItem, ReferencesInFileRequest, ReferencesInProjectRequest, references_in_file, references_in_project,
+        FindReferencesRequest, FindReferencesResult, LeanQueryItem, ReferenceScope, find_references,
     };
 
     let Some(root) = fixture_root() else {
@@ -744,36 +883,51 @@ async fn module_query_position_tools_return_bounded_results() {
     );
 
     let name = "LeanRsFixture.SourceRanges.knownTheorem".to_owned();
-    let file_refs = references_in_file(
+    let file_refs = find_references(
         &ctx,
-        ReferencesInFileRequest {
-            file: file.clone(),
+        FindReferencesRequest {
             name: name.clone(),
+            scope: ReferenceScope::File,
+            file: Some(file.clone()),
+            files: Vec::new(),
+            limit: None,
             project: None,
         },
     )
     .await
-    .expect("references_in_file");
+    .expect("find_references file");
+    let FindReferencesResult::Ok { references, .. } = file_refs.result else {
+        panic!("file reference lookup should succeed");
+    };
     assert!(
-        file_refs.result.references.iter().any(|hit| hit.kind == "def"),
-        "file-local references should include the binder for {name}: {:?}",
-        file_refs.result.references
+        references.iter().any(|hit| hit.kind == "def"),
+        "file-local references should include the binder for {name}: {references:?}"
     );
 
-    let project_refs = references_in_project(
+    let project_refs = find_references(
         &ctx,
-        ReferencesInProjectRequest {
+        FindReferencesRequest {
             name,
+            scope: ReferenceScope::Project,
+            file: None,
             files: vec![file],
             limit: Some(1),
             project: None,
         },
     )
     .await
-    .expect("references_in_project");
-    assert_eq!(project_refs.result.files_scanned, 1);
+    .expect("find_references project");
+    let FindReferencesResult::Ok {
+        references,
+        files_scanned,
+        ..
+    } = project_refs.result
+    else {
+        panic!("project reference lookup should succeed");
+    };
+    assert_eq!(files_scanned, 1);
     assert!(
-        project_refs.result.references.len() <= 1,
+        references.len() <= 1,
         "project reference scan must obey the requested limit"
     );
 }

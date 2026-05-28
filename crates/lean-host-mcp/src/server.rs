@@ -43,9 +43,7 @@ impl LeanHostService {
 
 #[tool_router]
 impl LeanHostService {
-    #[tool(
-        description = "Elaborate a Lean term against the project environment. Returns success or structured diagnostics."
-    )]
+    #[tool(description = "Elaborate a Lean term; return success or diagnostics.")]
     async fn elaborate(
         &self,
         Parameters(req): Parameters<tools::lean::ElaborateRequest>,
@@ -53,9 +51,7 @@ impl LeanHostService {
         wrap(tools::lean::elaborate(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Kernel-check a Lean declaration source. Returns Checked / Rejected / Unavailable / Unsupported plus diagnostics."
-    )]
+    #[tool(description = "Kernel-check one Lean declaration source.")]
     async fn kernel_check(
         &self,
         Parameters(req): Parameters<tools::lean::KernelCheckRequest>,
@@ -87,9 +83,7 @@ impl LeanHostService {
         wrap(tools::lean::is_def_eq(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Inspect one Lean declaration by name or cursor position, returning bounded statement, documentation, source, and metadata useful for proof work."
-    )]
+    #[tool(description = "Inspect one Lean declaration by name or cursor.")]
     async fn inspect_declaration(
         &self,
         Parameters(req): Parameters<tools::declaration::InspectDeclarationRequest>,
@@ -97,9 +91,7 @@ impl LeanHostService {
         wrap(tools::declaration::inspect_declaration(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Proof-agent retrieval: from a cursor or explicit goal/type text, return bounded ranked declarations likely to help the next proof step."
-    )]
+    #[tool(description = "Return ranked declarations for the next proof step.")]
     async fn search_for_proof(
         &self,
         Parameters(req): Parameters<tools::proof_search::SearchForProofRequest>,
@@ -107,9 +99,7 @@ impl LeanHostService {
         wrap(tools::proof_search::search_for_proof(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Try one or more proof snippets against an in-memory Lean source overlay. Never writes files."
-    )]
+    #[tool(description = "Try proof snippets in memory. Never writes files.")]
     async fn try_proof_step(
         &self,
         Parameters(req): Parameters<tools::proof_action::TryProofStepRequest>,
@@ -117,9 +107,7 @@ impl LeanHostService {
         wrap(tools::proof_action::try_proof_step(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Verify one Lean declaration in an in-memory source snapshot under a sorry/axiom policy. Never writes files."
-    )]
+    #[tool(description = "Verify one declaration in memory. Never writes files.")]
     async fn verify_declaration(
         &self,
         Parameters(req): Parameters<tools::proof_action::VerifyDeclarationRequest>,
@@ -127,19 +115,15 @@ impl LeanHostService {
         wrap(tools::proof_action::verify_declaration(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Filesystem regex sweep over the project's .lean files. Presets: sorry, admit, axiom, set_option."
-    )]
-    async fn project_scan(
+    #[tool(description = "Bounded source/text search over Lean files.")]
+    async fn source_search(
         &self,
-        Parameters(req): Parameters<tools::scan::ProjectScanRequest>,
-    ) -> std::result::Result<Json<Response<tools::scan::ProjectScanResult>>, McpError> {
-        wrap(tools::scan::project_scan(&self.ctx, req).await)
+        Parameters(req): Parameters<tools::scan::SourceSearchRequest>,
+    ) -> std::result::Result<Json<Response<tools::scan::SourceSearchResult>>, McpError> {
+        wrap(tools::scan::source_search(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Default proof-agent context at a cursor: diagnostics, goals, locals, expected type, and safe edit spans."
-    )]
+    #[tool(description = "Proof context at a cursor.")]
     async fn proof_state(
         &self,
         Parameters(req): Parameters<tools::position::ProofStateRequest>,
@@ -147,7 +131,7 @@ impl LeanHostService {
         wrap(tools::position::proof_state(&self.ctx, req).await)
     }
 
-    #[tool(description = "Expert tool: run a bounded custom batch of Lean semantic projections against one file.")]
+    #[tool(description = "Run a bounded semantic query batch against one file.")]
     async fn lean_query(
         &self,
         Parameters(req): Parameters<tools::position::LeanQueryRequest>,
@@ -155,24 +139,20 @@ impl LeanHostService {
         wrap(tools::position::lean_query(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Binder and use-site occurrences of a fully-qualified Lean name in one .lean file. Bounded and file-scoped."
-    )]
-    async fn references_in_file(
+    #[tool(description = "Find references to a fully-qualified Lean name.")]
+    async fn find_references(
         &self,
-        Parameters(req): Parameters<tools::position::ReferencesInFileRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::ReferencesInFileResult>>, McpError> {
-        wrap(tools::position::references_in_file(&self.ctx, req).await)
+        Parameters(req): Parameters<tools::position::FindReferencesRequest>,
+    ) -> std::result::Result<Json<Response<tools::position::FindReferencesResult>>, McpError> {
+        wrap(tools::position::find_references(&self.ctx, req).await)
     }
 
-    #[tool(
-        description = "Explicit project-wide scan for binder and use-site occurrences of a fully-qualified Lean name. Optional files and limit bound the walk."
-    )]
-    async fn references_in_project(
+    #[tool(description = "Advise Mathlib-compatible declaration placement.")]
+    async fn mathlib_placement(
         &self,
-        Parameters(req): Parameters<tools::position::ReferencesInProjectRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::ReferencesInProjectResult>>, McpError> {
-        wrap(tools::position::references_in_project(&self.ctx, req).await)
+        Parameters(req): Parameters<tools::placement::MathlibPlacementRequest>,
+    ) -> std::result::Result<Json<Response<tools::placement::MathlibPlacementResult>>, McpError> {
+        wrap(tools::placement::mathlib_placement(&self.ctx, req).await)
     }
 }
 
@@ -191,8 +171,9 @@ impl ServerHandler for LeanHostService {
             "MCP server hosting Lean 4 in-process via lean-rs. \
              Tools elaborate / kernel-check terms, run bounded MetaM ops, \
              inspect one selected declaration, try and verify proof actions \
-             without writing files, scan .lean files, and run bounded \
-             proof-context and semantic file queries."
+             without writing files, search source text, find references, \
+             advise Mathlib placement, and run bounded proof-context and \
+             semantic file queries."
                 .to_owned(),
         );
         info

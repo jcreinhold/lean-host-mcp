@@ -5,7 +5,8 @@ One crate, library plus two binaries (the MCP server and a tiny worker child). L
 ```
 main.rs         clap CLI, rmcp stdio entry
 server.rs       LeanHostService (rmcp glue)
-tools/          lean.rs (6), index.rs (3), position.rs (5), scan.rs (1)
+tools/          lean.rs, declaration.rs, proof_search.rs, proof_action.rs,
+                scan.rs, placement.rs, position.rs
 project.rs      LeanProject—closure-channel actor; owns the LeanWorkerHostHandle,
                 the DeclarationIndex, and the ModuleQueryCache for one Lake project
 projections.rs  pure data-shuffle helpers from lean-rs-worker shapes into the MCP wire
@@ -135,6 +136,24 @@ goes through `search_for_proof`, and callers inspect one selected candidate by n
 declaration facts. The old synchronous index rebuild path remains out of the MCP surface: a model-controlled tool should
 not be able to trigger a full environment walk plus bulk type rendering.
 
+## Source and placement policy
+
+`source_search` is a worker-free source/text scan. It resolves the routed Lake project only far enough to find the root,
+walks `.lean` files under the same ignored-directory policy as reference lookup, and reports `source_based: true` so
+callers do not confuse textual matches with Lean facts. It has presets for imports, namespaces, declaration names, and
+theorem statements.
+
+`find_references` is the single public reference tool. It requires `scope: "file"` or `scope: "project"` and reuses the
+Lean reference selector per file; malformed scope/file combinations are structured results, not worker errors. Project
+scope can still walk a tree, but the caller sees scanned/skipped counts, per-file header/import failures, unsupported
+files, and truncation.
+
+`mathlib_placement` is host policy rather than Lean runtime. It scans a bounded Mathlib source root for nearby files,
+namespaces, imports, possible duplicates, and naming examples, and optionally samples one selected declaration or
+statement through existing semantic tools. Root discovery is install-safe: explicit `mathlib_root`, then
+`<project>/Mathlib`, then `<project>/.lake/packages/mathlib/Mathlib`. There is no user-specific global fallback; missing
+roots return `status: "missing_mathlib_root"`.
+
 ## Non-mutating proof actions
 
 Proof actions are worker-backed overlays, not edits. `try_proof_step` reads one file, resolves a safe proof edit from
@@ -157,8 +176,7 @@ of these tools writes source files or creates a sandbox copy.
 `proof_state` and `lean_query` call the worker's `process_module_query_batch` capability. There is no whole-file
 info-tree result in the parent. `proof_state` hides the selector batch behind one proof-agent context with conservative
 host-owned output budgets. `lean_query` keeps the selector model available for expert callers that need a custom
-projection batch. The reference tools still use the older single-query capability until the later source/reference
-redesign replaces them.
+projection batch. `find_references` uses the older single-query capability per selected file.
 
 The worker owns module snapshot reuse for batched proof-agent queries and reports cache status, output bytes, and phase
 timings in each batch outcome. The host deliberately does not keep an exact batch-result cache for `proof_state` or
@@ -169,7 +187,7 @@ The cache is populated through `LeanProject`'s worker actor. The tool reads the 
 header, opens a short-lived worker session, passes the canonical file path as the worker `file_label`, and calls the
 batch or single-query worker method. Files whose header references modules the session's open env does not have still
 return a bounded result; the `MissingImports` signal travels as an envelope warning for single-file tools or a result
-sidebar for `references_in_project`.
+sidebar for `find_references`.
 
 Frame size is controlled by query shape, not transport tuning. The project actor uses the upstream worker frame cap, and
 the tool layer has no fallback that requests rendered `exprStr` / `typeStr` for every term in a file.

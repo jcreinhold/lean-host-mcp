@@ -202,19 +202,47 @@ The target can be a declaration `name` or a cursor `line`/`column`. `verificatio
 `unsupported`. Policy failures are data in the result, so a theorem containing `sorry` returns a successful MCP response
 with `verification_status: "has_sorry"` when `allow_sorry` is false.
 
-## Project scan (`src/tools/scan.rs`)
+## Source search (`src/tools/scan.rs`)
 
-### `project_scan`
+### `source_search`
 
-Filesystem regex sweep over the project's `.lean` files. No Lean dependency; results are textual matches, not elaborator
-output. Its freshness envelope reports `imports: []`.
+Bounded source/text search over the project's `.lean` files. No Lean dependency; results are textual matches, not
+elaborator output or semantic claims. Its freshness envelope reports `imports: []`.
 
 ```jsonc
 { "preset": "sorry" }
 { "preset": "custom", "pattern": "@\\[simp\\]", "limit": 100 }
 ```
 
-Presets: `sorry | admit | axiom | set_option | custom`.
+Presets: `sorry | admit | axiom | imports | namespaces | declaration_names | theorem_statements | custom`.
+
+Results include `matches`, `files_scanned`, `files_skipped`, `truncated`, and `source_based: true`.
+
+## Mathlib placement (`src/tools/placement.rs`)
+
+### `mathlib_placement`
+
+Bounded host-policy advice for where a declaration belongs in a Mathlib-compatible source layout. It scans Mathlib
+source text under an explicit or project-discovered root and may sample `inspect_declaration` / `search_for_proof` for
+the one selected declaration or statement. It never performs all-Mathlib semantic elaboration.
+
+```jsonc
+// request with an explicit Mathlib source root
+{
+  "statement": "theorem map_append_new : True",
+  "concepts": ["List", "map_append"],
+  "proposed_name": "map_append_new",
+  "mathlib_root": "/abs/path/to/project/.lake/packages/mathlib/Mathlib"
+}
+```
+
+When `mathlib_root` is omitted, discovery is limited to the routed project: `<project>/Mathlib` and
+`<project>/.lake/packages/mathlib/Mathlib`. Missing roots return `status: "missing_mathlib_root"` with the checked
+paths; there is no user-machine fallback path.
+
+Placement results include likely namespace/file/imports, nearby source declarations, possible duplicates, naming
+examples, upstream-readiness notes, source facts, semantic facts, and warnings. Source facts are explicitly
+source-based; semantic facts come only from selected bounded worker calls.
 
 ## Proof-agent module tools (`src/tools/position.rs`)
 
@@ -309,44 +337,31 @@ Duplicate selector ids and empty selector arrays return `status: "invalid_select
 `{ value, truncated }` objects where rendering can grow. `total_truncated` means the batch-level response budget was
 hit; selector-level budget exhaustion returns an item with `status: "budget_exceeded"`.
 
-### `references_in_file`
+### `find_references`
 
 ```jsonc
-// request
-{ "file": "LeanRsFixture/Scalars.lean", "name": "Nat.add" }
+// file scope
+{ "scope": "file", "file": "LeanRsFixture/Scalars.lean", "name": "Nat.add" }
+
+// project scope restricted to specific files
+{ "scope": "project", "name": "Nat.add", "files": ["LeanRsFixture/Scalars.lean"], "limit": 100 }
 
 // result
 {
-  "references": [
-    { "file": "LeanRsFixture/Scalars.lean", "line": 12, "column": 7,
-      "end_line": 12, "end_column": 14, "kind": "ref" }
-  ]
-}
-```
-
-`kind` is `"def"` at binder sites, `"ref"` at use sites. Name matching is exact: pass the fully-qualified form Lean
-records. The result includes `truncated` when the upstream reference projection hit its per-file budget.
-
-### `references_in_project`
-
-```jsonc
-// request: explicitly search every project .lean file
-{ "name": "Nat.add", "limit": 1000 }
-
-// request: restrict to specific files
-{ "name": "Nat.add", "files": ["LeanRsFixture/Scalars.lean"], "limit": 100 }
-
-// result
-{
+  "status": "ok",
   "references": [
     { "file": "LeanRsFixture/Scalars.lean", "line": 12, "column": 7,
       "end_line": 12, "end_column": 14, "kind": "ref" }
   ],
-  "files_scanned": 1
+  "files_scanned": 1,
+  "files_skipped": 0,
+  "semantic_based": true
 }
 ```
 
-Hits cap at `min(limit, 1000)` and set `truncated: true` when the scan stops early or a per-file query truncates. The
-walk continues past per-file failures; three sidebars (all omitted when empty) report them: `unsupported_files` (dylib
-lacks the shim), `header_parse_failed_files` (`{ file, diagnostics }`), `missing_imports_files` (`{ file, missing: [...]
-}`). Results are sorted by `(file, line, column)`.
+`kind` is `"def"` at binder sites, `"ref"` at use sites. Name matching is exact: pass the fully-qualified form Lean
+records. Hits cap at `min(limit, 1000)` and set `truncated: true` when the scan stops early or a per-file query
+truncates. Project scope walks every `.lean` file only when `files` is omitted. Malformed scope combinations return
+`status: "invalid_request"` as structured data. Per-file failures are reported in omitted-when-empty sidebars:
+`unsupported_files`, `header_parse_failed_files`, and `missing_imports_files`. Results are sorted by
+`(file, line, column)`.
