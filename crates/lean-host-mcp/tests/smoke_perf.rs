@@ -160,7 +160,6 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         .flatten()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
-    assert!(tool_names.contains("lean_query"), "tools/list must expose lean_query");
     assert!(tool_names.contains("proof_state"), "tools/list must expose proof_state");
     assert!(
         tool_names.contains("inspect_declaration"),
@@ -179,18 +178,13 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         "tools/list must expose verify_declaration"
     );
     assert!(
-        tool_names.contains("source_search"),
-        "tools/list must expose source_search"
-    );
-    assert!(
         tool_names.contains("find_references"),
         "tools/list must expose find_references"
     );
-    assert!(
-        tool_names.contains("mathlib_placement"),
-        "tools/list must expose mathlib_placement"
-    );
     for removed in [
+        "lean_query",
+        "source_search",
+        "mathlib_placement",
         "file_diagnostics",
         "goal_at_position",
         "type_at_position",
@@ -313,13 +307,12 @@ fn fixture_calls() -> Vec<ToolCall> {
             }),
         },
         ToolCall {
-            label: "inspect_cursor_known_theorem",
+            label: "inspect_known_theorem",
             tool_name: "inspect_declaration",
             category: "declaration",
             arguments: json!({
+                "name": "LeanRsFixture.SourceRanges.knownTheorem",
                 "file": "LeanRsFixture/SourceRanges.lean",
-                "line": 8,
-                "column": 3
             }),
         },
         ToolCall {
@@ -333,19 +326,12 @@ fn fixture_calls() -> Vec<ToolCall> {
             }),
         },
         ToolCall {
-            label: "source_search_sorry",
-            tool_name: "source_search",
-            category: "source",
-            arguments: json!({ "preset": "sorry", "limit": 20 }),
-        },
-        ToolCall {
             label: "try_proof_step_trivial",
             tool_name: "try_proof_step",
             category: "proof_action",
             arguments: json!({
                 "file": "LeanRsFixture/ProofActions.lean",
-                "line": 4,
-                "column": 3,
+                "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "snippet": "trivial"
             }),
         },
@@ -355,8 +341,7 @@ fn fixture_calls() -> Vec<ToolCall> {
             category: "proof_action",
             arguments: json!({
                 "file": "LeanRsFixture/ProofActions.lean",
-                "line": 4,
-                "column": 3,
+                "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "snippet": "exact missingIdentifier"
             }),
         },
@@ -366,8 +351,7 @@ fn fixture_calls() -> Vec<ToolCall> {
             category: "proof_action",
             arguments: json!({
                 "file": "LeanRsFixture/ProofActions.lean",
-                "line": 4,
-                "column": 3,
+                "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "snippets": [
                     "exact missingIdentifier",
                     "trivial",
@@ -387,7 +371,7 @@ fn fixture_calls() -> Vec<ToolCall> {
             category: "proof_action",
             arguments: json!({
                 "file": "LeanRsFixture/ProofActions.lean",
-                "name": "LeanRsFixture.ProofActions.closedTheorem",
+                "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "report_axioms": true
             }),
         },
@@ -397,7 +381,7 @@ fn fixture_calls() -> Vec<ToolCall> {
             category: "proof_action",
             arguments: json!({
                 "file": "LeanRsFixture/ProofActions.lean",
-                "name": "LeanRsFixture.ProofActions.sorryTheorem"
+                "declaration": "LeanRsFixture.ProofActions.sorryTheorem"
             }),
         },
         ToolCall {
@@ -406,8 +390,7 @@ fn fixture_calls() -> Vec<ToolCall> {
             category: "position",
             arguments: json!({
                 "file": "LeanRsFixture/SourceRanges.lean",
-                "line": 8,
-                "column": 3
+                "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
             }),
         },
         ToolCall {
@@ -416,18 +399,16 @@ fn fixture_calls() -> Vec<ToolCall> {
             category: "position",
             arguments: json!({
                 "file": "LeanRsFixture/SourceRanges.lean",
-                "line": 8,
-                "column": 3
+                "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
             }),
         },
         ToolCall {
-            label: "search_for_proof_trivial_cursor",
+            label: "search_for_proof_trivial_declaration",
             tool_name: "search_for_proof",
             category: "proof_search",
             arguments: json!({
                 "file": "LeanRsFixture/SourceRanges.lean",
-                "line": 8,
-                "column": 3,
+                "declaration": "LeanRsFixture.SourceRanges.knownTheorem",
                 "limit": 10
             }),
         },
@@ -440,19 +421,6 @@ fn fixture_calls() -> Vec<ToolCall> {
                 "imports": ["LeanRsFixture.SourceRanges"],
                 "mode": "exact",
                 "limit": 10
-            }),
-        },
-        ToolCall {
-            label: "lean_query_source_ranges",
-            tool_name: "lean_query",
-            category: "position",
-            arguments: json!({
-                "file": "LeanRsFixture/SourceRanges.lean",
-                "selectors": [
-                    { "selector": "diagnostics", "id": "diagnostics" },
-                    { "selector": "type_at", "id": "type", "line": 7, "column": 9 },
-                    { "selector": "proof_state", "id": "proof", "line": 8, "column": 3 }
-                ]
             }),
         },
         ToolCall {
@@ -476,43 +444,27 @@ fn fixture_calls() -> Vec<ToolCall> {
                 "limit": 20
             }),
         },
-        ToolCall {
-            label: "mathlib_placement_missing_root",
-            tool_name: "mathlib_placement",
-            category: "source",
-            arguments: json!({
-                "statement": "theorem smokePlacementProbe : True",
-                "concepts": ["True"],
-                "proposed_name": "smokePlacementProbe",
-                "mathlib_root": "DefinitelyMissingMathlibRoot"
-            }),
-        },
     ]
 }
 
 fn external_project_calls() -> Vec<ToolCall> {
-    let mut calls = vec![
-        ToolCall {
-            label: "inspect_nat_add_zero_no_imports",
-            tool_name: "inspect_declaration",
-            category: "declaration",
-            arguments: json!({ "name": "Nat.add_zero", "imports": [] }),
-        },
-        ToolCall {
-            label: "source_search_sorry",
-            tool_name: "source_search",
-            category: "source",
-            arguments: json!({ "preset": "sorry", "limit": 50 }),
-        },
-    ];
-    if let Ok(file) = std::env::var("LEAN_HOST_MCP_SMOKE_FILE") {
+    let mut calls = vec![ToolCall {
+        label: "inspect_nat_add_zero_no_imports",
+        tool_name: "inspect_declaration",
+        category: "declaration",
+        arguments: json!({ "name": "Nat.add_zero", "imports": [] }),
+    }];
+    if let (Ok(file), Ok(declaration)) = (
+        std::env::var("LEAN_HOST_MCP_SMOKE_FILE"),
+        std::env::var("LEAN_HOST_MCP_SMOKE_DECLARATION"),
+    ) {
         calls.push(ToolCall {
-            label: "lean_query_env_file_diagnostics",
-            tool_name: "lean_query",
+            label: "proof_state_env_declaration",
+            tool_name: "proof_state",
             category: "position",
             arguments: json!({
                 "file": file,
-                "selectors": [{ "selector": "diagnostics", "id": "diagnostics" }]
+                "declaration": declaration
             }),
         });
     }
@@ -523,36 +475,17 @@ fn kanproofs_calls() -> Vec<ToolCall> {
     let file = std::env::var("LEAN_HOST_MCP_SMOKE_KANPROOFS_FILE").unwrap_or_else(|_| {
         "KanProofs/AlgebraicGeometry/Sites/FiniteEtale/Quotient/BaseChange/Restrict.lean".to_owned()
     });
-    let line = env_u32("LEAN_HOST_MCP_SMOKE_KANPROOFS_LINE").unwrap_or(127);
-    let column = env_u32("LEAN_HOST_MCP_SMOKE_KANPROOFS_COLUMN").unwrap_or(10);
+    let declaration = std::env::var("LEAN_HOST_MCP_SMOKE_KANPROOFS_DECLARATION").unwrap_or_else(|_| "dummy".to_owned());
 
-    vec![
-        ToolCall {
-            label: "lean_query_basechange_restrict_diagnostics",
-            tool_name: "lean_query",
-            category: "kanproofs-position",
-            arguments: json!({
-                "file": file,
-                "selectors": [{ "selector": "diagnostics", "id": "diagnostics" }]
-            }),
-        },
-        ToolCall {
-            label: "proof_state_basechange_restrict_cursor",
-            tool_name: "proof_state",
-            category: "kanproofs-position",
-            arguments: json!({
-                "file": std::env::var("LEAN_HOST_MCP_SMOKE_KANPROOFS_FILE").unwrap_or_else(|_| {
-                    "KanProofs/AlgebraicGeometry/Sites/FiniteEtale/Quotient/BaseChange/Restrict.lean".to_owned()
-                }),
-                "line": line,
-                "column": column
-            }),
-        },
-    ]
-}
-
-fn env_u32(name: &str) -> Option<u32> {
-    std::env::var(name).ok()?.parse().ok()
+    vec![ToolCall {
+        label: "proof_state_kanproofs_declaration",
+        tool_name: "proof_state",
+        category: "kanproofs-position",
+        arguments: json!({
+            "file": file,
+            "declaration": declaration
+        }),
+    }]
 }
 
 struct McpServer {

@@ -1,8 +1,7 @@
 //! Declaration inspection for proof work.
 //!
 //! This is the model-facing declaration surface: inspect one selected
-//! declaration by name, or resolve one cursor to a declaration and inspect
-//! that name. Search remains owned by `search_for_proof`.
+//! declaration by name. Search remains owned by `search_for_proof`.
 
 // Tool handlers consume request structs so owned strings can cross the
 // worker-actor channel without extra lifetimes.
@@ -11,22 +10,17 @@
 use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
-    LeanWorkerDeclarationInspectionFields, LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationTargetResult,
-    LeanWorkerElabOptions, LeanWorkerModuleCacheStatus, LeanWorkerModuleQueryBatchOutcome,
-    LeanWorkerModuleQueryBatchResult, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets,
+    LeanWorkerDeclarationInspectionFields, LeanWorkerDeclarationInspectionRequest, LeanWorkerOutputBudgets,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
-use crate::projections::{
-    DeclarationInspectionCandidate, DeclarationInspectionResult, map_worker_err, project_declaration_inspection,
-};
+use crate::projections::{DeclarationInspectionResult, map_worker_err, project_declaration_inspection};
 use crate::tools::{ToolContext, freshness_for, session_imports};
 
-const DECLARATION_TARGET_ID: &str = "declaration_target";
 const DEFAULT_FIELD_BYTES: u32 = 8 * 1024;
 const MIN_FIELD_BYTES: u32 = 256;
 const MAX_FIELD_BYTES: u32 = 64 * 1024;
@@ -34,7 +28,7 @@ const DEFAULT_TOTAL_BYTES: u32 = 64 * 1024;
 const MIN_TOTAL_BYTES: u32 = 1024;
 const MAX_TOTAL_BYTES: u32 = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, JsonSchema)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "field-selection booleans mirror the lean-rs declaration inspection request"
@@ -50,6 +44,70 @@ pub struct InspectDeclarationFields {
     pub attributes: bool,
     #[serde(default = "default_true")]
     pub flags: bool,
+}
+
+impl<'de> Deserialize<'de> for InspectDeclarationFields {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+        if let Some(items) = value.as_array() {
+            let mut fields = Self {
+                source: false,
+                statement: false,
+                docstring: false,
+                attributes: false,
+                flags: false,
+            };
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err(serde::de::Error::custom("field selection list entries must be strings"));
+                };
+                match name {
+                    "source" => fields.source = true,
+                    "statement" | "type" => fields.statement = true,
+                    "docstring" | "docs" => fields.docstring = true,
+                    "attributes" => fields.attributes = true,
+                    "flags" => fields.flags = true,
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "unknown declaration inspection field `{other}`"
+                        )));
+                    }
+                }
+            }
+            return Ok(fields);
+        }
+        #[derive(Deserialize)]
+        #[allow(
+            clippy::struct_excessive_bools,
+            reason = "helper mirrors declaration inspection field-selection booleans"
+        )]
+        struct FieldObject {
+            #[serde(default = "default_true")]
+            source: bool,
+            #[serde(default = "default_true")]
+            statement: bool,
+            #[serde(default = "default_true")]
+            docstring: bool,
+            #[serde(default = "default_true")]
+            attributes: bool,
+            #[serde(default = "default_true")]
+            flags: bool,
+        }
+        let fields = FieldObject::deserialize(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            source: fields.source,
+            statement: fields.statement,
+            docstring: fields.docstring,
+            attributes: fields.attributes,
+            flags: fields.flags,
+        })
+    }
 }
 
 impl Default for InspectDeclarationFields {
@@ -78,14 +136,9 @@ impl From<InspectDeclarationFields> for LeanWorkerDeclarationInspectionFields {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct InspectDeclarationRequest {
-    #[serde(default)]
-    pub name: Option<String>,
+    pub name: String,
     #[serde(default)]
     pub file: Option<PathBuf>,
-    #[serde(default)]
-    pub line: Option<u32>,
-    #[serde(default)]
-    pub column: Option<u32>,
     #[serde(default)]
     pub imports: Vec<String>,
     #[serde(default)]
@@ -98,7 +151,7 @@ pub struct InspectDeclarationRequest {
     pub max_total_bytes: Option<u32>,
 }
 
-/// Inspect one Lean declaration by name or cursor position.
+/// Inspect one Lean declaration by name.
 ///
 /// # Errors
 ///
@@ -114,59 +167,23 @@ pub async fn inspect_declaration(
             let budgets = budgets_for(&req);
             let fields = req.fields.into();
 
-            if let Some(name) = req.name.clone().filter(|name| !name.trim().is_empty()) {
-                let result = inspect_name(&project, name, req.imports.clone(), fields, budgets).await?;
-                return Ok(Response::ok(result, freshness_for(&project, &req.imports)));
-            }
-
-            let Some(file) = req.file.clone() else {
+            if req.name.trim().is_empty() {
                 return Ok(Response::ok(
                     DeclarationInspectionResult::NotFound { name: None },
                     freshness_for(&project, &req.imports),
                 )
-                .warn("inspect_declaration requires either `name` or `file`/`line`/`column`"));
-            };
-            let (Some(line), Some(column)) = (req.line, req.column) else {
-                return Ok(Response::ok(
-                    DeclarationInspectionResult::NotFound { name: None },
-                    freshness_for(&project, &req.imports),
-                )
-                .warn("cursor inspection requires `file`, `line`, and `column`"));
-            };
-
-            let cursor = resolve_cursor_target(&project, &file, line, column).await?;
-            let mut imports = cursor.imports;
-            extend_unique(&mut imports, req.imports);
-            let freshness = project.freshness(&imports);
-
-            let mut response = match cursor.result {
-                CursorTargetResult::Target { name } => {
-                    let result = inspect_name(&project, name, imports, fields, budgets).await?;
-                    Response::ok(result, freshness)
-                }
-                CursorTargetResult::NotFound => {
-                    Response::ok(DeclarationInspectionResult::NotFound { name: None }, freshness)
-                        .warn("cursor did not resolve to a declaration target")
-                }
-                CursorTargetResult::Ambiguous { candidates } => {
-                    Response::ok(DeclarationInspectionResult::Ambiguous { candidates }, freshness)
-                        .warn("cursor resolved to multiple declaration targets")
-                }
-                CursorTargetResult::Unsupported => Response::ok(DeclarationInspectionResult::Unsupported, freshness),
-            };
-
-            if let Some(cache_status) = cursor.cache_status {
-                response
-                    .next_actions
-                    .push(format!("worker module snapshot cache status: {cache_status}"));
+                .warn("inspect_declaration requires `name`"));
             }
-            if !cursor.missing_imports.is_empty() {
-                response.warnings.push(format!(
-                    "file header referenced imports not present in the opened session: {}",
-                    cursor.missing_imports.join(", ")
-                ));
+            let mut imports = req.imports.clone();
+            if let Some(file) = req.file.as_ref() {
+                let input = read_query_file(project.canonical_root(), file)?;
+                extend_unique(&mut imports, input.imports);
+                if let Some(module) = module_name_for_file(project.canonical_root(), &input.resolved) {
+                    extend_unique(&mut imports, vec![module]);
+                }
             }
-            Ok(response)
+            let result = inspect_name(&project, req.name.clone(), imports.clone(), fields, budgets).await?;
+            Ok(Response::ok(result, freshness_for(&project, &imports)))
         })
         .await
 }
@@ -192,139 +209,9 @@ async fn inspect_name(
         .await
 }
 
-struct CursorTarget {
-    result: CursorTargetResult,
-    imports: Vec<String>,
-    missing_imports: Vec<String>,
-    cache_status: Option<&'static str>,
-}
-
-enum CursorTargetResult {
-    Target {
-        name: String,
-    },
-    NotFound,
-    Ambiguous {
-        candidates: Vec<DeclarationInspectionCandidate>,
-    },
-    Unsupported,
-}
-
-async fn resolve_cursor_target(
-    project: &crate::project::LeanProject,
-    path: &Path,
-    line: u32,
-    column: u32,
-) -> Result<CursorTarget> {
-    let input = read_query_file(project.canonical_root(), path)?;
-    let mut imports = input.imports.clone();
-    if let Some(module) = module_name_for_file(project.canonical_root(), &input.resolved) {
-        extend_unique(&mut imports, vec![module]);
-    }
-    let file_label = input.resolved.to_string_lossy().into_owned();
-    let selectors = vec![LeanWorkerModuleQuerySelector::DeclarationTarget {
-        id: DECLARATION_TARGET_ID.to_owned(),
-        name: None,
-        line: Some(line),
-        column: Some(column),
-    }];
-    let budgets = LeanWorkerOutputBudgets {
-        per_field_bytes: MIN_FIELD_BYTES,
-        total_bytes: MIN_TOTAL_BYTES,
-    };
-    let outcome = process_target_query(project, input.source, file_label, selectors, budgets).await?;
-    Ok(match outcome {
-        LeanWorkerModuleQueryBatchOutcome::Ok { result, facts, .. } => CursorTarget {
-            result: project_target_result(result.items),
-            imports,
-            missing_imports: Vec::new(),
-            cache_status: Some(cache_status_label(facts.cache_status)),
-        },
-        LeanWorkerModuleQueryBatchOutcome::MissingImports {
-            result, missing, facts, ..
-        } => CursorTarget {
-            result: project_target_result(result.items),
-            imports,
-            missing_imports: missing,
-            cache_status: Some(cache_status_label(facts.cache_status)),
-        },
-        LeanWorkerModuleQueryBatchOutcome::HeaderParseFailed { facts, .. } => CursorTarget {
-            result: CursorTargetResult::NotFound,
-            imports,
-            missing_imports: Vec::new(),
-            cache_status: Some(cache_status_label(facts.cache_status)),
-        },
-        LeanWorkerModuleQueryBatchOutcome::Unsupported => CursorTarget {
-            result: CursorTargetResult::Unsupported,
-            imports,
-            missing_imports: Vec::new(),
-            cache_status: None,
-        },
-        _ => CursorTarget {
-            result: CursorTargetResult::Unsupported,
-            imports,
-            missing_imports: Vec::new(),
-            cache_status: None,
-        },
-    })
-}
-
-async fn process_target_query(
-    project: &crate::project::LeanProject,
-    source: String,
-    file_label: String,
-    selectors: Vec<LeanWorkerModuleQuerySelector>,
-    budgets: LeanWorkerOutputBudgets,
-) -> Result<LeanWorkerModuleQueryBatchOutcome> {
-    let imports = session_imports(header_imports(&source));
-    project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let options = LeanWorkerElabOptions::new().file_label(&file_label);
-            session
-                .process_module_query_batch(&source, &selectors, &budgets, &options, None, None)
-                .map_err(map_worker_err)
-        })
-        .await
-}
-
-fn project_target_result(items: Vec<lean_rs_worker_parent::LeanWorkerModuleQueryBatchItem>) -> CursorTargetResult {
-    for item in items {
-        let lean_rs_worker_parent::LeanWorkerModuleQueryBatchItem::Ok { id, result } = item else {
-            continue;
-        };
-        if id != DECLARATION_TARGET_ID {
-            continue;
-        }
-        let LeanWorkerModuleQueryBatchResult::DeclarationTarget(target) = *result else {
-            continue;
-        };
-        return match target {
-            LeanWorkerDeclarationTargetResult::Target { info } => CursorTargetResult::Target {
-                name: info.declaration_name,
-            },
-            LeanWorkerDeclarationTargetResult::NotFound => CursorTargetResult::NotFound,
-            LeanWorkerDeclarationTargetResult::Ambiguous { candidates } => CursorTargetResult::Ambiguous {
-                candidates: candidates
-                    .into_iter()
-                    .map(|info| DeclarationInspectionCandidate {
-                        name: info.declaration_name,
-                        kind: info.declaration_kind,
-                    })
-                    .collect(),
-            },
-            _ => CursorTargetResult::NotFound,
-        };
-    }
-    CursorTargetResult::NotFound
-}
-
 struct QueryFile {
     resolved: PathBuf,
     imports: Vec<String>,
-    source: String,
 }
 
 fn read_query_file(root: &Path, path: &Path) -> Result<QueryFile> {
@@ -332,11 +219,7 @@ fn read_query_file(root: &Path, path: &Path) -> Result<QueryFile> {
     let bytes = std::fs::read(&resolved).map_err(ServerError::Io)?;
     let source = String::from_utf8(bytes).map_err(|e| ServerError::Internal(format!("file not UTF-8: {e}")))?;
     let imports = header_imports(&source);
-    Ok(QueryFile {
-        resolved,
-        imports,
-        source,
-    })
+    Ok(QueryFile { resolved, imports })
 }
 
 fn resolve_path(root: &Path, path: &Path) -> PathBuf {
@@ -405,16 +288,6 @@ fn extend_unique(out: &mut Vec<String>, extra: Vec<String>) {
     }
 }
 
-fn cache_status_label(status: LeanWorkerModuleCacheStatus) -> &'static str {
-    match status {
-        LeanWorkerModuleCacheStatus::Hit => "hit",
-        LeanWorkerModuleCacheStatus::Miss => "miss",
-        LeanWorkerModuleCacheStatus::Rebuilt => "rebuilt",
-        LeanWorkerModuleCacheStatus::Evicted => "evicted",
-        _ => "unknown",
-    }
-}
-
 const fn default_true() -> bool {
     true
 }
@@ -427,19 +300,10 @@ mod tests {
     #[test]
     fn inspect_request_accepts_name_mode() {
         let req: InspectDeclarationRequest = serde_json::from_str(r#"{"name":"Nat.add_zero"}"#).unwrap();
-        assert_eq!(req.name.as_deref(), Some("Nat.add_zero"));
+        assert_eq!(req.name, "Nat.add_zero");
         assert!(req.file.is_none());
         assert!(req.fields.statement);
         assert!(req.fields.docstring);
-    }
-
-    #[test]
-    fn inspect_request_accepts_cursor_mode() {
-        let req: InspectDeclarationRequest = serde_json::from_str(r#"{"file":"A.lean","line":4,"column":2}"#).unwrap();
-        assert_eq!(req.file, Some(PathBuf::from("A.lean")));
-        assert_eq!(req.line, Some(4));
-        assert_eq!(req.column, Some(2));
-        assert!(req.name.is_none());
     }
 
     #[test]
@@ -465,5 +329,16 @@ mod tests {
         assert!(!req.fields.docstring);
         assert!(req.fields.attributes);
         assert!(req.fields.flags);
+    }
+
+    #[test]
+    fn field_selection_accepts_string_list_shorthand() {
+        let req: InspectDeclarationRequest =
+            serde_json::from_str(r#"{"name":"Nat.add_zero","fields":["statement","attributes"]}"#).unwrap();
+        assert!(!req.fields.source);
+        assert!(req.fields.statement);
+        assert!(!req.fields.docstring);
+        assert!(req.fields.attributes);
+        assert!(!req.fields.flags);
     }
 }

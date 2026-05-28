@@ -1,5 +1,8 @@
-//! Tools that drive the Lean session directly: `elaborate`, `kernel_check`,
-//! `infer_type`, `whnf`, and `is_def_eq`.
+//! Internal low-level Lean session probes used by crate tests and benchmarks.
+//!
+//! These functions are deliberately not registered in the MCP server. The
+//! model-facing API exposes proof-work outcomes instead of term/meta
+//! primitives.
 //!
 //! Every tool returns a [`Response`] envelope; failure modes Lean reports
 //! (parse errors, elaboration errors, kernel rejections, meta timeouts) are

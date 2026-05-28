@@ -244,7 +244,7 @@ impl ProjectBroker {
     /// Resolve the hint and load the project's [`LakeProjectMeta`] without
     /// opening (or touching) a worker. Tools that only need filesystem-level
     /// information about the project (e.g.
-    /// [`source_search`](crate::tools::scan::source_search)) call this instead
+    /// project-scoped tools call this instead
     /// of [`Self::with_project`] so a broken worker bootstrap can't block a
     /// pure filesystem operation.
     ///

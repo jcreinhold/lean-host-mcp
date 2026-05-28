@@ -275,9 +275,17 @@ pub struct ProofAttemptCandidate {
     pub id: String,
     pub status: String,
     pub diagnostics: ElabFailure,
+    pub downstream_diagnostics: ElabFailure,
     pub goals: Vec<RenderedText>,
-    pub safe_edit: Option<ProofActionDeclarationTarget>,
+    pub declaration: Option<ProofActionDeclarationTarget>,
+    pub proof_position: Option<ProofPositionSummary>,
     pub output_truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ProofPositionSummary {
+    pub index: u32,
+    pub tactic: RenderedText,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -639,8 +647,13 @@ pub(crate) fn project_proof_attempt_row(row: LeanWorkerProofAttemptRow) -> Proof
         id: row.id,
         status: proof_attempt_status(row.status).to_owned(),
         diagnostics: project_failure(&row.diagnostics),
+        downstream_diagnostics: project_failure(&row.downstream_diagnostics),
         goals: row.goals.into_iter().map(project_rendered_info).collect(),
-        safe_edit: row.safe_edit.map(project_proof_action_target),
+        declaration: row.declaration.map(project_proof_action_target),
+        proof_position: row.proof_position.map(|position| ProofPositionSummary {
+            index: position.index,
+            tactic: project_rendered_info(position.tactic),
+        }),
         output_truncated: row.output_truncated,
     }
 }

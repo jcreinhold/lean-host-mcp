@@ -43,7 +43,7 @@ impl LeanHostService {
 
 #[tool_router]
 impl LeanHostService {
-    #[tool(description = "Inspect one Lean declaration by name or cursor.")]
+    #[tool(description = "Inspect one Lean declaration by name.")]
     async fn inspect_declaration(
         &self,
         Parameters(req): Parameters<tools::declaration::InspectDeclarationRequest>,
@@ -75,28 +75,12 @@ impl LeanHostService {
         wrap(tools::proof_action::verify_declaration(&self.ctx, req).await)
     }
 
-    #[tool(description = "Bounded source/text search over Lean files.")]
-    async fn source_search(
-        &self,
-        Parameters(req): Parameters<tools::scan::SourceSearchRequest>,
-    ) -> std::result::Result<Json<Response<tools::scan::SourceSearchResult>>, McpError> {
-        wrap(tools::scan::source_search(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Proof context at a cursor.")]
+    #[tool(description = "Proof context for a declaration proof position.")]
     async fn proof_state(
         &self,
         Parameters(req): Parameters<tools::position::ProofStateRequest>,
     ) -> std::result::Result<Json<Response<tools::position::ProofStateResult>>, McpError> {
         wrap(tools::position::proof_state(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Run a bounded semantic query batch against one file.")]
-    async fn lean_query(
-        &self,
-        Parameters(req): Parameters<tools::position::LeanQueryRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::LeanQueryResult>>, McpError> {
-        wrap(tools::position::lean_query(&self.ctx, req).await)
     }
 
     #[tool(description = "Find references to a fully-qualified Lean name.")]
@@ -105,14 +89,6 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::position::FindReferencesRequest>,
     ) -> std::result::Result<Json<Response<tools::position::FindReferencesResult>>, McpError> {
         wrap(tools::position::find_references(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Advise Mathlib-compatible declaration placement.")]
-    async fn mathlib_placement(
-        &self,
-        Parameters(req): Parameters<tools::placement::MathlibPlacementRequest>,
-    ) -> std::result::Result<Json<Response<tools::placement::MathlibPlacementResult>>, McpError> {
-        wrap(tools::placement::mathlib_placement(&self.ctx, req).await)
     }
 }
 
@@ -131,8 +107,7 @@ impl ServerHandler for LeanHostService {
             "MCP server hosting Lean 4 in-process via lean-rs. \
              Tools expose a bounded proof-agent workflow: proof context, \
              proof retrieval, declaration inspection, non-mutating proof \
-             attempts and verification, source search, reference lookup, \
-             Mathlib placement advice, and expert semantic file queries."
+             attempts and verification, and semantic reference lookup."
                 .to_owned(),
         );
         info

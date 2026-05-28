@@ -1,9 +1,7 @@
-//! Bounded module-query tools: `proof_state`, `lean_query`, and reference
-//! queries.
+//! Bounded declaration-context and reference tools.
 //!
-//! The public proof-agent path uses one batched worker call per file probe.
-//! `proof_state` presents a curated proof workflow context; `lean_query`
-//! keeps the underlying selector batch available for expert callers.
+//! The public proof-agent path uses declaration/proof-position anchors. Raw
+//! cursor and span selectors remain worker internals, not MCP inputs.
 
 // Tool handlers consume request structs so owned strings can cross the
 // worker-actor channel without extra lifetimes.
@@ -19,7 +17,7 @@ use lean_rs_worker_parent::{
     LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryBatchResult, LeanWorkerModuleQueryCacheFacts,
     LeanWorkerModuleQueryOutcome, LeanWorkerModuleQueryResult, LeanWorkerModuleQuerySelector,
     LeanWorkerModuleQueryTimings, LeanWorkerModuleSourceSpan, LeanWorkerNameRef, LeanWorkerOutputBudgets,
-    LeanWorkerProofStateInfo, LeanWorkerProofStateResult, LeanWorkerRenderedInfo,
+    LeanWorkerProofPositionSelector, LeanWorkerProofStateInfo, LeanWorkerProofStateResult, LeanWorkerRenderedInfo,
     LeanWorkerSurroundingDeclarationResult, LeanWorkerTypeAtResult,
 };
 use schemars::JsonSchema;
@@ -40,9 +38,6 @@ const MAX_REFERENCES: usize = 1000;
 
 const PROOF_STATE_DIAGNOSTICS_ID: &str = "diagnostics";
 const PROOF_STATE_CONTEXT_ID: &str = "proof_state";
-const PROOF_STATE_TARGET_ID: &str = "declaration_target";
-const PROOF_STATE_SURROUNDING_ID: &str = "surrounding_declaration";
-const PROOF_STATE_TERM_ID: &str = "term";
 
 const PROOF_AGENT_PER_FIELD_BYTES: u32 = 4 * 1024;
 const EXPERT_QUERY_PER_FIELD_BYTES: u32 = 8 * 1024;
@@ -151,9 +146,6 @@ pub struct ProofStateContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration_name: Option<String>,
     pub namespace_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub safe_edit: Option<DeclarationTargetInfo>,
-    pub span: SourceSpan,
     pub goals_before: Vec<String>,
     pub goals_after: Vec<String>,
     pub locals: Vec<LocalInfo>,
@@ -204,13 +196,38 @@ pub struct ProofStateRequest {
     /// Path to a `.lean` file. Resolved against the resolved project root
     /// if relative.
     pub file: PathBuf,
-    /// 1-indexed line.
-    pub line: u32,
-    /// 1-indexed column.
-    pub column: u32,
+    /// Fully-qualified or file-local declaration name to inspect.
+    pub declaration: String,
+    #[serde(default)]
+    pub proof_position: ProofPositionSelector,
     /// Optional explicit project root for this call.
     #[serde(default)]
     pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProofPositionSelector {
+    #[default]
+    Default,
+    Index {
+        index: u32,
+    },
+    AfterText {
+        text: String,
+        #[serde(default)]
+        occurrence: Option<u32>,
+    },
+}
+
+pub(crate) fn worker_proof_position(position: ProofPositionSelector) -> LeanWorkerProofPositionSelector {
+    match position {
+        ProofPositionSelector::Default => LeanWorkerProofPositionSelector::Default,
+        ProofPositionSelector::Index { index } => LeanWorkerProofPositionSelector::Index { index },
+        ProofPositionSelector::AfterText { text, occurrence } => {
+            LeanWorkerProofPositionSelector::AfterText { text, occurrence }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -228,8 +245,6 @@ pub enum ProofStateResult {
         declaration_name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         namespace_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        span: Option<SourceSpan>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         goals_before: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -238,16 +253,8 @@ pub enum ProofStateResult {
         locals: Vec<LocalInfo>,
         #[serde(skip_serializing_if = "Option::is_none")]
         expected_type: Option<RenderedText>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        safe_edit: Option<Box<DeclarationTargetInfo>>,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        target_declaration: Option<Box<DeclarationTargetProjection>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        surrounding_declaration: Option<Box<SurroundingDeclarationProjection>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        term: Option<Box<TypeAtProjection>>,
         total_truncated: bool,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         unavailable: Vec<SelectorMessage>,
@@ -380,40 +387,24 @@ pub enum LeanQueryResult {
     Unsupported,
 }
 
-/// Inspect the current Lean proof context at a cursor position.
+/// Inspect the current Lean proof context at a declaration proof position.
 ///
 /// # Errors
 ///
 /// Returns `ServerError::Io` when the file cannot be read and
 /// `ServerError::Lean` for worker infrastructure failures.
 pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Response<ProofStateResult>> {
-    let hint = ProjectHint::from_request(req.project);
+    let hint = ProjectHint::from_request(req.project.clone());
     ctx.broker
         .with_project(hint, move |project| async move {
             let selectors = vec![
                 LeanWorkerModuleQuerySelector::Diagnostics {
                     id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
                 },
-                LeanWorkerModuleQuerySelector::ProofState {
+                LeanWorkerModuleQuerySelector::ProofStateInDeclaration {
                     id: PROOF_STATE_CONTEXT_ID.to_owned(),
-                    line: req.line,
-                    column: req.column,
-                },
-                LeanWorkerModuleQuerySelector::DeclarationTarget {
-                    id: PROOF_STATE_TARGET_ID.to_owned(),
-                    name: None,
-                    line: Some(req.line),
-                    column: Some(req.column),
-                },
-                LeanWorkerModuleQuerySelector::SurroundingDeclaration {
-                    id: PROOF_STATE_SURROUNDING_ID.to_owned(),
-                    line: req.line,
-                    column: req.column,
-                },
-                LeanWorkerModuleQuerySelector::TypeAt {
-                    id: PROOF_STATE_TERM_ID.to_owned(),
-                    line: req.line,
-                    column: req.column,
+                    declaration: req.declaration,
+                    position: worker_proof_position(req.proof_position),
                 },
             ];
             let budgets = proof_agent_budgets();
@@ -434,16 +425,11 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                     };
                     let mut declaration_name = None;
                     let mut namespace_name = None;
-                    let mut span = None;
                     let mut goals_before = Vec::new();
                     let mut goals_after = Vec::new();
                     let mut locals = Vec::new();
                     let mut expected_type = None;
-                    let mut safe_edit = None;
                     let mut truncated = false;
-                    let mut term = None;
-                    let mut target_declaration = None;
-                    let mut surrounding_declaration = None;
                     let mut unavailable = Vec::new();
                     let mut budget_exceeded = Vec::new();
 
@@ -458,27 +444,16 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                                         let info = *info;
                                         declaration_name = info.declaration_name;
                                         namespace_name = Some(info.namespace_name);
-                                        span = Some(info.span);
                                         goals_before = info.goals_before;
                                         goals_after = info.goals_after;
                                         locals = info.locals;
                                         expected_type = info.expected_type;
-                                        safe_edit = info.safe_edit.map(Box::new);
                                         truncated = info.truncated;
                                     }
                                     ProofStateProjection::Unavailable { message } => {
                                         unavailable.push(SelectorMessage { id, message });
                                     }
                                 },
-                                (PROOF_STATE_TARGET_ID, LeanQueryProjection::DeclarationTarget(value)) => {
-                                    target_declaration = Some(Box::new(value));
-                                }
-                                (PROOF_STATE_SURROUNDING_ID, LeanQueryProjection::SurroundingDeclaration(value)) => {
-                                    surrounding_declaration = Some(Box::new(value));
-                                }
-                                (PROOF_STATE_TERM_ID, LeanQueryProjection::TypeAt(value)) => {
-                                    term = Some(Box::new(value));
-                                }
                                 _ => {}
                             },
                             ProjectedBatchItem::Unavailable { id, message } => {
@@ -495,16 +470,11 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                             diagnostics,
                             declaration_name,
                             namespace_name,
-                            span,
                             goals_before,
                             goals_after,
                             locals,
                             expected_type,
-                            safe_edit,
                             truncated,
-                            target_declaration,
-                            surrounding_declaration,
-                            term,
                             total_truncated: result.total_truncated,
                             unavailable,
                             budget_exceeded,
@@ -664,8 +634,8 @@ pub enum FindReferencesResult {
 /// # Errors
 ///
 /// Returns `ServerError::Lean` if an underlying file query fails for an
-/// infrastructure reason. Files that cannot be read are skipped silently
-/// (same policy as [`crate::tools::scan::source_search`]).
+/// infrastructure reason. Files that cannot be read are counted as skipped
+/// files so a bounded project-scope lookup can continue.
 pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> Result<Response<FindReferencesResult>> {
     let hint = ProjectHint::from_request(req.project);
     ctx.broker
@@ -1100,8 +1070,6 @@ fn project_proof_state_info(info: LeanWorkerProofStateInfo) -> ProofStateContext
     ProofStateContext {
         declaration_name: info.declaration_name,
         namespace_name: info.namespace_name,
-        safe_edit: info.safe_edit.map(project_declaration_target_info),
-        span: span_of_module(info.span),
         goals_before: info.goals_before,
         goals_after: info.goals_after,
         locals: info.locals.into_iter().map(project_local_info).collect(),
@@ -1367,11 +1335,10 @@ mod tests {
     };
 
     use super::{
-        BatchQueryRun, DeclarationTargetProjection, DiagnosticSummary, DiagnosticsBlock, LeanQueryRequest,
-        LeanQueryResult, LeanQuerySelector, ProofStateRequest, ProofStateResult, RenderedText, SourceSpan,
-        SurroundingDeclarationProjection, cache_status_label, duplicate_selector_id, expert_query_budgets,
-        header_imports, project_query_facts, proof_agent_budgets, read_query_file, reference_query_budgets,
-        route_batch_outcome, validate_lean_query_selectors,
+        BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, LeanQueryRequest, LeanQueryResult, LeanQuerySelector,
+        ProofPositionSelector, ProofStateRequest, ProofStateResult, RenderedText, cache_status_label,
+        duplicate_selector_id, expert_query_budgets, header_imports, project_query_facts, proof_agent_budgets,
+        read_query_file, reference_query_budgets, route_batch_outcome, validate_lean_query_selectors,
     };
 
     fn worker_facts(status: LeanWorkerModuleCacheStatus) -> LeanWorkerModuleQueryCacheFacts {
@@ -1413,9 +1380,9 @@ import Init -- comment
     #[test]
     fn proof_state_request_round_trips() {
         let request: ProofStateRequest =
-            serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
-        assert_eq!(request.line, 7);
-        assert_eq!(request.column, 3);
+            serde_json::from_str(r#"{"file":"Foo/Bar.lean","declaration":"Foo.Bar.t"}"#).unwrap();
+        assert_eq!(request.declaration, "Foo.Bar.t");
+        assert!(matches!(request.proof_position, ProofPositionSelector::Default));
     }
 
     #[test]
@@ -1442,12 +1409,6 @@ import Init -- comment
             },
             declaration_name: Some("Demo.proof".to_owned()),
             namespace_name: Some("Demo".to_owned()),
-            span: Some(SourceSpan {
-                start_line: 3,
-                start_column: 5,
-                end_line: 3,
-                end_column: 12,
-            }),
             goals_before: vec!["⊢ True".to_owned()],
             goals_after: Vec::new(),
             locals: Vec::new(),
@@ -1455,11 +1416,7 @@ import Init -- comment
                 value: "True".to_owned(),
                 truncated: false,
             }),
-            safe_edit: None,
             truncated: false,
-            target_declaration: Some(Box::new(DeclarationTargetProjection::NotFound)),
-            surrounding_declaration: Some(Box::new(SurroundingDeclarationProjection::None)),
-            term: None,
             total_truncated: false,
             unavailable: Vec::new(),
             budget_exceeded: Vec::new(),
@@ -1470,10 +1427,10 @@ import Init -- comment
         assert_eq!(value["status"], "context");
         assert_eq!(value["declaration_name"], "Demo.proof");
         assert_eq!(value["namespace_name"], "Demo");
-        assert_eq!(value["span"]["start_line"], 3);
         assert_eq!(value["goals_before"][0], "⊢ True");
         assert_eq!(value["expected_type"]["value"], "True");
-        assert_eq!(value["target_declaration"]["status"], "not_found");
+        assert!(value.get("span").is_none());
+        assert!(value.get("safe_edit").is_none());
         assert!(value.get("proof_state").is_none());
         assert!(value.get("declaration_target").is_none());
     }

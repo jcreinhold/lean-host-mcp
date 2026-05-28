@@ -11,10 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
-    LeanWorkerDeclarationTargetResult, LeanWorkerDeclarationVerificationRequest,
-    LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions, LeanWorkerModuleQueryBatchOutcome,
-    LeanWorkerModuleQueryBatchResult, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets,
-    LeanWorkerProofAttemptRequest, LeanWorkerProofCandidate, LeanWorkerProofEditTarget, LeanWorkerProofStateResult,
+    LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions,
+    LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofCandidate, LeanWorkerProofEditTarget,
     LeanWorkerSorryPolicy,
 };
 use schemars::JsonSchema;
@@ -25,12 +23,11 @@ use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::projections::{
     DeclarationVerificationResult, ElabFailure, ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult,
-    map_worker_err, project_declaration_verification, project_proof_action_target, project_proof_attempt,
+    map_worker_err, project_declaration_verification, project_proof_attempt,
 };
+use crate::tools::position::{ProofPositionSelector, worker_proof_position};
 use crate::tools::{ToolContext, session_imports};
 
-const PROOF_STATE_ID: &str = "proof_state";
-const DECLARATION_TARGET_ID: &str = "declaration_target";
 const MAX_CANDIDATES: usize = 8;
 const DEFAULT_FIELD_BYTES: u32 = 4 * 1024;
 const MIN_FIELD_BYTES: u32 = 256;
@@ -39,28 +36,18 @@ const DEFAULT_TOTAL_BYTES: u32 = 64 * 1024;
 const MIN_TOTAL_BYTES: u32 = 1024;
 const MAX_TOTAL_BYTES: u32 = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TryProofStepMode {
-    #[default]
-    SafeEdit,
-    InsertAt,
-    DeclarationBody,
-}
-
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct TryProofStepRequest {
     pub file: PathBuf,
-    pub line: u32,
-    pub column: u32,
+    pub declaration: String,
+    #[serde(default)]
+    pub proof_position: ProofPositionSelector,
     #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
     pub snippet: Option<String>,
     #[serde(default)]
     pub snippets: Vec<String>,
-    #[serde(default)]
-    pub mode: TryProofStepMode,
     #[serde(default)]
     pub max_field_bytes: Option<u32>,
     #[serde(default)]
@@ -72,14 +59,9 @@ pub struct TryProofStepRequest {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct VerifyDeclarationRequest {
     pub file: PathBuf,
+    pub declaration: String,
     #[serde(default)]
     pub project: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub line: Option<u32>,
-    #[serde(default)]
-    pub column: Option<u32>,
     #[serde(default)]
     pub allow_sorry: bool,
     #[serde(default)]
@@ -124,42 +106,27 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
                 .warn("try_proof_step requires `snippet` or `snippets`"));
             }
 
-            let resolved = resolve_action_target(
-                &project,
-                input.source.clone(),
-                file_label.clone(),
-                req.line,
-                req.column,
-                req.mode,
-            )
-            .await?;
-            let mut response = match resolved.target {
-                ActionTarget::Edit { edit, safe_edit } => {
-                    let request = LeanWorkerProofAttemptRequest {
-                        source: input.source,
-                        edit,
-                        candidates,
-                        budgets,
-                    };
-                    let result = project
-                        .submit(move |cap| {
-                            let mut session = cap
-                                .open_session_with_imports(session_imports(input.imports.clone()), None, None)
-                                .map_err(map_worker_err)?;
-                            session
-                                .attempt_proof(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
-                                .map(project_proof_attempt)
-                                .map_err(map_worker_err)
-                        })
-                        .await?;
-                    Response::ok(
-                        append_capped_rows(fill_missing_safe_edit(result, safe_edit), extra_rows),
-                        freshness,
-                    )
-                }
-                ActionTarget::Unsupported => Response::ok(ProofAttemptResult::Unsupported, freshness)
-                    .warn("cursor did not resolve to a safe proof edit target"),
+            let request = LeanWorkerProofAttemptRequest {
+                source: input.source,
+                edit: LeanWorkerProofEditTarget::Declaration {
+                    name: req.declaration.clone(),
+                    position: worker_proof_position(req.proof_position.clone()),
+                },
+                candidates,
+                budgets,
             };
+            let result = project
+                .submit(move |cap| {
+                    let mut session = cap
+                        .open_session_with_imports(session_imports(input.imports.clone()), None, None)
+                        .map_err(map_worker_err)?;
+                    session
+                        .attempt_proof(&request, &elab_options(&file_label, req.heartbeat_limit), None, None)
+                        .map(project_proof_attempt)
+                        .map_err(map_worker_err)
+                })
+                .await?;
+            let mut response = Response::ok(append_capped_rows(result, extra_rows), freshness);
             response
                 .next_actions
                 .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
@@ -185,17 +152,12 @@ pub async fn verify_declaration(
             let file_label = input.resolved.to_string_lossy().into_owned();
             let freshness = project.freshness(&input.imports);
             let budgets = proof_action_budgets(req.max_field_bytes, req.max_total_bytes);
-            let target = if let Some(name) = req.name.clone().filter(|name| !name.trim().is_empty()) {
-                VerificationTarget::Target(LeanWorkerDeclarationVerificationTarget::Name { name })
-            } else if let (Some(line), Some(column)) = (req.line, req.column) {
-                resolve_verification_target(&project, input.source.clone(), file_label.clone(), line, column).await?
-            } else {
-                VerificationTarget::Unsupported
-            };
-
-            let VerificationTarget::Target(target) = target else {
+            if req.declaration.trim().is_empty() {
                 return Ok(Response::ok(DeclarationVerificationResult::Unsupported, freshness)
-                    .warn("verify_declaration requires `name` or `file`/`line`/`column`"));
+                    .warn("verify_declaration requires `declaration`"));
+            }
+            let target = LeanWorkerDeclarationVerificationTarget::Name {
+                name: req.declaration.clone(),
             };
 
             let request = LeanWorkerDeclarationVerificationRequest {
@@ -322,8 +284,13 @@ fn capped_candidate_rows(req: &TryProofStepRequest) -> Vec<ProofAttemptCandidate
                 diagnostics: Vec::new(),
                 truncated: false,
             },
+            downstream_diagnostics: ElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
             goals: Vec::new(),
-            safe_edit: None,
+            declaration: None,
+            proof_position: None,
             output_truncated: false,
         })
         .collect()
@@ -358,231 +325,11 @@ fn append_capped_rows(result: ProofAttemptResult, extra_rows: Vec<ProofAttemptCa
     }
 }
 
-fn fill_missing_safe_edit(
-    result: ProofAttemptResult,
-    safe_edit: Option<crate::projections::ProofActionDeclarationTarget>,
-) -> ProofAttemptResult {
-    match result {
-        ProofAttemptResult::Ok { result, imports } => ProofAttemptResult::Ok {
-            result: fill_rows_safe_edit(result, safe_edit),
-            imports,
-        },
-        ProofAttemptResult::MissingImports {
-            result,
-            imports,
-            missing,
-        } => ProofAttemptResult::MissingImports {
-            result: fill_rows_safe_edit(result, safe_edit),
-            imports,
-            missing,
-        },
-        ProofAttemptResult::HeaderParseFailed { diagnostics } => ProofAttemptResult::HeaderParseFailed { diagnostics },
-        ProofAttemptResult::Unsupported => ProofAttemptResult::Unsupported,
-    }
-}
-
-fn fill_rows_safe_edit(
-    mut envelope: ProofAttemptEnvelope,
-    safe_edit: Option<crate::projections::ProofActionDeclarationTarget>,
-) -> ProofAttemptEnvelope {
-    if let Some(safe_edit) = safe_edit {
-        for row in &mut envelope.candidates {
-            if row.safe_edit.is_none() {
-                row.safe_edit = Some(safe_edit.clone());
-            }
-        }
-    }
-    envelope
-}
-
 fn append_rows(mut envelope: ProofAttemptEnvelope, mut extra_rows: Vec<ProofAttemptCandidate>) -> ProofAttemptEnvelope {
     envelope.candidates.append(&mut extra_rows);
     envelope.candidate_limit = MAX_CANDIDATES as u32;
     envelope.candidates_truncated = envelope.candidates_truncated || envelope.candidates.len() > MAX_CANDIDATES;
     envelope
-}
-
-enum ActionTarget {
-    Edit {
-        edit: LeanWorkerProofEditTarget,
-        safe_edit: Option<crate::projections::ProofActionDeclarationTarget>,
-    },
-    Unsupported,
-}
-
-struct ResolvedActionTarget {
-    target: ActionTarget,
-}
-
-async fn resolve_action_target(
-    project: &crate::project::LeanProject,
-    source: String,
-    file_label: String,
-    line: u32,
-    column: u32,
-    mode: TryProofStepMode,
-) -> Result<ResolvedActionTarget> {
-    if matches!(mode, TryProofStepMode::InsertAt) {
-        return Ok(ResolvedActionTarget {
-            target: ActionTarget::Edit {
-                edit: LeanWorkerProofEditTarget::InsertAt { line, column },
-                safe_edit: None,
-            },
-        });
-    }
-
-    let outcome = run_target_query(project, source, file_label, line, column).await?;
-    Ok(match resolve_target_from_batch(outcome) {
-        ResolvedCursor::SafeEdit { span } if matches!(mode, TryProofStepMode::SafeEdit) => ResolvedActionTarget {
-            target: ActionTarget::Edit {
-                edit: LeanWorkerProofEditTarget::ReplaceSpan {
-                    span: span.body_span.clone(),
-                },
-                safe_edit: Some(project_proof_action_target(span)),
-            },
-        },
-        ResolvedCursor::Declaration { name, info } => {
-            let edit = if matches!(mode, TryProofStepMode::DeclarationBody) {
-                LeanWorkerProofEditTarget::DeclarationBody { name }
-            } else {
-                LeanWorkerProofEditTarget::ReplaceSpan {
-                    span: info.body_span.clone(),
-                }
-            };
-            ResolvedActionTarget {
-                target: ActionTarget::Edit {
-                    edit,
-                    safe_edit: Some(project_proof_action_target(info)),
-                },
-            }
-        }
-        ResolvedCursor::SafeEdit { span } => ResolvedActionTarget {
-            target: ActionTarget::Edit {
-                edit: LeanWorkerProofEditTarget::ReplaceSpan {
-                    span: span.body_span.clone(),
-                },
-                safe_edit: Some(project_proof_action_target(span)),
-            },
-        },
-        ResolvedCursor::Unsupported => ResolvedActionTarget {
-            target: ActionTarget::Unsupported,
-        },
-    })
-}
-
-enum VerificationTarget {
-    Target(LeanWorkerDeclarationVerificationTarget),
-    Unsupported,
-}
-
-async fn resolve_verification_target(
-    project: &crate::project::LeanProject,
-    source: String,
-    file_label: String,
-    line: u32,
-    column: u32,
-) -> Result<VerificationTarget> {
-    let outcome = run_target_query(project, source, file_label, line, column).await?;
-    Ok(match resolve_target_from_batch(outcome) {
-        ResolvedCursor::Declaration { info, .. } => {
-            VerificationTarget::Target(LeanWorkerDeclarationVerificationTarget::Span {
-                span: info.declaration_span,
-            })
-        }
-        ResolvedCursor::SafeEdit { span } => {
-            VerificationTarget::Target(LeanWorkerDeclarationVerificationTarget::Span {
-                span: span.declaration_span,
-            })
-        }
-        ResolvedCursor::Unsupported => VerificationTarget::Unsupported,
-    })
-}
-
-async fn run_target_query(
-    project: &crate::project::LeanProject,
-    source: String,
-    file_label: String,
-    line: u32,
-    column: u32,
-) -> Result<LeanWorkerModuleQueryBatchOutcome> {
-    let imports = session_imports(header_imports(&source));
-    let selectors = vec![
-        LeanWorkerModuleQuerySelector::ProofState {
-            id: PROOF_STATE_ID.to_owned(),
-            line,
-            column,
-        },
-        LeanWorkerModuleQuerySelector::DeclarationTarget {
-            id: DECLARATION_TARGET_ID.to_owned(),
-            name: None,
-            line: Some(line),
-            column: Some(column),
-        },
-    ];
-    let budgets = LeanWorkerOutputBudgets {
-        per_field_bytes: MIN_FIELD_BYTES,
-        total_bytes: MIN_TOTAL_BYTES,
-    };
-    project
-        .submit(move |cap| {
-            let mut session = cap
-                .open_session_with_imports(imports, None, None)
-                .map_err(map_worker_err)?;
-            let options = LeanWorkerElabOptions::new().file_label(&file_label);
-            session
-                .process_module_query_batch(&source, &selectors, &budgets, &options, None, None)
-                .map_err(map_worker_err)
-        })
-        .await
-}
-
-enum ResolvedCursor {
-    SafeEdit {
-        span: lean_rs_worker_parent::LeanWorkerDeclarationTargetInfo,
-    },
-    Declaration {
-        name: String,
-        info: lean_rs_worker_parent::LeanWorkerDeclarationTargetInfo,
-    },
-    Unsupported,
-}
-
-fn resolve_target_from_batch(outcome: LeanWorkerModuleQueryBatchOutcome) -> ResolvedCursor {
-    let items = match outcome {
-        LeanWorkerModuleQueryBatchOutcome::Ok { result, .. }
-        | LeanWorkerModuleQueryBatchOutcome::MissingImports { result, .. } => result.items,
-        LeanWorkerModuleQueryBatchOutcome::HeaderParseFailed { .. }
-        | LeanWorkerModuleQueryBatchOutcome::Unsupported
-        | _ => return ResolvedCursor::Unsupported,
-    };
-
-    let mut declaration = None;
-    for item in items {
-        let lean_rs_worker_parent::LeanWorkerModuleQueryBatchItem::Ok { id, result } = item else {
-            continue;
-        };
-        match (id.as_str(), *result) {
-            (
-                PROOF_STATE_ID,
-                LeanWorkerModuleQueryBatchResult::ProofState(LeanWorkerProofStateResult::State { info }),
-            ) => {
-                if let Some(safe_edit) = info.safe_edit {
-                    return ResolvedCursor::SafeEdit { span: safe_edit };
-                }
-            }
-            (
-                DECLARATION_TARGET_ID,
-                LeanWorkerModuleQueryBatchResult::DeclarationTarget(LeanWorkerDeclarationTargetResult::Target { info }),
-            ) => {
-                declaration = Some(ResolvedCursor::Declaration {
-                    name: info.declaration_name.clone(),
-                    info,
-                });
-            }
-            _ => {}
-        }
-    }
-    declaration.unwrap_or(ResolvedCursor::Unsupported)
 }
 
 #[cfg(test)]
@@ -601,13 +348,11 @@ mod tests {
     fn try_proof_step_request_accepts_single_snippet() {
         let req: TryProofStepRequest = serde_json::from_value(json!({
             "file": "Demo.lean",
-            "line": 3,
-            "column": 8,
+            "declaration": "Demo.closed",
             "snippet": "rfl"
         }))
         .unwrap();
         assert_eq!(requested_snippets(&req), vec!["rfl"]);
-        assert!(matches!(req.mode, TryProofStepMode::SafeEdit));
     }
 
     #[test]
@@ -615,12 +360,11 @@ mod tests {
         let snippets = (0..10).map(|idx| format!("exact h{idx}")).collect::<Vec<_>>();
         let req = TryProofStepRequest {
             file: PathBuf::from("Demo.lean"),
-            line: 1,
-            column: 1,
+            declaration: "Demo.closed".to_owned(),
+            proof_position: ProofPositionSelector::Default,
             project: None,
             snippet: None,
             snippets,
-            mode: TryProofStepMode::SafeEdit,
             max_field_bytes: None,
             max_total_bytes: None,
             heartbeat_limit: None,
@@ -632,24 +376,15 @@ mod tests {
     }
 
     #[test]
-    fn verify_declaration_request_accepts_name_and_cursor_modes() {
-        let by_name: VerifyDeclarationRequest = serde_json::from_value(json!({
+    fn verify_declaration_request_accepts_declaration_mode() {
+        let req: VerifyDeclarationRequest = serde_json::from_value(json!({
             "file": "Demo.lean",
-            "name": "Demo.closed",
+            "declaration": "Demo.closed",
             "report_axioms": true
         }))
         .unwrap();
-        assert_eq!(by_name.name.as_deref(), Some("Demo.closed"));
-        assert!(by_name.report_axioms);
-
-        let by_cursor: VerifyDeclarationRequest = serde_json::from_value(json!({
-            "file": "Demo.lean",
-            "line": 4,
-            "column": 3
-        }))
-        .unwrap();
-        assert_eq!(by_cursor.line, Some(4));
-        assert!(!by_cursor.allow_sorry);
+        assert_eq!(req.declaration, "Demo.closed");
+        assert!(req.report_axioms);
     }
 
     #[test]

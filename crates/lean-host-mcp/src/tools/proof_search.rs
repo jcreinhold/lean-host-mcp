@@ -1,7 +1,7 @@
 //! Proof-agent declaration retrieval.
 //!
 //! `search_for_proof` is an intent-shaped orchestration over existing
-//! bounded primitives: cursor context comes from `proof_state`, candidate
+//! bounded primitives: declaration context comes from `proof_state`, candidate
 //! generation comes from lean-rs declaration search v2, and ranking stays
 //! local and deterministic. It deliberately does not render declarations.
 
@@ -27,7 +27,7 @@ use crate::projections::{
     DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, map_worker_err,
     project_declaration_search,
 };
-use crate::tools::position::{ProofStateRequest, ProofStateResult};
+use crate::tools::position::{ProofPositionSelector, ProofStateRequest, ProofStateResult};
 use crate::tools::{ToolContext, freshness_for, session_imports};
 
 const DEFAULT_LIMIT: usize = 10;
@@ -50,16 +50,15 @@ pub enum ProofSearchMode {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchForProofRequest {
-    /// Path to a `.lean` file for cursor-based proof retrieval.
+    /// Path to a `.lean` file for declaration-based proof retrieval.
     #[serde(default)]
     pub file: Option<PathBuf>,
-    /// 1-indexed cursor line for cursor-based proof retrieval.
+    /// Declaration name for file-based proof retrieval.
     #[serde(default)]
-    pub line: Option<u32>,
-    /// 1-indexed cursor column for cursor-based proof retrieval.
+    pub declaration: Option<String>,
     #[serde(default)]
-    pub column: Option<u32>,
-    /// Explicit goal text when no file cursor is available.
+    pub proof_position: ProofPositionSelector,
+    /// Explicit goal text when no file/declaration context is available.
     #[serde(default)]
     pub goal: Option<String>,
     /// Explicit type/proposition text. Used with or instead of `goal`.
@@ -194,13 +193,16 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
         .collect::<Vec<_>>()
         .join("\n");
 
-    if let (Some(file), Some(line), Some(column)) = (req.file.clone(), req.line, req.column) {
+    if let (Some(file), Some(declaration)) = (
+        req.file.clone(),
+        req.declaration.clone().filter(|value| !value.trim().is_empty()),
+    ) {
         let proof_response = crate::tools::position::proof_state(
             ctx,
             ProofStateRequest {
                 file,
-                line,
-                column,
+                declaration,
+                proof_position: req.proof_position.clone(),
                 project: req.project.clone(),
             },
         )
@@ -317,7 +319,7 @@ fn profile_from_text(
 ) -> TargetProfile {
     let constants = extract_constants(&text);
     let heads = extract_heads(&text);
-    let name_fragments = extract_name_fragments(&constants, &heads);
+    let name_fragments = extract_name_fragments(&text, &constants, &heads);
     TargetProfile {
         namespace,
         constants,
@@ -353,7 +355,9 @@ fn plan_searches(profile: &TargetProfile, mode: ProofSearchMode) -> Vec<PlannedS
             }
         }
         ProofSearchMode::Exact | ProofSearchMode::Apply | ProofSearchMode::NextStep => {
-            if let Some(head) = primary_head.as_deref() {
+            if let Some(head) = primary_head.as_deref()
+                && !(mode == ProofSearchMode::NextStep && constants.is_empty() && is_broad_head(head))
+            {
                 push_head_search(&mut out, profile, "conclusion_head", Some(head));
             }
             if !constants.is_empty() {
@@ -597,6 +601,14 @@ fn candidate_score(
     if mode == ProofSearchMode::Simp && row.name.contains("simp") {
         score = score.saturating_add(8);
     }
+    if is_generic_candidate(&row.name) {
+        score = score.saturating_sub(40);
+    }
+    for fragment in &profile.name_fragments {
+        if row.name.to_lowercase().contains(fragment) {
+            score = score.saturating_add(5);
+        }
+    }
     if search_label == "required_constants" {
         score = score.saturating_add(6);
     }
@@ -604,6 +616,22 @@ fn candidate_score(
         score = score.saturating_add(20);
     }
     score
+}
+
+fn is_broad_head(head: &str) -> bool {
+    matches!(head, "Eq" | "Iff" | "Exists" | "True")
+}
+
+fn is_generic_candidate(name: &str) -> bool {
+    let has_generic_segment = name.split('.').any(|segment| {
+        segment == "rec"
+            || segment == "recOn"
+            || segment == "ndrec"
+            || segment.starts_with("rec_")
+            || segment.starts_with("recOn_")
+            || segment.starts_with("ndrec_")
+    });
+    name.starts_with("Acc.") || has_generic_segment
 }
 
 fn pruned_from_facts(facts: &DeclarationSearchFacts, returned: usize) -> usize {
@@ -677,10 +705,13 @@ fn extract_heads(text: &str) -> Vec<String> {
     heads.into_iter().collect()
 }
 
-fn extract_name_fragments(constants: &[String], heads: &[String]) -> Vec<String> {
+fn extract_name_fragments(text: &str, constants: &[String], heads: &[String]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for item in constants.iter().chain(heads.iter()) {
+        if is_broad_head(item) {
+            continue;
+        }
         for segment in item.split('.') {
             let fragment = segment.trim_matches('_');
             if fragment.len() >= 3 && seen.insert(fragment.to_lowercase()) {
@@ -691,7 +722,25 @@ fn extract_name_fragments(constants: &[String], heads: &[String]) -> Vec<String>
             }
         }
     }
+    for token in identifier_tokens(text) {
+        for segment in token.split('.') {
+            let fragment = segment.trim_matches('_').to_lowercase();
+            if fragment.len() >= 3 && useful_lower_fragment(&fragment) && seen.insert(fragment.clone()) {
+                out.push(fragment);
+            }
+            if out.len() >= MAX_NAME_FRAGMENTS {
+                return out;
+            }
+        }
+    }
     out
+}
+
+fn useful_lower_fragment(fragment: &str) -> bool {
+    matches!(
+        fragment,
+        "den" | "num" | "cast" | "intcast" | "rat" | "mul" | "dvd" | "pow" | "int" | "nat"
+    ) || fragment.contains("cast")
 }
 
 fn identifier_tokens(text: &str) -> Vec<String> {
@@ -778,5 +827,66 @@ mod tests {
         assert!(profile.heads.iter().any(|head| head == "Eq"));
         assert!(profile.constants.iter().any(|constant| constant == "Nat.succ"));
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "Nat"));
+    }
+
+    #[test]
+    fn rat_arithmetic_profile_keeps_useful_lowercase_fragments() {
+        let profile = profile_from_text(
+            "q : ℚ\nm c : ℤ\nhc : m = ↑q.den * c\n⊢ ↑(c * q.num) = ↑m * q".to_owned(),
+            Some("Rat".to_owned()),
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert!(profile.name_fragments.iter().any(|fragment| fragment == "den"));
+        assert!(profile.name_fragments.iter().any(|fragment| fragment == "num"));
+        assert!(
+            !plan_searches(&profile, ProofSearchMode::NextStep)
+                .iter()
+                .any(|search| search.label == "conclusion_head"),
+            "next_step should not run a broad Eq-head search without required constants"
+        );
+    }
+
+    #[test]
+    fn generic_recursor_candidates_are_down_ranked() {
+        let profile = profile_from_text(
+            "⊢ ↑(c * q.num) = ↑m * q".to_owned(),
+            Some("Rat".to_owned()),
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        let flags = crate::projections::DeclarationFlags {
+            is_private: false,
+            is_generated: false,
+            is_internal: false,
+        };
+        let generic = DeclarationSummary {
+            name: "Acc.ndrecOn_eq_ndrecOnC".to_owned(),
+            kind: "theorem".to_owned(),
+            module: None,
+            source: None,
+            match_reason: "name fragment".to_owned(),
+            score: 100,
+            rank: 1,
+            flags: flags.clone(),
+        };
+        let rat_candidate = DeclarationSummary {
+            name: "Rat.num_den_helper".to_owned(),
+            kind: "theorem".to_owned(),
+            module: Some("Mathlib.Data.Rat.Lemmas".to_owned()),
+            source: None,
+            match_reason: "name fragment".to_owned(),
+            score: 100,
+            rank: 1,
+            flags,
+        };
+        assert!(
+            candidate_score(&rat_candidate, &profile, ProofSearchMode::NextStep, "name_fragment")
+                > candidate_score(&generic, &profile, ProofSearchMode::NextStep, "name_fragment")
+        );
     }
 }

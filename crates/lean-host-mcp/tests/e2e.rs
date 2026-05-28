@@ -23,16 +23,14 @@ use std::process::Command;
 use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::tools::lean::{ElaborateRequest, ElaborateResult, InferTypeRequest, elaborate, infer_type};
-use lean_host_mcp::tools::placement::{MathlibPlacementRequest, mathlib_placement};
 use lean_host_mcp::tools::position::{
     DiagnosticsBlock, LeanQueryProjection, LeanQueryRequest, LeanQueryResult, LeanQuerySelector, ModuleQueryFacts,
-    ProofStateRequest, ProofStateResult, TypeAtProjection, lean_query, proof_state,
+    ProofPositionSelector, ProofStateRequest, ProofStateResult, TypeAtProjection, lean_query, proof_state,
 };
 use lean_host_mcp::tools::proof_action::{
-    TryProofStepMode, TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
+    TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
 };
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
-use lean_host_mcp::tools::scan::{Preset, SourceSearchRequest, source_search};
 use lean_host_mcp::{
     BrokerConfig, DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProjectBroker,
     ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, Response, ServerError,
@@ -207,10 +205,8 @@ async fn describe_prelude_name() {
     let resp = inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
-            name: Some("Nat.add_zero".into()),
+            name: "Nat.add_zero".into(),
             file: None,
-            line: None,
-            column: None,
             imports: vec!["LeanRsFixture.Handles".into()],
             project: None,
             fields: InspectDeclarationFields::default(),
@@ -224,114 +220,6 @@ async fn describe_prelude_name() {
         matches!(resp.result, lean_host_mcp::DeclarationInspectionResult::Found { .. }),
         "Nat.add_zero is part of the prelude"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn source_search_returns_bounded_fixture_matches() {
-    let Some(root) = fixture_root() else {
-        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
-    };
-    let ctx = open_ctx(&root);
-    let resp = source_search(
-        &ctx,
-        SourceSearchRequest {
-            preset: Preset::TheoremStatements,
-            pattern: None,
-            limit: Some(2),
-            max_files_scanned: Some(20),
-            project: None,
-        },
-    )
-    .await
-    .expect("source_search");
-    assert!(resp.result.source_based);
-    assert!(resp.result.files_scanned > 0);
-    assert!(resp.result.matches.len() <= 2);
-    assert!(
-        resp.result.matches.iter().any(|hit| hit.text.contains("theorem")),
-        "fixture source search should return theorem source lines: {:?}",
-        resp.result.matches
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn mathlib_placement_uses_explicit_fake_mathlib_root() {
-    let Some(root) = fixture_root() else {
-        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
-    };
-    let ctx = open_ctx(&root);
-    let temp = tempfile::tempdir().expect("fake mathlib tempdir");
-    let mathlib = temp.path().join("Mathlib");
-    let data = mathlib.join("Data/List");
-    fs::create_dir_all(&data).expect("create fake Mathlib/Data/List");
-    fs::write(
-        data.join("Basic.lean"),
-        r"
-namespace List
-
-theorem map_append_fakePlacementExample : True := by
-  trivial
-
-end List
-",
-    )
-    .expect("write fake mathlib file");
-
-    let resp = mathlib_placement(
-        &ctx,
-        MathlibPlacementRequest {
-            name: None,
-            file: None,
-            line: None,
-            column: None,
-            statement: Some("theorem map_append_new : True".to_owned()),
-            concepts: vec!["List".to_owned(), "map_append".to_owned()],
-            proposed_name: Some("map_append_new".to_owned()),
-            mathlib_root: Some(mathlib),
-            project: None,
-            limit: Some(5),
-        },
-    )
-    .await
-    .expect("mathlib_placement");
-    assert_eq!(resp.result.status, "placement");
-    assert_eq!(resp.result.likely_file.as_deref(), Some("Data/List/Basic.lean"));
-    assert_eq!(resp.result.suggested_imports, vec!["Mathlib.Data.List.Basic"]);
-    assert!(
-        resp.result
-            .source_facts
-            .as_ref()
-            .is_some_and(|facts| facts.source_based)
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn mathlib_placement_reports_missing_root() {
-    let Some(root) = fixture_root() else {
-        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
-    };
-    let ctx = open_ctx(&root);
-    let resp = mathlib_placement(
-        &ctx,
-        MathlibPlacementRequest {
-            name: None,
-            file: None,
-            line: None,
-            column: None,
-            statement: Some("theorem missing_mathlib_root_probe : True".to_owned()),
-            concepts: vec!["True".to_owned()],
-            proposed_name: Some("missing_mathlib_root_probe".to_owned()),
-            mathlib_root: Some(root.join("DefinitelyMissingMathlibRoot")),
-            project: None,
-            limit: None,
-        },
-    )
-    .await
-    .expect("mathlib_placement missing root");
-    assert_eq!(resp.result.status, "missing_mathlib_root");
 }
 
 #[test]
@@ -348,10 +236,9 @@ fn is_def_eq_request_round_trips_transparency() {
 #[test]
 fn search_for_proof_request_round_trips() {
     let cursor: SearchForProofRequest =
-        serde_json::from_str(r#"{"file":"A.lean","line":4,"column":2,"mode":"apply","limit":200}"#).unwrap();
+        serde_json::from_str(r#"{"file":"A.lean","declaration":"A.t","mode":"apply","limit":200}"#).unwrap();
     assert_eq!(cursor.file, Some(PathBuf::from("A.lean")));
-    assert_eq!(cursor.line, Some(4));
-    assert_eq!(cursor.column, Some(2));
+    assert_eq!(cursor.declaration.as_deref(), Some("A.t"));
     assert_eq!(cursor.mode, Some(ProofSearchMode::Apply));
     assert_eq!(cursor.limit, Some(200));
 
@@ -373,8 +260,10 @@ fn proof_action_results_serialise_status_tags() {
                 id: "candidate_1".into(),
                 status: "closed".into(),
                 diagnostics: failure.clone(),
+                downstream_diagnostics: failure.clone(),
                 goals: Vec::new(),
-                safe_edit: None,
+                declaration: None,
+                proof_position: None,
                 output_truncated: false,
             }],
             candidate_limit: 8,
@@ -426,9 +315,8 @@ fn proof_action_results_serialise_status_tags() {
 fn position_requests_round_trip() {
     use lean_host_mcp::tools::position::{FindReferencesRequest, ReferenceScope};
 
-    let g: ProofStateRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","line":7,"column":3}"#).unwrap();
-    assert_eq!(g.line, 7);
-    assert_eq!(g.column, 3);
+    let g: ProofStateRequest = serde_json::from_str(r#"{"file":"Foo/Bar.lean","declaration":"Foo.Bar.t"}"#).unwrap();
+    assert_eq!(g.declaration, "Foo.Bar.t");
 
     let q: LeanQueryRequest =
         serde_json::from_str(r#"{"file":"X.lean","selectors":[{"selector":"type_at","id":"t","line":1,"column":1}]}"#)
@@ -496,23 +384,6 @@ fn references_result_skips_empty_fields() {
     };
     let s = serde_json::to_string(&invalid).unwrap();
     assert!(s.contains(r#""status":"invalid_request""#));
-}
-
-#[test]
-fn source_search_and_mathlib_placement_requests_round_trip() {
-    let source: SourceSearchRequest =
-        serde_json::from_str(r#"{"preset":"custom","pattern":"theorem","limit":5,"max_files_scanned":10}"#).unwrap();
-    assert!(matches!(source.preset, Preset::Custom));
-    assert_eq!(source.pattern.as_deref(), Some("theorem"));
-    assert_eq!(source.limit, Some(5));
-    assert_eq!(source.max_files_scanned, Some(10));
-
-    let placement: MathlibPlacementRequest =
-        serde_json::from_str(r#"{"statement":"theorem foo : True","concepts":["True"],"proposed_name":"foo"}"#)
-            .unwrap();
-    assert_eq!(placement.statement.as_deref(), Some("theorem foo : True"));
-    assert_eq!(placement.concepts, vec!["True"]);
-    assert_eq!(placement.proposed_name.as_deref(), Some("foo"));
 }
 
 #[test]
@@ -598,10 +469,8 @@ async fn mathlib_fixture_uses_transitive_package_search_paths() {
     let inspected = inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
-            name: Some("Nat.add_zero".into()),
+            name: "Nat.add_zero".into(),
             file: None,
-            line: None,
-            column: None,
             imports: vec!["Mathlib.Data.Nat.Basic".into()],
             project: None,
             fields: InspectDeclarationFields::default(),
@@ -698,10 +567,8 @@ async fn inspect_declaration_by_name_populates_statement() {
     let resp = inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
-            name: Some("Nat.add_zero".into()),
+            name: "Nat.add_zero".into(),
             file: None,
-            line: None,
-            column: None,
             imports: vec!["LeanRsFixture.Handles".into()],
             project: None,
             fields: InspectDeclarationFields::default(),
@@ -823,8 +690,8 @@ async fn module_query_position_tools_return_bounded_results() {
         &ctx,
         ProofStateRequest {
             file: file.clone(),
-            line: 8,
-            column: 3,
+            declaration: "LeanRsFixture.SourceRanges.knownTheorem".into(),
+            proof_position: ProofPositionSelector::default(),
             project: None,
         },
     )
@@ -842,11 +709,7 @@ async fn module_query_position_tools_return_bounded_results() {
         goals_before,
         locals,
         expected_type,
-        safe_edit,
         truncated,
-        span,
-        target_declaration,
-        surrounding_declaration,
         query_facts,
         ..
     } = goal_resp.result
@@ -854,23 +717,10 @@ async fn module_query_position_tools_return_bounded_results() {
         panic!("expected a tactic context at `trivial`");
     };
     assert_eq!(diagnostics.summary.errors, 0);
-    assert!(span.is_some(), "proof_state should include the cursor context span");
     assert!(locals.is_empty(), "fixture tactic context has no locals");
     assert!(
         expected_type.as_ref().is_none_or(|text| !text.value.is_empty()),
         "expected type should be omitted or non-empty"
-    );
-    assert!(
-        safe_edit.is_some(),
-        "fixture proof_state should include safe edit metadata"
-    );
-    assert!(
-        target_declaration.is_some(),
-        "proof_state should include target declaration status"
-    );
-    assert!(
-        surrounding_declaration.is_some(),
-        "proof_state should include surrounding declaration status"
     );
     assert!(!truncated, "small fixture goal should not truncate");
     assert!(
@@ -966,6 +816,79 @@ async fn kanproofs_basechange_restrict_diagnostics_stays_bounded() {
             DiagnosticsOutcome::Elaborated(_) | DiagnosticsOutcome::HeaderParseFailed
         ),
         "KanProofs smoke should return a structured diagnostics result"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires built KanProofs; set LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE to enable"]
+async fn kanproofs_rat_try_proof_step_returns_structured_candidate_failure() {
+    let Some(root) = kanproofs_fixture_root() else {
+        eprintln!("skipping: LEAN_HOST_MCP_TEST_KANPROOFS_FIXTURE not set");
+        return;
+    };
+    let ctx = open_ctx(&root);
+    let file = PathBuf::from("KanProofs/Data/Rat/Lemmas.lean");
+
+    let resp = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: file.clone(),
+            declaration: "Rat.exists_intCast_eq_intCast_mul_of_den_dvd".into(),
+            proof_position: ProofPositionSelector::AfterText {
+                text: "refine ⟨c * q.num, ?_⟩".to_owned(),
+                occurrence: None,
+            },
+            project: None,
+            snippet: Some("exact definitely_missing_identifier".to_owned()),
+            snippets: Vec::new(),
+            max_field_bytes: None,
+            max_total_bytes: None,
+            heartbeat_limit: None,
+        },
+    )
+    .await
+    .expect("KanProofs Rat try_proof_step should not kill the worker");
+
+    let ProofAttemptResult::Ok { result, .. } = resp.result else {
+        panic!("KanProofs Rat proof attempt should return a structured ok result");
+    };
+    let candidate = result.candidates.first().expect("one proof candidate row");
+    assert_eq!(candidate.status, "failed", "candidate row: {candidate:?}");
+    assert!(
+        candidate
+            .diagnostics
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("definitely_missing_identifier")),
+        "candidate-local diagnostics should mention the submitted snippet: {:?}",
+        candidate.diagnostics
+    );
+    assert!(
+        candidate
+            .diagnostics
+            .diagnostics
+            .iter()
+            .chain(candidate.downstream_diagnostics.diagnostics.iter())
+            .all(|diagnostic| !diagnostic.message.contains("unexpected token '/--'")),
+        "overlay construction must not corrupt the following docstring: {:?} / {:?}",
+        candidate.diagnostics,
+        candidate.downstream_diagnostics
+    );
+
+    let health = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file,
+            declaration: "Rat.exists_intCast_eq_intCast_mul_of_den_dvd".into(),
+            proof_position: ProofPositionSelector::default(),
+            project: None,
+        },
+    )
+    .await
+    .expect("proof_state after failed KanProofs proof attempt");
+    assert!(
+        matches!(health.result, ProofStateResult::Context { .. }),
+        "failed KanProofs proof attempt should not poison later proof_state"
     );
 }
 
@@ -1126,7 +1049,7 @@ async fn file_diagnostics_cache_warm() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
-async fn inspect_declaration_by_cursor_resolves_target() {
+async fn inspect_declaration_by_name_with_file_imports_resolves_local_target() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
@@ -1135,10 +1058,8 @@ async fn inspect_declaration_by_cursor_resolves_target() {
     let resp = inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
-            name: None,
+            name: "LeanRsFixture.SourceRanges.knownTheorem".into(),
             file: Some(PathBuf::from("LeanRsFixture/SourceRanges.lean")),
-            line: Some(8),
-            column: Some(3),
             imports: Vec::new(),
             project: None,
             fields: InspectDeclarationFields::default(),
@@ -1147,18 +1068,11 @@ async fn inspect_declaration_by_cursor_resolves_target() {
         },
     )
     .await
-    .expect("inspect_declaration cursor");
+    .expect("inspect_declaration by name with file imports");
     let lean_host_mcp::DeclarationInspectionResult::Found { declaration } = resp.result else {
-        panic!("cursor should resolve a declaration target");
+        panic!("named local declaration should resolve with file-derived imports");
     };
     assert_eq!(declaration.name, "LeanRsFixture.SourceRanges.knownTheorem");
-    assert!(
-        resp.next_actions
-            .iter()
-            .any(|hint| hint.contains("worker module snapshot cache status:")),
-        "cursor inspection should report module snapshot cache status: {:?}",
-        resp.next_actions
-    );
 }
 
 #[tokio::test]
@@ -1172,10 +1086,8 @@ async fn inspect_declaration_unknown_returns_not_found() {
     let resp = inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
-            name: Some("LeanRsFixture.SourceRanges.noSuchDeclaration".into()),
+            name: "LeanRsFixture.SourceRanges.noSuchDeclaration".into(),
             file: None,
-            line: None,
-            column: None,
             imports: vec!["LeanRsFixture.SourceRanges".into()],
             project: None,
             fields: InspectDeclarationFields::default(),
@@ -1202,10 +1114,8 @@ async fn inspect_declaration_small_cap_truncates_statement() {
     let resp = inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
-            name: Some("Lean.Meta.forallTelescopeReducing".into()),
+            name: "Lean.Meta.forallTelescopeReducing".into(),
             file: None,
-            line: None,
-            column: None,
             imports: vec!["Lean".into()],
             project: None,
             fields: InspectDeclarationFields::default(),
@@ -1241,8 +1151,8 @@ async fn search_for_proof_explicit_goal_returns_bounded_candidates() {
         &ctx,
         SearchForProofRequest {
             file: None,
-            line: None,
-            column: None,
+            declaration: None,
+            proof_position: ProofPositionSelector::default(),
             goal: Some("⊢ True".into()),
             type_text: None,
             imports: vec!["LeanRsFixture.SourceRanges".into()],
@@ -1291,8 +1201,8 @@ async fn search_for_proof_cursor_goal_reports_cache_and_candidates() {
         &ctx,
         SearchForProofRequest {
             file: Some(PathBuf::from("LeanRsFixture/SourceRanges.lean")),
-            line: Some(8),
-            column: Some(3),
+            declaration: Some("LeanRsFixture.SourceRanges.knownTheorem".into()),
+            proof_position: ProofPositionSelector::default(),
             goal: None,
             type_text: None,
             imports: Vec::new(),
@@ -1333,8 +1243,8 @@ async fn search_for_proof_candidate_can_be_inspected() {
         &ctx,
         SearchForProofRequest {
             file: None,
-            line: None,
-            column: None,
+            declaration: None,
+            proof_position: ProofPositionSelector::default(),
             goal: Some("⊢ True".into()),
             type_text: None,
             imports: vec!["LeanRsFixture.SourceRanges".into()],
@@ -1354,10 +1264,8 @@ async fn search_for_proof_candidate_can_be_inspected() {
     let inspected = inspect_declaration(
         &ctx,
         InspectDeclarationRequest {
-            name: Some(candidate.name.clone()),
+            name: candidate.name.clone(),
             file: None,
-            line: None,
-            column: None,
             imports: vec!["LeanRsFixture.SourceRanges".into()],
             project: None,
             fields: InspectDeclarationFields::default(),
@@ -1389,8 +1297,8 @@ async fn search_for_proof_broad_goal_reports_pruning_without_type_text() {
         &ctx,
         SearchForProofRequest {
             file: None,
-            line: None,
-            column: None,
+            declaration: None,
+            proof_position: ProofPositionSelector::default(),
             goal: Some("⊢ a = b".into()),
             type_text: None,
             imports: vec!["Lean".into()],
@@ -1425,12 +1333,11 @@ async fn try_proof_step_closes_simple_goal_without_mutating_file() {
         &ctx,
         TryProofStepRequest {
             file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
-            line: 4,
-            column: 3,
+            declaration: "LeanRsFixture.ProofActions.stepTheorem".into(),
+            proof_position: ProofPositionSelector::default(),
             project: None,
             snippet: Some("trivial".into()),
             snippets: Vec::new(),
-            mode: TryProofStepMode::SafeEdit,
             max_field_bytes: None,
             max_total_bytes: None,
             heartbeat_limit: None,
@@ -1446,8 +1353,8 @@ async fn try_proof_step_closes_simple_goal_without_mutating_file() {
     let candidate = result.candidates.first().expect("one proof candidate row");
     assert_eq!(candidate.status, "closed");
     assert!(
-        candidate.safe_edit.is_some(),
-        "closed candidate should report the safe edit span"
+        candidate.declaration.is_some(),
+        "closed candidate should report the selected declaration"
     );
     assert_eq!(fs::read(&file).expect("read fixture after"), before);
 }
@@ -1466,12 +1373,11 @@ async fn try_proof_step_bad_snippet_returns_diagnostics_and_session_stays_health
         &ctx,
         TryProofStepRequest {
             file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
-            line: 4,
-            column: 3,
+            declaration: "LeanRsFixture.ProofActions.stepTheorem".into(),
+            proof_position: ProofPositionSelector::default(),
             project: None,
             snippet: Some("exact missingIdentifier".into()),
             snippets: Vec::new(),
-            mode: TryProofStepMode::SafeEdit,
             max_field_bytes: None,
             max_total_bytes: None,
             heartbeat_limit: None,
@@ -1495,8 +1401,8 @@ async fn try_proof_step_bad_snippet_returns_diagnostics_and_session_stays_health
         &ctx,
         ProofStateRequest {
             file: PathBuf::from("LeanRsFixture/SourceRanges.lean"),
-            line: 8,
-            column: 3,
+            declaration: "LeanRsFixture.SourceRanges.knownTheorem".into(),
+            proof_position: ProofPositionSelector::default(),
             project: None,
         },
     )
@@ -1522,12 +1428,11 @@ async fn try_proof_step_multiple_candidates_are_capped() {
         &ctx,
         TryProofStepRequest {
             file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
-            line: 4,
-            column: 3,
+            declaration: "LeanRsFixture.ProofActions.stepTheorem".into(),
+            proof_position: ProofPositionSelector::default(),
             project: None,
             snippet: None,
             snippets,
-            mode: TryProofStepMode::SafeEdit,
             max_field_bytes: None,
             max_total_bytes: None,
             heartbeat_limit: None,
@@ -1572,10 +1477,8 @@ async fn verify_declaration_accepts_closed_theorem() {
         &ctx,
         VerifyDeclarationRequest {
             file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            declaration: "LeanRsFixture.ProofActions.stepTheorem".into(),
             project: None,
-            name: Some("LeanRsFixture.ProofActions.closedTheorem".into()),
-            line: None,
-            column: None,
             allow_sorry: false,
             report_axioms: true,
             max_field_bytes: None,
@@ -1611,10 +1514,8 @@ async fn verify_declaration_detects_sorry() {
         &ctx,
         VerifyDeclarationRequest {
             file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+            declaration: "LeanRsFixture.ProofActions.sorryTheorem".into(),
             project: None,
-            name: Some("LeanRsFixture.ProofActions.sorryTheorem".into()),
-            line: None,
-            column: None,
             allow_sorry: false,
             report_axioms: false,
             max_field_bytes: None,
