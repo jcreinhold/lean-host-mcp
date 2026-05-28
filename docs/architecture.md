@@ -5,8 +5,9 @@ One crate, library plus two binaries (the MCP server and a tiny worker child). L
 ```
 main.rs         clap CLI, rmcp stdio entry
 server.rs       LeanHostService (rmcp glue)
-tools/          lean.rs, declaration.rs, proof_search.rs, proof_action.rs,
+tools/          declaration.rs, proof_search.rs, proof_action.rs,
                 scan.rs, placement.rs, position.rs
+                (lean.rs keeps internal low-level worker helpers)
 project.rs      LeanProject—closure-channel actor; owns the LeanWorkerHostHandle,
                 the DeclarationIndex, and the ModuleQueryCache for one Lake project
 projections.rs  pure data-shuffle helpers from lean-rs-worker shapes into the MCP wire
@@ -135,6 +136,11 @@ The public MCP declaration surface does not expose raw declaration search or typ
 goes through `search_for_proof`, and callers inspect one selected candidate by name when they need statement text or
 declaration facts. The old synchronous index rebuild path remains out of the MCP surface: a model-controlled tool should
 not be able to trigger a full environment walk plus bulk type rendering.
+
+The same rule applies to low-level term/meta operations. The host can still call lean-rs helpers for elaboration,
+kernel checks, type inference, weak-head normalization, and definitional equality in internal tests or future
+composition, but those are not individual model-facing MCP tools. The public layer exposes proof-work outcomes rather
+than Lean runtime mechanisms.
 
 ## Source and placement policy
 

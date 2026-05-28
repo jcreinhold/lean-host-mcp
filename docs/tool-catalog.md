@@ -23,64 +23,16 @@ was recently evicted. When omitted, the server resolves the project via the stan
 
 The `project` field is omitted from the per-tool examples below for brevity; assume it on every request schema.
 
-Lean session and declaration tools also accept an `imports` field. It is the complete per-call import vector. An empty
+Declaration and proof-search tools also accept an `imports` field. It is the complete per-call import vector. An empty
 array means the call asks for no extra imports beyond the worker's base environment.
 
-## Lean session tools (`src/tools/lean.rs`)
+## Proof workflow tools
 
-### `elaborate`
+The model-facing surface is organized around the proof workflow:
+`proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> verify_declaration`. The low-level Lean
+runtime operations used internally by the host are deliberately not separate public tools.
 
-Type-check a term against the project environment.
-
-```jsonc
-// request
-{ "source": "(Nat.succ 0 : Nat)", "imports": ["Mod.A"] }
-
-// result
-{ "status": "Ok",     "ok": true }
-{ "status": "Failed", "diagnostics": [...], "truncated": false }
-```
-
-### `kernel_check`
-
-Full elaborate plus `addDecl`. Returns Lean's `LeanKernelOutcome`, projected.
-
-```jsonc
-// request
-{ "source": "theorem foo : 1 + 1 = 2 := rfl", "imports": [] }
-
-// result
-{
-  "status":  "Checked",
-  "summary": { "declaration_name": "foo", "kind": "theorem", "type_signature": "1 + 1 = 2" },
-  "failure": null
-}
-```
-
-### `infer_type` / `whnf`
-
-`Meta.inferType` or `Meta.whnf` over a term that is elaborated first.
-
-```jsonc
-{ "term": "Nat.succ 0", "imports": [] }
-```
-
-`rendered` is pretty-printed via the optional `pp_expr` shim. If the loaded worker host shims lack
-`lean_rs_host_meta_pp_expr`, the worker falls back to `Expr.toString` (signalled by `LeanWorkerRendering::Raw`) and the
-server attaches a warning to the envelope; the field is still populated either way.
-
-### `is_def_eq`
-
-```jsonc
-// request
-{ "lhs": "1 + 1", "rhs": "2", "imports": [], "transparency": "reducible" }
-
-// result
-{ "status": "Ok", "definitionally_equal": true, "rendered": null, "failure": null }
-```
-
-`transparency` is optional and accepts `default | reducible | instances | all` (default `default`). It picks the
-reducibility view `Meta.isDefEq` runs under: the same two terms can be def-eq under one setting and not another.
+## Declaration tools (`src/tools/declaration.rs`)
 
 ### `inspect_declaration`
 

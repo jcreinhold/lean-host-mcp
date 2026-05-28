@@ -200,10 +200,15 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         "project_scan",
         "references_in_file",
         "references_in_project",
+        "elaborate",
+        "kernel_check",
+        "infer_type",
+        "whnf",
+        "is_def_eq",
     ] {
         assert!(
             !tool_names.contains(removed),
-            "tools/list must not expose removed position tool {removed}"
+            "tools/list must not expose removed tool {removed}"
         );
     }
     let tools_record = ToolListRecord {
@@ -298,52 +303,6 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 fn fixture_calls() -> Vec<ToolCall> {
     vec![
-        ToolCall {
-            label: "elaborate_nat",
-            tool_name: "elaborate",
-            category: "term",
-            arguments: json!({
-                "source": "(Nat.succ 0 : Nat)",
-                "imports": ["LeanRsFixture.Handles"]
-            }),
-        },
-        ToolCall {
-            label: "kernel_check_theorem",
-            tool_name: "kernel_check",
-            category: "term",
-            arguments: json!({
-                "source": "theorem smokePerfKernelCheck : 1 + 1 = 2 := rfl",
-                "imports": []
-            }),
-        },
-        ToolCall {
-            label: "infer_type_nat_fn",
-            tool_name: "infer_type",
-            category: "meta",
-            arguments: json!({
-                "term": "fun (n : Nat) => n + 1",
-                "imports": ["LeanRsFixture.Handles"]
-            }),
-        },
-        ToolCall {
-            label: "whnf_nat_add",
-            tool_name: "whnf",
-            category: "meta",
-            arguments: json!({
-                "term": "(fun n : Nat => n + 0) 4",
-                "imports": []
-            }),
-        },
-        ToolCall {
-            label: "is_def_eq_nat",
-            tool_name: "is_def_eq",
-            category: "meta",
-            arguments: json!({
-                "lhs": "1 + 1",
-                "rhs": "2",
-                "imports": []
-            }),
-        },
         ToolCall {
             label: "inspect_nat_add_zero",
             tool_name: "inspect_declaration",
@@ -533,12 +492,6 @@ fn fixture_calls() -> Vec<ToolCall> {
 
 fn external_project_calls() -> Vec<ToolCall> {
     let mut calls = vec![
-        ToolCall {
-            label: "infer_type_no_imports",
-            tool_name: "infer_type",
-            category: "meta",
-            arguments: json!({ "term": "fun (n : Nat) => n + 1", "imports": [] }),
-        },
         ToolCall {
             label: "inspect_nat_add_zero_no_imports",
             tool_name: "inspect_declaration",

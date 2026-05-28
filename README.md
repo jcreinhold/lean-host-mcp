@@ -4,14 +4,14 @@ A Model Context Protocol server that hosts Lean 4 in a supervised worker child v
 `lean-rs-worker-child` crate pair. The parent process owns a shims-only `LeanWorkerHostHandle`; the worker child owns
 the `LeanRuntime` and bundled host-shim capabilities. The parent does **not** link `libleanshared`, which lets one
 running `lean-host-mcp` serve projects on different Lean toolchains: each toolchain has its own pre-built worker binary
-installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Tool calls run as Meta and kernel operations inside
-that child rather than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child; the
-supervisor restarts it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
+installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Proof-agent calls run inside that child rather
+than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child; the supervisor restarts
+it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
-Thirteen tools are exposed: term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`),
-bounded declaration lookup (`search_declarations`, `type_of_name`, `hover_by_name`), a filesystem sweep
-(`project_scan`), proof-agent module queries (`proof_state`, `lean_query`), and explicit file/project reference queries
-(`references_in_file`, `references_in_project`). Per-tool request and result schemas live in
+The public tool surface is the proof workflow, not a mirror of Lean's runtime internals:
+`proof_state`, `search_for_proof`, `inspect_declaration`, `try_proof_step`, and `verify_declaration`. Source and project
+support comes from `source_search`, `find_references`, and `mathlib_placement`. `lean_query` remains the expert escape
+hatch for bounded semantic file/cursor projections. Per-tool request and result schemas live in
 [`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in [`docs/architecture.md`](docs/architecture.md).
 
 ## Prerequisite: any built Lake project
@@ -117,9 +117,9 @@ Every tool returns the same outer shape; only `result` varies.
 }
 ```
 
-`freshness.imports` is the import vector used for that call: explicit request imports for term/declaration tools and
-file-header imports for module-query tools. An empty array means the call used no extra imports beyond the worker's base
-environment.
+`freshness.imports` is the import vector used for that call: explicit request imports for declaration/proof-search
+tools and file-header imports for module-query tools. An empty array means the call used no extra imports beyond the
+worker's base environment.
 
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors.
 MCP errors are reserved for infrastructure failures: the worker thread died, the runtime failed to initialise, the Lake

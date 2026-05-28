@@ -43,46 +43,6 @@ impl LeanHostService {
 
 #[tool_router]
 impl LeanHostService {
-    #[tool(description = "Elaborate a Lean term; return success or diagnostics.")]
-    async fn elaborate(
-        &self,
-        Parameters(req): Parameters<tools::lean::ElaborateRequest>,
-    ) -> std::result::Result<Json<Response<tools::lean::ElaborateResult>>, McpError> {
-        wrap(tools::lean::elaborate(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Kernel-check one Lean declaration source.")]
-    async fn kernel_check(
-        &self,
-        Parameters(req): Parameters<tools::lean::KernelCheckRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::KernelOutcome>>, McpError> {
-        wrap(tools::lean::kernel_check(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Infer the type of a Lean term via Meta.inferType.")]
-    async fn infer_type(
-        &self,
-        Parameters(req): Parameters<tools::lean::InferTypeRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::MetaOutcome>>, McpError> {
-        wrap(tools::lean::infer_type(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Reduce a Lean term to weak-head normal form via Meta.whnf.")]
-    async fn whnf(
-        &self,
-        Parameters(req): Parameters<tools::lean::WhnfRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::MetaOutcome>>, McpError> {
-        wrap(tools::lean::whnf(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Check whether two Lean terms are definitionally equal via Meta.isDefEq.")]
-    async fn is_def_eq(
-        &self,
-        Parameters(req): Parameters<tools::lean::IsDefEqRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::MetaOutcome>>, McpError> {
-        wrap(tools::lean::is_def_eq(&self.ctx, req).await)
-    }
-
     #[tool(description = "Inspect one Lean declaration by name or cursor.")]
     async fn inspect_declaration(
         &self,
@@ -169,11 +129,10 @@ impl ServerHandler for LeanHostService {
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
         info.instructions = Some(
             "MCP server hosting Lean 4 in-process via lean-rs. \
-             Tools elaborate / kernel-check terms, run bounded MetaM ops, \
-             inspect one selected declaration, try and verify proof actions \
-             without writing files, search source text, find references, \
-             advise Mathlib placement, and run bounded proof-context and \
-             semantic file queries."
+             Tools expose a bounded proof-agent workflow: proof context, \
+             proof retrieval, declaration inspection, non-mutating proof \
+             attempts and verification, source search, reference lookup, \
+             Mathlib placement advice, and expert semantic file queries."
                 .to_owned(),
         );
         info
