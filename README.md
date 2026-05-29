@@ -74,11 +74,12 @@ Environment vars:
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `LEAN_HOST_MCP_PROJECT` | Default Lake root for calls without a `project=` argument. | unset |
-| `LEAN_HOST_MCP_CACHE_DIR` | SQLite declaration-index store. | `$XDG_CACHE_HOME/lean-host-mcp` |
-| `LEAN_HOST_MCP_MAX_PROJECTS` | Max [`LeanProject`]s kept resident; oldest is evicted on overflow. | `4` |
+| `LEAN_HOST_MCP_MAX_PROJECTS` | Max project runtimes kept resident; oldest idle runtime is evicted on overflow. | `4` |
 | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Window after which an unused project is reaped. `0` disables. | `600` |
 | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | Process-wide permits for heavy Lean semantic work. `1` serializes cross-project calls for daily-driver robustness. | `1` |
-| `LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB` | Worker RSS ceiling used by restart policy and import-profile cycling. | `3145728` |
+| `LEAN_HOST_MCP_SEMANTIC_WAITERS` | Process-wide capacity for callers waiting on semantic-work admission. Full admission returns retryable `semantic_admission_full`. | `16` |
+| `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | Maximum wait for semantic-work admission. Timeout returns retryable `semantic_admission_timeout`. | `60000` |
+| `LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB` | Worker RSS ceiling used by project-level import-profile cycling. | `3145728` |
 | `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Worker module-snapshot cache RSS guard. | `2097152` |
 | `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Worker module-snapshot cache byte cap. | `33554432` |
 | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | Bounded per-project semantic mailbox capacity. Full mailboxes return retryable `busy`. | `8` |

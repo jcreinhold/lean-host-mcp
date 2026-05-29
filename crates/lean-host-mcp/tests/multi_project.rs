@@ -6,8 +6,8 @@
 //! Tests use the project's `session_id` (stamped into every
 //! [`Freshness`](lean_host_mcp::Freshness) envelope) as the identity
 //! signal: the broker re-allocates `session_id` on every successful
-//! [`LeanProject::open`], so a value change between two
-//! [`ProjectBroker::with_project`] calls means the underlying actor was
+//! opening a private project runtime, so a value change between two
+//! [`ProjectBroker::project_runtime`] calls means the underlying actor was
 //! shut down and replaced.
 //!
 //! A second "project" is synthesized from the real fixture: a tempdir
@@ -42,16 +42,16 @@ fn fixture_root() -> Option<PathBuf> {
 }
 
 fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize, idle_timeout: Duration) -> Arc<ProjectBroker> {
-    let cache_dir = tempfile::tempdir().expect("cache tempdir").keep();
     let cwd = env_default.clone().unwrap_or_else(|| PathBuf::from("/"));
     ProjectBroker::new(BrokerConfig {
-        cache_dir,
         config_default: None,
         env_default,
         cwd,
         max_projects,
         idle_timeout,
         semantic_permits: BrokerConfig::default_semantic_permits(),
+        semantic_waiters: BrokerConfig::default_semantic_waiters(),
+        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
     })
 }
 
@@ -79,9 +79,11 @@ fn make_synthetic_project(fixture_root: &Path) -> (tempfile::TempDir, PathBuf) {
 
 async fn session_id_for(broker: &Arc<ProjectBroker>, hint: ProjectHint) -> String {
     broker
-        .with_project(hint, |project| async move { Ok(project.session_id().to_owned()) })
+        .project_runtime(hint, Vec::new())
         .await
-        .expect("with_project")
+        .expect("project_runtime")
+        .freshness
+        .session_id
 }
 
 #[tokio::test]

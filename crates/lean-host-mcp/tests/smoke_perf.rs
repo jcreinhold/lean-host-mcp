@@ -462,12 +462,10 @@ struct McpServer {
 
 impl McpServer {
     async fn start(project_root: &Path) -> Self {
-        let cache_dir = tempfile::tempdir().expect("temp cache dir").keep();
         let config_dir = tempfile::tempdir().expect("temp config dir").keep();
         let mut child = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
             .arg("--lake-root")
             .arg(project_root)
-            .env("LEAN_HOST_MCP_CACHE_DIR", cache_dir)
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("RUST_LOG", "warn")
             .stdin(Stdio::piped())

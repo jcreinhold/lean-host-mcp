@@ -3,8 +3,8 @@
 //!
 //! - **warm**: project already resident; cost is mutex acquisition, LRU
 //!   promote, manifest SHA-256, `Arc::clone`. Target: < 50 µs at p99.
-//! - **cold**: pool empty; cost is [`LeanProject::open`] + insert. Dominated
-//!   by worker-child spawn (multi-second).
+//! - **cold**: pool empty; cost is project runtime open + insert. Dominated
+//!   by worker-child spawn.
 //! - **eviction**: pool at capacity (1), alternating two projects. Cost is
 //!   shutdown of the LRU victim plus a cold open of the requested project.
 //!
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectHint, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectHint};
 use tokio::runtime::Runtime;
 
 fn fixture_root() -> Option<PathBuf> {
@@ -51,21 +51,19 @@ fn make_synthetic_project(fixture_root: &Path) -> (tempfile::TempDir, PathBuf) {
 fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize) -> Arc<ProjectBroker> {
     let cwd = env_default.clone().unwrap_or_else(|| PathBuf::from("/"));
     ProjectBroker::new(BrokerConfig {
-        cache_dir: default_cache_dir(),
         config_default: None,
         env_default,
         cwd,
         max_projects,
         idle_timeout: Duration::ZERO,
         semantic_permits: BrokerConfig::default_semantic_permits(),
+        semantic_waiters: BrokerConfig::default_semantic_waiters(),
+        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
     })
 }
 
 async fn touch(broker: &Arc<ProjectBroker>, hint: ProjectHint) {
-    broker
-        .with_project(hint, |_project| async move { Ok(()) })
-        .await
-        .expect("with_project");
+    broker.project_runtime(hint, Vec::new()).await.expect("project_runtime");
 }
 
 fn bench_warm(c: &mut Criterion, rt: &Runtime, root: &Path) {

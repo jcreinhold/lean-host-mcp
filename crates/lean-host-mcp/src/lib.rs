@@ -10,15 +10,14 @@
 //!   `{result, freshness, runtime, warnings, next_actions}` wrapper every
 //!   semantic tool returns.
 //! - [`broker`]: `ProjectBroker`, the mediator that resolves a per-call
-//!   project hint into an `Arc<LeanProject>` via the env / cwd-walk /
-//!   config-default chain.
-//! - [`project`]: `LeanProject`, the unit of multiplexing. Owns one
-//!   supervised worker actor and the bounded module-query cache for one Lake
-//!   project.
+//!   project hint into typed operations on a private project runtime via the
+//!   env / cwd-walk / config-default chain.
+//! - `project`: private per-project actor runtime. Owns one supervised worker
+//!   actor and the bounded module-query cache for one Lake project.
 //! - [`projections`]: pure data-shuffle projection types and helpers from
 //!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.
 //! - [`lake_meta`]: `LakeProjectMeta`, the minimal description of a Lake
-//!   project that `LeanProject::open` consumes.
+//!   project that the private project runtime consumes.
 //! - [`index`]: legacy `DeclarationIndex` storage retained for internal tests
 //!   and migration; MCP declaration lookup now uses bounded worker queries.
 //! - [`error`]: `ServerError`, the one error type tool handlers return.
@@ -32,7 +31,7 @@ pub mod envelope;
 pub mod error;
 pub mod index;
 pub mod lake_meta;
-pub mod project;
+mod project;
 pub mod projections;
 pub mod server;
 pub mod toolchain;
@@ -43,7 +42,6 @@ pub use envelope::{Freshness, Response, RuntimeFacts};
 pub use error::{Result, ServerError};
 pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};
 pub use lake_meta::LakeProjectMeta;
-pub use project::LeanProject;
 pub use projections::{
     DeclarationFlags, DeclarationInspection, DeclarationInspectionCandidate, DeclarationInspectionResult,
     DeclarationProofSearchFacts, DeclarationRow, DeclarationSearchFacts, DeclarationSearchPruning,

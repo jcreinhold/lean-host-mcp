@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
-use lean_host_mcp::{BrokerConfig, LeanHostService, ProjectBroker, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, LeanHostService, ProjectBroker};
 
 /// Stdio MCP server that hosts a Lean 4 environment via a worker child.
 #[derive(Debug, Parser)]
@@ -47,11 +47,6 @@ struct ServeArgs {
     /// arguments always win.
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
-
-    /// Directory for the `SQLite` declaration index. Defaults to
-    /// `$XDG_CACHE_HOME/lean-host-mcp` (or `$HOME/.cache/lean-host-mcp`).
-    #[arg(long, env = "LEAN_HOST_MCP_CACHE_DIR")]
-    cache_dir: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -98,31 +93,33 @@ fn init_tracing() {
 
 #[allow(clippy::significant_drop_tightening)]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
     let env_default = args.lake_root;
     let config_default = read_config_default();
     let cwd = std::env::current_dir()?;
-    let (max_projects, idle_timeout, semantic_permits) = BrokerConfig::pool_from_env()?;
+    let (max_projects, idle_timeout, semantic_permits, semantic_waiters, semantic_admission_timeout) =
+        BrokerConfig::pool_from_env()?;
 
     tracing::info!(
         env_default = ?env_default,
         config_default = ?config_default,
         cwd = %cwd.display(),
-        cache_dir = %cache_dir.display(),
         max_projects = %max_projects,
         idle_timeout_secs = idle_timeout.as_secs(),
         semantic_permits = %semantic_permits,
+        semantic_waiters = %semantic_waiters,
+        semantic_admission_timeout_millis = semantic_admission_timeout.as_millis(),
         "starting lean-host-mcp",
     );
 
     let broker = ProjectBroker::new(BrokerConfig {
-        cache_dir,
         config_default,
         env_default,
         cwd,
         max_projects,
         idle_timeout,
         semantic_permits,
+        semantic_waiters,
+        semantic_admission_timeout,
     });
     let service = LeanHostService::new(broker);
     let server = service.serve(stdio()).await?;

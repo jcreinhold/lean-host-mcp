@@ -83,57 +83,58 @@ pub struct VerifyDeclarationRequest {
 /// unsupported worker shims are normal result statuses.
 pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Result<Response<ProofAttemptResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let input = read_query_file(project.canonical_root(), &req.file)?;
-            let file_label = input.resolved.to_string_lossy().into_owned();
-            let freshness = project.freshness(&input.imports);
-            let budgets = proof_action_budgets(req.max_field_bytes, req.max_total_bytes);
-            let candidates = proof_candidates(&req);
-            let extra_rows = capped_candidate_rows(&req);
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let input = read_query_file(&meta.canonical_root, &req.file)?;
+    let file_label = input.resolved.to_string_lossy().into_owned();
+    let budgets = proof_action_budgets(req.max_field_bytes, req.max_total_bytes);
+    let candidates = proof_candidates(&req);
+    let extra_rows = capped_candidate_rows(&req);
 
-            if candidates.is_empty() {
-                return Ok(Response::ok(
-                    ProofAttemptResult::Ok {
-                        result: ProofAttemptEnvelope {
-                            candidates: extra_rows,
-                            candidate_limit: MAX_CANDIDATES as u32,
-                            candidates_truncated: false,
-                        },
-                        imports: input.imports,
-                    },
-                    freshness,
-                )
-                .warn("try_proof_step requires `snippet` or `snippets`"));
-            }
-
-            let request = LeanWorkerProofAttemptRequest {
-                source: input.source,
-                edit: LeanWorkerProofEditTarget::Declaration {
-                    name: req.declaration.clone(),
-                    position: worker_proof_position(req.proof_position.clone()),
+    if candidates.is_empty() {
+        let runtime = ctx.broker.project_runtime(hint, input.imports.clone()).await?;
+        return Ok(Response::ok(
+            ProofAttemptResult::Ok {
+                result: ProofAttemptEnvelope {
+                    candidates: extra_rows,
+                    candidate_limit: MAX_CANDIDATES as u32,
+                    candidates_truncated: false,
                 },
-                candidates,
-                budgets,
-            };
-            let call = project
-                .attempt_proof(
-                    session_imports(input.imports.clone()),
-                    request,
-                    elab_options(&file_label, req.heartbeat_limit),
-                )
-                .await?;
-            let mut response = Response::ok(
-                append_capped_rows(project_proof_attempt(call.value), extra_rows),
-                freshness,
-            )
-            .with_runtime(call.runtime);
-            response
-                .next_actions
-                .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
-            Ok(response)
-        })
-        .await
+                imports: input.imports,
+            },
+            runtime.freshness,
+        )
+        .with_runtime(runtime.runtime)
+        .warn("try_proof_step requires `snippet` or `snippets`"));
+    }
+
+    let request = LeanWorkerProofAttemptRequest {
+        source: input.source,
+        edit: LeanWorkerProofEditTarget::Declaration {
+            name: req.declaration.clone(),
+            position: worker_proof_position(req.proof_position.clone()),
+        },
+        candidates,
+        budgets,
+    };
+    let call = ctx
+        .broker
+        .attempt_proof(
+            hint,
+            session_imports(input.imports.clone()),
+            input.imports,
+            request,
+            elab_options(&file_label, req.heartbeat_limit),
+        )
+        .await?;
+    let mut response = Response::ok(
+        append_capped_rows(project_proof_attempt(call.value), extra_rows),
+        call.freshness,
+    )
+    .with_runtime(call.runtime);
+    response
+        .next_actions
+        .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
+    Ok(response)
 }
 
 /// Verify one declaration in an in-memory source snapshot.
@@ -147,46 +148,49 @@ pub async fn verify_declaration(
     req: VerifyDeclarationRequest,
 ) -> Result<Response<DeclarationVerificationResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let input = read_query_file(project.canonical_root(), &req.file)?;
-            let file_label = input.resolved.to_string_lossy().into_owned();
-            let freshness = project.freshness(&input.imports);
-            let budgets = proof_action_budgets(req.max_field_bytes, req.max_total_bytes);
-            if req.declaration.trim().is_empty() {
-                return Ok(Response::ok(DeclarationVerificationResult::Unsupported, freshness)
-                    .warn("verify_declaration requires `declaration`"));
-            }
-            let target = LeanWorkerDeclarationVerificationTarget::Name {
-                name: req.declaration.clone(),
-            };
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let input = read_query_file(&meta.canonical_root, &req.file)?;
+    let file_label = input.resolved.to_string_lossy().into_owned();
+    let budgets = proof_action_budgets(req.max_field_bytes, req.max_total_bytes);
+    if req.declaration.trim().is_empty() {
+        let runtime = ctx.broker.project_runtime(hint, input.imports.clone()).await?;
+        return Ok(
+            Response::ok(DeclarationVerificationResult::Unsupported, runtime.freshness)
+                .with_runtime(runtime.runtime)
+                .warn("verify_declaration requires `declaration`"),
+        );
+    }
+    let target = LeanWorkerDeclarationVerificationTarget::Name {
+        name: req.declaration.clone(),
+    };
 
-            let request = LeanWorkerDeclarationVerificationRequest {
-                source: input.source,
-                target,
-                sorry_policy: if req.allow_sorry {
-                    LeanWorkerSorryPolicy::Allow
-                } else {
-                    LeanWorkerSorryPolicy::Deny
-                },
-                report_axioms: req.report_axioms,
-                budgets,
-            };
-            let call = project
-                .verify_declaration(
-                    session_imports(input.imports.clone()),
-                    request,
-                    elab_options(&file_label, req.heartbeat_limit),
-                )
-                .await?;
-            let mut response =
-                Response::ok(project_declaration_verification(call.value), freshness).with_runtime(call.runtime);
-            response
-                .next_actions
-                .push("source file was not modified by verification".to_owned());
-            Ok(response)
-        })
-        .await
+    let request = LeanWorkerDeclarationVerificationRequest {
+        source: input.source,
+        target,
+        sorry_policy: if req.allow_sorry {
+            LeanWorkerSorryPolicy::Allow
+        } else {
+            LeanWorkerSorryPolicy::Deny
+        },
+        report_axioms: req.report_axioms,
+        budgets,
+    };
+    let call = ctx
+        .broker
+        .verify_declaration(
+            hint,
+            session_imports(input.imports.clone()),
+            input.imports,
+            request,
+            elab_options(&file_label, req.heartbeat_limit),
+        )
+        .await?;
+    let mut response =
+        Response::ok(project_declaration_verification(call.value), call.freshness).with_runtime(call.runtime);
+    response
+        .next_actions
+        .push("source file was not modified by verification".to_owned());
+    Ok(response)
 }
 
 fn proof_action_budgets(max_field_bytes: Option<u32>, max_total_bytes: Option<u32>) -> LeanWorkerOutputBudgets {

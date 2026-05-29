@@ -20,15 +20,14 @@ use lean_rs_worker_parent::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::broker::ProjectHint;
+use crate::broker::{BrokerCall, ProjectHint};
 use crate::envelope::{Response, RuntimeFacts};
 use crate::error::Result;
-use crate::project::ProjectCall;
 use crate::projections::{
     DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, project_declaration_search,
 };
 use crate::tools::position::{ProofPositionSelector, ProofStateRequest, ProofStateResult};
-use crate::tools::{ToolContext, freshness_for, session_imports};
+use crate::tools::{ToolContext, session_imports};
 
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 20;
@@ -159,12 +158,8 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
         warnings.push("no usable goal constants, heads, or name fragments were available for retrieval".to_owned());
         let result = empty_result(profile, warnings);
         let hint = ProjectHint::from_request(project);
-        return ctx
-            .broker
-            .with_project(hint, move |project| async move {
-                Ok(Response::ok(result, freshness_for(&project, &[])).with_runtime(project.runtime_facts()))
-            })
-            .await;
+        let runtime = ctx.broker.project_runtime(hint, Vec::new()).await?;
+        return Ok(Response::ok(result, runtime.freshness).with_runtime(runtime.runtime));
     }
 
     let mut search_results = Vec::new();
@@ -180,12 +175,9 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let result = rank_results(&profile, mode, limit, search_count, search_results, warnings);
     let freshness_imports = profile.imports.clone();
     let hint = ProjectHint::from_request(project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let runtime = runtime.unwrap_or_else(|| project.runtime_facts());
-            Ok(Response::ok(result, freshness_for(&project, &freshness_imports)).with_runtime(runtime))
-        })
-        .await
+    let project_runtime = ctx.broker.project_runtime(hint, freshness_imports).await?;
+    let runtime = runtime.unwrap_or(project_runtime.runtime);
+    Ok(Response::ok(result, project_runtime.freshness).with_runtime(runtime))
 }
 
 async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result<TargetProfile> {
@@ -464,18 +456,17 @@ async fn run_declaration_search(
     project: Option<String>,
     imports: Vec<String>,
     search: LeanWorkerDeclarationSearch,
-) -> Result<ProjectCall<DeclarationSearchResult>> {
+) -> Result<BrokerCall<DeclarationSearchResult>> {
     let hint = ProjectHint::from_request(project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let imports = session_imports(imports);
-            let call = project.search_declarations(imports, search).await?;
-            Ok(ProjectCall {
-                value: project_declaration_search(call.value),
-                runtime: call.runtime,
-            })
-        })
-        .await
+    let call = ctx
+        .broker
+        .search_declarations(hint, session_imports(imports.clone()), imports, search)
+        .await?;
+    Ok(BrokerCall {
+        value: project_declaration_search(call.value),
+        runtime: call.runtime,
+        freshness: call.freshness,
+    })
 }
 
 fn rank_results(

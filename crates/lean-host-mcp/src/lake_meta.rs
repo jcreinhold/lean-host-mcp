@@ -1,8 +1,8 @@
 //! Description of a Lake project plus the discovery logic that builds one
 //! from a directory hint.
 //!
-//! [`LeanProject::open`](crate::project::LeanProject::open) consumes a
-//! [`LakeProjectMeta`] to spawn a worker. The struct carries every
+//! The private project runtime consumes [`LakeProjectMeta`] to spawn a
+//! worker. The struct carries every
 //! per-project field the worker / index / cache layers need: canonical
 //! root, toolchain label, package/library hints, the umbrella module Lake
 //! generates next to the library, and manifest hash.
@@ -29,8 +29,8 @@ use serde::Deserialize;
 use crate::error::{Result, ServerError};
 use crate::index::fingerprint_lake_project;
 
-/// Everything `LeanProject::open` needs to spawn a worker against one Lake
-/// project.
+/// Everything the private project runtime needs to spawn a worker against one
+/// Lake project.
 ///
 /// Built from a directory by [`LakeProjectMeta::from_explicit`], or—when
 /// the caller only has a starting hint—[`LakeProjectMeta::discover_from`].

@@ -6,14 +6,8 @@
 //! serialise straight into the JSON envelope.
 //!
 //! All projection *types* and *helper functions* live here. Tool handlers
-//! import the wire types from this module; the [`project`](crate::project)
-//! module calls the helpers from inside the worker-actor closure so the
-//! values returned to the tool layer already wear the wire shape.
-
-// `map_worker_err` is the natural `.map_err(...)` callable for the
-// closures the tool handlers ship to the worker actor. The
-// pass-by-value shape is forced by `Result::map_err`. Several other
-// projection helpers consume their argument; the lint is noise here.
+//! import the wire types from this module. Worker lifecycle/error
+//! classification belongs in the runtime boundary, not in projection code.
 #![allow(clippy::needless_pass_by_value)]
 
 use lean_rs_worker_parent::{
@@ -23,13 +17,11 @@ use lean_rs_worker_parent::{
     LeanWorkerDeclarationSearchRow, LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationTargetInfo,
     LeanWorkerDeclarationVerificationFacts, LeanWorkerDeclarationVerificationResult,
     LeanWorkerDeclarationVerificationStatus, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerElabResult,
-    LeanWorkerError, LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerModuleSourceSpan,
+    LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerModuleSourceSpan,
     LeanWorkerProofAttemptEnvelope, LeanWorkerProofAttemptResult, LeanWorkerProofAttemptRow,
     LeanWorkerProofAttemptStatus, LeanWorkerRendered, LeanWorkerRenderedInfo, LeanWorkerRendering,
     LeanWorkerSourceRange,
 };
-
-use crate::error::ServerError;
 
 /// Source-range projection with public fields mirroring `LeanWorkerSourceRange`.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -766,30 +758,5 @@ fn project_proof_search_facts(facts: LeanWorkerDeclarationProofSearchFacts) -> D
         is_instance: facts.is_instance,
         is_class: facts.is_class,
         class_name: facts.class_name,
-    }
-}
-
-/// Classify a worker-layer error.
-///
-/// Bootstrap failures map to `ServerError::BadProject`; everything else is
-/// a Lean-domain runtime outcome and maps to `ServerError::Lean`. The
-/// bootstrap-classification set is fixed by the worker contract.
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "LeanWorkerError is upstream-evolving; everything outside the bootstrap-classification set maps to Lean for the MCP wire"
-)]
-pub fn map_worker_err(err: LeanWorkerError) -> ServerError {
-    match err {
-        LeanWorkerError::WorkerChildUnresolved { .. }
-        | LeanWorkerError::WorkerChildNotExecutable { .. }
-        | LeanWorkerError::Bootstrap { .. }
-        | LeanWorkerError::CapabilityBuild { .. }
-        | LeanWorkerError::Setup { .. }
-        | LeanWorkerError::Handshake { .. }
-        | LeanWorkerError::CapabilityMetadataMismatch { .. } => ServerError::BadProject(err.to_string()),
-        LeanWorkerError::ChildPanicOrAbort { .. } | LeanWorkerError::ChildExited { .. } => ServerError::Lean(format!(
-            "worker process exited; project worker will restart before the next request: {err}"
-        )),
-        _ => ServerError::Lean(err.to_string()),
     }
 }

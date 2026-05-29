@@ -34,13 +34,14 @@ fn broker(cfg: BrokerConfig) -> std::sync::Arc<ProjectBroker> {
 
 fn cfg(cwd: PathBuf, env_default: Option<PathBuf>, config_default: Option<PathBuf>) -> BrokerConfig {
     BrokerConfig {
-        cache_dir: std::env::temp_dir(),
         config_default,
         env_default,
         cwd,
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: std::time::Duration::ZERO,
         semantic_permits: BrokerConfig::default_semantic_permits(),
+        semantic_waiters: BrokerConfig::default_semantic_waiters(),
+        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
     }
 }
 

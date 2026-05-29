@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
-use lean_host_mcp::{BrokerConfig, ProjectBroker, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, ProjectBroker};
 use tokio::runtime::Runtime;
 
 fn fixture_root() -> Option<PathBuf> {
@@ -33,13 +33,14 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
     };
     let rt = Runtime::new().unwrap();
     let broker = ProjectBroker::new(BrokerConfig {
-        cache_dir: default_cache_dir(),
         config_default: None,
         env_default: Some(root.clone()),
         cwd: root,
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: BrokerConfig::default_idle_timeout(),
         semantic_permits: BrokerConfig::default_semantic_permits(),
+        semantic_waiters: BrokerConfig::default_semantic_waiters(),
+        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
     });
     let ctx = ToolContext { broker };
     // Prime the import set so the first measured iteration doesn't pay the

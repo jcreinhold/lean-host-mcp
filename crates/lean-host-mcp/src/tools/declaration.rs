@@ -18,10 +18,9 @@ use serde::{Deserialize, Deserializer};
 use crate::broker::ProjectHint;
 use crate::envelope::Response;
 use crate::error::Result;
-use crate::project::ProjectCall;
 use crate::projections::{DeclarationInspectionResult, project_declaration_inspection};
 use crate::tools::source_input::{module_name_for_file, read_query_file};
-use crate::tools::{ToolContext, freshness_for, session_imports};
+use crate::tools::{ToolContext, session_imports};
 
 const DEFAULT_FIELD_BYTES: u32 = 8 * 1024;
 const MIN_FIELD_BYTES: u32 = 256;
@@ -164,45 +163,36 @@ pub async fn inspect_declaration(
     req: InspectDeclarationRequest,
 ) -> Result<Response<DeclarationInspectionResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let budgets = budgets_for(&req);
-            let fields = req.fields.into();
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let budgets = budgets_for(&req);
+    let fields = req.fields.into();
 
-            if req.name.trim().is_empty() {
-                return Ok(Response::ok(
-                    DeclarationInspectionResult::NotFound { name: None },
-                    freshness_for(&project, &req.imports),
-                )
-                .warn("inspect_declaration requires `name`"));
-            }
-            let mut imports = req.imports.clone();
-            if let Some(file) = req.file.as_ref() {
-                let input = read_query_file(project.canonical_root(), file)?;
-                extend_unique(&mut imports, input.imports);
-                if let Some(module) = module_name_for_file(project.canonical_root(), &input.resolved) {
-                    extend_unique(&mut imports, vec![module]);
-                }
-            }
-            let call = inspect_name(&project, req.name.clone(), imports.clone(), fields, budgets).await?;
-            Ok(Response::ok(
-                project_declaration_inspection(call.value),
-                freshness_for(&project, &imports),
-            )
-            .with_runtime(call.runtime))
-        })
-        .await
-}
-
-async fn inspect_name(
-    project: &crate::project::LeanProject,
-    name: String,
-    imports: Vec<String>,
-    fields: LeanWorkerDeclarationInspectionFields,
-    budgets: LeanWorkerOutputBudgets,
-) -> Result<ProjectCall<lean_rs_worker_parent::LeanWorkerDeclarationInspectionResult>> {
-    let request = LeanWorkerDeclarationInspectionRequest { name, fields, budgets };
-    project.inspect_declaration(session_imports(imports), request).await
+    if req.name.trim().is_empty() {
+        let runtime = ctx.broker.project_runtime(hint, req.imports.clone()).await?;
+        return Ok(
+            Response::ok(DeclarationInspectionResult::NotFound { name: None }, runtime.freshness)
+                .with_runtime(runtime.runtime)
+                .warn("inspect_declaration requires `name`"),
+        );
+    }
+    let mut imports = req.imports.clone();
+    if let Some(file) = req.file.as_ref() {
+        let input = read_query_file(&meta.canonical_root, file)?;
+        extend_unique(&mut imports, input.imports);
+        if let Some(module) = module_name_for_file(&meta.canonical_root, &input.resolved) {
+            extend_unique(&mut imports, vec![module]);
+        }
+    }
+    let request = LeanWorkerDeclarationInspectionRequest {
+        name: req.name.clone(),
+        fields,
+        budgets,
+    };
+    let call = ctx
+        .broker
+        .inspect_declaration(hint, session_imports(imports.clone()), imports, request)
+        .await?;
+    Ok(Response::ok(project_declaration_inspection(call.value), call.freshness).with_runtime(call.runtime))
 }
 
 fn budgets_for(req: &InspectDeclarationRequest) -> LeanWorkerOutputBudgets {

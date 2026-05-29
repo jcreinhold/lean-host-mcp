@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lean_host_mcp::{LakeProjectMeta, LeanProject, default_cache_dir};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectHint};
 use lean_rs_worker_parent::{LeanWorkerElabOptions, LeanWorkerModuleQuery};
 use tokio::runtime::Runtime;
 
@@ -43,22 +43,36 @@ fn bench_module_query(c: &mut Criterion) {
     for (name, query) in queries {
         let rt = Runtime::new().unwrap();
         let imports = vec!["LeanRsFixture.Handles".to_owned()];
-        let meta = LakeProjectMeta::from_explicit(&root).expect("meta");
-        let project = LeanProject::open(meta, &default_cache_dir()).expect("open");
+        let broker = ProjectBroker::new(BrokerConfig {
+            config_default: None,
+            env_default: Some(root.clone()),
+            cwd: root.clone(),
+            max_projects: BrokerConfig::default_max_projects(),
+            idle_timeout: BrokerConfig::default_idle_timeout(),
+            semantic_permits: BrokerConfig::default_semantic_permits(),
+            semantic_waiters: BrokerConfig::default_semantic_waiters(),
+            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
+        });
         group.bench_function(name, |b| {
             b.iter(|| {
                 let source = source.clone();
                 let imports = imports.clone();
                 let query = query.clone();
                 rt.block_on(async {
-                    project
-                        .process_module_query(imports, source, query, LeanWorkerElabOptions::new())
+                    broker
+                        .process_module_query(
+                            ProjectHint::Default,
+                            imports.clone(),
+                            imports,
+                            source,
+                            query,
+                            LeanWorkerElabOptions::new(),
+                        )
                         .await
                         .expect("process_module_query");
                 });
             });
         });
-        project.shutdown();
     }
     group.finish();
 }

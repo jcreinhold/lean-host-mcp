@@ -20,25 +20,14 @@ pub mod proof_search;
 pub(crate) mod source_input;
 
 use crate::broker::ProjectBroker;
-use crate::envelope::Freshness;
-use crate::project::LeanProject;
 
 /// Shared state every tool handler reads.
 ///
-/// Holds the broker; each tool's body resolves its
-/// [`ProjectHint`](crate::broker::ProjectHint) inside
-/// [`ProjectBroker::with_project`](crate::broker::ProjectBroker::with_project)
-/// and receives an `Arc<LeanProject>` for the duration of its closure.
+/// Holds the broker; each tool calls a narrow broker operation for its
+/// semantic work instead of receiving a raw project actor handle.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub broker: Arc<ProjectBroker>,
-}
-
-/// Build the [`Freshness`] envelope for a tool response. `session_id` is
-/// the project actor's stable identity: two calls to the same project see
-/// the same value; eviction or manifest invalidation changes it.
-pub(crate) fn freshness_for(project: &LeanProject, imports: &[String]) -> Freshness {
-    project.freshness(imports)
 }
 
 /// Imports passed to worker sessions: `Init` is the internal base

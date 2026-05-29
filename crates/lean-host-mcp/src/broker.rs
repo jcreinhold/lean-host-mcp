@@ -1,19 +1,18 @@
 //! `ProjectBroker`: the mediator between MCP tool dispatch and
-//! [`LeanProject`].
+//! the private per-project Lean runtime.
 //!
 //! Two responsibilities:
 //!
 //! 1. **Resolve** a tool call's [`ProjectHint`] into a canonical Lake-root
 //!    path via the five-step chain
 //!    *explicit → env → cwd-walk → config-default → error*.
-//! 2. **Lend** an `Arc<LeanProject>` to the tool's closure, opening the
-//!    project lazily on first use, reusing it on subsequent calls, and
-//!    evicting under LRU and idle pressure.
+//! 2. **Dispatch** typed semantic operations to a private per-project
+//!    runtime, opening the project lazily on first use, reusing it on
+//!    subsequent calls, and evicting under LRU and idle pressure.
 //!
-//! The closure-shaped [`with_project`](ProjectBroker::with_project) API is
-//! deliberate: tools never see the registry; they receive a clone of the
-//! project's `Arc` and the broker's mutex is released before the closure
-//! runs.
+//! Tool modules call narrow domain methods such as
+//! [`ProjectBroker::inspect_declaration`] and never receive raw project actor
+//! handles.
 //!
 //! **LRU + idle eviction.** The registry is an [`lru::LruCache`] capped by
 //! [`BrokerConfig::max_projects`] (default 4). A background reaper spawned
@@ -26,25 +25,33 @@
 //! shut down and re-spawned. The cost is one ≤ 50 KB SHA-256 per tool call.
 //!
 //! **Slow-path concurrency.** The registry mutex is never held across
-//! [`LeanProject::open`] (multi-second worker spawn) or
-//! [`LeanProject::call`]. Concurrent misses for the same canonical root are
-//! coalesced so only one project actor is opened. Heavy semantic jobs are
+//! worker spawn or command execution. Concurrent misses for the same
+//! canonical root are coalesced so only one project actor is opened. Heavy semantic jobs are
 //! additionally gated by a process-wide permit owned by the broker.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use lean_rs_worker_parent::{
+    LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationSearch,
+    LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationVerificationRequest,
+    LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions, LeanWorkerModuleQuery,
+    LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector,
+    LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult,
+};
 use lru::LruCache;
 use parking_lot::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
+use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
+use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::index::fingerprint_lake_project;
 use crate::lake_meta::LakeProjectMeta;
-use crate::project::{LeanProject, SemanticAdmission};
+use crate::project::{LeanProject, ProjectCall, SemanticAdmission};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
 pub const DEFAULT_MAX_PROJECTS: usize = 4;
@@ -57,6 +64,8 @@ pub const DEFAULT_MAX_PROJECTS: usize = 4;
 /// within a reasonable bound.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_SEMANTIC_PERMITS: usize = 1;
+pub const DEFAULT_SEMANTIC_WAITERS: usize = 16;
+pub const DEFAULT_SEMANTIC_ADMISSION_TIMEOUT_MILLIS: u64 = 60_000;
 
 const REAPER_TICK: Duration = Duration::from_mins(1);
 
@@ -65,11 +74,10 @@ const REAPER_TICK: Duration = Duration::from_mins(1);
 /// without `std::env::set_current_dir`.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
-    pub cache_dir: PathBuf,
     pub config_default: Option<PathBuf>,
     pub env_default: Option<PathBuf>,
     pub cwd: PathBuf,
-    /// Maximum number of [`LeanProject`] instances kept resident. A miss
+    /// Maximum number of private project runtimes kept resident. A miss
     /// when the pool is full evicts the LRU entry.
     pub max_projects: NonZeroUsize,
     /// Idle window after which a project is eligible for the reaper.
@@ -77,6 +85,10 @@ pub struct BrokerConfig {
     pub idle_timeout: Duration,
     /// Process-wide permits for heavy Lean semantic work.
     pub semantic_permits: NonZeroUsize,
+    /// Process-wide capacity for callers waiting on semantic-work permits.
+    pub semantic_waiters: NonZeroUsize,
+    /// Maximum time a caller may wait for semantic-work admission.
+    pub semantic_admission_timeout: Duration,
 }
 
 impl BrokerConfig {
@@ -90,11 +102,15 @@ impl BrokerConfig {
     ///
     /// [`ServerError::Internal`] when an env var is set but unparseable
     /// (non-numeric, or `MAX_PROJECTS=0`).
-    pub fn pool_from_env() -> Result<(NonZeroUsize, Duration, NonZeroUsize)> {
+    pub fn pool_from_env() -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
         parse_pool_config(
             std::env::var("LEAN_HOST_MCP_MAX_PROJECTS").ok().as_deref(),
             std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok().as_deref(),
             std::env::var("LEAN_HOST_MCP_SEMANTIC_PERMITS").ok().as_deref(),
+            std::env::var("LEAN_HOST_MCP_SEMANTIC_WAITERS").ok().as_deref(),
+            std::env::var("LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -117,6 +133,18 @@ impl BrokerConfig {
     pub fn default_semantic_permits() -> NonZeroUsize {
         NonZeroUsize::new(DEFAULT_SEMANTIC_PERMITS).unwrap_or(NonZeroUsize::MIN)
     }
+
+    /// Convenience: default global semantic-admission waiter capacity.
+    #[must_use]
+    pub fn default_semantic_waiters() -> NonZeroUsize {
+        NonZeroUsize::new(DEFAULT_SEMANTIC_WAITERS).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    /// Convenience: default global semantic-admission wait timeout.
+    #[must_use]
+    pub const fn default_semantic_admission_timeout() -> Duration {
+        Duration::from_millis(DEFAULT_SEMANTIC_ADMISSION_TIMEOUT_MILLIS)
+    }
 }
 
 /// Pure parser shared by [`BrokerConfig::pool_from_env`] and unit tests.
@@ -124,7 +152,9 @@ fn parse_pool_config(
     max: Option<&str>,
     idle: Option<&str>,
     semantic: Option<&str>,
-) -> Result<(NonZeroUsize, Duration, NonZeroUsize)> {
+    semantic_waiters: Option<&str>,
+    semantic_timeout_millis: Option<&str>,
+) -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
     let max_projects = match max {
         Some(s) => {
             let n: usize = s
@@ -155,7 +185,40 @@ fn parse_pool_config(
         }
         None => BrokerConfig::default_semantic_permits(),
     };
-    Ok((max_projects, idle_timeout, semantic_permits))
+    let semantic_waiters = match semantic_waiters {
+        Some(s) => {
+            let n: usize = s
+                .parse()
+                .map_err(|e| ServerError::Internal(format!("LEAN_HOST_MCP_SEMANTIC_WAITERS={s:?} not a usize: {e}")))?;
+            NonZeroUsize::new(n).ok_or_else(|| {
+                ServerError::Internal("LEAN_HOST_MCP_SEMANTIC_WAITERS=0 would reject all waiters".into())
+            })?
+        }
+        None => BrokerConfig::default_semantic_waiters(),
+    };
+    let semantic_admission_timeout = match semantic_timeout_millis {
+        Some(s) => {
+            let n: u64 = s.parse().map_err(|e| {
+                ServerError::Internal(format!(
+                    "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS={s:?} not a u64: {e}"
+                ))
+            })?;
+            if n == 0 {
+                return Err(ServerError::Internal(
+                    "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS=0 is not allowed".into(),
+                ));
+            }
+            Duration::from_millis(n)
+        }
+        None => BrokerConfig::default_semantic_admission_timeout(),
+    };
+    Ok((
+        max_projects,
+        idle_timeout,
+        semantic_permits,
+        semantic_waiters,
+        semantic_admission_timeout,
+    ))
 }
 
 /// Per-call routing hint. `Default` runs the full resolution chain;
@@ -181,7 +244,22 @@ impl ProjectHint {
 struct BrokerInner {
     registry: LruCache<PathBuf, Arc<LeanProject>>,
     last_used: HashMap<PathBuf, Instant>,
-    opening_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
+    opening_locks: HashMap<PathBuf, Arc<AsyncMutex<()>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerCall<T> {
+    pub value: T,
+    pub runtime: RuntimeFacts,
+    pub freshness: Freshness,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CachedBrokerCall<T> {
+    pub value: T,
+    pub runtime: RuntimeFacts,
+    pub freshness: Freshness,
+    pub freshly_processed: bool,
 }
 
 pub struct ProjectBroker {
@@ -213,7 +291,11 @@ impl ProjectBroker {
                 last_used: HashMap::new(),
                 opening_locks: HashMap::new(),
             }),
-            semantic_admission: SemanticAdmission::new(config.semantic_permits),
+            semantic_admission: SemanticAdmission::new(
+                config.semantic_permits,
+                config.semantic_waiters,
+                config.semantic_admission_timeout,
+            ),
             config,
         });
         broker.spawn_reaper();
@@ -272,10 +354,8 @@ impl ProjectBroker {
 
     /// Resolve the hint and load the project's [`LakeProjectMeta`] without
     /// opening (or touching) a worker. Tools that only need filesystem-level
-    /// information about the project (e.g.
-    /// project-scoped tools call this instead
-    /// of [`Self::with_project`] so a broken worker bootstrap can't block a
-    /// pure filesystem operation.
+    /// information about the project so a broken worker bootstrap can't block
+    /// a pure filesystem operation.
     ///
     /// # Errors
     ///
@@ -286,30 +366,228 @@ impl ProjectBroker {
         LakeProjectMeta::from_explicit(&root)
     }
 
-    /// Resolve the hint, ensure a [`LeanProject`] is open for that root,
-    /// and run `job` with a clone of the project's `Arc`. The registry
-    /// mutex is released before `job` runs, and is never held across
-    /// [`LeanProject::open`] on the miss path.
+    /// Process one module query through the project runtime.
     ///
     /// # Errors
     ///
-    /// Resolution failures, manifest-read failures, and
-    /// [`LeanProject::open`] failures travel as [`ServerError`]. The
-    /// closure's own errors propagate unchanged.
-    pub async fn with_project<F, Fut, R>(&self, hint: ProjectHint, job: F) -> Result<R>
-    where
-        F: FnOnce(Arc<LeanProject>) -> Fut + Send,
-        Fut: Future<Output = Result<R>> + Send,
-        R: Send,
-    {
+    /// Returns resolution, project-open, admission, or worker runtime failures.
+    pub async fn process_module_query(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        source: String,
+        query: LeanWorkerModuleQuery,
+        options: LeanWorkerElabOptions,
+    ) -> Result<BrokerCall<LeanWorkerModuleQueryOutcome>> {
+        let project = self.project_for(hint).await?;
+        let call = project
+            .process_module_query(session_imports, source, query, options)
+            .await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Process one cacheable module query through the project runtime.
+    pub(crate) async fn process_cached_module_query(
+        &self,
+        hint: ProjectHint,
+        path: PathBuf,
+        content_hash: [u8; 32],
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        source: String,
+        query: LeanWorkerModuleQuery,
+        options: LeanWorkerElabOptions,
+    ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryOutcome>> {
+        let project = self.project_for(hint).await?;
+        let key = ModuleQueryKey::from_query(&query);
+        if let Some(value) = project.module_query_cache().get(&path, content_hash, &key) {
+            return Ok(CachedBrokerCall {
+                value,
+                runtime: project.runtime_facts(),
+                freshness: project.freshness(&freshness_imports),
+                freshly_processed: false,
+            });
+        }
+        let call = project
+            .process_module_query(session_imports, source, query, options)
+            .await?;
+        project
+            .module_query_cache()
+            .insert(path, content_hash, key, call.value.clone());
+        Ok(CachedBrokerCall {
+            value: call.value,
+            runtime: call.runtime,
+            freshness: project.freshness(&freshness_imports),
+            freshly_processed: true,
+        })
+    }
+
+    /// Process one module-query batch through the project runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, project-open, admission, or worker runtime failures.
+    pub async fn process_module_query_batch(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        source: String,
+        selectors: Vec<LeanWorkerModuleQuerySelector>,
+        budgets: LeanWorkerOutputBudgets,
+        options: LeanWorkerElabOptions,
+    ) -> Result<BrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
+        let project = self.project_for(hint).await?;
+        let call = project
+            .process_module_query_batch(session_imports, source, selectors, budgets, options)
+            .await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Process one cacheable module-query batch through the project runtime.
+    pub(crate) async fn process_cached_module_query_batch(
+        &self,
+        hint: ProjectHint,
+        path: PathBuf,
+        content_hash: [u8; 32],
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        source: String,
+        selectors: Vec<LeanWorkerModuleQuerySelector>,
+        budgets: LeanWorkerOutputBudgets,
+        options: LeanWorkerElabOptions,
+    ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
+        let project = self.project_for(hint).await?;
+        let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
+        if let Some(value) = project.module_query_cache().get_batch(&path, content_hash, &key) {
+            return Ok(CachedBrokerCall {
+                value,
+                runtime: project.runtime_facts(),
+                freshness: project.freshness(&freshness_imports),
+                freshly_processed: false,
+            });
+        }
+        let call = project
+            .process_module_query_batch(session_imports, source, selectors, budgets, options)
+            .await?;
+        project
+            .module_query_cache()
+            .insert_batch(path, content_hash, key, call.value.clone());
+        Ok(CachedBrokerCall {
+            value: call.value,
+            runtime: call.runtime,
+            freshness: project.freshness(&freshness_imports),
+            freshly_processed: true,
+        })
+    }
+
+    /// Inspect one declaration through the project runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, project-open, admission, or worker runtime failures.
+    pub async fn inspect_declaration(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        request: LeanWorkerDeclarationInspectionRequest,
+    ) -> Result<BrokerCall<LeanWorkerDeclarationInspectionResult>> {
+        let project = self.project_for(hint).await?;
+        let call = project.inspect_declaration(session_imports, request).await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Run declaration search through the project runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, project-open, admission, or worker runtime failures.
+    pub async fn search_declarations(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        request: LeanWorkerDeclarationSearch,
+    ) -> Result<BrokerCall<LeanWorkerDeclarationSearchResult>> {
+        let project = self.project_for(hint).await?;
+        let call = project.search_declarations(session_imports, request).await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Try proof fragments through the project runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, project-open, admission, or worker runtime failures.
+    pub async fn attempt_proof(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        request: LeanWorkerProofAttemptRequest,
+        options: LeanWorkerElabOptions,
+    ) -> Result<BrokerCall<LeanWorkerProofAttemptResult>> {
+        let project = self.project_for(hint).await?;
+        let call = project.attempt_proof(session_imports, request, options).await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Verify one declaration through the project runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, project-open, admission, or worker runtime failures.
+    pub async fn verify_declaration(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        request: LeanWorkerDeclarationVerificationRequest,
+        options: LeanWorkerElabOptions,
+    ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationResult>> {
+        let project = self.project_for(hint).await?;
+        let call = project.verify_declaration(session_imports, request, options).await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Return runtime/freshness metadata for a project without submitting worker work.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution or project-open failures.
+    pub async fn project_runtime(&self, hint: ProjectHint, freshness_imports: Vec<String>) -> Result<BrokerCall<()>> {
+        let project = self.project_for(hint).await?;
+        let out = BrokerCall {
+            value: (),
+            runtime: project.runtime_facts(),
+            freshness: project.freshness(&freshness_imports),
+        };
+        drop(project);
+        Ok(out)
+    }
+
+    async fn project_for(&self, hint: ProjectHint) -> Result<Arc<LeanProject>> {
         let root = self.resolve(&hint)?;
-        let project = self.acquire(root)?;
-        job(project).await
+        self.acquire(root).await
     }
 
     /// Look up or open the project for `root`. Mutex is released around
     /// the slow path so concurrent calls for different roots parallelize.
-    fn acquire(&self, root: PathBuf) -> Result<Arc<LeanProject>> {
+    async fn acquire(&self, root: PathBuf) -> Result<Arc<LeanProject>> {
         // Fast path: registry hit + matching manifest hash.
         let cached = {
             let mut inner = self.inner.lock();
@@ -342,10 +620,10 @@ impl ProjectBroker {
                 inner
                     .opening_locks
                     .entry(root.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
             )
         };
-        let _open_guard = open_lock.lock();
+        let _open_guard = open_lock.lock().await;
 
         let cached_after_wait = {
             let mut inner = self.inner.lock();
@@ -369,22 +647,29 @@ impl ProjectBroker {
         }
 
         // Slow path: open without holding the registry lock.
-        let meta = match LakeProjectMeta::from_explicit(&root) {
-            Ok(meta) => meta,
-            Err(err) => {
+        let meta_root = root.clone();
+        let meta = match tokio::task::spawn_blocking(move || LakeProjectMeta::from_explicit(&meta_root)).await {
+            Ok(Ok(meta)) => meta,
+            Ok(Err(err)) => {
                 self.inner.lock().opening_locks.remove(&root);
                 return Err(err);
             }
-        };
-        let opened = match LeanProject::open_with_admission(
-            meta,
-            &self.config.cache_dir,
-            Arc::clone(&self.semantic_admission),
-        ) {
-            Ok(project) => project,
             Err(err) => {
                 self.inner.lock().opening_locks.remove(&root);
+                return Err(ServerError::Internal(format!("project metadata task failed: {err}")));
+            }
+        };
+        let admission = Arc::clone(&self.semantic_admission);
+        let opened = match tokio::task::spawn_blocking(move || LeanProject::open_with_admission(meta, admission)).await
+        {
+            Ok(Ok(project)) => project,
+            Ok(Err(err)) => {
+                self.inner.lock().opening_locks.remove(&root);
                 return Err(err);
+            }
+            Err(err) => {
+                self.inner.lock().opening_locks.remove(&root);
+                return Err(ServerError::Internal(format!("project open task failed: {err}")));
             }
         };
 
@@ -501,6 +786,14 @@ fn pop_idle_lru(registry: &mut LruCache<PathBuf, Arc<LeanProject>>) -> Option<(P
     Some((key, project))
 }
 
+fn broker_call<T>(project: &LeanProject, freshness_imports: &[String], call: ProjectCall<T>) -> BrokerCall<T> {
+    BrokerCall {
+        value: call.value,
+        runtime: call.runtime,
+        freshness: project.freshness(freshness_imports),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -525,13 +818,14 @@ mod tests {
 
     fn cfg(cwd: PathBuf, env: Option<PathBuf>, conf: Option<PathBuf>) -> BrokerConfig {
         BrokerConfig {
-            cache_dir: std::env::temp_dir(),
             config_default: conf,
             env_default: env,
             cwd,
             max_projects: BrokerConfig::default_max_projects(),
             idle_timeout: Duration::ZERO,
             semantic_permits: NonZeroUsize::MIN,
+            semantic_waiters: BrokerConfig::default_semantic_waiters(),
+            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
         }
     }
 
@@ -556,37 +850,47 @@ mod tests {
 
     #[test]
     fn parse_pool_config_uses_defaults_when_unset() {
-        let (max, idle, semantic) = parse_pool_config(None, None, None).unwrap();
+        let (max, idle, semantic, waiters, timeout) = parse_pool_config(None, None, None, None, None).unwrap();
         assert_eq!(max.get(), DEFAULT_MAX_PROJECTS);
         assert_eq!(idle, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
         assert_eq!(semantic.get(), DEFAULT_SEMANTIC_PERMITS);
+        assert_eq!(waiters.get(), DEFAULT_SEMANTIC_WAITERS);
+        assert_eq!(
+            timeout,
+            Duration::from_millis(DEFAULT_SEMANTIC_ADMISSION_TIMEOUT_MILLIS)
+        );
     }
 
     #[test]
     fn parse_pool_config_accepts_explicit_values() {
-        let (max, idle, semantic) = parse_pool_config(Some("8"), Some("30"), Some("2")).unwrap();
+        let (max, idle, semantic, waiters, timeout) =
+            parse_pool_config(Some("8"), Some("30"), Some("2"), Some("12"), Some("250")).unwrap();
         assert_eq!(max.get(), 8);
         assert_eq!(idle, Duration::from_secs(30));
         assert_eq!(semantic.get(), 2);
+        assert_eq!(waiters.get(), 12);
+        assert_eq!(timeout, Duration::from_millis(250));
     }
 
     #[test]
     fn parse_pool_config_treats_zero_idle_as_disable() {
-        let (_, idle, _) = parse_pool_config(None, Some("0"), None).unwrap();
+        let (_, idle, _, _, _) = parse_pool_config(None, Some("0"), None, None, None).unwrap();
         assert_eq!(idle, Duration::ZERO);
     }
 
     #[test]
     fn parse_pool_config_rejects_max_projects_zero() {
-        let err = parse_pool_config(Some("0"), None, None).unwrap_err();
+        let err = parse_pool_config(Some("0"), None, None, None, None).unwrap_err();
         assert!(matches!(err, ServerError::Internal(_)), "{err:?}");
     }
 
     #[test]
     fn parse_pool_config_rejects_garbage() {
-        assert!(parse_pool_config(Some("seven"), None, None).is_err());
-        assert!(parse_pool_config(None, Some("forever"), None).is_err());
-        assert!(parse_pool_config(None, None, Some("many")).is_err());
-        assert!(parse_pool_config(None, None, Some("0")).is_err());
+        assert!(parse_pool_config(Some("seven"), None, None, None, None).is_err());
+        assert!(parse_pool_config(None, Some("forever"), None, None, None).is_err());
+        assert!(parse_pool_config(None, None, Some("many"), None, None).is_err());
+        assert!(parse_pool_config(None, None, Some("0"), None, None).is_err());
+        assert!(parse_pool_config(None, None, None, Some("0"), None).is_err());
+        assert!(parse_pool_config(None, None, None, None, Some("0")).is_err());
     }
 }

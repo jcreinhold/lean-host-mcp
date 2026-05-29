@@ -12,6 +12,8 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
+use lean_rs_worker_parent::LeanWorkerError;
+
 #[derive(Debug, Clone, Serialize, JsonSchema, thiserror::Error)]
 #[error("worker unavailable: {reason}")]
 pub struct WorkerUnavailable {
@@ -78,5 +80,31 @@ impl From<ServerError> for McpError {
 impl From<anyhow::Error> for ServerError {
     fn from(err: anyhow::Error) -> Self {
         Self::Internal(err.to_string())
+    }
+}
+
+/// Classify a worker-layer infrastructure error at the runtime boundary.
+///
+/// Bootstrap failures map to `ServerError::BadProject`; worker death and
+/// timeout cases that need retry/restart metadata are handled by the project
+/// actor before this fallback is used.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::wildcard_enum_match_arm,
+    reason = "LeanWorkerError is upstream-evolving; everything outside the bootstrap-classification set maps to Lean for the MCP wire"
+)]
+pub(crate) fn map_worker_err(err: LeanWorkerError) -> ServerError {
+    match err {
+        LeanWorkerError::WorkerChildUnresolved { .. }
+        | LeanWorkerError::WorkerChildNotExecutable { .. }
+        | LeanWorkerError::Bootstrap { .. }
+        | LeanWorkerError::CapabilityBuild { .. }
+        | LeanWorkerError::Setup { .. }
+        | LeanWorkerError::Handshake { .. }
+        | LeanWorkerError::CapabilityMetadataMismatch { .. } => ServerError::BadProject(err.to_string()),
+        LeanWorkerError::ChildPanicOrAbort { .. } | LeanWorkerError::ChildExited { .. } => ServerError::Lean(format!(
+            "worker process exited; project worker will restart before the next request: {err}"
+        )),
+        _ => ServerError::Lean(err.to_string()),
     }
 }

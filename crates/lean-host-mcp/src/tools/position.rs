@@ -7,9 +7,7 @@
 // worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationTargetInfo, LeanWorkerDeclarationTargetResult, LeanWorkerElabOptions, LeanWorkerLocalInfo,
@@ -25,10 +23,8 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
-use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
-use crate::envelope::{Response, RuntimeFacts};
+use crate::envelope::{Freshness, Response, RuntimeFacts};
 use crate::error::{Result, ServerError};
-use crate::project::{LeanProject, ProjectCall};
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
 use crate::tools::source_input::{header_imports, read_query_file, resolve_path};
 use crate::tools::{ToolContext, is_ignored_dir, session_imports};
@@ -272,120 +268,15 @@ pub enum ProofStateResult {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct LeanQueryRequest {
-    /// Path to a `.lean` file. Resolved against the resolved project root
-    /// if relative.
-    pub file: PathBuf,
-    /// Bounded semantic projections to run against the file in one
-    /// elaboration.
-    pub selectors: Vec<LeanQuerySelector>,
-    /// Optional explicit project root for this call.
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(tag = "selector", rename_all = "snake_case")]
-pub enum LeanQuerySelector {
-    Diagnostics {
-        id: String,
-    },
-    ProofState {
-        id: String,
-        line: u32,
-        column: u32,
-    },
-    TypeAt {
-        id: String,
-        line: u32,
-        column: u32,
-    },
-    References {
-        id: String,
-        name: String,
-    },
-    DeclarationTarget {
-        id: String,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        line: Option<u32>,
-        #[serde(default)]
-        column: Option<u32>,
-    },
-    SurroundingDeclaration {
-        id: String,
-        line: u32,
-        column: u32,
-    },
-}
-
-impl LeanQuerySelector {
-    fn id(&self) -> &str {
-        match self {
-            Self::Diagnostics { id }
-            | Self::ProofState { id, .. }
-            | Self::TypeAt { id, .. }
-            | Self::References { id, .. }
-            | Self::DeclarationTarget { id, .. }
-            | Self::SurroundingDeclaration { id, .. } => id,
-        }
-    }
-
-    fn into_worker(self) -> LeanWorkerModuleQuerySelector {
-        match self {
-            Self::Diagnostics { id } => LeanWorkerModuleQuerySelector::Diagnostics { id },
-            Self::ProofState { id, line, column } => LeanWorkerModuleQuerySelector::ProofState { id, line, column },
-            Self::TypeAt { id, line, column } => LeanWorkerModuleQuerySelector::TypeAt { id, line, column },
-            Self::References { id, name } => LeanWorkerModuleQuerySelector::References { id, name },
-            Self::DeclarationTarget { id, name, line, column } => {
-                LeanWorkerModuleQuerySelector::DeclarationTarget { id, name, line, column }
-            }
-            Self::SurroundingDeclaration { id, line, column } => {
-                LeanWorkerModuleQuerySelector::SurroundingDeclaration { id, line, column }
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LeanQueryProjection {
+enum BatchProjection {
     Diagnostics(DiagnosticsBlock),
     ProofState(ProofStateProjection),
     TypeAt(TypeAtProjection),
     References(ReferencesProjection),
     DeclarationTarget(DeclarationTargetProjection),
     SurroundingDeclaration(SurroundingDeclarationProjection),
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum LeanQueryItem {
-    Ok { result: LeanQueryProjection },
-    Unavailable { message: String },
-    BudgetExceeded { message: String },
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum LeanQueryResult {
-    Results {
-        items: BTreeMap<String, LeanQueryItem>,
-        total_truncated: bool,
-        query_facts: ModuleQueryFacts,
-    },
-    HeaderParseFailed {
-        summary: DiagnosticSummary,
-        diagnostics: Vec<Diagnostic>,
-        truncated: bool,
-        query_facts: ModuleQueryFacts,
-    },
-    InvalidSelectors {
-        message: String,
-    },
-    Unsupported,
 }
 
 /// Inspect the current Lean proof context at a declaration proof position.
@@ -396,190 +287,112 @@ pub enum LeanQueryResult {
 /// `ServerError::Lean` for worker infrastructure failures.
 pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Response<ProofStateResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let selectors = vec![
-                LeanWorkerModuleQuerySelector::Diagnostics {
-                    id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
-                },
-                LeanWorkerModuleQuerySelector::ProofStateInDeclaration {
-                    id: PROOF_STATE_CONTEXT_ID.to_owned(),
-                    declaration: req.declaration,
-                    position: worker_proof_position(req.proof_position),
-                },
-            ];
-            let budgets = proof_agent_budgets();
-            let run = run_module_query_batch(&project, &req.file, selectors, budgets).await?;
-            let freshness = project.freshness(&run.imports);
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let selectors = vec![
+        LeanWorkerModuleQuerySelector::Diagnostics {
+            id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
+        },
+        LeanWorkerModuleQuerySelector::ProofStateInDeclaration {
+            id: PROOF_STATE_CONTEXT_ID.to_owned(),
+            declaration: req.declaration,
+            position: worker_proof_position(req.proof_position),
+        },
+    ];
+    let budgets = proof_agent_budgets();
+    let run = run_module_query_batch(ctx, hint, &meta.canonical_root, &req.file, selectors, budgets).await?;
+    let freshness = run.freshness.clone();
 
-            match run.outcome {
-                BatchQueryRun::Ready {
-                    result,
-                    facts,
-                    missing_imports,
-                } => {
-                    let query_facts = project_query_facts(facts);
-                    let mut diagnostics = DiagnosticsBlock {
-                        summary: DiagnosticSummary::default(),
-                        diagnostics: Vec::new(),
-                        truncated: false,
-                    };
-                    let mut declaration_name = None;
-                    let mut namespace_name = None;
-                    let mut goals_before = Vec::new();
-                    let mut goals_after = Vec::new();
-                    let mut locals = Vec::new();
-                    let mut expected_type = None;
-                    let mut truncated = false;
-                    let mut unavailable = Vec::new();
-                    let mut budget_exceeded = Vec::new();
+    match run.outcome {
+        BatchQueryRun::Ready {
+            result,
+            facts,
+            missing_imports,
+        } => {
+            let query_facts = project_query_facts(facts);
+            let mut diagnostics = DiagnosticsBlock {
+                summary: DiagnosticSummary::default(),
+                diagnostics: Vec::new(),
+                truncated: false,
+            };
+            let mut declaration_name = None;
+            let mut namespace_name = None;
+            let mut goals_before = Vec::new();
+            let mut goals_after = Vec::new();
+            let mut locals = Vec::new();
+            let mut expected_type = None;
+            let mut truncated = false;
+            let mut unavailable = Vec::new();
+            let mut budget_exceeded = Vec::new();
 
-                    for item in result.items {
-                        match project_batch_item(item, None) {
-                            ProjectedBatchItem::Ok { id, result } => match (id.as_str(), result) {
-                                (PROOF_STATE_DIAGNOSTICS_ID, LeanQueryProjection::Diagnostics(block)) => {
-                                    diagnostics = block;
-                                }
-                                (PROOF_STATE_CONTEXT_ID, LeanQueryProjection::ProofState(value)) => match value {
-                                    ProofStateProjection::State { info } => {
-                                        let info = *info;
-                                        declaration_name = info.declaration_name;
-                                        namespace_name = Some(info.namespace_name);
-                                        goals_before = info.goals_before;
-                                        goals_after = info.goals_after;
-                                        locals = info.locals;
-                                        expected_type = info.expected_type;
-                                        truncated = info.truncated;
-                                    }
-                                    ProofStateProjection::Unavailable { message } => {
-                                        unavailable.push(SelectorMessage { id, message });
-                                    }
-                                },
-                                _ => {}
-                            },
-                            ProjectedBatchItem::Unavailable { id, message } => {
+            for item in result.items {
+                match project_batch_item(item, None) {
+                    ProjectedBatchItem::Ok { id, result } => match (id.as_str(), result) {
+                        (PROOF_STATE_DIAGNOSTICS_ID, BatchProjection::Diagnostics(block)) => {
+                            diagnostics = block;
+                        }
+                        (PROOF_STATE_CONTEXT_ID, BatchProjection::ProofState(value)) => match value {
+                            ProofStateProjection::State { info } => {
+                                let info = *info;
+                                declaration_name = info.declaration_name;
+                                namespace_name = Some(info.namespace_name);
+                                goals_before = info.goals_before;
+                                goals_after = info.goals_after;
+                                locals = info.locals;
+                                expected_type = info.expected_type;
+                                truncated = info.truncated;
+                            }
+                            ProofStateProjection::Unavailable { message } => {
                                 unavailable.push(SelectorMessage { id, message });
                             }
-                            ProjectedBatchItem::BudgetExceeded { id, message } => {
-                                budget_exceeded.push(SelectorMessage { id, message });
-                            }
-                        }
+                        },
+                        _ => {}
+                    },
+                    ProjectedBatchItem::Unavailable { id, message } => {
+                        unavailable.push(SelectorMessage { id, message });
                     }
-
-                    let response = Response::ok(
-                        ProofStateResult::Context {
-                            diagnostics,
-                            declaration_name,
-                            namespace_name,
-                            goals_before,
-                            goals_after,
-                            locals,
-                            expected_type,
-                            truncated,
-                            total_truncated: result.total_truncated,
-                            unavailable,
-                            budget_exceeded,
-                            query_facts: Box::new(query_facts.clone()),
-                        },
-                        freshness,
-                    )
-                    .with_runtime(run.runtime.clone());
-                    Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
-                }
-                BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
-                    let block = diagnostics_block(diagnostics);
-                    Ok(Response::ok(
-                        ProofStateResult::HeaderParseFailed {
-                            summary: block.summary,
-                            diagnostics: block.diagnostics,
-                            truncated: block.truncated,
-                            query_facts: project_query_facts(facts),
-                        },
-                        freshness,
-                    )
-                    .with_runtime(run.runtime))
-                }
-                BatchQueryRun::Unsupported => {
-                    Ok(Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime))
-                }
-            }
-        })
-        .await
-}
-
-/// Run a bounded batch of Lean semantic projections against one file.
-///
-/// # Errors
-///
-/// Returns `ServerError::Io` when the file cannot be read and
-/// `ServerError::Lean` for worker infrastructure failures.
-pub async fn lean_query(ctx: &ToolContext, req: LeanQueryRequest) -> Result<Response<LeanQueryResult>> {
-    let invalid_selectors = validate_lean_query_selectors(&req.selectors);
-    let hint = ProjectHint::from_request(req.project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            if let Some(message) = invalid_selectors {
-                return Ok(Response::ok(
-                    LeanQueryResult::InvalidSelectors { message },
-                    project.freshness(&[]),
-                ));
-            }
-
-            let selectors = req
-                .selectors
-                .into_iter()
-                .map(LeanQuerySelector::into_worker)
-                .collect::<Vec<_>>();
-            let budgets = expert_query_budgets();
-            let run = run_module_query_batch(&project, &req.file, selectors, budgets).await?;
-            let freshness = project.freshness(&run.imports);
-
-            match run.outcome {
-                BatchQueryRun::Ready {
-                    result,
-                    facts,
-                    missing_imports,
-                } => {
-                    let query_facts = project_query_facts(facts);
-                    let root = project.canonical_root().to_path_buf();
-                    let resolved = resolve_path(&root, &req.file);
-                    let display = display_path(&root, &resolved);
-                    let mut items = BTreeMap::new();
-                    for item in result.items {
-                        let projected = project_batch_item(item, Some(&display));
-                        let (id, value) = projected.into_item();
-                        items.insert(id, value);
+                    ProjectedBatchItem::BudgetExceeded { id, message } => {
+                        budget_exceeded.push(SelectorMessage { id, message });
                     }
-                    let response = Response::ok(
-                        LeanQueryResult::Results {
-                            items,
-                            total_truncated: result.total_truncated,
-                            query_facts: query_facts.clone(),
-                        },
-                        freshness,
-                    )
-                    .with_runtime(run.runtime.clone());
-                    Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
-                }
-                BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
-                    let block = diagnostics_block(diagnostics);
-                    Ok(Response::ok(
-                        LeanQueryResult::HeaderParseFailed {
-                            summary: block.summary,
-                            diagnostics: block.diagnostics,
-                            truncated: block.truncated,
-                            query_facts: project_query_facts(facts),
-                        },
-                        freshness,
-                    )
-                    .with_runtime(run.runtime))
-                }
-                BatchQueryRun::Unsupported => {
-                    Ok(Response::ok(LeanQueryResult::Unsupported, freshness).with_runtime(run.runtime))
                 }
             }
-        })
-        .await
+
+            let response = Response::ok(
+                ProofStateResult::Context {
+                    diagnostics,
+                    declaration_name,
+                    namespace_name,
+                    goals_before,
+                    goals_after,
+                    locals,
+                    expected_type,
+                    truncated,
+                    total_truncated: result.total_truncated,
+                    unavailable,
+                    budget_exceeded,
+                    query_facts: Box::new(query_facts.clone()),
+                },
+                freshness,
+            )
+            .with_runtime(run.runtime.clone());
+            Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
+        }
+        BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
+            let block = diagnostics_block(diagnostics);
+            Ok(Response::ok(
+                ProofStateResult::HeaderParseFailed {
+                    summary: block.summary,
+                    diagnostics: block.diagnostics,
+                    truncated: block.truncated,
+                    query_facts: project_query_facts(facts),
+                },
+                freshness,
+            )
+            .with_runtime(run.runtime))
+        }
+        BatchQueryRun::Unsupported => {
+            Ok(Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime))
+        }
+    }
 }
 
 // --- references --------------------------------------------------------
@@ -647,165 +460,163 @@ pub enum FindReferencesResult {
 /// files so a bounded project-scope lookup can continue.
 pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> Result<Response<FindReferencesResult>> {
     let hint = ProjectHint::from_request(req.project);
-    ctx.broker
-        .with_project(hint, move |project| async move {
-            let freshness = project.freshness(&[]);
-            let mut runtime = project.runtime_facts();
-            let root = project.canonical_root().to_path_buf();
-            let files = match req.scope {
-                ReferenceScope::File => {
-                    let Some(file) = req.file.as_ref() else {
-                        return Ok(Response::ok(
-                            FindReferencesResult::InvalidRequest {
-                                message: "find_references with scope=file requires `file`".to_owned(),
-                                semantic_based: true,
-                            },
-                            freshness,
-                        )
-                        .with_runtime(runtime));
-                    };
-                    if !req.files.is_empty() {
-                        return Ok(Response::ok(
-                            FindReferencesResult::InvalidRequest {
-                                message: "find_references with scope=file accepts `file`, not `files`".to_owned(),
-                                semantic_based: true,
-                            },
-                            freshness,
-                        )
-                        .with_runtime(runtime));
-                    }
-                    vec![resolve_path(&root, file)]
-                }
-                ReferenceScope::Project => {
-                    if req.file.is_some() {
-                        return Ok(Response::ok(
-                            FindReferencesResult::InvalidRequest {
-                                message: "find_references with scope=project accepts `files`, not `file`".to_owned(),
-                                semantic_based: true,
-                            },
-                            freshness,
-                        )
-                        .with_runtime(runtime));
-                    }
-                    if req.files.is_empty() {
-                        enumerate_lean_files(&root)
-                    } else {
-                        req.files.iter().map(|p| resolve_path(&root, p)).collect()
-                    }
-                }
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let base = ctx.broker.project_runtime(hint.clone(), Vec::new()).await?;
+    let freshness = base.freshness;
+    let mut runtime = base.runtime;
+    let root = meta.canonical_root;
+    let files = match req.scope {
+        ReferenceScope::File => {
+            let Some(file) = req.file.as_ref() else {
+                return Ok(Response::ok(
+                    FindReferencesResult::InvalidRequest {
+                        message: "find_references with scope=file requires `file`".to_owned(),
+                        semantic_based: true,
+                    },
+                    freshness,
+                )
+                .with_runtime(runtime));
             };
-            let limit = req.limit.unwrap_or(MAX_REFERENCES).min(MAX_REFERENCES);
+            if !req.files.is_empty() {
+                return Ok(Response::ok(
+                    FindReferencesResult::InvalidRequest {
+                        message: "find_references with scope=file accepts `file`, not `files`".to_owned(),
+                        semantic_based: true,
+                    },
+                    freshness,
+                )
+                .with_runtime(runtime));
+            }
+            vec![resolve_path(&root, file)]
+        }
+        ReferenceScope::Project => {
+            if req.file.is_some() {
+                return Ok(Response::ok(
+                    FindReferencesResult::InvalidRequest {
+                        message: "find_references with scope=project accepts `files`, not `file`".to_owned(),
+                        semantic_based: true,
+                    },
+                    freshness,
+                )
+                .with_runtime(runtime));
+            }
+            if req.files.is_empty() {
+                enumerate_lean_files(&root)
+            } else {
+                req.files.iter().map(|p| resolve_path(&root, p)).collect()
+            }
+        }
+    };
+    let limit = req.limit.unwrap_or(MAX_REFERENCES).min(MAX_REFERENCES);
 
-            let mut hits: Vec<ReferenceHit> = Vec::new();
-            let mut unsupported_files: Vec<String> = Vec::new();
-            let mut header_parse_failed_files: Vec<HeaderParseFailedFile> = Vec::new();
-            let mut missing_imports_files: Vec<MissingImportsFile> = Vec::new();
-            let mut truncated = false;
-            let mut files_scanned = 0usize;
-            let mut files_skipped = 0usize;
-            let mut any_freshly_processed = false;
+    let mut hits: Vec<ReferenceHit> = Vec::new();
+    let mut unsupported_files: Vec<String> = Vec::new();
+    let mut header_parse_failed_files: Vec<HeaderParseFailedFile> = Vec::new();
+    let mut missing_imports_files: Vec<MissingImportsFile> = Vec::new();
+    let mut truncated = false;
+    let mut files_scanned = 0usize;
+    let mut files_skipped = 0usize;
+    let mut any_freshly_processed = false;
 
-            'outer: for path in files {
-                let display = display_path(&root, &path);
-                let query = LeanWorkerModuleQuery::References { name: req.name.clone() };
-                match run_module_query(&project, &path, query).await {
-                    Ok(QueryRun {
-                        outcome:
-                            ModuleQueryRun::Ready {
-                                result: LeanWorkerModuleQueryResult::References(result),
-                                freshly_processed,
-                                missing_imports,
-                            },
-                        runtime: run_runtime,
-                    }) => {
-                        runtime = run_runtime;
-                        files_scanned = files_scanned.saturating_add(1);
-                        any_freshly_processed |= freshly_processed;
-                        if !missing_imports.is_empty() {
-                            missing_imports_files.push(MissingImportsFile {
-                                file: display.clone(),
-                                missing: missing_imports,
-                            });
-                        }
-                        if result.truncated {
-                            truncated = true;
-                        }
-                        for node in &result.references {
-                            if hits.len() >= limit {
-                                truncated = true;
-                                break 'outer;
-                            }
-                            hits.push(project_reference(&display, node));
-                        }
+    'outer: for path in files {
+        let display = display_path(&root, &path);
+        let query = LeanWorkerModuleQuery::References { name: req.name.clone() };
+        match run_module_query(ctx, hint.clone(), &root, &path, query).await {
+            Ok(QueryRun {
+                outcome:
+                    ModuleQueryRun::Ready {
+                        result: LeanWorkerModuleQueryResult::References(result),
+                        freshly_processed,
+                        missing_imports,
+                    },
+                runtime: run_runtime,
+            }) => {
+                runtime = run_runtime;
+                files_scanned = files_scanned.saturating_add(1);
+                any_freshly_processed |= freshly_processed;
+                if !missing_imports.is_empty() {
+                    missing_imports_files.push(MissingImportsFile {
+                        file: display.clone(),
+                        missing: missing_imports,
+                    });
+                }
+                if result.truncated {
+                    truncated = true;
+                }
+                for node in &result.references {
+                    if hits.len() >= limit {
+                        truncated = true;
+                        break 'outer;
                     }
-                    Ok(QueryRun {
-                        outcome:
-                            ModuleQueryRun::Ready {
-                                freshly_processed,
-                                missing_imports,
-                                ..
-                            },
-                        runtime: run_runtime,
-                    }) => {
-                        runtime = run_runtime;
-                        files_scanned = files_scanned.saturating_add(1);
-                        any_freshly_processed |= freshly_processed;
-                        if !missing_imports.is_empty() {
-                            missing_imports_files.push(MissingImportsFile {
-                                file: display,
-                                missing: missing_imports,
-                            });
-                        }
-                    }
-                    Ok(QueryRun {
-                        outcome: ModuleQueryRun::HeaderParseFailed { diagnostics },
-                        runtime: run_runtime,
-                    }) => {
-                        runtime = run_runtime;
-                        header_parse_failed_files.push(HeaderParseFailedFile {
-                            file: display,
-                            diagnostics,
-                        });
-                    }
-                    Ok(QueryRun {
-                        outcome: ModuleQueryRun::Unsupported,
-                        runtime: run_runtime,
-                    }) => {
-                        runtime = run_runtime;
-                        unsupported_files.push(display);
-                    }
-                    Err(ServerError::Io(_)) => {
-                        files_skipped = files_skipped.saturating_add(1);
-                    }
-                    Err(err) => return Err(err),
+                    hits.push(project_reference(&display, node));
                 }
             }
+            Ok(QueryRun {
+                outcome:
+                    ModuleQueryRun::Ready {
+                        freshly_processed,
+                        missing_imports,
+                        ..
+                    },
+                runtime: run_runtime,
+            }) => {
+                runtime = run_runtime;
+                files_scanned = files_scanned.saturating_add(1);
+                any_freshly_processed |= freshly_processed;
+                if !missing_imports.is_empty() {
+                    missing_imports_files.push(MissingImportsFile {
+                        file: display,
+                        missing: missing_imports,
+                    });
+                }
+            }
+            Ok(QueryRun {
+                outcome: ModuleQueryRun::HeaderParseFailed { diagnostics },
+                runtime: run_runtime,
+            }) => {
+                runtime = run_runtime;
+                header_parse_failed_files.push(HeaderParseFailedFile {
+                    file: display,
+                    diagnostics,
+                });
+            }
+            Ok(QueryRun {
+                outcome: ModuleQueryRun::Unsupported,
+                runtime: run_runtime,
+            }) => {
+                runtime = run_runtime;
+                unsupported_files.push(display);
+            }
+            Err(ServerError::Io(_)) => {
+                files_skipped = files_skipped.saturating_add(1);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
-            hits.sort_by(|a, b| {
-                a.file
-                    .cmp(&b.file)
-                    .then(a.line.cmp(&b.line))
-                    .then(a.column.cmp(&b.column))
-            });
+    hits.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line.cmp(&b.line))
+            .then(a.column.cmp(&b.column))
+    });
 
-            let result = FindReferencesResult::Ok {
-                references: hits,
-                truncated,
-                files_scanned,
-                files_skipped,
-                unsupported_files,
-                header_parse_failed_files,
-                missing_imports_files,
-                semantic_based: true,
-            };
-            Ok(attach_query_notes(
-                Response::ok(result, freshness).with_runtime(runtime),
-                any_freshly_processed,
-                &[],
-                false,
-            ))
-        })
-        .await
+    let result = FindReferencesResult::Ok {
+        references: hits,
+        truncated,
+        files_scanned,
+        files_skipped,
+        unsupported_files,
+        header_parse_failed_files,
+        missing_imports_files,
+        semantic_based: true,
+    };
+    Ok(attach_query_notes(
+        Response::ok(result, freshness).with_runtime(runtime),
+        any_freshly_processed,
+        &[],
+        false,
+    ))
 }
 
 // --- shared plumbing ---------------------------------------------------
@@ -829,8 +640,8 @@ enum ModuleQueryRun {
 
 struct BatchRun {
     outcome: BatchQueryRun,
-    imports: Vec<String>,
     runtime: RuntimeFacts,
+    freshness: Freshness,
 }
 
 enum BatchQueryRun {
@@ -846,56 +657,63 @@ enum BatchQueryRun {
     Unsupported,
 }
 
-async fn run_module_query(project: &Arc<LeanProject>, path: &Path, query: LeanWorkerModuleQuery) -> Result<QueryRun> {
-    let input = read_query_file(project.canonical_root(), path)?;
-    let key = ModuleQueryKey::from_query(&query);
-    if let Some(outcome) = project.module_query_cache().get(&input.resolved, input.hash, &key) {
-        return Ok(QueryRun {
-            outcome: route_query_outcome(outcome, false),
-            runtime: project.runtime_facts(),
-        });
-    }
-
-    let call = process_module_query(project, input.source, query).await?;
-    let outcome = call.value;
-    project
-        .module_query_cache()
-        .insert(input.resolved, input.hash, key, outcome.clone());
+async fn run_module_query(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    root: &Path,
+    path: &Path,
+    query: LeanWorkerModuleQuery,
+) -> Result<QueryRun> {
+    let input = read_query_file(root, path)?;
+    let session_imports = session_imports(header_imports(&input.source));
+    let call = ctx
+        .broker
+        .process_cached_module_query(
+            hint,
+            input.resolved,
+            input.hash,
+            session_imports,
+            input.imports,
+            input.source,
+            query,
+            LeanWorkerElabOptions::new(),
+        )
+        .await?;
     Ok(QueryRun {
-        outcome: route_query_outcome(outcome, true),
+        outcome: route_query_outcome(call.value, call.freshly_processed),
         runtime: call.runtime,
     })
 }
 
 async fn run_module_query_batch(
-    project: &Arc<LeanProject>,
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    root: &Path,
     path: &Path,
     selectors: Vec<LeanWorkerModuleQuerySelector>,
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<BatchRun> {
-    let input = read_query_file(project.canonical_root(), path)?;
-    let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
-    if let Some(outcome) = project
-        .module_query_cache()
-        .get_batch(&input.resolved, input.hash, &key)
-    {
-        return Ok(BatchRun {
-            outcome: route_batch_outcome(outcome),
-            imports: input.imports,
-            runtime: project.runtime_facts(),
-        });
-    }
-
+    let input = read_query_file(root, path)?;
     let file_label = input.resolved.to_string_lossy().into_owned();
-    let call = process_module_query_batch(project, input.source, file_label, selectors, budgets).await?;
-    let outcome = call.value;
-    project
-        .module_query_cache()
-        .insert_batch(input.resolved, input.hash, key, outcome.clone());
+    let session_imports = session_imports(header_imports(&input.source));
+    let call = ctx
+        .broker
+        .process_cached_module_query_batch(
+            hint,
+            input.resolved,
+            input.hash,
+            session_imports,
+            input.imports.clone(),
+            input.source,
+            selectors,
+            budgets,
+            LeanWorkerElabOptions::new().file_label(&file_label),
+        )
+        .await?;
     Ok(BatchRun {
-        outcome: route_batch_outcome(outcome),
-        imports: input.imports,
+        outcome: route_batch_outcome(call.value),
         runtime: call.runtime,
+        freshness: call.freshness,
     })
 }
 
@@ -966,45 +784,10 @@ fn route_batch_outcome(outcome: LeanWorkerModuleQueryBatchOutcome) -> BatchQuery
     }
 }
 
-async fn process_module_query(
-    project: &Arc<LeanProject>,
-    source: String,
-    query: LeanWorkerModuleQuery,
-) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
-    let imports = session_imports(header_imports(&source));
-    project
-        .process_module_query(imports, source, query, LeanWorkerElabOptions::new())
-        .await
-}
-
-async fn process_module_query_batch(
-    project: &Arc<LeanProject>,
-    source: String,
-    file_label: String,
-    selectors: Vec<LeanWorkerModuleQuerySelector>,
-    budgets: LeanWorkerOutputBudgets,
-) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
-    let imports = session_imports(header_imports(&source));
-    let options = LeanWorkerElabOptions::new().file_label(&file_label);
-    project
-        .process_module_query_batch(imports, source, selectors, budgets, options)
-        .await
-}
-
 enum ProjectedBatchItem {
-    Ok { id: String, result: LeanQueryProjection },
+    Ok { id: String, result: BatchProjection },
     Unavailable { id: String, message: String },
     BudgetExceeded { id: String, message: String },
-}
-
-impl ProjectedBatchItem {
-    fn into_item(self) -> (String, LeanQueryItem) {
-        match self {
-            Self::Ok { id, result } => (id, LeanQueryItem::Ok { result }),
-            Self::Unavailable { id, message } => (id, LeanQueryItem::Unavailable { message }),
-            Self::BudgetExceeded { id, message } => (id, LeanQueryItem::BudgetExceeded { message }),
-        }
-    }
 }
 
 fn project_batch_item(item: LeanWorkerModuleQueryBatchItem, file: Option<&str>) -> ProjectedBatchItem {
@@ -1024,18 +807,18 @@ fn project_batch_item(item: LeanWorkerModuleQueryBatchItem, file: Option<&str>) 
     }
 }
 
-fn project_batch_result(result: LeanWorkerModuleQueryBatchResult, file: Option<&str>) -> LeanQueryProjection {
+fn project_batch_result(result: LeanWorkerModuleQueryBatchResult, file: Option<&str>) -> BatchProjection {
     match result {
         LeanWorkerModuleQueryBatchResult::Diagnostics(failure) => {
-            LeanQueryProjection::Diagnostics(diagnostics_block(project_failure(&failure)))
+            BatchProjection::Diagnostics(diagnostics_block(project_failure(&failure)))
         }
         LeanWorkerModuleQueryBatchResult::ProofState(result) => {
-            LeanQueryProjection::ProofState(project_proof_state_result(result))
+            BatchProjection::ProofState(project_proof_state_result(result))
         }
-        LeanWorkerModuleQueryBatchResult::TypeAt(result) => LeanQueryProjection::TypeAt(project_type_at_result(result)),
+        LeanWorkerModuleQueryBatchResult::TypeAt(result) => BatchProjection::TypeAt(project_type_at_result(result)),
         LeanWorkerModuleQueryBatchResult::References(result) => {
             let display = file.unwrap_or("");
-            LeanQueryProjection::References(ReferencesProjection {
+            BatchProjection::References(ReferencesProjection {
                 references: result
                     .references
                     .iter()
@@ -1045,12 +828,12 @@ fn project_batch_result(result: LeanWorkerModuleQueryBatchResult, file: Option<&
             })
         }
         LeanWorkerModuleQueryBatchResult::DeclarationTarget(result) => {
-            LeanQueryProjection::DeclarationTarget(project_declaration_target_result(result))
+            BatchProjection::DeclarationTarget(project_declaration_target_result(result))
         }
         LeanWorkerModuleQueryBatchResult::SurroundingDeclaration(result) => {
-            LeanQueryProjection::SurroundingDeclaration(project_surrounding_declaration_result(result))
+            BatchProjection::SurroundingDeclaration(project_surrounding_declaration_result(result))
         }
-        _ => LeanQueryProjection::Diagnostics(DiagnosticsBlock {
+        _ => BatchProjection::Diagnostics(DiagnosticsBlock {
             summary: DiagnosticSummary::default(),
             diagnostics: Vec::new(),
             truncated: false,
@@ -1154,24 +937,6 @@ fn diagnostics_block(failure: ElabFailure) -> DiagnosticsBlock {
         diagnostics,
         truncated,
     }
-}
-
-fn duplicate_selector_id(selectors: &[LeanQuerySelector]) -> Option<String> {
-    let mut seen = BTreeSet::new();
-    for selector in selectors {
-        let id = selector.id();
-        if !seen.insert(id.to_owned()) {
-            return Some(id.to_owned());
-        }
-    }
-    None
-}
-
-fn validate_lean_query_selectors(selectors: &[LeanQuerySelector]) -> Option<String> {
-    if selectors.is_empty() {
-        return Some("selectors must not be empty".to_owned());
-    }
-    duplicate_selector_id(selectors).map(|id| format!("selector id `{id}` appears more than once"))
 }
 
 fn sort_diagnostics(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
@@ -1307,10 +1072,9 @@ mod tests {
     };
 
     use super::{
-        BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, LeanQueryRequest, LeanQueryResult, LeanQuerySelector,
-        ProofPositionSelector, ProofStateRequest, ProofStateResult, RenderedText, cache_status_label,
-        duplicate_selector_id, expert_query_budgets, project_query_facts, proof_agent_budgets, reference_query_budgets,
-        route_batch_outcome, validate_lean_query_selectors,
+        BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, ProofPositionSelector, ProofStateRequest, ProofStateResult,
+        RenderedText, cache_status_label, expert_query_budgets, project_query_facts, proof_agent_budgets,
+        reference_query_budgets, route_batch_outcome,
     };
     use crate::tools::source_input::{header_imports, read_query_file};
 
@@ -1406,62 +1170,6 @@ import Init -- comment
         assert!(value.get("safe_edit").is_none());
         assert!(value.get("proof_state").is_none());
         assert!(value.get("declaration_target").is_none());
-    }
-
-    #[test]
-    fn lean_query_request_round_trips_typed_selectors() {
-        let request: LeanQueryRequest = serde_json::from_str(
-            r#"{"file":"Foo.lean","selectors":[
-                {"selector":"diagnostics","id":"d"},
-                {"selector":"proof_state","id":"p","line":4,"column":2},
-                {"selector":"type_at","id":"t","line":5,"column":9},
-                {"selector":"references","id":"r","name":"Nat.add"},
-                {"selector":"declaration_target","id":"target","line":5,"column":9},
-                {"selector":"surrounding_declaration","id":"around","line":5,"column":9}
-            ]}"#,
-        )
-        .unwrap();
-        assert_eq!(request.selectors.len(), 6);
-        assert!(matches!(request.selectors[0], LeanQuerySelector::Diagnostics { .. }));
-    }
-
-    #[test]
-    fn lean_query_selector_validation_rejects_empty_and_duplicate_ids() {
-        let empty: Vec<LeanQuerySelector> = Vec::new();
-        assert_eq!(duplicate_selector_id(&empty), None);
-        assert_eq!(
-            validate_lean_query_selectors(&empty),
-            Some("selectors must not be empty".to_owned())
-        );
-
-        let selectors = vec![
-            LeanQuerySelector::Diagnostics { id: "same".to_owned() },
-            LeanQuerySelector::TypeAt {
-                id: "same".to_owned(),
-                line: 1,
-                column: 1,
-            },
-        ];
-        assert_eq!(duplicate_selector_id(&selectors), Some("same".to_owned()));
-        assert_eq!(
-            validate_lean_query_selectors(&selectors),
-            Some("selector id `same` appears more than once".to_owned())
-        );
-    }
-
-    #[test]
-    fn lean_query_result_serialises_status_tag() {
-        let unsupported = serde_json::to_string(&LeanQueryResult::Unsupported).unwrap();
-        assert_eq!(unsupported, r#"{"status":"unsupported"}"#);
-
-        let invalid = serde_json::to_string(&LeanQueryResult::InvalidSelectors {
-            message: "selectors must not be empty".to_owned(),
-        })
-        .unwrap();
-        assert_eq!(
-            invalid,
-            r#"{"status":"invalid_selectors","message":"selectors must not be empty"}"#
-        );
     }
 
     #[test]

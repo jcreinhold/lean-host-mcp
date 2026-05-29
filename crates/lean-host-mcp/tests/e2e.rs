@@ -26,7 +26,6 @@ use lean_host_mcp::tools::proof_action::{
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
 use lean_host_mcp::{
     BrokerConfig, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker, ProofAttemptResult,
-    default_cache_dir,
 };
 
 fn fixture_root() -> Option<PathBuf> {
@@ -35,13 +34,14 @@ fn fixture_root() -> Option<PathBuf> {
 
 fn open_ctx(root: &Path) -> ToolContext {
     let broker = ProjectBroker::new(BrokerConfig {
-        cache_dir: default_cache_dir(),
         config_default: None,
         env_default: Some(root.to_path_buf()),
         cwd: root.to_path_buf(),
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: BrokerConfig::default_idle_timeout(),
         semantic_permits: BrokerConfig::default_semantic_permits(),
+        semantic_waiters: BrokerConfig::default_semantic_waiters(),
+        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
     });
     ToolContext { broker }
 }
