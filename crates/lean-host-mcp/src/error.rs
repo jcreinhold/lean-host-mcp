@@ -18,22 +18,22 @@ use lean_rs_worker_parent::LeanWorkerError;
 #[derive(Debug, Clone, Serialize, JsonSchema, thiserror::Error)]
 #[error("worker unavailable: {reason}")]
 pub struct WorkerUnavailable {
-    pub retryable: bool,
-    pub worker_restarted: bool,
-    pub project_root: String,
-    pub project_hash: String,
-    pub imports: Vec<String>,
-    pub session_id: String,
-    pub lean_toolchain: String,
-    pub worker_generation: u64,
-    pub reason: String,
-    pub restart_cause: Option<String>,
-    pub rss_kib: Option<u64>,
-    pub limit_kib: Option<u64>,
-    pub retry_after_millis: Option<u64>,
-    pub restarts_in_window: Option<u64>,
-    pub window_millis: Option<u64>,
-    pub runtime: RuntimeFacts,
+    pub(crate) retryable: bool,
+    pub(crate) worker_restarted: bool,
+    pub(crate) project_root: String,
+    pub(crate) project_hash: String,
+    pub(crate) imports: Vec<String>,
+    pub(crate) session_id: String,
+    pub(crate) lean_toolchain: String,
+    pub(crate) worker_generation: u64,
+    pub(crate) reason: String,
+    pub(crate) restart_cause: Option<String>,
+    pub(crate) rss_kib: Option<u64>,
+    pub(crate) limit_kib: Option<u64>,
+    pub(crate) retry_after_millis: Option<u64>,
+    pub(crate) restarts_in_window: Option<u64>,
+    pub(crate) window_millis: Option<u64>,
+    pub(crate) runtime: RuntimeFacts,
 }
 
 impl WorkerUnavailable {

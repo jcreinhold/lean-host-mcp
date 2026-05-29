@@ -51,7 +51,7 @@ use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::index::fingerprint_lake_project;
 use crate::lake_meta::LakeProjectMeta;
-use crate::project::{LeanProject, ProjectCall, SemanticAdmission};
+use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig, SemanticAdmission};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
 pub const DEFAULT_MAX_PROJECTS: usize = 4;
@@ -265,6 +265,7 @@ pub(crate) struct CachedBrokerCall<T> {
 pub struct ProjectBroker {
     inner: Mutex<BrokerInner>,
     config: BrokerConfig,
+    runtime_config: ProjectRuntimeConfig,
     semantic_admission: Arc<SemanticAdmission>,
 }
 
@@ -285,12 +286,22 @@ impl ProjectBroker {
     /// fine because tests call [`Self::reap_idle`] directly.
     #[must_use]
     pub fn new(config: BrokerConfig) -> Arc<Self> {
+        Self::new_with_runtime_config(config, ProjectRuntimeConfig::default())
+    }
+
+    /// Construct a broker with an explicit private project-runtime policy.
+    ///
+    /// The binary uses this to pass startup-parsed runtime env once, rather
+    /// than having project open reread process environment on every miss.
+    #[must_use]
+    pub fn new_with_runtime_config(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<Self> {
         let broker = Arc::new(Self {
             inner: Mutex::new(BrokerInner {
                 registry: LruCache::new(config.max_projects),
                 last_used: HashMap::new(),
                 opening_locks: HashMap::new(),
             }),
+            runtime_config,
             semantic_admission: SemanticAdmission::new(
                 config.semantic_permits,
                 config.semantic_waiters,
@@ -414,12 +425,13 @@ impl ProjectBroker {
         let call = project
             .process_module_query(session_imports, source, query, options)
             .await?;
+        let (value, runtime) = call.into_parts();
         project
             .module_query_cache()
-            .insert(path, content_hash, key, call.value.clone());
+            .insert(path, content_hash, key, value.clone());
         Ok(CachedBrokerCall {
-            value: call.value,
-            runtime: call.runtime,
+            value,
+            runtime,
             freshness: project.freshness(&freshness_imports),
             freshly_processed: true,
         })
@@ -475,12 +487,13 @@ impl ProjectBroker {
         let call = project
             .process_module_query_batch(session_imports, source, selectors, budgets, options)
             .await?;
+        let (value, runtime) = call.into_parts();
         project
             .module_query_cache()
-            .insert_batch(path, content_hash, key, call.value.clone());
+            .insert_batch(path, content_hash, key, value.clone());
         Ok(CachedBrokerCall {
-            value: call.value,
-            runtime: call.runtime,
+            value,
+            runtime,
             freshness: project.freshness(&freshness_imports),
             freshly_processed: true,
         })
@@ -660,7 +673,11 @@ impl ProjectBroker {
             }
         };
         let admission = Arc::clone(&self.semantic_admission);
-        let opened = match tokio::task::spawn_blocking(move || LeanProject::open_with_admission(meta, admission)).await
+        let runtime_config = self.runtime_config.clone();
+        let opened = match tokio::task::spawn_blocking(move || {
+            LeanProject::open_with_admission(meta, admission, runtime_config)
+        })
+        .await
         {
             Ok(Ok(project)) => project,
             Ok(Err(err)) => {
@@ -797,9 +814,10 @@ fn pop_idle_lru(registry: &mut LruCache<PathBuf, Arc<LeanProject>>) -> Option<(P
 }
 
 fn broker_call<T>(project: &LeanProject, freshness_imports: &[String], call: ProjectCall<T>) -> BrokerCall<T> {
+    let (value, runtime) = call.into_parts();
     BrokerCall {
-        value: call.value,
-        runtime: call.runtime,
+        value,
+        runtime,
         freshness: project.freshness(freshness_imports),
     }
 }

@@ -42,6 +42,7 @@ pub use envelope::{Freshness, Response, ResponseStatus, RuntimeFacts, RuntimeFai
 pub use error::{Result, ServerError};
 pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};
 pub use lake_meta::LakeProjectMeta;
+pub use project::ProjectRuntimeConfig;
 pub use projections::{
     DeclarationFlags, DeclarationInspection, DeclarationInspectionCandidate, DeclarationInspectionResult,
     DeclarationProofSearchFacts, DeclarationRow, DeclarationSearchFacts, DeclarationSearchPruning,

@@ -10,8 +10,8 @@ The model-facing tools are:
 proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> verify_declaration
 ```
 
-`find_references` is the bounded semantic support tool. Text grep, Mathlib placement policy, raw hover/type queries,
-and low-level term/meta primitives are not part of the public MCP surface.
+`find_references` is the bounded semantic support tool. Text grep, Mathlib placement policy, raw hover/type queries, and
+low-level term/meta primitives are not part of the public MCP surface.
 
 ## Crate Layout
 
@@ -27,17 +27,17 @@ envelope.rs     Response<T> = { result, freshness, warnings, next_actions }
 bin/worker.rs   entry point for lean_rs_worker_child::run_worker_child_stdio()
 ```
 
-`server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when
-needed, and send one typed read-only semantic job to the project worker actor.
+`server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when needed,
+and send one typed read-only semantic job to the project worker actor.
 
 ## Project And Worker Boundary
 
-`ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction,
-manifest invalidation, multi-project routing, and coalescing concurrent opens for the same canonical root.
-`LeanProject` owns the supervised `lean-rs-worker` child and a dedicated actor thread. The actor has private state
-(`Ready`, `Restarting`, `Draining`, `Stopped`), a bounded mailbox, a worker generation counter, the last restart reason,
-the last import profile, and module-query cache handles. The parent binary never links `libleanshared`; the
-per-toolchain worker child does.
+`ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction, manifest
+invalidation, multi-project routing, and coalescing concurrent opens for the same canonical root. `LeanProject` owns the
+supervised `lean-rs-worker` child and a dedicated actor thread. The actor has private state (`Ready`, `Restarting`,
+`Draining`, `Stopped`), a bounded mailbox, a worker generation counter, the last restart reason, the last import
+profile, and module-query cache handles. The parent binary never links `libleanshared`; the per-toolchain worker child
+does.
 
 Each project actor runs one semantic job at a time in FIFO mailbox order. The broker also owns a process-wide semantic
 permit gate, defaulting to one permit, so cross-project heavy calls are serialized unless the deployment explicitly
@@ -70,8 +70,8 @@ Proof tools share the same anchor shape:
 - `{"kind":"index","index":N}` selects the Nth open tactic state.
 - `{"kind":"after_text","text":"...","occurrence":N}` selects a tactic/source fragment inside the declaration body.
 
-The Lean shim resolves these selectors to private source evidence. Raw offsets, line offsets, syntax spans,
-indentation, overlay insertion, and diagnostic-locality classification stay below the worker boundary.
+The Lean shim resolves these selectors to private source evidence. Raw offsets, line offsets, syntax spans, indentation,
+overlay insertion, and diagnostic-locality classification stay below the worker boundary.
 
 ## Tool Semantics
 

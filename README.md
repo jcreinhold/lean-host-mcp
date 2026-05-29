@@ -4,14 +4,14 @@ A Model Context Protocol server that hosts Lean 4 in a supervised worker child v
 `lean-rs-worker-child` crate pair. The parent process owns a shims-only `LeanWorkerHostHandle`; the worker child owns
 the `LeanRuntime` and bundled host-shim capabilities. The parent does **not** link `libleanshared`, which lets one
 running `lean-host-mcp` serve projects on different Lean toolchains: each toolchain has its own pre-built worker binary
-installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Proof-agent calls run inside that child rather
-than as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child; the supervisor restarts
-it instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
+installed under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. Proof-agent calls run inside that child rather than
+as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child; the supervisor restarts it
+instead of taking down the MCP server. That's the difference from `lean-lsp-mcp`.
 
-The public tool surface is the proof workflow, not a mirror of Lean's runtime internals:
-`proof_state`, `search_for_proof`, `inspect_declaration`, `try_proof_step`, `verify_declaration`, and
-`find_references`. Per-tool request and result schemas live in
-[`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in [`docs/architecture.md`](docs/architecture.md).
+The public tool surface is the proof workflow, not a mirror of Lean's runtime internals: `proof_state`,
+`search_for_proof`, `inspect_declaration`, `try_proof_step`, `verify_declaration`, and `find_references`. Per-tool
+request and result schemas live in [`docs/tool-catalog.md`](docs/tool-catalog.md); internal layering in
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Prerequisite: any built Lake project
 
@@ -168,34 +168,33 @@ Recoverable runtime/actor failures are normal tool responses, not JSON-RPC error
 }
 ```
 
-`freshness.imports` is the import vector used for that call: explicit request imports for declaration/proof-search
-tools and file-header imports for module-query tools. An empty array means the call used no extra imports beyond the
-worker's base environment.
+`freshness.imports` is the import vector used for that call: explicit request imports for declaration/proof-search tools
+and file-header imports for module-query tools. An empty array means the call used no extra imports beyond the worker's
+base environment.
 
 `runtime` is attached to semantic tool calls. It reports the current worker generation, whether this call observed or
 performed a restart, retry count, admission wait, actor queue wait, RSS when available, the import profile,
 profile-switch count, `call_restart` for this call, and `last_restart` as lifecycle history. Lean-domain failures
-(parse, elaboration, kernel rejection, meta
-timeout) are part of the `ok` payload. Retryable runtime failures such as admission pressure, mailbox pressure, worker
-death, or session loss are `runtime_unavailable` responses. MCP errors are reserved for invalid requests, I/O/config
-failures, internal invariants, and unusable Lake projects.
+(parse, elaboration, kernel rejection, meta timeout) are part of the `ok` payload. Retryable runtime failures such as
+admission pressure, mailbox pressure, worker death, or session loss are `runtime_unavailable` responses. MCP errors are
+reserved for invalid requests, I/O/config failures, internal invariants, and unusable Lake projects.
 
 ## Capability shims and proof-agent module queries
 
-`proof_state` depends on the optional bounded `lean_rs_host_process_module_query_batch` shim.
-`proof_state` is the common proof-agent call: one request returns a compact context with diagnostics, goals, locals,
-expected type, target declaration, and surrounding declaration. A worker whose bundled shims do not expose the batch
-capability answers `{ "status": "unsupported" }`; public tools never request or cache whole-file info trees. Successful
-proof-context responses include `query_facts` with worker cache status, output bytes, and phase timings. Repeated calls
-reach the worker snapshot cache so warm behavior is observable.
+`proof_state` depends on the optional bounded `lean_rs_host_process_module_query_batch` shim. `proof_state` is the
+common proof-agent call: one request returns a compact context with diagnostics, goals, locals, expected type, target
+declaration, and surrounding declaration. A worker whose bundled shims do not expose the batch capability answers
+`{ "status": "unsupported" }`; public tools never request or cache whole-file info trees. Successful proof-context
+responses include `query_facts` with worker cache status, output bytes, and phase timings. Repeated calls reach the
+worker snapshot cache so warm behavior is observable.
 
 Files whose header imports modules the server's open env doesn't have are still processed; missing imports surface as an
 envelope warning. Files using Lean 4's module-system header syntax, including `module`, `public import`, `import all`,
 and `meta import`, are supported. A header that doesn't parse short-circuits to `header_parse_failed`.
 
 Unlike an external LSP process, the host can still start when unrelated project modules are broken. Calls whose imports
-avoid the broken module continue to work; a broken target file reports structured Lean diagnostics instead of a bootstrap
-failure.
+avoid the broken module continue to work; a broken target file reports structured Lean diagnostics instead of a
+bootstrap failure.
 
 ## Build, test, lint
 
@@ -222,9 +221,9 @@ The ignored `smoke_perf` integration test is the black-box baseline harness for 
 stdio MCP server, calls `tools/list`, runs representative tool calls, and emits JSONL rows with wall time, serialized
 response bytes, 32 KiB / 64 KiB budget flags, status, warning count, observable project-session changes, and process RSS
 when the platform exposes it. For `proof_state`, rows also include the worker module-cache status, worker-reported
-output bytes, phase timings, and optional worker cache size facts. The budget constants are test-only
-guardrails: ordinary model-facing responses should aim for 16-32 KiB, with 64 KiB as the default hard ceiling.
-Production truncation is still tool-specific policy.
+output bytes, phase timings, and optional worker cache size facts. The budget constants are test-only guardrails:
+ordinary model-facing responses should aim for 16-32 KiB, with 64 KiB as the default hard ceiling. Production truncation
+is still tool-specific policy.
 
 ```sh
 cargo build -p lean-host-mcp

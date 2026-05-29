@@ -132,6 +132,129 @@ async fn black_box_mcp_smoke_perf_baseline() {
     );
 }
 
+#[tokio::test]
+#[ignore = "manual black-box MCP burst with tight admission limits"]
+async fn black_box_pipelined_admission_pressure_returns_structured_statuses() {
+    let scenario = Scenario {
+        label: "fixture_admission_pressure",
+        project_root: fixture_root(),
+        calls: fixture_calls(),
+    };
+    let mut server = McpServer::start_with_env(
+        &scenario.project_root,
+        &[
+            ("LEAN_HOST_MCP_SEMANTIC_PERMITS", "1"),
+            ("LEAN_HOST_MCP_SEMANTIC_WAITERS", "1"),
+            ("LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS", "1"),
+        ],
+    )
+    .await;
+
+    let burst = scenario.calls.iter().cycle().take(12).collect::<Vec<_>>();
+    let responses = server
+        .pipeline_tool_calls(&burst)
+        .await
+        .expect("pipelined MCP admission-pressure burst should complete");
+
+    for (call, response) in burst.iter().zip(responses.iter()) {
+        assert!(
+            response.json.get("error").is_none(),
+            "pipelined {} returned JSON-RPC error: {:?}",
+            call.label,
+            response.json
+        );
+        let status = envelope_status(&response.json);
+        assert!(
+            matches!(status.as_str(), "ok" | "runtime_unavailable"),
+            "pipelined {} returned unexpected envelope status {status}: {:?}",
+            call.label,
+            response.json
+        );
+        if status == "runtime_unavailable" {
+            let reason = runtime_error_reason(&response.json).unwrap_or_default();
+            assert!(
+                reason.starts_with("semantic_admission_") || reason == "mailbox_full",
+                "runtime pressure should be structured admission/mailbox pressure, got {reason}: {:?}",
+                response.json
+            );
+        }
+    }
+
+    let follow_up = server
+        .request(
+            "tools/call",
+            json!({
+                "name": "proof_state",
+                "arguments": {
+                    "file": "LeanRsFixture/SourceRanges.lean",
+                    "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
+                }
+            }),
+        )
+        .await
+        .expect("healthy follow-up proof_state response");
+    assert!(
+        follow_up.json.get("error").is_none(),
+        "follow-up proof_state must not return JSON-RPC error: {:?}",
+        follow_up.json
+    );
+    assert_ne!(response_status(&follow_up.json), "tool_error");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "manual RSS policy sweep for future threshold tuning"]
+async fn rss_threshold_sweep_fixture_sequence_reports_metrics() {
+    let scenario = Scenario {
+        label: "fixture_rss_sweep",
+        project_root: fixture_root(),
+        calls: fixture_calls(),
+    };
+    for threshold in [3_u64 * 1024 * 1024, 5_u64 * 1024 * 1024, 7_u64 * 1024 * 1024] {
+        let threshold_s = threshold.to_string();
+        let mut server = McpServer::start_with_env(
+            &scenario.project_root,
+            &[("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB", threshold_s.as_str())],
+        )
+        .await;
+        let started = Instant::now();
+        let mut status_counts = BTreeMap::<String, usize>::new();
+        let mut sessions = BTreeSet::<String>::new();
+        let mut cache_hits = 0usize;
+        let mut peak_rss_kib = server.rss_kib().unwrap_or_default();
+        let mut last_session_id = None;
+
+        for call in &scenario.calls {
+            let record = server.call_tool("fixture_rss_sweep", call, &mut last_session_id).await;
+            *status_counts.entry(record.status.clone()).or_default() += 1;
+            if let Some(session) = last_session_id.as_ref() {
+                sessions.insert(session.clone());
+            }
+            if record.worker_cache_status.as_deref() == Some("hit") {
+                cache_hits = cache_hits.saturating_add(1);
+            }
+            if let Some(rss) = record.rss_after_kib {
+                peak_rss_kib = peak_rss_kib.max(rss);
+            }
+        }
+
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "event": "rss_threshold_sweep",
+                "threshold_kib": threshold,
+                "wall_ms": started.elapsed().as_millis(),
+                "session_count": sessions.len(),
+                "cache_hits": cache_hits,
+                "peak_server_rss_kib": peak_rss_kib,
+                "status_counts": status_counts,
+            }))
+            .expect("serialize RSS sweep record")
+        );
+        server.shutdown().await;
+    }
+}
+
 async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
     eprintln!(
         "smoke_perf: starting scenario '{}' ({})",
@@ -497,17 +620,24 @@ struct McpServer {
 
 impl McpServer {
     async fn start(project_root: &Path) -> Self {
+        Self::start_with_env(project_root, &[]).await
+    }
+
+    async fn start_with_env(project_root: &Path, envs: &[(&str, &str)]) -> Self {
         let config_dir = tempfile::tempdir().expect("temp config dir").keep();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+        command
             .arg("--lake-root")
             .arg(project_root)
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("RUST_LOG", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn lean-host-mcp");
+            .stderr(Stdio::piped());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn lean-host-mcp");
 
         let stdin = child.stdin.take().expect("server stdin");
         let stdout = BufReader::new(child.stdout.take().expect("server stdout"));
@@ -825,6 +955,28 @@ fn response_status(response: &Value) -> String {
         return "tool_error".to_owned();
     }
     "ok".to_owned()
+}
+
+fn envelope_status(response: &Value) -> String {
+    for path in ["/result/structuredContent/status", "/result/result/status"] {
+        if let Some(status) = response.pointer(path).and_then(Value::as_str) {
+            return status.to_owned();
+        }
+    }
+    response_status(response)
+}
+
+fn runtime_error_reason(response: &Value) -> Option<String> {
+    for path in [
+        "/result/structuredContent/runtime_error/reason",
+        "/result/structuredContent/result/runtime_error/reason",
+        "/result/result/runtime_error/reason",
+    ] {
+        if let Some(reason) = response.pointer(path).and_then(Value::as_str) {
+            return Some(reason.to_owned());
+        }
+    }
+    None
 }
 
 fn warnings_count(response: &Value) -> usize {

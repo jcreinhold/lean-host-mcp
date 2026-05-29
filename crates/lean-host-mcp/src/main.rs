@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
-use lean_host_mcp::{BrokerConfig, LeanHostService, ProjectBroker};
+use lean_host_mcp::{BrokerConfig, LeanHostService, ProjectBroker, ProjectRuntimeConfig};
 
 /// Stdio MCP server that hosts a Lean 4 environment via a worker child.
 #[derive(Debug, Parser)]
@@ -98,6 +98,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let (max_projects, idle_timeout, semantic_permits, semantic_waiters, semantic_admission_timeout) =
         BrokerConfig::pool_from_env()?;
+    let runtime_config = ProjectRuntimeConfig::from_env()?;
 
     tracing::info!(
         env_default = ?env_default,
@@ -108,19 +109,27 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         semantic_permits = %semantic_permits,
         semantic_waiters = %semantic_waiters,
         semantic_admission_timeout_millis = semantic_admission_timeout.as_millis(),
+        worker_rss_post_job_restart_kib = runtime_config.worker_rss_post_job_restart_kib(),
+        worker_rss_hard_kill_kib = runtime_config.worker_rss_hard_kill_kib(),
+        worker_rss_sample_millis = runtime_config.worker_rss_sample_millis(),
+        import_switch_rss_soft_kib = runtime_config.import_switch_rss_soft_kib(),
+        project_mailbox_capacity = runtime_config.mailbox_capacity(),
         "starting lean-host-mcp",
     );
 
-    let broker = ProjectBroker::new(BrokerConfig {
-        config_default,
-        env_default,
-        cwd,
-        max_projects,
-        idle_timeout,
-        semantic_permits,
-        semantic_waiters,
-        semantic_admission_timeout,
-    });
+    let broker = ProjectBroker::new_with_runtime_config(
+        BrokerConfig {
+            config_default,
+            env_default,
+            cwd,
+            max_projects,
+            idle_timeout,
+            semantic_permits,
+            semantic_waiters,
+            semantic_admission_timeout,
+        },
+        runtime_config,
+    );
     let service = LeanHostService::new(broker);
     let server = service.serve(stdio()).await?;
     server.waiting().await?;

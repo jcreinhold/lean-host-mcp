@@ -48,11 +48,206 @@ const MAX_JOB_RETRIES: u32 = 1;
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_mins(1);
 
+/// Runtime policy for one private project actor.
+///
+/// The binary parses this once at server startup and passes it into the
+/// broker. Tests and embedders can construct the default directly without
+/// rereading process environment during project open.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProjectRuntimeConfig {
+    worker_rss_post_job_restart_kib: u64,
+    worker_rss_hard_kill_kib: u64,
+    worker_rss_sample_millis: u64,
+    import_switch_rss_soft_kib: u64,
+    module_cache_rss_guard_kib: u64,
+    module_cache_max_bytes: u64,
+    mailbox_capacity: usize,
+    max_restarts_per_window: usize,
+    restart_window: Duration,
+}
+
+impl Default for ProjectRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_rss_post_job_restart_kib: WORKER_RSS_POST_JOB_RESTART_KIB,
+            worker_rss_hard_kill_kib: WORKER_RSS_HARD_KILL_KIB,
+            worker_rss_sample_millis: WORKER_RSS_SAMPLE_MILLIS,
+            import_switch_rss_soft_kib: IMPORT_SWITCH_RSS_SOFT_KIB,
+            module_cache_rss_guard_kib: MODULE_CACHE_RSS_GUARD_KIB,
+            module_cache_max_bytes: MODULE_CACHE_MAX_BYTES,
+            mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
+            max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
+            restart_window: RESTART_WINDOW,
+        }
+    }
+}
+
+impl ProjectRuntimeConfig {
+    /// Parse runtime env vars once at server startup.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Internal`] when a runtime env var is malformed, zero
+    /// where zero is unsafe, or an obsolete variable name is present.
+    pub fn from_env() -> Result<Self> {
+        parse_runtime_config(RuntimeEnv {
+            worker_rss_ceiling_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB")?,
+            worker_rss_post_job_restart_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB")?,
+            worker_rss_hard_kill_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB")?,
+            worker_rss_sample_millis: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS")?,
+            import_switch_rss_soft_kib: runtime_env_var("LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB")?,
+            module_cache_rss_guard_kib: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB")?,
+            module_cache_max_bytes: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES")?,
+            project_mailbox_capacity: runtime_env_var("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY")?,
+            worker_restart_limit: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_LIMIT")?,
+            worker_restart_window_secs: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS")?,
+        })
+    }
+
+    #[must_use]
+    pub const fn worker_rss_post_job_restart_kib(&self) -> u64 {
+        self.worker_rss_post_job_restart_kib
+    }
+
+    #[must_use]
+    pub const fn worker_rss_hard_kill_kib(&self) -> u64 {
+        self.worker_rss_hard_kill_kib
+    }
+
+    #[must_use]
+    pub const fn worker_rss_sample_millis(&self) -> u64 {
+        self.worker_rss_sample_millis
+    }
+
+    #[must_use]
+    pub const fn import_switch_rss_soft_kib(&self) -> u64 {
+        self.import_switch_rss_soft_kib
+    }
+
+    #[must_use]
+    pub const fn module_cache_rss_guard_kib(&self) -> u64 {
+        self.module_cache_rss_guard_kib
+    }
+
+    #[must_use]
+    pub const fn module_cache_max_bytes(&self) -> u64 {
+        self.module_cache_max_bytes
+    }
+
+    #[must_use]
+    pub const fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity
+    }
+
+    #[must_use]
+    pub const fn max_restarts_per_window(&self) -> usize {
+        self.max_restarts_per_window
+    }
+
+    #[must_use]
+    pub const fn restart_window(&self) -> Duration {
+        self.restart_window
+    }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeEnv {
+    worker_rss_ceiling_kib: Option<String>,
+    worker_rss_post_job_restart_kib: Option<String>,
+    worker_rss_hard_kill_kib: Option<String>,
+    worker_rss_sample_millis: Option<String>,
+    import_switch_rss_soft_kib: Option<String>,
+    module_cache_rss_guard_kib: Option<String>,
+    module_cache_max_bytes: Option<String>,
+    project_mailbox_capacity: Option<String>,
+    worker_restart_limit: Option<String>,
+    worker_restart_window_secs: Option<String>,
+}
+
+fn parse_runtime_config(env: RuntimeEnv) -> Result<ProjectRuntimeConfig> {
+    if env.worker_rss_ceiling_kib.is_some() {
+        return Err(ServerError::Internal(
+            "LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB is obsolete; use \
+             LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB for planned post-job cycling or \
+             LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB for the in-flight hard kill limit"
+                .to_owned(),
+        ));
+    }
+    let defaults = ProjectRuntimeConfig::default();
+    Ok(ProjectRuntimeConfig {
+        worker_rss_post_job_restart_kib: parse_nonzero_u64(
+            "LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB",
+            env.worker_rss_post_job_restart_kib.as_deref(),
+            defaults.worker_rss_post_job_restart_kib,
+        )?,
+        worker_rss_hard_kill_kib: parse_nonzero_u64(
+            "LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB",
+            env.worker_rss_hard_kill_kib.as_deref(),
+            defaults.worker_rss_hard_kill_kib,
+        )?,
+        worker_rss_sample_millis: parse_nonzero_u64(
+            "LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS",
+            env.worker_rss_sample_millis.as_deref(),
+            defaults.worker_rss_sample_millis,
+        )?,
+        import_switch_rss_soft_kib: parse_nonzero_u64(
+            "LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB",
+            env.import_switch_rss_soft_kib.as_deref(),
+            defaults.import_switch_rss_soft_kib,
+        )?,
+        module_cache_rss_guard_kib: parse_nonzero_u64(
+            "LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB",
+            env.module_cache_rss_guard_kib.as_deref(),
+            defaults.module_cache_rss_guard_kib,
+        )?,
+        module_cache_max_bytes: parse_nonzero_u64(
+            "LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES",
+            env.module_cache_max_bytes.as_deref(),
+            defaults.module_cache_max_bytes,
+        )?,
+        mailbox_capacity: parse_nonzero_usize(
+            "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
+            env.project_mailbox_capacity.as_deref(),
+            defaults.mailbox_capacity,
+        )?,
+        max_restarts_per_window: parse_nonzero_usize(
+            "LEAN_HOST_MCP_WORKER_RESTART_LIMIT",
+            env.worker_restart_limit.as_deref(),
+            defaults.max_restarts_per_window,
+        )?,
+        restart_window: Duration::from_secs(parse_nonzero_u64(
+            "LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS",
+            env.worker_restart_window_secs.as_deref(),
+            defaults.restart_window.as_secs(),
+        )?),
+    })
+}
+
+fn runtime_env_var(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err @ std::env::VarError::NotUnicode(_)) => {
+            Err(ServerError::Internal(format!("{name} is not valid unicode: {err}")))
+        }
+    }
+}
+
 /// Result of one project actor call.
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectCall<T> {
-    pub value: T,
-    pub runtime: RuntimeFacts,
+    value: T,
+    runtime: RuntimeFacts,
+}
+
+impl<T> ProjectCall<T> {
+    pub(crate) fn new(value: T, runtime: RuntimeFacts) -> Self {
+        Self { value, runtime }
+    }
+
+    pub(crate) fn into_parts(self) -> (T, RuntimeFacts) {
+        (self.value, self.runtime)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,7 +521,11 @@ impl std::fmt::Debug for LeanProject {
 }
 
 impl LeanProject {
-    pub(crate) fn open_with_admission(meta: LakeProjectMeta, admission: Arc<SemanticAdmission>) -> Result<Arc<Self>> {
+    pub(crate) fn open_with_admission(
+        meta: LakeProjectMeta,
+        admission: Arc<SemanticAdmission>,
+        runtime_config: ProjectRuntimeConfig,
+    ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
             worker_generation: 1,
@@ -337,7 +536,13 @@ impl LeanProject {
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let healthy = Arc::new(AtomicBool::new(true));
-        let config = ActorConfig::from_meta(&meta, session_id.clone(), Arc::clone(&runtime), Arc::clone(&healthy))?;
+        let config = ActorConfig::from_meta(
+            &meta,
+            session_id.clone(),
+            Arc::clone(&runtime),
+            Arc::clone(&healthy),
+            runtime_config,
+        )?;
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
@@ -684,6 +889,7 @@ impl ActorConfig {
         session_id: String,
         runtime: Arc<Mutex<RuntimeSnapshot>>,
         healthy: Arc<AtomicBool>,
+        runtime_config: ProjectRuntimeConfig,
     ) -> Result<Self> {
         let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
         let worker = WorkerBinary::resolve_for(&toolchain_id).map_err(|e| ServerError::BadProject(e.to_string()))?;
@@ -699,28 +905,15 @@ impl ActorConfig {
             session_id,
             runtime,
             healthy,
-            worker_rss_post_job_restart_kib: env_u64_reject_old(
-                "LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB",
-                WORKER_RSS_POST_JOB_RESTART_KIB,
-                "LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB",
-            )?,
-            worker_rss_hard_kill_kib: env_u64("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB", WORKER_RSS_HARD_KILL_KIB)?,
-            worker_rss_sample_millis: env_u64("LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS", WORKER_RSS_SAMPLE_MILLIS)?,
-            import_switch_rss_soft_kib: env_u64(
-                "LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB",
-                IMPORT_SWITCH_RSS_SOFT_KIB,
-            )?,
-            module_cache_rss_guard_kib: env_u64(
-                "LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB",
-                MODULE_CACHE_RSS_GUARD_KIB,
-            )?,
-            module_cache_max_bytes: env_u64("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES", MODULE_CACHE_MAX_BYTES)?,
-            mailbox_capacity: env_usize("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY", PROJECT_MAILBOX_CAPACITY)?,
-            max_restarts_per_window: env_usize("LEAN_HOST_MCP_WORKER_RESTART_LIMIT", MAX_RESTARTS_PER_WINDOW)?,
-            restart_window: Duration::from_secs(env_u64(
-                "LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS",
-                RESTART_WINDOW.as_secs(),
-            )?),
+            worker_rss_post_job_restart_kib: runtime_config.worker_rss_post_job_restart_kib(),
+            worker_rss_hard_kill_kib: runtime_config.worker_rss_hard_kill_kib(),
+            worker_rss_sample_millis: runtime_config.worker_rss_sample_millis(),
+            import_switch_rss_soft_kib: runtime_config.import_switch_rss_soft_kib(),
+            module_cache_rss_guard_kib: runtime_config.module_cache_rss_guard_kib(),
+            module_cache_max_bytes: runtime_config.module_cache_max_bytes(),
+            mailbox_capacity: runtime_config.mailbox_capacity(),
+            max_restarts_per_window: runtime_config.max_restarts_per_window(),
+            restart_window: runtime_config.restart_window(),
         })
     }
 }
@@ -830,7 +1023,7 @@ impl ProjectActorState {
                     let runtime =
                         self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
                     self.publish_runtime(&runtime);
-                    return Ok(ProjectCall { value, runtime });
+                    return Ok(ProjectCall::new(value, runtime));
                 }
                 Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
@@ -1230,6 +1423,14 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
     if preflight {
         let report = builder.check();
         if let Some(first) = report.first_error() {
+            if bootstrap_failure_is_hard_rss(&first.code().to_string(), first.message()) {
+                return Err(bootstrap_hard_rss_unavailable(
+                    config,
+                    first.message().to_owned(),
+                    parse_keyed_u64(first.message(), "current_kib"),
+                    parse_keyed_u64(first.message(), "limit_kib").or(Some(config.worker_rss_hard_kill_kib)),
+                ));
+            }
             return Err(ServerError::BadProject(format!(
                 "{}: {}",
                 first.code(),
@@ -1237,12 +1438,93 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
             )));
         }
     }
-    let handle = builder.open().map_err(map_worker_err)?;
+    let handle = match builder.open() {
+        Ok(handle) => handle,
+        Err(LeanWorkerError::RssHardLimitExceeded {
+            operation,
+            current_kib,
+            limit_kib,
+        }) => {
+            return Err(bootstrap_hard_rss_unavailable(
+                config,
+                format!(
+                    "rss_hard_limit_exceeded operation={operation} current_kib={current_kib} limit_kib={limit_kib}"
+                ),
+                Some(current_kib),
+                Some(limit_kib),
+            ));
+        }
+        Err(err) => return Err(map_worker_err(err)),
+    };
     let runtime_toolchain = handle
         .runtime_metadata()
         .lean_version
         .unwrap_or_else(|| config.toolchain_label.clone());
     Ok((handle, runtime_toolchain))
+}
+
+fn bootstrap_failure_is_hard_rss(code: &str, message: &str) -> bool {
+    let lower = message.to_lowercase();
+    code.contains("rss")
+        || lower.contains("hard rss limit")
+        || lower.contains("rss_hard_limit")
+        || lower.contains("rss_hard_limit_exceeded")
+        || lower.contains("rss hard limit")
+}
+
+fn bootstrap_hard_rss_unavailable(
+    config: &ActorConfig,
+    reason: String,
+    current_kib: Option<u64>,
+    limit_kib: Option<u64>,
+) -> ServerError {
+    config.healthy.store(false, Ordering::Release);
+    let generation = config.runtime.lock().worker_generation;
+    let event = restart_event(
+        RestartCause::RssHardLimit,
+        reason.clone(),
+        generation,
+        current_kib,
+        limit_kib,
+    );
+    let runtime = RuntimeFacts {
+        worker_generation: generation,
+        worker_restarted: true,
+        retry_count: 0,
+        admission_wait_millis: 0,
+        queue_wait_millis: 0,
+        call_restart: Some(event.clone()),
+        last_restart: Some(event.clone()),
+        rss_kib: current_kib,
+        worker_lanes: 1,
+        import_profile: None,
+        profile_switch_count: 0,
+    };
+    *config.runtime.lock() = RuntimeSnapshot {
+        worker_generation: generation,
+        last_restart: Some(event),
+        rss_kib: current_kib,
+        import_profile: None,
+        profile_switch_count: 0,
+    };
+    ServerError::worker_unavailable(WorkerUnavailable {
+        retryable: false,
+        worker_restarted: true,
+        project_root: config.lake_root.to_string_lossy().into_owned(),
+        project_hash: config.manifest_hash.clone(),
+        imports: Vec::new(),
+        session_id: config.session_id.clone(),
+        lean_toolchain: config.toolchain_label.clone(),
+        worker_generation: generation,
+        reason,
+        restart_cause: Some(RestartCause::RssHardLimit.as_str().to_owned()),
+        rss_kib: current_kib,
+        limit_kib,
+        retry_after_millis: None,
+        restarts_in_window: None,
+        window_millis: None,
+        runtime,
+    })
 }
 
 fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
@@ -1333,39 +1615,38 @@ fn millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn env_u64(name: &str, default: u64) -> Result<u64> {
-    match std::env::var(name) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<u64>()
-                .map_err(|e| ServerError::Internal(format!("{name}={value:?} not a u64: {e}")))?;
-            if parsed == 0 {
-                return Err(ServerError::Internal(format!("{name}=0 is not allowed")));
-            }
-            Ok(parsed)
-        }
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(e) => Err(ServerError::Internal(format!("{name} is not valid unicode: {e}"))),
-    }
+fn parse_keyed_u64(text: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}=");
+    let start = text.find(&prefix)?.checked_add(prefix.len())?;
+    let digits = text[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
 }
 
-fn env_u64_reject_old(name: &str, default: u64, old_name: &str) -> Result<u64> {
-    if std::env::var_os(old_name).is_some() {
-        return Err(ServerError::Internal(format!(
-            "{old_name} was renamed to {name}; set {name} instead"
-        )));
+fn parse_nonzero_u64(name: &str, value: Option<&str>, default: u64) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|e| ServerError::Internal(format!("{name}={value:?} not a u64: {e}")))?;
+    if parsed == 0 {
+        return Err(ServerError::Internal(format!("{name}=0 is not allowed")));
     }
-    env_u64(name, default)
+    Ok(parsed)
 }
 
-fn env_usize(name: &str, default: usize) -> Result<usize> {
-    let value = env_u64(name, default as u64)?;
-    usize::try_from(value).map_err(|_| ServerError::Internal(format!("{name}={value} does not fit in usize")))
+fn parse_nonzero_usize(name: &str, value: Option<&str>, default: usize) -> Result<usize> {
+    let parsed = parse_nonzero_u64(name, value, default as u64)?;
+    usize::try_from(parsed).map_err(|_| ServerError::Internal(format!("{name}={parsed} does not fit in usize")))
 }
 
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
+    clippy::panic,
     clippy::unwrap_used,
     reason = "unit tests use expect/unwrap_err to state the branch under test directly"
 )]
@@ -1392,6 +1673,96 @@ mod tests {
         let _held = admission.acquire().await.expect("initial permit");
 
         assert_eq!(admission.acquire().await.unwrap_err(), AdmissionError::Timeout);
+    }
+
+    #[test]
+    fn runtime_config_rejects_obsolete_rss_ceiling_env() {
+        let err = parse_runtime_config(RuntimeEnv {
+            worker_rss_ceiling_kib: Some("123".to_owned()),
+            ..RuntimeEnv::default()
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB is obsolete"));
+        assert!(err.contains("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB"));
+        assert!(err.contains("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB"));
+    }
+
+    #[test]
+    fn runtime_config_parses_runtime_policy_without_env_reads() {
+        let config = parse_runtime_config(RuntimeEnv {
+            worker_rss_post_job_restart_kib: Some("5".to_owned()),
+            worker_rss_hard_kill_kib: Some("7".to_owned()),
+            worker_rss_sample_millis: Some("11".to_owned()),
+            import_switch_rss_soft_kib: Some("13".to_owned()),
+            module_cache_rss_guard_kib: Some("17".to_owned()),
+            module_cache_max_bytes: Some("19".to_owned()),
+            project_mailbox_capacity: Some("23".to_owned()),
+            worker_restart_limit: Some("29".to_owned()),
+            worker_restart_window_secs: Some("31".to_owned()),
+            ..RuntimeEnv::default()
+        })
+        .unwrap();
+
+        assert_eq!(config.worker_rss_post_job_restart_kib(), 5);
+        assert_eq!(config.worker_rss_hard_kill_kib(), 7);
+        assert_eq!(config.worker_rss_sample_millis(), 11);
+        assert_eq!(config.import_switch_rss_soft_kib(), 13);
+        assert_eq!(config.module_cache_rss_guard_kib(), 17);
+        assert_eq!(config.module_cache_max_bytes(), 19);
+        assert_eq!(config.mailbox_capacity(), 23);
+        assert_eq!(config.max_restarts_per_window(), 29);
+        assert_eq!(config.restart_window(), Duration::from_secs(31));
+    }
+
+    #[test]
+    fn bootstrap_hard_rss_failure_is_structured_runtime_unavailable() {
+        let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
+            worker_generation: 1,
+            last_restart: None,
+            rss_kib: None,
+            import_profile: None,
+            profile_switch_count: 0,
+        }));
+        let config = ActorConfig {
+            lake_root: PathBuf::from("/tmp/lean-host-mcp-bootstrap-rss-test"),
+            manifest_hash: "sha256-test".to_owned(),
+            toolchain_label: "leanprover/lean4:test".to_owned(),
+            worker_path: PathBuf::from("/tmp/worker"),
+            lean_sysroot: PathBuf::from("/tmp/lean"),
+            session_id: "session-test".to_owned(),
+            runtime: Arc::clone(&runtime),
+            healthy: Arc::new(AtomicBool::new(true)),
+            worker_rss_post_job_restart_kib: WORKER_RSS_POST_JOB_RESTART_KIB,
+            worker_rss_hard_kill_kib: 64,
+            worker_rss_sample_millis: WORKER_RSS_SAMPLE_MILLIS,
+            import_switch_rss_soft_kib: IMPORT_SWITCH_RSS_SOFT_KIB,
+            module_cache_rss_guard_kib: MODULE_CACHE_RSS_GUARD_KIB,
+            module_cache_max_bytes: MODULE_CACHE_MAX_BYTES,
+            mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
+            max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
+            restart_window: RESTART_WINDOW,
+        };
+
+        let err = bootstrap_hard_rss_unavailable(
+            &config,
+            "rss_hard_limit_exceeded operation=startup current_kib=128 limit_kib=64".to_owned(),
+            Some(128),
+            Some(64),
+        );
+
+        let ServerError::WorkerUnavailable(info) = err else {
+            panic!("expected WorkerUnavailable");
+        };
+        assert!(!info.retryable);
+        assert_eq!(info.restart_cause.as_deref(), Some("rss_hard_limit_exceeded"));
+        assert_eq!(info.rss_kib, Some(128));
+        assert_eq!(info.limit_kib, Some(64));
+        assert_eq!(
+            info.runtime.last_restart.as_ref().map(|event| event.cause.as_str()),
+            Some("rss_hard_limit_exceeded")
+        );
     }
 
     #[test]

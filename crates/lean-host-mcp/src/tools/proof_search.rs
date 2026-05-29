@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::broker::{BrokerCall, ProjectHint};
 use crate::envelope::{Response, RuntimeFacts};
-use crate::error::Result;
+use crate::error::{Result, ServerError};
 use crate::projections::{
     DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, project_declaration_search,
 };
@@ -175,8 +175,24 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let mut search_results = Vec::new();
     let mut runtime: Option<RuntimeFacts> = None;
     for search in searches.iter().take(MAX_SEARCHES) {
-        let call =
-            run_declaration_search(ctx, project.clone(), profile.imports.clone(), search.request.clone()).await?;
+        let call = match run_declaration_search(ctx, project.clone(), profile.imports.clone(), search.request.clone())
+            .await
+        {
+            Ok(call) => call,
+            Err(err) if missing_import_failure(&err) => {
+                warnings.push(format!(
+                    "missing_imports: declaration search could not load import profile {:?}: {err}",
+                    profile.imports
+                ));
+                let result = empty_result(profile.clone(), warnings);
+                let hint = ProjectHint::from_request(project);
+                let project_runtime = ctx.broker.project_runtime(hint, profile.imports.clone()).await?;
+                return Ok(Response::ok(result, project_runtime.freshness)
+                    .with_runtime(project_runtime.runtime)
+                    .hint("supply a valid file or explicit imports; search_for_proof will not broad-import Mathlib as fallback"));
+            }
+            Err(err) => return Err(err),
+        };
         runtime = Some(call.runtime);
         search_results.push((search.label, call.value));
     }
@@ -629,6 +645,9 @@ fn candidate_score(
     if is_generic_additive_or_cast_candidate(&lower_name) && !profile_allows_generic_additive_or_cast(profile) {
         score = score.saturating_sub(20);
     }
+    if is_structural_noise_candidate(&lower_name, row.module.as_deref(), profile) {
+        score = score.saturating_sub(45);
+    }
     score = score.saturating_add(profile_specific_score_adjustment(&lower_name, profile));
     for fragment in &profile.name_fragments {
         if lower_name.contains(fragment) {
@@ -679,7 +698,28 @@ fn profile_specific_score_adjustment(lower_name: &str, profile: &TargetProfile) 
             24,
             -12,
         ),
-        GoalProfileKind::LinearArithmetic | GoalProfileKind::Generic => 0,
+        GoalProfileKind::LinearArithmetic => topical_adjustment(
+            lower_name,
+            &[
+                "int.linear",
+                "int.cooper",
+                "cooper",
+                "omega",
+                "linarith",
+                "linear",
+                "le_of",
+                "lt_of",
+                "add_le",
+                "le_add",
+                "sub_le",
+                "le_sub",
+                "nonneg",
+                "nonpos",
+            ],
+            28,
+            -6,
+        ),
+        GoalProfileKind::Generic => 0,
     }
 }
 
@@ -726,6 +766,41 @@ fn is_generic_additive_or_cast_candidate(lower_name: &str) -> bool {
             "cast",
         ],
     )
+}
+
+fn is_structural_noise_candidate(lower_name: &str, module: Option<&str>, profile: &TargetProfile) -> bool {
+    let lower_module = module.unwrap_or_default().to_lowercase();
+    let mentions_data = profile_mentions_any(profile, &["array", "list", "vector", "getelem"]);
+    if !mentions_data
+        && (contains_any(
+            lower_name,
+            &["array.", "list.", "vector.", "getelem", "getelem?", "uget"],
+        ) || contains_any(&lower_module, &["init.data.array", "data.array", "data.list"]))
+    {
+        return true;
+    }
+
+    let mentions_order_morphism = profile_mentions_any(profile, &["antitone", "monotone", "strictmono", "strictanti"]);
+    if !mentions_order_morphism
+        && contains_any(
+            lower_name,
+            &["antitone.", "monotone.", "strictmono.", "strictanti.", "reflect_lt"],
+        )
+    {
+        return true;
+    }
+    false
+}
+
+fn profile_mentions_any(profile: &TargetProfile, needles: &[&str]) -> bool {
+    profile
+        .name_fragments
+        .iter()
+        .chain(profile.constants.iter())
+        .any(|item| {
+            let lower = item.to_lowercase();
+            needles.iter().any(|needle| lower.contains(needle))
+        })
 }
 
 fn profile_allows_generic_additive_or_cast(profile: &TargetProfile) -> bool {
@@ -1000,7 +1075,19 @@ fn curated_fragments(kind: GoalProfileKind) -> &'static [&'static str] {
             "term",
             "theory",
         ],
-        GoalProfileKind::LinearArithmetic => &["linear", "cooper", "omega", "linarith", "le", "lt"],
+        GoalProfileKind::LinearArithmetic => &[
+            "int.linear",
+            "cooper",
+            "omega",
+            "linarith",
+            "linear",
+            "add_le",
+            "le_add",
+            "sub_le",
+            "le_sub",
+            "le",
+            "lt",
+        ],
         GoalProfileKind::Generic => &[],
     }
 }
@@ -1037,6 +1124,14 @@ fn useful_lower_fragment(fragment: &str) -> bool {
             | "realize"
             | "theory"
             | "term"
+            | "linear"
+            | "cooper"
+            | "omega"
+            | "linarith"
+            | "add_le"
+            | "le_add"
+            | "sub_le"
+            | "le_sub"
     ) || fragment.contains("cast")
 }
 
@@ -1079,6 +1174,15 @@ fn is_stopword(token: &str) -> bool {
             | "unsafe"
             | "where"
     )
+}
+
+fn missing_import_failure(err: &ServerError) -> bool {
+    let text = err.to_string().to_lowercase();
+    (text.contains(".olean")
+        && (text.contains("does not exist") || text.contains("no such file") || text.contains("object file")))
+        || text.contains("unknown module")
+        || text.contains("unknown import")
+        || text.contains("module not found")
 }
 
 #[cfg(test)]
@@ -1264,5 +1368,52 @@ mod tests {
             candidate_score(&solver, &linear, ProofSearchMode::NextStep, "name_fragment")
                 > candidate_score(&solver, &factorization, ProofSearchMode::NextStep, "name_fragment")
         );
+    }
+
+    #[test]
+    fn linear_profile_prefers_solver_and_int_inequality_candidates_over_lt_noise() {
+        let profile = profile_from_text(
+            "x y : ℤ\nhxy : x + 2 * y ≤ 17\nhy : 0 ≤ y\n⊢ x ≤ 17".to_owned(),
+            Some("Int".to_owned()),
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(profile.kind, GoalProfileKind::LinearArithmetic);
+
+        let solver = summary(
+            "Int.Linear.ExprCnstr.denote_le",
+            Some("Mathlib.Tactic.Omega.IntList"),
+            80,
+        );
+        let cooper = summary(
+            "Int.Cooper.proof_of_linear_combination",
+            Some("Mathlib.Tactic.Omega"),
+            80,
+        );
+        let array_noise = summary("Array.getElem?_of_lt", Some("Init.Data.Array.Basic"), 100);
+        let order_noise = summary("Antitone.reflect_lt", Some("Mathlib.Order.Basic"), 100);
+
+        let solver_score = candidate_score(&solver, &profile, ProofSearchMode::NextStep, "name_fragment");
+        let cooper_score = candidate_score(&cooper, &profile, ProofSearchMode::NextStep, "name_fragment");
+        let array_score = candidate_score(&array_noise, &profile, ProofSearchMode::NextStep, "name_fragment");
+        let order_score = candidate_score(&order_noise, &profile, ProofSearchMode::NextStep, "name_fragment");
+
+        assert!(solver_score > array_score, "{solver_score} should beat {array_score}");
+        assert!(cooper_score > order_score, "{cooper_score} should beat {order_score}");
+    }
+
+    #[test]
+    fn missing_import_search_errors_are_recognized_for_empty_result_shaping() {
+        assert!(missing_import_failure(&ServerError::Lean(
+            "object file '/tmp/Missing/Import.olean' does not exist".to_owned()
+        )));
+        assert!(missing_import_failure(&ServerError::Lean(
+            "unknown module 'Definitely.Missing'".to_owned()
+        )));
+        assert!(!missing_import_failure(&ServerError::Lean(
+            "unknown declaration Foo.bar".to_owned()
+        )));
     }
 }
