@@ -79,7 +79,7 @@ Environment vars:
 | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | Process-wide permits for heavy Lean semantic work. `1` serializes cross-project calls for daily-driver robustness. | `1` |
 | `LEAN_HOST_MCP_SEMANTIC_WAITERS` | Process-wide capacity for callers waiting on semantic-work admission. Full admission returns retryable `semantic_admission_full`. | `16` |
 | `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | Maximum wait for semantic-work admission. Timeout returns retryable `semantic_admission_timeout`. | `60000` |
-| `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB` | Post-job RSS threshold that triggers a planned worker cycle before accepting the next call. The old `LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB` name is rejected. | `3145728` |
+| `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB` | Post-job RSS threshold that triggers a planned worker cycle before accepting the next call. | `3145728` |
 | `LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB` | RSS threshold for preemptively cycling a worker before switching to a different import profile. Planned cycles do not count toward crash-loop restart limits. | `2097152` |
 | `LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB` | In-flight hard RSS kill threshold. Crossing it terminates/restarts the child and returns non-retryable `rss_hard_limit_exceeded` for that call. | `16777216` |
 | `LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS` | Sampling interval for the in-flight hard RSS watchdog. | `250` |

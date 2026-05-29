@@ -88,10 +88,9 @@ impl ProjectRuntimeConfig {
     /// # Errors
     ///
     /// [`ServerError::Internal`] when a runtime env var is malformed, zero
-    /// where zero is unsafe, or an obsolete variable name is present.
+    /// where zero is unsafe.
     pub fn from_env() -> Result<Self> {
         parse_runtime_config(RuntimeEnv {
-            worker_rss_ceiling_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB")?,
             worker_rss_post_job_restart_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB")?,
             worker_rss_hard_kill_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB")?,
             worker_rss_sample_millis: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS")?,
@@ -152,7 +151,6 @@ impl ProjectRuntimeConfig {
 
 #[derive(Debug, Default)]
 struct RuntimeEnv {
-    worker_rss_ceiling_kib: Option<String>,
     worker_rss_post_job_restart_kib: Option<String>,
     worker_rss_hard_kill_kib: Option<String>,
     worker_rss_sample_millis: Option<String>,
@@ -165,14 +163,6 @@ struct RuntimeEnv {
 }
 
 fn parse_runtime_config(env: RuntimeEnv) -> Result<ProjectRuntimeConfig> {
-    if env.worker_rss_ceiling_kib.is_some() {
-        return Err(ServerError::Internal(
-            "LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB is obsolete; use \
-             LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB for planned post-job cycling or \
-             LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB for the in-flight hard kill limit"
-                .to_owned(),
-        ));
-    }
     let defaults = ProjectRuntimeConfig::default();
     Ok(ProjectRuntimeConfig {
         worker_rss_post_job_restart_kib: parse_nonzero_u64(
@@ -1676,20 +1666,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_rejects_obsolete_rss_ceiling_env() {
-        let err = parse_runtime_config(RuntimeEnv {
-            worker_rss_ceiling_kib: Some("123".to_owned()),
-            ..RuntimeEnv::default()
-        })
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB is obsolete"));
-        assert!(err.contains("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB"));
-        assert!(err.contains("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB"));
-    }
-
-    #[test]
     fn runtime_config_parses_runtime_policy_without_env_reads() {
         let config = parse_runtime_config(RuntimeEnv {
             worker_rss_post_job_restart_kib: Some("5".to_owned()),
@@ -1701,7 +1677,6 @@ mod tests {
             project_mailbox_capacity: Some("23".to_owned()),
             worker_restart_limit: Some("29".to_owned()),
             worker_restart_window_secs: Some("31".to_owned()),
-            ..RuntimeEnv::default()
         })
         .unwrap();
 
