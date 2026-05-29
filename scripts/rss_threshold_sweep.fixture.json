@@ -1,0 +1,73 @@
+{
+  "calls": [
+    {
+      "label": "inspect_nat_add_zero",
+      "tool": "inspect_declaration",
+      "arguments": {
+        "name": "Nat.add_zero",
+        "imports": ["LeanRsFixture.Handles"]
+      }
+    },
+    {
+      "label": "inspect_known_theorem",
+      "tool": "inspect_declaration",
+      "arguments": {
+        "name": "LeanRsFixture.SourceRanges.knownTheorem",
+        "file": "${PROJECT_ROOT}/LeanRsFixture/SourceRanges.lean"
+      }
+    },
+    {
+      "label": "try_proof_step_bad",
+      "tool": "try_proof_step",
+      "arguments": {
+        "file": "${PROJECT_ROOT}/LeanRsFixture/ProofActions.lean",
+        "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+        "snippet": "exact missingIdentifier"
+      }
+    },
+    {
+      "label": "proof_state_trivial_cold",
+      "tool": "proof_state",
+      "arguments": {
+        "file": "${PROJECT_ROOT}/LeanRsFixture/SourceRanges.lean",
+        "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
+      }
+    },
+    {
+      "label": "proof_state_trivial_warm_repeat",
+      "tool": "proof_state",
+      "arguments": {
+        "file": "${PROJECT_ROOT}/LeanRsFixture/SourceRanges.lean",
+        "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
+      }
+    },
+    {
+      "label": "search_for_proof_trivial_declaration",
+      "tool": "search_for_proof",
+      "arguments": {
+        "file": "${PROJECT_ROOT}/LeanRsFixture/SourceRanges.lean",
+        "declaration": "LeanRsFixture.SourceRanges.knownTheorem",
+        "limit": 10
+      }
+    },
+    {
+      "label": "verify_known_theorem",
+      "tool": "verify_declaration",
+      "arguments": {
+        "file": "${PROJECT_ROOT}/LeanRsFixture/ProofActions.lean",
+        "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+        "report_axioms": true
+      }
+    },
+    {
+      "label": "find_references_file_known_theorem",
+      "tool": "find_references",
+      "arguments": {
+        "name": "LeanRsFixture.SourceRanges.knownTheorem",
+        "scope": "file",
+        "file": "${PROJECT_ROOT}/LeanRsFixture/SourceRanges.lean",
+        "limit": 10
+      }
+    }
+  ]
+}

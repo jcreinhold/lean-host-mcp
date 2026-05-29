@@ -43,8 +43,8 @@ single Streamable HTTP server for that run. HTTP sessions are independent rmcp s
 `LeanHostService` values share one broker, so all sessions still obey the same per-project FIFO actor, process-wide
 semantic permit gate, bounded mailbox, RSS policy, and worker restart semantics.
 
-Runtime pressure is not a transport error. Admission pressure, mailbox pressure, worker death, session loss, and
-restart recovery continue to surface through the normal tool response envelope as `status = "runtime_unavailable"` with
+Runtime pressure is not a transport error. Admission pressure, mailbox pressure, worker death, session loss, and restart
+recovery continue to surface through the normal tool response envelope as `status = "runtime_unavailable"` with
 structured runtime metadata. HTTP status codes are reserved for transport/protocol failures such as invalid headers or
 bad HTTP paths.
 

@@ -65,6 +65,17 @@ struct SmokeRecord {
     worker_rendering_micros: Option<u64>,
     worker_cache_entry_count: Option<u64>,
     worker_cache_approx_bytes: Option<u64>,
+    runtime_worker_generation: Option<u64>,
+    runtime_worker_restarted: Option<bool>,
+    runtime_retry_count: Option<u64>,
+    runtime_admission_wait_millis: Option<u64>,
+    runtime_queue_wait_millis: Option<u64>,
+    runtime_rss_kib: Option<u64>,
+    runtime_call_restart_cause: Option<String>,
+    runtime_call_restart_planned: Option<bool>,
+    runtime_call_restart_rss_kib: Option<u64>,
+    runtime_call_restart_limit_kib: Option<u64>,
+    runtime_last_restart_cause: Option<String>,
     infrastructure_event: Option<String>,
 }
 
@@ -221,7 +232,20 @@ async fn rss_threshold_sweep_fixture_sequence_reports_metrics() {
         let mut status_counts = BTreeMap::<String, usize>::new();
         let mut sessions = BTreeSet::<String>::new();
         let mut cache_hits = 0usize;
-        let mut peak_rss_kib = server.rss_kib().unwrap_or_default();
+        let mut peak_server_rss_kib = server.rss_kib().unwrap_or_default();
+        let mut peak_runtime_rss_kib = 0_u64;
+        let mut max_worker_generation = 0_u64;
+        let mut final_worker_generation = None::<u64>;
+        let mut worker_restarted_true_count = 0usize;
+        let mut call_restart_count = 0usize;
+        let mut planned_restart_count = 0usize;
+        let mut unplanned_restart_count = 0usize;
+        let mut call_restart_causes = BTreeMap::<String, usize>::new();
+        let mut last_restart_causes = BTreeMap::<String, usize>::new();
+        let mut retry_count_total = 0_u64;
+        let mut max_retry_count = 0_u64;
+        let mut max_admission_wait_millis = 0_u64;
+        let mut max_queue_wait_millis = 0_u64;
         let mut last_session_id = None;
 
         for call in &scenario.calls {
@@ -234,7 +258,39 @@ async fn rss_threshold_sweep_fixture_sequence_reports_metrics() {
                 cache_hits = cache_hits.saturating_add(1);
             }
             if let Some(rss) = record.rss_after_kib {
-                peak_rss_kib = peak_rss_kib.max(rss);
+                peak_server_rss_kib = peak_server_rss_kib.max(rss);
+            }
+            if let Some(rss) = record.runtime_rss_kib {
+                peak_runtime_rss_kib = peak_runtime_rss_kib.max(rss);
+            }
+            if let Some(generation) = record.runtime_worker_generation {
+                max_worker_generation = max_worker_generation.max(generation);
+                final_worker_generation = Some(generation);
+            }
+            if record.runtime_worker_restarted == Some(true) {
+                worker_restarted_true_count = worker_restarted_true_count.saturating_add(1);
+            }
+            if let Some(count) = record.runtime_retry_count {
+                retry_count_total = retry_count_total.saturating_add(count);
+                max_retry_count = max_retry_count.max(count);
+            }
+            if let Some(wait) = record.runtime_admission_wait_millis {
+                max_admission_wait_millis = max_admission_wait_millis.max(wait);
+            }
+            if let Some(wait) = record.runtime_queue_wait_millis {
+                max_queue_wait_millis = max_queue_wait_millis.max(wait);
+            }
+            if let Some(cause) = record.runtime_call_restart_cause.as_ref() {
+                call_restart_count = call_restart_count.saturating_add(1);
+                *call_restart_causes.entry(cause.clone()).or_default() += 1;
+                match record.runtime_call_restart_planned {
+                    Some(true) => planned_restart_count = planned_restart_count.saturating_add(1),
+                    Some(false) => unplanned_restart_count = unplanned_restart_count.saturating_add(1),
+                    None => {}
+                }
+            }
+            if let Some(cause) = record.runtime_last_restart_cause.as_ref() {
+                *last_restart_causes.entry(cause.clone()).or_default() += 1;
             }
         }
 
@@ -246,7 +302,20 @@ async fn rss_threshold_sweep_fixture_sequence_reports_metrics() {
                 "wall_ms": started.elapsed().as_millis(),
                 "session_count": sessions.len(),
                 "cache_hits": cache_hits,
-                "peak_server_rss_kib": peak_rss_kib,
+                "peak_server_rss_kib": peak_server_rss_kib,
+                "peak_runtime_rss_kib": peak_runtime_rss_kib,
+                "max_worker_generation": max_worker_generation,
+                "final_worker_generation": final_worker_generation,
+                "worker_restarted_true_count": worker_restarted_true_count,
+                "call_restart_count": call_restart_count,
+                "planned_restart_count": planned_restart_count,
+                "unplanned_restart_count": unplanned_restart_count,
+                "call_restart_causes": call_restart_causes,
+                "last_restart_causes": last_restart_causes,
+                "retry_count_total": retry_count_total,
+                "max_retry_count": max_retry_count,
+                "max_admission_wait_millis": max_admission_wait_millis,
+                "max_queue_wait_millis": max_queue_wait_millis,
                 "status_counts": status_counts,
             }))
             .expect("serialize RSS sweep record")
@@ -728,6 +797,17 @@ impl McpServer {
                     worker_rendering_micros: query_timing_u64(&response.json, "rendering_micros"),
                     worker_cache_entry_count: query_fact_u64(&response.json, "cache_entry_count"),
                     worker_cache_approx_bytes: query_fact_u64(&response.json, "cache_approx_bytes"),
+                    runtime_worker_generation: runtime_u64(&response.json, "worker_generation"),
+                    runtime_worker_restarted: runtime_bool(&response.json, "worker_restarted"),
+                    runtime_retry_count: runtime_u64(&response.json, "retry_count"),
+                    runtime_admission_wait_millis: runtime_u64(&response.json, "admission_wait_millis"),
+                    runtime_queue_wait_millis: runtime_u64(&response.json, "queue_wait_millis"),
+                    runtime_rss_kib: runtime_u64(&response.json, "rss_kib"),
+                    runtime_call_restart_cause: runtime_restart_str(&response.json, "call_restart", "cause"),
+                    runtime_call_restart_planned: runtime_restart_bool(&response.json, "call_restart", "planned"),
+                    runtime_call_restart_rss_kib: runtime_restart_u64(&response.json, "call_restart", "rss_kib"),
+                    runtime_call_restart_limit_kib: runtime_restart_u64(&response.json, "call_restart", "limit_kib"),
+                    runtime_last_restart_cause: runtime_restart_str(&response.json, "last_restart", "cause"),
                     infrastructure_event,
                 }
             }
@@ -754,6 +834,17 @@ impl McpServer {
                 worker_rendering_micros: None,
                 worker_cache_entry_count: None,
                 worker_cache_approx_bytes: None,
+                runtime_worker_generation: None,
+                runtime_worker_restarted: None,
+                runtime_retry_count: None,
+                runtime_admission_wait_millis: None,
+                runtime_queue_wait_millis: None,
+                runtime_rss_kib: None,
+                runtime_call_restart_cause: None,
+                runtime_call_restart_planned: None,
+                runtime_call_restart_rss_kib: None,
+                runtime_call_restart_limit_kib: None,
+                runtime_last_restart_cause: None,
                 infrastructure_event: Some(err),
             },
         }
@@ -1013,6 +1104,49 @@ fn query_timing_u64(response: &Value, field: &str) -> Option<u64> {
         .get("timings")?
         .get(field)
         .and_then(Value::as_u64)
+}
+
+fn runtime_facts(response: &Value) -> Option<&Value> {
+    for path in [
+        "/result/structuredContent/runtime",
+        "/result/structuredContent/result/runtime",
+        "/result/result/runtime",
+    ] {
+        if let Some(runtime) = response.pointer(path) {
+            return Some(runtime);
+        }
+    }
+    None
+}
+
+fn runtime_u64(response: &Value, field: &str) -> Option<u64> {
+    runtime_facts(response)?.get(field).and_then(Value::as_u64)
+}
+
+fn runtime_bool(response: &Value, field: &str) -> Option<bool> {
+    runtime_facts(response)?.get(field).and_then(Value::as_bool)
+}
+
+fn runtime_restart_str(response: &Value, restart: &str, field: &str) -> Option<String> {
+    runtime_facts(response)?
+        .get(restart)?
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn runtime_restart_u64(response: &Value, restart: &str, field: &str) -> Option<u64> {
+    runtime_facts(response)?
+        .get(restart)?
+        .get(field)
+        .and_then(Value::as_u64)
+}
+
+fn runtime_restart_bool(response: &Value, restart: &str, field: &str) -> Option<bool> {
+    runtime_facts(response)?
+        .get(restart)?
+        .get(field)
+        .and_then(Value::as_bool)
 }
 
 fn infrastructure_event(response: &Value, session_changed: bool) -> Option<String> {
