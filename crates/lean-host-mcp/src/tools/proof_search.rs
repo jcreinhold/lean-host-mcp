@@ -207,7 +207,17 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
         } else {
             proof_response.freshness.imports.clone()
         };
-        match proof_response.result {
+        let Some(proof_result) = proof_response.result else {
+            return Ok(profile_from_text(
+                explicit_text,
+                None,
+                imports,
+                "runtime_unavailable_degraded_to_explicit_text".to_owned(),
+                None,
+                vec!["proof-state runtime was unavailable; used explicit goal/type text".to_owned()],
+            ));
+        };
+        match proof_result {
             ProofStateResult::Context {
                 goals_before,
                 goals_after,
@@ -592,6 +602,9 @@ fn candidate_score(
     if is_generic_candidate(&row.name) {
         score = score.saturating_sub(40);
     }
+    if is_generic_int_solver_candidate(&row.name) && !profile_is_linear_arithmetic(profile) {
+        score = score.saturating_sub(35);
+    }
     for fragment in &profile.name_fragments {
         if row.name.to_lowercase().contains(fragment) {
             score = score.saturating_add(if is_structural_fragment(fragment) { 10 } else { 5 });
@@ -622,10 +635,36 @@ fn is_generic_candidate(name: &str) -> bool {
     name.starts_with("Acc.") || has_generic_segment
 }
 
+fn is_generic_int_solver_candidate(name: &str) -> bool {
+    name.contains("Int.Linear") || name.contains("Int.Cooper") || name.contains(".Linear.") || name.contains(".Cooper.")
+}
+
+fn profile_is_linear_arithmetic(profile: &TargetProfile) -> bool {
+    profile.name_fragments.iter().any(|fragment| {
+        matches!(
+            fragment.as_str(),
+            "linear" | "omega" | "cooper" | "le" | "lt" | "ge" | "gt" | "add" | "sub"
+        )
+    })
+}
+
 fn is_structural_fragment(fragment: &str) -> bool {
     matches!(
         fragment,
-        "den" | "num" | "denominator" | "cast" | "intcast" | "mul" | "dvd" | "pow"
+        "den"
+            | "num"
+            | "denominator"
+            | "cast"
+            | "intcast"
+            | "mul"
+            | "dvd"
+            | "pow"
+            | "factorization"
+            | "natabs"
+            | "associated"
+            | "isunit"
+            | "sign"
+            | "prod"
     ) || fragment.contains("cast")
 }
 
@@ -749,7 +788,22 @@ fn extract_name_fragments(text: &str, constants: &[String], heads: &[String]) ->
 fn useful_lower_fragment(fragment: &str) -> bool {
     matches!(
         fragment,
-        "den" | "num" | "denominator" | "cast" | "intcast" | "mul" | "dvd" | "pow" | "int" | "nat"
+        "den"
+            | "num"
+            | "denominator"
+            | "cast"
+            | "intcast"
+            | "mul"
+            | "dvd"
+            | "pow"
+            | "int"
+            | "nat"
+            | "factorization"
+            | "natabs"
+            | "associated"
+            | "isunit"
+            | "sign"
+            | "prod"
     ) || fragment.contains("cast")
 }
 

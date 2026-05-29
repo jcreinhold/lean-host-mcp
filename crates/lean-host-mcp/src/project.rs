@@ -23,6 +23,7 @@ use lean_rs_worker_parent::{
     LeanWorkerHostHandleBuilder, LeanWorkerLifecycleSnapshot, LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery,
     LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector,
     LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRestartPolicy,
+    LeanWorkerRestartReason,
 };
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -38,6 +39,7 @@ const MODULE_QUERY_CACHE_CAPACITY: usize = 256;
 const WORKER_REQUEST_RESTARTS: u64 = 64;
 const PROJECT_MAILBOX_CAPACITY: usize = 8;
 const WORKER_RSS_CEILING_KIB: u64 = 3 * 1024 * 1024;
+const IMPORT_SWITCH_RSS_SOFT_KIB: u64 = 2 * 1024 * 1024;
 const MODULE_CACHE_RSS_GUARD_KIB: u64 = 2 * 1024 * 1024;
 const MODULE_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_JOB_RETRIES: u32 = 1;
@@ -126,6 +128,77 @@ enum ProjectMessage {
     },
 }
 
+impl ProjectMessage {
+    fn imports(&self) -> &[String] {
+        match self {
+            Self::ModuleQuery { meta, .. }
+            | Self::ModuleQueryBatch { meta, .. }
+            | Self::DeclarationInspection { meta, .. }
+            | Self::DeclarationSearch { meta, .. }
+            | Self::ProofAttempt { meta, .. }
+            | Self::DeclarationVerification { meta, .. } => &meta.imports,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartCause {
+    #[expect(dead_code, reason = "stable wire cause reserved for future non-RSS profile cycling")]
+    ImportProfileSwitch,
+    RssImportSwitch,
+    MaxRequests,
+    MaxImports,
+    RssCeiling,
+    Idle,
+    Timeout,
+    Cancelled,
+    ChildExit,
+    ChildAbort,
+    SessionMissing,
+    Explicit,
+    WorkerInternal,
+}
+
+impl RestartCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ImportProfileSwitch => "import_profile_switch",
+            Self::RssImportSwitch => "rss_import_switch",
+            Self::MaxRequests => "max_requests",
+            Self::MaxImports => "max_imports",
+            Self::RssCeiling => "rss_ceiling",
+            Self::Idle => "idle",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::ChildExit => "child_exit",
+            Self::ChildAbort => "child_abort",
+            Self::SessionMissing => "session_missing",
+            Self::Explicit => "explicit",
+            Self::WorkerInternal => "worker_internal",
+        }
+    }
+
+    const fn counts_toward_restart_limit(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout | Self::Cancelled | Self::ChildExit | Self::ChildAbort | Self::SessionMissing
+        )
+    }
+}
+
+fn restart_cause_from_worker(reason: &LeanWorkerRestartReason) -> RestartCause {
+    match reason.stable_cause() {
+        "explicit" => RestartCause::Explicit,
+        "max_requests" => RestartCause::MaxRequests,
+        "max_imports" => RestartCause::MaxImports,
+        "rss_ceiling" => RestartCause::RssCeiling,
+        "idle" => RestartCause::Idle,
+        "cancelled" => RestartCause::Cancelled,
+        "timeout" => RestartCause::Timeout,
+        _ => RestartCause::WorkerInternal,
+    }
+}
+
 /// Process-wide async admission for heavy Lean semantic work.
 #[derive(Debug)]
 pub(crate) struct SemanticAdmission {
@@ -169,6 +242,10 @@ enum AdmissionError {
 struct RuntimeSnapshot {
     worker_generation: u64,
     restart_reason: Option<String>,
+    restart_cause: Option<String>,
+    rss_kib: Option<u64>,
+    import_profile: Option<String>,
+    profile_switch_count: u64,
 }
 
 impl RuntimeSnapshot {
@@ -180,6 +257,11 @@ impl RuntimeSnapshot {
             admission_wait_millis: 0,
             queue_wait_millis: 0,
             restart_reason: self.restart_reason.clone(),
+            restart_cause: self.restart_cause.clone(),
+            rss_kib: self.rss_kib,
+            worker_lanes: 1,
+            import_profile: self.import_profile.clone(),
+            profile_switch_count: self.profile_switch_count,
         }
     }
 }
@@ -219,6 +301,10 @@ impl LeanProject {
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
             worker_generation: 1,
             restart_reason: None,
+            restart_cause: None,
+            rss_kib: None,
+            import_profile: None,
+            profile_switch_count: 0,
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let healthy = Arc::new(AtomicBool::new(true));
@@ -397,11 +483,11 @@ impl LeanProject {
                 AdmissionError::Timeout => "semantic_admission_timeout",
                 AdmissionError::Closed => "semantic_admission_closed",
             };
-            ServerError::WorkerUnavailable(WorkerUnavailable {
+            ServerError::worker_unavailable(WorkerUnavailable {
                 retryable: !matches!(err, AdmissionError::Closed),
                 worker_restarted: false,
                 reason: reason.to_owned(),
-                ..self.worker_error_context()
+                ..self.worker_error_context(&imports)
             })
         })?;
         let admission_wait_millis = millis_u64(created_at.elapsed());
@@ -429,7 +515,7 @@ impl LeanProject {
     where
         T: Send + 'static,
     {
-        let project_info = self.worker_error_context();
+        let project_info = self.worker_error_context(message.imports());
         let tx = self
             .actor_tx
             .lock()
@@ -439,7 +525,7 @@ impl LeanProject {
         match tx.try_send(message) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                return Err(ServerError::WorkerUnavailable(WorkerUnavailable {
+                return Err(ServerError::worker_unavailable(WorkerUnavailable {
                     retryable: true,
                     worker_restarted: false,
                     reason: "mailbox_full".to_owned(),
@@ -448,7 +534,7 @@ impl LeanProject {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.shutdown();
-                return Err(ServerError::WorkerUnavailable(WorkerUnavailable {
+                return Err(ServerError::worker_unavailable(WorkerUnavailable {
                     retryable: true,
                     worker_restarted: false,
                     reason: "mailbox_closed".to_owned(),
@@ -504,23 +590,34 @@ impl LeanProject {
     }
 
     fn unavailable(&self, reason: impl Into<String>, retryable: bool, worker_restarted: bool) -> ServerError {
-        ServerError::WorkerUnavailable(WorkerUnavailable {
+        ServerError::worker_unavailable(WorkerUnavailable {
             retryable,
             worker_restarted,
             reason: reason.into(),
-            ..self.worker_error_context()
+            ..self.worker_error_context(&[])
         })
     }
 
-    fn worker_error_context(&self) -> WorkerUnavailable {
+    fn worker_error_context(&self, imports: &[String]) -> WorkerUnavailable {
         let snapshot = self.runtime.lock().clone();
+        let runtime = snapshot.facts();
         WorkerUnavailable {
             retryable: true,
             worker_restarted: false,
             project_root: self.canonical_root.to_string_lossy().into_owned(),
+            project_hash: self.manifest_hash.clone(),
+            imports: imports.to_vec(),
             session_id: self.session_id.clone(),
+            lean_toolchain: self.toolchain.clone(),
             worker_generation: snapshot.worker_generation,
             reason: String::new(),
+            restart_cause: snapshot.restart_cause,
+            rss_kib: snapshot.rss_kib,
+            limit_kib: None,
+            retry_after_millis: None,
+            restarts_in_window: None,
+            window_millis: None,
+            runtime,
         }
     }
 }
@@ -534,6 +631,7 @@ impl Drop for LeanProject {
 #[derive(Clone)]
 struct ActorConfig {
     lake_root: PathBuf,
+    manifest_hash: String,
     toolchain_label: String,
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
@@ -541,6 +639,7 @@ struct ActorConfig {
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     healthy: Arc<AtomicBool>,
     worker_rss_ceiling_kib: u64,
+    import_switch_rss_soft_kib: u64,
     module_cache_rss_guard_kib: u64,
     module_cache_max_bytes: u64,
     mailbox_capacity: usize,
@@ -562,6 +661,7 @@ impl ActorConfig {
             .map_err(|e| ServerError::BadProject(e.to_string()))?;
         Ok(Self {
             lake_root: meta.canonical_root.clone(),
+            manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
             worker_path: worker.path,
             lean_sysroot,
@@ -569,6 +669,10 @@ impl ActorConfig {
             runtime,
             healthy,
             worker_rss_ceiling_kib: env_u64("LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB", WORKER_RSS_CEILING_KIB)?,
+            import_switch_rss_soft_kib: env_u64(
+                "LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB",
+                IMPORT_SWITCH_RSS_SOFT_KIB,
+            )?,
             module_cache_rss_guard_kib: env_u64(
                 "LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB",
                 MODULE_CACHE_RSS_GUARD_KIB,
@@ -589,9 +693,12 @@ struct ProjectActorState {
     handle: LeanWorkerHostHandle,
     worker_generation_base: u64,
     last_restart_reason: Option<String>,
+    last_restart_cause: Option<RestartCause>,
     last_import_fingerprint: Option<String>,
+    profile_switch_count: u64,
+    last_rss_kib: Option<u64>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
-    restart_times: VecDeque<Instant>,
+    abnormal_restart_times: VecDeque<Instant>,
 }
 
 impl ProjectActorState {
@@ -668,7 +775,7 @@ impl ProjectActorState {
     ) -> Result<ProjectCall<R>> {
         let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
         let generation_before = self.observed_generation();
-        self.cycle_before_import_switch_if_needed(&meta.import_fingerprint)?;
+        self.cycle_before_import_switch_if_needed(&meta)?;
         let mut lifecycle_baseline = self.handle.lifecycle_snapshot();
 
         let max_retries = meta.retry_policy.retries();
@@ -676,51 +783,78 @@ impl ProjectActorState {
         loop {
             match job(&mut self.handle, meta.imports.clone()) {
                 Ok(value) => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     self.last_import_fingerprint = Some(meta.import_fingerprint.clone());
+                    self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
                     let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
                     self.publish_runtime(&runtime);
                     return Ok(ProjectCall { value, runtime });
                 }
                 Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     let first_reason = err.to_string();
-                    self.rebuild_after_worker_death(first_reason)?;
+                    self.rebuild_after_worker_death(first_reason, worker_death_cause(&err), &meta)?;
                     lifecycle_baseline = self.handle.lifecycle_snapshot();
                     retry_count = retry_count.saturating_add(1);
                 }
                 Err(err) if worker_error_is_recoverable_death(&err) => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     let reason = format!("worker_died_after_retry: {err}");
                     let generation = self.observed_generation();
                     let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
                     self.publish_runtime(&runtime);
-                    return Err(self.worker_unavailable(reason, true, generation > generation_before));
+                    return Err(self.worker_unavailable_for(
+                        &meta,
+                        reason,
+                        true,
+                        generation > generation_before,
+                        Some(worker_death_cause(&err)),
+                        None,
+                        None,
+                    ));
+                }
+                Err(err) if worker_error_is_session_missing(&err) && retry_count < max_retries => {
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
+                    self.rebuild_after_worker_death(
+                        format!("session_missing: {err}"),
+                        RestartCause::SessionMissing,
+                        &meta,
+                    )?;
+                    lifecycle_baseline = self.handle.lifecycle_snapshot();
+                    retry_count = retry_count.saturating_add(1);
                 }
                 Err(err) if worker_error_is_session_missing(&err) => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     let generation = self.observed_generation();
                     let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
                     self.publish_runtime(&runtime);
-                    return Err(self.worker_unavailable(
+                    return Err(self.worker_unavailable_for(
+                        &meta,
                         format!("session_missing: {err}"),
                         true,
                         generation > generation_before,
+                        Some(RestartCause::SessionMissing),
+                        None,
+                        None,
                     ));
                 }
                 Err(err) if matches!(err, LeanWorkerError::Timeout { .. }) => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     let generation = self.observed_generation();
                     let runtime = self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis);
                     self.publish_runtime(&runtime);
-                    return Err(self.worker_unavailable(
+                    return Err(self.worker_unavailable_for(
+                        &meta,
                         format!("timeout: {err}"),
                         true,
                         generation > generation_before,
+                        Some(RestartCause::Timeout),
+                        None,
+                        None,
                     ));
                 }
                 Err(err) => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     self.last_import_fingerprint = Some(meta.import_fingerprint.clone());
                     return Err(map_worker_err(err));
                 }
@@ -728,69 +862,94 @@ impl ProjectActorState {
         }
     }
 
-    fn cycle_before_import_switch_if_needed(&mut self, import_fingerprint: &str) -> Result<()> {
-        if self.last_import_fingerprint.as_deref() == Some(import_fingerprint) {
+    fn cycle_before_import_switch_if_needed(&mut self, meta: &JobMeta) -> Result<()> {
+        let Some(previous_import_fingerprint) = self.last_import_fingerprint.as_deref() else {
+            return Ok(());
+        };
+        if previous_import_fingerprint == meta.import_fingerprint {
             return Ok(());
         }
+        self.profile_switch_count = self.profile_switch_count.saturating_add(1);
         let Some(current_kib) = self.handle.rss_kib() else {
             return Ok(());
         };
-        if current_kib < self.config.worker_rss_ceiling_kib {
+        self.last_rss_kib = Some(current_kib);
+        if current_kib < self.config.import_switch_rss_soft_kib {
             return Ok(());
         }
-        let reason = format!(
-            "rss_import_switch current_kib={current_kib} limit_kib={}",
+        let limit_kib = if current_kib >= self.config.worker_rss_ceiling_kib {
             self.config.worker_rss_ceiling_kib
-        );
-        self.record_restart_or_stop(&reason)?;
+        } else {
+            self.config.import_switch_rss_soft_kib
+        };
+        let reason = format!("rss_import_switch current_kib={current_kib} limit_kib={limit_kib}");
+        self.record_restart_or_stop(RestartCause::RssImportSwitch, &reason)
+            .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         self.handle.restart().map_err(map_worker_err)?;
         self.last_restart_reason = Some(reason);
+        self.last_restart_cause = Some(RestartCause::RssImportSwitch);
+        self.last_rss_kib = self.handle.rss_kib().or(Some(current_kib));
         Ok(())
     }
 
-    fn rebuild_after_worker_death(&mut self, reason: String) -> Result<()> {
-        self.record_restart_or_stop(&reason)?;
+    fn rebuild_after_worker_death(&mut self, reason: String, cause: RestartCause, meta: &JobMeta) -> Result<()> {
+        self.record_restart_or_stop(cause, &reason)
+            .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         let next_generation = self.observed_generation().saturating_add(1);
         let (handle, _) = open_worker(&self.config, false)?;
         self.handle = handle;
         self.worker_generation_base = next_generation;
         self.last_restart_reason = Some(reason);
+        self.last_restart_cause = Some(cause);
+        self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
         Ok(())
     }
 
-    fn account_lifecycle_restarts_since(&mut self, before: &LeanWorkerLifecycleSnapshot) -> Result<()> {
+    fn account_lifecycle_restarts_since(&mut self, before: &LeanWorkerLifecycleSnapshot, meta: &JobMeta) -> Result<()> {
         let after = self.handle.lifecycle_snapshot();
         let restarted = after.restarts.saturating_sub(before.restarts);
         if restarted == 0 {
+            self.last_rss_kib = after.last_rss_kib.or(self.last_rss_kib);
             return Ok(());
         }
-        let reason = after
-            .last_restart_reason
-            .as_ref()
-            .map_or_else(|| "worker_internal_restart".to_owned(), |reason| format!("{reason:?}"));
+        let (cause, reason) = after.last_restart_reason.as_ref().map_or_else(
+            || (RestartCause::WorkerInternal, "worker_internal_restart".to_owned()),
+            |reason| (restart_cause_from_worker(reason), restart_reason_text(reason)),
+        );
         for _ in 0..restarted {
-            self.record_restart_or_stop(&reason)?;
+            self.record_restart_or_stop(cause, &reason)
+                .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         }
         self.last_restart_reason = Some(reason);
+        self.last_restart_cause = Some(cause);
+        self.last_rss_kib = after.last_rss_kib.or(self.last_rss_kib);
         Ok(())
     }
 
-    fn record_restart_or_stop(&mut self, reason: &str) -> Result<()> {
+    fn record_restart_or_stop(
+        &mut self,
+        cause: RestartCause,
+        reason: &str,
+    ) -> std::result::Result<(), RestartLimitExceeded> {
+        if !cause.counts_toward_restart_limit() {
+            return Ok(());
+        }
         let now = Instant::now();
         while self
-            .restart_times
+            .abnormal_restart_times
             .front()
             .is_some_and(|seen| now.saturating_duration_since(*seen) > self.config.restart_window)
         {
-            self.restart_times.pop_front();
+            self.abnormal_restart_times.pop_front();
         }
-        if self.restart_times.len() >= self.config.max_restarts_per_window {
+        if self.abnormal_restart_times.len() >= self.config.max_restarts_per_window {
             self.config.healthy.store(false, Ordering::Release);
             let message = format!(
                 "restart_limit_exceeded after {} restarts in {:?}; latest: {reason}",
                 self.config.max_restarts_per_window, self.config.restart_window
             );
             self.last_restart_reason = Some(message.clone());
+            self.last_restart_cause = Some(cause);
             self.publish_runtime(&RuntimeFacts {
                 worker_generation: self.observed_generation(),
                 worker_restarted: false,
@@ -798,10 +957,20 @@ impl ProjectActorState {
                 admission_wait_millis: 0,
                 queue_wait_millis: 0,
                 restart_reason: Some(message.clone()),
+                restart_cause: Some(cause.as_str().to_owned()),
+                rss_kib: self.last_rss_kib,
+                worker_lanes: 1,
+                import_profile: self.last_import_fingerprint.clone(),
+                profile_switch_count: self.profile_switch_count,
             });
-            return Err(self.worker_unavailable(message, false, false));
+            return Err(RestartLimitExceeded {
+                message,
+                cause,
+                restarts_in_window: self.abnormal_restart_times.len() as u64,
+                window_millis: millis_u64(self.config.restart_window),
+            });
         }
-        self.restart_times.push_back(now);
+        self.abnormal_restart_times.push_back(now);
         Ok(())
     }
 
@@ -818,13 +987,21 @@ impl ProjectActorState {
         queue_wait_millis: u64,
     ) -> RuntimeFacts {
         let generation = self.observed_generation();
+        let snapshot = self.handle.lifecycle_snapshot();
         let restart_reason = self
-            .handle
-            .lifecycle_snapshot()
             .last_restart_reason
-            .as_ref()
-            .map(|reason| format!("{reason:?}"))
-            .or_else(|| self.last_restart_reason.clone());
+            .clone()
+            .or_else(|| snapshot.last_restart_reason.as_ref().map(restart_reason_text));
+        let restart_cause = self
+            .last_restart_cause
+            .map(|cause| cause.as_str().to_owned())
+            .or_else(|| {
+                snapshot
+                    .last_restart_reason
+                    .as_ref()
+                    .map(restart_cause_from_worker)
+                    .map(|cause| cause.as_str().to_owned())
+            });
         RuntimeFacts {
             worker_generation: generation,
             worker_restarted: generation > generation_before,
@@ -832,6 +1009,11 @@ impl ProjectActorState {
             admission_wait_millis: meta.admission_wait_millis,
             queue_wait_millis,
             restart_reason,
+            restart_cause,
+            rss_kib: snapshot.last_rss_kib.or(self.last_rss_kib),
+            worker_lanes: 1,
+            import_profile: Some(meta.import_fingerprint.clone()),
+            profile_switch_count: self.profile_switch_count,
         }
     }
 
@@ -839,19 +1021,72 @@ impl ProjectActorState {
         *self.runtime.lock() = RuntimeSnapshot {
             worker_generation: runtime.worker_generation,
             restart_reason: runtime.restart_reason.clone(),
+            restart_cause: runtime.restart_cause.clone(),
+            rss_kib: runtime.rss_kib,
+            import_profile: runtime.import_profile.clone(),
+            profile_switch_count: runtime.profile_switch_count,
         };
     }
 
-    fn worker_unavailable(&self, reason: String, retryable: bool, worker_restarted: bool) -> ServerError {
-        ServerError::WorkerUnavailable(WorkerUnavailable {
+    fn worker_unavailable_for(
+        &self,
+        meta: &JobMeta,
+        reason: String,
+        retryable: bool,
+        worker_restarted: bool,
+        cause: Option<RestartCause>,
+        limit_kib: Option<u64>,
+        retry_after_millis: Option<u64>,
+    ) -> ServerError {
+        let snapshot = self.runtime.lock().facts();
+        ServerError::worker_unavailable(WorkerUnavailable {
             retryable,
             worker_restarted,
             project_root: self.config.lake_root.to_string_lossy().into_owned(),
+            project_hash: self.config.manifest_hash.clone(),
+            imports: meta.imports.clone(),
             session_id: self.config.session_id.clone(),
+            lean_toolchain: self.config.toolchain_label.clone(),
             worker_generation: self.observed_generation(),
+            restart_cause: cause.map(|cause| cause.as_str().to_owned()),
+            rss_kib: self.last_rss_kib,
+            limit_kib,
+            retry_after_millis,
+            restarts_in_window: Some(self.abnormal_restart_times.len() as u64),
+            window_millis: Some(millis_u64(self.config.restart_window)),
+            runtime: snapshot,
             reason,
         })
     }
+
+    fn restart_limit_error(&self, imports: &[String], limit: RestartLimitExceeded) -> ServerError {
+        let snapshot = self.runtime.lock().facts();
+        ServerError::worker_unavailable(WorkerUnavailable {
+            retryable: false,
+            worker_restarted: false,
+            project_root: self.config.lake_root.to_string_lossy().into_owned(),
+            project_hash: self.config.manifest_hash.clone(),
+            imports: imports.to_vec(),
+            session_id: self.config.session_id.clone(),
+            lean_toolchain: self.config.toolchain_label.clone(),
+            worker_generation: self.observed_generation(),
+            reason: limit.message,
+            restart_cause: Some(limit.cause.as_str().to_owned()),
+            rss_kib: self.last_rss_kib,
+            limit_kib: None,
+            retry_after_millis: Some(limit.window_millis),
+            restarts_in_window: Some(limit.restarts_in_window),
+            window_millis: Some(limit.window_millis),
+            runtime: snapshot,
+        })
+    }
+}
+
+struct RestartLimitExceeded {
+    message: String,
+    cause: RestartCause,
+    restarts_in_window: u64,
+    window_millis: u64,
 }
 
 fn actor_main(
@@ -870,9 +1105,12 @@ fn actor_main(
         handle,
         worker_generation_base: 1,
         last_restart_reason: None,
+        last_restart_cause: None,
         last_import_fingerprint: None,
+        profile_switch_count: 0,
+        last_rss_kib: None,
         runtime: Arc::clone(&config.runtime),
-        restart_times: VecDeque::new(),
+        abnormal_restart_times: VecDeque::new(),
     };
 
     let (tx, mut rx) = mpsc::channel::<ProjectMessage>(config.mailbox_capacity);
@@ -937,6 +1175,43 @@ fn worker_error_is_session_missing(err: &LeanWorkerError) -> bool {
     matches!(err, LeanWorkerError::Worker { code, .. } if code == "lean_rs.worker.session_missing")
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only worker process death variants are restart causes; all other errors are classified elsewhere"
+)]
+fn worker_death_cause(err: &LeanWorkerError) -> RestartCause {
+    match err {
+        LeanWorkerError::ChildPanicOrAbort { .. } => RestartCause::ChildAbort,
+        LeanWorkerError::ChildExited { .. } => RestartCause::ChildExit,
+        _ => RestartCause::WorkerInternal,
+    }
+}
+
+fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
+    match reason {
+        LeanWorkerRestartReason::Explicit => RestartCause::Explicit.as_str().to_owned(),
+        LeanWorkerRestartReason::MaxRequests { limit } => format!("max_requests limit={limit}"),
+        LeanWorkerRestartReason::MaxImports { limit } => format!("max_imports limit={limit}"),
+        LeanWorkerRestartReason::RssCeiling { current_kib, limit_kib } => {
+            format!("rss_ceiling current_kib={current_kib} limit_kib={limit_kib}")
+        }
+        LeanWorkerRestartReason::Idle { idle_for, limit } => {
+            format!(
+                "idle idle_for_millis={} limit_millis={}",
+                millis_u64(*idle_for),
+                millis_u64(*limit)
+            )
+        }
+        LeanWorkerRestartReason::Cancelled { operation } => format!("cancelled operation={operation}"),
+        LeanWorkerRestartReason::RequestTimeout { operation, duration } => {
+            format!(
+                "timeout operation={operation} duration_millis={}",
+                millis_u64(*duration)
+            )
+        }
+    }
+}
+
 fn import_fingerprint(imports: &[String]) -> String {
     imports.join("\n")
 }
@@ -995,5 +1270,44 @@ mod tests {
         let _held = admission.acquire().await.expect("initial permit");
 
         assert_eq!(admission.acquire().await.unwrap_err(), AdmissionError::Timeout);
+    }
+
+    #[test]
+    fn planned_restart_causes_do_not_consume_abnormal_restart_budget() {
+        assert!(!RestartCause::RssImportSwitch.counts_toward_restart_limit());
+        assert!(!RestartCause::MaxRequests.counts_toward_restart_limit());
+        assert!(!RestartCause::MaxImports.counts_toward_restart_limit());
+        assert!(!RestartCause::RssCeiling.counts_toward_restart_limit());
+        assert!(!RestartCause::Idle.counts_toward_restart_limit());
+
+        assert!(RestartCause::ChildExit.counts_toward_restart_limit());
+        assert!(RestartCause::ChildAbort.counts_toward_restart_limit());
+        assert!(RestartCause::Timeout.counts_toward_restart_limit());
+        assert!(RestartCause::Cancelled.counts_toward_restart_limit());
+        assert!(RestartCause::SessionMissing.counts_toward_restart_limit());
+    }
+
+    #[test]
+    fn worker_restart_reason_maps_to_stable_cause() {
+        assert_eq!(
+            restart_cause_from_worker(&LeanWorkerRestartReason::MaxRequests { limit: 1 }).as_str(),
+            "max_requests"
+        );
+        assert_eq!(
+            restart_cause_from_worker(&LeanWorkerRestartReason::RssCeiling {
+                current_kib: 2,
+                limit_kib: 1,
+            })
+            .as_str(),
+            "rss_ceiling"
+        );
+        assert_eq!(
+            restart_cause_from_worker(&LeanWorkerRestartReason::RequestTimeout {
+                operation: "test",
+                duration: Duration::from_millis(1),
+            })
+            .as_str(),
+            "timeout"
+        );
     }
 }

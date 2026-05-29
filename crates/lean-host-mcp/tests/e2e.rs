@@ -95,7 +95,10 @@ async fn inspect_proof_state_try_verify_and_references() {
     )
     .await
     .expect("inspect declaration");
-    assert!(matches!(inspected.result, DeclarationInspectionResult::Found { .. }));
+    assert!(matches!(
+        inspected.result.expect("inspect result"),
+        DeclarationInspectionResult::Found { .. }
+    ));
 
     let proof = proof_state(
         &ctx,
@@ -113,7 +116,7 @@ async fn inspect_proof_state_try_verify_and_references() {
         goals_after,
         query_facts,
         ..
-    } = proof.result
+    } = proof.result.expect("proof result")
     else {
         panic!("expected proof context");
     };
@@ -138,7 +141,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     )
     .await
     .expect("warm proof_state");
-    let ProofStateResult::Context { query_facts, .. } = warm.result else {
+    let ProofStateResult::Context { query_facts, .. } = warm.result.expect("warm proof result") else {
         panic!("expected warm proof context");
     };
     assert_eq!(query_facts.cache_status, "hit");
@@ -160,7 +163,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     )
     .await
     .expect("bad proof attempt");
-    let ProofAttemptResult::Ok { result, .. } = bad.result else {
+    let ProofAttemptResult::Ok { result, .. } = bad.result.expect("proof attempt result") else {
         panic!("proof attempt should return ok envelope");
     };
     assert_eq!(result.candidates.len(), 1);
@@ -192,7 +195,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     .await
     .expect("verify closed theorem");
     assert!(matches!(
-        verified.result,
+        verified.result.expect("verification result"),
         DeclarationVerificationResult::Ok {
             verification_status,
             ..
@@ -215,7 +218,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     .await
     .expect("verify sorry theorem");
     assert!(matches!(
-        sorry.result,
+        sorry.result.expect("sorry verification result"),
         DeclarationVerificationResult::Ok {
             verification_status,
             facts,
@@ -236,7 +239,7 @@ async fn inspect_proof_state_try_verify_and_references() {
     )
     .await
     .expect("find references");
-    let FindReferencesResult::Ok { references, .. } = refs.result else {
+    let FindReferencesResult::Ok { references, .. } = refs.result.expect("references result") else {
         panic!("references should succeed");
     };
     assert!(
@@ -270,11 +273,17 @@ async fn search_for_proof_prefers_relevant_fixture_lemmas() {
     .await
     .expect("search_for_proof");
     assert!(
-        response.result.candidates.iter().any(|candidate| {
-            candidate.name.contains("Rat") && (candidate.name.contains("num") || candidate.name.contains("den"))
-        }),
+        response
+            .result
+            .as_ref()
+            .expect("search result")
+            .candidates
+            .iter()
+            .any(|candidate| {
+                candidate.name.contains("Rat") && (candidate.name.contains("num") || candidate.name.contains("den"))
+            }),
         "fixture arithmetic search should surface Rat num/den structure above generic noise: {:?}",
-        response.result.candidates
+        response.result.as_ref().expect("search result").candidates
     );
 }
 

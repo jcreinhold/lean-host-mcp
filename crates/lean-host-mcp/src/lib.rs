@@ -38,7 +38,7 @@ pub mod toolchain;
 pub mod tools;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
-pub use envelope::{Freshness, Response, RuntimeFacts};
+pub use envelope::{Freshness, Response, ResponseStatus, RuntimeFacts, RuntimeFailure};
 pub use error::{Result, ServerError};
 pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};
 pub use lake_meta::LakeProjectMeta;

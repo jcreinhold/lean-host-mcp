@@ -690,13 +690,23 @@ impl ProjectBroker {
                 inner.opening_locks.remove(&root);
                 drop(inner);
                 opened.shutdown();
-                return Err(ServerError::WorkerUnavailable(crate::error::WorkerUnavailable {
+                return Err(ServerError::worker_unavailable(crate::error::WorkerUnavailable {
                     retryable: true,
                     worker_restarted: false,
                     project_root: root.to_string_lossy().into_owned(),
+                    project_hash: String::new(),
+                    imports: Vec::new(),
                     session_id: String::new(),
+                    lean_toolchain: String::new(),
                     worker_generation: 0,
                     reason: "project_pool_busy_all_entries_active".to_owned(),
+                    restart_cause: None,
+                    rss_kib: None,
+                    limit_kib: None,
+                    retry_after_millis: None,
+                    restarts_in_window: None,
+                    window_millis: None,
+                    runtime: crate::envelope::RuntimeFacts::default(),
                 }));
             }
             if let Some((ref evicted_path, _)) = victim {

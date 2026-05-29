@@ -192,7 +192,15 @@ pub async fn inspect_declaration(
         .broker
         .inspect_declaration(hint, session_imports(imports.clone()), imports, request)
         .await?;
-    Ok(Response::ok(project_declaration_inspection(call.value), call.freshness).with_runtime(call.runtime))
+    let projected = project_declaration_inspection(call.value);
+    let bare_name_without_context = req.file.is_none() && req.imports.is_empty();
+    let mut response = Response::ok(projected.clone(), call.freshness).with_runtime(call.runtime);
+    if bare_name_without_context && matches!(projected, DeclarationInspectionResult::NotFound { .. }) {
+        response = response.hint(
+            "bare-name inspection only sees the opened import profile; pass `file` or explicit `imports` for Mathlib/project declarations",
+        );
+    }
+    Ok(response)
 }
 
 fn budgets_for(req: &InspectDeclarationRequest) -> LeanWorkerOutputBudgets {

@@ -80,6 +80,7 @@ Environment vars:
 | `LEAN_HOST_MCP_SEMANTIC_WAITERS` | Process-wide capacity for callers waiting on semantic-work admission. Full admission returns retryable `semantic_admission_full`. | `16` |
 | `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | Maximum wait for semantic-work admission. Timeout returns retryable `semantic_admission_timeout`. | `60000` |
 | `LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB` | Worker RSS ceiling used by project-level import-profile cycling. | `3145728` |
+| `LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB` | RSS threshold for preemptively cycling a worker before switching to a different import profile. Planned cycles do not count toward crash-loop restart limits. | `2097152` |
 | `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Worker module-snapshot cache RSS guard. | `2097152` |
 | `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Worker module-snapshot cache byte cap. | `33554432` |
 | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | Bounded per-project semantic mailbox capacity. Full mailboxes return retryable `busy`. | `8` |
@@ -105,11 +106,14 @@ do not need to set `LEAN_SYSROOT` in the MCP client config.
 
 ## Response envelope
 
-Every tool returns the same outer shape; only `result` varies.
+Every tool returns the same outer shape; `result` is tool-specific and `runtime_error` is populated only for recoverable
+runtime failures.
 
 ```jsonc
 {
+  "status": "ok",                    // or "runtime_unavailable"
   "result":   { /* tool-specific */ },
+  "runtime_error": null,              // populated when status is "runtime_unavailable"
   "freshness": {
     "project_root":   "/abs/path",
     "project_hash":   "sha256-hex of lake-manifest.json",
@@ -121,11 +125,44 @@ Every tool returns the same outer shape; only `result` varies.
     "worker_generation": 1,
     "worker_restarted": false,
     "retry_count": 0,
+    "admission_wait_millis": 0,
     "queue_wait_millis": 0,
-    "restart_reason": null
+    "restart_reason": null,
+    "restart_cause": null,
+    "rss_kib": null,
+    "worker_lanes": 1,
+    "import_profile": "Init\nProject.Module",
+    "profile_switch_count": 0
   },
   "warnings":     ["..."],     // omitted when empty
   "next_actions": ["..."]      // omitted when empty
+}
+```
+
+Recoverable runtime/actor failures are normal tool responses, not JSON-RPC errors:
+
+```jsonc
+{
+  "status": "runtime_unavailable",
+  "result": null,
+  "runtime_error": {
+    "reason": "semantic_admission_timeout",
+    "retryable": true,
+    "project_root": "/abs/path",
+    "session_id": "uuid",
+    "worker_generation": 3,
+    "worker_restarted": false,
+    "restart_cause": null,
+    "rss_kib": 2097152,
+    "limit_kib": null,
+    "retry_after_millis": 60000,
+    "restarts_in_window": 1,
+    "window_millis": 60000
+  },
+  "freshness": { /* same shape as above */ },
+  "runtime": { /* best-known runtime facts */ },
+  "warnings": [],
+  "next_actions": []
 }
 ```
 
@@ -134,10 +171,11 @@ tools and file-header imports for module-query tools. An empty array means the c
 worker's base environment.
 
 `runtime` is attached to semantic tool calls. It reports the current worker generation, whether the call recovered from
-a worker restart, retry count, queue wait time, and the last restart reason when known. Lean-domain failures (parse,
-elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors. MCP errors are reserved for
-infrastructure failures: the bounded project mailbox is full, the worker cannot be restarted, the runtime failed to
-initialise, or the Lake project is unusable.
+a worker restart, retry count, admission wait, actor queue wait, RSS when available, the import profile, profile-switch
+count, and the last stable restart cause when known. Lean-domain failures (parse, elaboration, kernel rejection, meta
+timeout) are part of the `ok` payload. Retryable runtime failures such as admission pressure, mailbox pressure, worker
+death, or session loss are `runtime_unavailable` responses. MCP errors are reserved for invalid requests, I/O/config
+failures, internal invariants, and unusable Lake projects.
 
 ## Capability shims and proof-agent module queries
 

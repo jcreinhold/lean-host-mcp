@@ -16,6 +16,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 
 use crate::broker::ProjectBroker;
 use crate::envelope::Response;
+use crate::error::ServerError;
 use crate::tools::{self, ToolContext};
 
 // Deliberately not `use crate::error::Result;` here: the `#[tool_handler]`
@@ -118,5 +119,77 @@ fn wrap<T>(result: crate::error::Result<Response<T>>) -> std::result::Result<Jso
 where
     T: serde::Serialize + schemars::JsonSchema,
 {
-    result.map(Json).map_err(McpError::from)
+    match result {
+        Ok(response) => Ok(Json(response)),
+        Err(ServerError::WorkerUnavailable(info)) => {
+            let freshness = info.freshness();
+            let failure = info.failure();
+            Ok(Json(Response::runtime_unavailable(
+                failure,
+                freshness,
+                info.runtime.clone(),
+            )))
+        }
+        Err(err) => Err(McpError::from(err)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::envelope::RuntimeFacts;
+    use crate::error::{ServerError, WorkerUnavailable};
+
+    #[test]
+    fn worker_unavailable_is_a_structured_tool_response() {
+        let runtime = RuntimeFacts {
+            worker_generation: 7,
+            retry_count: 1,
+            restart_cause: Some("child_exit".to_owned()),
+            worker_lanes: 1,
+            ..RuntimeFacts::default()
+        };
+        let response = wrap::<serde_json::Value>(Err(ServerError::worker_unavailable(WorkerUnavailable {
+            retryable: true,
+            worker_restarted: true,
+            project_root: "/tmp/project".to_owned(),
+            project_hash: "hash".to_owned(),
+            imports: vec!["Init".to_owned()],
+            session_id: "session".to_owned(),
+            lean_toolchain: "leanprover/lean4:v4.30.0".to_owned(),
+            worker_generation: 7,
+            reason: "worker_death".to_owned(),
+            restart_cause: Some("child_exit".to_owned()),
+            rss_kib: Some(42),
+            limit_kib: Some(100),
+            retry_after_millis: None,
+            restarts_in_window: Some(1),
+            window_millis: Some(60_000),
+            runtime,
+        })))
+        .unwrap()
+        .0;
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            json.pointer("/status").and_then(serde_json::Value::as_str),
+            Some("runtime_unavailable")
+        );
+        assert!(json.pointer("/result").is_none_or(serde_json::Value::is_null));
+        assert_eq!(
+            json.pointer("/runtime_error/retryable")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            json.pointer("/runtime_error/restart_cause")
+                .and_then(serde_json::Value::as_str),
+            Some("child_exit")
+        );
+        assert_eq!(
+            json.pointer("/runtime/retry_count").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
 }

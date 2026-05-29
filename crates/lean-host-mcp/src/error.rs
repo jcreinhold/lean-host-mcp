@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
+use crate::envelope::{Freshness, RuntimeFacts, RuntimeFailure};
 use lean_rs_worker_parent::LeanWorkerError;
 
 #[derive(Debug, Clone, Serialize, JsonSchema, thiserror::Error)]
@@ -20,9 +21,48 @@ pub struct WorkerUnavailable {
     pub retryable: bool,
     pub worker_restarted: bool,
     pub project_root: String,
+    pub project_hash: String,
+    pub imports: Vec<String>,
     pub session_id: String,
+    pub lean_toolchain: String,
     pub worker_generation: u64,
     pub reason: String,
+    pub restart_cause: Option<String>,
+    pub rss_kib: Option<u64>,
+    pub limit_kib: Option<u64>,
+    pub retry_after_millis: Option<u64>,
+    pub restarts_in_window: Option<u64>,
+    pub window_millis: Option<u64>,
+    pub runtime: RuntimeFacts,
+}
+
+impl WorkerUnavailable {
+    pub(crate) fn freshness(&self) -> Freshness {
+        Freshness {
+            project_root: self.project_root.clone(),
+            project_hash: self.project_hash.clone(),
+            imports: self.imports.clone(),
+            session_id: self.session_id.clone(),
+            lean_toolchain: self.lean_toolchain.clone(),
+        }
+    }
+
+    pub(crate) fn failure(&self) -> RuntimeFailure {
+        RuntimeFailure {
+            reason: self.reason.clone(),
+            retryable: self.retryable,
+            project_root: self.project_root.clone(),
+            session_id: self.session_id.clone(),
+            worker_generation: self.worker_generation,
+            worker_restarted: self.worker_restarted,
+            restart_cause: self.restart_cause.clone(),
+            rss_kib: self.rss_kib,
+            limit_kib: self.limit_kib,
+            retry_after_millis: self.retry_after_millis,
+            restarts_in_window: self.restarts_in_window,
+            window_millis: self.window_millis,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,8 +73,8 @@ pub enum ServerError {
     #[error("session thread is gone")]
     SessionGone,
 
-    #[error(transparent)]
-    WorkerUnavailable(WorkerUnavailable),
+    #[error("{0}")]
+    WorkerUnavailable(Box<WorkerUnavailable>),
 
     #[error("lake project not usable: {0}")]
     BadProject(String),
@@ -51,21 +91,37 @@ pub enum ServerError {
 
 pub type Result<T> = std::result::Result<T, ServerError>;
 
+impl ServerError {
+    pub(crate) fn worker_unavailable(info: WorkerUnavailable) -> Self {
+        Self::WorkerUnavailable(Box::new(info))
+    }
+}
+
 impl From<ServerError> for McpError {
     fn from(err: ServerError) -> Self {
         // -32603 == internal error in JSON-RPC. The MCP spec leaves wider
         // codes available but most clients only branch on this band.
         match err {
             ServerError::WorkerUnavailable(info) => {
+                let message = info.to_string();
                 let data = json!({
                     "retryable": info.retryable,
                     "worker_restarted": info.worker_restarted,
-                    "project_root": info.project_root,
-                    "session_id": info.session_id,
+                    "project_root": &info.project_root,
+                    "project_hash": &info.project_hash,
+                    "imports": &info.imports,
+                    "session_id": &info.session_id,
+                    "lean_toolchain": &info.lean_toolchain,
                     "worker_generation": info.worker_generation,
-                    "reason": info.reason,
+                    "reason": &info.reason,
+                    "restart_cause": &info.restart_cause,
+                    "rss_kib": info.rss_kib,
+                    "limit_kib": info.limit_kib,
+                    "retry_after_millis": info.retry_after_millis,
+                    "restarts_in_window": info.restarts_in_window,
+                    "window_millis": info.window_millis,
                 });
-                Self::internal_error(info.to_string(), Some(data))
+                Self::internal_error(message, Some(data))
             }
             other @ (ServerError::Lean(_)
             | ServerError::SessionGone

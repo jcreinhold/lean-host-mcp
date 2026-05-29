@@ -4,7 +4,9 @@
 //!
 //! ```jsonc
 //! {
-//!   "result":   { /* tool-specific */ },
+//!   "status": "ok",
+//!   "result":   { /* tool-specific; null for runtime_unavailable */ },
+//!   "runtime_error": null,
 //!   "freshness": {
 //!     "project_root":   "/abs/path",
 //!     "project_hash":   "sha256-hex",
@@ -54,6 +56,43 @@ pub struct RuntimeFacts {
     pub queue_wait_millis: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_cause: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_kib: Option<u64>,
+    pub worker_lanes: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_profile: Option<String>,
+    pub profile_switch_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStatus {
+    Ok,
+    RuntimeUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeFailure {
+    pub reason: String,
+    pub retryable: bool,
+    pub project_root: String,
+    pub session_id: String,
+    pub worker_generation: u64,
+    pub worker_restarted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_cause: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_kib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_kib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarts_in_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -61,7 +100,9 @@ pub struct Response<T>
 where
     T: Serialize + JsonSchema,
 {
-    pub result: T,
+    pub status: ResponseStatus,
+    pub result: Option<T>,
+    pub runtime_error: Option<RuntimeFailure>,
     pub freshness: Freshness,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeFacts>,
@@ -77,12 +118,30 @@ where
 {
     pub fn ok(result: T, freshness: Freshness) -> Self {
         Self {
-            result,
+            status: ResponseStatus::Ok,
+            result: Some(result),
+            runtime_error: None,
             freshness,
             runtime: None,
             warnings: Vec::new(),
             next_actions: Vec::new(),
         }
+    }
+
+    pub fn runtime_unavailable(failure: RuntimeFailure, freshness: Freshness, runtime: RuntimeFacts) -> Self {
+        Self {
+            status: ResponseStatus::RuntimeUnavailable,
+            result: None,
+            runtime_error: Some(failure),
+            freshness,
+            runtime: Some(runtime),
+            warnings: Vec::new(),
+            next_actions: Vec::new(),
+        }
+    }
+
+    pub fn result_ref(&self) -> Option<&T> {
+        self.result.as_ref()
     }
 
     #[must_use]
