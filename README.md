@@ -60,6 +60,38 @@ lake build && lean-host-mcp
 lean-host-mcp --lake-root /path/to/your/lake/project
 ```
 
+## Transports
+
+`lean-host-mcp` serves exactly one transport per process.
+
+Stdio is the default and is the right choice for clients that launch an MCP server with a `command`:
+
+```sh
+lean-host-mcp --lake-root /path/to/your/lake/project
+```
+
+Streamable HTTP is selected by `--bind` or `LEAN_HOST_MCP_BIND`:
+
+```sh
+lean-host-mcp serve --lake-root /path/to/your/lake/project --bind 127.0.0.1:8765
+```
+
+The default HTTP route is `/mcp`; override it with `--http-path /some-path` or `LEAN_HOST_MCP_HTTP_PATH`. `--http-path`
+requires `--bind`; it never switches transports by itself. HTTP binds are loopback-only for now (`127.0.0.1` or `::1`).
+The server has no built-in authentication or TLS, so non-loopback addresses are rejected rather than merely discouraged.
+
+Example Streamable HTTP client configuration for clients that accept a URL:
+
+```jsonc
+{
+  "mcpServers": {
+    "lean-host": {
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
 Project resolution chain (used by every tool call that does not pass its own `project="..."` argument):
 
 1. `LEAN_HOST_MCP_PROJECT` (or `--lake-root`)
@@ -74,6 +106,8 @@ Environment vars:
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `LEAN_HOST_MCP_PROJECT` | Default Lake root for calls without a `project=` argument. | unset |
+| `LEAN_HOST_MCP_BIND` | Loopback `ADDR:PORT` for Streamable HTTP. When unset, stdio is used. | unset |
+| `LEAN_HOST_MCP_HTTP_PATH` | Streamable HTTP route. Only valid when `LEAN_HOST_MCP_BIND` or `--bind` is set. | `/mcp` |
 | `LEAN_HOST_MCP_MAX_PROJECTS` | Max project runtimes kept resident; oldest idle runtime is evicted on overflow. | `4` |
 | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Window after which an unused project is reaped. `0` disables. | `600` |
 | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | Process-wide permits for heavy Lean semantic work. `1` serializes cross-project calls for daily-driver robustness. | `1` |

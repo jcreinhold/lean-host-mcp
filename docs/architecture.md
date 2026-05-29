@@ -16,7 +16,8 @@ low-level term/meta primitives are not part of the public MCP surface.
 ## Crate Layout
 
 ```
-main.rs         clap CLI, rmcp stdio entry
+main.rs         clap CLI, shared broker setup, rmcp stdio entry
+transport_http.rs private axum/rmcp Streamable HTTP entry
 server.rs       LeanHostService tool registration
 tools/          declaration.rs, proof_search.rs, proof_action.rs, position.rs
 project.rs      LeanProject worker actor for one Lake project
@@ -29,6 +30,23 @@ bin/worker.rs   entry point for lean_rs_worker_child::run_worker_child_stdio()
 
 `server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when needed,
 and send one typed read-only semantic job to the project worker actor.
+
+## Transport Boundary
+
+The transport seam is above `LeanHostService`. Stdio and Streamable HTTP both construct the same service over the same
+`ProjectBroker`; neither transport owns Lean sessions, project caches, admission policy, restart policy, or tool
+schemas. `transport_http.rs` contains the axum and rmcp Streamable HTTP session wiring so HTTP request types do not
+reach the tool, broker, or project-runtime layers.
+
+Stdio remains the default process model: one client launches one server and EOF ends the process. `--bind` selects a
+single Streamable HTTP server for that run. HTTP sessions are independent rmcp sessions, but the cloned
+`LeanHostService` values share one broker, so all sessions still obey the same per-project FIFO actor, process-wide
+semantic permit gate, bounded mailbox, RSS policy, and worker restart semantics.
+
+Runtime pressure is not a transport error. Admission pressure, mailbox pressure, worker death, session loss, and
+restart recovery continue to surface through the normal tool response envelope as `status = "runtime_unavailable"` with
+structured runtime metadata. HTTP status codes are reserved for transport/protocol failures such as invalid headers or
+bad HTTP paths.
 
 ## Project And Worker Boundary
 
@@ -53,8 +71,9 @@ Lean-domain results from infrastructure recovery and lifecycle history.
 
 Each semantic tool opens a short-lived worker session with imports derived from the source header or explicit request.
 Lean-domain failures such as parse errors, elaboration diagnostics, missing imports, unsupported shim exports, failed
-proof snippets, and sorry policy failures are structured tool results. MCP errors are reserved for infrastructure
-failures such as a full mailbox, restart-loop exhaustion, or a project that cannot start.
+proof snippets, and sorry policy failures are structured tool results. Recoverable runtime failures are
+`runtime_unavailable` tool responses. MCP errors are reserved for invalid requests, I/O/config failures, internal
+invariants, and unusable Lake projects.
 
 ## Declaration-Centric Proof API
 

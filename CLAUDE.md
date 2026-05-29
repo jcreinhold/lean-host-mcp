@@ -37,6 +37,7 @@ cargo build --release -p lean-host-mcp-worker           # release worker (links 
 cargo clippy --workspace --all-targets -- -D warnings   # lints; --workspace is safe (clippy doesn't link)
 cargo test -p lean-host-mcp                             # parent tests (no Lean fixture required)
 cargo test -p lean-host-mcp <name>                      # single test by name substring
+cargo test -p lean-host-mcp --test http_transport       # black-box Streamable HTTP transport tests
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
     cargo test -p lean-host-mcp --test e2e --test worker -- --ignored   # opt-in E2E + worker integration
 cargo bench -p lean-host-mcp --bench worker_roundtrip                   # gated on LEAN_HOST_MCP_BENCH_FIXTURE
@@ -85,7 +86,18 @@ suite uses; it isn't a template consumers must mirror. Then point the server at 
 ./target/release/lean-host-mcp --lake-root /path/to/lake/project
 ```
 
-`LEAN_HOST_MCP_{PROJECT,CACHE_DIR}` provide the corresponding environment overrides.
+`LEAN_HOST_MCP_PROJECT` provides the corresponding project override.
+
+Stdio is the default transport. `--bind 127.0.0.1:PORT` (or `LEAN_HOST_MCP_BIND`) selects Streamable HTTP instead, with
+`/mcp` as the default route. `--http-path` only applies with `--bind`; non-loopback binds are rejected because the HTTP
+server has no built-in authentication or TLS.
+
+```sh
+cargo run -p lean-host-mcp -- serve --lake-root /path/to/lake/project --bind 127.0.0.1:8765
+```
+
+The parent crate enables rmcp's `transport-streamable-http-server` feature and hosts it through axum. Keep that HTTP
+wiring inside the binary transport module; `LeanHostService`, `ProjectBroker`, and tools must remain transport-agnostic.
 
 ## Architecture: closure-channel actor over a worker child
 

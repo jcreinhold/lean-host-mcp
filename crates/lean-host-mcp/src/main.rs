@@ -1,14 +1,19 @@
 //! `lean-host-mcp`—Model Context Protocol server hosting Lean 4 via a
 //! supervised [`lean-rs-worker`] child.
 //!
-//! Stdio transport. Wire into Claude Code / any MCP client by pointing the
-//! `command` at the built binary. With a Lake project visible from the
-//! invocation directory (or one set via `LEAN_HOST_MCP_PROJECT` /
-//! `~/.config/lean-host-mcp/config.toml`), no flags are required.
+//! Stdio is the default transport. `--bind` selects Streamable HTTP. With a
+//! Lake project visible from the invocation directory (or one set via
+//! `LEAN_HOST_MCP_PROJECT` / `~/.config/lean-host-mcp/config.toml`), no
+//! project flags are required.
 
+mod transport_http;
+
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -47,7 +52,18 @@ struct ServeArgs {
     /// arguments always win.
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
+
+    /// Loopback address for Streamable HTTP, e.g. 127.0.0.1:8765.
+    /// If omitted, the server uses stdio.
+    #[arg(long, env = "LEAN_HOST_MCP_BIND")]
+    bind: Option<SocketAddr>,
+
+    /// HTTP route for Streamable HTTP. Requires --bind.
+    #[arg(long, env = "LEAN_HOST_MCP_HTTP_PATH")]
+    http_path: Option<String>,
 }
+
+const DEFAULT_HTTP_PATH: &str = "/mcp";
 
 fn main() -> ExitCode {
     init_tracing();
@@ -93,12 +109,16 @@ fn init_tracing() {
 
 #[allow(clippy::significant_drop_tightening)]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let http = http_config(&args)?;
     let env_default = args.lake_root;
     let config_default = read_config_default();
     let cwd = std::env::current_dir()?;
     let (max_projects, idle_timeout, semantic_permits, semantic_waiters, semantic_admission_timeout) =
         BrokerConfig::pool_from_env()?;
     let runtime_config = ProjectRuntimeConfig::from_env()?;
+    let transport = if http.is_some() { "http" } else { "stdio" };
+    let bind_display = http.as_ref().map(|config| config.bind.to_string());
+    let http_path = http.as_ref().map(|config| config.path.as_str());
 
     tracing::info!(
         env_default = ?env_default,
@@ -114,10 +134,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         worker_rss_sample_millis = runtime_config.worker_rss_sample_millis(),
         import_switch_rss_soft_kib = runtime_config.import_switch_rss_soft_kib(),
         project_mailbox_capacity = runtime_config.mailbox_capacity(),
+        transport = transport,
+        bind = bind_display.as_deref(),
+        http_path = http_path,
         "starting lean-host-mcp",
     );
 
-    let broker = ProjectBroker::new_with_runtime_config(
+    let broker = build_broker(
         BrokerConfig {
             config_default,
             env_default,
@@ -130,9 +153,59 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         },
         runtime_config,
     );
-    let service = LeanHostService::new(broker);
-    let server = service.serve(stdio()).await?;
-    server.waiting().await?;
+    if let Some(config) = http {
+        transport_http::serve(broker, config).await?;
+    } else {
+        let service = LeanHostService::new(broker);
+        let server = service.serve(stdio()).await?;
+        server.waiting().await?;
+    }
+    Ok(())
+}
+
+fn build_broker(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<ProjectBroker> {
+    ProjectBroker::new_with_runtime_config(config, runtime_config)
+}
+
+fn http_config(args: &ServeArgs) -> anyhow::Result<Option<transport_http::HttpServeConfig>> {
+    match (args.bind, args.http_path.as_deref()) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => bail!("--http-path/LEAN_HOST_MCP_HTTP_PATH requires --bind/LEAN_HOST_MCP_BIND"),
+        (Some(bind), path) => {
+            validate_loopback_bind(bind)?;
+            let path = path.unwrap_or(DEFAULT_HTTP_PATH);
+            validate_http_path(path)?;
+            Ok(Some(transport_http::HttpServeConfig {
+                bind,
+                path: path.to_owned(),
+            }))
+        }
+    }
+}
+
+fn validate_loopback_bind(bind: SocketAddr) -> anyhow::Result<()> {
+    if bind.ip().is_loopback() {
+        Ok(())
+    } else {
+        bail!("--bind must be a loopback address; got {bind}")
+    }
+}
+
+fn validate_http_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        bail!("--http-path must not be empty");
+    }
+    if !path.starts_with('/') {
+        bail!("--http-path must start with '/': {path}");
+    }
+    if path.contains('?') || path.contains('#') {
+        bail!("--http-path must not contain a query string or fragment: {path}");
+    }
+    if path.contains('*') || path.contains('{') || path.contains('}') {
+        bail!("--http-path must not contain route captures or wildcards: {path}");
+    }
+    path.parse::<axum::http::Uri>()
+        .with_context(|| format!("--http-path is not a valid URI path: {path}"))?;
     Ok(())
 }
 
@@ -168,4 +241,51 @@ fn config_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(p));
     }
     dirs::config_dir()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn no_bind_selects_stdio_even_with_lake_root() {
+        let cli = Cli::parse_from(["lean-host-mcp", "--lake-root", "/tmp/project"]);
+        assert!(cli.serve.bind.is_none());
+        assert!(http_config(&cli.serve).expect("stdio config").is_none());
+    }
+
+    #[test]
+    fn bind_selects_http_with_default_path() {
+        let cli = Cli::parse_from(["lean-host-mcp", "--bind", "127.0.0.1:8765"]);
+        let http = http_config(&cli.serve).expect("http config").expect("http selected");
+        assert_eq!(http.bind, "127.0.0.1:8765".parse().expect("socket addr"));
+        assert_eq!(http.path, DEFAULT_HTTP_PATH);
+    }
+
+    #[test]
+    fn http_path_without_bind_is_rejected() {
+        let cli = Cli::parse_from(["lean-host-mcp", "--http-path", "/mcp"]);
+        let err = http_config(&cli.serve).expect_err("http path requires bind");
+        assert!(err.to_string().contains("requires --bind"));
+    }
+
+    #[test]
+    fn non_loopback_bind_is_rejected() {
+        let cli = Cli::parse_from(["lean-host-mcp", "--bind", "0.0.0.0:8765"]);
+        let err = http_config(&cli.serve).expect_err("non-loopback should fail");
+        assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn invalid_http_paths_are_rejected() {
+        for path in ["", "mcp", "/mcp?x=1", "/mcp#frag", "/{*rest}", "/mcp/*rest"] {
+            let err = validate_http_path(path).expect_err("invalid path should fail");
+            assert!(
+                err.to_string().contains("--http-path"),
+                "unexpected error for {path:?}: {err}"
+            );
+        }
+    }
 }

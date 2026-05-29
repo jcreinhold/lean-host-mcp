@@ -37,19 +37,27 @@ name = "multi_project_dispatch"
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 lru = "0.18"
 parking_lot = "0.12"
 regex = "1"
-rmcp = { version = "1.7", features = ["macros", "schemars", "server", "transport-io"] }
+rmcp = { version = "1.7", features = [
+  "macros",
+  "schemars",
+  "server",
+  "transport-io",
+  "transport-streamable-http-server",
+] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -61,6 +69,7 @@ lean-rs-worker-parent = { path = "../../../lean-rs/crates/lean-rs-worker-parent"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 insta = { version = "1", features = ["json"] }
+reqwest = { version = "0.13", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["process"] }
 
