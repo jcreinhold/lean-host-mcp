@@ -138,7 +138,7 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::envelope::RuntimeFacts;
+    use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
     use crate::error::{ServerError, WorkerUnavailable};
 
     #[test]
@@ -146,7 +146,14 @@ mod tests {
         let runtime = RuntimeFacts {
             worker_generation: 7,
             retry_count: 1,
-            restart_cause: Some("child_exit".to_owned()),
+            call_restart: Some(RuntimeRestartEvent {
+                cause: "child_exit".to_owned(),
+                reason: "worker_death".to_owned(),
+                worker_generation: 7,
+                planned: false,
+                rss_kib: Some(42),
+                limit_kib: Some(100),
+            }),
             worker_lanes: 1,
             ..RuntimeFacts::default()
         };

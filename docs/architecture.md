@@ -44,11 +44,12 @@ permit gate, defaulting to one permit, so cross-project heavy calls are serializ
 raises `LEAN_HOST_MCP_SEMANTIC_PERMITS`. A full project mailbox is a structured retryable infrastructure error rather
 than unbounded memory growth.
 
-The actor samples worker RSS before import-profile switches. If the worker is above the configured soft ceiling, it
-cycles the child before opening the next session. Fatal child exits are caught inside the actor: the worker is rebuilt,
-the generation is bumped, and read-only semantic jobs are retried once. Responses carry runtime facts (`worker_generation`,
-`worker_restarted`, `retry_count`, `queue_wait_millis`, `restart_reason`) so clients can distinguish Lean-domain results
-from infrastructure recovery.
+The actor samples worker RSS before import-profile switches. If the worker is above the configured soft threshold, it
+cycles the child before opening the next session. The supervisor also enforces a parent-side hard RSS watchdog during
+long-running requests. Fatal child exits are caught inside the actor: the worker is rebuilt, the generation is bumped,
+and read-only semantic jobs are retried once. Responses carry runtime facts (`worker_generation`, `worker_restarted`,
+`retry_count`, `admission_wait_millis`, `queue_wait_millis`, `call_restart`, `last_restart`) so clients can distinguish
+Lean-domain results from infrastructure recovery and lifecycle history.
 
 Each semantic tool opens a short-lived worker session with imports derived from the source header or explicit request.
 Lean-domain failures such as parse errors, elaboration diagnostics, missing imports, unsupported shim exports, failed

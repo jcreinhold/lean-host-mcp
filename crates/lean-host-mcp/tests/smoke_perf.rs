@@ -239,6 +239,41 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         println!("{}", serde_json::to_string(&record).expect("serialize smoke record"));
     }
 
+    if scenario.label == "fixture" {
+        let burst = scenario
+            .calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call.label,
+                    "proof_state_trivial_warm_repeat"
+                        | "inspect_known_theorem"
+                        | "verify_known_theorem"
+                        | "find_references_file_known_theorem"
+                )
+            })
+            .collect::<Vec<_>>();
+        let responses = server
+            .pipeline_tool_calls(&burst)
+            .await
+            .expect("pipelined MCP burst should complete");
+        for (call, response) in burst.iter().zip(responses.iter()) {
+            assert!(
+                response.json.get("error").is_none(),
+                "pipelined {} returned JSON-RPC error: {:?}",
+                call.label,
+                response.json
+            );
+            let status = response_status(&response.json);
+            assert!(
+                !status.starts_with("mcp_error:") && status != "tool_error",
+                "pipelined {} returned infrastructure status {status}: {:?}",
+                call.label,
+                response.json
+            );
+        }
+    }
+
     server.shutdown().await;
 }
 
@@ -607,6 +642,50 @@ impl McpServer {
         self.read_response(id).await
     }
 
+    async fn pipeline_tool_calls(&mut self, calls: &[&ToolCall]) -> Result<Vec<McpResponse>, String> {
+        let mut ids = Vec::with_capacity(calls.len());
+        for call in calls {
+            let id = self.next_id;
+            self.next_id = self.next_id.checked_add(1).expect("MCP request id overflow");
+            ids.push(id);
+            let message = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": call.tool_name,
+                    "arguments": call.arguments
+                }
+            });
+            self.write_message(&message).await?;
+        }
+
+        let mut pending = ids.iter().copied().collect::<BTreeSet<_>>();
+        let mut by_id = BTreeMap::new();
+        tokio::time::timeout(call_timeout(), async {
+            while !pending.is_empty() {
+                let response = self.read_any_response().await?;
+                let Some(id) = response.json.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if pending.remove(&id) {
+                    by_id.insert(id, response);
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| "timed out waiting for pipelined responses".to_owned())??;
+
+        ids.into_iter()
+            .map(|id| {
+                by_id
+                    .remove(&id)
+                    .ok_or_else(|| format!("missing pipelined response id {id}"))
+            })
+            .collect()
+    }
+
     async fn notify(&mut self, method: &str, params: Value) {
         let message = json!({
             "jsonrpc": "2.0",
@@ -629,27 +708,32 @@ impl McpServer {
     async fn read_response(&mut self, id: u64) -> Result<McpResponse, String> {
         tokio::time::timeout(call_timeout(), async {
             loop {
-                let mut line = String::new();
-                let bytes = self
-                    .stdout
-                    .read_line(&mut line)
-                    .await
-                    .map_err(|err| format!("read response: {err}"))?;
-                if bytes == 0 {
-                    return Err("server stdout closed".to_owned());
-                }
-                let json: Value =
-                    serde_json::from_str(line.trim_end()).map_err(|err| format!("parse response JSON: {err}"))?;
+                let response = self.read_any_response().await?;
+                let json = &response.json;
                 if json.get("id").and_then(Value::as_u64) == Some(id) {
-                    return Ok(McpResponse {
-                        raw_len: line.len(),
-                        json,
-                    });
+                    return Ok(response);
                 }
             }
         })
         .await
         .map_err(|_| format!("timed out waiting for response id {id}"))?
+    }
+
+    async fn read_any_response(&mut self) -> Result<McpResponse, String> {
+        let mut line = String::new();
+        let bytes = self
+            .stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|err| format!("read response: {err}"))?;
+        if bytes == 0 {
+            return Err("server stdout closed".to_owned());
+        }
+        let json: Value = serde_json::from_str(line.trim_end()).map_err(|err| format!("parse response JSON: {err}"))?;
+        Ok(McpResponse {
+            raw_len: line.len(),
+            json,
+        })
     }
 
     fn rss_kib(&self) -> Option<u64> {

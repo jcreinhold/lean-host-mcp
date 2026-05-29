@@ -34,7 +34,7 @@ const MAX_LIMIT: usize = 20;
 const SEARCH_FANOUT: usize = 50;
 const MAX_SEARCHES: usize = 6;
 const MAX_REQUIRED_CONSTANTS: usize = 3;
-const MAX_NAME_FRAGMENTS: usize = 6;
+const MAX_NAME_FRAGMENTS: usize = 12;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +117,7 @@ pub struct SearchForProofResult {
 
 #[derive(Debug, Clone)]
 struct TargetProfile {
+    kind: GoalProfileKind,
     namespace: Option<String>,
     constants: Vec<String>,
     heads: Vec<String>,
@@ -125,6 +126,15 @@ struct TargetProfile {
     proof_state_status: String,
     cache_status: Option<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum GoalProfileKind {
+    RatArithmetic,
+    IntFactorization,
+    ModelTheoryRelabel,
+    LinearArithmetic,
+    Generic,
 }
 
 #[derive(Debug, Clone)]
@@ -324,8 +334,10 @@ fn profile_from_text(
 ) -> TargetProfile {
     let constants = extract_constants(&text);
     let heads = extract_heads(&text);
-    let name_fragments = extract_name_fragments(&text, &constants, &heads);
+    let kind = classify_goal_profile(&text, &constants);
+    let name_fragments = extract_name_fragments(&text, &constants, &heads, kind);
     TargetProfile {
+        kind,
         namespace,
         constants,
         heads,
@@ -582,6 +594,7 @@ fn candidate_score(
     search_label: &str,
 ) -> i32 {
     let mut score = row.score;
+    let lower_name = row.name.to_lowercase();
     if row.kind == "theorem" {
         score = score.saturating_add(10);
     }
@@ -592,6 +605,14 @@ fn candidate_score(
         && row.name.starts_with(namespace)
     {
         score = score.saturating_add(8);
+    }
+    if let (Some(namespace), Some(module)) = (profile.namespace.as_deref(), row.module.as_deref())
+        && namespace
+            .split('.')
+            .next()
+            .is_some_and(|root| !root.is_empty() && module.contains(root))
+    {
+        score = score.saturating_add(4);
     }
     if mode == ProofSearchMode::Rewrite && (row.name.contains("iff") || row.name.contains("eq")) {
         score = score.saturating_add(8);
@@ -605,8 +626,12 @@ fn candidate_score(
     if is_generic_int_solver_candidate(&row.name) && !profile_is_linear_arithmetic(profile) {
         score = score.saturating_sub(35);
     }
+    if is_generic_additive_or_cast_candidate(&lower_name) && !profile_allows_generic_additive_or_cast(profile) {
+        score = score.saturating_sub(20);
+    }
+    score = score.saturating_add(profile_specific_score_adjustment(&lower_name, profile));
     for fragment in &profile.name_fragments {
-        if row.name.to_lowercase().contains(fragment) {
+        if lower_name.contains(fragment) {
             score = score.saturating_add(if is_structural_fragment(fragment) { 10 } else { 5 });
         }
     }
@@ -617,6 +642,53 @@ fn candidate_score(
         score = score.saturating_add(20);
     }
     score
+}
+
+fn profile_specific_score_adjustment(lower_name: &str, profile: &TargetProfile) -> i32 {
+    match profile.kind {
+        GoalProfileKind::RatArithmetic => {
+            topical_adjustment(lower_name, &["rat", "den", "num", "denominator", "intcast"], 22, -8)
+        }
+        GoalProfileKind::IntFactorization => topical_adjustment(
+            lower_name,
+            &[
+                "factorization",
+                "factor",
+                "prime",
+                "irreducible",
+                "multiplicity",
+                "normalizedfactors",
+                "associated",
+                "isunit",
+                "dvd",
+            ],
+            24,
+            -12,
+        ),
+        GoalProfileKind::ModelTheoryRelabel => topical_adjustment(
+            lower_name,
+            &[
+                "relabel",
+                "bounded",
+                "formula",
+                "language",
+                "firstorder",
+                "realize",
+                "theory",
+            ],
+            24,
+            -12,
+        ),
+        GoalProfileKind::LinearArithmetic | GoalProfileKind::Generic => 0,
+    }
+}
+
+fn topical_adjustment(lower_name: &str, topical_fragments: &[&str], boost: i32, miss_penalty: i32) -> i32 {
+    if topical_fragments.iter().any(|fragment| lower_name.contains(fragment)) {
+        boost
+    } else {
+        miss_penalty
+    }
 }
 
 fn is_broad_head(head: &str) -> bool {
@@ -639,13 +711,119 @@ fn is_generic_int_solver_candidate(name: &str) -> bool {
     name.contains("Int.Linear") || name.contains("Int.Cooper") || name.contains(".Linear.") || name.contains(".Cooper.")
 }
 
+fn is_generic_additive_or_cast_candidate(lower_name: &str) -> bool {
+    contains_any(
+        lower_name,
+        &[
+            "addmonoidhom",
+            "addmonoid",
+            "addcomm",
+            "int.cast",
+            "nat.cast",
+            "zsmul",
+            "nsmul",
+            "coe",
+            "cast",
+        ],
+    )
+}
+
+fn profile_allows_generic_additive_or_cast(profile: &TargetProfile) -> bool {
+    matches!(
+        profile.kind,
+        GoalProfileKind::RatArithmetic | GoalProfileKind::LinearArithmetic
+    ) || profile.name_fragments.iter().any(|fragment| {
+        matches!(
+            fragment.as_str(),
+            "cast" | "intcast" | "coe" | "add" | "sub" | "linear" | "omega" | "cooper"
+        )
+    })
+}
+
 fn profile_is_linear_arithmetic(profile: &TargetProfile) -> bool {
+    if profile.kind == GoalProfileKind::LinearArithmetic {
+        return true;
+    }
     profile.name_fragments.iter().any(|fragment| {
         matches!(
             fragment.as_str(),
             "linear" | "omega" | "cooper" | "le" | "lt" | "ge" | "gt" | "add" | "sub"
         )
     })
+}
+
+fn classify_goal_profile(text: &str, constants: &[String]) -> GoalProfileKind {
+    let lower = text.to_lowercase();
+    let constant_text = constants
+        .iter()
+        .map(|constant| constant.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let haystack = format!("{lower} {constant_text}");
+    if contains_any(
+        &haystack,
+        &["rat", "ℚ", "denominator", ".den", ".num", "num", "intcast"],
+    ) {
+        return GoalProfileKind::RatArithmetic;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "factorization",
+            "factorisation",
+            "prime",
+            "irreducible",
+            "multiplicity",
+            "normalizedfactors",
+            "associated",
+            "isunit",
+            "dvd",
+            "nat.factor",
+            "int.factor",
+        ],
+    ) {
+        return GoalProfileKind::IntFactorization;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "relabel",
+            "bounded",
+            "formula",
+            "firstorder",
+            "language",
+            "structure",
+            "term",
+            "realize",
+            "lhom",
+            "theory",
+        ],
+    ) {
+        return GoalProfileKind::ModelTheoryRelabel;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "int.linear",
+            "cooper",
+            "omega",
+            "linarith",
+            "linear",
+            "≤",
+            "<=",
+            "≥",
+            ">=",
+            " < ",
+            " > ",
+        ],
+    ) {
+        return GoalProfileKind::LinearArithmetic;
+    }
+    GoalProfileKind::Generic
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn is_structural_fragment(fragment: &str) -> bool {
@@ -660,11 +838,19 @@ fn is_structural_fragment(fragment: &str) -> bool {
             | "dvd"
             | "pow"
             | "factorization"
+            | "factor"
+            | "prime"
+            | "irreducible"
+            | "multiplicity"
             | "natabs"
             | "associated"
             | "isunit"
             | "sign"
             | "prod"
+            | "relabel"
+            | "bounded"
+            | "formula"
+            | "language"
     ) || fragment.contains("cast")
 }
 
@@ -739,10 +925,15 @@ fn extract_heads(text: &str) -> Vec<String> {
     heads.into_iter().collect()
 }
 
-fn extract_name_fragments(text: &str, constants: &[String], heads: &[String]) -> Vec<String> {
+fn extract_name_fragments(text: &str, constants: &[String], heads: &[String], kind: GoalProfileKind) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     let mut broad_namespace_fragments = Vec::new();
+    for fragment in curated_fragments(kind) {
+        if seen.insert((*fragment).to_owned()) {
+            out.push((*fragment).to_owned());
+        }
+    }
     for token in identifier_tokens(text) {
         for segment in token.split('.') {
             let fragment = segment.trim_matches('_').to_lowercase();
@@ -785,6 +976,35 @@ fn extract_name_fragments(text: &str, constants: &[String], heads: &[String]) ->
     out
 }
 
+fn curated_fragments(kind: GoalProfileKind) -> &'static [&'static str] {
+    match kind {
+        GoalProfileKind::RatArithmetic => &["den", "num", "denominator", "intcast", "cast"],
+        GoalProfileKind::IntFactorization => &[
+            "factorization",
+            "factor",
+            "prime",
+            "irreducible",
+            "multiplicity",
+            "normalizedfactors",
+            "associated",
+            "isunit",
+            "dvd",
+        ],
+        GoalProfileKind::ModelTheoryRelabel => &[
+            "relabel",
+            "bounded",
+            "formula",
+            "language",
+            "firstorder",
+            "realize",
+            "term",
+            "theory",
+        ],
+        GoalProfileKind::LinearArithmetic => &["linear", "cooper", "omega", "linarith", "le", "lt"],
+        GoalProfileKind::Generic => &[],
+    }
+}
+
 fn useful_lower_fragment(fragment: &str) -> bool {
     matches!(
         fragment,
@@ -799,11 +1019,24 @@ fn useful_lower_fragment(fragment: &str) -> bool {
             | "int"
             | "nat"
             | "factorization"
+            | "factor"
+            | "prime"
+            | "irreducible"
+            | "multiplicity"
+            | "normalizedfactors"
             | "natabs"
             | "associated"
             | "isunit"
             | "sign"
             | "prod"
+            | "relabel"
+            | "bounded"
+            | "formula"
+            | "firstorder"
+            | "language"
+            | "realize"
+            | "theory"
+            | "term"
     ) || fragment.contains("cast")
 }
 
@@ -855,6 +1088,23 @@ mod tests {
 
     use super::*;
 
+    fn summary(name: &str, module: Option<&str>, score: i32) -> DeclarationSummary {
+        DeclarationSummary {
+            name: name.to_owned(),
+            kind: "theorem".to_owned(),
+            module: module.map(ToOwned::to_owned),
+            source: None,
+            match_reason: "name fragment".to_owned(),
+            score,
+            rank: 1,
+            flags: crate::projections::DeclarationFlags {
+                is_private: false,
+                is_generated: false,
+                is_internal: false,
+            },
+        }
+    }
+
     #[test]
     fn search_for_proof_request_defaults() {
         let req: SearchForProofRequest = serde_json::from_value(json!({"goal":"⊢ True"})).unwrap();
@@ -891,6 +1141,7 @@ mod tests {
         assert!(profile.heads.iter().any(|head| head == "Eq"));
         assert!(profile.constants.iter().any(|constant| constant == "Nat.succ"));
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "nat"));
+        assert_eq!(profile.kind, GoalProfileKind::Generic);
     }
 
     #[test]
@@ -903,6 +1154,7 @@ mod tests {
             None,
             Vec::new(),
         );
+        assert_eq!(profile.kind, GoalProfileKind::RatArithmetic);
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "den"));
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "num"));
         assert!(
@@ -927,34 +1179,90 @@ mod tests {
             None,
             Vec::new(),
         );
-        let flags = crate::projections::DeclarationFlags {
-            is_private: false,
-            is_generated: false,
-            is_internal: false,
-        };
-        let generic = DeclarationSummary {
-            name: "Acc.ndrecOn_eq_ndrecOnC".to_owned(),
-            kind: "theorem".to_owned(),
-            module: None,
-            source: None,
-            match_reason: "name fragment".to_owned(),
-            score: 100,
-            rank: 1,
-            flags: flags.clone(),
-        };
-        let rat_candidate = DeclarationSummary {
-            name: "Rat.num_den_helper".to_owned(),
-            kind: "theorem".to_owned(),
-            module: Some("Mathlib.Data.Rat.Lemmas".to_owned()),
-            source: None,
-            match_reason: "name fragment".to_owned(),
-            score: 100,
-            rank: 1,
-            flags,
-        };
+        let generic = summary("Acc.ndrecOn_eq_ndrecOnC", None, 100);
+        let rat_candidate = summary("Rat.num_den_helper", Some("Mathlib.Data.Rat.Lemmas"), 100);
         assert!(
             candidate_score(&rat_candidate, &profile, ProofSearchMode::NextStep, "name_fragment")
                 > candidate_score(&generic, &profile, ProofSearchMode::NextStep, "name_fragment")
+        );
+    }
+
+    #[test]
+    fn int_factorization_profile_prefers_topical_candidates_over_cast_noise() {
+        let profile = profile_from_text(
+            "n : ℤ\nh : n.factorization p ≠ 0\n⊢ p ∣ n".to_owned(),
+            Some("Int".to_owned()),
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(profile.kind, GoalProfileKind::IntFactorization);
+        assert!(
+            profile
+                .name_fragments
+                .iter()
+                .any(|fragment| fragment == "factorization")
+        );
+        let topical = summary(
+            "Int.factorization_dvd_of_mem_support",
+            Some("Mathlib.Data.Int.Factorization"),
+            90,
+        );
+        let generic_cast = summary("Int.cast_add", Some("Mathlib.Data.Int.Cast"), 100);
+        assert!(
+            candidate_score(&topical, &profile, ProofSearchMode::NextStep, "name_fragment")
+                > candidate_score(&generic_cast, &profile, ProofSearchMode::NextStep, "name_fragment")
+        );
+    }
+
+    #[test]
+    fn model_theory_relabel_profile_prefers_formula_candidates_over_array_noise() {
+        let profile = profile_from_text(
+            "φ : FirstOrder.Language.BoundedFormula L ν n\n⊢ φ.relabel σ = ψ".to_owned(),
+            Some("FirstOrder".to_owned()),
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(profile.kind, GoalProfileKind::ModelTheoryRelabel);
+        assert!(profile.name_fragments.iter().any(|fragment| fragment == "relabel"));
+        let topical = summary(
+            "FirstOrder.Language.BoundedFormula.relabel_id",
+            Some("Mathlib.ModelTheory.Syntax"),
+            90,
+        );
+        let array_noise = summary("Array.map_eq_map_data", Some("Init.Data.Array"), 100);
+        assert!(
+            candidate_score(&topical, &profile, ProofSearchMode::NextStep, "name_fragment")
+                > candidate_score(&array_noise, &profile, ProofSearchMode::NextStep, "name_fragment")
+        );
+    }
+
+    #[test]
+    fn linear_profile_allows_int_solver_candidates_but_factorization_does_not() {
+        let linear = profile_from_text(
+            "x y : ℤ\nh : x + y ≤ 3\n⊢ x ≤ 3".to_owned(),
+            None,
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(linear.kind, GoalProfileKind::LinearArithmetic);
+        let factorization = profile_from_text(
+            "h : n.factorization p ≠ 0\n⊢ p ∣ n".to_owned(),
+            None,
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        let solver = summary("Int.Linear.cooper_dvd", Some("Mathlib.Tactic.Omega"), 100);
+        assert!(
+            candidate_score(&solver, &linear, ProofSearchMode::NextStep, "name_fragment")
+                > candidate_score(&solver, &factorization, ProofSearchMode::NextStep, "name_fragment")
         );
     }
 }

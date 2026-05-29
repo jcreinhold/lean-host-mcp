@@ -79,8 +79,10 @@ Environment vars:
 | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | Process-wide permits for heavy Lean semantic work. `1` serializes cross-project calls for daily-driver robustness. | `1` |
 | `LEAN_HOST_MCP_SEMANTIC_WAITERS` | Process-wide capacity for callers waiting on semantic-work admission. Full admission returns retryable `semantic_admission_full`. | `16` |
 | `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | Maximum wait for semantic-work admission. Timeout returns retryable `semantic_admission_timeout`. | `60000` |
-| `LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB` | Worker RSS ceiling used by project-level import-profile cycling. | `3145728` |
+| `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB` | Post-job RSS threshold that triggers a planned worker cycle before accepting the next call. The old `LEAN_HOST_MCP_WORKER_RSS_CEILING_KIB` name is rejected. | `3145728` |
 | `LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB` | RSS threshold for preemptively cycling a worker before switching to a different import profile. Planned cycles do not count toward crash-loop restart limits. | `2097152` |
+| `LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB` | In-flight hard RSS kill threshold. Crossing it terminates/restarts the child and returns non-retryable `rss_hard_limit_exceeded` for that call. | `16777216` |
+| `LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS` | Sampling interval for the in-flight hard RSS watchdog. | `250` |
 | `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Worker module-snapshot cache RSS guard. | `2097152` |
 | `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Worker module-snapshot cache byte cap. | `33554432` |
 | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | Bounded per-project semantic mailbox capacity. Full mailboxes return retryable `busy`. | `8` |
@@ -127,8 +129,8 @@ runtime failures.
     "retry_count": 0,
     "admission_wait_millis": 0,
     "queue_wait_millis": 0,
-    "restart_reason": null,
-    "restart_cause": null,
+    "call_restart": null,
+    "last_restart": null,
     "rss_kib": null,
     "worker_lanes": 1,
     "import_profile": "Init\nProject.Module",
@@ -170,9 +172,10 @@ Recoverable runtime/actor failures are normal tool responses, not JSON-RPC error
 tools and file-header imports for module-query tools. An empty array means the call used no extra imports beyond the
 worker's base environment.
 
-`runtime` is attached to semantic tool calls. It reports the current worker generation, whether the call recovered from
-a worker restart, retry count, admission wait, actor queue wait, RSS when available, the import profile, profile-switch
-count, and the last stable restart cause when known. Lean-domain failures (parse, elaboration, kernel rejection, meta
+`runtime` is attached to semantic tool calls. It reports the current worker generation, whether this call observed or
+performed a restart, retry count, admission wait, actor queue wait, RSS when available, the import profile,
+profile-switch count, `call_restart` for this call, and `last_restart` as lifecycle history. Lean-domain failures
+(parse, elaboration, kernel rejection, meta
 timeout) are part of the `ok` payload. Retryable runtime failures such as admission pressure, mailbox pressure, worker
 death, or session loss are `runtime_unavailable` responses. MCP errors are reserved for invalid requests, I/O/config
 failures, internal invariants, and unusable Lake projects.

@@ -20,7 +20,8 @@
 //!     "retry_count": 0,
 //!     "admission_wait_millis": 0,
 //!     "queue_wait_millis": 0,
-//!     "restart_reason": null
+//!     "call_restart": null,
+//!     "last_restart": null
 //!   },
 //!   "warnings":     ["..."],     // omitted when empty
 //!   "next_actions": ["..."]      // omitted when empty
@@ -48,6 +49,18 @@ pub struct Freshness {
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct RuntimeRestartEvent {
+    pub cause: String,
+    pub reason: String,
+    pub worker_generation: u64,
+    pub planned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_kib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_kib: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RuntimeFacts {
     pub worker_generation: u64,
     pub worker_restarted: bool,
@@ -55,9 +68,9 @@ pub struct RuntimeFacts {
     pub admission_wait_millis: u64,
     pub queue_wait_millis: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub restart_reason: Option<String>,
+    pub call_restart: Option<RuntimeRestartEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub restart_cause: Option<String>,
+    pub last_restart: Option<RuntimeRestartEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_kib: Option<u64>,
     pub worker_lanes: u32,
@@ -160,5 +173,46 @@ where
     pub fn hint(mut self, msg: impl Into<String>) -> Self {
         self.next_actions.push(msg.into());
         self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_facts_separate_call_restart_from_lifecycle_history() {
+        let facts = RuntimeFacts {
+            worker_generation: 4,
+            worker_restarted: false,
+            retry_count: 0,
+            admission_wait_millis: 0,
+            queue_wait_millis: 0,
+            call_restart: None,
+            last_restart: Some(RuntimeRestartEvent {
+                cause: "rss_post_job".to_owned(),
+                reason: "rss_post_job current_kib=5 limit_kib=4".to_owned(),
+                worker_generation: 3,
+                planned: true,
+                rss_kib: Some(5),
+                limit_kib: Some(4),
+            }),
+            rss_kib: Some(2),
+            worker_lanes: 1,
+            import_profile: Some("Init".to_owned()),
+            profile_switch_count: 1,
+        };
+
+        let json = serde_json::to_value(facts).unwrap();
+        assert!(json.pointer("/call_restart").is_none_or(serde_json::Value::is_null));
+        assert_eq!(
+            json.pointer("/last_restart/cause").and_then(serde_json::Value::as_str),
+            Some("rss_post_job")
+        );
+        assert_eq!(
+            json.pointer("/worker_restarted").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 }
