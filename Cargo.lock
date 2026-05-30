@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "lean-rs-sys",
  "lean-toolchain",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-host"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "lean-rs",
  "lean-toolchain",
@@ -1088,14 +1088,14 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-sys"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "lean-rs-worker-child"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "lean-rs",
  "lean-rs-host",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-worker-parent"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "lean-rs-worker-protocol",
  "lean-toolchain",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "lean-rs-worker-protocol"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "lean-toolchain",
  "serde",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "lean-toolchain"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "lean-rs-sys",
  "serde_json",
