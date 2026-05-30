@@ -10,5 +10,16 @@
   },
   "enabledPlugins": {
     "lean-rs-skills@lean-rs-skills": true
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/format.sh" },
+          { "type": "command", "command": ".claude/hooks/contract-guard.sh" }
+        ]
+      }
+    ]
   }
 }

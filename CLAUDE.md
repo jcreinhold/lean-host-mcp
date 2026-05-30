@@ -208,6 +208,19 @@ Discovery order: `LEAN_HOST_MCP_TARGET_TOOLCHAIN` (resolved as `~/.elan/toolchai
 file-level `#![allow(...)]`. When a warning is unavoidable in production code, add `#[allow(..., reason = "...")]` with
 a concrete justification; `rg 'reason = ' src/` shows the established style.
 
+## Local automation
+
+Two PostToolUse hooks run on every edit (`.claude/settings.json`): `.claude/hooks/format.sh` reformats the touched file
+(rustfmt / taplo / mdwright, best-effort, never blocks), and `.claude/hooks/contract-guard.sh` posts non-blocking
+reminders for the two invariants greps can catch — no `println!`/`print!` in `src/` (stdout is the stdio transport), and
+no Lean-runtime dep creeping into the parent manifest. The `architecture-reviewer` agent covers the deeper invariants
+(closure-channel actor, envelope contract, transport-agnostic core).
+
+`scripts/prerelease.sh` is the local CI mirror plus the gates CI omits but the repo already configures: the parent ⊥
+libleanshared release link-set assertion, `taplo`/`mdwright`/`prettier` format checks, `cargo deny`, and `cargo shear`.
+Run it before tagging (`--quick` skips cargo-deny for iteration). The `/release-lean-host-mcp` skill walks the full
+release checklist.
+
 ## Version matrix
 
 The supported `lean-rs` / Lean toolchain pairing lives in the README, which is the single source of truth. Bumping the
