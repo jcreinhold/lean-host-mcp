@@ -115,11 +115,24 @@ run_gate "cargo fmt --all -- --check" \
 run_gate "cargo clippy --workspace --all-targets -- -D warnings" \
 	cargo clippy --workspace --all-targets -- -D warnings
 
-run_gate "cargo build --all-targets" \
-	cargo build --all-targets
+# Build and test PER-MEMBER, never workspace-wide. A `--workspace` /
+# `--all-targets` build unifies the `lean-rs-sys` feature set across the
+# parent and worker crates, silently re-linking `libleanshared` into the
+# parent (CLAUDE.md "Always build per-member"). That both violates the
+# parent ⊥ libleanshared invariant and makes the parent's own test binary
+# unrunnable — it references `@rpath/libleanshared.dylib` with no rpath to
+# find it. Scoping to `-p` keeps the parent on `lean-rs-sys` metadata-only,
+# so its tests run on any machine without the dylib on the loader path.
+run_gate "cargo build -p lean-host-mcp --all-targets" \
+	cargo build -p lean-host-mcp --all-targets
 
-run_gate "cargo test --all-targets" \
-	cargo test --all-targets
+run_gate "cargo build -p lean-host-mcp-worker --all-targets" \
+	cargo build -p lean-host-mcp-worker --all-targets
+
+# The worker crate has no tests of its own (a 2-line entry point); the worker
+# build gate above is its coverage. Test the parent per-member.
+run_gate "cargo test -p lean-host-mcp --all-targets" \
+	cargo test -p lean-host-mcp --all-targets
 
 # -- Key invariant: the parent must NOT link libleanshared ------------------
 #
