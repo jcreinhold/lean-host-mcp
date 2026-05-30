@@ -46,6 +46,14 @@ pub struct Freshness {
     pub imports: Vec<String>,
     pub session_id: String,
     pub lean_toolchain: String,
+    /// Project-lifetime toolchain-provenance advisories (unknown pin, missing
+    /// provenance sidecar). Never serialized: every response's freshness flows
+    /// through one producer ([`crate::project`]'s `freshness`) and one drain
+    /// ([`crate::server`]'s `wrap`), which moves these into the top-level
+    /// `warnings` array so the envelope contract stays "warnings are top-level".
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) toolchain_advisories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]

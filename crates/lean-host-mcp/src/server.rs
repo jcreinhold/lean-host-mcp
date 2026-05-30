@@ -120,7 +120,16 @@ where
     T: serde::Serialize + schemars::JsonSchema,
 {
     match result {
-        Ok(response) => Ok(Json(response)),
+        Ok(mut response) => {
+            // Drain project-lifetime toolchain advisories (unknown pin, missing
+            // provenance sidecar) carried on freshness into the top-level
+            // warnings array — the single place every tool's response funnels
+            // through, so the contract "warnings are top-level" holds without
+            // each handler re-plumbing them.
+            let advisories = std::mem::take(&mut response.freshness.toolchain_advisories);
+            response.warnings.extend(advisories);
+            Ok(Json(response))
+        }
         Err(ServerError::WorkerUnavailable(info)) => {
             let freshness = info.freshness();
             let failure = info.failure();

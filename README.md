@@ -274,11 +274,15 @@ use the same workload, byte accounting, and cold/warm worker behaviour.
 
 ## Versions
 
-`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.16 (which transitively pin `lean-rs`
-/ `lean-rs-host` 0.1.16). The server inherits whichever Lean toolchain each consumer Lake project pins, provided it sits
-inside the `lean-rs` support window declared by
-[`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). Bumping the supported
-toolchain is a `lean-rs` change first, then a version bump here.
+`lean-host-mcp` 0.1.0 targets `lean-rs-worker-parent` / `lean-rs-worker-child` 0.1.17 (which transitively pin `lean-rs`
+/ `lean-rs-host` 0.1.17). The supported Lean window is `4.26.0 ..= 4.31.0-rc1` — the head, Lean **4.31.0-rc1**, is the
+version this release is built and tested against. The server inherits whichever Lean toolchain each consumer Lake
+project pins, provided it sits inside the `lean-rs` support window declared by
+[`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain). The host reads that window
+directly from `lean-toolchain::SUPPORTED_TOOLCHAINS` rather than duplicating it: a project pinning a toolchain outside
+the window is rejected at open with a one-line verdict naming the window and the nearest supported version, and
+`install-worker` refuses to build for an out-of-window pin. Bumping the supported toolchain is a `lean-rs` change first,
+then a version bump here.
 
 ## License
 

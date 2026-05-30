@@ -75,6 +75,40 @@ proof snippets, and sorry policy failures are structured tool results. Recoverab
 `runtime_unavailable` tool responses. MCP errors are reserved for invalid requests, I/O/config failures, internal
 invariants, and unusable Lake projects.
 
+### Toolchain-Readiness Gate
+
+Before the broker spawns a child for a newly-resolved project, `WorkerBinary::resolve_ready_for` (in `toolchain.rs`)
+folds every toolchain-version-drift situation into one `Readiness` verdict. It hides four independently-volatile
+decisions behind a single call: the supported window (read directly from `lean_toolchain::SUPPORTED_TOOLCHAINS` — the
+host never duplicates the list), the elan layout, the worker install layout, and the header-digest provenance check. The
+verdicts:
+
+- `Unsupported` — a numbered pin outside `floor ..= head`. Short-circuits before any filesystem probe (the bogus
+  toolchain is usually not installed), so the caller gets the window message, not a buried "elan not installed" error.
+- `Stale` — the toolchain's `lean.h` no longer matches the digest recorded when the worker was built (an rc republished
+  under the same id, a rebuilt toolchain). Caught before spawn with a rebuild command, instead of the cryptic runtime
+  `"incompatible header"` olean crash.
+- `NotInstalled` / `ToolchainNotInstalled` — the worker binary, or the elan toolchain itself, is absent.
+- `UnknownPin` — a `nightly-*` or otherwise non-`vX.Y.Z` pin: allowed, but the host cannot vouch for it.
+- `Ready` — spawn, optionally carrying a soft `note` (e.g. a worker installed by an older host with no provenance
+  record).
+
+`project.rs` maps the hard verdicts to one typed `ServerError::BadProject` sentence carrying the corrective command;
+`UnknownPin` and the soft `Ready` note ride along as project-lifetime advisories that `LeanProject::freshness` attaches
+and `server::wrap` drains into the top-level envelope `warnings`. `install-worker` consults only the pure
+`ToolchainId::window_verdict` *before* its multi-minute build, refusing an out-of-window pin and warning on an unknown
+one. The digest is hashed once on the cold open/resolve path; the warm broker-reuse path (manifest-hash + health check)
+never re-hashes.
+
+### Worker Provenance Sidecar
+
+`install-worker` writes a private `worker.json` next to each installed binary recording the toolchain id, the full
+`lean.h` SHA-256 the worker was built against, the `lean_toolchain::LEAN_VERSION` of the build, and whether that digest
+matched the supported window at build time. The readiness gate re-hashes the toolchain's current `lean.h` and compares;
+a mismatch is `Stale`, a missing sidecar (older host) degrades to a soft warning rather than an error.
+`install-worker --list` surfaces both axes per worker: a `support` column (`supported` / `outside-window` / `unknown`)
+and a `header` column (`ok` / `stale` / `no-record`).
+
 ## Declaration-Centric Proof API
 
 Proof tools share the same anchor shape:

@@ -32,7 +32,7 @@ use crate::cache::ModuleQueryCache;
 use crate::envelope::{Freshness, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
 use crate::lake_meta::LakeProjectMeta;
-use crate::toolchain::{ToolchainId, WorkerBinary};
+use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
 
 /// LRU capacity for exact bounded module query results.
 const MODULE_QUERY_CACHE_CAPACITY: usize = 256;
@@ -490,6 +490,10 @@ pub(crate) struct LeanProject {
     library: Option<String>,
     manifest_hash: String,
     session_id: String,
+    /// Toolchain-provenance advisories captured at open (unknown pin, missing
+    /// sidecar). Surfaced into every response's envelope warnings via
+    /// [`Self::freshness`]; empty for a fully-vouched-for worker.
+    open_warnings: Vec<String>,
     actor_tx: Mutex<Option<mpsc::Sender<ProjectMessage>>>,
     admission: Arc<SemanticAdmission>,
     active_jobs: Arc<AtomicUsize>,
@@ -526,7 +530,7 @@ impl LeanProject {
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let healthy = Arc::new(AtomicBool::new(true));
-        let config = ActorConfig::from_meta(
+        let (config, open_warnings) = ActorConfig::from_meta(
             &meta,
             session_id.clone(),
             Arc::clone(&runtime),
@@ -556,6 +560,7 @@ impl LeanProject {
             library: meta.library,
             manifest_hash: meta.manifest_hash,
             session_id,
+            open_warnings,
             actor_tx: Mutex::new(Some(actor_tx)),
             admission,
             active_jobs,
@@ -792,6 +797,7 @@ impl LeanProject {
             imports: request_imports.to_vec(),
             session_id: self.session_id.clone(),
             lean_toolchain: self.toolchain.clone(),
+            toolchain_advisories: self.open_warnings.clone(),
         }
     }
 
@@ -874,23 +880,67 @@ struct ActorConfig {
 }
 
 impl ActorConfig {
+    /// Resolve the pinned toolchain into a spawnable config plus any
+    /// open-time provenance advisories. All version-drift situations collapse
+    /// into the one [`WorkerBinary::resolve_ready_for`] verdict: hard failures
+    /// become a typed [`ServerError::BadProject`] carrying the corrective
+    /// command; soft ones (unknown pin, missing sidecar) ride along as
+    /// warnings the project surfaces in every envelope.
     fn from_meta(
         meta: &LakeProjectMeta,
         session_id: String,
         runtime: Arc<Mutex<RuntimeSnapshot>>,
         healthy: Arc<AtomicBool>,
         runtime_config: ProjectRuntimeConfig,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<String>)> {
         let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
-        let worker = WorkerBinary::resolve_for(&toolchain_id).map_err(|e| ServerError::BadProject(e.to_string()))?;
-        let lean_sysroot = toolchain_id
-            .elan_dir()
-            .map_err(|e| ServerError::BadProject(e.to_string()))?;
-        Ok(Self {
+        let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready_for(&toolchain_id) {
+            Readiness::Ready {
+                worker,
+                lean_sysroot,
+                note,
+            } => (worker.path, lean_sysroot, note.into_iter().collect()),
+            Readiness::UnknownPin {
+                pin,
+                worker,
+                lean_sysroot,
+            } => (
+                worker.path,
+                lean_sysroot,
+                vec![format!(
+                    "lean-toolchain pins {pin}, which is not a recognized lean-rs supported version \
+                     (e.g. a nightly); proceeding, but the host cannot vouch for ABI compatibility"
+                )],
+            ),
+            Readiness::Unsupported { window, nearest } => {
+                return Err(ServerError::BadProject(format!(
+                    "lean-toolchain pins {toolchain_id}, outside the lean-rs supported window {window}; \
+                     nearest supported: {nearest}. Pin a supported toolchain (or bump lean-rs) and reopen."
+                )));
+            }
+            Readiness::Stale { toolchain, install_cmd } => {
+                return Err(ServerError::BadProject(format!(
+                    "worker for {toolchain} was built against a different lean.h than the toolchain now \
+                     provides (header drift); rebuild it: {install_cmd}"
+                )));
+            }
+            Readiness::NotInstalled { toolchain, install_cmd } => {
+                return Err(ServerError::BadProject(format!(
+                    "no worker binary for toolchain {toolchain}; run: {install_cmd}"
+                )));
+            }
+            Readiness::ToolchainNotInstalled { toolchain, elan_dir } => {
+                return Err(ServerError::BadProject(format!(
+                    "elan toolchain {toolchain} is not installed (expected {})",
+                    elan_dir.display()
+                )));
+            }
+        };
+        let config = Self {
             lake_root: meta.canonical_root.clone(),
             manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
-            worker_path: worker.path,
+            worker_path,
             lean_sysroot,
             session_id,
             runtime,
@@ -904,7 +954,8 @@ impl ActorConfig {
             mailbox_capacity: runtime_config.mailbox_capacity(),
             max_restarts_per_window: runtime_config.max_restarts_per_window(),
             restart_window: runtime_config.restart_window(),
-        })
+        };
+        Ok((config, open_warnings))
     }
 }
 

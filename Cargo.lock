@@ -1035,6 +1035,7 @@ dependencies = [
  "criterion",
  "dirs",
  "lean-rs-worker-parent",
+ "lean-toolchain",
  "lru",
  "parking_lot",
  "regex",

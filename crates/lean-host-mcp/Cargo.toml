@@ -65,6 +65,11 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
 lean-rs-worker-parent = { path = "../../../lean-rs/crates/lean-rs-worker-parent" }
+# Non-FFI facade over lean-rs-sys (metadata-only, no link directives): supplies
+# the supported-toolchain window. Already in the parent's closure via
+# lean-rs-worker-parent, so this direct dep adds no new linkage. The parent must
+# stay free of libleanshared — see the link-set assertion in CLAUDE.md.
+lean-toolchain = { path = "../../../lean-rs/crates/lean-toolchain" }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

@@ -44,6 +44,7 @@ impl WorkerUnavailable {
             imports: self.imports.clone(),
             session_id: self.session_id.clone(),
             lean_toolchain: self.lean_toolchain.clone(),
+            toolchain_advisories: Vec::new(),
         }
     }
 

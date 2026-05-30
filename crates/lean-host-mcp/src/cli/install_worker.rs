@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use clap::Args;
 use sha2::{Digest, Sha256};
 
-use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WorkerBinary};
+use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WindowVerdict, WorkerBinary, WorkerSidecar, hash_lean_header};
 
 /// Mutually-exclusive flags for `install-worker`.
 #[derive(Debug, Args)]
@@ -100,9 +100,24 @@ fn run_list() -> anyhow::Result<()> {
         let meta = fs::metadata(&bin)?;
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let sha = sha256_prefix(&bin, 8)?;
+        // Window + provenance status, derived from the same sources the open
+        // gate uses: the pin's window verdict and the sidecar digest re-hashed
+        // against the toolchain's current lean.h.
+        let parsed = ToolchainId::parse(id).ok();
+        let support = parsed.as_ref().map_or("unknown", |t| t.window_verdict().label());
+        let current = parsed
+            .as_ref()
+            .and_then(|t| t.elan_dir().ok())
+            .and_then(|dir| hash_lean_header(&dir).ok());
+        let header = match WorkerSidecar::load(&id_path) {
+            Some(sidecar) => sidecar.header_status(current.as_deref()),
+            None => "no-record",
+        };
         rows.push(ListRow {
             id: id.to_owned(),
             path: bin,
+            support,
+            header,
             size: meta.len(),
             mtime,
             sha,
@@ -110,10 +125,16 @@ fn run_list() -> anyhow::Result<()> {
     }
     rows.sort_by(|a, b| a.id.cmp(&b.id));
 
-    println!("{:<28}  {:>10}  {:<24}  sha256", "toolchain", "size", "mtime");
+    println!(
+        "{:<28}  {:<14}  {:<9}  {:>10}  {:<24}  sha256",
+        "toolchain", "support", "header", "size", "mtime"
+    );
     for row in &rows {
         let mtime = humantime::format_rfc3339_seconds_or_fallback(row.mtime);
-        println!("{:<28}  {:>10}  {:<24}  {}", row.id, row.size, mtime, row.sha);
+        println!(
+            "{:<28}  {:<14}  {:<9}  {:>10}  {:<24}  {}",
+            row.id, row.support, row.header, row.size, mtime, row.sha
+        );
     }
     Ok(())
 }
@@ -125,6 +146,8 @@ struct ListRow {
         reason = "path is informational; not yet printed but useful for future flags"
     )]
     path: PathBuf,
+    support: &'static str,
+    header: &'static str,
     size: u64,
     mtime: SystemTime,
     sha: String,
@@ -159,9 +182,28 @@ fn run_auto(source_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
+    // Classify against the supported window *before* the multi-minute build —
+    // an out-of-window worker would only fail lean-rs-sys's header-digest
+    // check minutes later.
+    match id.window_verdict() {
+        WindowVerdict::OutOfWindow { window, nearest } => {
+            return Err(anyhow::anyhow!(
+                "{id} is outside the lean-rs supported window {window}; nearest supported: {nearest}. \
+                 Refusing to build an unsupported worker — pin a supported toolchain, or bump lean-rs first."
+            ));
+        }
+        WindowVerdict::Unknown => {
+            eprintln!(
+                "warning: {id} is not a recognized lean-rs supported version (e.g. a nightly); \
+                 building anyway, but the resulting worker is unsupported and may fail to load."
+            );
+        }
+        WindowVerdict::Supported => {}
+    }
+
     // Sanity: the elan toolchain has to exist before we ask the worker
     // crate's build.rs to point at it.
-    id.elan_dir()?;
+    let elan_dir = id.elan_dir()?;
 
     println!("==> building lean-host-mcp-worker for {id}");
     let status = Command::new("cargo")
@@ -198,13 +240,21 @@ fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
         fs::remove_file(&built)?;
     }
 
+    // Record provenance next to the binary: the full lean.h digest the worker
+    // was built against, so a later open can detect header drift (the rc
+    // republished under the same id) before spawning the child.
+    let header_digest = hash_lean_header(&elan_dir)?;
+    let supported = lean_toolchain::supported_by_digest(&header_digest).is_some();
+    WorkerSidecar::record(&dest_dir, id, header_digest)?;
+
     let meta = fs::metadata(&dest)?;
     let sha = sha256_prefix(&dest, 16)?;
     println!(
-        "==> installed {} ({} bytes, sha256 {}…)",
+        "==> installed {} ({} bytes, sha256 {}…, header {})",
         dest.display(),
         meta.len(),
         sha,
+        if supported { "supported" } else { "unrecognized" },
     );
     Ok(dest)
 }
