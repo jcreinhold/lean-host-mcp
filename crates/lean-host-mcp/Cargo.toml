@@ -68,7 +68,6 @@ lean-rs-worker-parent = { path = "../../../lean-rs/crates/lean-rs-worker-parent"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-insta = { version = "1", features = ["json"] }
 reqwest = { version = "0.13", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["process"] }
