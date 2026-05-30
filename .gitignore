@@ -11,3 +11,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+
+# Claude Code local runtime artifacts
+.claude/scheduled_tasks.lock
