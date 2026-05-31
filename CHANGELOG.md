@@ -18,14 +18,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   keeping the parent free of the Lean dylib so one server can host multiple toolchains.
 - Multi-toolchain dispatch: each Lake project resolves its own `lean-toolchain` pin to a worker binary under
   `~/.local/share/lean-host-mcp/workers/<id>/`; `install-worker` subcommand builds and installs them.
-- Position tools (`goal_at_position`, `type_at_position`, `references_of_name`, `file_diagnostics`) backed by a
-  content-hashed processed-file cache, degrading to `{ "status": "unsupported" }` when the host shim is absent.
-- SQLite-indexed lookups (`find_symbol`, `find_lemma`, `outline`) and a Lean-free filesystem `project_scan` sweep.
+- A six-tool declaration-centric proof workflow:
+  `proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> verify_declaration`, plus
+  `find_references` for semantic lookup. `proof_state` degrades to `{ "status": "unsupported" }` when the optional host
+  shim is absent.
 - Closure-channel actor over the worker child, with a `ProjectBroker` per-project pool and idle reaper.
 - Stdio (default) and loopback-only Streamable HTTP transports.
 - Response envelope contract (`result` + `freshness` + optional `warnings`/`next_actions`) shared by every tool;
   Lean-domain failures are part of the `Ok` payload, not MCP errors.
-- Worker RSS supervision with a post-job restart policy, plus the `rss_threshold_sweep.py` tuning tool.
+- Worker RSS supervision: a post-job restart policy and an in-flight hard-kill watchdog, plus the
+  `rss_threshold_sweep.py` tuning tool.
 
 ### Notes
 

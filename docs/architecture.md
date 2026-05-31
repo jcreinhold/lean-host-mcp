@@ -16,16 +16,20 @@ low-level term/meta primitives are not part of the public MCP surface.
 ## Crate Layout
 
 ```
-main.rs         clap CLI, shared broker setup, rmcp stdio entry
-transport_http.rs private axum/rmcp Streamable HTTP entry
-server.rs       LeanHostService tool registration
-tools/          declaration.rs, proof_search.rs, proof_action.rs, position.rs
-project.rs      LeanProject worker actor for one Lake project
-projections.rs  stable MCP projections from lean-rs worker types
-lake_meta.rs    minimal Lake-project metadata
-cache.rs        small LRU for bounded reference queries
-envelope.rs     Response<T> = { result, freshness, warnings, next_actions }
-bin/worker.rs   entry point for lean_rs_worker_child::run_worker_child_stdio()
+crates/lean-host-mcp/src/
+  main.rs           clap CLI, shared broker setup, rmcp stdio entry
+  transport_http.rs private axum/rmcp Streamable HTTP entry
+  server.rs         LeanHostService tool registration
+  broker.rs         ProjectBroker: LRU pool, idle eviction, per-call routing
+  project.rs        LeanProject worker actor for one Lake project
+  tools/            declaration.rs, proof_search.rs, proof_action.rs, position.rs
+  projections.rs    stable MCP projections from lean-rs worker types
+  lake_meta.rs      minimal Lake-project metadata
+  cache.rs          small LRU for bounded reference queries
+  envelope.rs       Response<T> = { status, result, freshness, runtime, warnings, next_actions }
+
+crates/lean-host-mcp-worker/src/
+  main.rs           worker child: lean_rs_worker_child::run_worker_child_stdio()
 ```
 
 `server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when needed,
@@ -52,10 +56,11 @@ bad HTTP paths.
 
 `ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction, manifest
 invalidation, multi-project routing, and coalescing concurrent opens for the same canonical root. `LeanProject` owns the
-supervised `lean-rs-worker` child and a dedicated actor thread. The actor has private state (`Ready`, `Restarting`,
-`Draining`, `Stopped`), a bounded mailbox, a worker generation counter, the last restart reason, the last import
-profile, and module-query cache handles. The parent binary never links `libleanshared`; the per-toolchain worker child
-does.
+supervised `lean-rs-worker` child and a dedicated actor thread; that thread is the sole owner of the worker handle, so
+"exactly one owner of the Lean runtime at a time" is a structural fact rather than a lock discipline. It services one
+semantic job at a time in FIFO order and tracks a worker generation counter, the last restart reason, and the last
+import profile. A bounded mailbox turns overload into a retryable `busy` failure instead of unbounded memory growth. The
+parent binary never links `libleanshared`; the per-toolchain worker child does.
 
 Each project actor runs one semantic job at a time in FIFO mailbox order. The broker also owns a process-wide semantic
 permit gate, defaulting to one permit, so cross-project heavy calls are serialized unless the deployment explicitly

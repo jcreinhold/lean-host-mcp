@@ -17,15 +17,15 @@ is deliberate—see "Multi-toolchain dispatch" below.
 Reader-facing references live under `docs/`: `tool-catalog.md` is the per-tool request/result schema, `architecture.md`
 is the deeper layering write-up. This file captures what's relevant only to working on the code itself.
 
-Tools fall into four groups by shared plumbing: session-backed handlers (`src/tools/lean.rs`), the filesystem sweep
-(`src/tools/scan.rs`), SQLite-indexed lookups (`src/tools/index.rs`), and the position-tool cluster
-(`src/tools/position.rs`). The position tools drive `LeanWorkerSession::process_module` (header-aware), projecting the
-worker's `LeanWorkerProcessedFile` (four info-tree arrays plus diagnostics) through a content-hashed in-memory cache
-(`src/cache.rs`). Three are cursor-driven (`goal_at_position`, `type_at_position`, `references_of_name`); the fourth,
-`file_diagnostics`, is file-scoped but rides the same cache, so the typical agent loop ("what's wrong; then probe the
-problem site") pays for the elaboration once. The shim is optional, so each position tool returns
-`{ "status": "unsupported" }` cleanly when the loaded dylib lacks it. Missing imports become an envelope warning; header
-parse failures short-circuit to a `header_parse_failed` status variant.
+The public surface is a six-tool proof workflow, grouped in `src/tools/` by shared plumbing:
+`proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> verify_declaration`, with `find_references`
+as the semantic-lookup companion. `declaration.rs` backs `inspect_declaration`; `proof_search.rs` backs
+`search_for_proof`; `proof_action.rs` backs `try_proof_step` and `verify_declaration`; `position.rs` backs `proof_state`
+and `find_references`; `source_input.rs` is the shared source-reading helper. `proof_state` depends on an optional
+bounded shim and returns `{ "status": "unsupported" }` cleanly when the loaded dylib lacks it. Lean-domain failures
+(parse, elaboration, kernel rejection, meta timeout) are part of the `ok` payload; missing imports become an envelope
+warning. `src/index.rs` is a legacy SQLite declaration index kept for internal tests only—the MCP tools call bounded
+worker queries instead, never the index.
 
 ## Common commands
 
@@ -39,8 +39,8 @@ cargo test -p lean-host-mcp                             # parent tests (no Lean 
 cargo test -p lean-host-mcp <name>                      # single test by name substring
 cargo test -p lean-host-mcp --test http_transport       # black-box Streamable HTTP transport tests
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
-    cargo test -p lean-host-mcp --test e2e --test worker -- --ignored   # opt-in E2E + worker integration
-cargo bench -p lean-host-mcp --bench worker_roundtrip                   # gated on LEAN_HOST_MCP_BENCH_FIXTURE
+    cargo test -p lean-host-mcp --test e2e -- --ignored   # opt-in end-to-end against a real fixture
+cargo bench -p lean-host-mcp --bench worker_roundtrip     # gated on LEAN_HOST_MCP_BENCH_FIXTURE
 ```
 
 ### Always build per-member, never `--workspace`
@@ -121,8 +121,9 @@ produced the worker binary's rpath. **A single server process can host workers f
 resolves its own pinned toolchain, the parent spawns one worker per toolchain, and the supervisor sets `LEAN_SYSROOT`
 invisibly per spawn. The MCP client does not need to set `LEAN_SYSROOT` in the server's `env` block.
 
-The "one owner of the host handle at a time" invariant is enforced by parking it on a dedicated OS thread named
-`"lean-host-mcp/session"`. The channel carries a closure type, not a Request enum:
+`LeanProject` (`src/project.rs`) is the actor. It parks the handle on a dedicated OS thread—one per project—so "exactly
+one owner of the Lean runtime at a time" is structural, not a lock discipline. The channel carries a closure type, not a
+Request enum:
 
 ```rust
 type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
@@ -130,10 +131,10 @@ type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
 while let Some(job) = rx.blocking_recv() { job(&mut handle); }
 ```
 
-Each public method on `SessionHost` is one inline closure that opens a session via
-`handle.open_session_with_imports(...)`, calls the typed worker method, projects the worker's wire-stable result into
-the MCP-stable wire shape, and replies via `oneshot`. Adding a new tool is **one method on `SessionHost`** plus maybe
-one projection helper—no `Request` variant + `WorkerState::handle` arm + `do_*` method coordination.
+Each public method on `LeanProject` enqueues one closure that opens a worker session with the requested imports, calls
+the typed worker method, projects the worker's wire-stable result into the MCP-stable wire shape, and replies via
+`oneshot`. Adding a tool is one method on `LeanProject` plus maybe one projection helper—no `Request` variant +
+state-machine arm + `do_*` method to coordinate.
 
 **Do not** try to:
 - Hold a `LeanWorkerSession<'_>` across an `.await` (it borrows from `&mut LeanWorkerHostHandle`).
@@ -141,8 +142,8 @@ one projection helper—no `Request` variant + `WorkerState::handle` arm + `do_*
 - Add a `Request` enum back. The closure-channel shape is deliberately the simpler form.
 
 Lean-domain failures cross the worker boundary as `Serialize + Deserialize` data (`LeanWorkerElabFailure`,
-`LeanWorkerMetaResult<T>`, etc.); the projection from worker types to MCP types is pure Rust data shuffling—no opaque
-handles to manage, unlike the original in-process design.
+`LeanWorkerMetaResult<T>`, etc.); the projection from worker types to MCP types is pure Rust data shuffling, with no
+opaque handles to manage.
 
 ## Module layout
 
@@ -150,47 +151,53 @@ handles to manage, unlike the original in-process design.
 crates/
   lean-host-mcp/                # parent crate (no libleanshared link)
     src/
-      main.rs        clap CLI: `serve` (default) + `install-worker`
-      lib.rs         re-exports (LeanHostService, LeanProject, DeclarationIndex, ToolchainId, …)
-      server.rs      rmcp glue (LeanHostService)
-      project.rs     LeanProject closure-channel actor + worker resolution
-      broker.rs      ProjectBroker: per-project pool, idle reaper, hint resolution
-      toolchain.rs   ToolchainId / WorkerBinary / ToolchainError
+      main.rs           clap CLI: `serve` (default) + `install-worker`
+      lib.rs            re-exports (LeanHostService, ProjectBroker, ToolchainId, …)
+      server.rs         rmcp glue (LeanHostService)
+      transport_http.rs axum/rmcp Streamable HTTP wiring
+      broker.rs         ProjectBroker: per-project LRU pool, idle reaper, hint resolution
+      project.rs        LeanProject closure-channel actor + worker resolution
+      toolchain.rs      ToolchainId / WorkerBinary / ToolchainError
       cli/install_worker.rs   `install-worker` subcommand
-      index.rs       DeclarationIndex: SQLite-backed deep module behind the three index tools
-      cache.rs       ProcessedFileCache: LRU<Arc<LeanWorkerProcessedFile>> + position-lookup helpers
-      envelope.rs    Response<T> = { result, freshness, warnings, next_actions }
-      error.rs       ServerError
-      lake_meta.rs   LakeProjectMeta + lakefile discovery
+      projections.rs    worker-type -> MCP-wire projection helpers
+      cache.rs          ModuleQueryCache: bounded module-query result cache
+      envelope.rs       Response<T> = { status, result, freshness, runtime, warnings, next_actions }
+      error.rs          ServerError
+      lake_meta.rs      LakeProjectMeta + lakefile discovery
+      index.rs          legacy SQLite DeclarationIndex (internal tests only)
       tools/
-        mod.rs       ToolContext (broker + processed_files + ...)
-        lean.rs      six session-backed handlers
-        scan.rs      project_scan: pure filesystem regex sweep, no Lean dependency
-        index.rs     find_symbol / find_lemma / outline: thin wrappers over DeclarationIndex
-        position.rs  goal_at_position / type_at_position / references_of_name / file_diagnostics: cache-backed
+        mod.rs          ToolContext + shared tool plumbing
+        declaration.rs  inspect_declaration
+        proof_search.rs search_for_proof
+        proof_action.rs try_proof_step / verify_declaration
+        position.rs     proof_state / find_references
+        source_input.rs shared source-reading helper
   lean-host-mcp-worker/         # worker child binary (only crate that links libleanshared)
-    build.rs         emits rpath; honors LEAN_HOST_MCP_TARGET_TOOLCHAIN
-    src/main.rs      2-line entry: lean_rs_worker_child::run_worker_child_stdio()
+    build.rs            emits rpath; honors LEAN_HOST_MCP_TARGET_TOOLCHAIN
+    src/main.rs         2-line entry: lean_rs_worker_child::run_worker_child_stdio()
 ```
 
-Tools are grouped by **shared plumbing**, not one-file-per-tool. The six `lean.rs` handlers all hit `SessionHost`; the
-three `tools/index.rs` handlers all hit the SQLite index; the three `tools/position.rs` handlers share the
-`ProcessedFileCache`; `scan.rs` is plumbing-free.
+Tools are grouped by **shared plumbing**, not one-file-per-tool: the handlers in each `tools/` file share the worker
+call and projection path for that stage of the proof workflow.
 
 ## The envelope contract
 
 Every tool returns `Response<T>` from `envelope.rs`:
 
 ```jsonc
-{ "result": { /* tool-specific */ },
-  "freshness": { lake_root, imports, session_id, lean_toolchain },
-  "warnings": [...],      // omitted when empty
-  "next_actions": [...]   // omitted when empty
+{ "status": "ok",                 // or "runtime_unavailable"
+  "result": { /* tool-specific; null on runtime_unavailable */ },
+  "runtime_error": null,          // populated on runtime_unavailable
+  "freshness": { project_root, project_hash, imports, session_id, lean_toolchain },
+  "runtime": { /* RuntimeFacts; attached to semantic calls */ },
+  "warnings": [...],              // omitted when empty
+  "next_actions": [...]           // omitted when empty
 }
 ```
 
-This is the **only** shape every tool shares. Three volatile decisions hide behind it: what "freshness" means, what a
-warning looks like, and whether `next_actions` are present. Tools don't get to pick the shape; they fill it in.
+This is the **only** shape every tool shares. Volatile decisions hide behind it: what "freshness" means, what a warning
+looks like, whether `next_actions` are present. Tools don't pick the shape; they fill it in. The full field-by-field
+contract lives in `docs/tool-catalog.md` and the README.
 
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors.
 `ServerError` is only for infrastructure failures (worker thread gone, runtime init failed, Lake project unusable).
