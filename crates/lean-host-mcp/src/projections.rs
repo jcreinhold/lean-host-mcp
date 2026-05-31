@@ -250,8 +250,19 @@ pub struct DeclarationInspection {
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DeclarationInspectionResult {
-    Found { declaration: Box<DeclarationInspection> },
-    NotFound { name: Option<String> },
+    Found {
+        declaration: Box<DeclarationInspection>,
+    },
+    NotFound {
+        name: Option<String>,
+    },
+    /// The declaration's import closure reached an unbuilt `.olean`, so the
+    /// name could not be resolved against a complete environment. Distinct from
+    /// `not_found` (which would falsely claim the declaration does not exist):
+    /// it may resolve once the project is built. The envelope carries the
+    /// `lake build` warning. Shares the `needs_build` status token with the
+    /// other resolution-bearing tools.
+    NeedsBuild,
     Unsupported,
 }
 

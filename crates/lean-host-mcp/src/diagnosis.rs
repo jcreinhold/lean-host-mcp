@@ -24,7 +24,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::envelope::Response;
-use crate::error::ServerError;
+use crate::error::{Result, ServerError};
 
 /// Why a query ran against an environment that was not fully built. Each
 /// variant carries only what the renderer needs to name the blocking work.
@@ -60,6 +60,37 @@ pub(crate) fn missing_olean_failure(err: &ServerError) -> bool {
 /// The wire status token for a degraded, incomplete-build verdict. One producer
 /// so every tool agrees on the spelling.
 pub(crate) const NEEDS_BUILD_STATUS: &str = "needs_build";
+
+/// A worker call either produced its value, or it hit an unbuilt dependency
+/// while assembling the environment. The second case is recoverable and
+/// agent-actionable (run `lake build`), not an infrastructure failure, so the
+/// tools degrade it into a `needs_build` verdict rather than letting it
+/// propagate as an MCP transport error.
+pub(crate) enum CallOutcome<T> {
+    Ready(T),
+    NeedsBuild(ServerError),
+}
+
+/// Split a worker-call result into the normal value and the
+/// "ran against an unbuilt dependency" case. The single chokepoint where
+/// `verify_declaration`, `proof_state`, and `try_proof_step` recognise the
+/// condition, so all three degrade on exactly the predicate `find_references`
+/// already uses ([`missing_olean_failure`]). `find_references` does not call
+/// this — its loop skips the file and continues rather than returning early —
+/// but it shares the same predicate, so the policy lives in one place.
+///
+/// # Errors
+///
+/// Propagates any [`ServerError`] that is *not* a missing-`.olean` failure
+/// unchanged; only the recoverable build-state case is captured as
+/// [`CallOutcome::NeedsBuild`].
+pub(crate) fn classify_missing_olean<T>(outcome: Result<T>) -> Result<CallOutcome<T>> {
+    match outcome {
+        Ok(value) => Ok(CallOutcome::Ready(value)),
+        Err(err) if missing_olean_failure(&err) => Ok(CallOutcome::NeedsBuild(err)),
+        Err(err) => Err(err),
+    }
+}
 
 /// The canonical `(warning, next_action)` pair for an incomplete build. Pure so
 /// it can be unit-tested without a [`Response`]. `project_root` comes from the
@@ -175,6 +206,26 @@ mod tests {
         let (warning, _) = needs_build_text("/work/proj", &cause);
         assert!(warning.contains("Foo.olean"));
         assert!(!warning.contains("second line"));
+    }
+
+    #[test]
+    fn classify_missing_olean_routes_only_build_artifacts_to_needs_build() {
+        // A missing-`.olean` infrastructure failure becomes the recoverable
+        // needs_build case.
+        let missing: Result<()> = Err(ServerError::Lean(
+            "object file '/p/Dep.olean' of module Dep does not exist".to_owned(),
+        ));
+        assert!(matches!(
+            classify_missing_olean(missing),
+            Ok(CallOutcome::NeedsBuild(_))
+        ));
+
+        // An unrelated infrastructure error still propagates.
+        let other: Result<()> = Err(ServerError::Lean("worker thread gone".to_owned()));
+        assert!(classify_missing_olean(other).is_err());
+
+        // A success passes through untouched.
+        assert!(matches!(classify_missing_olean(Ok(7)), Ok(CallOutcome::Ready(7))));
     }
 
     #[test]

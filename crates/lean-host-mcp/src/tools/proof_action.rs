@@ -19,11 +19,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::broker::ProjectHint;
+use crate::diagnosis::{CallOutcome, IncompleteCause, NEEDS_BUILD_STATUS, classify_missing_olean, warn_needs_build};
 use crate::envelope::Response;
-use crate::error::Result;
+use crate::error::{Result, ServerError};
 use crate::projections::{
-    DeclarationVerificationResult, ElabFailure, ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult,
-    project_declaration_verification, project_proof_attempt,
+    DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProofAttemptCandidate,
+    ProofAttemptEnvelope, ProofAttemptResult, project_declaration_verification, project_proof_attempt,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
 use crate::tools::source_input::read_query_file;
@@ -107,6 +108,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
         .warn("try_proof_step requires `snippet` or `snippets`"));
     }
 
+    let imports = input.imports;
     let request = LeanWorkerProofAttemptRequest {
         source: input.source,
         edit: LeanWorkerProofEditTarget::Declaration {
@@ -116,16 +118,23 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
         candidates,
         budgets,
     };
-    let call = ctx
-        .broker
-        .attempt_proof(
-            hint,
-            session_imports(input.imports.clone()),
-            input.imports,
-            request,
-            elab_options(&file_label, req.heartbeat_limit),
-        )
-        .await?;
+    // A missing-`.olean` in the target's own import closure means the worker
+    // could not assemble the environment to attempt anything; degrade to the
+    // shared needs_build verdict instead of letting the raw error propagate.
+    let call = match classify_missing_olean(
+        ctx.broker
+            .attempt_proof(
+                hint.clone(),
+                session_imports(imports.clone()),
+                imports.clone(),
+                request,
+                elab_options(&file_label, req.heartbeat_limit),
+            )
+            .await,
+    )? {
+        CallOutcome::Ready(call) => call,
+        CallOutcome::NeedsBuild(err) => return proof_step_needs_build_response(ctx, hint, imports, err).await,
+    };
     let mut response = Response::ok(
         append_capped_rows(project_proof_attempt(call.value), extra_rows),
         call.freshness,
@@ -141,10 +150,44 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
         _ => None,
     };
     if let Some(missing) = missing {
-        response =
-            crate::diagnosis::warn_needs_build(response, &crate::diagnosis::IncompleteCause::MissingImports(missing));
+        response = warn_needs_build(response, &IncompleteCause::MissingImports(missing));
     }
     Ok(response)
+}
+
+/// Build the degraded envelope when `try_proof_step`'s target import closure
+/// hit an unbuilt `.olean`: no candidate could run against an incomplete
+/// environment. Mirrors the verify degrade — a `missing_imports` result plus
+/// the canonical `needs_build` warning naming the blocking olean.
+async fn proof_step_needs_build_response(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    imports: Vec<String>,
+    err: ServerError,
+) -> Result<Response<ProofAttemptResult>> {
+    let base = ctx.broker.project_runtime(hint, imports.clone()).await?;
+    let mut response = Response::ok(needs_build_attempt_result(imports), base.freshness).with_runtime(base.runtime);
+    response
+        .next_actions
+        .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
+    Ok(warn_needs_build(
+        response,
+        &IncompleteCause::MissingOlean(err.to_string()),
+    ))
+}
+
+/// The proof-attempt result for an unbuilt-dependency degrade: an empty
+/// `missing_imports` envelope (nothing ran). Pure, for unit testing.
+fn needs_build_attempt_result(imports: Vec<String>) -> ProofAttemptResult {
+    ProofAttemptResult::MissingImports {
+        result: ProofAttemptEnvelope {
+            candidates: Vec::new(),
+            candidate_limit: MAX_CANDIDATES as u32,
+            candidates_truncated: false,
+        },
+        imports,
+        missing: Vec::new(),
+    }
 }
 
 /// Verify one declaration in an in-memory source snapshot.
@@ -185,16 +228,24 @@ pub async fn verify_declaration(
         report_axioms: req.report_axioms,
         budgets,
     };
-    let call = ctx
-        .broker
-        .verify_declaration(
-            hint,
-            session_imports(input.imports.clone()),
-            input.imports,
-            request,
-            elab_options(&file_label, req.heartbeat_limit),
-        )
-        .await?;
+    let imports = input.imports;
+    // A missing-`.olean` in the target's own import closure means the worker
+    // could not assemble the environment to check anything; degrade to the
+    // shared needs_build verdict instead of letting the raw error propagate.
+    let call = match classify_missing_olean(
+        ctx.broker
+            .verify_declaration(
+                hint.clone(),
+                session_imports(imports.clone()),
+                imports.clone(),
+                request,
+                elab_options(&file_label, req.heartbeat_limit),
+            )
+            .await,
+    )? {
+        CallOutcome::Ready(call) => call,
+        CallOutcome::NeedsBuild(err) => return verification_needs_build_response(ctx, hint, imports, err).await,
+    };
     let mut response =
         Response::ok(project_declaration_verification(call.value), call.freshness).with_runtime(call.runtime);
     response
@@ -212,7 +263,7 @@ pub async fn verify_declaration(
         None => (None, Vec::new(), None),
     };
     if let Some(cause) = cause {
-        response = crate::diagnosis::warn_needs_build(response, &cause);
+        response = warn_needs_build(response, &cause);
     }
     response = crate::diagnosis::warn_ambiguous(response, &candidates);
     if let Some(warning) = axiom_warning {
@@ -221,10 +272,67 @@ pub async fn verify_declaration(
     Ok(response)
 }
 
+/// Build the degraded verdict + envelope when `verify_declaration`'s target
+/// import closure hit an unbuilt `.olean`. Freshness/runtime come from
+/// [`crate::broker::ProjectBroker::project_runtime`], a registry hit with no
+/// worker round-trip, so only this rare arm pays for it.
+async fn verification_needs_build_response(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    imports: Vec<String>,
+    err: ServerError,
+) -> Result<Response<DeclarationVerificationResult>> {
+    let base = ctx.broker.project_runtime(hint, imports.clone()).await?;
+    let mut response =
+        Response::ok(needs_build_verification_result(imports), base.freshness).with_runtime(base.runtime);
+    response
+        .next_actions
+        .push("source file was not modified by verification".to_owned());
+    Ok(warn_needs_build(
+        response,
+        &IncompleteCause::MissingOlean(err.to_string()),
+    ))
+}
+
+/// The verification verdict for an unbuilt-dependency degrade. Same wire shape
+/// as the worker-typed `needs_build` (status `missing_imports`,
+/// `verification_status:"needs_build"`, `facts_trustworthy:false`) so the two
+/// degrade paths are indistinguishable to a client. Pure, for unit testing.
+fn needs_build_verification_result(imports: Vec<String>) -> DeclarationVerificationResult {
+    DeclarationVerificationResult::MissingImports {
+        verification_status: NEEDS_BUILD_STATUS.to_owned(),
+        facts: Box::new(needs_build_facts()),
+        imports,
+        missing: Vec::new(),
+    }
+}
+
+/// Untrustworthy, empty facts for a degraded verdict: nothing was checked
+/// because the environment could not be assembled. `axioms_available:false`
+/// reads the empty `axioms` as "not computed", not "no axioms".
+fn needs_build_facts() -> DeclarationVerificationFacts {
+    DeclarationVerificationFacts {
+        target: None,
+        diagnostics: ElabFailure {
+            diagnostics: Vec::new(),
+            truncated: false,
+        },
+        unresolved_goals: Vec::new(),
+        contains_sorry: false,
+        contains_admit: false,
+        contains_sorry_ax: false,
+        axioms: Vec::new(),
+        axioms_truncated: false,
+        axioms_available: false,
+        output_truncated: false,
+        candidates: Vec::new(),
+        facts_trustworthy: false,
+    }
+}
+
 /// Incomplete-build cause for a verification result, if the verdict was
 /// computed against an environment that was not fully assembled.
-fn verification_incomplete_cause(result: &DeclarationVerificationResult) -> Option<crate::diagnosis::IncompleteCause> {
-    use crate::diagnosis::IncompleteCause;
+fn verification_incomplete_cause(result: &DeclarationVerificationResult) -> Option<IncompleteCause> {
     match result {
         // The worker reports needs_build through the MissingImports outcome,
         // which names the unbuilt modules.
@@ -233,9 +341,7 @@ fn verification_incomplete_cause(result: &DeclarationVerificationResult) -> Opti
         }
         DeclarationVerificationResult::Ok {
             verification_status, ..
-        } if verification_status == crate::diagnosis::NEEDS_BUILD_STATUS => {
-            Some(IncompleteCause::MissingImports(Vec::new()))
-        }
+        } if verification_status == NEEDS_BUILD_STATUS => Some(IncompleteCause::MissingImports(Vec::new())),
         DeclarationVerificationResult::Ok { .. }
         | DeclarationVerificationResult::HeaderParseFailed { .. }
         | DeclarationVerificationResult::Unsupported => None,
@@ -385,6 +491,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::indexing_slicing,
+        clippy::panic,
         reason = "unit tests should fail directly on malformed fixtures"
     )]
 
@@ -444,5 +551,34 @@ mod tests {
         let high = proof_action_budgets(Some(u32::MAX), Some(u32::MAX));
         assert_eq!(high.per_field_bytes, MAX_FIELD_BYTES);
         assert_eq!(high.total_bytes, MAX_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn unbuilt_dependency_verification_is_needs_build_with_untrustworthy_facts() {
+        // The env-based degrade must match the worker-typed needs_build shape:
+        // verification_status "needs_build" + facts_trustworthy false.
+        let DeclarationVerificationResult::MissingImports {
+            verification_status,
+            facts,
+            ..
+        } = needs_build_verification_result(vec!["Foo.Bar".to_owned()])
+        else {
+            panic!("expected a missing_imports verdict");
+        };
+        assert_eq!(verification_status, NEEDS_BUILD_STATUS);
+        assert!(!facts.facts_trustworthy);
+        assert!(!facts.axioms_available);
+        assert!(!facts.contains_sorry);
+    }
+
+    #[test]
+    fn unbuilt_dependency_proof_attempt_is_empty_missing_imports() {
+        let ProofAttemptResult::MissingImports { result, missing, .. } =
+            needs_build_attempt_result(vec!["Foo.Bar".to_owned()])
+        else {
+            panic!("expected a missing_imports envelope");
+        };
+        assert!(result.candidates.is_empty());
+        assert!(missing.is_empty());
     }
 }

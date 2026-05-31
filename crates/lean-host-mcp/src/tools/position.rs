@@ -311,7 +311,23 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
         },
     ];
     let budgets = proof_agent_budgets();
-    let run = run_module_query_batch(ctx, hint, &meta.canonical_root, &req.file, selectors, budgets).await?;
+    // A missing-`.olean` in the declaration's own import closure means the batch
+    // could not run; degrade to the shared needs_build verdict instead of
+    // letting the raw error propagate as an MCP transport error.
+    let run = match crate::diagnosis::classify_missing_olean(
+        run_module_query_batch(ctx, hint.clone(), &meta.canonical_root, &req.file, selectors, budgets).await,
+    )? {
+        crate::diagnosis::CallOutcome::Ready(run) => run,
+        crate::diagnosis::CallOutcome::NeedsBuild(err) => {
+            // Forward the file's real header imports so the degraded envelope's
+            // `freshness.imports` matches the success path (re-read on this rare
+            // arm only; empty if the file is now unreadable).
+            let imports = read_query_file(&meta.canonical_root, &req.file)
+                .map(|input| input.imports)
+                .unwrap_or_default();
+            return proof_state_needs_build_response(ctx, hint, imports, err).await;
+        }
+    };
     let freshness = run.freshness.clone();
 
     match run.outcome {
@@ -434,6 +450,72 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
         BatchQueryRun::Unsupported => {
             Ok(Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime))
         }
+    }
+}
+
+/// Build the degraded proof-state context when the declaration's import
+/// closure hit an unbuilt `.olean`: the batch could not run, so report a
+/// `needs_build` selector plus the canonical `lake build` warning — the same
+/// honest verdict the worker-typed `NeedsBuild` routing produces, rather than a
+/// raw transport error. Freshness/runtime come from a registry-hit
+/// `project_runtime` (no worker round-trip), paid only on this rare arm.
+async fn proof_state_needs_build_response(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    imports: Vec<String>,
+    err: ServerError,
+) -> Result<Response<ProofStateResult>> {
+    let base = ctx.broker.project_runtime(hint, imports).await?;
+    let message = err.to_string().lines().next().unwrap_or_default().trim().to_owned();
+    let response = Response::ok(needs_build_context(message), base.freshness).with_runtime(base.runtime);
+    Ok(crate::diagnosis::warn_needs_build(
+        response,
+        &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+    ))
+}
+
+/// Proof-state context for an unbuilt-dependency degrade: no goals, one
+/// `needs_build` selector entry. Pure, for unit testing.
+fn needs_build_context(message: String) -> ProofStateResult {
+    ProofStateResult::Context {
+        diagnostics: DiagnosticsBlock {
+            summary: DiagnosticSummary::default(),
+            diagnostics: Vec::new(),
+            truncated: false,
+        },
+        declaration_name: None,
+        namespace_name: None,
+        goals_before: Vec::new(),
+        goals_after: Vec::new(),
+        locals: Vec::new(),
+        expected_type: None,
+        truncated: false,
+        total_truncated: false,
+        unavailable: Vec::new(),
+        needs_build: vec![SelectorMessage {
+            id: PROOF_STATE_CONTEXT_ID.to_owned(),
+            message,
+        }],
+        ambiguous: Vec::new(),
+        budget_exceeded: Vec::new(),
+        query_facts: Box::new(degraded_query_facts()),
+    }
+}
+
+/// Zeroed query facts for a degrade path where no query ran: `cache_status`
+/// "unknown" rather than a misleading hit/miss, and zero timings.
+fn degraded_query_facts() -> ModuleQueryFacts {
+    ModuleQueryFacts {
+        cache_status: "unknown",
+        output_bytes: 0,
+        cache_entry_count: None,
+        cache_approx_bytes: None,
+        timings: ModuleQueryTimings {
+            header_import_micros: 0,
+            elaboration_micros: 0,
+            projection_micros: 0,
+            rendering_micros: 0,
+        },
     }
 }
 
@@ -1152,8 +1234,8 @@ mod tests {
 
     use super::{
         BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, ProofPositionSelector, ProofStateRequest, ProofStateResult,
-        RenderedText, cache_status_label, expert_query_budgets, project_query_facts, proof_agent_budgets,
-        reference_query_budgets, route_batch_outcome,
+        RenderedText, cache_status_label, expert_query_budgets, needs_build_context, project_query_facts,
+        proof_agent_budgets, reference_query_budgets, route_batch_outcome,
     };
     use crate::tools::source_input::{header_imports, read_query_file};
 
@@ -1213,6 +1295,19 @@ import Init -- comment
 
         let references = reference_query_budgets();
         assert_eq!(references, expert);
+    }
+
+    #[test]
+    fn needs_build_context_reports_a_needs_build_selector_not_unavailable() {
+        let result = needs_build_context("object file 'Dep.olean' ... does not exist".to_owned());
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["status"], "context");
+        // The blocking condition lands in `needs_build` (with the `lake build`
+        // envelope warning), never silently in `unavailable` or as goals.
+        assert_eq!(value["needs_build"][0]["id"], "proof_state");
+        assert!(value["needs_build"][0]["message"].as_str().unwrap().contains(".olean"));
+        assert!(value.get("unavailable").is_none());
+        assert!(value.get("goals_before").is_none());
     }
 
     #[test]

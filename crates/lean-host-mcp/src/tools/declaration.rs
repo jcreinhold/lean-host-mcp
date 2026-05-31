@@ -17,8 +17,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
 
 use crate::broker::ProjectHint;
+use crate::diagnosis::{CallOutcome, IncompleteCause, classify_missing_olean, warn_needs_build};
 use crate::envelope::Response;
-use crate::error::Result;
+use crate::error::{Result, ServerError};
 use crate::projections::{DeclarationInspectionResult, project_declaration_inspection};
 use crate::tools::source_input::{module_name_for_file, read_query_file};
 use crate::tools::{ToolContext, session_imports};
@@ -201,10 +202,18 @@ pub async fn inspect_declaration(
         fields,
         budgets,
     };
-    let call = ctx
-        .broker
-        .inspect_declaration(hint, session_imports(imports.clone()), imports, request)
-        .await?;
+    // A missing-`.olean` in the file's import closure means the name could not
+    // be resolved against a complete environment; degrade to the shared
+    // needs_build verdict rather than letting the raw error propagate (and
+    // rather than a dishonest not_found).
+    let call = match classify_missing_olean(
+        ctx.broker
+            .inspect_declaration(hint.clone(), session_imports(imports.clone()), imports.clone(), request)
+            .await,
+    )? {
+        CallOutcome::Ready(call) => call,
+        CallOutcome::NeedsBuild(err) => return inspection_needs_build_response(ctx, hint, imports, err).await,
+    };
     let projected = project_declaration_inspection(call.value);
     let bare_name_without_context = req.file.is_none() && req.imports.is_empty();
     let mut response = Response::ok(projected.clone(), call.freshness).with_runtime(call.runtime);
@@ -214,6 +223,23 @@ pub async fn inspect_declaration(
         );
     }
     Ok(response)
+}
+
+/// Build the degraded inspection verdict when the file's import closure hit an
+/// unbuilt `.olean`. Freshness/runtime come from a registry-hit
+/// `project_runtime` (no worker round-trip), paid only on this rare arm.
+async fn inspection_needs_build_response(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    imports: Vec<String>,
+    err: ServerError,
+) -> Result<Response<DeclarationInspectionResult>> {
+    let base = ctx.broker.project_runtime(hint, imports).await?;
+    let response = Response::ok(DeclarationInspectionResult::NeedsBuild, base.freshness).with_runtime(base.runtime);
+    Ok(warn_needs_build(
+        response,
+        &IncompleteCause::MissingOlean(err.to_string()),
+    ))
 }
 
 fn budgets_for(req: &InspectDeclarationRequest) -> LeanWorkerOutputBudgets {
@@ -242,7 +268,7 @@ const fn default_true() -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -278,6 +304,13 @@ mod tests {
         assert!(!req.fields.docstring);
         assert!(req.fields.attributes);
         assert!(req.fields.flags);
+    }
+
+    #[test]
+    fn needs_build_inspection_status_is_needs_build_not_not_found() {
+        // The unbuilt-closure degrade must not masquerade as not_found.
+        let value = serde_json::to_value(DeclarationInspectionResult::NeedsBuild).unwrap();
+        assert_eq!(value["status"], "needs_build");
     }
 
     #[test]

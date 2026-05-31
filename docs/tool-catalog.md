@@ -150,7 +150,10 @@ imports needed to resolve it:
 rather than a fully-elaborated term. `statement_rendering` reports the path that produced it (`"pretty"`, or `"raw"`
 when the pretty-printer fell back). Set `"raw_statement": true` for the fully-elaborated `Expr.toString` form.
 
-The result is one of `found`, `not_found`, or `unsupported`. A `found` declaration looks like:
+The result is one of `found`, `not_found`, `needs_build`, or `unsupported`. `needs_build` means the name's import
+closure reached an unbuilt `.olean`, so it could not be resolved against a complete environment — distinct from
+`not_found`, which would falsely claim the declaration does not exist (see
+[The `needs_build` signal](#the-needs_build-signal)). A `found` declaration looks like:
 
 ```jsonc
 {
@@ -298,11 +301,20 @@ not** fail the whole request: it skips that file, continues — returning the re
 
 ## The `needs_build` signal
 
-Several tools share one honest verdict for "the project environment is incomplete." `verify_declaration` reports it as
-`verification_status: "needs_build"`; `proof_state` collects the affected selectors in a `needs_build` array (distinct
-from `unavailable`); `find_references` and `search_for_proof` surface it as a top-level warning. In every case the
-warning text and a `lake build` next action are identical. The fix is always the same: run `lake build`, resolve errors,
-then retry.
+Every resolution-bearing tool shares one honest verdict for "the project environment is incomplete."
+`verify_declaration` reports it as `verification_status: "needs_build"`; `inspect_declaration` as
+`status: "needs_build"`; `proof_state` collects the affected selectors in a `needs_build` array (distinct from
+`unavailable`); `try_proof_step` returns an empty `missing_imports` envelope; `find_references` and `search_for_proof`
+surface it as a top-level warning. In every case the warning text and a `lake build` next action are identical. The fix
+is always the same: run `lake build`, resolve errors, then retry.
+
+The environment can be incomplete two ways, and both now reach the same verdict. The worker reports a *requested* import
+it could not load as a typed missing-imports/`needs_build` outcome. Separately, when the target's own import closure
+reaches an unbuilt **transitive** dependency, the header import fails with a missing `.olean` — and
+`verify_declaration`, `inspect_declaration`, `proof_state`, and `try_proof_step` now degrade that to `needs_build` too
+(previously it escaped as a hard error), exactly as `find_references` and `search_for_proof` already did. So every
+resolution-bearing tool shares one verdict whichever way the build is incomplete; the warning names the blocking
+`lake build`.
 
 This replaces what used to be a misleading `"ambiguous"` verdict with no candidates, or a hard error. The worker now
 classifies resolution at its own boundary, so `"ambiguous"` is reserved for *genuine* multiple-resolution and always
