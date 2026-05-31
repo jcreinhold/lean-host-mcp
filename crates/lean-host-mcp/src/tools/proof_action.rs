@@ -134,6 +134,16 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     response
         .next_actions
         .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
+    // If the attempt ran against imports the worker could not load, the
+    // candidate diagnostics describe a degraded environment; tell the agent.
+    let missing = match response.result_ref() {
+        Some(ProofAttemptResult::MissingImports { missing, .. }) => Some(missing.clone()),
+        _ => None,
+    };
+    if let Some(missing) = missing {
+        response =
+            crate::diagnosis::warn_needs_build(response, &crate::diagnosis::IncompleteCause::MissingImports(missing));
+    }
     Ok(response)
 }
 
@@ -190,7 +200,66 @@ pub async fn verify_declaration(
     response
         .next_actions
         .push("source file was not modified by verification".to_owned());
+    // Honest diagnostics: a `needs_build`/missing-import verdict means the
+    // facts were computed against an incomplete environment, and an empty
+    // axiom set on a verified proof is often under-reported.
+    let (cause, axiom_warning) = match response.result_ref() {
+        Some(result) => (
+            verification_incomplete_cause(result),
+            suspected_axiom_underreport(result, req.report_axioms),
+        ),
+        None => (None, None),
+    };
+    if let Some(cause) = cause {
+        response = crate::diagnosis::warn_needs_build(response, &cause);
+    }
+    if let Some(warning) = axiom_warning {
+        response = response.warn(warning);
+    }
     Ok(response)
+}
+
+/// Incomplete-build cause for a verification result, if the verdict was
+/// computed against an environment that was not fully assembled.
+fn verification_incomplete_cause(result: &DeclarationVerificationResult) -> Option<crate::diagnosis::IncompleteCause> {
+    use crate::diagnosis::IncompleteCause;
+    match result {
+        DeclarationVerificationResult::MissingImports { missing, .. } => {
+            Some(IncompleteCause::MissingImports(missing.clone()))
+        }
+        // `facts_trustworthy` is the single source of truth set by the
+        // projection: false exactly when the verdict was computed against an
+        // incomplete environment (the `needs_build` label). Checking it here
+        // avoids re-deriving the condition from the status string.
+        DeclarationVerificationResult::Ok { facts, .. } if !facts.facts_trustworthy => {
+            Some(IncompleteCause::Unresolved)
+        }
+        DeclarationVerificationResult::Ok { .. }
+        | DeclarationVerificationResult::HeaderParseFailed { .. }
+        | DeclarationVerificationResult::Unsupported => None,
+    }
+}
+
+/// A verified proof whose `report_axioms` run returned an empty axiom set is
+/// suspicious: anything resting on imported lemmas normally pulls `propext` /
+/// `Classical.choice` / `Quot.sound`. Flag it without claiming the facts wrong.
+fn suspected_axiom_underreport(result: &DeclarationVerificationResult, report_axioms: bool) -> Option<String> {
+    if !report_axioms {
+        return None;
+    }
+    let DeclarationVerificationResult::Ok {
+        verification_status,
+        facts,
+        ..
+    } = result
+    else {
+        return None;
+    };
+    (verification_status == "verified" && facts.axioms.is_empty() && !facts.axioms_truncated).then(|| {
+        "report_axioms returned an empty axiom set on a verified proof; if this declaration depends on imported \
+         (e.g. Mathlib) lemmas, the axiom list may be under-reported"
+            .to_owned()
+    })
 }
 
 fn proof_action_budgets(max_field_bytes: Option<u32>, max_total_bytes: Option<u32>) -> LeanWorkerOutputBudgets {

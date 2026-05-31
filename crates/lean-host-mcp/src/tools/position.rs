@@ -255,6 +255,12 @@ pub enum ProofStateResult {
         total_truncated: bool,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         unavailable: Vec<SelectorMessage>,
+        /// Selectors that could not resolve because the project environment is
+        /// incomplete (the name resolved ambiguously against a partial build).
+        /// Separated from `unavailable` so the agent sees a `lake build` cue
+        /// rather than a generic "unavailable". See the envelope warnings.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        needs_build: Vec<SelectorMessage>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         budget_exceeded: Vec<SelectorMessage>,
         query_facts: Box<ModuleQueryFacts>,
@@ -322,7 +328,20 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             let mut expected_type = None;
             let mut truncated = false;
             let mut unavailable = Vec::new();
+            let mut needs_build = Vec::new();
             let mut budget_exceeded = Vec::new();
+
+            // A selector that could not resolve because the project build is
+            // incomplete is routed to `needs_build`, not the generic
+            // `unavailable` bucket, so the agent gets a `lake build` cue
+            // instead of chasing a phantom name collision.
+            let mut route_unavailable = |id, message: String| {
+                if crate::diagnosis::signals_unresolved(&message) {
+                    needs_build.push(SelectorMessage { id, message });
+                } else {
+                    unavailable.push(SelectorMessage { id, message });
+                }
+            };
 
             for item in result.items {
                 match project_batch_item(item, None) {
@@ -342,13 +361,13 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                                 truncated = info.truncated;
                             }
                             ProofStateProjection::Unavailable { message } => {
-                                unavailable.push(SelectorMessage { id, message });
+                                route_unavailable(id, message);
                             }
                         },
                         _ => {}
                     },
                     ProjectedBatchItem::Unavailable { id, message } => {
-                        unavailable.push(SelectorMessage { id, message });
+                        route_unavailable(id, message);
                     }
                     ProjectedBatchItem::BudgetExceeded { id, message } => {
                         budget_exceeded.push(SelectorMessage { id, message });
@@ -356,6 +375,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 }
             }
 
+            let degraded = !needs_build.is_empty();
             let response = Response::ok(
                 ProofStateResult::Context {
                     diagnostics,
@@ -368,12 +388,18 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                     truncated,
                     total_truncated: result.total_truncated,
                     unavailable,
+                    needs_build,
                     budget_exceeded,
                     query_facts: Box::new(query_facts.clone()),
                 },
                 freshness,
             )
             .with_runtime(run.runtime.clone());
+            let response = if degraded {
+                crate::diagnosis::warn_needs_build(response, &crate::diagnosis::IncompleteCause::Unresolved)
+            } else {
+                response
+            };
             Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
@@ -517,6 +543,10 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut any_freshly_processed = false;
+    // First missing-`.olean` error, if any. Project scope degrades to
+    // "indexed so far" (like the LSP) rather than hard-erroring on the first
+    // unbuilt dependency; this carries the `lake build` cue for the envelope.
+    let mut needs_build: Option<ServerError> = None;
 
     'outer: for path in files {
         let display = display_path(&root, &path);
@@ -590,6 +620,14 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
             Err(ServerError::Io(_)) => {
                 files_skipped = files_skipped.saturating_add(1);
             }
+            Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
+                // An unbuilt dependency in an unrelated subtree should not make
+                // the whole query fail; skip the file and report needs_build.
+                files_skipped = files_skipped.saturating_add(1);
+                if needs_build.is_none() {
+                    needs_build = Some(err);
+                }
+            }
             Err(err) => return Err(err),
         }
     }
@@ -611,12 +649,20 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
         missing_imports_files,
         semantic_based: true,
     };
-    Ok(attach_query_notes(
+    let response = attach_query_notes(
         Response::ok(result, freshness).with_runtime(runtime),
         any_freshly_processed,
         &[],
         false,
-    ))
+    );
+    let response = match needs_build {
+        Some(err) => crate::diagnosis::warn_needs_build(
+            response,
+            &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+        ),
+        None => response,
+    };
+    Ok(response)
 }
 
 // --- shared plumbing ---------------------------------------------------
@@ -1156,6 +1202,7 @@ import Init -- comment
             truncated: false,
             total_truncated: false,
             unavailable: Vec::new(),
+            needs_build: Vec::new(),
             budget_exceeded: Vec::new(),
             query_facts: Box::new(project_query_facts(worker_facts(LeanWorkerModuleCacheStatus::Miss))),
         };

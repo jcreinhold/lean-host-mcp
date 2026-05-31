@@ -72,7 +72,10 @@ A successful response carries `status: "context"` and the context itself:
 ```
 
 A header that doesn't parse returns `status: "header_parse_failed"`; a worker without the optional module-query shim
-returns `status: "unsupported"`. The source spans in responses are diagnostic evidence, not edit handles.
+returns `status: "unsupported"`. The source spans in responses are diagnostic evidence, not edit handles. When a
+selector cannot resolve because the project build is incomplete, it appears in a `needs_build` array (distinct from
+`unavailable`) and a top-level warning names the `lake build` cue — see
+[The `needs_build` signal](#the-needs_build-signal).
 
 ## `search_for_proof`
 
@@ -215,8 +218,17 @@ policy. **It never writes source files.**
 ```
 
 `verification_status` is the verdict — `verified`, `has_sorry`, `has_unresolved_goals`, `has_diagnostics`, `not_found`,
-and so on. A policy failure (e.g. a `sorry` when `allow_sorry` is false) is a normal structured result, not an
-infrastructure error.
+`needs_build`, and so on. A policy failure (e.g. a `sorry` when `allow_sorry` is false) is a normal structured result,
+not an infrastructure error.
+
+`needs_build` means the name could not be resolved against a complete project environment — usually because the project
+is not fully built — so the facts were computed against a degraded environment. In that case `facts.facts_trustworthy`
+is `false` and a top-level `warning` names the `lake build` cue. `facts_trustworthy` is `true` for every clean verdict.
+Do not read a clean `contains_sorry:false` / `unresolved_goals:[]` as "verified" when `facts_trustworthy` is `false`.
+
+When `report_axioms` is true and a `verified` proof reports an empty `axioms` list (with `axioms_truncated:false`), a
+warning flags it as a likely under-report — a proof resting on imported lemmas normally pulls `propext` /
+`Classical.choice` / `Quot.sound`.
 
 ```jsonc
 {
@@ -228,7 +240,8 @@ infrastructure error.
       "contains_sorry": false,
       "unresolved_goals": [],
       "axioms": ["propext", "Classical.choice", "Quot.sound"],  // when report_axioms is true
-      "diagnostics": { "diagnostics": [], "truncated": false }
+      "diagnostics": { "diagnostics": [], "truncated": false },
+      "facts_trustworthy": true
     }
   }
 }
@@ -272,4 +285,15 @@ or the project, optionally narrowed to an explicit file list and a `limit` (capp
 ```
 
 Project scope also reports header-parse failures, files with missing imports, and unsupported files, so a partial scan
-is visible rather than silent.
+is visible rather than silent. If a file's query hits a missing `.olean` (an unbuilt dependency), project scope **does
+not** fail the whole request: it skips that file, continues — returning the references indexed so far, like an editor's
+"indexed so far" — and attaches a top-level `needs_build` warning naming the blocking `lake build` cue.
+
+## The `needs_build` signal
+
+Several tools share one honest verdict for "the project environment is incomplete." `verify_declaration` reports it as
+`verification_status: "needs_build"`; `proof_state` collects the affected selectors in a `needs_build` array (distinct
+from `unavailable`); `find_references` and `search_for_proof` surface it as a top-level warning. In every case the
+warning text and a `lake build` next action are identical, and they replace what used to be a misleading `"ambiguous"`
+verdict (with no candidates to act on) or a hard error. The fix is always the same: run `lake build`, resolve errors,
+then retry.

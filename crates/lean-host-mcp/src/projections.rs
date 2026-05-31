@@ -242,23 +242,10 @@ pub struct DeclarationInspection {
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct DeclarationInspectionCandidate {
-    pub name: String,
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DeclarationInspectionResult {
-    Found {
-        declaration: Box<DeclarationInspection>,
-    },
-    NotFound {
-        name: Option<String>,
-    },
-    Ambiguous {
-        candidates: Vec<DeclarationInspectionCandidate>,
-    },
+    Found { declaration: Box<DeclarationInspection> },
+    NotFound { name: Option<String> },
     Unsupported,
 }
 
@@ -321,6 +308,13 @@ pub struct DeclarationVerificationFacts {
     pub axioms: Vec<String>,
     pub axioms_truncated: bool,
     pub output_truncated: bool,
+    /// `false` when the verdict was computed against an incomplete project
+    /// environment (a `needs_build` status, or imports the worker could not
+    /// load). The other facts in this block are then unreliable: a clean
+    /// `contains_sorry:false` / `unresolved_goals:[]` does not mean the
+    /// declaration verified — the environment could not be assembled to check
+    /// it. Always serialized; an absent trust flag is worse than a present one.
+    pub facts_trustworthy: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -600,6 +594,12 @@ pub fn project_declaration_inspection(result: LeanWorkerDeclarationInspectionRes
             DeclarationInspectionResult::NotFound { name: Some(name) }
         }
         LeanWorkerDeclarationInspectionResult::Unsupported => DeclarationInspectionResult::Unsupported,
+        // `LeanWorkerDeclarationInspectionResult` is `Found | NotFound |
+        // Unsupported` on the current worker (the enum is `#[non_exhaustive]`,
+        // hence this arm). It has no `Ambiguous`/incomplete-build variant, so
+        // unlike `verify_declaration` there is no `needs_build` case to
+        // reclassify here. If the worker gains one (see
+        // ~/Code/prompts/lean-rs/12-*.md), route it through `crate::diagnosis`.
         _ => DeclarationInspectionResult::Unsupported,
     }
 }
@@ -672,11 +672,17 @@ pub fn project_declaration_verification(
             verification_status,
             facts,
             imports,
-        } => DeclarationVerificationResult::Ok {
-            verification_status: verification_status_label(verification_status, &facts).to_owned(),
-            facts: Box::new(project_declaration_verification_facts(*facts)),
-            imports,
-        },
+        } => {
+            let label = verification_status_label(verification_status, &facts);
+            // A `needs_build` verdict means the name could not be resolved
+            // against a complete environment, so the facts are unreliable.
+            let trustworthy = label != crate::diagnosis::NEEDS_BUILD_STATUS;
+            DeclarationVerificationResult::Ok {
+                verification_status: label.to_owned(),
+                facts: Box::new(project_declaration_verification_facts(*facts, trustworthy)),
+                imports,
+            }
+        }
         LeanWorkerDeclarationVerificationResult::MissingImports {
             verification_status,
             facts,
@@ -684,7 +690,9 @@ pub fn project_declaration_verification(
             missing,
         } => DeclarationVerificationResult::MissingImports {
             verification_status: verification_status_label(verification_status, &facts).to_owned(),
-            facts: Box::new(project_declaration_verification_facts(*facts)),
+            // Imports the worker could not load: the environment is incomplete,
+            // so the verdict's facts are not trustworthy.
+            facts: Box::new(project_declaration_verification_facts(*facts, false)),
             imports,
             missing,
         },
@@ -700,6 +708,7 @@ pub fn project_declaration_verification(
 
 fn project_declaration_verification_facts(
     facts: LeanWorkerDeclarationVerificationFacts,
+    facts_trustworthy: bool,
 ) -> DeclarationVerificationFacts {
     DeclarationVerificationFacts {
         target: facts.target.map(project_proof_action_target),
@@ -711,6 +720,7 @@ fn project_declaration_verification_facts(
         axioms: facts.axioms,
         axioms_truncated: facts.axioms_truncated,
         output_truncated: facts.output_truncated,
+        facts_trustworthy,
     }
 }
 
@@ -729,7 +739,11 @@ fn verification_status_label(
         }
         LeanWorkerDeclarationVerificationStatus::Rejected => "has_diagnostics",
         LeanWorkerDeclarationVerificationStatus::NotFound => "not_found",
-        LeanWorkerDeclarationVerificationStatus::Ambiguous => "ambiguous",
+        // The worker reports "ambiguous" with no competing candidates when the
+        // name cannot be resolved against a complete environment. On the
+        // current worker that is the incomplete-build condition, not a genuine
+        // multiple-resolution, so present it as the actionable `needs_build`.
+        LeanWorkerDeclarationVerificationStatus::Ambiguous => crate::diagnosis::NEEDS_BUILD_STATUS,
         LeanWorkerDeclarationVerificationStatus::Timeout => "timeout",
         LeanWorkerDeclarationVerificationStatus::BudgetExceeded => "budget_exceeded",
         LeanWorkerDeclarationVerificationStatus::Unsupported => "unsupported",
@@ -758,5 +772,74 @@ fn project_proof_search_facts(facts: LeanWorkerDeclarationProofSearchFacts) -> D
         is_instance: facts.is_instance,
         is_class: facts.is_class,
         class_name: facts.class_name,
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "unit tests fail directly on the wrong variant"
+)]
+mod tests {
+    use super::*;
+
+    fn clean_facts() -> LeanWorkerDeclarationVerificationFacts {
+        LeanWorkerDeclarationVerificationFacts {
+            target: None,
+            diagnostics: LeanWorkerElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
+            unresolved_goals: Vec::new(),
+            contains_sorry: false,
+            contains_admit: false,
+            contains_sorry_ax: false,
+            axioms: Vec::new(),
+            axioms_truncated: false,
+            output_truncated: false,
+        }
+    }
+
+    #[test]
+    fn ambiguous_verification_is_reclassified_as_needs_build_with_untrustworthy_facts() {
+        let result = project_declaration_verification(LeanWorkerDeclarationVerificationResult::Ok {
+            verification_status: LeanWorkerDeclarationVerificationStatus::Ambiguous,
+            facts: Box::new(clean_facts()),
+            imports: Vec::new(),
+        });
+        let DeclarationVerificationResult::Ok {
+            verification_status,
+            facts,
+            ..
+        } = result
+        else {
+            panic!("expected an Ok verdict");
+        };
+        assert_eq!(verification_status, "needs_build");
+        // The facts are retained (not nulled) but flagged untrustworthy so a
+        // reader can't take the clean `contains_sorry:false` at face value when
+        // the environment was incomplete.
+        assert!(!facts.facts_trustworthy);
+        assert!(!facts.contains_sorry);
+    }
+
+    #[test]
+    fn accepted_verification_keeps_facts_trustworthy() {
+        let result = project_declaration_verification(LeanWorkerDeclarationVerificationResult::Ok {
+            verification_status: LeanWorkerDeclarationVerificationStatus::Accepted,
+            facts: Box::new(clean_facts()),
+            imports: Vec::new(),
+        });
+        let DeclarationVerificationResult::Ok {
+            verification_status,
+            facts,
+            ..
+        } = result
+        else {
+            panic!("expected an Ok verdict");
+        };
+        assert_eq!(verification_status, "verified");
+        assert!(facts.facts_trustworthy);
     }
 }

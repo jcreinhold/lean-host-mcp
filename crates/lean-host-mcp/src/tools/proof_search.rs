@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::broker::{BrokerCall, ProjectHint};
 use crate::envelope::{Response, RuntimeFacts};
-use crate::error::{Result, ServerError};
+use crate::error::Result;
 use crate::projections::{
     DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, project_declaration_search,
 };
@@ -179,16 +179,16 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
             .await
         {
             Ok(call) => call,
-            Err(err) if missing_import_failure(&err) => {
-                warnings.push(format!(
-                    "missing_imports: declaration search could not load import profile {:?}: {err}",
-                    profile.imports
-                ));
+            Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
                 let result = empty_result(profile.clone(), warnings);
                 let hint = ProjectHint::from_request(project);
                 let project_runtime = ctx.broker.project_runtime(hint, profile.imports.clone()).await?;
-                return Ok(Response::ok(result, project_runtime.freshness)
-                    .with_runtime(project_runtime.runtime)
+                let response = Response::ok(result, project_runtime.freshness).with_runtime(project_runtime.runtime);
+                let response = crate::diagnosis::warn_needs_build(
+                    response,
+                    &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+                );
+                return Ok(response
                     .hint("supply a valid file or explicit imports; search_for_proof will not broad-import Mathlib as fallback"));
             }
             Err(err) => return Err(err),
@@ -560,6 +560,25 @@ fn rank_results(
             match_reason: candidate.reasons.into_iter().collect::<Vec<_>>().join(","),
         })
         .collect::<Vec<_>>();
+
+    // Honesty signal: if the goal carried domain name-fragments but no returned
+    // candidate's name matches any of them, the results are conclusion-head
+    // matches (e.g. generic `Iff`/`eq` lemmas), not domain-relevant. Say so
+    // rather than letting the agent mistake noise for guidance.
+    let mut warnings = warnings;
+    if !candidates.is_empty()
+        && !profile.name_fragments.is_empty()
+        && !candidates.iter().any(|candidate| {
+            let lower = candidate.name.to_lowercase();
+            profile.name_fragments.iter().any(|fragment| lower.contains(fragment))
+        })
+    {
+        warnings.push(
+            "results match the goal's conclusion head only, not its domain terms; for a known target prefer \
+             find_references or loogle over search_for_proof"
+                .to_owned(),
+        );
+    }
 
     let mut result = SearchForProofResult {
         diagnostics: ProofSearchDiagnostics {
@@ -1176,15 +1195,6 @@ fn is_stopword(token: &str) -> bool {
     )
 }
 
-fn missing_import_failure(err: &ServerError) -> bool {
-    let text = err.to_string().to_lowercase();
-    (text.contains(".olean")
-        && (text.contains("does not exist") || text.contains("no such file") || text.contains("object file")))
-        || text.contains("unknown module")
-        || text.contains("unknown import")
-        || text.contains("module not found")
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -1402,18 +1412,5 @@ mod tests {
 
         assert!(solver_score > array_score, "{solver_score} should beat {array_score}");
         assert!(cooper_score > order_score, "{cooper_score} should beat {order_score}");
-    }
-
-    #[test]
-    fn missing_import_search_errors_are_recognized_for_empty_result_shaping() {
-        assert!(missing_import_failure(&ServerError::Lean(
-            "object file '/tmp/Missing/Import.olean' does not exist".to_owned()
-        )));
-        assert!(missing_import_failure(&ServerError::Lean(
-            "unknown module 'Definitely.Missing'".to_owned()
-        )));
-        assert!(!missing_import_failure(&ServerError::Lean(
-            "unknown declaration Foo.bar".to_owned()
-        )));
     }
 }
