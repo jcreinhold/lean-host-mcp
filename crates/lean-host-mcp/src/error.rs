@@ -90,9 +90,6 @@ pub enum ServerError {
     #[error("lake project not usable: {0}")]
     BadProject(String),
 
-    #[error("declaration index: {0}")]
-    Index(String),
-
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -137,7 +134,6 @@ impl From<ServerError> for McpError {
             other @ (ServerError::Lean(_)
             | ServerError::SessionGone
             | ServerError::BadProject(_)
-            | ServerError::Index(_)
             | ServerError::Io(_)
             | ServerError::Internal(_)) => Self::internal_error(other.to_string(), None),
         }

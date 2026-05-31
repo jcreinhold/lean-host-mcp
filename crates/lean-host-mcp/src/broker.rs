@@ -49,8 +49,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
 use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
-use crate::index::fingerprint_lake_project;
-use crate::lake_meta::LakeProjectMeta;
+use crate::lake_meta::{LakeProjectMeta, fingerprint_lake_project};
 use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig, SemanticAdmission};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.

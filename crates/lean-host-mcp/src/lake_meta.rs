@@ -22,12 +22,13 @@
 //! calibration target. Anything more elaborate is the user's job to
 //! declare via the explicit hint.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::{Result, ServerError};
-use crate::index::fingerprint_lake_project;
 
 /// Everything the private project runtime needs to spawn a worker against one
 /// Lake project.
@@ -60,9 +61,8 @@ impl LakeProjectMeta {
     /// # Errors
     ///
     /// Returns [`ServerError::BadProject`] when the path does not
-    /// canonicalise, neither lakefile variant is present, or both parsers
-    /// reject the file. Propagates [`ServerError::Index`] from
-    /// [`fingerprint_lake_project`] if the manifest cannot be read.
+    /// canonicalise, neither lakefile variant is present, both parsers reject
+    /// the file, or [`fingerprint_lake_project`] cannot read the manifest.
     pub fn from_explicit(root: &Path) -> Result<Self> {
         let canonical_root = root
             .canonicalize()
@@ -218,6 +218,28 @@ fn read_lean_toolchain(root: &Path) -> String {
     std::fs::read_to_string(&path)
         .ok()
         .map_or_else(|| "unknown".into(), |s| s.trim().to_owned())
+}
+
+/// SHA-256 (lowercase hex) of `<lake_root>/lake-manifest.json`.
+///
+/// The manifest pins every transitive dependency revision, so its hash is a
+/// tight upper bound on "is the declaration set still the same" — the staleness
+/// fingerprint the broker uses to decide when a project's cached module queries
+/// are stale.
+///
+/// # Errors
+///
+/// Returns [`ServerError::BadProject`] if the manifest cannot be read.
+pub fn fingerprint_lake_project(lake_root: &Path) -> Result<String> {
+    let manifest = lake_root.join("lake-manifest.json");
+    let bytes =
+        std::fs::read(&manifest).map_err(|e| ServerError::BadProject(format!("read {}: {e}", manifest.display())))?;
+    let digest = Sha256::digest(&bytes);
+    let mut s = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in &digest {
+        let _ = write!(s, "{byte:02x}");
+    }
+    Ok(s)
 }
 
 /// Sanitise a directory name into a Lake package identifier.

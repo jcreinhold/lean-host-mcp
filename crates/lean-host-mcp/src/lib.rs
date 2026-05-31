@@ -18,8 +18,6 @@
 //!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.
 //! - [`lake_meta`]: `LakeProjectMeta`, the minimal description of a Lake
 //!   project that the private project runtime consumes.
-//! - [`index`]: legacy `DeclarationIndex` storage retained for internal tests
-//!   and migration; MCP declaration lookup now uses bounded worker queries.
 //! - [`error`]: `ServerError`, the one error type tool handlers return.
 //! - [`tools`]: tool implementations, grouped by proof workflow stage.
 //! - [`server`]: rmcp glue.
@@ -29,7 +27,6 @@ mod cache;
 pub mod cli;
 pub mod envelope;
 pub mod error;
-pub mod index;
 pub mod lake_meta;
 mod project;
 pub mod projections;
@@ -41,7 +38,6 @@ pub mod tools;
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
 pub use envelope::{Freshness, Response, ResponseStatus, RuntimeFacts, RuntimeFailure};
 pub use error::{Result, ServerError};
-pub use index::{DeclarationIndex, IndexedDeclaration, default_cache_dir, fingerprint_lake_project};
 pub use lake_meta::LakeProjectMeta;
 pub use project::ProjectRuntimeConfig;
 pub use projections::{
