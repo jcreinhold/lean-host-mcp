@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-31
+
 ### Added
 
 - Initial release of `lean-host-mcp`, an MCP server that hosts Lean 4 in a supervised worker child
@@ -28,9 +30,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Lean-domain failures are part of the `Ok` payload, not MCP errors.
 - Worker RSS supervision: a post-job restart policy and an in-flight hard-kill watchdog, plus the
   `rss_threshold_sweep.py` tuning tool.
+- Honest resolution verdicts: an incomplete project build degrades to a single `needs_build` verdict carrying a
+  `lake build` cue across `verify_declaration`, `inspect_declaration`, `proof_state`, `try_proof_step`,
+  `find_references`, and `search_for_proof` — never a misleading `ambiguous` status or a hard transport error. Genuine
+  ambiguity instead names the competing declarations, and `facts_trustworthy` flags any verdict computed against an
+  incomplete or unresolved environment.
+- Builds on `lean-rs-worker-parent` / `-child` 0.1.19 (worker protocol 8), supporting the Lean toolchain window
+  `4.26.0 ..= 4.31.0-rc1` (head `4.31.0-rc1`).
 
 ### Notes
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[unreleased]: https://github.com/jcreinhold/lean-host-mcp/commits/main
+[unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jcreinhold/lean-host-mcp/releases/tag/v0.1.0
