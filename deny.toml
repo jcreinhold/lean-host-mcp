@@ -84,7 +84,7 @@ deny = [
 ]
 
 # Certain crates/versions that will be skipped when doing duplicate detection.
-skip = ["hashbrown"]
+skip = []
 
 # Similarly to `skip` allows you to skip certain crates from being checked
 skip-tree = []
