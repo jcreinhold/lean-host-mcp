@@ -1,8 +1,12 @@
 # Architecture
 
-`lean-host-mcp` is a thin MCP server over `lean-rs-worker`. The public API is intentionally declaration-centric: agents
-name a declaration and, when needed, a proof position inside that declaration. They do not pass cursor coordinates,
-source spans, byte offsets, replacement ranges, or inserted spans.
+> This is a contributor and maintainer document: how the server is built and why. If you want to *use* `lean-host-mcp`,
+> start with the [README](../README.md) and the [tool catalog](tool-catalog.md).
+
+`lean-host-mcp` is a thin MCP server over `lean-rs-worker`. The design thesis is a **declaration-centric** public API:
+agents name a declaration and, when needed, a proof position inside it — never cursor coordinates, source spans, byte
+offsets, or replacement ranges. The host translates those names into bounded, read-only semantic jobs against a
+supervised worker child, and projects the worker's results into one stable response envelope.
 
 The model-facing tools are:
 
@@ -79,6 +83,12 @@ Lean-domain failures such as parse errors, elaboration diagnostics, missing impo
 proof snippets, and sorry policy failures are structured tool results. Recoverable runtime failures are
 `runtime_unavailable` tool responses. MCP errors are reserved for invalid requests, I/O/config failures, internal
 invariants, and unusable Lake projects.
+
+The capabilities the worker exercises across that boundary are the `lean_rs_host_*` symbols (28 mandatory, 6 optional)
+that ship inside `lean-rs-host` as a vendored Lake package. The host builds that package once per toolchain at first
+session open and loads it without touching the consumer project's `:shared` facet, so consumer projects never declare,
+link, or `@[export]` it. This is an implementation guarantee, not consumer setup; it is why the README's prerequisite is
+only "a built Lake project."
 
 ### Toolchain-Readiness Gate
 
@@ -173,18 +183,22 @@ policy. Policy failures are normal results.
 `find_references` runs semantic reference lookup for a fully-qualified name in file or bounded project scope. Project
 scope reports scanned/skipped files, header failures, missing imports, unsupported files, and truncation.
 
-## Removed Public Surface
+## Scope Boundary
 
-The server deliberately does not expose:
+The surface stays declaration-centric on purpose: every public tool answers a proof-work question about a named
+declaration, and lower-level Lean primitives stay private. Capabilities deliberately kept below the boundary, and the
+proof-work tool that subsumes each, include:
 
-- low-level term/meta tools: `elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`;
-- LSP-shaped declaration tools: `hover_by_name`, `type_of_name`, raw `search_declarations`;
-- raw module-query access: `lean_query`;
-- text search and placement policy: `source_search`, `project_scan`, `mathlib_placement`;
-- split reference aliases: `references_in_file`, `references_in_project`.
+- low-level term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`) — composed inside
+  `try_proof_step` and `verify_declaration`;
+- LSP-shaped declaration queries (`hover_by_name`, `type_of_name`, raw `search_declarations`) — folded into
+  `inspect_declaration` and `search_for_proof`;
+- raw module-query access (`lean_query`) — driven internally by `proof_state`;
+- text search and placement policy (`source_search`, `project_scan`, `mathlib_placement`);
+- split reference aliases (`references_in_file`, `references_in_project`) — unified under `find_references`.
 
-If one of these capabilities is needed to implement a deeper tool, keep it private and compose it inside the host or
-worker. A need to expose it directly is treated as evidence that a better proof-work abstraction is missing.
+When one of these is needed to implement a deeper tool, keep it private and compose it inside the host or worker. A need
+to expose it directly is treated as evidence that a better proof-work abstraction is missing.
 
 ## Budgets And Caching
 
