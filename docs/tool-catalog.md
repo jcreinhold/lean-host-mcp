@@ -225,8 +225,14 @@ policy. **It never writes source files.**
 ```
 
 `verification_status` is the verdict — `verified`, `has_sorry`, `has_unresolved_goals`, `has_diagnostics`, `not_found`,
-`needs_build`, `ambiguous`, and so on. A policy failure (e.g. a `sorry` when `allow_sorry` is false) is a normal
-structured result, not an infrastructure error.
+`needs_build`, `ambiguous`, `worker_recycled`, and so on. A policy failure (e.g. a `sorry` when `allow_sorry` is false)
+is a normal structured result, not an infrastructure error.
+
+`worker_recycled` means the worker was recycled or restarted *during* this call (a memory-pressure recycle on a heavy
+module, or a crash-and-retry), so a non-positive verdict here is a likely casualty of the recycle rather than a real
+result. `facts.facts_trustworthy` is `false` and a top-level warning names the cause and suggests a retry. A `verified`
+verdict is never relabeled — verification is monotone, so an accepted declaration stays trustworthy even under duress.
+See [The `worker_recycled` signal](#the-worker_recycled-signal).
 
 `needs_build` means the name could not be resolved against a complete project environment — usually because the project
 is not fully built — so the facts were computed against a degraded environment. `ambiguous` means the name genuinely
@@ -320,3 +326,22 @@ This replaces what used to be a misleading `"ambiguous"` verdict with no candida
 classifies resolution at its own boundary, so `"ambiguous"` is reserved for *genuine* multiple-resolution and always
 arrives with the competing declarations named (`proof_state`'s `ambiguous` array, `verify_declaration`'s
 `facts.candidates`), with a fully-qualify next action.
+
+## The `worker_recycled` signal
+
+`needs_build` and `ambiguous` are about the *input* (the environment was incomplete, or the name was ambiguous).
+`worker_recycled` is about the *execution*: the worker was recycled or restarted while the call was in flight. On a
+heavy module the worker's resident memory can cross its post-job RSS budget, triggering a recycle right after the job;
+or the job can crash the worker and be retried. Either way the verdict was computed under infrastructure duress, so a
+non-positive outcome — a rejection, `not_found`, a failed tactic, or empty goals — may be a casualty of the recycle
+rather than a real result.
+
+The signal comes from the call's runtime facts (`runtime.call_restart`), which the parent already attaches, not from a
+new worker outcome. Only *job-disrupting* causes count (`rss_post_job`, `child_abort`, `child_exit`, `session_missing`,
+`worker_internal`, `timeout`, `cancelled`); a pre-job `rss_import_switch` cycle runs the job on a fresh worker and is
+not flagged. `verify_declaration` relabels a non-positive verdict to `verification_status: "worker_recycled"` with
+`facts.facts_trustworthy: false`; `try_proof_step` and `proof_state` keep their result shape but carry a top-level
+warning, since they have no single verdict to relabel. In every case the next action is to retry — and if it persists,
+the module is too heavy for the worker's memory budget (raise `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB`, or verify
+out-of-band with `lake build <module>` / `lake env lean <file>`). A `verified` result is left untouched: verification is
+monotone, so an accepted declaration is trustworthy even if the worker recycled afterward.

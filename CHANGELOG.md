@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Honest `worker_recycled` verdict: when the worker is recycled or restarted *during* a semantic call (a memory-pressure
+  recycle on a heavy module, or a crash-and-retry), the verdict was computed under infrastructure duress.
+  `verify_declaration` now relabels a non-positive verdict to `verification_status: "worker_recycled"` with
+  `facts_trustworthy: false` instead of a misleading `not_found`, and `try_proof_step` / `proof_state` carry a retry
+  warning. A `verified` verdict is never relabeled (verification is monotone). The signal is derived from the call's
+  runtime facts (`call_restart`) and excludes benign pre-job/planned cycles.
+
 ## [0.1.0] - 2026-05-31
 
 ### Added

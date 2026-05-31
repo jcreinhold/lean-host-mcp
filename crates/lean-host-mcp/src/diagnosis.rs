@@ -1,7 +1,8 @@
 //! Resolution-health rendering: the parent's one set of honest, actionable
-//! messages for the two ways a name fails to resolve usefully — the project
-//! environment is incomplete (`needs_build`), or the name is genuinely
-//! ambiguous (multiple competing declarations).
+//! messages for the ways a verdict is untrustworthy — the project environment
+//! is incomplete (`needs_build`), the name is genuinely ambiguous (multiple
+//! competing declarations), or the verdict was computed while the worker was
+//! recycled/crashed mid-call (`worker_recycled`, [`execution_taint`]).
 //!
 //! Ousterhout ch.10 (exception aggregation). The incomplete-build condition
 //! used to reach the parent in several disguises — a worker `MissingImports`
@@ -23,7 +24,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::envelope::Response;
+use crate::envelope::{Response, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError};
 
 /// Why a query ran against an environment that was not fully built. Each
@@ -160,6 +161,84 @@ where
     resp.warn(warning).hint(next_action)
 }
 
+/// The wire status token for a verdict computed while the worker was recycled
+/// or crashed mid-call. One producer so every tool agrees on the spelling.
+pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
+
+/// Recognise that this call's verdict was computed under infrastructure duress:
+/// the worker was recycled or restarted *during* the call by a job-disrupting
+/// cause, so a non-positive Lean verdict (a rejection, `not_found`, timeout) is
+/// not reliable evidence about the declaration — it may be a casualty of the
+/// recycle, not a real result.
+///
+/// Returns the `call_restart` event for a job-disrupting cause; `None`
+/// otherwise. The benign causes are deliberately excluded:
+/// - `rss_import_switch` / `import_profile_switch` cycle the worker *before* the
+///   job runs, so the job then executes on a fresh worker — its verdict is
+///   sound.
+/// - `max_requests` / `max_imports` / `idle` / `explicit` are planned hygiene
+///   cycles, not duress.
+///
+/// `rss_post_job` *is* job-disrupting even though it fires after the job
+/// returned `Ok`: crossing the post-job RSS budget means the job elaborated
+/// under heavy memory pressure, and report 62 §A documented that exact
+/// condition degrading a verdict — a *valid* lemma returned `not_found` while
+/// the worker sat 2.4 GiB over its 5 GiB cap. The worker returns a degraded
+/// value rather than crashing, so "the job returned `Ok`" is not evidence the
+/// verdict is sound. A `verified` verdict is never relabeled regardless, so a
+/// marginal-overage false positive only costs a retry hint.
+///
+/// The cause strings mirror `crate::project::RestartCause::as_str`; the unit
+/// test below pins the disrupting set so a new cause there is a conscious
+/// decision here.
+pub(crate) fn execution_taint(runtime: &RuntimeFacts) -> Option<&RuntimeRestartEvent> {
+    let event = runtime.call_restart.as_ref()?;
+    matches!(
+        event.cause.as_str(),
+        "rss_post_job"
+            | "rss_hard_limit_exceeded"
+            | "child_abort"
+            | "child_exit"
+            | "session_missing"
+            | "worker_internal"
+            | "timeout"
+            | "cancelled"
+    )
+    .then_some(event)
+}
+
+/// The canonical `(warning, next_action)` pair for an execution-tainted verdict.
+/// Pure so it can be unit-tested without a [`Response`]. Names the recycle cause
+/// and, when known, the RSS numbers that explain it.
+pub(crate) fn execution_taint_text(event: &RuntimeRestartEvent) -> (String, String) {
+    let rss = match (event.rss_kib, event.limit_kib) {
+        (Some(rss), Some(limit)) => format!(" (rss {rss} KiB vs limit {limit} KiB)"),
+        (Some(rss), None) => format!(" (rss {rss} KiB)"),
+        _ => String::new(),
+    };
+    let warning = format!(
+        "the worker was recycled or restarted during this call ({cause}){rss}; any non-positive outcome here — a \
+         rejection, `not_found`, a failed tactic, or empty goals — may be a casualty of the recycle rather than a real \
+         result, and is not trustworthy. Retry; if it persists, the module is too heavy for the worker's memory budget \
+         (raise LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB or verify with `lake build` / `lake env lean`).",
+        cause = event.cause,
+    );
+    let next_action = "retry; if it persists, verify with `lake build <module>` or `lake env lean <file>`".to_owned();
+    (warning, next_action)
+}
+
+/// Attach the canonical execution-taint warning + retry next action. The single
+/// rendering point for the condition across `verify_declaration`,
+/// `try_proof_step`, and `proof_state`.
+#[must_use]
+pub(crate) fn warn_execution_taint<T>(resp: Response<T>, event: &RuntimeRestartEvent) -> Response<T>
+where
+    T: Serialize + JsonSchema,
+{
+    let (warning, next_action) = execution_taint_text(event);
+    resp.warn(warning).hint(next_action)
+}
+
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or(text).trim()
 }
@@ -226,6 +305,74 @@ mod tests {
 
         // A success passes through untouched.
         assert!(matches!(classify_missing_olean(Ok(7)), Ok(CallOutcome::Ready(7))));
+    }
+
+    fn facts_with_restart(cause: &str) -> RuntimeFacts {
+        RuntimeFacts {
+            call_restart: Some(RuntimeRestartEvent {
+                cause: cause.to_owned(),
+                reason: format!("{cause} current_kib=7000000 limit_kib=5000000"),
+                worker_generation: 9,
+                planned: false,
+                rss_kib: Some(7_000_000),
+                limit_kib: Some(5_000_000),
+            }),
+            ..RuntimeFacts::default()
+        }
+    }
+
+    #[test]
+    fn execution_taint_flags_job_disrupting_causes_only() {
+        // Job-disrupting causes taint the verdict.
+        for cause in [
+            "rss_post_job",
+            "rss_hard_limit_exceeded",
+            "child_abort",
+            "child_exit",
+            "session_missing",
+            "worker_internal",
+            "timeout",
+            "cancelled",
+        ] {
+            assert!(
+                execution_taint(&facts_with_restart(cause)).is_some(),
+                "{cause} should taint the verdict"
+            );
+        }
+        // A pre-job clean cycle and planned hygiene cycles do not: the job ran
+        // on a fresh worker, or the cycle was routine.
+        for cause in [
+            "rss_import_switch",
+            "import_profile_switch",
+            "max_requests",
+            "max_imports",
+            "idle",
+            "explicit",
+        ] {
+            assert!(
+                execution_taint(&facts_with_restart(cause)).is_none(),
+                "{cause} should not taint the verdict"
+            );
+        }
+        // No restart at all: nothing to flag.
+        assert!(execution_taint(&RuntimeFacts::default()).is_none());
+    }
+
+    #[test]
+    fn execution_taint_text_names_cause_and_rss_and_offers_a_retry() {
+        let (warning, next_action) = execution_taint_text(&RuntimeRestartEvent {
+            cause: "rss_post_job".to_owned(),
+            reason: String::new(),
+            worker_generation: 1,
+            planned: false,
+            rss_kib: Some(7_600_000),
+            limit_kib: Some(5_242_880),
+        });
+        assert!(warning.contains("rss_post_job"));
+        assert!(warning.contains("7600000"));
+        assert!(warning.contains("5242880"));
+        assert!(warning.contains("not trustworthy"));
+        assert!(next_action.contains("retry"));
     }
 
     #[test]

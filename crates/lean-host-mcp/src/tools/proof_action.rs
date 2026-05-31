@@ -19,7 +19,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::broker::ProjectHint;
-use crate::diagnosis::{CallOutcome, IncompleteCause, NEEDS_BUILD_STATUS, classify_missing_olean, warn_needs_build};
+use crate::diagnosis::{
+    CallOutcome, IncompleteCause, NEEDS_BUILD_STATUS, WORKER_RECYCLED_STATUS, classify_missing_olean, execution_taint,
+    warn_execution_taint, warn_needs_build,
+};
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::projections::{
@@ -135,6 +138,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
         CallOutcome::Ready(call) => call,
         CallOutcome::NeedsBuild(err) => return proof_step_needs_build_response(ctx, hint, imports, err).await,
     };
+    let taint = execution_taint(&call.runtime).cloned();
     let mut response = Response::ok(
         append_capped_rows(project_proof_attempt(call.value), extra_rows),
         call.freshness,
@@ -151,6 +155,11 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     };
     if let Some(missing) = missing {
         response = warn_needs_build(response, &IncompleteCause::MissingImports(missing));
+    }
+    // A recycle mid-attempt can turn a closing tactic into a spurious `failed`;
+    // there is no single verdict to relabel, so flag the whole attempt.
+    if let Some(event) = &taint {
+        response = warn_execution_taint(response, event);
     }
     Ok(response)
 }
@@ -246,8 +255,14 @@ pub async fn verify_declaration(
         CallOutcome::Ready(call) => call,
         CallOutcome::NeedsBuild(err) => return verification_needs_build_response(ctx, hint, imports, err).await,
     };
-    let mut response =
-        Response::ok(project_declaration_verification(call.value), call.freshness).with_runtime(call.runtime);
+    // If the worker was recycled/crashed mid-call, a non-positive verdict is a
+    // likely casualty of the recycle, not a real result; relabel it honestly
+    // before it reaches the agent (verification is monotone, so a `verified`
+    // verdict is left trustworthy even under duress).
+    let taint = execution_taint(&call.runtime).cloned();
+    let mut result = project_declaration_verification(call.value);
+    let recycled = taint.is_some() && relabel_recycled_verdict(&mut result);
+    let mut response = Response::ok(result, call.freshness).with_runtime(call.runtime);
     response
         .next_actions
         .push("source file was not modified by verification".to_owned());
@@ -269,7 +284,37 @@ pub async fn verify_declaration(
     if let Some(warning) = axiom_warning {
         response = response.warn(warning);
     }
+    if let Some(event) = taint.as_ref().filter(|_| recycled) {
+        response = warn_execution_taint(response, event);
+    }
     Ok(response)
+}
+
+/// When the worker was recycled mid-call, a non-positive verification verdict is
+/// suspect: relabel it to `worker_recycled` with untrustworthy facts. Returns
+/// `true` if it relabeled. Leaves `verified` (still trustworthy — verification
+/// is monotone) and the already-honest `needs_build` / `ambiguous` verdicts
+/// unchanged, and only touches the `Ok` variant — a `MissingImports` verdict's
+/// honest action is `lake build`, not a recycle notice. Pure, for unit testing.
+fn relabel_recycled_verdict(result: &mut DeclarationVerificationResult) -> bool {
+    let DeclarationVerificationResult::Ok {
+        verification_status,
+        facts,
+        ..
+    } = result
+    else {
+        return false;
+    };
+    let status = verification_status.as_str();
+    // `verified` is monotone-trustworthy; `needs_build` / `ambiguous` carry their
+    // own honest verdict; and the relabel is idempotent (already `worker_recycled`).
+    if status == "verified" || status == NEEDS_BUILD_STATUS || status == "ambiguous" || status == WORKER_RECYCLED_STATUS
+    {
+        return false;
+    }
+    WORKER_RECYCLED_STATUS.clone_into(verification_status);
+    facts.facts_trustworthy = false;
+    true
 }
 
 /// Build the degraded verdict + envelope when `verify_declaration`'s target
@@ -569,6 +614,65 @@ mod tests {
         assert!(!facts.facts_trustworthy);
         assert!(!facts.axioms_available);
         assert!(!facts.contains_sorry);
+    }
+
+    fn ok_verdict(status: &str, trustworthy: bool) -> DeclarationVerificationResult {
+        let mut facts = needs_build_facts();
+        facts.facts_trustworthy = trustworthy;
+        DeclarationVerificationResult::Ok {
+            verification_status: status.to_owned(),
+            facts: Box::new(facts),
+            imports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recycled_relabels_nonpositive_ok_verdict_to_worker_recycled() {
+        // A `not_found` produced while the worker was recycled is a likely
+        // casualty of the recycle, not a real "name absent".
+        let mut verdict = ok_verdict("not_found", true);
+        assert!(relabel_recycled_verdict(&mut verdict));
+        let DeclarationVerificationResult::Ok {
+            verification_status,
+            facts,
+            ..
+        } = verdict
+        else {
+            panic!("expected an Ok verdict");
+        };
+        assert_eq!(verification_status, WORKER_RECYCLED_STATUS);
+        assert!(!facts.facts_trustworthy);
+    }
+
+    #[test]
+    fn recycled_leaves_verified_and_already_honest_verdicts_unchanged() {
+        // `verified` is monotone-trustworthy even under duress; needs_build and
+        // ambiguous already carry their own honest, actionable verdict.
+        for status in ["verified", NEEDS_BUILD_STATUS, "ambiguous"] {
+            let mut verdict = ok_verdict(status, true);
+            assert!(
+                !relabel_recycled_verdict(&mut verdict),
+                "{status} must not be relabeled"
+            );
+            let DeclarationVerificationResult::Ok {
+                verification_status,
+                facts,
+                ..
+            } = verdict
+            else {
+                panic!("expected an Ok verdict");
+            };
+            assert_eq!(verification_status, status);
+            assert!(facts.facts_trustworthy);
+        }
+    }
+
+    #[test]
+    fn recycled_does_not_touch_missing_imports_verdict() {
+        // A MissingImports verdict's honest action is `lake build`, owned by the
+        // needs_build path — not a recycle notice.
+        let mut verdict = needs_build_verification_result(vec!["Foo.Bar".to_owned()]);
+        assert!(!relabel_recycled_verdict(&mut verdict));
     }
 
     #[test]

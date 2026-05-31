@@ -432,6 +432,12 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 None => response,
             };
             let response = crate::diagnosis::warn_ambiguous(response, &ambiguous_cue);
+            // A recycle mid-batch can leave the goal context empty or degraded,
+            // which reads as a clean "proof done"; flag it honestly.
+            let response = match crate::diagnosis::execution_taint(&run.runtime) {
+                Some(event) => crate::diagnosis::warn_execution_taint(response, event),
+                None => response,
+            };
             Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
