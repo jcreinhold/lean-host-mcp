@@ -108,6 +108,24 @@ impl ToolchainId {
         &self.0
     }
 
+    /// Total-order key for presenting toolchains in a sensible order: numbered
+    /// releases sorted semantically (a release candidate sorts *before* its
+    /// release, e.g. `v4.31.0-rc1 < v4.31.0`), then non-numbered pins
+    /// (`nightly-*`) after, ordered by their string (dates sort naturally).
+    ///
+    /// Reuses [`version_key`] so the ordering matches the supported-window
+    /// logic. Callers (`install-worker` listing/scan) `.cmp()` these keys
+    /// instead of comparing the raw strings, whose lexical order wrongly puts
+    /// `v4.31.0-rc1` *after* `v4.31.0` (the release is a prefix of the rc).
+    #[must_use]
+    pub fn sort_key(&self) -> (u8, (u32, u32, u32, u8, u32), String) {
+        let bare = self.0.strip_prefix('v').unwrap_or(&self.0);
+        match version_key(bare) {
+            Some(k) => (0, k, String::new()),
+            None => (1, (0, 0, 0, 0, 0), self.0.clone()),
+        }
+    }
+
     /// Classify this pin against the lean-rs supported window.
     ///
     /// Pure: reads only [`lean_toolchain::SUPPORTED_TOOLCHAINS`], no IO. The
@@ -385,12 +403,15 @@ pub enum WindowVerdict {
 }
 
 impl WindowVerdict {
-    /// One-word label for the `install-worker --list` `support` column.
+    /// One-word label for the `install-worker --list` `support` column:
+    /// `supported` (lean-rs supports this version), `unsupported` (a numbered
+    /// release outside the window), or `unknown` (not a numbered release, e.g.
+    /// a nightly).
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Supported => "supported",
-            Self::OutOfWindow { .. } => "outside-window",
+            Self::OutOfWindow { .. } => "unsupported",
             Self::Unknown => "unknown",
         }
     }
@@ -611,13 +632,15 @@ impl WorkerSidecar {
         self.header_digest == current_digest
     }
 
-    /// One-word label for the `install-worker --list` `header` column,
-    /// given the current `lean.h` digest (`None` when it could not be read).
+    /// One-word label for the `install-worker --list` `build` column, given the
+    /// toolchain's current `lean.h` digest (`None` when it could not be read, so
+    /// freshness cannot be judged): `fresh` (build still matches its toolchain),
+    /// `stale` (the header drifted under it — rebuild), or `unknown`.
     pub(crate) fn header_status(&self, current_digest: Option<&str>) -> &'static str {
         match current_digest {
-            Some(current) if self.header_matches(current) => "ok",
+            Some(current) if self.header_matches(current) => "fresh",
             Some(_) => "stale",
-            None => "no-record",
+            None => "unknown",
         }
     }
 
@@ -626,10 +649,11 @@ impl WorkerSidecar {
         self.smoke.as_ref()
     }
 
-    /// One-word label for the `install-worker --list` `smoke` column
-    /// (`passed` / `failed` / `no-record` for a pre-smoke-test sidecar).
+    /// One-word label for the `install-worker --list` `runtime` column:
+    /// `runs` / `crashed`, or `untested` for a sidecar written before the
+    /// post-build smoke test existed.
     pub(crate) fn smoke_status(&self) -> &'static str {
-        self.smoke.as_ref().map_or("no-record", SmokeOutcome::label)
+        self.smoke.as_ref().map_or("untested", SmokeOutcome::label)
     }
 }
 
@@ -874,6 +898,24 @@ mod tests {
     }
 
     #[test]
+    fn sort_key_orders_rc_before_release() {
+        let rc = ToolchainId::parse("v4.31.0-rc1").unwrap();
+        let rel = ToolchainId::parse("v4.31.0").unwrap();
+        let rc2 = ToolchainId::parse("v4.31.0-rc2").unwrap();
+        let prev = ToolchainId::parse("v4.30.0").unwrap();
+        let ngt = ToolchainId::parse("nightly-2026-05-20").unwrap();
+        assert!(rc.sort_key() < rel.sort_key(), "rc before its release");
+        assert!(rc.sort_key() < rc2.sort_key(), "rc1 before rc2");
+        assert!(prev.sort_key() < rc.sort_key(), "older release before the next rc");
+        assert!(rel.sort_key() < ngt.sort_key(), "numbered release before a nightly");
+
+        // The lexical order this replaces would sort to [prev, rel, rc, rc2].
+        let mut ids = vec![rel.clone(), prev.clone(), rc2.clone(), rc.clone()];
+        ids.sort_by_key(ToolchainId::sort_key);
+        assert_eq!(ids, vec![prev, rc, rc2, rel]);
+    }
+
+    #[test]
     fn sidecar_round_trips_record_then_load() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("v4.30.0").unwrap();
@@ -881,10 +923,10 @@ mod tests {
         let loaded = WorkerSidecar::load(tmp.path()).expect("sidecar should load");
         assert!(loaded.header_matches("abc123"));
         assert!(!loaded.header_matches("different"));
-        assert_eq!(loaded.header_status(Some("abc123")), "ok");
+        assert_eq!(loaded.header_status(Some("abc123")), "fresh");
         assert_eq!(loaded.header_status(Some("different")), "stale");
-        assert_eq!(loaded.header_status(None), "no-record");
-        assert_eq!(loaded.smoke_status(), "passed");
+        assert_eq!(loaded.header_status(None), "unknown");
+        assert_eq!(loaded.smoke_status(), "runs");
         assert_eq!(loaded.smoke(), Some(&SmokeOutcome::Passed));
     }
 
@@ -902,7 +944,7 @@ mod tests {
         fs::write(tmp.path().join(SIDECAR_FILE_NAME), legacy).unwrap();
         let loaded = WorkerSidecar::load(tmp.path()).expect("legacy sidecar should load");
         assert_eq!(loaded.smoke(), None);
-        assert_eq!(loaded.smoke_status(), "no-record");
+        assert_eq!(loaded.smoke_status(), "untested");
     }
 
     #[test]

@@ -48,11 +48,12 @@ pub(crate) enum SmokeOutcome {
 }
 
 impl SmokeOutcome {
-    /// One-word label for the `install-worker --list` `smoke` column.
+    /// One-word label for the `install-worker --list` `runtime` column:
+    /// `runs` (the worker ran Lean) or `crashed` (it could not).
     pub(crate) fn label(&self) -> &'static str {
         match self {
-            Self::Passed => "passed",
-            Self::Failed { .. } => "failed",
+            Self::Passed => "runs",
+            Self::Failed { .. } => "crashed",
         }
     }
 
@@ -151,8 +152,8 @@ mod tests {
                 .unwrap()
                 .contains("\"result\":\"passed\"")
         );
-        assert_eq!(passed.label(), "passed");
-        assert_eq!(failed.label(), "failed");
+        assert_eq!(passed.label(), "runs");
+        assert_eq!(failed.label(), "crashed");
         assert_eq!(failed.failure_detail(), Some("signal: 11 (SIGSEGV)"));
         assert_eq!(passed.failure_detail(), None);
     }

@@ -105,16 +105,24 @@ fn run_list() -> anyhow::Result<()> {
         // against the toolchain's current lean.h.
         let parsed = ToolchainId::parse(id).ok();
         let support = parsed.as_ref().map_or("unknown", |t| t.window_verdict().label());
+        // Semantic sort key (rc before its release), reusing the same ordering
+        // the open gate uses; fall back to the unknown bucket keyed on the raw
+        // directory name when it does not parse as a toolchain id.
+        let sort_key = parsed
+            .as_ref()
+            .map_or_else(|| (1, (0, 0, 0, 0, 0), id.to_owned()), ToolchainId::sort_key);
         let current = parsed
             .as_ref()
             .and_then(|t| t.elan_dir().ok())
             .and_then(|dir| hash_lean_header(&dir).ok());
-        // One sidecar load feeds both the header-drift and runtime-smoke columns.
+        // One sidecar load feeds both the `build` (header-drift) and `runtime`
+        // (smoke) columns. No sidecar means no provenance at all, so both are
+        // `unknown`/`untested` — the same labels their per-state helpers use.
         let sidecar = WorkerSidecar::load(&id_path);
         let header = sidecar
             .as_ref()
-            .map_or("no-record", |s| s.header_status(current.as_deref()));
-        let smoke = sidecar.as_ref().map_or("no-record", WorkerSidecar::smoke_status);
+            .map_or("unknown", |s| s.header_status(current.as_deref()));
+        let smoke = sidecar.as_ref().map_or("untested", WorkerSidecar::smoke_status);
         rows.push(ListRow {
             id: id.to_owned(),
             path: bin,
@@ -124,19 +132,21 @@ fn run_list() -> anyhow::Result<()> {
             size: meta.len(),
             mtime,
             sha,
+            sort_key,
         });
     }
-    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 
     println!(
         "{:<28}  {:<14}  {:<9}  {:<9}  {:>10}  {:<24}  sha256",
-        "toolchain", "support", "header", "smoke", "size", "mtime"
+        "toolchain", "support", "build", "runtime", "size", "built"
     );
     for row in &rows {
         let mtime = humantime::format_rfc3339_seconds_or_fallback(row.mtime);
+        let size = format_mib(row.size);
         println!(
             "{:<28}  {:<14}  {:<9}  {:<9}  {:>10}  {:<24}  {}",
-            row.id, row.support, row.header, row.smoke, row.size, mtime, row.sha
+            row.id, row.support, row.header, row.smoke, size, mtime, row.sha
         );
     }
     Ok(())
@@ -155,6 +165,8 @@ struct ListRow {
     size: u64,
     mtime: SystemTime,
     sha: String,
+    /// Semantic ordering key (rc before its release); see [`ToolchainId::sort_key`].
+    sort_key: (u8, (u32, u32, u32, u8, u32), String),
 }
 
 fn run_auto(source_dir: &Path) -> anyhow::Result<()> {
@@ -263,7 +275,7 @@ fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
     let meta = fs::metadata(&dest)?;
     let sha = sha256_prefix(&dest, 16)?;
     println!(
-        "==> installed {} ({} bytes, sha256 {}…, header {}, smoke {})",
+        "==> installed {} ({} bytes, sha256 {}…, digest {}, runtime {})",
         dest.display(),
         meta.len(),
         sha,
@@ -278,7 +290,7 @@ fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
         return Err(anyhow::anyhow!(
             "worker for {id} built but FAILED its runtime smoke test ({detail}); this toolchain's \
              libleanshared is ABI-incompatible with this lean-rs build. The worker is recorded as \
-             unusable (smoke=failed) and will not be served — pin a supported toolchain the host can \
+             unusable (runtime=crashed) and will not be served — pin a supported toolchain the host can \
              run, or rebuild lean-rs."
         ));
     }
@@ -313,7 +325,7 @@ fn discover_elan_toolchains() -> anyhow::Result<Vec<ToolchainId>> {
             out.push(id);
         }
     }
-    out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    out.sort_by_key(ToolchainId::sort_key);
     Ok(out)
 }
 
@@ -363,22 +375,86 @@ fn sha256_prefix(path: &Path, hex_chars: usize) -> anyhow::Result<String> {
     Ok(hex.chars().take(hex_chars).collect())
 }
 
-/// Tiny inline time formatter to avoid pulling in `humantime` as a new
-/// dependency just for `install-worker --list`.
+/// Format a byte count as MiB with two decimals for the `--list` `size`
+/// column. Binary file sizes are conventionally base-1024, so MiB (not MB) is
+/// the natural unit; a worker binary is a few MiB. Pure integer math — whole
+/// MiB, then the remainder scaled to hundredths — so there is no float cast.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bounded base-1024 size math on a u64 byte count; `remainder * 100` \
+              peaks near 1.05e8 and a worker is a few MiB, both nowhere near \
+              u64 overflow"
+)]
+fn format_mib(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    let whole = bytes / MIB;
+    let hundredths = (bytes % MIB) * 100 / MIB;
+    format!("{whole}.{hundredths:02} MiB")
+}
+
+/// Tiny inline RFC 3339 (UTC) time formatter, so `install-worker --list` shows
+/// `2026-05-31T18:36:11Z` instead of a raw epoch count, without taking on a date
+/// crate (`chrono`/`time`). The std library gives us the epoch seconds but no
+/// calendar conversion, so the civil-time math is done here by hand.
 mod humantime {
     use std::time::SystemTime;
 
     pub(super) fn format_rfc3339_seconds_or_fallback(t: SystemTime) -> String {
         match t.duration_since(SystemTime::UNIX_EPOCH) {
-            Ok(d) => {
-                let secs = d.as_secs();
-                // Civil-time conversion: `chrono` would be nicer but we
-                // don't want a new dep. Show seconds-since-epoch in a
-                // distinctive form so it's clear this is not a parsed
-                // calendar date.
-                format!("{secs}s-since-epoch")
-            }
+            Ok(d) => format_epoch_utc(d.as_secs()),
+            // A pre-1970 mtime is not worth a second algorithm for the negative
+            // case; it never arises for a freshly-built worker binary.
             Err(_) => "before-epoch".into(),
+        }
+    }
+
+    /// Format Unix epoch `secs` as an RFC 3339 UTC timestamp
+    /// (`YYYY-MM-DDThh:mm:ssZ`).
+    ///
+    /// The date half is Howard Hinnant's branchless `civil_from_days`
+    /// (<http://howardhinnant.github.io/date_algorithms.html#civil_from_days>):
+    /// days since 1970-01-01 → `(year, month, day)`, exact for all inputs, with
+    /// the era arithmetic placing the leap-day at the end of the 400-year cycle.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "pure bounded civil-time arithmetic on a u64 epoch-seconds value; \
+                  for any real file mtime every intermediate stays far inside i64 \
+                  range (a year > ~2.9e11 would be needed to overflow), so neither \
+                  overflow nor the single days-to-i64 cast can lose information"
+    )]
+    fn format_epoch_utc(secs: u64) -> String {
+        let days = (secs / 86_400) as i64;
+        let tod = secs % 86_400;
+        let (hour, minute, second) = (tod / 3_600, (tod % 3_600) / 60, tod % 60);
+
+        // civil_from_days: shift the epoch to 0000-03-01 so leap days fall last.
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097; // day-of-era, [0, 146096]
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day-of-year (Mar-based), [0, 365]
+        let mp = (5 * doy + 2) / 153; // month, Mar=0 .. Feb=11
+        let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+        let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+        let year = if month <= 2 { year + 1 } else { year };
+
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::format_epoch_utc;
+
+        #[test]
+        fn known_epochs_render_as_rfc3339_utc() {
+            assert_eq!(format_epoch_utc(0), "1970-01-01T00:00:00Z");
+            // A leap-year date past Feb (exercises the Mar-based month shift).
+            assert_eq!(format_epoch_utc(1_583_020_800), "2020-03-01T00:00:00Z");
+            // 2026-05-31T18:36:11Z — the kind of mtime `--list` prints.
+            assert_eq!(format_epoch_utc(1_780_252_571), "2026-05-31T18:36:11Z");
         }
     }
 }
@@ -389,7 +465,16 @@ mod tests {
 
     use clap::{Args as _, Command, FromArgMatches};
 
-    use super::InstallWorkerArgs;
+    use super::{InstallWorkerArgs, format_mib};
+
+    #[test]
+    fn format_mib_renders_two_decimals_base_1024() {
+        assert_eq!(format_mib(0), "0.00 MiB");
+        assert_eq!(format_mib(1024 * 1024), "1.00 MiB");
+        // The actual worker-binary sizes the `--list` table prints.
+        assert_eq!(format_mib(2_340_832), "2.23 MiB");
+        assert_eq!(format_mib(3_652_448), "3.48 MiB");
+    }
 
     fn parse(args: &[&str]) -> Result<InstallWorkerArgs, clap::Error> {
         let matches = InstallWorkerArgs::augment_args(Command::new("install-worker")).try_get_matches_from(args)?;

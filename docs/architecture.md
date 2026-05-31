@@ -130,8 +130,8 @@ installed (so `--list` shows it and the gate refuses it with a precise reason) r
 readiness gate re-hashes the toolchain's current `lean.h` and compares (a mismatch is `Stale`), then consults the smoke
 record (a failure is `Unusable`); a missing sidecar or a sidecar without a smoke record (older host) degrades to a soft
 warning rather than an error. `install-worker --list` surfaces three axes per worker: a `support` column (`supported` /
-`outside-window` / `unknown`), a `header` column (`ok` / `stale` / `no-record`), and a `smoke` column (`passed` /
-`failed` / `no-record`).
+`unsupported` / `unknown`), a `build` column (header-drift — `fresh` / `stale` / `unknown`), and a `runtime` column (the
+recorded smoke result — `runs` / `crashed` / `untested`).
 
 ## Declaration-Centric Proof API
 
