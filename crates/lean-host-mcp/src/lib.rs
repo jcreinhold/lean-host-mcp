@@ -34,6 +34,7 @@ pub mod lake_meta;
 mod project;
 pub mod projections;
 pub mod server;
+mod smoke;
 pub mod toolchain;
 pub mod tools;
 

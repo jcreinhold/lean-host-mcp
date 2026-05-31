@@ -724,6 +724,9 @@ impl ProjectBroker {
                     restarts_in_window: None,
                     window_millis: None,
                     runtime: crate::envelope::RuntimeFacts::default(),
+                    // Pool exhaustion is not toolchain-provenance related, and the
+                    // rejected project never opened, so there are no advisories.
+                    toolchain_advisories: Vec::new(),
                 }));
             }
             if let Some((ref evicted_path, _)) = victim {
@@ -742,7 +745,7 @@ impl ProjectBroker {
     }
 
     /// Evict every entry whose `last_used` timestamp is older than
-    /// `config.idle_timeout`. Called every [`REAPER_TICK`] by the
+    /// `config.idle_timeout`. Called every `REAPER_TICK` by the
     /// background task; tests call this directly to avoid waiting.
     pub fn reap_idle(&self) {
         if self.config.idle_timeout.is_zero() {

@@ -848,6 +848,7 @@ impl LeanProject {
             restarts_in_window: None,
             window_millis: None,
             runtime,
+            toolchain_advisories: self.open_warnings.clone(),
         }
     }
 }
@@ -877,6 +878,12 @@ struct ActorConfig {
     mailbox_capacity: usize,
     max_restarts_per_window: usize,
     restart_window: Duration,
+    /// Open-time toolchain advisories (unknown pin, missing sidecar, no smoke
+    /// record). The actor carries them so a `runtime_unavailable` it produces
+    /// after worker death still flags a suspect worker. Mirrors
+    /// [`LeanProject::open_warnings`]; both come from the one
+    /// [`WorkerBinary::resolve_ready_for`] verdict at open.
+    toolchain_advisories: Vec<String>,
 }
 
 impl ActorConfig {
@@ -924,6 +931,17 @@ impl ActorConfig {
                      provides (header drift); rebuild it: {install_cmd}"
                 )));
             }
+            Readiness::Unusable {
+                toolchain,
+                detail,
+                install_cmd,
+            } => {
+                return Err(ServerError::BadProject(format!(
+                    "worker for {toolchain} failed its runtime smoke test ({detail}); the toolchain's \
+                     libleanshared is ABI-incompatible with this lean-rs build and cannot be served. \
+                     Pin a supported toolchain the host can run, or rebuild lean-rs and reinstall: {install_cmd}"
+                )));
+            }
             Readiness::NotInstalled { toolchain, install_cmd } => {
                 return Err(ServerError::BadProject(format!(
                     "no worker binary for toolchain {toolchain}; run: {install_cmd}"
@@ -954,6 +972,7 @@ impl ActorConfig {
             mailbox_capacity: runtime_config.mailbox_capacity(),
             max_restarts_per_window: runtime_config.max_restarts_per_window(),
             restart_window: runtime_config.restart_window(),
+            toolchain_advisories: open_warnings.clone(),
         };
         Ok((config, open_warnings))
     }
@@ -1393,6 +1412,7 @@ impl ProjectActorState {
             window_millis: Some(millis_u64(self.config.restart_window)),
             runtime: snapshot,
             reason,
+            toolchain_advisories: self.config.toolchain_advisories.clone(),
         })
     }
 
@@ -1415,6 +1435,7 @@ impl ProjectActorState {
             restarts_in_window: Some(limit.restarts_in_window),
             window_millis: Some(limit.window_millis),
             runtime: snapshot,
+            toolchain_advisories: self.config.toolchain_advisories.clone(),
         })
     }
 }
@@ -1565,6 +1586,7 @@ fn bootstrap_hard_rss_unavailable(
         restarts_in_window: None,
         window_millis: None,
         runtime,
+        toolchain_advisories: config.toolchain_advisories.clone(),
     })
 }
 
@@ -1769,6 +1791,7 @@ mod tests {
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
             max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
             restart_window: RESTART_WINDOW,
+            toolchain_advisories: Vec::new(),
         };
 
         let err = bootstrap_hard_rss_unavailable(

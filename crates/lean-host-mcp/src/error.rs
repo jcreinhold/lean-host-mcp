@@ -34,6 +34,16 @@ pub struct WorkerUnavailable {
     pub(crate) restarts_in_window: Option<u64>,
     pub(crate) window_millis: Option<u64>,
     pub(crate) runtime: RuntimeFacts,
+    /// Project-lifetime toolchain advisories (unknown pin, missing provenance
+    /// sidecar, no smoke record) captured at open. Carried here so a worker
+    /// that dies mid-call still surfaces them on the `runtime_unavailable`
+    /// envelope — the moment a suspect worker is most worth flagging. Internal;
+    /// drained into the envelope's top-level `warnings`, never the error wire
+    /// `data`, so it is skipped from (de)serialization like its
+    /// [`Freshness`] counterpart.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) toolchain_advisories: Vec<String>,
 }
 
 impl WorkerUnavailable {
@@ -44,7 +54,7 @@ impl WorkerUnavailable {
             imports: self.imports.clone(),
             session_id: self.session_id.clone(),
             lean_toolchain: self.lean_toolchain.clone(),
-            toolchain_advisories: Vec::new(),
+            toolchain_advisories: self.toolchain_advisories.clone(),
         }
     }
 

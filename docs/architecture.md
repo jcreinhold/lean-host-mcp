@@ -83,36 +83,55 @@ invariants, and unusable Lake projects.
 ### Toolchain-Readiness Gate
 
 Before the broker spawns a child for a newly-resolved project, `WorkerBinary::resolve_ready_for` (in `toolchain.rs`)
-folds every toolchain-version-drift situation into one `Readiness` verdict. It hides four independently-volatile
+folds every toolchain-version-drift situation into one `Readiness` verdict. It hides five independently-volatile
 decisions behind a single call: the supported window (read directly from `lean_toolchain::SUPPORTED_TOOLCHAINS` — the
-host never duplicates the list), the elan layout, the worker install layout, and the header-digest provenance check. The
-verdicts:
+host never duplicates the list), the elan layout, the worker install layout, the header-digest provenance check, and the
+recorded runtime smoke result. The verdicts:
 
 - `Unsupported` — a numbered pin outside `floor ..= head`. Short-circuits before any filesystem probe (the bogus
   toolchain is usually not installed), so the caller gets the window message, not a buried "elan not installed" error.
+  The accompanying `nearest` is the genuinely closest supported version (smallest component-wise version distance, ties
+  resolved toward the newer release), not merely the window floor.
 - `Stale` — the toolchain's `lean.h` no longer matches the digest recorded when the worker was built (an rc republished
   under the same id, a rebuilt toolchain). Caught before spawn with a rebuild command, instead of the cryptic runtime
   `"incompatible header"` olean crash.
+- `Unusable` — the worker built and its header digest matches, but it failed its post-build runtime smoke test: the
+  toolchain's `libleanshared` is ABI-incompatible with this lean-rs build and crashes when it loads Lean. A matching
+  header digest is necessary but **not** sufficient for ABI compatibility, so the recorded smoke result is the sound
+  signal. Caught before spawn, instead of a per-call `runtime_unavailable` SIGSEGV loop.
 - `NotInstalled` / `ToolchainNotInstalled` — the worker binary, or the elan toolchain itself, is absent.
 - `UnknownPin` — a `nightly-*` or otherwise non-`vX.Y.Z` pin: allowed, but the host cannot vouch for it.
 - `Ready` — spawn, optionally carrying a soft `note` (e.g. a worker installed by an older host with no provenance
-  record).
+  record, or with a sidecar but no smoke record).
 
 `project.rs` maps the hard verdicts to one typed `ServerError::BadProject` sentence carrying the corrective command;
 `UnknownPin` and the soft `Ready` note ride along as project-lifetime advisories that `LeanProject::freshness` attaches
-and `server::wrap` drains into the top-level envelope `warnings`. `install-worker` consults only the pure
+and `server::wrap` drains into the top-level envelope `warnings`. Those advisories are also carried on
+`WorkerUnavailable`, so a worker that dies mid-call surfaces them on the `runtime_unavailable` envelope rather than
+dropping them exactly when a suspect worker is most worth flagging. `install-worker` consults only the pure
 `ToolchainId::window_verdict` *before* its multi-minute build, refusing an out-of-window pin and warning on an unknown
 one. The digest is hashed once on the cold open/resolve path; the warm broker-reuse path (manifest-hash + health check)
 never re-hashes.
 
+The hard verdicts are pre-spawn JSON-RPC `BadProject` errors; project-discovery checks fire first, in order: lakefile
+presence → `lake-manifest.json` → window/readiness gate → elan/worker presence. (A directory with no lakefile is
+rejected as "not a Lake project" before the window gate runs, so exercising `Unsupported` needs a real pinned Lake
+project, not an arbitrary directory.)
+
 ### Worker Provenance Sidecar
 
 `install-worker` writes a private `worker.json` next to each installed binary recording the toolchain id, the full
-`lean.h` SHA-256 the worker was built against, the `lean_toolchain::LEAN_VERSION` of the build, and whether that digest
-matched the supported window at build time. The readiness gate re-hashes the toolchain's current `lean.h` and compares;
-a mismatch is `Stale`, a missing sidecar (older host) degrades to a soft warning rather than an error.
-`install-worker --list` surfaces both axes per worker: a `support` column (`supported` / `outside-window` / `unknown`)
-and a `header` column (`ok` / `stale` / `no-record`).
+`lean.h` SHA-256 the worker was built against, the `lean_toolchain::LEAN_VERSION` of the build, whether that digest
+matched the supported window at build time, and the post-build **smoke** outcome. The smoke test spawns the
+freshly-built worker once and runs the cheapest faithful exercise of the FFI boundary — open a session importing `Init`
+and inspect `Nat.add_zero` — so an ABI-incompatible worker is caught at install (over the multi-minute build) rather
+than at every call. A smoke failure records `smoke: failed` and makes `install-worker` exit non-zero; the binary stays
+installed (so `--list` shows it and the gate refuses it with a precise reason) rather than being silently removed. The
+readiness gate re-hashes the toolchain's current `lean.h` and compares (a mismatch is `Stale`), then consults the smoke
+record (a failure is `Unusable`); a missing sidecar or a sidecar without a smoke record (older host) degrades to a soft
+warning rather than an error. `install-worker --list` surfaces three axes per worker: a `support` column (`supported` /
+`outside-window` / `unknown`), a `header` column (`ok` / `stale` / `no-record`), and a `smoke` column (`passed` /
+`failed` / `no-record`).
 
 ## Declaration-Centric Proof API
 

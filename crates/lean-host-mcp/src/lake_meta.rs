@@ -10,7 +10,7 @@
 //! Two constructors:
 //!
 //! - [`LakeProjectMeta::from_explicit`]: caller already has a Lake-root
-//!   path (e.g. resolved through the broker's [`ProjectHint::Explicit`]).
+//!   path (e.g. resolved through the broker's [`ProjectHint::Explicit`](crate::broker::ProjectHint::Explicit)).
 //! - [`LakeProjectMeta::discover_from`]: start from a hint and walk
 //!   upward looking for `lakefile.{toml,lean}`. Used by the broker's
 //!   cwd-walk step.

@@ -113,7 +113,7 @@ RSS thresholds are in KiB, byte caps in bytes; the parenthetical magnitude is fo
 | `LEAN_HOST_MCP_PROJECT` | Default Lake root for calls without a `project=` argument. | unset |
 | `LEAN_HOST_MCP_BIND` | Loopback `ADDR:PORT` for Streamable HTTP; stdio when unset. | unset |
 | `LEAN_HOST_MCP_HTTP_PATH` | Streamable HTTP route. Requires `--bind` / `LEAN_HOST_MCP_BIND`. | `/mcp` |
-| `LEAN_HOST_MCP_MAX_PROJECTS` | Resident project runtimes; oldest idle one is evicted on overflow. | `4` |
+| `LEAN_HOST_MCP_MAX_PROJECTS` | Resident project **slots**; oldest idle one is evicted on overflow. Counts every open project, including one whose worker is crash-looping (process-dead): it keeps its slot until the next call evicts it (health check) or the idle reaper reclaims it. | `4` |
 | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Idle window before a project is reaped. `0` disables. | `600` |
 | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | Process-wide permits for heavy semantic work; `1` serializes cross-project calls. | `1` |
 | `LEAN_HOST_MCP_SEMANTIC_WAITERS` | Callers that may queue for admission; overflow returns retryable `semantic_admission_full`. | `16` |
@@ -125,6 +125,14 @@ RSS thresholds are in KiB, byte caps in bytes; the parenthetical magnitude is fo
 | `LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS` | Sampling interval for the in-flight hard-RSS watchdog. | `250` |
 | `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Worker module-snapshot cache RSS guard. | `2097152` (2 GiB) |
 | `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Worker module-snapshot cache byte cap. | `33554432` (32 MiB) |
+
+### Process lifetime
+
+The idle reaper (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`) governs the per-project worker sub-actors, not the parent server
+process. A stdio server exits when its transport closes: it serves until the client closes the server's stdin (the
+normal disconnect path), so a well-behaved launcher reaps it automatically. Orphaned `lean-host-mcp` parents left
+running are launcher artifacts (a client that spawned a server and never closed its stdin), not leaked sessions — the
+server holds no project resident once its transport is gone.
 
 ## Wiring into Claude Code
 

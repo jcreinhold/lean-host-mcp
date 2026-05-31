@@ -109,15 +109,18 @@ fn run_list() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|t| t.elan_dir().ok())
             .and_then(|dir| hash_lean_header(&dir).ok());
-        let header = match WorkerSidecar::load(&id_path) {
-            Some(sidecar) => sidecar.header_status(current.as_deref()),
-            None => "no-record",
-        };
+        // One sidecar load feeds both the header-drift and runtime-smoke columns.
+        let sidecar = WorkerSidecar::load(&id_path);
+        let header = sidecar
+            .as_ref()
+            .map_or("no-record", |s| s.header_status(current.as_deref()));
+        let smoke = sidecar.as_ref().map_or("no-record", WorkerSidecar::smoke_status);
         rows.push(ListRow {
             id: id.to_owned(),
             path: bin,
             support,
             header,
+            smoke,
             size: meta.len(),
             mtime,
             sha,
@@ -126,14 +129,14 @@ fn run_list() -> anyhow::Result<()> {
     rows.sort_by(|a, b| a.id.cmp(&b.id));
 
     println!(
-        "{:<28}  {:<14}  {:<9}  {:>10}  {:<24}  sha256",
-        "toolchain", "support", "header", "size", "mtime"
+        "{:<28}  {:<14}  {:<9}  {:<9}  {:>10}  {:<24}  sha256",
+        "toolchain", "support", "header", "smoke", "size", "mtime"
     );
     for row in &rows {
         let mtime = humantime::format_rfc3339_seconds_or_fallback(row.mtime);
         println!(
-            "{:<28}  {:<14}  {:<9}  {:>10}  {:<24}  {}",
-            row.id, row.support, row.header, row.size, mtime, row.sha
+            "{:<28}  {:<14}  {:<9}  {:<9}  {:>10}  {:<24}  {}",
+            row.id, row.support, row.header, row.smoke, row.size, mtime, row.sha
         );
     }
     Ok(())
@@ -148,6 +151,7 @@ struct ListRow {
     path: PathBuf,
     support: &'static str,
     header: &'static str,
+    smoke: &'static str,
     size: u64,
     mtime: SystemTime,
     sha: String,
@@ -240,22 +244,44 @@ fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
         fs::remove_file(&built)?;
     }
 
+    // Prove the worker can actually run before vouching for it: a matching
+    // header digest does not imply ABI compatibility with this toolchain's
+    // libleanshared, so spawn the binary once and run a trivial real
+    // elaboration. This runs here, over the multi-minute build, instead of
+    // letting every project-open rediscover a crash at call time.
+    println!("==> smoke test: inspect Nat.add_zero [imports=Init] for {id}");
+    let smoke = crate::smoke::probe(&dest, &elan_dir, id);
+
     // Record provenance next to the binary: the full lean.h digest the worker
-    // was built against, so a later open can detect header drift (the rc
-    // republished under the same id) before spawning the child.
+    // was built against (so a later open can detect header drift — the rc
+    // republished under the same id) and the smoke outcome (so the gate can
+    // demote a worker that builds and digest-matches but cannot run).
     let header_digest = hash_lean_header(&elan_dir)?;
     let supported = lean_toolchain::supported_by_digest(&header_digest).is_some();
-    WorkerSidecar::record(&dest_dir, id, header_digest)?;
+    WorkerSidecar::record(&dest_dir, id, header_digest, smoke.clone())?;
 
     let meta = fs::metadata(&dest)?;
     let sha = sha256_prefix(&dest, 16)?;
     println!(
-        "==> installed {} ({} bytes, sha256 {}…, header {})",
+        "==> installed {} ({} bytes, sha256 {}…, header {}, smoke {})",
         dest.display(),
         meta.len(),
         sha,
         if supported { "supported" } else { "unrecognized" },
+        smoke.label(),
     );
+
+    // A worker that built and digest-matched but crashed the smoke test is
+    // recorded as unusable (so `--list` shows it and the gate refuses it) and
+    // surfaced as a hard install failure — exit non-zero so the user/CI sees it.
+    if let Some(detail) = smoke.failure_detail() {
+        return Err(anyhow::anyhow!(
+            "worker for {id} built but FAILED its runtime smoke test ({detail}); this toolchain's \
+             libleanshared is ABI-incompatible with this lean-rs build. The worker is recorded as \
+             unusable (smoke=failed) and will not be served — pin a supported toolchain the host can \
+             run, or rebuild lean-rs."
+        ));
+    }
     Ok(dest)
 }
 

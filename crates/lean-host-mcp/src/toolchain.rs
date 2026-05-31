@@ -4,12 +4,12 @@
 //! Two value types and one error live here:
 //!
 //! - [`ToolchainId`] is the canonical short form of a toolchain pin
-//!   (e.g. `v4.30.0`, `nightly-2026-05-20`). [`Self::parse`] accepts
+//!   (e.g. `v4.30.0`, `nightly-2026-05-20`). [`ToolchainId::parse`] accepts
 //!   either the bare short form or the elan-style `leanprover/lean4:<id>`.
-//!   [`Self::from_lake_root`] reads `<root>/lean-toolchain` and parses it.
+//!   [`ToolchainId::from_lake_root`] reads `<root>/lean-toolchain` and parses it.
 //! - [`WorkerBinary`] is the resolved path to a worker binary that links
 //!   the corresponding Lean shared library.
-//!   [`Self::resolve_for`] consults (in order) the
+//!   [`WorkerBinary::resolve_for`] consults (in order) the
 //!   `LEAN_HOST_MCP_WORKERS_DIR` developer override, then
 //!   `<install_root>/<id>/lean-host-mcp-worker`. Missing produces an
 //!   actionable [`ToolchainError::WorkerNotInstalled`] whose `install_cmd`
@@ -20,6 +20,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+use crate::smoke::SmokeOutcome;
 
 /// Canonical short form of a Lean toolchain pin (e.g. `v4.30.0`,
 /// `nightly-2026-05-20`).
@@ -231,14 +233,15 @@ impl WorkerBinary {
     /// provenance, folded into a single [`Readiness`] verdict the caller maps
     /// to one outcome (spawn, warn-and-spawn, or a typed `BadProject`).
     ///
-    /// This hides four independently-volatile decisions behind one call — the
+    /// This hides five independently-volatile decisions behind one call — the
     /// window source ([`ToolchainId::window_verdict`]), the elan layout
     /// ([`ToolchainId::elan_dir`]), the worker install layout
-    /// ([`Self::resolve_with_override`]), and the provenance mechanism
-    /// ([`WorkerSidecar`]) — so no call site consults a classifier and a
-    /// separate provenance check. An out-of-window pin short-circuits before
-    /// any filesystem probe, so the caller gets the window message even when
-    /// the bogus toolchain was never installed.
+    /// ([`Self::resolve_with_override`]), the header-digest provenance
+    /// mechanism, and the recorded runtime smoke result (both via the private
+    /// `WorkerSidecar`) — so no call site consults a classifier and a separate
+    /// provenance check. An out-of-window pin short-circuits before any
+    /// filesystem probe, so the caller gets the window message even when the
+    /// bogus toolchain was never installed.
     ///
     /// On the happy path it hashes `<elan_dir>/include/lean/lean.h` once (a
     /// few-KB SHA-256); this belongs on the cold resolve/open path, not the
@@ -294,21 +297,48 @@ impl WorkerBinary {
                 install_cmd: install_cmd(pin),
             };
         };
-        // Provenance: a recorded build-time digest that no longer matches the
-        // toolchain's current lean.h means the header drifted under the worker.
+        // Provenance, in order of severity:
+        //   1. header drift  → Stale   (rebuild advice trumps everything else)
+        //   2. smoke failed   → Unusable (built + digest-matched, but cannot run)
+        //   3. smoke missing  → Ready + soft note (older host: reinstall to verify)
+        //   4. sidecar absent → Ready + soft note (older host: no provenance at all)
         let install_dir = worker.path.parent().unwrap_or(&worker.path);
         let note = match WorkerSidecar::load(install_dir) {
-            Some(sidecar) => match current_digest {
-                Some(current) if !sidecar.header_matches(current) => {
+            Some(sidecar) => {
+                // A recorded build-time digest that no longer matches the
+                // toolchain's current lean.h means the header drifted under the
+                // worker; a rebuild is the right move regardless of any smoke
+                // verdict, so check it first.
+                if let Some(current) = current_digest
+                    && !sidecar.header_matches(current)
+                {
                     return Readiness::Stale {
                         toolchain: pin.clone(),
                         install_cmd: install_cmd(pin),
                     };
                 }
-                // Digest matches, or the current header was unreadable so we
-                // cannot prove drift — trust the recorded provenance.
-                _ => None,
-            },
+                match sidecar.smoke() {
+                    // A header-digest match does not imply ABI compatibility (a
+                    // toolchain's libleanshared can crash this worker); the
+                    // recorded runtime smoke result is the sound signal.
+                    Some(SmokeOutcome::Failed { detail }) => {
+                        return Readiness::Unusable {
+                            toolchain: pin.clone(),
+                            detail: detail.to_owned(),
+                            install_cmd: install_cmd(pin),
+                        };
+                    }
+                    Some(SmokeOutcome::Passed) => None,
+                    // Built by an older host that did not smoke-test: the header
+                    // digest still guards drift, but the worker is unverified at
+                    // runtime — nudge a reinstall to record a smoke result.
+                    None => Some(format!(
+                        "worker for {pin} has no runtime smoke record (installed by an older host); \
+                         reinstall to verify it can run: {}",
+                        install_cmd(pin)
+                    )),
+                }
+            }
             // A worker installed by an older host has no sidecar: not an error,
             // just unknown provenance worth a soft nudge to reinstall.
             None => Some(format!(
@@ -390,6 +420,17 @@ pub enum Readiness {
         toolchain: ToolchainId,
         install_cmd: String,
     },
+    /// The worker built and its header digest matches, but it failed its
+    /// post-build runtime smoke test — the toolchain's `libleanshared` is
+    /// ABI-incompatible with this lean-rs build and the worker crashes when it
+    /// loads Lean. `detail` is the recorded failure (e.g. `signal: 11
+    /// (SIGSEGV)`). A hard verdict: serving it would only produce per-call
+    /// `runtime_unavailable` crashes.
+    Unusable {
+        toolchain: ToolchainId,
+        detail: String,
+        install_cmd: String,
+    },
     /// No worker binary installed for this pin.
     NotInstalled {
         toolchain: ToolchainId,
@@ -430,10 +471,41 @@ fn version_key(s: &str) -> Option<(u32, u32, u32, u8, u32)> {
     })
 }
 
+/// Collapse a [`version_key`] into a single monotonic scalar, so version
+/// nearness is a difference on a number line rather than a per-component
+/// comparison.
+///
+/// Each field gets a positional weight large enough that a higher field always
+/// dominates a lower one (major ≫ minor ≫ patch ≫ rc/release split ≫ rc
+/// number). This is what makes "nearest" behave: a pin a whole major above the
+/// head is closest to the head (largest scalar), not to whichever lower version
+/// happens to share a digit, and `4.30.0-rc1` is closest to its own release
+/// `4.30.0` (one rc step, weight ~10³) rather than to `4.29.1` (a patch away,
+/// weight ~10⁶). The weights assume the realistic ranges of a Lean version
+/// (each field < 1000); see the supported-window table.
+fn version_scalar((major, minor, patch, rc_flag, rc_num): (u32, u32, u32, u8, u32)) -> u64 {
+    // Saturating throughout (workspace denies unchecked arithmetic); the
+    // realistic field ranges are nowhere near `u64::MAX`, so saturation never
+    // bites — it just keeps the lint happy and the mapping total.
+    u64::from(major)
+        .saturating_mul(1_000_000_000_000)
+        .saturating_add(u64::from(minor).saturating_mul(1_000_000_000))
+        .saturating_add(u64::from(patch).saturating_mul(1_000_000))
+        .saturating_add(u64::from(rc_flag).saturating_mul(1_000))
+        .saturating_add(u64::from(rc_num))
+}
+
 /// The `floor ..= head` window string and the nearest supported version for a
 /// numbered pin outside the window. Both derive from
 /// [`lean_toolchain::SUPPORTED_TOOLCHAINS`] (ordered ascending; each entry's
 /// first version is canonical) — never a hardcoded literal list.
+///
+/// "Nearest" scans every supported version and picks the one whose key is the
+/// smallest [`version_distance`] from the pin, ties broken toward the newer
+/// version to bias migration forward. This is why `v4.30.0-rc1` resolves to
+/// `4.30.0` (one rc step away) rather than the window floor: the old logic only
+/// compared the pin against the head and fell back to the floor for everything
+/// below it.
 fn out_of_window_bounds(pin: (u32, u32, u32, u8, u32)) -> (String, String) {
     let entries = lean_toolchain::SUPPORTED_TOOLCHAINS;
     let floor = entries
@@ -447,10 +519,19 @@ fn out_of_window_bounds(pin: (u32, u32, u32, u8, u32)) -> (String, String) {
         .copied()
         .unwrap_or_default();
     let window = format!("{floor} ..= {head}");
-    let nearest = match version_key(head) {
-        Some(head_key) if pin > head_key => head,
-        _ => floor,
-    };
+    let pin_scalar = version_scalar(pin);
+    let nearest = entries
+        .iter()
+        .filter_map(|t| t.versions.first().copied())
+        .filter_map(|v| version_key(v).map(|key| (v, version_scalar(key))))
+        .min_by(|(_, a), (_, b)| {
+            a.abs_diff(pin_scalar)
+                .cmp(&b.abs_diff(pin_scalar))
+                // Equal distance (pin sits exactly between two releases): prefer
+                // the newer supported version, so callers are nudged forward.
+                .then_with(|| b.cmp(a))
+        })
+        .map_or(floor, |(v, _)| v);
     (window, nearest.to_owned())
 }
 
@@ -489,17 +570,30 @@ pub(crate) struct WorkerSidecar {
     built_against_lean_version: String,
     /// Whether `supported_by_digest(header_digest)` matched at build time.
     digest_supported_at_build: bool,
+    /// Outcome of the post-build runtime smoke test. `None` for a sidecar
+    /// written by a host predating the smoke test — unknown, not failed, so the
+    /// gate treats it as a soft "reinstall to verify" note rather than a hard
+    /// `Unusable`.
+    #[serde(default)]
+    smoke: Option<SmokeOutcome>,
 }
 
 impl WorkerSidecar {
-    /// Write `<install_dir>/worker.json` recording `header_digest` and the
-    /// host's build-time context. Overwrites any existing record.
-    pub(crate) fn record(install_dir: &Path, id: &ToolchainId, header_digest: String) -> std::io::Result<()> {
+    /// Write `<install_dir>/worker.json` recording `header_digest`, the host's
+    /// build-time context, and the post-build `smoke` outcome. Overwrites any
+    /// existing record.
+    pub(crate) fn record(
+        install_dir: &Path,
+        id: &ToolchainId,
+        header_digest: String,
+        smoke: SmokeOutcome,
+    ) -> std::io::Result<()> {
         let sidecar = Self {
             toolchain: id.as_str().to_owned(),
             digest_supported_at_build: lean_toolchain::supported_by_digest(&header_digest).is_some(),
             built_against_lean_version: lean_toolchain::LEAN_VERSION.to_owned(),
             header_digest,
+            smoke: Some(smoke),
         };
         let json = serde_json::to_string_pretty(&sidecar).map_err(std::io::Error::other)?;
         std::fs::write(install_dir.join(SIDECAR_FILE_NAME), json)
@@ -525,6 +619,17 @@ impl WorkerSidecar {
             Some(_) => "stale",
             None => "no-record",
         }
+    }
+
+    /// The recorded post-build runtime smoke outcome, if any.
+    pub(crate) fn smoke(&self) -> Option<&SmokeOutcome> {
+        self.smoke.as_ref()
+    }
+
+    /// One-word label for the `install-worker --list` `smoke` column
+    /// (`passed` / `failed` / `no-record` for a pre-smoke-test sidecar).
+    pub(crate) fn smoke_status(&self) -> &'static str {
+        self.smoke.as_ref().map_or("no-record", SmokeOutcome::label)
     }
 }
 
@@ -717,6 +822,33 @@ mod tests {
     }
 
     #[test]
+    fn window_verdict_flags_in_between_rc_with_nearest_release() {
+        // A release candidate of an already-supported release (e.g. `4.30.0-rc1`
+        // when `4.30.0` ships) is out of window, and its genuinely-nearest
+        // supported version is that release — not the window floor.
+        let (floor, _) = window_bounds();
+        let release = lean_toolchain::SUPPORTED_TOOLCHAINS
+            .iter()
+            .filter_map(|t| t.versions.first().copied())
+            // A `X.Y.Z` release (no `-rc`) other than the floor, so the rc we
+            // synthesize is genuinely between two supported versions.
+            .find(|v| !v.contains("-rc") && *v != floor)
+            .expect("the supported window should contain a non-floor numbered release");
+        let rc = format!("{release}-rc1");
+        // Guard: the synthesized rc must not itself be a supported entry.
+        assert!(
+            lean_toolchain::supported_for(&rc).is_none(),
+            "{rc} unexpectedly supported"
+        );
+        match ToolchainId::parse(&format!("v{rc}")).unwrap().window_verdict() {
+            WindowVerdict::OutOfWindow { nearest, .. } => assert_eq!(nearest, release),
+            other @ (WindowVerdict::Supported | WindowVerdict::Unknown) => {
+                panic!("expected OutOfWindow, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn window_verdict_treats_nightly_as_unknown() {
         let id = ToolchainId::parse("nightly-2026-05-20").unwrap();
         assert_eq!(id.window_verdict(), WindowVerdict::Unknown);
@@ -745,13 +877,74 @@ mod tests {
     fn sidecar_round_trips_record_then_load() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("v4.30.0").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "abc123".to_owned()).unwrap();
+        WorkerSidecar::record(tmp.path(), &id, "abc123".to_owned(), SmokeOutcome::Passed).unwrap();
         let loaded = WorkerSidecar::load(tmp.path()).expect("sidecar should load");
         assert!(loaded.header_matches("abc123"));
         assert!(!loaded.header_matches("different"));
         assert_eq!(loaded.header_status(Some("abc123")), "ok");
         assert_eq!(loaded.header_status(Some("different")), "stale");
         assert_eq!(loaded.header_status(None), "no-record");
+        assert_eq!(loaded.smoke_status(), "passed");
+        assert_eq!(loaded.smoke(), Some(&SmokeOutcome::Passed));
+    }
+
+    #[test]
+    fn legacy_sidecar_without_smoke_field_loads_as_no_record() {
+        // A sidecar written by a host predating the smoke test has no `smoke`
+        // key; `#[serde(default)]` must read it back as unknown, not fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = r#"{
+            "toolchain": "v4.30.0",
+            "header_digest": "abc123",
+            "built_against_lean_version": "4.30.0",
+            "digest_supported_at_build": true
+        }"#;
+        fs::write(tmp.path().join(SIDECAR_FILE_NAME), legacy).unwrap();
+        let loaded = WorkerSidecar::load(tmp.path()).expect("legacy sidecar should load");
+        assert_eq!(loaded.smoke(), None);
+        assert_eq!(loaded.smoke_status(), "no-record");
+    }
+
+    #[test]
+    fn smoke_failed_is_unusable_even_with_matching_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
+        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
+        WorkerSidecar::record(
+            tmp.path(),
+            &id,
+            "digest".to_owned(),
+            SmokeOutcome::Failed {
+                detail: "signal: 11 (SIGSEGV)".to_owned(),
+            },
+        )
+        .unwrap();
+        let sysroot = tmp.path().to_path_buf();
+        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
+        let Readiness::Unusable { detail, .. } = readiness else {
+            panic!("expected Unusable, got {readiness:?}");
+        };
+        assert!(detail.contains("SIGSEGV"), "got: {detail}");
+    }
+
+    #[test]
+    fn smoke_record_missing_is_ready_with_reinstall_note() {
+        // Sidecar present (digest guards drift) but no smoke record: a legacy
+        // worker. Ready, but nudged to reinstall to verify it runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
+        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
+        let legacy = format!(
+            r#"{{"toolchain":"{}","header_digest":"digest","built_against_lean_version":"x","digest_supported_at_build":true}}"#,
+            id.as_str()
+        );
+        fs::write(tmp.path().join(SIDECAR_FILE_NAME), legacy).unwrap();
+        let sysroot = tmp.path().to_path_buf();
+        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
+        let Readiness::Ready { note: Some(note), .. } = readiness else {
+            panic!("expected Ready with a reinstall note, got {readiness:?}");
+        };
+        assert!(note.contains("smoke"), "got: {note}");
     }
 
     #[test]
@@ -759,7 +952,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "digest".to_owned()).unwrap();
+        WorkerSidecar::record(tmp.path(), &id, "digest".to_owned(), SmokeOutcome::Passed).unwrap();
         let sysroot = tmp.path().to_path_buf();
         let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
         assert!(
@@ -773,7 +966,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "built-digest".to_owned()).unwrap();
+        WorkerSidecar::record(tmp.path(), &id, "built-digest".to_owned(), SmokeOutcome::Passed).unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
             WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("drifted-digest")),
@@ -799,7 +992,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("nightly-2026-05-20").unwrap();
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        WorkerSidecar::record(tmp.path(), &id, "d".to_owned()).unwrap();
+        WorkerSidecar::record(tmp.path(), &id, "d".to_owned(), SmokeOutcome::Passed).unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
             WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("d")),

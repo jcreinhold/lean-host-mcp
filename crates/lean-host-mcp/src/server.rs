@@ -1,5 +1,5 @@
 //! rmcp server glue. Registers model-facing Lean tools and wires them to the
-//! [`tools`](crate::tools) module.
+//! [`tools`] module.
 //!
 //! Each `#[tool]` handler is a thin call into the implementation function;
 //! all real work happens in `crate::tools` and `crate::project`. Returns
@@ -120,20 +120,11 @@ where
     T: serde::Serialize + schemars::JsonSchema,
 {
     match result {
-        Ok(mut response) => {
-            // Drain project-lifetime toolchain advisories (unknown pin, missing
-            // provenance sidecar) carried on freshness into the top-level
-            // warnings array — the single place every tool's response funnels
-            // through, so the contract "warnings are top-level" holds without
-            // each handler re-plumbing them.
-            let advisories = std::mem::take(&mut response.freshness.toolchain_advisories);
-            response.warnings.extend(advisories);
-            Ok(Json(response))
-        }
+        Ok(response) => Ok(finalize(response)),
         Err(ServerError::WorkerUnavailable(info)) => {
             let freshness = info.freshness();
             let failure = info.failure();
-            Ok(Json(Response::runtime_unavailable(
+            Ok(finalize(Response::runtime_unavailable(
                 failure,
                 freshness,
                 info.runtime.clone(),
@@ -141,6 +132,24 @@ where
         }
         Err(err) => Err(McpError::from(err)),
     }
+}
+
+/// Drain project-lifetime toolchain advisories (unknown pin, missing provenance
+/// sidecar, no smoke record) carried on `freshness` into the top-level
+/// `warnings` array.
+///
+/// This is the single funnel every tool response passes through, so the
+/// contract "warnings are top-level" holds without each handler re-plumbing
+/// them — and it applies identically to `ok` and `runtime_unavailable`
+/// responses, so a worker that dies mid-call keeps its advisories instead of
+/// silently dropping them.
+fn finalize<T>(mut response: Response<T>) -> Json<Response<T>>
+where
+    T: serde::Serialize + schemars::JsonSchema,
+{
+    let advisories = std::mem::take(&mut response.freshness.toolchain_advisories);
+    response.warnings.extend(advisories);
+    Json(response)
 }
 
 #[cfg(test)]
@@ -183,6 +192,9 @@ mod tests {
             restarts_in_window: Some(1),
             window_millis: Some(60_000),
             runtime,
+            // A no-record / suspect worker carries an open-time advisory; it must
+            // survive onto the failure envelope, not vanish when the worker dies.
+            toolchain_advisories: vec!["worker for v4.30.0 has no runtime smoke record".to_owned()],
         })))
         .unwrap()
         .0;
@@ -206,6 +218,12 @@ mod tests {
         assert_eq!(
             json.pointer("/runtime/retry_count").and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+        // Finding #3: the open-time advisory is drained onto the failure
+        // envelope's top-level warnings rather than dropped.
+        assert_eq!(
+            json.pointer("/warnings/0").and_then(serde_json::Value::as_str),
+            Some("worker for v4.30.0 has no runtime smoke record")
         );
     }
 }
