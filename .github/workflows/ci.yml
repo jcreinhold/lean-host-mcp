@@ -18,17 +18,44 @@ jobs:
         run: rustup show
       - name: Cache
         uses: Swatinem/rust-cache@v2
-      - name: Install elan
+      - name: Install elan + supported Lean toolchain
         run: |
           set -euo pipefail
+          # A real, supported Lean toolchain is mandatory: lean-rs-sys's build.rs
+          # discovers the prefix, hashes lean.h, and fails early unless it matches
+          # SUPPORTED_TOOLCHAINS (intentional ABI guard). `--default-toolchain none`
+          # builds nothing past fmt. Track the fixture's pin so CI follows the
+          # supported head automatically.
+          toolchain="$(cat fixtures/lean/lean-toolchain)"
           curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-            | sh -s -- -y --default-toolchain none
+            | sh -s -- -y --default-toolchain "$toolchain"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          # lean-rs-sys/build.rs consumes LEAN_SYSROOT; export the shell-expanded
+          # path so discovery does not depend on PATH ordering.
+          echo "LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---${toolchain##*:}" >> "$GITHUB_ENV"
       - name: fmt
         run: cargo fmt --all -- --check
+      # clippy --workspace is link-safe (no final link happens) per CLAUDE.md.
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: build
-        run: cargo build --all-targets
-      - name: test
-        run: cargo test --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Build and test PER-MEMBER, never workspace-wide: a `--all-targets`
+      # workspace build unifies the lean-rs-sys feature set across the parent and
+      # worker, silently re-linking libleanshared into the parent (CLAUDE.md
+      # "Always build per-member"). That also makes the parent's own test binary
+      # unrunnable — it would reference @rpath/libleanshared.dylib with no rpath.
+      - name: build (parent)
+        run: cargo build -p lean-host-mcp --all-targets
+      - name: build (worker)
+        run: cargo build -p lean-host-mcp-worker --all-targets
+      - name: test (parent)
+        run: cargo test -p lean-host-mcp --all-targets
+      # The parent must NOT link libleanshared. Built as a separate per-member
+      # release invocation so the worker's feature set never unifies in.
+      - name: parent ⊥ libleanshared
+        run: |
+          set -euo pipefail
+          cargo build --release -p lean-host-mcp
+          if ldd target/release/lean-host-mcp | grep -q libleanshared; then
+            echo "FAIL: parent links libleanshared" >&2
+            exit 1
+          fi
