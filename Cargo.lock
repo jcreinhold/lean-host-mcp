@@ -1067,6 +1067,8 @@ dependencies = [
 [[package]]
 name = "lean-rs"
 version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d817c202e5e081e3e73c329ae75eaf539183cc9b2c79954551b3f7aaf991bad"
 dependencies = [
  "lean-rs-sys",
  "lean-toolchain",
@@ -1080,6 +1082,8 @@ dependencies = [
 [[package]]
 name = "lean-rs-host"
 version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e6677d55b4d28ea64e116cc8ec51acf647630600ea176d34528928e954ccf81"
 dependencies = [
  "lean-rs",
  "lean-toolchain",
@@ -1090,6 +1094,8 @@ dependencies = [
 [[package]]
 name = "lean-rs-sys"
 version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29633341ca57439b09e54cd8b808a15dbab75fda958c6e8d893132818df3acbd"
 dependencies = [
  "sha2",
 ]
@@ -1097,6 +1103,8 @@ dependencies = [
 [[package]]
 name = "lean-rs-worker-child"
 version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c682e6a10dcd34bac9320c26a7a238d2994aff437b5c4efe262fb61e663da665"
 dependencies = [
  "lean-rs",
  "lean-rs-host",
@@ -1111,6 +1119,8 @@ dependencies = [
 [[package]]
 name = "lean-rs-worker-parent"
 version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d9cc8637d94eb0d279e660110cd926e4439396857e6ce1554b625bde93396b9"
 dependencies = [
  "lean-rs-worker-protocol",
  "lean-toolchain",
@@ -1121,6 +1131,8 @@ dependencies = [
 [[package]]
 name = "lean-rs-worker-protocol"
 version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fdc04f7c9b9d672929d27aa522dc6ed1633a79da7a1621c130efd5d33d47dde"
 dependencies = [
  "lean-toolchain",
  "serde",
@@ -1130,6 +1142,8 @@ dependencies = [
 [[package]]
 name = "lean-toolchain"
 version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6149d88522a189ac1e5a1f5257c5c39173dc2c9c860d4fc325cf8cf8ced2c6b2"
 dependencies = [
  "lean-rs-sys",
  "serde_json",
