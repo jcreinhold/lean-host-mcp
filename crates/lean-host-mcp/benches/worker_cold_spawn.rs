@@ -55,6 +55,7 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
                         imports: vec!["LeanRsFixture.Handles".to_owned()],
                         project: None,
                         fields: InspectDeclarationFields::default(),
+                        raw_statement: false,
                         max_field_bytes: Some(512),
                         max_total_bytes: Some(2048),
                     },

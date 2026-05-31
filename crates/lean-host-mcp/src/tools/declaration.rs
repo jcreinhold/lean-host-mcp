@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationInspectionFields, LeanWorkerDeclarationInspectionRequest, LeanWorkerOutputBudgets,
+    LeanWorkerRendering,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
@@ -131,6 +132,10 @@ impl From<InspectDeclarationFields> for LeanWorkerDeclarationInspectionFields {
             docstring: fields.docstring,
             attributes: fields.attributes,
             flags: fields.flags,
+            // Default to notation-aware pretty-printing (the worker renders with
+            // `ppExpr`, `pp.universes false`, and falls back to Raw on failure).
+            // The `raw_statement` request flag overrides this in the handler.
+            rendering: LeanWorkerRendering::Pretty,
         }
     }
 }
@@ -146,6 +151,11 @@ pub struct InspectDeclarationRequest {
     pub project: Option<String>,
     #[serde(default)]
     pub fields: InspectDeclarationFields,
+    /// Return the fully-elaborated `statement` term (`Expr.toString`) instead
+    /// of the default notation-aware pretty form. Rarely needed — the pretty
+    /// form is the editor-`hover`-quality signature.
+    #[serde(default)]
+    pub raw_statement: bool,
     #[serde(default)]
     pub max_field_bytes: Option<u32>,
     #[serde(default)]
@@ -165,7 +175,10 @@ pub async fn inspect_declaration(
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let budgets = budgets_for(&req);
-    let fields = req.fields.into();
+    let mut fields: LeanWorkerDeclarationInspectionFields = req.fields.into();
+    if req.raw_statement {
+        fields.rendering = LeanWorkerRendering::Raw;
+    }
 
     if req.name.trim().is_empty() {
         let runtime = ctx.broker.project_runtime(hint, req.imports.clone()).await?;

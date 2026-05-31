@@ -65,12 +65,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
-lean-rs-worker-parent = "0.1.17"
+lean-rs-worker-parent = "0.1.18"
 # Non-FFI facade over lean-rs-sys (metadata-only, no link directives): supplies
 # the supported-toolchain window. Already in the parent's closure via
 # lean-rs-worker-parent, so this direct dep adds no new linkage. The parent must
 # stay free of libleanshared — see the link-set assertion in CLAUDE.md.
-lean-toolchain = "0.1.17"
+lean-toolchain = "0.1.18"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

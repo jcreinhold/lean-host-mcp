@@ -200,19 +200,21 @@ pub async fn verify_declaration(
     response
         .next_actions
         .push("source file was not modified by verification".to_owned());
-    // Honest diagnostics: a `needs_build`/missing-import verdict means the
-    // facts were computed against an incomplete environment, and an empty
-    // axiom set on a verified proof is often under-reported.
-    let (cause, axiom_warning) = match response.result_ref() {
+    // Honest diagnostics: route the verdict's resolution health (needs_build
+    // vs genuine ambiguity) through the shared renderer, and flag when the
+    // axiom walk could not run.
+    let (cause, candidates, axiom_warning) = match response.result_ref() {
         Some(result) => (
             verification_incomplete_cause(result),
-            suspected_axiom_underreport(result, req.report_axioms),
+            verification_ambiguous_candidates(result),
+            axiom_unavailable_warning(result, req.report_axioms),
         ),
-        None => (None, None),
+        None => (None, Vec::new(), None),
     };
     if let Some(cause) = cause {
         response = crate::diagnosis::warn_needs_build(response, &cause);
     }
+    response = crate::diagnosis::warn_ambiguous(response, &candidates);
     if let Some(warning) = axiom_warning {
         response = response.warn(warning);
     }
@@ -224,15 +226,15 @@ pub async fn verify_declaration(
 fn verification_incomplete_cause(result: &DeclarationVerificationResult) -> Option<crate::diagnosis::IncompleteCause> {
     use crate::diagnosis::IncompleteCause;
     match result {
+        // The worker reports needs_build through the MissingImports outcome,
+        // which names the unbuilt modules.
         DeclarationVerificationResult::MissingImports { missing, .. } => {
             Some(IncompleteCause::MissingImports(missing.clone()))
         }
-        // `facts_trustworthy` is the single source of truth set by the
-        // projection: false exactly when the verdict was computed against an
-        // incomplete environment (the `needs_build` label). Checking it here
-        // avoids re-deriving the condition from the status string.
-        DeclarationVerificationResult::Ok { facts, .. } if !facts.facts_trustworthy => {
-            Some(IncompleteCause::Unresolved)
+        DeclarationVerificationResult::Ok {
+            verification_status, ..
+        } if verification_status == crate::diagnosis::NEEDS_BUILD_STATUS => {
+            Some(IncompleteCause::MissingImports(Vec::new()))
         }
         DeclarationVerificationResult::Ok { .. }
         | DeclarationVerificationResult::HeaderParseFailed { .. }
@@ -240,24 +242,45 @@ fn verification_incomplete_cause(result: &DeclarationVerificationResult) -> Opti
     }
 }
 
-/// A verified proof whose `report_axioms` run returned an empty axiom set is
-/// suspicious: anything resting on imported lemmas normally pulls `propext` /
-/// `Classical.choice` / `Quot.sound`. Flag it without claiming the facts wrong.
-fn suspected_axiom_underreport(result: &DeclarationVerificationResult, report_axioms: bool) -> Option<String> {
-    if !report_axioms {
-        return None;
-    }
+/// Competing declarations when the verdict is genuinely ambiguous, ready for
+/// the shared ambiguity renderer. Empty otherwise.
+fn verification_ambiguous_candidates(result: &DeclarationVerificationResult) -> Vec<crate::diagnosis::CompetingDecl> {
     let DeclarationVerificationResult::Ok {
         verification_status,
         facts,
         ..
     } = result
     else {
+        return Vec::new();
+    };
+    if verification_status != "ambiguous" {
+        return Vec::new();
+    }
+    facts
+        .candidates
+        .iter()
+        .map(|c| crate::diagnosis::CompetingDecl {
+            name: c.declaration_name.clone(),
+            namespace: (!c.namespace_name.is_empty()).then(|| c.namespace_name.clone()),
+        })
+        .collect()
+}
+
+/// When `report_axioms` was requested but the worker could not compute the
+/// axiom set (`axioms_available == false`), the empty `axioms` list means "not
+/// computed", not "no axioms". Say so. A genuine empty set
+/// (`axioms_available == true`) needs no caveat — the false-positive is defined
+/// out of existence.
+fn axiom_unavailable_warning(result: &DeclarationVerificationResult, report_axioms: bool) -> Option<String> {
+    if !report_axioms {
+        return None;
+    }
+    let DeclarationVerificationResult::Ok { facts, .. } = result else {
         return None;
     };
-    (verification_status == "verified" && facts.axioms.is_empty() && !facts.axioms_truncated).then(|| {
-        "report_axioms returned an empty axiom set on a verified proof; if this declaration depends on imported \
-         (e.g. Mathlib) lemmas, the axiom list may be under-reported"
+    (!facts.axioms_available).then(|| {
+        "report_axioms: the axiom dependency set could not be computed (target unresolved or budget exhausted); \
+         the empty `axioms` list means \"not computed\", not \"no axioms\""
             .to_owned()
     })
 }

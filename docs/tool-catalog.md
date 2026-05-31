@@ -146,8 +146,11 @@ imports needed to resolve it:
 }
 ```
 
-The result is one of `found`, `not_found`, `ambiguous` (with candidate names), or `unsupported`. A `found` declaration
-looks like:
+`statement` is pretty-printed by default (notation-aware, `pp.universes false`) — an editor-`hover`-quality signature
+rather than a fully-elaborated term. `statement_rendering` reports the path that produced it (`"pretty"`, or `"raw"`
+when the pretty-printer fell back). Set `"raw_statement": true` for the fully-elaborated `Expr.toString` form.
+
+The result is one of `found`, `not_found`, or `unsupported`. A `found` declaration looks like:
 
 ```jsonc
 {
@@ -157,6 +160,7 @@ looks like:
     "kind": "theorem",
     "module": "Init.Data.Nat.Basic",
     "statement": { "value": "∀ (n : Nat), n + 0 = n", "truncated": false },
+    "statement_rendering": "pretty",
     "docstring": { "value": "…", "truncated": false },
     "attributes": ["simp"],
     "flags": { "is_private": false, "is_generated": false, "is_internal": false }
@@ -218,17 +222,19 @@ policy. **It never writes source files.**
 ```
 
 `verification_status` is the verdict — `verified`, `has_sorry`, `has_unresolved_goals`, `has_diagnostics`, `not_found`,
-`needs_build`, and so on. A policy failure (e.g. a `sorry` when `allow_sorry` is false) is a normal structured result,
-not an infrastructure error.
+`needs_build`, `ambiguous`, and so on. A policy failure (e.g. a `sorry` when `allow_sorry` is false) is a normal
+structured result, not an infrastructure error.
 
 `needs_build` means the name could not be resolved against a complete project environment — usually because the project
-is not fully built — so the facts were computed against a degraded environment. In that case `facts.facts_trustworthy`
-is `false` and a top-level `warning` names the `lake build` cue. `facts_trustworthy` is `true` for every clean verdict.
+is not fully built — so the facts were computed against a degraded environment. `ambiguous` means the name genuinely
+resolves to more than one declaration; `facts.candidates` names the competitors (fully-qualified) so you can
+disambiguate. In both cases `facts.facts_trustworthy` is `false` and a top-level `warning` carries the cue (`lake build`
+for `needs_build`, fully-qualify for `ambiguous`); it is `true` only for clean verdicts that checked a resolved target.
 Do not read a clean `contains_sorry:false` / `unresolved_goals:[]` as "verified" when `facts_trustworthy` is `false`.
 
-When `report_axioms` is true and a `verified` proof reports an empty `axioms` list (with `axioms_truncated:false`), a
-warning flags it as a likely under-report — a proof resting on imported lemmas normally pulls `propext` /
-`Classical.choice` / `Quot.sound`.
+`facts.axioms_available` distinguishes "checked, no nontrivial axioms" (`true` with empty `axioms`) from "could not
+check" (`false` — target unresolved or budget exhausted); when `false` and `report_axioms` was requested, a warning says
+the axiom list is not authoritative.
 
 ```jsonc
 {
@@ -240,6 +246,7 @@ warning flags it as a likely under-report — a proof resting on imported lemmas
       "contains_sorry": false,
       "unresolved_goals": [],
       "axioms": ["propext", "Classical.choice", "Quot.sound"],  // when report_axioms is true
+      "axioms_available": true,
       "diagnostics": { "diagnostics": [], "truncated": false },
       "facts_trustworthy": true
     }
@@ -294,6 +301,10 @@ not** fail the whole request: it skips that file, continues — returning the re
 Several tools share one honest verdict for "the project environment is incomplete." `verify_declaration` reports it as
 `verification_status: "needs_build"`; `proof_state` collects the affected selectors in a `needs_build` array (distinct
 from `unavailable`); `find_references` and `search_for_proof` surface it as a top-level warning. In every case the
-warning text and a `lake build` next action are identical, and they replace what used to be a misleading `"ambiguous"`
-verdict (with no candidates to act on) or a hard error. The fix is always the same: run `lake build`, resolve errors,
+warning text and a `lake build` next action are identical. The fix is always the same: run `lake build`, resolve errors,
 then retry.
+
+This replaces what used to be a misleading `"ambiguous"` verdict with no candidates, or a hard error. The worker now
+classifies resolution at its own boundary, so `"ambiguous"` is reserved for *genuine* multiple-resolution and always
+arrives with the competing declarations named (`proof_state`'s `ambiguous` array, `verify_declaration`'s
+`facts.candidates`), with a fully-qualify next action.

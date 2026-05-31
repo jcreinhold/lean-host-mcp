@@ -156,6 +156,8 @@ pub struct ProofStateContext {
 pub enum ProofStateProjection {
     State { info: Box<ProofStateContext> },
     Unavailable { message: String },
+    Ambiguous { candidates: Vec<DeclarationTargetInfo> },
+    NeedsBuild { missing: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -256,11 +258,15 @@ pub enum ProofStateResult {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         unavailable: Vec<SelectorMessage>,
         /// Selectors that could not resolve because the project environment is
-        /// incomplete (the name resolved ambiguously against a partial build).
-        /// Separated from `unavailable` so the agent sees a `lake build` cue
-        /// rather than a generic "unavailable". See the envelope warnings.
+        /// incomplete. Separated from `unavailable` so the agent sees a
+        /// `lake build` cue rather than a generic "unavailable"; the envelope
+        /// also carries the canonical warning.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         needs_build: Vec<SelectorMessage>,
+        /// Competing declarations when the requested name is genuinely
+        /// ambiguous. Empty otherwise; the envelope warning names them too.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        ambiguous: Vec<DeclarationTargetInfo>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         budget_exceeded: Vec<SelectorMessage>,
         query_facts: Box<ModuleQueryFacts>,
@@ -329,19 +335,9 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             let mut truncated = false;
             let mut unavailable = Vec::new();
             let mut needs_build = Vec::new();
+            let mut needs_build_missing: Vec<String> = Vec::new();
+            let mut ambiguous: Vec<DeclarationTargetInfo> = Vec::new();
             let mut budget_exceeded = Vec::new();
-
-            // A selector that could not resolve because the project build is
-            // incomplete is routed to `needs_build`, not the generic
-            // `unavailable` bucket, so the agent gets a `lake build` cue
-            // instead of chasing a phantom name collision.
-            let mut route_unavailable = |id, message: String| {
-                if crate::diagnosis::signals_unresolved(&message) {
-                    needs_build.push(SelectorMessage { id, message });
-                } else {
-                    unavailable.push(SelectorMessage { id, message });
-                }
-            };
 
             for item in result.items {
                 match project_batch_item(item, None) {
@@ -361,13 +357,28 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                                 truncated = info.truncated;
                             }
                             ProofStateProjection::Unavailable { message } => {
-                                route_unavailable(id, message);
+                                unavailable.push(SelectorMessage { id, message });
+                            }
+                            // The worker (protocol 8) classifies an incomplete
+                            // environment and a genuine collision as typed
+                            // verdicts; route each to its honest bucket.
+                            ProofStateProjection::NeedsBuild { missing } => {
+                                let message = if missing.is_empty() {
+                                    "project environment is incomplete".to_owned()
+                                } else {
+                                    format!("missing: {}", missing.join(", "))
+                                };
+                                needs_build_missing.extend(missing);
+                                needs_build.push(SelectorMessage { id, message });
+                            }
+                            ProofStateProjection::Ambiguous { candidates } => {
+                                ambiguous.extend(candidates);
                             }
                         },
                         _ => {}
                     },
                     ProjectedBatchItem::Unavailable { id, message } => {
-                        route_unavailable(id, message);
+                        unavailable.push(SelectorMessage { id, message });
                     }
                     ProjectedBatchItem::BudgetExceeded { id, message } => {
                         budget_exceeded.push(SelectorMessage { id, message });
@@ -375,7 +386,8 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 }
             }
 
-            let degraded = !needs_build.is_empty();
+            let needs_build_cue = (!needs_build.is_empty()).then(|| needs_build_missing.clone());
+            let ambiguous_cue = competing_decls(&ambiguous);
             let response = Response::ok(
                 ProofStateResult::Context {
                     diagnostics,
@@ -389,17 +401,21 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                     total_truncated: result.total_truncated,
                     unavailable,
                     needs_build,
+                    ambiguous,
                     budget_exceeded,
                     query_facts: Box::new(query_facts.clone()),
                 },
                 freshness,
             )
             .with_runtime(run.runtime.clone());
-            let response = if degraded {
-                crate::diagnosis::warn_needs_build(response, &crate::diagnosis::IncompleteCause::Unresolved)
-            } else {
-                response
+            let response = match needs_build_cue {
+                Some(missing) => crate::diagnosis::warn_needs_build(
+                    response,
+                    &crate::diagnosis::IncompleteCause::MissingImports(missing),
+                ),
+                None => response,
             };
+            let response = crate::diagnosis::warn_ambiguous(response, &ambiguous_cue);
             Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
@@ -893,6 +909,10 @@ fn project_proof_state_result(result: LeanWorkerProofStateResult) -> ProofStateP
             info: Box::new(project_proof_state_info(*info)),
         },
         LeanWorkerProofStateResult::Unavailable { message } => ProofStateProjection::Unavailable { message },
+        LeanWorkerProofStateResult::Ambiguous { candidates } => ProofStateProjection::Ambiguous {
+            candidates: candidates.into_iter().map(project_declaration_target_info).collect(),
+        },
+        LeanWorkerProofStateResult::NeedsBuild { missing } => ProofStateProjection::NeedsBuild { missing },
         _ => ProofStateProjection::Unavailable {
             message: "worker returned an unknown proof-state result".to_owned(),
         },
@@ -961,6 +981,19 @@ fn project_surrounding_declaration_result(
         LeanWorkerSurroundingDeclarationResult::None => SurroundingDeclarationProjection::None,
         _ => SurroundingDeclarationProjection::None,
     }
+}
+
+/// Map projected ambiguity candidates to the diagnosis renderer's shape. The
+/// fully-qualified `declaration_name` plus `namespace_name` disambiguator is
+/// what an agent needs to pick the intended declaration.
+fn competing_decls(candidates: &[DeclarationTargetInfo]) -> Vec<crate::diagnosis::CompetingDecl> {
+    candidates
+        .iter()
+        .map(|info| crate::diagnosis::CompetingDecl {
+            name: info.declaration_name.clone(),
+            namespace: (!info.namespace_name.is_empty()).then(|| info.namespace_name.clone()),
+        })
+        .collect()
 }
 
 fn project_declaration_target_info(info: LeanWorkerDeclarationTargetInfo) -> DeclarationTargetInfo {
@@ -1203,6 +1236,7 @@ import Init -- comment
             total_truncated: false,
             unavailable: Vec::new(),
             needs_build: Vec::new(),
+            ambiguous: Vec::new(),
             budget_exceeded: Vec::new(),
             query_facts: Box::new(project_query_facts(worker_facts(LeanWorkerModuleCacheStatus::Miss))),
         };
