@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 lean-host-mcp publishes **both** crates to crates.io (`lean-host-mcp` and `lean-host-mcp-worker`). Publishing is
 **CI-driven**: `.github/workflows/release.yml` triggers on a `v<semver>` tag push, re-runs the full gate, then publishes
-both crates (worker first, `--no-verify`; then the parent) and creates a GitHub Release from the matching CHANGELOG
+both crates (worker first, then the parent, both `--no-verify`) and creates a GitHub Release from the matching CHANGELOG
 section. A release is therefore a local gate + version bump + CHANGELOG + a signed git tag — the **tag push is the
 trigger**, not a manual upload.
 
@@ -70,12 +70,13 @@ anything uploads.
 
 ## 6. Watch the release workflow
 
-The tag push starts `.github/workflows/release.yml`. It re-runs the gate (`verify`), then `publish` uploads **worker
-first** (`--no-verify`, since its verify build would link `libleanshared`), then the **parent** (verifies normally — it
-never links `libleanshared`, so the publish job needs no Lean toolchain), and finally creates the GitHub Release from
-the `## [X.Y.Z]` CHANGELOG section. Worker-before-parent is a user-experience rule (a user must never install a parent
-whose `install-worker` resolves a not-yet-published worker), not a cargo constraint — the two crates have no inter-crate
-dependency.
+The tag push starts `.github/workflows/release.yml`. It re-runs the gate (`verify` — the only job with a Lean toolchain;
+it builds/tests both crates, asserts parent ⊥ libleanshared, and dry-run-verifies both tarballs), then the Lean-free
+`publish` job uploads **worker first** then the **parent**, both `--no-verify` (the worker links `libleanshared` and
+even the parent's verify build pulls `lean-rs-sys`, both needing a Lean toolchain the publish job lacks — the gate
+already verified), and finally creates the GitHub Release from the `## [X.Y.Z]` CHANGELOG section. Worker-before-parent
+is a user-experience rule (a user must never install a parent whose `install-worker` resolves a not-yet-published
+worker), not a cargo constraint — the two crates have no inter-crate dependency.
 
 Watch the run (`gh run watch` or the Actions tab). crates.io versions are permanent — a mistake can only be yanked, not
 replaced.

@@ -14,12 +14,14 @@ name: Release
 # `CARGO_REGISTRY_TOKEN` must be set in the repository secrets before the first
 # tag push — a scoped publish token from <https://crates.io/settings/tokens>.
 #
-# Two-crate split drives the job layout: the parent never links libleanshared,
-# so its verify build (and thus the whole `publish` job) needs no Lean toolchain.
-# The worker does link libleanshared, so it publishes with `--no-verify` to skip
-# the verify build that would demand a Lean toolchain in the publish env. Only
-# the `verify` gate installs Lean — to build/test the worker and assert the
-# parent ⊥ libleanshared link invariant.
+# Two-crate split drives the job layout. Only the `verify` gate installs Lean:
+# it builds and tests both crates per-member, asserts the parent ⊥ libleanshared
+# link invariant, and verify-builds both publish tarballs (`cargo publish
+# --dry-run`). The `publish` job is therefore Lean-free — it uploads both crates
+# with `--no-verify`, relying on that gate. This is necessary, not just an
+# optimization: the worker links libleanshared, and even the parent's verify
+# build pulls lean-rs-sys, whose build script requires a Lean toolchain. A
+# Lean-free publish must skip verification; the gate already performed it.
 
 on:
   push:
@@ -178,19 +180,21 @@ jobs:
             cargo publish -p "$crate" "$@"
           }
           # Worker first: a user must never install a parent whose install-worker
-          # resolves a not-yet-published worker. --no-verify skips the worker's
-          # verify build, which would link libleanshared and demand a Lean
-          # toolchain here. The parent verifies normally (it never links
-          # libleanshared, so it needs no Lean toolchain).
+          # resolves a not-yet-published worker. Both publish with --no-verify:
+          # the verify build pulls lean-rs-sys (and, for the worker, links
+          # libleanshared), which demands a Lean toolchain this Lean-free job
+          # does not have. The `verify` gate already built, tested, and dry-run
+          # verified both tarballs.
           publish_one lean-host-mcp-worker --no-verify
-          publish_one lean-host-mcp
+          publish_one lean-host-mcp --no-verify
 
       - name: Publish dry-run (no upload)
         if: inputs.dry_run == true
         run: |
           set -euo pipefail
+          # --no-verify on both: this job has no Lean toolchain (see header).
           cargo publish -p lean-host-mcp-worker --no-verify --dry-run
-          cargo publish -p lean-host-mcp --dry-run
+          cargo publish -p lean-host-mcp --no-verify --dry-run
 
       - name: Extract CHANGELOG section for this release
         if: inputs.dry_run != true && github.event_name == 'push'
