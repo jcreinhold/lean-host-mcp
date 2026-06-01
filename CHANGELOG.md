@@ -11,6 +11,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `cargo install lean-host-mcp` now works without a source checkout. When the server binary was not built from a
+  checkout, `install-worker` builds each per-toolchain worker from the published `lean-host-mcp-worker` crate
+  (`cargo install lean-host-mcp-worker --version =<ver>`) instead of erroring; from a checkout it still builds the
+  worker from workspace source, and `--source-dir` overrides the choice. The worker is still compiled locally per
+  toolchain (its rpath is machine-specific) and smoke-tested before use. Both crates are now published to crates.io.
 - Unified TOML config file for every tunable knob. A `lean-host-mcp.toml` (found by walking up from the working
   directory, like the lakefile) or the home `~/.config/lean-host-mcp/config.toml` can set the `[runtime]`, `[broker]`,
   and `[server]` knobs that were previously env-var-only, plus the existing `primary_project`. When both files exist

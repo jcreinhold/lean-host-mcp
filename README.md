@@ -32,14 +32,14 @@ workflow and the request/result schema for each tool are in [`docs/tool-catalog.
 ## Quick start
 
 ```sh
-# 1. Install the parent binary. Build per-member, never `cargo build --workspace`
-#    (a workspace build links libleanshared into the parent; see docs/operations.md).
-cd /path/to/lean-host-mcp
-cargo install --path crates/lean-host-mcp
+# 1. Install the server.
+cargo install lean-host-mcp
 
 # 2. Install a worker binary for each Lean toolchain you use. With no flag,
 #    install-worker scans ~/.elan/toolchains and builds any that are missing;
-#    each lands under ~/.local/share/lean-host-mcp/workers/<id>/.
+#    each lands under ~/.local/share/lean-host-mcp/workers/<id>/. The worker is
+#    compiled locally per toolchain (it links libleanshared), so this needs a
+#    Rust toolchain on PATH and the matching Lean toolchain installed via elan.
 lean-host-mcp install-worker
 lean-host-mcp install-worker --toolchain v4.30.0   # or one toolchain
 lean-host-mcp install-worker --list                # see what's installed
@@ -49,6 +49,11 @@ lean-host-mcp install-worker --list                # see what's installed
 cd /path/to/your/lake/project
 lake build && lean-host-mcp
 ```
+
+Contributors working from a checkout install the same way but with `cargo install --path crates/lean-host-mcp` — from a
+checkout, `install-worker` builds the worker from the workspace source (and `--source-dir` points it at a checkout
+elsewhere). Build per-member, never `cargo build --workspace`, which would link libleanshared into the parent (see
+[docs/operations.md](docs/operations.md)).
 
 To pin a default project explicitly instead of relying on the working directory:
 
