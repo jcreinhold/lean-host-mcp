@@ -6,11 +6,18 @@ disable-model-invocation: true
 
 # Releasing lean-host-mcp
 
-lean-host-mcp publishes **both** crates to crates.io (`lean-host-mcp` and `lean-host-mcp-worker`). There is **no**
-`release.yml` yet — a release is a local gate + version bump + CHANGELOG + a signed git tag + a manual `cargo publish`.
+lean-host-mcp publishes **both** crates to crates.io (`lean-host-mcp` and `lean-host-mcp-worker`). Publishing is
+**CI-driven**: `.github/workflows/release.yml` triggers on a `v<semver>` tag push, re-runs the full gate, then publishes
+both crates (worker first, `--no-verify`; then the parent) and creates a GitHub Release from the matching CHANGELOG
+section. A release is therefore a local gate + version bump + CHANGELOG + a signed git tag — the **tag push is the
+trigger**, not a manual upload.
 
-Work top to bottom. Steps 1–4 are reversible; step 5 (the tag push) and step 6 (the crates.io publish) are **not** —
-crates.io versions are permanent (yank-only). Do them only after a human confirms.
+Work top to bottom. Steps 1–4 are reversible; step 5 (the tag push) is **not** — it kicks off the irreversible crates.io
+publish, and crates.io versions are permanent (yank-only). Do it only after a human confirms.
+
+**One-time setup:** the repo must have a `CARGO_REGISTRY_TOKEN` secret (a scoped publish token from
+<https://crates.io/settings/tokens>); the publish job fails fast with a clear message if it is absent. Rehearse the
+whole pipeline without uploading by running the workflow via `workflow_dispatch` with `dry_run: true`.
 
 ## 1. Pre-flight gate
 
@@ -46,23 +53,33 @@ Confirm the supported `lean-rs` / Lean toolchain pairing in the **README** (the 
 this release. Bumping the toolchain is a `lean-rs` change first, then a version bump here — see CLAUDE.md "Version
 matrix".
 
-## 5. Tag (irreversible)
+## 5. Tag and push (triggers the irreversible publish)
+
+First push the release commit, then push the matching signed tag. The workflow runs the gate and publishes from the
+**tagged commit**, so `release.yml` (and the CHANGELOG section for this version) must already be in it.
 
 After human confirmation:
 
 ```sh
+git push origin main
 git tag -s vX.Y.Z -m "lean-host-mcp vX.Y.Z" && git push origin vX.Y.Z
 ```
 
-## 6. Publish to crates.io (irreversible)
+The tag's name must equal `v` + the workspace version, or the `verify` job fails the tag-vs-version check before
+anything uploads.
 
-After the tag is pushed, publish the exact tagged commit. **Worker first**, then the parent — a user must never be able
-to install a parent whose `install-worker` resolves a not-yet-published worker:
+## 6. Watch the release workflow
 
-```sh
-cargo publish --no-verify -p lean-host-mcp-worker   # --no-verify: its verify-build would link libleanshared
-cargo publish -p lean-host-mcp                       # parent verifies normally (never links libleanshared)
-```
+The tag push starts `.github/workflows/release.yml`. It re-runs the gate (`verify`), then `publish` uploads **worker
+first** (`--no-verify`, since its verify build would link `libleanshared`), then the **parent** (verifies normally — it
+never links `libleanshared`, so the publish job needs no Lean toolchain), and finally creates the GitHub Release from
+the `## [X.Y.Z]` CHANGELOG section. Worker-before-parent is a user-experience rule (a user must never install a parent
+whose `install-worker` resolves a not-yet-published worker), not a cargo constraint — the two crates have no inter-crate
+dependency.
 
-The two crates have no inter-crate dependency, so this ordering is a user-experience rule, not a cargo constraint.
-crates.io versions are permanent — a mistake can only be yanked, not replaced.
+Watch the run (`gh run watch` or the Actions tab). crates.io versions are permanent — a mistake can only be yanked, not
+replaced.
+
+**Recovery.** If the run dies between the two uploads (e.g. the parent loses the index-propagation race), re-run the
+workflow via `workflow_dispatch` (`dry_run: false`). The publish step is idempotent: it skips any crate whose version is
+already on crates.io and uploads only the missing one, so it completes the release without burning a version.
