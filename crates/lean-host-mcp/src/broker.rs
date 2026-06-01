@@ -47,6 +47,7 @@ use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
+use crate::config_file::BrokerFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::lake_meta::{LakeProjectMeta, fingerprint_lake_project};
@@ -102,6 +103,20 @@ impl BrokerConfig {
     /// [`ServerError::Internal`] when an env var is set but unparseable
     /// (non-numeric, or `MAX_PROJECTS=0`).
     pub fn pool_from_env() -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
+        Self::pool_from_env_with_file(&BrokerFileConfig::default())
+    }
+
+    /// Resolve the pool knobs with a config-file section beneath the env vars:
+    /// each knob is `env var > file > built-in default`. The same zero/deadlock
+    /// guards apply to a file-sourced value as to an env-sourced one.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Internal`] when an env var is set but unparseable, or a
+    /// resolved value (env or file) is zero where zero would deadlock.
+    pub fn pool_from_env_with_file(
+        file: &BrokerFileConfig,
+    ) -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
         parse_pool_config(
             std::env::var("LEAN_HOST_MCP_MAX_PROJECTS").ok().as_deref(),
             std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok().as_deref(),
@@ -110,6 +125,7 @@ impl BrokerConfig {
             std::env::var("LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS")
                 .ok()
                 .as_deref(),
+            file,
         )
     }
 
@@ -146,78 +162,94 @@ impl BrokerConfig {
     }
 }
 
-/// Pure parser shared by [`BrokerConfig::pool_from_env`] and unit tests.
+/// Pure parser shared by [`BrokerConfig::pool_from_env_with_file`] and unit
+/// tests. Each knob resolves `env > file > default`; zero/deadlock guards apply
+/// to the resolved value whatever its source.
 fn parse_pool_config(
     max: Option<&str>,
     idle: Option<&str>,
     semantic: Option<&str>,
     semantic_waiters: Option<&str>,
     semantic_timeout_millis: Option<&str>,
+    file: &BrokerFileConfig,
 ) -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
-    let max_projects = match max {
-        Some(s) => {
-            let n: usize = s
-                .parse()
-                .map_err(|e| ServerError::Internal(format!("LEAN_HOST_MCP_MAX_PROJECTS={s:?} not a usize: {e}")))?;
-            NonZeroUsize::new(n)
-                .ok_or_else(|| ServerError::Internal("LEAN_HOST_MCP_MAX_PROJECTS=0 would deadlock the pool".into()))?
-        }
-        None => BrokerConfig::default_max_projects(),
-    };
-    let idle_timeout = match idle {
-        Some(s) => {
-            let n: u64 = s
-                .parse()
-                .map_err(|e| ServerError::Internal(format!("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS={s:?} not a u64: {e}")))?;
-            Duration::from_secs(n)
-        }
-        None => BrokerConfig::default_idle_timeout(),
-    };
-    let semantic_permits = match semantic {
-        Some(s) => {
-            let n: usize = s
-                .parse()
-                .map_err(|e| ServerError::Internal(format!("LEAN_HOST_MCP_SEMANTIC_PERMITS={s:?} not a usize: {e}")))?;
-            NonZeroUsize::new(n).ok_or_else(|| {
-                ServerError::Internal("LEAN_HOST_MCP_SEMANTIC_PERMITS=0 would deadlock semantic work".into())
-            })?
-        }
-        None => BrokerConfig::default_semantic_permits(),
-    };
-    let semantic_waiters = match semantic_waiters {
-        Some(s) => {
-            let n: usize = s
-                .parse()
-                .map_err(|e| ServerError::Internal(format!("LEAN_HOST_MCP_SEMANTIC_WAITERS={s:?} not a usize: {e}")))?;
-            NonZeroUsize::new(n).ok_or_else(|| {
-                ServerError::Internal("LEAN_HOST_MCP_SEMANTIC_WAITERS=0 would reject all waiters".into())
-            })?
-        }
-        None => BrokerConfig::default_semantic_waiters(),
-    };
-    let semantic_admission_timeout = match semantic_timeout_millis {
-        Some(s) => {
-            let n: u64 = s.parse().map_err(|e| {
-                ServerError::Internal(format!(
-                    "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS={s:?} not a u64: {e}"
-                ))
-            })?;
-            if n == 0 {
-                return Err(ServerError::Internal(
-                    "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS=0 is not allowed".into(),
-                ));
-            }
-            Duration::from_millis(n)
-        }
-        None => BrokerConfig::default_semantic_admission_timeout(),
-    };
+    let max_projects = nonzero(
+        resolve_usize(
+            "LEAN_HOST_MCP_MAX_PROJECTS",
+            max,
+            file.max_projects,
+            DEFAULT_MAX_PROJECTS,
+        )?,
+        "LEAN_HOST_MCP_MAX_PROJECTS=0 would deadlock the pool",
+    )?;
+    // Idle timeout intentionally allows 0 (disables idle eviction).
+    let idle_timeout = Duration::from_secs(resolve_u64(
+        "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS",
+        idle,
+        file.idle_timeout_secs,
+        DEFAULT_IDLE_TIMEOUT_SECS,
+    )?);
+    let semantic_permits = nonzero(
+        resolve_usize(
+            "LEAN_HOST_MCP_SEMANTIC_PERMITS",
+            semantic,
+            file.semantic_permits,
+            DEFAULT_SEMANTIC_PERMITS,
+        )?,
+        "LEAN_HOST_MCP_SEMANTIC_PERMITS=0 would deadlock semantic work",
+    )?;
+    let semantic_waiters = nonzero(
+        resolve_usize(
+            "LEAN_HOST_MCP_SEMANTIC_WAITERS",
+            semantic_waiters,
+            file.semantic_waiters,
+            DEFAULT_SEMANTIC_WAITERS,
+        )?,
+        "LEAN_HOST_MCP_SEMANTIC_WAITERS=0 would reject all waiters",
+    )?;
+    let timeout_millis = resolve_u64(
+        "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS",
+        semantic_timeout_millis,
+        file.semantic_admission_timeout_millis,
+        DEFAULT_SEMANTIC_ADMISSION_TIMEOUT_MILLIS,
+    )?;
+    if timeout_millis == 0 {
+        return Err(ServerError::Internal(
+            "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS=0 is not allowed".into(),
+        ));
+    }
     Ok((
         max_projects,
         idle_timeout,
         semantic_permits,
         semantic_waiters,
-        semantic_admission_timeout,
+        Duration::from_millis(timeout_millis),
     ))
+}
+
+/// Resolve a `usize` knob through `env > file > default`. The env string is
+/// parsed here; the file value is already typed.
+fn resolve_usize(name: &str, env: Option<&str>, file: Option<usize>, default: usize) -> Result<usize> {
+    match env {
+        Some(s) => s
+            .parse()
+            .map_err(|e| ServerError::Internal(format!("{name}={s:?} not a usize: {e}"))),
+        None => Ok(file.unwrap_or(default)),
+    }
+}
+
+/// Resolve a `u64` knob through `env > file > default`.
+fn resolve_u64(name: &str, env: Option<&str>, file: Option<u64>, default: u64) -> Result<u64> {
+    match env {
+        Some(s) => s
+            .parse()
+            .map_err(|e| ServerError::Internal(format!("{name}={s:?} not a u64: {e}"))),
+        None => Ok(file.unwrap_or(default)),
+    }
+}
+
+fn nonzero(value: usize, zero_message: &str) -> Result<NonZeroUsize> {
+    NonZeroUsize::new(value).ok_or_else(|| ServerError::Internal(zero_message.to_owned()))
 }
 
 /// Per-call routing hint. `Default` runs the full resolution chain;
@@ -608,9 +640,16 @@ impl ProjectBroker {
         if let Some(project) = cached {
             let current_hash = fingerprint_lake_project(&root)?;
             if project.manifest_hash() == current_hash && project.is_healthy() {
+                tracing::debug!(project = %root.display(), cache_hit = true, "reusing resident project");
                 self.inner.lock().last_used.insert(root, Instant::now());
                 return Ok(project);
             }
+            tracing::debug!(
+                project = %root.display(),
+                manifest_changed = project.manifest_hash() != current_hash,
+                healthy = project.is_healthy(),
+                "evicting stale project before reopen"
+            );
             // Stale entry (manifest changed or actor died); evict and fall
             // through to reopen. Without the `is_healthy` check the next
             // caller would receive a `SessionGone` for every tool call until
@@ -681,6 +720,7 @@ impl ProjectBroker {
             Ok(Ok(project)) => project,
             Ok(Err(err)) => {
                 self.inner.lock().opening_locks.remove(&root);
+                tracing::warn!(project = %root.display(), error = %err, "project open failed");
                 return Err(err);
             }
             Err(err) => {
@@ -688,6 +728,7 @@ impl ProjectBroker {
                 return Err(ServerError::Internal(format!("project open task failed: {err}")));
             }
         };
+        tracing::info!(project = %root.display(), toolchain = %opened.toolchain(), "opened project; worker spawned");
 
         // Reacquire, race-resolve, insert with possible eviction.
         let mut inner = self.inner.lock();
@@ -706,6 +747,10 @@ impl ProjectBroker {
                 inner.opening_locks.remove(&root);
                 drop(inner);
                 opened.shutdown();
+                tracing::warn!(
+                    project = %root.display(),
+                    "project pool full and every entry is active; rejecting (retryable)"
+                );
                 return Err(ServerError::worker_unavailable(crate::error::WorkerUnavailable {
                     retryable: true,
                     worker_restarted: false,
@@ -738,6 +783,7 @@ impl ProjectBroker {
         inner.opening_locks.remove(&root);
         drop(inner);
         if let Some(v) = victim {
+            tracing::debug!(evicted = %v.canonical_root().display(), "evicted LRU project to make room");
             v.shutdown();
         }
         Ok(project)
@@ -773,6 +819,13 @@ impl ProjectBroker {
             }
             out
         };
+        if !evicted.is_empty() {
+            tracing::info!(
+                evicted_count = evicted.len(),
+                idle_timeout_secs = self.config.idle_timeout.as_secs(),
+                "idle reaper evicted projects"
+            );
+        }
         for v in evicted {
             v.shutdown();
         }
@@ -880,7 +933,8 @@ mod tests {
 
     #[test]
     fn parse_pool_config_uses_defaults_when_unset() {
-        let (max, idle, semantic, waiters, timeout) = parse_pool_config(None, None, None, None, None).unwrap();
+        let empty = BrokerFileConfig::default();
+        let (max, idle, semantic, waiters, timeout) = parse_pool_config(None, None, None, None, None, &empty).unwrap();
         assert_eq!(max.get(), DEFAULT_MAX_PROJECTS);
         assert_eq!(idle, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
         assert_eq!(semantic.get(), DEFAULT_SEMANTIC_PERMITS);
@@ -893,8 +947,9 @@ mod tests {
 
     #[test]
     fn parse_pool_config_accepts_explicit_values() {
+        let empty = BrokerFileConfig::default();
         let (max, idle, semantic, waiters, timeout) =
-            parse_pool_config(Some("8"), Some("30"), Some("2"), Some("12"), Some("250")).unwrap();
+            parse_pool_config(Some("8"), Some("30"), Some("2"), Some("12"), Some("250"), &empty).unwrap();
         assert_eq!(max.get(), 8);
         assert_eq!(idle, Duration::from_secs(30));
         assert_eq!(semantic.get(), 2);
@@ -904,23 +959,51 @@ mod tests {
 
     #[test]
     fn parse_pool_config_treats_zero_idle_as_disable() {
-        let (_, idle, _, _, _) = parse_pool_config(None, Some("0"), None, None, None).unwrap();
+        let empty = BrokerFileConfig::default();
+        let (_, idle, _, _, _) = parse_pool_config(None, Some("0"), None, None, None, &empty).unwrap();
         assert_eq!(idle, Duration::ZERO);
     }
 
     #[test]
     fn parse_pool_config_rejects_max_projects_zero() {
-        let err = parse_pool_config(Some("0"), None, None, None, None).unwrap_err();
+        let empty = BrokerFileConfig::default();
+        let err = parse_pool_config(Some("0"), None, None, None, None, &empty).unwrap_err();
         assert!(matches!(err, ServerError::Internal(_)), "{err:?}");
     }
 
     #[test]
     fn parse_pool_config_rejects_garbage() {
-        assert!(parse_pool_config(Some("seven"), None, None, None, None).is_err());
-        assert!(parse_pool_config(None, Some("forever"), None, None, None).is_err());
-        assert!(parse_pool_config(None, None, Some("many"), None, None).is_err());
-        assert!(parse_pool_config(None, None, Some("0"), None, None).is_err());
-        assert!(parse_pool_config(None, None, None, Some("0"), None).is_err());
-        assert!(parse_pool_config(None, None, None, None, Some("0")).is_err());
+        let e = BrokerFileConfig::default();
+        assert!(parse_pool_config(Some("seven"), None, None, None, None, &e).is_err());
+        assert!(parse_pool_config(None, Some("forever"), None, None, None, &e).is_err());
+        assert!(parse_pool_config(None, None, Some("many"), None, None, &e).is_err());
+        assert!(parse_pool_config(None, None, Some("0"), None, None, &e).is_err());
+        assert!(parse_pool_config(None, None, None, Some("0"), None, &e).is_err());
+        assert!(parse_pool_config(None, None, None, None, Some("0"), &e).is_err());
+    }
+
+    #[test]
+    fn parse_pool_config_file_value_used_when_env_unset_and_env_wins() {
+        let file = BrokerFileConfig {
+            max_projects: Some(7),
+            semantic_admission_timeout_millis: Some(0), // would be rejected if the env didn't win
+            ..BrokerFileConfig::default()
+        };
+        // Env unset -> file value used for max_projects.
+        let (max, ..) = parse_pool_config(None, None, None, None, Some("250"), &file).unwrap();
+        assert_eq!(max.get(), 7);
+        // Env present -> env wins over the (here invalid) file value.
+        let (max, _, _, _, timeout) = parse_pool_config(Some("3"), None, None, None, Some("250"), &file).unwrap();
+        assert_eq!(max.get(), 3);
+        assert_eq!(timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn parse_pool_config_rejects_zero_max_projects_from_file() {
+        let file = BrokerFileConfig {
+            max_projects: Some(0),
+            ..BrokerFileConfig::default()
+        };
+        assert!(parse_pool_config(None, None, None, None, None, &file).is_err());
     }
 }

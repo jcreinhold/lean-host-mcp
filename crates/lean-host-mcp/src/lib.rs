@@ -25,6 +25,8 @@
 pub mod broker;
 mod cache;
 pub mod cli;
+pub mod config_file;
+pub mod config_schema;
 mod diagnosis;
 pub mod envelope;
 pub mod error;
@@ -37,6 +39,7 @@ pub mod toolchain;
 pub mod tools;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
+pub use config_file::ConfigFile;
 pub use envelope::{Freshness, Response, ResponseStatus, RuntimeFacts, RuntimeFailure};
 pub use error::{Result, ServerError};
 pub use lake_meta::LakeProjectMeta;

@@ -121,7 +121,12 @@ single client surveys several projects. A call that omits it resolves the projec
 
 1. `LEAN_HOST_MCP_PROJECT` (or the `--lake-root` flag)
 2. Walk upward from the server's working directory for `lakefile.{toml,lean}`
-3. `~/.config/lean-host-mcp/config.toml` → `primary_project = "/abs/path"`
+3. `primary_project` in the config file (`./lean-host-mcp.toml` or `~/.config/lean-host-mcp/config.toml`)
+
+All tunable knobs (worker memory ceilings, pool sizing, transport) can also be set in that config file instead of env
+vars. Run `lean-host-mcp config init` to write a documented starter with every option at its default, then edit it. See
+[Configuration file](docs/operations.md#configuration-file) for discovery and precedence, and
+[Configuration reference](docs/operations.md#configuration-reference) for the full per-knob table.
 
 ## Response envelope
 

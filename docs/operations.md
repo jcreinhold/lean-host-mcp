@@ -5,27 +5,89 @@ test and performance harness. Most users need none of this — start with the [R
 [tool catalog](tool-catalog.md). Reach for this page when you are sizing a deployment, debugging a `runtime_unavailable`
 response, or working on the server itself.
 
-## Environment variables
+## Configuration file
 
-RSS thresholds are in KiB, byte caps in bytes; the parenthetical magnitude is for reading, not for setting.
+Every knob can live in one TOML file instead of a dozen environment variables. Generate a documented starter — every
+option written at its current default, each with a comment explaining it — then edit what you need:
 
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `LEAN_HOST_MCP_PROJECT` | Default Lake root for calls without a `project=` argument. | unset |
-| `LEAN_HOST_MCP_BIND` | Loopback `ADDR:PORT` for Streamable HTTP; stdio when unset. | unset |
-| `LEAN_HOST_MCP_HTTP_PATH` | Streamable HTTP route. Requires `--bind` / `LEAN_HOST_MCP_BIND`. | `/mcp` |
-| `LEAN_HOST_MCP_MAX_PROJECTS` | Resident project **slots**; oldest idle one is evicted on overflow. Counts every open project, including one whose worker is crash-looping (process-dead): it keeps its slot until the next call evicts it (health check) or the idle reaper reclaims it. | `4` |
-| `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Idle window before a project is reaped. `0` disables. | `600` |
-| `LEAN_HOST_MCP_SEMANTIC_PERMITS` | Process-wide permits for heavy semantic work; `1` serializes cross-project calls. | `1` |
-| `LEAN_HOST_MCP_SEMANTIC_WAITERS` | Callers that may queue for admission; overflow returns retryable `semantic_admission_full`. | `16` |
-| `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | Max admission wait; timeout returns retryable `semantic_admission_timeout`. | `60000` |
-| `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | Per-project job mailbox depth; a full mailbox returns retryable `busy`. | `8` |
-| `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB` | Post-job RSS ceiling that triggers a planned worker cycle. | `5242880` (5 GiB) |
-| `LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB` | RSS ceiling that cycles a worker before an import-profile switch. | `2097152` (2 GiB) |
-| `LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB` | In-flight hard kill; crossing it restarts the child, returning `rss_hard_limit_exceeded`. | `16777216` (16 GiB) |
-| `LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS` | Sampling interval for the in-flight hard-RSS watchdog. | `250` |
-| `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Worker module-snapshot cache RSS guard. | `2097152` (2 GiB) |
-| `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Worker module-snapshot cache byte cap. | `33554432` (32 MiB) |
+```sh
+lean-host-mcp config init          # writes ./lean-host-mcp.toml (project-local)
+lean-host-mcp config init --home   # writes ~/.config/lean-host-mcp/config.toml (per-user)
+```
+
+`config init` refuses to overwrite an existing file unless you pass `--force`; `--path FILE` writes somewhere else.
+Discovery at startup:
+
+1. **Project-local** (preferred): the nearest `lean-host-mcp.toml`, found by walking up from the server's working
+   directory (the same upward search as the lakefile).
+2. **Home**: `<config-dir>/lean-host-mcp/config.toml` (e.g. `~/.config/lean-host-mcp/config.toml`;
+   `LEAN_HOST_MCP_CONFIG_DIR` overrides the base dir, used by the test suite).
+
+When both exist they **merge per key**: the home file sets baseline values and the local file overrides only the keys it
+sets. A missing file is fine; a malformed file is logged and ignored. The same startup validation applies whatever the
+source (RSS ordering, non-zero pool guards).
+
+## Configuration reference
+
+Every knob, with the environment variable — and, for the transport knobs, the CLI flag — that overrides it. Precedence
+per knob is **CLI flag > env var > file > built-in default**, so an env var still overrides the file and existing
+`LEAN_HOST_MCP_*` setups keep working unchanged. RSS thresholds are in KiB and byte caps in bytes; a magnitude in a
+description (e.g. "5 GiB") is for reading, not for setting.
+
+<!-- BEGIN GENERATED: do not edit by hand. Regenerate from `config_schema::render_reference_table`; the `operations_md_reference_table_is_in_sync` test fails when this block drifts. -->
+
+| Key | Type | Default | Override | Description |
+| --- | --- | --- | --- | --- |
+| `primary_project` | path | unset | `--lake-root / LEAN_HOST_MCP_PROJECT` | Default Lake project for calls that omit an explicit project= argument. Lowest-priority fallback, after the flag/env and the nearest lakefile above the working directory. |
+| `runtime.worker_rss_post_job_restart_kib` | integer (KiB) | `5242880` | `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB` | Post-job soft restart ceiling: after a call finishes, the worker is recycled if its resident memory is at or above this. Raise toward the hard-kill ceiling to recycle less often. Default 5 GiB. |
+| `runtime.worker_rss_hard_kill_kib` | integer (KiB) | `16777216` | `LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB` | In-flight hard-kill ceiling: a call whose worker crosses this is killed mid-call so a runaway tactic cannot exhaust the machine. Must be at least the post-job ceiling. Default 16 GiB. |
+| `runtime.worker_rss_sample_millis` | integer (ms) | `250` | `LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS` | How often the supervisor samples worker resident memory for the in-flight hard-kill watchdog. |
+| `runtime.import_switch_rss_soft_kib` | integer (KiB) | `2097152` | `LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB` | Soft restart ceiling applied when a call needs a different import set than the live worker holds. Must not exceed the post-job ceiling. Default 2 GiB. |
+| `runtime.module_cache_rss_guard_kib` | integer (KiB) | `2097152` | `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Resident-memory ceiling above which the per-worker module-query cache stops growing. Default 2 GiB. |
+| `runtime.module_cache_max_bytes` | integer (bytes) | `33554432` | `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Maximum size of the per-worker module-query result cache, in bytes. Default 32 MiB. |
+| `runtime.project_mailbox_capacity` | integer | `8` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls may queue for one project's worker before new calls are shed with a retryable busy status. |
+| `runtime.worker_restart_limit` | integer | `3` | `LEAN_HOST_MCP_WORKER_RESTART_LIMIT` | How many worker restarts are tolerated within the restart window before the project is marked unhealthy. |
+| `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
+| `broker.max_projects` | integer | `4` | `LEAN_HOST_MCP_MAX_PROJECTS` | How many distinct Lake projects stay open at once; on overflow the least-recently-used project's worker is evicted. |
+| `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes. |
+| `broker.semantic_permits` | integer | `1` | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | How many semantic (elaborating) calls run concurrently across all projects. Lean elaboration is single-threaded per worker, so raising this helps only when hosting several projects at once. |
+| `broker.semantic_waiters` | integer | `16` | `LEAN_HOST_MCP_SEMANTIC_WAITERS` | How many semantic calls may queue for a permit before new ones are shed with a retryable semantic_admission_full status. |
+| `broker.semantic_admission_timeout_millis` | integer (ms) | `60000` | `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | How long a semantic call waits for a permit before giving up with a retryable semantic_admission_timeout status. Default 60 seconds. |
+| `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
+| `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
+
+<!-- END GENERATED -->
+
+The three RSS ceilings must satisfy `import_switch <= post_job <= hard_kill`; the server **refuses to start** with a
+clear `invalid RSS config: …` message otherwise (an inverted order makes the cheaper planned cycle unreachable — e.g.
+`post_job` above `hard_kill` means every overrun escalates straight to an in-flight hard kill). To recycle less often
+under memory pressure, raise `post_job` toward (but below) `hard_kill` — e.g.
+`LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB=8388608` for an 8 GiB post-job ceiling.
+
+## Observing worker recycles
+
+Every recycle is logged to **stderr** (stdout stays clean for the stdio transport) and tallied into each tool response's
+`runtime` facts, so you can answer *why* and *how often* a worker recycles without guessing.
+
+Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `rss_kib`, `limit_kib`, `planned`,
+`restarts_total`. Level tracks the signal, not whether the cycle was planned:
+
+- `warn` — abnormal/crash causes: `rss_hard_limit_exceeded`, `child_abort`, `child_exit`, `session_missing`,
+  `worker_internal`, `timeout`, `cancelled` (and `restart limit exceeded; marking project unhealthy`).
+- `info` — memory-pressure cycles: `rss_post_job`, `rss_import_switch` (the frequency to watch when tuning the budget),
+  plus `opened project` / `idle reaper evicted projects` lifecycle lines.
+- `debug` — pure hygiene (`max_requests`, `max_imports`, `idle`, `explicit`), per-call tool entry, project resolution,
+  the `job` span, and a `post-job rss check` showing live RSS vs the `post_job` ceiling.
+
+Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for the per-call detail. Example at default level:
+
+```text
+INFO worker recycled (memory pressure) cause=rss_post_job rss_kib=Some(7340032) limit_kib=Some(5242880) restarts_total=4
+```
+
+The same data reaches the MCP client in `response.runtime`: the per-call cause in `call_restart`, the most recent in
+`last_restart`, and the lifetime frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause` (omitted
+when no recycle has happened).
 
 ## Process lifetime
 

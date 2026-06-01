@@ -49,6 +49,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::declaration::InspectDeclarationRequest>,
     ) -> std::result::Result<Json<Response<crate::projections::DeclarationInspectionResult>>, McpError> {
+        tracing::debug!(tool = "inspect_declaration", "tool call");
         wrap(tools::declaration::inspect_declaration(&self.ctx, req).await)
     }
 
@@ -57,6 +58,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::proof_search::SearchForProofRequest>,
     ) -> std::result::Result<Json<Response<tools::proof_search::SearchForProofResult>>, McpError> {
+        tracing::debug!(tool = "search_for_proof", "tool call");
         wrap(tools::proof_search::search_for_proof(&self.ctx, req).await)
     }
 
@@ -65,6 +67,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::proof_action::TryProofStepRequest>,
     ) -> std::result::Result<Json<Response<crate::projections::ProofAttemptResult>>, McpError> {
+        tracing::debug!(tool = "try_proof_step", "tool call");
         wrap(tools::proof_action::try_proof_step(&self.ctx, req).await)
     }
 
@@ -73,6 +76,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::proof_action::VerifyDeclarationRequest>,
     ) -> std::result::Result<Json<Response<crate::projections::DeclarationVerificationResult>>, McpError> {
+        tracing::debug!(tool = "verify_declaration", "tool call");
         wrap(tools::proof_action::verify_declaration(&self.ctx, req).await)
     }
 
@@ -81,6 +85,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::position::ProofStateRequest>,
     ) -> std::result::Result<Json<Response<tools::position::ProofStateResult>>, McpError> {
+        tracing::debug!(tool = "proof_state", "tool call");
         wrap(tools::position::proof_state(&self.ctx, req).await)
     }
 
@@ -89,6 +94,7 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::position::FindReferencesRequest>,
     ) -> std::result::Result<Json<Response<tools::position::FindReferencesResult>>, McpError> {
+        tracing::debug!(tool = "find_references", "tool call");
         wrap(tools::position::find_references(&self.ctx, req).await)
     }
 }

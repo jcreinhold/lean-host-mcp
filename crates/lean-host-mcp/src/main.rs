@@ -17,12 +17,12 @@ use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
-use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
+use lean_host_mcp::cli::config_init::{self, ConfigCommand};
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
-use lean_host_mcp::{BrokerConfig, LeanHostService, ProjectBroker, ProjectRuntimeConfig};
+use lean_host_mcp::{BrokerConfig, ConfigFile, LeanHostService, ProjectBroker, ProjectRuntimeConfig};
 
 /// Stdio MCP server that hosts a Lean 4 environment via a worker child.
 #[derive(Debug, Parser)]
@@ -41,6 +41,11 @@ enum Command {
     Serve(ServeArgs),
     /// Build and install a per-toolchain worker binary.
     InstallWorker(InstallWorkerArgs),
+    /// Generate and manage the configuration file.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -73,6 +78,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("lean-host-mcp install-worker: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Config { command }) => match config_init::run(&command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("lean-host-mcp config: {err}");
                 ExitCode::FAILURE
             }
         },
@@ -109,16 +121,36 @@ fn init_tracing() {
 
 #[allow(clippy::significant_drop_tightening)]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    let http = http_config(&args)?;
-    let env_default = args.lake_root;
-    let config_default = read_config_default();
     let cwd = std::env::current_dir()?;
+    // Merged config file (project-local `lean-host-mcp.toml` over the home
+    // file). It is the layer beneath env/CLI: each knob is CLI > env > file >
+    // default.
+    let file = ConfigFile::load(&cwd);
+
+    // Transport: clap already folds CLI-or-env into `args.*`, so `.or(file)`
+    // yields CLI > env > file. The file's `bind` is a raw string, parsed here so
+    // the library config schema stays transport-type-free.
+    let file_bind = file
+        .server
+        .bind
+        .as_deref()
+        .map(|s| {
+            s.parse::<SocketAddr>()
+                .with_context(|| format!("config [server] bind is not a socket address: {s}"))
+        })
+        .transpose()?;
+    let bind = args.bind.or(file_bind);
+    let http_path = args.http_path.clone().or_else(|| file.server.http_path.clone());
+    let http = http_config(bind, http_path.as_deref())?;
+
+    let env_default = args.lake_root;
+    let config_default = file.primary_project.clone();
     let (max_projects, idle_timeout, semantic_permits, semantic_waiters, semantic_admission_timeout) =
-        BrokerConfig::pool_from_env()?;
-    let runtime_config = ProjectRuntimeConfig::from_env()?;
+        BrokerConfig::pool_from_env_with_file(&file.broker)?;
+    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
-    let http_path = http.as_ref().map(|config| config.path.as_str());
+    let http_path_log = http.as_ref().map(|config| config.path.as_str());
 
     tracing::info!(
         env_default = ?env_default,
@@ -136,7 +168,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         project_mailbox_capacity = runtime_config.mailbox_capacity(),
         transport = transport,
         bind = bind_display.as_deref(),
-        http_path = http_path,
+        http_path = http_path_log,
         "starting lean-host-mcp",
     );
 
@@ -167,8 +199,11 @@ fn build_broker(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> A
     ProjectBroker::new_with_runtime_config(config, runtime_config)
 }
 
-fn http_config(args: &ServeArgs) -> anyhow::Result<Option<transport_http::HttpServeConfig>> {
-    match (args.bind, args.http_path.as_deref()) {
+fn http_config(
+    bind: Option<SocketAddr>,
+    http_path: Option<&str>,
+) -> anyhow::Result<Option<transport_http::HttpServeConfig>> {
+    match (bind, http_path) {
         (None, None) => Ok(None),
         (None, Some(_)) => bail!("--http-path/LEAN_HOST_MCP_HTTP_PATH requires --bind/LEAN_HOST_MCP_BIND"),
         (Some(bind), path) => {
@@ -209,40 +244,6 @@ fn validate_http_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Top-level config schema. Reserved keys (e.g. future per-project
-/// overrides) are accepted but ignored.
-#[derive(Debug, Default, Deserialize)]
-struct ConfigFile {
-    primary_project: Option<PathBuf>,
-}
-
-/// Read `<config-dir>/lean-host-mcp/config.toml` and return its
-/// `primary_project` if present. Missing file / missing key / parse
-/// failures are all silent: the broker's resolution chain treats this as
-/// "no default" and continues. The `LEAN_HOST_MCP_CONFIG_DIR` env override
-/// exists for the test suite so resolution tests don't read the
-/// developer's real config.
-fn read_config_default() -> Option<PathBuf> {
-    let dir = config_dir()?;
-    let path = dir.join("lean-host-mcp").join("config.toml");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let parsed: ConfigFile = match toml::from_str(&contents) {
-        Ok(c) => c,
-        Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "config.toml parse failed; ignoring");
-            return None;
-        }
-    };
-    parsed.primary_project
-}
-
-fn config_dir() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("LEAN_HOST_MCP_CONFIG_DIR") {
-        return Some(PathBuf::from(p));
-    }
-    dirs::config_dir()
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -253,13 +254,19 @@ mod tests {
     fn no_bind_selects_stdio_even_with_lake_root() {
         let cli = Cli::parse_from(["lean-host-mcp", "--lake-root", "/tmp/project"]);
         assert!(cli.serve.bind.is_none());
-        assert!(http_config(&cli.serve).expect("stdio config").is_none());
+        assert!(
+            http_config(cli.serve.bind, cli.serve.http_path.as_deref())
+                .expect("stdio config")
+                .is_none()
+        );
     }
 
     #[test]
     fn bind_selects_http_with_default_path() {
         let cli = Cli::parse_from(["lean-host-mcp", "--bind", "127.0.0.1:8765"]);
-        let http = http_config(&cli.serve).expect("http config").expect("http selected");
+        let http = http_config(cli.serve.bind, cli.serve.http_path.as_deref())
+            .expect("http config")
+            .expect("http selected");
         assert_eq!(http.bind, "127.0.0.1:8765".parse().expect("socket addr"));
         assert_eq!(http.path, DEFAULT_HTTP_PATH);
     }
@@ -267,14 +274,14 @@ mod tests {
     #[test]
     fn http_path_without_bind_is_rejected() {
         let cli = Cli::parse_from(["lean-host-mcp", "--http-path", "/mcp"]);
-        let err = http_config(&cli.serve).expect_err("http path requires bind");
+        let err = http_config(cli.serve.bind, cli.serve.http_path.as_deref()).expect_err("http path requires bind");
         assert!(err.to_string().contains("requires --bind"));
     }
 
     #[test]
     fn non_loopback_bind_is_rejected() {
         let cli = Cli::parse_from(["lean-host-mcp", "--bind", "0.0.0.0:8765"]);
-        let err = http_config(&cli.serve).expect_err("non-loopback should fail");
+        let err = http_config(cli.serve.bind, cli.serve.http_path.as_deref()).expect_err("non-loopback should fail");
         assert!(err.to_string().contains("loopback"));
     }
 

@@ -8,7 +8,7 @@
 
 #![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +29,7 @@ use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::cache::ModuleQueryCache;
+use crate::config_file::RuntimeFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
 use crate::lake_meta::LakeProjectMeta;
@@ -90,17 +91,32 @@ impl ProjectRuntimeConfig {
     /// [`ServerError::Internal`] when a runtime env var is malformed, zero
     /// where zero is unsafe.
     pub fn from_env() -> Result<Self> {
-        parse_runtime_config(RuntimeEnv {
-            worker_rss_post_job_restart_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB")?,
-            worker_rss_hard_kill_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB")?,
-            worker_rss_sample_millis: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS")?,
-            import_switch_rss_soft_kib: runtime_env_var("LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB")?,
-            module_cache_rss_guard_kib: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB")?,
-            module_cache_max_bytes: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES")?,
-            project_mailbox_capacity: runtime_env_var("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY")?,
-            worker_restart_limit: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_LIMIT")?,
-            worker_restart_window_secs: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS")?,
-        })
+        Self::from_env_with_file(&RuntimeFileConfig::default())
+    }
+
+    /// Resolve the runtime policy with a config-file section as the layer
+    /// beneath env vars: each knob is `env var > file > built-in default`.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Internal`] when an env var is malformed, or a resolved
+    /// value (from env or file) is zero where zero is unsafe, or the RSS
+    /// ceilings violate `import_switch <= post_job <= hard_kill`.
+    pub fn from_env_with_file(file: &RuntimeFileConfig) -> Result<Self> {
+        parse_runtime_config(
+            RuntimeEnv {
+                worker_rss_post_job_restart_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB")?,
+                worker_rss_hard_kill_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB")?,
+                worker_rss_sample_millis: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS")?,
+                import_switch_rss_soft_kib: runtime_env_var("LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB")?,
+                module_cache_rss_guard_kib: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB")?,
+                module_cache_max_bytes: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES")?,
+                project_mailbox_capacity: runtime_env_var("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY")?,
+                worker_restart_limit: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_LIMIT")?,
+                worker_restart_window_secs: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS")?,
+            },
+            file,
+        )
     }
 
     #[must_use]
@@ -162,55 +178,91 @@ struct RuntimeEnv {
     worker_restart_window_secs: Option<String>,
 }
 
-fn parse_runtime_config(env: RuntimeEnv) -> Result<ProjectRuntimeConfig> {
+fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig) -> Result<ProjectRuntimeConfig> {
     let defaults = ProjectRuntimeConfig::default();
-    Ok(ProjectRuntimeConfig {
+    let config = ProjectRuntimeConfig {
         worker_rss_post_job_restart_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB",
             env.worker_rss_post_job_restart_kib.as_deref(),
+            file.worker_rss_post_job_restart_kib,
             defaults.worker_rss_post_job_restart_kib,
         )?,
         worker_rss_hard_kill_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB",
             env.worker_rss_hard_kill_kib.as_deref(),
+            file.worker_rss_hard_kill_kib,
             defaults.worker_rss_hard_kill_kib,
         )?,
         worker_rss_sample_millis: parse_nonzero_u64(
             "LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS",
             env.worker_rss_sample_millis.as_deref(),
+            file.worker_rss_sample_millis,
             defaults.worker_rss_sample_millis,
         )?,
         import_switch_rss_soft_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB",
             env.import_switch_rss_soft_kib.as_deref(),
+            file.import_switch_rss_soft_kib,
             defaults.import_switch_rss_soft_kib,
         )?,
         module_cache_rss_guard_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB",
             env.module_cache_rss_guard_kib.as_deref(),
+            file.module_cache_rss_guard_kib,
             defaults.module_cache_rss_guard_kib,
         )?,
         module_cache_max_bytes: parse_nonzero_u64(
             "LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES",
             env.module_cache_max_bytes.as_deref(),
+            file.module_cache_max_bytes,
             defaults.module_cache_max_bytes,
         )?,
         mailbox_capacity: parse_nonzero_usize(
             "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
             env.project_mailbox_capacity.as_deref(),
+            file.project_mailbox_capacity,
             defaults.mailbox_capacity,
         )?,
         max_restarts_per_window: parse_nonzero_usize(
             "LEAN_HOST_MCP_WORKER_RESTART_LIMIT",
             env.worker_restart_limit.as_deref(),
+            file.worker_restart_limit,
             defaults.max_restarts_per_window,
         )?,
         restart_window: Duration::from_secs(parse_nonzero_u64(
             "LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS",
             env.worker_restart_window_secs.as_deref(),
+            file.worker_restart_window_secs,
             defaults.restart_window.as_secs(),
         )?),
-    })
+    };
+    validate_rss_ordering(&config)?;
+    Ok(config)
+}
+
+/// The three RSS ceilings escalate: a worker cycles cleanly before an
+/// import-profile switch (`import_switch`), again after a job that grew past the
+/// post-job budget (`post_job`), and is killed in-flight only at the hard limit
+/// (`hard_kill`). If a tuned value inverts that order the cheaper cycle can
+/// never fire — e.g. `post_job > hard_kill` means the planned post-job recycle
+/// is unreachable and every overrun escalates straight to a hard kill. Reject it
+/// at startup with the offending values, rather than degrade silently.
+fn validate_rss_ordering(config: &ProjectRuntimeConfig) -> Result<()> {
+    if config.import_switch_rss_soft_kib > config.worker_rss_post_job_restart_kib {
+        return Err(ServerError::Internal(format!(
+            "invalid RSS config: import_switch={} KiB exceeds post_job={} KiB \
+             (need import_switch <= post_job <= hard_kill)",
+            config.import_switch_rss_soft_kib, config.worker_rss_post_job_restart_kib,
+        )));
+    }
+    if config.worker_rss_post_job_restart_kib > config.worker_rss_hard_kill_kib {
+        return Err(ServerError::Internal(format!(
+            "invalid RSS config: post_job={} KiB exceeds hard_kill={} KiB \
+             (need import_switch <= post_job <= hard_kill)",
+            config.worker_rss_post_job_restart_kib, config.worker_rss_hard_kill_kib,
+        )));
+    }
+    Ok(())
 }
 
 fn runtime_env_var(name: &str) -> Result<Option<String>> {
@@ -401,6 +453,57 @@ fn restart_event(
     }
 }
 
+/// Per-project recycle tally over the worker's lifetime, all causes.
+///
+/// Recorded once per event at [`ProjectActorState::record_restart`] and copied
+/// into [`RuntimeSnapshot`] on publish, so the no-call and error paths report
+/// the same totals a live call would. This answers "how *often*, and why?"; the
+/// single most-recent event stays in `last_restart`.
+#[derive(Debug, Clone, Default)]
+struct RestartStats {
+    total: u64,
+    by_cause: BTreeMap<String, u64>,
+}
+
+impl RestartStats {
+    fn observe(&mut self, cause: &str) {
+        self.total = self.total.saturating_add(1);
+        let count = self.by_cause.entry(cause.to_owned()).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+/// Emit one structured log line for a recycle. Level tracks the *signal*, not
+/// `planned`: crash/abnormal causes `warn`, memory-pressure cycles `info` (the
+/// frequency an operator tuning the RSS budget watches), pure hygiene `debug`.
+fn log_restart(event: &RuntimeRestartEvent, restarts_total: u64) {
+    macro_rules! emit {
+        ($level:ident, $msg:literal) => {
+            tracing::$level!(
+                cause = %event.cause,
+                reason = %event.reason,
+                worker_generation = event.worker_generation,
+                rss_kib = ?event.rss_kib,
+                limit_kib = ?event.limit_kib,
+                planned = event.planned,
+                restarts_total,
+                $msg
+            )
+        };
+    }
+    match event.cause.as_str() {
+        "rss_hard_limit_exceeded"
+        | "child_abort"
+        | "child_exit"
+        | "session_missing"
+        | "worker_internal"
+        | "timeout"
+        | "cancelled" => emit!(warn, "worker recycled (abnormal)"),
+        "rss_post_job" | "rss_import_switch" => emit!(info, "worker recycled (memory pressure)"),
+        _ => emit!(debug, "worker recycled (hygiene)"),
+    }
+}
+
 fn restart_cause_from_worker(reason: &LeanWorkerRestartReason) -> RestartCause {
     match reason.stable_cause() {
         "explicit" => RestartCause::Explicit,
@@ -461,6 +564,8 @@ struct RuntimeSnapshot {
     rss_kib: Option<u64>,
     import_profile: Option<String>,
     profile_switch_count: u64,
+    restarts_total: u64,
+    restarts_by_cause: BTreeMap<String, u64>,
 }
 
 impl RuntimeSnapshot {
@@ -477,6 +582,8 @@ impl RuntimeSnapshot {
             worker_lanes: 1,
             import_profile: self.import_profile.clone(),
             profile_switch_count: self.profile_switch_count,
+            restarts_total: self.restarts_total,
+            restarts_by_cause: self.restarts_by_cause.clone(),
         }
     }
 }
@@ -527,6 +634,8 @@ impl LeanProject {
             rss_kib: None,
             import_profile: None,
             profile_switch_count: 0,
+            restarts_total: 0,
+            restarts_by_cause: BTreeMap::new(),
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let healthy = Arc::new(AtomicBool::new(true));
@@ -785,6 +894,14 @@ impl LeanProject {
         &self.manifest_hash
     }
 
+    pub(crate) fn toolchain(&self) -> &str {
+        &self.toolchain
+    }
+
+    pub(crate) fn canonical_root(&self) -> &Path {
+        &self.canonical_root
+    }
+
     pub(crate) fn module_query_cache(&self) -> &ModuleQueryCache {
         &self.module_queries
     }
@@ -954,6 +1071,12 @@ impl ActorConfig {
                 )));
             }
         };
+        tracing::debug!(
+            toolchain = %toolchain_id,
+            worker = %worker_path.display(),
+            sysroot = %lean_sysroot.display(),
+            "resolved ready worker binary"
+        );
         let config = Self {
             lake_root: meta.canonical_root.clone(),
             manifest_hash: meta.manifest_hash.clone(),
@@ -988,6 +1111,7 @@ struct ProjectActorState {
     last_rss_kib: Option<u64>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     abnormal_restart_times: VecDeque<Instant>,
+    restart_stats: RestartStats,
 }
 
 impl ProjectActorState {
@@ -1062,6 +1186,15 @@ impl ProjectActorState {
         meta: JobMeta,
         job: impl Fn(&mut LeanWorkerHostHandle, Vec<String>) -> std::result::Result<R, LeanWorkerError>,
     ) -> Result<ProjectCall<R>> {
+        // Runs on the project's dedicated actor thread (no async), so an entered
+        // span is correct and ties every nested worker/recycle log to this call.
+        let _span = tracing::debug_span!(
+            "job",
+            session_id = %self.config.session_id,
+            imports = meta.imports.len(),
+            queue_wait_millis = millis_u64(meta.queued_at.elapsed()),
+        )
+        .entered();
         let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
         let generation_before = self.observed_generation();
         let mut call_restart = self.cycle_before_import_switch_if_needed(&meta)?;
@@ -1082,6 +1215,12 @@ impl ProjectActorState {
                     }
                     let runtime =
                         self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
+                    tracing::debug!(
+                        retry_count,
+                        rss_kib = ?runtime.rss_kib,
+                        worker_generation = runtime.worker_generation,
+                        "job complete"
+                    );
                     self.publish_runtime(&runtime);
                     return Ok(ProjectCall::new(value, runtime));
                 }
@@ -1218,7 +1357,7 @@ impl ProjectActorState {
             Some(current_kib),
             Some(limit_kib),
         );
-        self.last_restart = Some(event.clone());
+        self.record_restart(event.clone());
         Ok(Some(event))
     }
 
@@ -1228,6 +1367,7 @@ impl ProjectActorState {
         };
         self.last_rss_kib = Some(current_kib);
         let limit_kib = self.config.worker_rss_post_job_restart_kib;
+        tracing::debug!(rss_kib = current_kib, limit_kib, "post-job rss check");
         if current_kib < limit_kib {
             return Ok(None);
         }
@@ -1243,7 +1383,7 @@ impl ProjectActorState {
             Some(current_kib),
             Some(limit_kib),
         );
-        self.last_restart = Some(event.clone());
+        self.record_restart(event.clone());
         Ok(Some(event))
     }
 
@@ -1261,7 +1401,7 @@ impl ProjectActorState {
         self.worker_generation_base = next_generation;
         self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
         let event = restart_event(cause, reason, self.observed_generation(), self.last_rss_kib, None);
-        self.last_restart = Some(event.clone());
+        self.record_restart(event.clone());
         Ok(event)
     }
 
@@ -1286,8 +1426,19 @@ impl ProjectActorState {
         }
         self.last_rss_kib = after.last_rss_kib.or(self.last_rss_kib);
         let event = restart_event(cause, reason, self.observed_generation(), self.last_rss_kib, None);
-        self.last_restart = Some(event.clone());
+        self.record_restart(event.clone());
         Ok(Some(event))
+    }
+
+    /// The single place a recycle becomes observable: tally it for frequency
+    /// reporting, log it at a signal-appropriate level, and store it as the
+    /// latest event. Every restart path funnels through here, so adding one is
+    /// a single call. Kept distinct from [`Self::record_restart_or_stop`], which
+    /// owns the orthogonal sliding-window health *policy*.
+    fn record_restart(&mut self, event: RuntimeRestartEvent) {
+        self.restart_stats.observe(&event.cause);
+        log_restart(&event, self.restart_stats.total);
+        self.last_restart = Some(event);
     }
 
     fn record_restart_or_stop(
@@ -1308,6 +1459,12 @@ impl ProjectActorState {
         }
         if self.abnormal_restart_times.len() >= self.config.max_restarts_per_window {
             self.config.healthy.store(false, Ordering::Release);
+            tracing::warn!(
+                cause = cause.as_str(),
+                restarts_in_window = self.abnormal_restart_times.len(),
+                window_millis = millis_u64(self.config.restart_window),
+                "restart limit exceeded; marking project unhealthy"
+            );
             let message = format!(
                 "restart_limit_exceeded after {} restarts in {:?}; latest: {reason}",
                 self.config.max_restarts_per_window, self.config.restart_window
@@ -1319,7 +1476,7 @@ impl ProjectActorState {
                 self.last_rss_kib,
                 None,
             );
-            self.last_restart = Some(event.clone());
+            self.record_restart(event.clone());
             self.publish_runtime(&RuntimeFacts {
                 worker_generation: self.observed_generation(),
                 worker_restarted: false,
@@ -1332,6 +1489,8 @@ impl ProjectActorState {
                 worker_lanes: 1,
                 import_profile: self.last_import_fingerprint.clone(),
                 profile_switch_count: self.profile_switch_count,
+                restarts_total: self.restart_stats.total,
+                restarts_by_cause: self.restart_stats.by_cause.clone(),
             });
             return Err(RestartLimitExceeded {
                 message,
@@ -1371,6 +1530,8 @@ impl ProjectActorState {
             worker_lanes: 1,
             import_profile: Some(meta.import_fingerprint.clone()),
             profile_switch_count: self.profile_switch_count,
+            restarts_total: self.restart_stats.total,
+            restarts_by_cause: self.restart_stats.by_cause.clone(),
         }
     }
 
@@ -1381,6 +1542,8 @@ impl ProjectActorState {
             rss_kib: runtime.rss_kib,
             import_profile: runtime.import_profile.clone(),
             profile_switch_count: runtime.profile_switch_count,
+            restarts_total: runtime.restarts_total,
+            restarts_by_cause: runtime.restarts_by_cause.clone(),
         };
     }
 
@@ -1468,6 +1631,7 @@ fn actor_main(
         last_rss_kib: None,
         runtime: Arc::clone(&config.runtime),
         abnormal_restart_times: VecDeque::new(),
+        restart_stats: RestartStats::default(),
     };
 
     let (tx, mut rx) = mpsc::channel::<ProjectMessage>(config.mailbox_capacity);
@@ -1549,6 +1713,12 @@ fn bootstrap_hard_rss_unavailable(
         current_kib,
         limit_kib,
     );
+    // First-spawn worker tripped the hard RSS limit before serving a call: a
+    // single terminal recycle. Emit the same log line a live recycle would, so
+    // the cause is visible on stderr even when the project never opens.
+    let restarts_total = 1;
+    log_restart(&event, restarts_total);
+    let by_cause = BTreeMap::from([(RestartCause::RssHardLimit.as_str().to_owned(), restarts_total)]);
     let runtime = RuntimeFacts {
         worker_generation: generation,
         worker_restarted: true,
@@ -1561,6 +1731,8 @@ fn bootstrap_hard_rss_unavailable(
         worker_lanes: 1,
         import_profile: None,
         profile_switch_count: 0,
+        restarts_total,
+        restarts_by_cause: by_cause.clone(),
     };
     *config.runtime.lock() = RuntimeSnapshot {
         worker_generation: generation,
@@ -1568,6 +1740,8 @@ fn bootstrap_hard_rss_unavailable(
         rss_kib: current_kib,
         import_profile: None,
         profile_switch_count: 0,
+        restarts_total,
+        restarts_by_cause: by_cause,
     };
     ServerError::worker_unavailable(WorkerUnavailable {
         retryable: false,
@@ -1688,21 +1862,26 @@ fn parse_keyed_u64(text: &str, key: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn parse_nonzero_u64(name: &str, value: Option<&str>, default: u64) -> Result<u64> {
-    let Some(value) = value else {
-        return Ok(default);
+/// Resolve a knob through `env > file > default` and reject a zero result
+/// whatever its source. `env` is the raw env-var string (parsed here); `file`
+/// is the already-typed config-file value; `default` is the built-in constant.
+fn parse_nonzero_u64(name: &str, env: Option<&str>, file: Option<u64>, default: u64) -> Result<u64> {
+    let value = match env {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|e| ServerError::Internal(format!("{name}={raw:?} not a u64: {e}")))?,
+        None => file.unwrap_or(default),
     };
-    let parsed = value
-        .parse::<u64>()
-        .map_err(|e| ServerError::Internal(format!("{name}={value:?} not a u64: {e}")))?;
-    if parsed == 0 {
-        return Err(ServerError::Internal(format!("{name}=0 is not allowed")));
+    if value == 0 {
+        return Err(ServerError::Internal(format!(
+            "{name} resolved to 0, which is not allowed"
+        )));
     }
-    Ok(parsed)
+    Ok(value)
 }
 
-fn parse_nonzero_usize(name: &str, value: Option<&str>, default: usize) -> Result<usize> {
-    let parsed = parse_nonzero_u64(name, value, default as u64)?;
+fn parse_nonzero_usize(name: &str, env: Option<&str>, file: Option<usize>, default: usize) -> Result<usize> {
+    let parsed = parse_nonzero_u64(name, env, file.map(|v| v as u64), default as u64)?;
     usize::try_from(parsed).map_err(|_| ServerError::Internal(format!("{name}={parsed} does not fit in usize")))
 }
 
@@ -1740,28 +1919,141 @@ mod tests {
 
     #[test]
     fn runtime_config_parses_runtime_policy_without_env_reads() {
-        let config = parse_runtime_config(RuntimeEnv {
-            worker_rss_post_job_restart_kib: Some("5".to_owned()),
-            worker_rss_hard_kill_kib: Some("7".to_owned()),
-            worker_rss_sample_millis: Some("11".to_owned()),
-            import_switch_rss_soft_kib: Some("13".to_owned()),
-            module_cache_rss_guard_kib: Some("17".to_owned()),
-            module_cache_max_bytes: Some("19".to_owned()),
-            project_mailbox_capacity: Some("23".to_owned()),
-            worker_restart_limit: Some("29".to_owned()),
-            worker_restart_window_secs: Some("31".to_owned()),
-        })
+        // Distinct values that also satisfy the RSS ordering invariant
+        // (import_switch <= post_job <= hard_kill); see validate_rss_ordering.
+        let config = parse_runtime_config(
+            RuntimeEnv {
+                worker_rss_post_job_restart_kib: Some("5".to_owned()),
+                worker_rss_hard_kill_kib: Some("7".to_owned()),
+                worker_rss_sample_millis: Some("11".to_owned()),
+                import_switch_rss_soft_kib: Some("3".to_owned()),
+                module_cache_rss_guard_kib: Some("17".to_owned()),
+                module_cache_max_bytes: Some("19".to_owned()),
+                project_mailbox_capacity: Some("23".to_owned()),
+                worker_restart_limit: Some("29".to_owned()),
+                worker_restart_window_secs: Some("31".to_owned()),
+            },
+            &RuntimeFileConfig::default(),
+        )
         .unwrap();
 
         assert_eq!(config.worker_rss_post_job_restart_kib(), 5);
         assert_eq!(config.worker_rss_hard_kill_kib(), 7);
         assert_eq!(config.worker_rss_sample_millis(), 11);
-        assert_eq!(config.import_switch_rss_soft_kib(), 13);
+        assert_eq!(config.import_switch_rss_soft_kib(), 3);
         assert_eq!(config.module_cache_rss_guard_kib(), 17);
         assert_eq!(config.module_cache_max_bytes(), 19);
         assert_eq!(config.mailbox_capacity(), 23);
         assert_eq!(config.max_restarts_per_window(), 29);
         assert_eq!(config.restart_window(), Duration::from_secs(31));
+    }
+
+    #[test]
+    fn rss_config_rejects_post_job_above_hard_kill() {
+        let err = parse_runtime_config(
+            RuntimeEnv {
+                // 20 GiB post-job ceiling above the 16 GiB default hard kill: the
+                // planned post-job cycle could never fire before the hard kill.
+                worker_rss_post_job_restart_kib: Some("20971520".to_owned()),
+                ..RuntimeEnv::default()
+            },
+            &RuntimeFileConfig::default(),
+        )
+        .unwrap_err();
+        let ServerError::Internal(message) = err else {
+            panic!("expected Internal config error");
+        };
+        assert!(message.contains("invalid RSS config"), "message: {message}");
+        assert!(message.contains("hard_kill"), "message: {message}");
+    }
+
+    #[test]
+    fn rss_config_rejects_import_switch_above_post_job() {
+        let err = parse_runtime_config(
+            RuntimeEnv {
+                // Import-switch soft limit above the 5 GiB default post-job ceiling.
+                import_switch_rss_soft_kib: Some("6291456".to_owned()),
+                ..RuntimeEnv::default()
+            },
+            &RuntimeFileConfig::default(),
+        )
+        .unwrap_err();
+        let ServerError::Internal(message) = err else {
+            panic!("expected Internal config error");
+        };
+        assert!(message.contains("invalid RSS config"), "message: {message}");
+        assert!(message.contains("import_switch"), "message: {message}");
+    }
+
+    #[test]
+    fn rss_config_accepts_raising_post_job_to_8gib() {
+        // The motivating case: 8 GiB post-job ceiling, below the 16 GiB hard
+        // kill and above the 2 GiB import-switch soft limit.
+        let config = parse_runtime_config(
+            RuntimeEnv {
+                worker_rss_post_job_restart_kib: Some("8388608".to_owned()),
+                ..RuntimeEnv::default()
+            },
+            &RuntimeFileConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(config.worker_rss_post_job_restart_kib(), 8_388_608);
+    }
+
+    #[test]
+    fn runtime_config_precedence_env_over_file_over_default() {
+        let file = RuntimeFileConfig {
+            worker_rss_post_job_restart_kib: Some(8_388_608),
+            ..RuntimeFileConfig::default()
+        };
+        // Env unset -> file value is used.
+        let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+        assert_eq!(config.worker_rss_post_job_restart_kib(), 8_388_608);
+        // Env set -> env wins over the file (6 GiB, still a valid ordering).
+        let env = RuntimeEnv {
+            worker_rss_post_job_restart_kib: Some("6291456".to_owned()),
+            ..RuntimeEnv::default()
+        };
+        let config = parse_runtime_config(env, &file).unwrap();
+        assert_eq!(config.worker_rss_post_job_restart_kib(), 6_291_456);
+        // Neither -> built-in default.
+        let config = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default()).unwrap();
+        assert_eq!(
+            config.worker_rss_post_job_restart_kib(),
+            WORKER_RSS_POST_JOB_RESTART_KIB
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_zero_and_bad_ordering_from_file() {
+        let zero = RuntimeFileConfig {
+            worker_rss_sample_millis: Some(0),
+            ..RuntimeFileConfig::default()
+        };
+        assert!(parse_runtime_config(RuntimeEnv::default(), &zero).is_err());
+
+        let inverted = RuntimeFileConfig {
+            worker_rss_post_job_restart_kib: Some(20_971_520), // above 16 GiB default hard kill
+            ..RuntimeFileConfig::default()
+        };
+        let err = parse_runtime_config(RuntimeEnv::default(), &inverted).unwrap_err();
+        let ServerError::Internal(message) = err else {
+            panic!("expected Internal config error");
+        };
+        assert!(message.contains("invalid RSS config"), "message: {message}");
+    }
+
+    #[test]
+    fn restart_stats_tally_total_and_per_cause() {
+        let mut stats = RestartStats::default();
+        stats.observe("rss_post_job");
+        stats.observe("rss_post_job");
+        stats.observe("child_abort");
+
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.by_cause.get("rss_post_job"), Some(&2));
+        assert_eq!(stats.by_cause.get("child_abort"), Some(&1));
+        assert_eq!(stats.by_cause.get("idle"), None);
     }
 
     #[test]
@@ -1772,6 +2064,8 @@ mod tests {
             rss_kib: None,
             import_profile: None,
             profile_switch_count: 0,
+            restarts_total: 0,
+            restarts_by_cause: BTreeMap::new(),
         }));
         let config = ActorConfig {
             lake_root: PathBuf::from("/tmp/lean-host-mcp-bootstrap-rss-test"),

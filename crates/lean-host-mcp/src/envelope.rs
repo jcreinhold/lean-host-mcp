@@ -36,6 +36,8 @@
 //! how it's serialized, and what an MCP "warning" looks like. Tools don't
 //! pick the layout; they build a `Response<T>` and let rmcp serialize it.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -85,6 +87,13 @@ pub struct RuntimeFacts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_profile: Option<String>,
     pub profile_switch_count: u64,
+    /// Worker recycles observed over this project's lifetime, all causes. Lets
+    /// a client see recycle *frequency* (the per-call cause is in `call_restart`).
+    pub restarts_total: u64,
+    /// Lifetime recycle count keyed by stable cause string (e.g. `rss_post_job`).
+    /// Omitted when no recycle has happened.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub restarts_by_cause: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -210,6 +219,8 @@ mod tests {
             worker_lanes: 1,
             import_profile: Some("Init".to_owned()),
             profile_switch_count: 1,
+            restarts_total: 1,
+            restarts_by_cause: BTreeMap::from([("rss_post_job".to_owned(), 1)]),
         };
 
         let json = serde_json::to_value(facts).unwrap();

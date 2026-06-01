@@ -262,6 +262,12 @@ pub async fn verify_declaration(
     let taint = execution_taint(&call.runtime).cloned();
     let mut result = project_declaration_verification(call.value);
     let recycled = taint.is_some() && relabel_recycled_verdict(&mut result);
+    if recycled && let Some(event) = taint.as_ref() {
+        tracing::debug!(
+            cause = %event.cause,
+            "relabeled verification verdict to worker_recycled (execution taint)"
+        );
+    }
     let mut response = Response::ok(result, call.freshness).with_runtime(call.runtime);
     response
         .next_actions

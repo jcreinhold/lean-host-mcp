@@ -345,3 +345,8 @@ warning, since they have no single verdict to relabel. In every case the next ac
 the module is too heavy for the worker's memory budget (raise `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB`, or verify
 out-of-band with `lake build <module>` / `lake env lean <file>`). A `verified` result is left untouched: verification is
 monotone, so an accepted declaration is trustworthy even if the worker recycled afterward.
+
+To gauge *how often* this is happening, every response's `runtime` carries `restarts_total` and a per-cause breakdown
+`restarts_by_cause` over the worker's lifetime, and each recycle is logged to the server's stderr (see
+[operations.md](operations.md#observing-worker-recycles)). A high `rss_post_job` count is the cue to raise the post-job
+RSS ceiling.

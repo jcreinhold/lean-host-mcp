@@ -11,6 +11,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Unified TOML config file for every tunable knob. A `lean-host-mcp.toml` (found by walking up from the working
+  directory, like the lakefile) or the home `~/.config/lean-host-mcp/config.toml` can set the `[runtime]`, `[broker]`,
+  and `[server]` knobs that were previously env-var-only, plus the existing `primary_project`. When both files exist
+  they merge per key (local wins); precedence is `CLI > env var > file > built-in default`, so existing
+  `LEAN_HOST_MCP_*` setups are unaffected and an env var still overrides the file. Malformed files are logged and
+  ignored. See [docs/operations.md](docs/operations.md#configuration-file).
+- `lean-host-mcp config init` writes a documented starter config file — every option at its current default, each with a
+  comment explaining it — to `./lean-host-mcp.toml` (or `~/.config/lean-host-mcp/config.toml` with `--home`, or a
+  `--path`). The file, the per-knob reference table in the docs, and the built-in defaults are all generated from one
+  in-code catalogue, so they cannot drift.
+- Worker-recycle observability: each recycle is now logged to stderr with structured fields (`cause`, `reason`,
+  `worker_generation`, `rss_kib`, `limit_kib`, `restarts_total`) at a signal-appropriate level (`warn` for
+  abnormal/crash, `info` for memory-pressure cycles, `debug` for hygiene), and every response's `runtime` carries
+  lifetime `restarts_total` plus a per-cause `restarts_by_cause` breakdown so recycle *frequency* is visible. See
+  [docs/operations.md](docs/operations.md#observing-worker-recycles).
+- Structured `tracing` across the server's high-value paths (tool entry, project open/eviction, the idle reaper, the
+  per-call job span, RSS headroom, toolchain resolution, and verdict-relabel decisions), all on stderr so the stdio
+  transport's stdout stays clean. Default level is `info`; `RUST_LOG=lean_host_mcp=debug` surfaces per-call detail.
+- RSS-config guard rails: the server validates `import_switch <= post_job <= hard_kill` at startup and refuses to start
+  with a clear `invalid RSS config: …` message on an inverted ordering, so e.g. raising
+  `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB` above the hard-kill ceiling fails fast instead of degrading silently.
 - Honest `worker_recycled` verdict: when the worker is recycled or restarted *during* a semantic call (a memory-pressure
   recycle on a heavy module, or a crash-and-retry), the verdict was computed under infrastructure duress.
   `verify_declaration` now relabels a non-positive verdict to `verification_status: "worker_recycled"` with
