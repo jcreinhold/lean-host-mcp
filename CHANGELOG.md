@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 <!-- ASSISTANT: add new entries under [Unreleased]; `release-lean-host-mcp` promotes them on tag. -->
 
-## [Unreleased]
+## [0.1.0] - 2026-06-01
 
 ### Added
 
@@ -43,11 +43,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `facts_trustworthy: false` instead of a misleading `not_found`, and `try_proof_step` / `proof_state` carry a retry
   warning. A `verified` verdict is never relabeled (verification is monotone). The signal is derived from the call's
   runtime facts (`call_restart`) and excludes benign pre-job/planned cycles.
-
-## [0.1.0] - 2026-05-31
-
-### Added
-
 - Initial release of `lean-host-mcp`, an MCP server that hosts Lean 4 in a supervised worker child
   (`lean-rs-worker-parent` + `lean-rs-worker-child`) and reaches the elaborator and kernel directly rather than through
   an external LSP.
@@ -77,5 +72,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/jcreinhold/lean-host-mcp/releases/tag/v0.1.0
