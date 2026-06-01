@@ -9,11 +9,15 @@
 //!   and build for any missing ones.
 //! - `--list`: print a table of currently-installed workers.
 //!
-//! The build shells out to `cargo build --release -p lean-host-mcp-worker`
-//! with `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` set so the worker crate's
-//! `build.rs` bakes the correct rpath. The resulting binary is moved into
-//! the install root; `cargo` output streams to stdout/stderr unchanged so
-//! the user sees real build errors when they occur.
+//! The worker is always compiled locally per toolchain (its `build.rs` bakes an
+//! absolute rpath, so binaries don't travel), with `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>`
+//! set so the right rpath is baked in. Where the worker *source* comes from is
+//! decided once, internally, by [`resolve_worker_source`]: a local checkout
+//! (`cargo build -p lean-host-mcp-worker`) when this binary was built from one,
+//! otherwise the published crate (`cargo install lean-host-mcp-worker`). Callers
+//! of `install-worker` never choose; `--source-dir` is the override for the rare
+//! case of a checkout that moved after the binary was built. `cargo` output
+//! streams to stdout/stderr unchanged so the user sees real build errors.
 
 use std::fs;
 use std::io::Read;
@@ -23,6 +27,7 @@ use std::time::SystemTime;
 
 use clap::Args;
 use sha2::{Digest, Sha256};
+use tempfile::TempDir;
 
 use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WindowVerdict, WorkerBinary, WorkerSidecar, hash_lean_header};
 
@@ -65,15 +70,15 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     if args.list {
         return run_list();
     }
-    let source_dir = resolve_source_dir(args.source_dir.as_deref())?;
+    let source = resolve_worker_source(args.source_dir.as_deref())?;
     if args.auto {
-        run_auto(&source_dir)
+        run_auto(&source)
     } else if let Some(raw) = args.toolchain.as_deref() {
         let id = ToolchainId::parse(raw)?;
-        install_one(&id, &source_dir)?;
+        install_one(&id, &source)?;
         Ok(())
     } else {
-        run_auto(&source_dir)
+        run_auto(&source)
     }
 }
 
@@ -169,7 +174,7 @@ struct ListRow {
     sort_key: (u8, (u32, u32, u32, u8, u32), String),
 }
 
-fn run_auto(source_dir: &Path) -> anyhow::Result<()> {
+fn run_auto(source: &WorkerSource) -> anyhow::Result<()> {
     let toolchains = discover_elan_toolchains()?;
     if toolchains.is_empty() {
         println!("(no Lean toolchains found under ~/.elan/toolchains)");
@@ -182,7 +187,7 @@ fn run_auto(source_dir: &Path) -> anyhow::Result<()> {
             println!("{id}: already-installed");
             continue;
         }
-        match install_one(&id, source_dir) {
+        match install_one(&id, source) {
             Ok(_) => println!("{id}: installed"),
             Err(err) => {
                 eprintln!("{id}: failed: {err}");
@@ -197,7 +202,7 @@ fn run_auto(source_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
+fn install_one(id: &ToolchainId, source: &WorkerSource) -> anyhow::Result<PathBuf> {
     // Classify against the supported window *before* the multi-minute build —
     // an out-of-window worker would only fail lean-rs-sys's header-digest
     // check minutes later.
@@ -221,28 +226,10 @@ fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
     // crate's build.rs to point at it.
     let elan_dir = id.elan_dir()?;
 
-    println!("==> building lean-host-mcp-worker for {id}");
-    let status = Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .arg("-p")
-        .arg("lean-host-mcp-worker")
-        .current_dir(source_dir)
-        .env("LEAN_HOST_MCP_TARGET_TOOLCHAIN", id.as_str())
-        .status()?;
-    if !status.success() {
-        return Err(anyhow::anyhow!(
-            "cargo build -p lean-host-mcp-worker (toolchain {id}) failed with status {status}"
-        ));
-    }
-
-    let built = source_dir.join("target").join("release").join(WORKER_FILE_NAME);
-    if !built.is_file() {
-        return Err(anyhow::anyhow!(
-            "expected worker binary at {} but did not find one",
-            built.display()
-        ));
-    }
+    // Build the worker (local checkout or published crate — `build_worker`
+    // hides which). `staged` owns the temp dir for the registry build, so it
+    // must stay alive until the binary has been relocated below.
+    let staged = build_worker(source, id)?;
 
     let dest_dir = WorkerBinary::install_root().join(id.as_str());
     fs::create_dir_all(&dest_dir)?;
@@ -250,10 +237,10 @@ fn install_one(id: &ToolchainId, source_dir: &Path) -> anyhow::Result<PathBuf> {
     if dest.is_file() {
         fs::remove_file(&dest)?;
     }
-    if fs::rename(&built, &dest).is_err() {
+    if fs::rename(&staged.binary, &dest).is_err() {
         // Cross-device move: fall back to copy + remove.
-        fs::copy(&built, &dest)?;
-        fs::remove_file(&built)?;
+        fs::copy(&staged.binary, &dest)?;
+        fs::remove_file(&staged.binary)?;
     }
 
     // Prove the worker can actually run before vouching for it: a matching
@@ -329,7 +316,32 @@ fn discover_elan_toolchains() -> anyhow::Result<Vec<ToolchainId>> {
     Ok(out)
 }
 
-fn resolve_source_dir(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+/// Where the worker crate's source comes from for a build. Resolved once per
+/// run; the install path never learns which arm produced the binary.
+enum WorkerSource {
+    /// A local checkout: build the worker in place, reusing cargo's incremental
+    /// cache. Carries the workspace root.
+    LocalWorkspace(PathBuf),
+    /// No checkout: fetch and build the published `lean-host-mcp-worker` crate
+    /// at this binary's own version.
+    Registry,
+}
+
+/// A freshly built worker binary, ready to relocate into the install root.
+struct StagedWorker {
+    /// Path to the built binary.
+    binary: PathBuf,
+    /// Kept alive (registry build only) so the binary isn't deleted before it
+    /// is relocated; dropping a [`TempDir`] removes its contents.
+    _tmp: Option<TempDir>,
+}
+
+/// Decide where to get the worker source. `--source-dir` wins; otherwise, if
+/// this binary was built from a checkout (the worker crate is present beside
+/// it), build locally; anything else (a registry-installed binary) uses the
+/// published crate. A missing checkout is not an error — it is the registry
+/// path.
+fn resolve_worker_source(explicit: Option<&Path>) -> anyhow::Result<WorkerSource> {
     if let Some(p) = explicit {
         if !p.is_dir() {
             return Err(anyhow::anyhow!(
@@ -337,22 +349,98 @@ fn resolve_source_dir(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
                 p.display()
             ));
         }
-        return Ok(p.to_path_buf());
+        return Ok(WorkerSource::LocalWorkspace(p.to_path_buf()));
     }
-    // `CARGO_MANIFEST_DIR` for this crate is `<workspace>/crates/lean-host-mcp`.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest
+    // `CARGO_MANIFEST_DIR` is `<workspace>/crates/lean-host-mcp` when this binary
+    // was built from a checkout; for a registry-installed binary it points into
+    // `~/.cargo/registry/...` with no worker crate beside it. Probe for the
+    // worker crate's manifest specifically, not just any `Cargo.toml`.
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| anyhow::anyhow!("could not derive workspace root from CARGO_MANIFEST_DIR"))?
-        .to_path_buf();
-    if workspace.join("Cargo.toml").is_file() {
-        return Ok(workspace);
+        .map(Path::to_path_buf);
+    if let Some(ws) = workspace
+        && ws
+            .join("crates")
+            .join("lean-host-mcp-worker")
+            .join("Cargo.toml")
+            .is_file()
+    {
+        return Ok(WorkerSource::LocalWorkspace(ws));
     }
-    Err(anyhow::anyhow!(
-        "workspace root {} not present on disk; pass --source-dir to point at the lean-host-mcp checkout",
-        workspace.display()
-    ))
+    Ok(WorkerSource::Registry)
+}
+
+/// Build a worker binary for `id` with the matching toolchain rpath baked in,
+/// returning its path (and, for the registry build, the temp-dir guard that
+/// must outlive the relocate). This is the only place the two source strategies
+/// diverge.
+fn build_worker(source: &WorkerSource, id: &ToolchainId) -> anyhow::Result<StagedWorker> {
+    match source {
+        WorkerSource::LocalWorkspace(workspace) => {
+            println!("==> building lean-host-mcp-worker for {id} (workspace source)");
+            let status = Command::new("cargo")
+                .arg("build")
+                .arg("--release")
+                .arg("-p")
+                .arg(WORKER_FILE_NAME)
+                .current_dir(workspace)
+                .env("LEAN_HOST_MCP_TARGET_TOOLCHAIN", id.as_str())
+                .status()?;
+            if !status.success() {
+                return Err(anyhow::anyhow!(
+                    "cargo build -p lean-host-mcp-worker (toolchain {id}) failed with status {status}"
+                ));
+            }
+            let built = workspace.join("target").join("release").join(WORKER_FILE_NAME);
+            if !built.is_file() {
+                return Err(anyhow::anyhow!(
+                    "expected worker binary at {} but did not find one",
+                    built.display()
+                ));
+            }
+            Ok(StagedWorker {
+                binary: built,
+                _tmp: None,
+            })
+        }
+        WorkerSource::Registry => {
+            // Pin the worker to this binary's exact version — they share the
+            // workspace version and are ABI-coupled, so lockstep is intended.
+            let version = env!("CARGO_PKG_VERSION");
+            println!("==> installing lean-host-mcp-worker {version} for {id} (crates.io)");
+            let tmp = tempfile::tempdir()?;
+            let status = Command::new("cargo")
+                .arg("install")
+                .arg(WORKER_FILE_NAME)
+                .arg("--version")
+                .arg(format!("={version}"))
+                .arg("--bin")
+                .arg(WORKER_FILE_NAME)
+                .arg("--root")
+                .arg(tmp.path())
+                .arg("--locked")
+                .env("LEAN_HOST_MCP_TARGET_TOOLCHAIN", id.as_str())
+                .status()?;
+            if !status.success() {
+                return Err(anyhow::anyhow!(
+                    "cargo install lean-host-mcp-worker@={version} (toolchain {id}) failed with status {status}; \
+                     a Rust toolchain and network access are required"
+                ));
+            }
+            let built = tmp.path().join("bin").join(WORKER_FILE_NAME);
+            if !built.is_file() {
+                return Err(anyhow::anyhow!(
+                    "cargo install did not produce a worker binary at {}",
+                    built.display()
+                ));
+            }
+            Ok(StagedWorker {
+                binary: built,
+                _tmp: Some(tmp),
+            })
+        }
+    }
 }
 
 fn sha256_prefix(path: &Path, hex_chars: usize) -> anyhow::Result<String> {
@@ -461,11 +549,11 @@ mod humantime {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::panic)]
 
     use clap::{Args as _, Command, FromArgMatches};
 
-    use super::{InstallWorkerArgs, format_mib};
+    use super::{InstallWorkerArgs, WorkerSource, format_mib, resolve_worker_source};
 
     #[test]
     fn format_mib_renders_two_decimals_base_1024() {
@@ -503,5 +591,39 @@ mod tests {
         let err = parse(&["install-worker", "--auto", "--list"]).expect_err("mode flags conflict");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn explicit_source_dir_selects_local_workspace() {
+        let dir = std::env::temp_dir();
+        match resolve_worker_source(Some(&dir)).expect("existing dir resolves") {
+            WorkerSource::LocalWorkspace(p) => assert_eq!(p, dir),
+            WorkerSource::Registry => panic!("explicit --source-dir should select a local build"),
+        }
+    }
+
+    #[test]
+    fn explicit_missing_source_dir_is_an_error() {
+        let missing = std::env::temp_dir().join("lhm-install-worker-no-such-dir");
+        assert!(resolve_worker_source(Some(&missing)).is_err());
+    }
+
+    #[test]
+    fn no_flag_inside_a_checkout_selects_local_workspace() {
+        // The test binary is built from the workspace, so `CARGO_MANIFEST_DIR`'s
+        // grandparent holds `crates/lean-host-mcp-worker/Cargo.toml`. (A
+        // registry-installed binary, with no worker crate beside it, would
+        // resolve to `Registry` — exercised by the install rehearsal, not here.)
+        match resolve_worker_source(None).expect("resolves") {
+            WorkerSource::LocalWorkspace(ws) => {
+                assert!(
+                    ws.join("crates")
+                        .join("lean-host-mcp-worker")
+                        .join("Cargo.toml")
+                        .is_file()
+                );
+            }
+            WorkerSource::Registry => panic!("a checkout build should select the local workspace"),
+        }
     }
 }

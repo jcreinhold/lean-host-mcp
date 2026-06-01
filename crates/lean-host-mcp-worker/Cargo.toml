@@ -1,10 +1,11 @@
 [package]
 authors.workspace = true
+categories = ["development-tools"]
 description = "Worker-child binary for lean-host-mcp (links libleanshared; spawned by the parent)"
 edition.workspace = true
+keywords = ["lean", "lean4", "mcp"]
 license.workspace = true
 name = "lean-host-mcp-worker"
-publish = false
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

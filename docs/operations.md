@@ -164,6 +164,22 @@ Unlike an external LSP process, the host can still start when unrelated project 
 avoid the broken module continue to work; a broken target file reports structured Lean diagnostics instead of a
 bootstrap failure.
 
+## Installing workers
+
+`install-worker` always compiles the worker locally, once per Lean toolchain — its `build.rs` bakes an absolute rpath to
+that toolchain's `lib/lean`, so a worker binary can't be shipped prebuilt. What it can vary is where the worker *source*
+comes from, and it decides that itself:
+
+- **Registry** (the default for a `cargo install lean-host-mcp` binary): fetch and build the published
+  `lean-host-mcp-worker` crate at the server's own version (`cargo install lean-host-mcp-worker --version =<ver>`).
+- **Local workspace** (automatic when running from a checkout): build the worker from the workspace source
+  (`cargo build -p lean-host-mcp-worker`), reusing cargo's incremental cache.
+
+The detection is "was this binary built from a checkout that still has the worker crate beside it?" — no flag needed.
+`--source-dir <path>` overrides it to build from an explicit checkout (useful if the original checkout moved after the
+binary was built). Either way the worker needs a Rust toolchain on `PATH` and the matching Lean toolchain installed via
+elan; the freshly built worker is smoke-tested before it is recorded as usable.
+
 ## Build, test, lint
 
 ```sh
