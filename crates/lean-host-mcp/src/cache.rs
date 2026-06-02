@@ -192,6 +192,7 @@ mod tests {
                     id: "proof_state".into(),
                     declaration: "A.one".into(),
                     position: LeanWorkerProofPositionSelector::default(),
+                    locals_raw: false,
                 }],
                 &budgets
             ),
@@ -200,6 +201,7 @@ mod tests {
                     id: "proof_state".into(),
                     declaration: "A.two".into(),
                     position: LeanWorkerProofPositionSelector::default(),
+                    locals_raw: false,
                 }],
                 &budgets
             )

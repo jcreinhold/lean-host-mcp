@@ -153,8 +153,9 @@ Proof tools share the same anchor shape:
 
 `proof_position` is intent-shaped:
 
-- `{"kind":"default"}` selects the first open tactic state in declaration order.
-- `{"kind":"index","index":N}` selects the Nth open tactic state.
+- `{"kind":"default"}` (or omitting the field) selects the pristine entry goal — the state before any tactic runs;
+  `try_proof_step` splices before the first tactic there.
+- `{"kind":"index","index":N}` selects the state after the Nth tactic (`index:0` = after the first tactic).
 - `{"kind":"after_text","text":"...","occurrence":N}` selects a tactic/source fragment inside the declaration body.
 
 The Lean shim resolves these selectors to private source evidence. Raw offsets, line offsets, syntax spans, indentation,

@@ -50,18 +50,25 @@ The proof context at one position inside a declaration: open goals, local hypoth
 }
 ```
 
-`proof_position` is optional. When omitted, the worker selects the first open tactic state in declaration order. To
-target a specific one, select it by index:
+`proof_position` is optional. When omitted (the default), it targets the **pristine entry goal** — the proof state
+*before any tactic runs*. There, no tactic has executed yet, so `goals_before` and `goals_after` are equal: both are the
+declaration's opening goal. This is the goal a from-scratch tactic block submitted to `try_proof_step` (also at its
+default) will elaborate against — the two tools agree on where the default proof starts.
+
+To inspect a *tactic state* instead — the goals open **after** a tactic has run — select it by index:
 
 ```json
 { "kind": "index", "index": 1 }
 ```
 
-or by the source text just before it:
+(so `{ "kind": "index", "index": 0 }` is the state after the first tactic), or by the source text just before it:
 
 ```json
 { "kind": "after_text", "text": "skip", "occurrence": 0 }
 ```
+
+For these, `goals_before` is the state entering that tactic and `goals_after` is the state after it; continue a
+`try_proof_step` snippet from `goals_after`, not from `goals_before`.
 
 A successful response carries `status: "context"` and the context itself:
 
@@ -69,8 +76,8 @@ A successful response carries `status: "context"` and the context itself:
 {
   "status": "context",
   "declaration_name": "LeanRsFixture.ProofActions.stepTheorem",
-  "goals_before": ["⊢ p ∧ q"],          // goals open at this position
-  "goals_after":  ["⊢ q"],               // goals after the position's tactic, when applicable
+  "goals_before": ["⊢ p ∧ q"],          // goals entering this position
+  "goals_after":  ["⊢ q"],               // goals after the position's tactic (== goals_before at the entry default)
   "locals": [ { "name": "h", "type_str": { "value": "p", "truncated": false }, "value": null } ],
   "expected_type": { "value": "p ∧ q", "truncated": false },
   "truncated": false,
@@ -197,6 +204,13 @@ writes source files.** Apply a snippet you like yourself.
   "snippet": "trivial"
 }
 ```
+
+`proof_position` shares the [`proof_state` selector](#proof_state). When omitted (the default), the snippet is spliced
+*before the first tactic* and elaborates against the pristine entry goal — the same goal `proof_state`'s default reports
+as `goals_before`. So a from-scratch tactic block read off `proof_state` works at the default. To continue *after* an
+existing tactic instead, target `{ "kind": "index", "index": N }` / `after_text` and write a snippet that picks up from
+that position's `goals_after`; a from-scratch block there will re-introduce binders already in scope and fail (the
+response flags this).
 
 Pass `snippets` (a list) to try several at once; up to 8 candidates are attempted, the rest reported as
 `budget_exceeded`. Each candidate reports its status (`closed`, `progressed`, `failed`, `timeout`, …), the diagnostics

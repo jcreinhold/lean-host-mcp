@@ -81,6 +81,107 @@ fn request_schemas_are_declaration_centric() {
     );
 }
 
+/// The default proof position is the pristine entry goal: `proof_state` shows
+/// it (before == after), a default `try_proof_step` from-scratch block closes
+/// the goal against it, and the same block at the post-first-tactic position
+/// (`index: 0`) traps — reproducing the `le_saturatedClosure` symptom on the
+/// `entryBinderTheorem` fixture.
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let decl = "LeanRsFixture.ProofActions.entryBinderTheorem".to_owned();
+    let from_scratch = "intro p hp; exact hp".to_owned();
+
+    // proof_state at the default shows the pristine entry goal: nothing has run,
+    // so before == after, and it is the declaration's opening goal.
+    let proof = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: proof_actions_file(),
+            declaration: decl.clone(),
+            proof_position: ProofPositionSelector::default(),
+            project: None,
+        },
+    )
+    .await
+    .expect("proof_state");
+    let ProofStateResult::Context {
+        goals_before,
+        goals_after,
+        ..
+    } = proof.result.expect("proof result")
+    else {
+        panic!("expected proof context");
+    };
+    assert_eq!(
+        goals_before, goals_after,
+        "at the entry no tactic has run, so before == after: {goals_before:?} / {goals_after:?}"
+    );
+    assert!(
+        goals_before.iter().any(|goal| goal.contains("p → p")),
+        "entry goal should be the pristine declaration goal: {goals_before:?}"
+    );
+
+    // try_proof_step at the default splices before the first tactic, so the
+    // from-scratch block elaborates against the pristine goal and closes it.
+    let closed = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: proof_actions_file(),
+            declaration: decl.clone(),
+            proof_position: ProofPositionSelector::default(),
+            project: None,
+            snippet: Some(from_scratch.clone()),
+            snippets: Vec::new(),
+        },
+    )
+    .await
+    .expect("default try_proof_step");
+    let ProofAttemptResult::Ok { result, .. } = closed.result.expect("default attempt result") else {
+        panic!("expected ok envelope");
+    };
+    assert_eq!(
+        result.candidates[0].status, "closed",
+        "from-scratch block must close the goal at the pristine entry default: {:?}",
+        result.candidates[0]
+    );
+
+    // The same block at the post-first-tactic position (`index: 0`) re-introduces
+    // binders already in scope and fails — and the response carries the cue.
+    let trapped = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: proof_actions_file(),
+            declaration: decl,
+            proof_position: ProofPositionSelector::Index { index: 0 },
+            project: None,
+            snippet: Some(from_scratch),
+            snippets: Vec::new(),
+        },
+    )
+    .await
+    .expect("index:0 try_proof_step");
+    let cue_warnings = trapped.warnings.clone();
+    let cue_next = trapped.next_actions.clone();
+    let ProofAttemptResult::Ok { result, .. } = trapped.result.expect("index:0 attempt result") else {
+        panic!("expected ok envelope");
+    };
+    assert_ne!(
+        result.candidates[0].status, "closed",
+        "a from-scratch block at index:0 must not close (binders already introduced): {:?}",
+        result.candidates[0]
+    );
+    assert!(
+        cue_warnings.iter().any(|w| w.contains("already in scope"))
+            && cue_next.iter().any(|a| a.contains("pristine entry")),
+        "index:0 binder-reintroduction failure should surface the entry cue: warnings={cue_warnings:?} next={cue_next:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn inspect_proof_state_try_verify_and_references() {

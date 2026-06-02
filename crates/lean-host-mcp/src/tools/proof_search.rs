@@ -55,7 +55,8 @@ pub struct SearchForProofRequest {
     /// Declaration name for file-based proof retrieval.
     #[serde(default)]
     pub declaration: Option<String>,
-    /// Where in the proof to read the goal; defaults to the main goal.
+    /// Where in the proof to read the goal; defaults to the pristine entry goal
+    /// (before any tactic runs). See [`ProofPositionSelector`].
     #[serde(default)]
     pub proof_position: ProofPositionSelector,
     /// Explicit goal text when no file/declaration context is available.

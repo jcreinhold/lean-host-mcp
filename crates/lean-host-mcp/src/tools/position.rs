@@ -204,9 +204,17 @@ pub struct ProofStateRequest {
     pub project: Option<String>,
 }
 
-/// Where in a proof to act. `default` targets the declaration's main goal;
-/// `index` selects the Nth goal; `after_text` selects the position just after a
-/// matched source fragment.
+/// Where in a proof to act.
+///
+/// `default` (also when the field is omitted) targets the **pristine entry
+/// goal** — the proof state *before any tactic runs*. `proof_state` reports it
+/// as `goals_before` (equal to `goals_after`, since nothing has run), and a
+/// `try_proof_step` snippet is spliced *before* the first tactic, so a
+/// from-scratch tactic block elaborates against this goal.
+///
+/// `index` selects the state *after* the Nth tactic has run (so `index: 0` is
+/// the first-tactic state — read `goals_after` and continue from there);
+/// `after_text` selects the state just after a matched source fragment.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProofPositionSelector {
@@ -225,7 +233,11 @@ pub enum ProofPositionSelector {
 
 pub(crate) fn worker_proof_position(position: ProofPositionSelector) -> LeanWorkerProofPositionSelector {
     match position {
-        ProofPositionSelector::Default => LeanWorkerProofPositionSelector::Default,
+        // The default is the pristine entry goal: `proof_state`'s `goals_before`
+        // shows it and a `try_proof_step` snippet splices before the first
+        // tactic, so the two tools agree on where the default proof starts. The
+        // old first-tactic-state default is still reachable as `Index { 0 }`.
+        ProofPositionSelector::Default => LeanWorkerProofPositionSelector::Entry,
         ProofPositionSelector::Index { index } => LeanWorkerProofPositionSelector::Index { index },
         ProofPositionSelector::AfterText { text, occurrence } => {
             LeanWorkerProofPositionSelector::AfterText { text, occurrence }
@@ -316,6 +328,9 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             id: PROOF_STATE_CONTEXT_ID.to_owned(),
             declaration: req.declaration,
             position: worker_proof_position(req.proof_position),
+            // Pretty, notation-aware locals (the worker default); the raw
+            // `Expr` form is an expert-only opt-in we do not surface here.
+            locals_raw: false,
         },
     ];
     let budgets = proof_agent_budgets();
@@ -1230,9 +1245,10 @@ mod tests {
     };
 
     use super::{
-        BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, ProofPositionSelector, ProofStateRequest, ProofStateResult,
-        RenderedText, cache_status_label, expert_query_budgets, needs_build_context, project_query_facts,
-        proof_agent_budgets, reference_query_budgets, route_batch_outcome,
+        BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, LeanWorkerProofPositionSelector, ProofPositionSelector,
+        ProofStateRequest, ProofStateResult, RenderedText, cache_status_label, expert_query_budgets,
+        needs_build_context, project_query_facts, proof_agent_budgets, reference_query_budgets, route_batch_outcome,
+        worker_proof_position,
     };
     use crate::tools::source_input::{header_imports, read_query_file};
 
@@ -1278,6 +1294,21 @@ import Init -- comment
             serde_json::from_str(r#"{"file":"Foo/Bar.lean","declaration":"Foo.Bar.t"}"#).unwrap();
         assert_eq!(request.declaration, "Foo.Bar.t");
         assert!(matches!(request.proof_position, ProofPositionSelector::Default));
+    }
+
+    #[test]
+    fn default_position_maps_to_pristine_entry() {
+        // The default targets the pristine entry goal so `proof_state` and
+        // `try_proof_step` agree on where the default proof starts; the old
+        // first-tactic-state default stays reachable as `index: 0`.
+        assert!(matches!(
+            worker_proof_position(ProofPositionSelector::Default),
+            LeanWorkerProofPositionSelector::Entry
+        ));
+        assert!(matches!(
+            worker_proof_position(ProofPositionSelector::Index { index: 0 }),
+            LeanWorkerProofPositionSelector::Index { index: 0 }
+        ));
     }
 
     #[test]

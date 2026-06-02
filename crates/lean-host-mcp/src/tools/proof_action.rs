@@ -47,7 +47,8 @@ pub struct TryProofStepRequest {
     pub file: PathBuf,
     /// Declaration to target within `file`.
     pub declaration: String,
-    /// Where in the proof to act; defaults to the declaration's main goal.
+    /// Where in the proof to act; defaults to the pristine entry goal (the
+    /// snippet is spliced before the first tactic). See [`ProofPositionSelector`].
     #[serde(default)]
     pub proof_position: ProofPositionSelector,
     /// Project-root override; defaults to the server's configured Lake project.
@@ -160,7 +161,54 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     if let Some(event) = &taint {
         response = warn_execution_taint(response, event);
     }
+    // A from-scratch tactic block submitted to an explicit `index` / `after_text`
+    // position can fail because the binders it re-introduces are already in scope
+    // from earlier tactics. The default targets the pristine entry goal, so this
+    // never bites there; for explicit positions, point the agent back at the
+    // entry/default or at continuing from this position's `goals_after`.
+    if attempt_reintroduces_bound_binders(&response) {
+        response.warnings.push(
+            "a candidate failed to introduce binders that are already in scope at this position; \
+             a from-scratch tactic block belongs at the pristine entry goal, not after earlier tactics have run"
+                .to_owned(),
+        );
+        response.next_actions.push(
+            "omit `proof_position` (or use the default) to start from the pristine entry goal, \
+             or continue this candidate from the position's `goals_after`"
+                .to_owned(),
+        );
+    }
     Ok(response)
+}
+
+/// Lean diagnostics for a tactic that tried to introduce binders no longer
+/// available — the signature of a from-scratch block run *after* earlier
+/// tactics already introduced those binders, rather than at the entry goal.
+fn diagnostics_reintroduce_binders(diagnostics: &ElabFailure) -> bool {
+    diagnostics.diagnostics.iter().any(|diagnostic| {
+        let message = &diagnostic.message;
+        // `introN` is the binder-introduction primitive `intro` lowers to; the
+        // phrasings vary across Lean versions ("no additional binders or `let`
+        // bindings in the goal to introduce", "insufficient number of binders").
+        message.contains("introN")
+            || message.contains("no additional binders")
+            || message.contains("no binders to introduce")
+            || message.contains("insufficient number of binders")
+    })
+}
+
+/// True when some failed candidate carries a binder-reintroduction diagnostic.
+/// Read-only over the built response, so it never disturbs the result payload.
+fn attempt_reintroduces_bound_binders(response: &Response<ProofAttemptResult>) -> bool {
+    let Some(ProofAttemptResult::Ok { result, .. } | ProofAttemptResult::MissingImports { result, .. }) =
+        response.result_ref()
+    else {
+        return false;
+    };
+    result
+        .candidates
+        .iter()
+        .any(|candidate| candidate.status == "failed" && diagnostics_reintroduce_binders(&candidate.diagnostics))
 }
 
 /// Build the degraded envelope when `try_proof_step`'s target import closure
@@ -577,6 +625,28 @@ mod tests {
         let capped = capped_candidate_rows(&req);
         assert_eq!(capped.len(), 2);
         assert_eq!(capped[0].status, "budget_exceeded");
+    }
+
+    #[test]
+    fn binder_reintroduction_diagnostics_drive_the_cue() {
+        use crate::projections::{Diagnostic, Severity};
+        let with = |message: &str| ElabFailure {
+            diagnostics: vec![Diagnostic {
+                severity: Severity::Error,
+                message: message.to_owned(),
+                position: None,
+                file: None,
+            }],
+            truncated: false,
+        };
+        // The exact message Lean 4.31 emits for this fixture, plus an older phrasing.
+        assert!(diagnostics_reintroduce_binders(&with(
+            "Tactic `introN` failed: There are no additional binders or `let` bindings in the goal to introduce"
+        )));
+        assert!(diagnostics_reintroduce_binders(&with(
+            "tactic 'introN' failed, insufficient number of binders"
+        )));
+        assert!(!diagnostics_reintroduce_binders(&with("unknown identifier 'foo'")));
     }
 
     #[test]

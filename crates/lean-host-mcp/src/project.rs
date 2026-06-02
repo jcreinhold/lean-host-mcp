@@ -1835,6 +1835,7 @@ fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
             )
         }
         LeanWorkerRestartReason::Cancelled { operation } => format!("cancelled operation={operation}"),
+        LeanWorkerRestartReason::ChildAbort { operation } => format!("child_abort operation={operation}"),
         LeanWorkerRestartReason::RequestTimeout { operation, duration } => {
             format!(
                 "timeout operation={operation} duration_millis={}",
