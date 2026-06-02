@@ -182,8 +182,8 @@ mailbox pressure, worker death, session loss) return `status: "runtime_unavailab
 
 ## Versions
 
-`lean-host-mcp` 0.2.0 builds on `lean-rs-worker-parent` / `-child` 0.1.19, which transitively pin `lean-rs` /
-`lean-rs-host` 0.1.19. It supports the Lean window `4.26.0 ..= 4.31.0-rc1` and is built and tested against the head of
+`lean-host-mcp` 0.3.0 builds on `lean-rs-worker-parent` / `-child` 0.1.20, which transitively pin `lean-rs` /
+`lean-rs-host` 0.1.20. It supports the Lean window `4.26.0 ..= 4.31.0-rc1` and is built and tested against the head of
 that window, Lean **4.31.0-rc1**.
 
 A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long

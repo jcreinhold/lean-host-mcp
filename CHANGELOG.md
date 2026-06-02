@@ -7,6 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 <!-- ASSISTANT: add new entries under [Unreleased]; `release-lean-host-mcp` promotes them on tag. -->
 
+## [0.3.0] - 2026-06-02
+
+### Changed
+
+- The default proof position is now the **pristine entry goal** — the state before any tactic runs. `proof_state` and
+  `try_proof_step` previously disagreed: `proof_state`'s `goals_before` showed the entry goal, but `try_proof_step`
+  spliced a candidate _after_ the first tactic, so a from-scratch tactic block read off `proof_state` failed with
+  `introN failed: ... no additional binders to introduce`. Now `proof_state` at the default reports the entry goal
+  (`goals_before == goals_after`) and a default `try_proof_step` snippet elaborates against that same goal, so
+  from-scratch blocks work at the default. The old first-tactic state stays reachable as `{kind:"index","index":0}`.
+  **Behavioral change** for callers that relied on the default mapping to the post-first-tactic state.
+- Bumped the `lean-rs-worker-parent` / `-child` and `lean-toolchain` dependencies to 0.1.20, which adds the upstream
+  `Entry` proof-position selector this reconciliation maps the default onto.
+
+### Added
+
+- For explicit `{kind:"index"}` / `after_text` positions, a failed candidate carrying a binder-introduction diagnostic
+  now surfaces a cue pointing at the entry default (or continuing from `goals_after`), so the trap is signposted even
+  off the default path.
+
 ## [0.2.0] - 2026-06-02
 
 ### Changed
@@ -95,5 +115,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
+[0.3.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jcreinhold/lean-host-mcp/releases/tag/v0.1.0
