@@ -408,7 +408,18 @@ fn plan_searches(profile: &TargetProfile, mode: ProofSearchMode) -> Vec<PlannedS
             if let Some(head) = primary_head.as_deref()
                 && !(mode == ProofSearchMode::NextStep && constants.is_empty() && is_broad_head(head))
             {
-                push_head_search(&mut out, profile, "conclusion_head", Some(head));
+                // A specific relational head (`LE.le`, `Membership.mem`, …) is a
+                // meaningful filter and labels the search `conclusion_head`, which
+                // counts as corroboration. A broad head (`Eq`/`Iff`/…) matches
+                // nearly everything, so it gets a distinct label and does *not*
+                // corroborate — otherwise generic `*_eq_*` lemmas would outrank
+                // domain name-fragment matches.
+                let label = if is_broad_head(head) {
+                    "broad_conclusion_head"
+                } else {
+                    "conclusion_head"
+                };
+                push_head_search(&mut out, profile, label, Some(head));
             }
             if !constants.is_empty() {
                 push_required_search(&mut out, profile, "required_constants", constants);
@@ -562,8 +573,35 @@ fn rank_results(
         }
     }
 
+    // Name-fragment bonus, applied once per candidate now that the full set of
+    // corroborating searches is known. The structural `+10` is earned only when
+    // a head or required-constants search also vouches for the candidate; a bare
+    // lexical hit gets the smaller `+5` and no structural lift.
+    for entry in by_name.values_mut() {
+        let corroborated = is_corroborated(&entry.reasons);
+        let lower = entry.row.name.to_lowercase();
+        let mut bonus = 0i32;
+        for fragment in &profile.name_fragments {
+            if lower.contains(fragment) {
+                bonus = bonus.saturating_add(if corroborated && is_structural_fragment(fragment) {
+                    10
+                } else {
+                    5
+                });
+            }
+        }
+        entry.score = entry.score.saturating_add(bonus);
+    }
+
+    // When any candidate is head-/constant-corroborated, sink the purely lexical
+    // ones below all of them: the worker's +40 name-suffix base outscores its +30
+    // conclusion-head base, so a flat penalty cannot reliably demote noise.
+    let any_corroborated = by_name.values().any(|entry| is_corroborated(&entry.reasons));
     let mut ranked = by_name.into_values().collect::<Vec<_>>();
-    ranked.sort_by_key(|candidate| (Reverse(candidate.score), candidate.row.name.clone()));
+    ranked.sort_by_key(|candidate| {
+        let demoted = any_corroborated && !is_corroborated(&candidate.reasons);
+        (demoted, Reverse(candidate.score), candidate.row.name.clone())
+    });
     let ranked_count = ranked.len();
     let candidates = ranked
         .into_iter()
@@ -593,6 +631,24 @@ fn rank_results(
     {
         warnings.push(
             "results match the goal's conclusion head only, not its domain terms; for a known target prefer \
+             find_references or loogle over search_for_proof"
+                .to_owned(),
+        );
+    }
+
+    // Honesty signal, complementary to the above: if every returned candidate's
+    // only evidence is a name-fragment substring — no conclusion-head and no
+    // required-constant search vouched for it — the results are lexical guesses.
+    // Mutually exclusive with the head-only warning by construction.
+    if !candidates.is_empty()
+        && candidates.iter().all(|candidate| {
+            !candidate.match_reason.contains("conclusion_head")
+                && !candidate.match_reason.contains("required_constants")
+        })
+    {
+        warnings.push(
+            "results matched the goal by name fragment only, with no conclusion-head or required-constant \
+             corroboration; they are lexical guesses and may not match the goal — for a known target prefer \
              find_references or loogle over search_for_proof"
                 .to_owned(),
         );
@@ -657,6 +713,20 @@ fn record_response_bytes(result: &mut SearchForProofResult) {
     }
 }
 
+/// Whether a candidate's accumulated evidence includes a *specific* head or a
+/// required-constants search — i.e. something type-aware vouched for it, not just
+/// a name-substring or a broad `Eq`/`Iff` head (which match nearly everything).
+///
+/// Keyed on the exact parent search label: the worker stamps `conclusion_head`
+/// into its `match_reason` for broad heads too, so a substring test would let
+/// generic `*_eq_*` lemmas masquerade as corroborated. Broad-head searches carry
+/// the distinct `broad_conclusion_head` label and deliberately do not match here.
+fn is_corroborated(reasons: &BTreeSet<String>) -> bool {
+    reasons
+        .iter()
+        .any(|reason| reason == "conclusion_head" || reason == "required_constants")
+}
+
 fn candidate_score(
     row: &DeclarationSummary,
     profile: &TargetProfile,
@@ -703,11 +773,6 @@ fn candidate_score(
         score = score.saturating_sub(45);
     }
     score = score.saturating_add(profile_specific_score_adjustment(&lower_name, profile));
-    for fragment in &profile.name_fragments {
-        if lower_name.contains(fragment) {
-            score = score.saturating_add(if is_structural_fragment(fragment) { 10 } else { 5 });
-        }
-    }
     if search_label == "required_constants" {
         score = score.saturating_add(6);
     }
@@ -980,7 +1045,7 @@ fn is_structural_fragment(fragment: &str) -> bool {
             | "bounded"
             | "formula"
             | "language"
-    ) || fragment.contains("cast")
+    )
 }
 
 fn pruned_from_facts(facts: &DeclarationSearchFacts, returned: usize) -> usize {
@@ -1014,7 +1079,15 @@ fn preferred_head(heads: &[String], mode: ProofSearchMode) -> Option<String> {
             return Some("Iff".to_owned());
         }
     }
-    heads.first().cloned()
+    // Prefer a specific relational head (`LE.le`, `Membership.mem`, …) over a
+    // broad one (`Eq`/`Iff`/`Exists`/`True`): a hypothesis `=` must not let `Eq`
+    // (alphabetically first in the `BTreeSet`) win and then get dropped by the
+    // broad-head guard in `plan_searches`.
+    heads
+        .iter()
+        .find(|head| !is_broad_head(head))
+        .or_else(|| heads.first())
+        .cloned()
 }
 
 fn extract_constants(text: &str) -> Vec<String> {
@@ -1036,6 +1109,9 @@ fn extract_heads(text: &str) -> Vec<String> {
     if text.contains('=') {
         heads.insert("Eq".to_owned());
     }
+    if text.contains('≠') {
+        heads.insert("Ne".to_owned());
+    }
     if text.contains('↔') || text.contains("<->") {
         heads.insert("Iff".to_owned());
     }
@@ -1051,7 +1127,76 @@ fn extract_heads(text: &str) -> Vec<String> {
     if text.contains("True") {
         heads.insert("True".to_owned());
     }
+    // Relational/membership/order notation maps to the head constant the worker
+    // filters on (`conclusionHead?` = `getAppFn` of the fully-quantified
+    // conclusion, matched by exact `Name` equality). Without these, an `LE.le`
+    // goal yields no head and the one type-aware worker filter never runs.
+    if text.contains('≤') || text.contains("<=") {
+        heads.insert("LE.le".to_owned());
+    }
+    if text.contains('≥') || text.contains(">=") {
+        heads.insert("GE.ge".to_owned());
+    }
+    if text.contains('∈') {
+        heads.insert("Membership.mem".to_owned());
+    }
+    if text.contains('∣') {
+        heads.insert("Dvd.dvd".to_owned());
+    }
+    if text.contains('⊆') {
+        heads.insert("HasSubset.Subset".to_owned());
+    }
+    // Bare ASCII `<`/`>` are the pretty-printer's rendering of `LT.lt`/`GT.gt`,
+    // but they also appear inside `<=`, `>=`, `<->`, and the `->`/`<-` arrows;
+    // only count a `<`/`>` that is not part of one of those sequences.
+    if has_bare_relation(text, '<') {
+        heads.insert("LT.lt".to_owned());
+    }
+    if has_bare_relation(text, '>') {
+        heads.insert("GT.gt".to_owned());
+    }
     heads.into_iter().collect()
+}
+
+/// Whether `text` contains a `<`/`>` that denotes `LT.lt`/`GT.gt` rather than a
+/// fragment of `<=`, `>=`, `<->`, or an ASCII arrow (`->`, `<-`).
+fn has_bare_relation(text: &str, target: char) -> bool {
+    let chars = text.chars().collect::<Vec<_>>();
+    chars.iter().enumerate().any(|(i, &c)| {
+        if c != target {
+            return false;
+        }
+        let next = i.checked_add(1).and_then(|j| chars.get(j)).copied();
+        let prev = i.checked_sub(1).and_then(|j| chars.get(j)).copied();
+        match target {
+            // `<=` (LE.le) and `<-`/`<->` (arrows/Iff) are not LT.lt.
+            '<' => next != Some('=') && next != Some('-'),
+            // `>=` (GE.ge) and a trailing `>` of `->`/`<->` are not GT.gt.
+            '>' => next != Some('=') && prev != Some('-'),
+            _ => false,
+        }
+    })
+}
+
+/// Heads `extract_heads` synthesizes from notation. These are structural
+/// operators, not domain terms, so they must not seed name-fragment searches.
+fn is_notation_head(head: &str) -> bool {
+    matches!(
+        head,
+        "Eq" | "Ne"
+            | "Iff"
+            | "And"
+            | "Or"
+            | "Exists"
+            | "True"
+            | "LE.le"
+            | "GE.ge"
+            | "LT.lt"
+            | "GT.gt"
+            | "Membership.mem"
+            | "Dvd.dvd"
+            | "HasSubset.Subset"
+    )
 }
 
 fn extract_name_fragments(text: &str, constants: &[String], heads: &[String], kind: GoalProfileKind) -> Vec<String> {
@@ -1081,7 +1226,7 @@ fn extract_name_fragments(text: &str, constants: &[String], heads: &[String], ki
         }
     }
     for item in constants.iter().chain(heads.iter()) {
-        if is_broad_head(item) {
+        if is_notation_head(item) {
             continue;
         }
         for segment in item.split('.') {
@@ -1186,7 +1331,7 @@ fn useful_lower_fragment(fragment: &str) -> bool {
             | "le_add"
             | "sub_le"
             | "le_sub"
-    ) || fragment.contains("cast")
+    )
 }
 
 fn identifier_tokens(text: &str) -> Vec<String> {
@@ -1254,12 +1399,182 @@ mod tests {
         }
     }
 
+    fn search_result(rows: Vec<DeclarationSummary>) -> DeclarationSearchResult {
+        let n = rows.len();
+        DeclarationSearchResult {
+            declarations: rows,
+            truncated: false,
+            facts: DeclarationSearchFacts {
+                declarations_scanned: n,
+                after_name_filter: n,
+                after_kind_filter: n,
+                after_required_constants_filter: n,
+                after_conclusion_filter: n,
+                after_scope_filter: n,
+                source_lookups: 0,
+                broad_pruning: Vec::new(),
+                truncated: false,
+                timings: crate::projections::DeclarationSearchTimings {
+                    scan_micros: 0,
+                    rank_micros: 0,
+                    source_micros: 0,
+                },
+            },
+        }
+    }
+
     #[test]
     fn search_for_proof_request_defaults() {
         let req: SearchForProofRequest = serde_json::from_value(json!({"goal":"⊢ True"})).unwrap();
         assert_eq!(req.mode.unwrap_or_default(), ProofSearchMode::NextStep);
         assert!(req.file.is_none());
         assert_eq!(req.goal.as_deref(), Some("⊢ True"));
+    }
+
+    #[test]
+    fn extract_heads_recognizes_relational_membership_and_divisibility() {
+        assert!(extract_heads("⊢ a ≤ b").iter().any(|head| head == "LE.le"));
+        assert!(extract_heads("⊢ x ∈ s").iter().any(|head| head == "Membership.mem"));
+        assert!(extract_heads("⊢ a ∣ b").iter().any(|head| head == "Dvd.dvd"));
+        assert!(extract_heads("⊢ s ⊆ t").iter().any(|head| head == "HasSubset.Subset"));
+        assert!(extract_heads("⊢ a ≠ b").iter().any(|head| head == "Ne"));
+        assert!(extract_heads("⊢ a < b").iter().any(|head| head == "LT.lt"));
+        // `≤` and `<=` are LE.le, never LT.lt; an ASCII arrow is never GT.gt.
+        assert!(!extract_heads("⊢ a ≤ b").iter().any(|head| head == "LT.lt"));
+        assert!(extract_heads("⊢ a <= b").iter().any(|head| head == "LE.le"));
+        assert!(!extract_heads("f : a -> b").iter().any(|head| head == "GT.gt"));
+        // The plain-Eq case is unchanged.
+        assert!(extract_heads("⊢ a = b").iter().any(|head| head == "Eq"));
+    }
+
+    #[test]
+    fn plan_searches_emits_conclusion_head_for_le_goal() {
+        let profile = profile_from_text(
+            "⊢ I ≤ I.saturatedClosure".to_owned(),
+            Some("CategoryTheory".to_owned()),
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert!(profile.heads.iter().any(|head| head == "LE.le"));
+        let searches = plan_searches(&profile, ProofSearchMode::NextStep);
+        let head = searches
+            .iter()
+            .find(|search| search.label == "conclusion_head")
+            .expect("a relational goal must trigger a conclusion_head search");
+        assert_eq!(head.request.conclusion_head.as_deref(), Some("LE.le"));
+    }
+
+    #[test]
+    fn plan_searches_keeps_eq_head_for_eq_goal_with_constants() {
+        let profile = profile_from_text(
+            "⊢ Nat.succ n = Nat.succ m".to_owned(),
+            Some("Nat".to_owned()),
+            Vec::new(),
+            "explicit_text".to_owned(),
+            None,
+            Vec::new(),
+        );
+        let searches = plan_searches(&profile, ProofSearchMode::Exact);
+        // The Eq head search still runs; a broad head carries a distinct label so
+        // it does not falsely corroborate generic equality lemmas.
+        let head = searches
+            .iter()
+            .find(|search| search.request.conclusion_head.as_deref() == Some("Eq"))
+            .expect("the plain-Eq head path must still run");
+        assert_eq!(head.label, "broad_conclusion_head");
+    }
+
+    #[test]
+    fn preferred_head_picks_specific_over_broad() {
+        // A hypothesis `=` plus a goal `≤`: the specific LE.le head must win.
+        let heads = extract_heads("h : x = y\n⊢ x ≤ y");
+        assert_eq!(
+            preferred_head(&heads, ProofSearchMode::NextStep).as_deref(),
+            Some("LE.le")
+        );
+        // A pure-Eq goal still yields Eq.
+        let eq_heads = extract_heads("⊢ x = y");
+        assert_eq!(
+            preferred_head(&eq_heads, ProofSearchMode::NextStep).as_deref(),
+            Some("Eq")
+        );
+    }
+
+    #[test]
+    fn lexical_only_candidates_are_demoted_below_corroborated() {
+        let profile = profile_from_text(
+            "⊢ I ≤ I.saturatedClosure".to_owned(),
+            None,
+            Vec::new(),
+            "context".to_owned(),
+            None,
+            Vec::new(),
+        );
+        // A genuine LE.le head match (low base score) and a high-scoring lexical
+        // suffix hit that no head/constant search corroborates.
+        let head_row = summary(
+            "CategoryTheory.MorphismProperty.le_saturatedClosure",
+            Some("Mathlib.CategoryTheory.MorphismProperty.Basic"),
+            60,
+        );
+        let noise_row = summary("Rat.den_intCast", Some("Mathlib.Data.Rat.Cast"), 120);
+        let result = rank_results(
+            &profile,
+            ProofSearchMode::NextStep,
+            10,
+            2,
+            vec![
+                ("conclusion_head", search_result(vec![head_row])),
+                ("name_fragment", search_result(vec![noise_row])),
+            ],
+            Vec::new(),
+            false,
+        );
+        assert_eq!(
+            result.candidates.first().expect("a candidate").name,
+            "CategoryTheory.MorphismProperty.le_saturatedClosure",
+            "the head-corroborated candidate must rank above the higher-scoring lexical hit"
+        );
+        assert_eq!(result.candidates.last().expect("a candidate").name, "Rat.den_intCast");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("lexical guesses")),
+            "a head-corroborated result set is not lexical-only"
+        );
+    }
+
+    #[test]
+    fn all_lexical_candidates_trigger_lexical_only_warning() {
+        let profile = profile_from_text(
+            "⊢ I ≤ I.saturatedClosure".to_owned(),
+            None,
+            Vec::new(),
+            "context".to_owned(),
+            None,
+            Vec::new(),
+        );
+        // Only a name-fragment hit (matches the `le` fragment), nothing corroborates it.
+        let row = summary("Rat.le_intCast", Some("Mathlib.Data.Rat.Cast"), 100);
+        let result = rank_results(
+            &profile,
+            ProofSearchMode::NextStep,
+            10,
+            1,
+            vec![("name_fragment", search_result(vec![row]))],
+            Vec::new(),
+            false,
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("lexical guesses")),
+            "an entirely uncorroborated result set must carry the lexical-only warning"
+        );
     }
 
     #[test]
