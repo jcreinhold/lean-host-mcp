@@ -36,6 +36,21 @@ async fn streamable_http_initialize_and_tools_list() {
         .expect("tools/list response");
     assert_eq!(tool_names(&tools.json), expected_tools());
 
+    // Handlers return a bare `CallToolResult`, so rmcp advertises no `outputSchema`.
+    // The Anthropic Messages API drops it anyway, and deep `$defs` break strict clients.
+    let listed = tools
+        .json
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .expect("tools/list should carry a tools array");
+    for tool in listed {
+        assert!(
+            tool.get("outputSchema").is_none(),
+            "tool {} should not advertise an outputSchema: {tool:?}",
+            tool.get("name").and_then(Value::as_str).unwrap_or("?")
+        );
+    }
+
     server.shutdown().await;
 }
 
@@ -235,6 +250,9 @@ impl HttpMcpServer {
             .arg(bind.to_string())
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("RUST_LOG", "warn")
+            // These tests read `structuredContent` and full telemetry; opt into both.
+            .env("LEAN_HOST_MCP_RESPONSE_CARRIER", "both")
+            .env("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -543,7 +561,7 @@ fn runtime_error_reason(response: &Value) -> Option<String> {
 
 fn runtime_u64(response: &Value, field: &str) -> Option<u64> {
     response
-        .pointer("/result/structuredContent/runtime")
+        .pointer("/result/structuredContent/telemetry/runtime")
         .and_then(|runtime| runtime.get(field))
         .and_then(Value::as_u64)
 }

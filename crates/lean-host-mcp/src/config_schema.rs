@@ -180,6 +180,48 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         overrides: "--http-path / LEAN_HOST_MCP_HTTP_PATH",
         description: "HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp.",
     },
+    FieldDoc {
+        key: "server.response_carrier",
+        ty: "string (text, structured, both)",
+        value: "\"text\"",
+        commented: false,
+        overrides: "LEAN_HOST_MCP_RESPONSE_CARRIER",
+        description: "Which field of the tool result carries the envelope. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text.",
+    },
+    // ---- [telemetry] — model-facing envelope verbosity ------------------
+    FieldDoc {
+        key: "telemetry.verbosity",
+        ty: "string (quiet, full)",
+        value: "\"quiet\"",
+        commented: false,
+        overrides: "LEAN_HOST_MCP_TELEMETRY_VERBOSITY",
+        description: "How much operational telemetry the envelope carries. quiet keeps proof-relevant content and drops the runtime block, manifest hash, and full import list; full emits everything for debugging. Default quiet.",
+    },
+    // ---- [output] — per-call output budget overrides --------------------
+    FieldDoc {
+        key: "output.max_field_bytes",
+        ty: "integer (bytes)",
+        value: "8192",
+        commented: true,
+        overrides: "LEAN_HOST_MCP_OUTPUT_MAX_FIELD_BYTES",
+        description: "Override the per-field output byte cap for all tools. Unset keeps each tool's built-in default (8 KiB for inspection, 4 KiB for proof actions). Clamped to 256 bytes to 64 KiB.",
+    },
+    FieldDoc {
+        key: "output.max_total_bytes",
+        ty: "integer (bytes)",
+        value: "65536",
+        commented: true,
+        overrides: "LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES",
+        description: "Override the total output byte cap for all tools. Unset keeps the built-in 64 KiB default. Clamped to 1 KiB to 64 KiB.",
+    },
+    FieldDoc {
+        key: "output.heartbeat_limit",
+        ty: "integer (heartbeats)",
+        value: "200000",
+        commented: true,
+        overrides: "LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT",
+        description: "Default elaboration heartbeat budget for try_proof_step and verify_declaration. Unset uses the worker default. Bounds runaway tactics.",
+    },
 ];
 
 /// Split a dotted key into `(table, leaf)`. A top-level key (no `.`) returns an

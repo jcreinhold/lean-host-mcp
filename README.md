@@ -145,16 +145,26 @@ one whose Lean-domain outcome was a failure.
   "runtime_error": null,              // populated when status is "runtime_unavailable"
   "freshness": {
     "project_root":   "/abs/path",
-    "project_hash":   "sha256-hex of lake-manifest.json",
-    "imports":        ["Mod.A", "..."],
     "session_id":     "uuid",          // project-actor identity; changes only on re-spawn (LRU/idle/manifest)
     "lean_toolchain": "leanprover/lean4:v4.29.1"
   },
-  "runtime":      { /* worker generation, restart/retry facts; attached to semantic calls */ },
+  // Operational telemetry, omitted by default; set `telemetry.verbosity = full` to emit it.
+  "telemetry": {
+    "project_hash": "sha256-hex of lake-manifest.json",
+    "imports":      ["Mod.A", "..."],
+    "runtime":      { /* worker generation, restart/retry facts */ }
+  },
   "warnings":     ["..."],     // omitted when empty
   "next_actions": ["..."]      // omitted when empty
 }
 ```
+
+`freshness` is always emitted — a small, stable identity. The `telemetry` block (cache hash, import list, worker
+`runtime` facts) is **omitted by default** (`telemetry.verbosity = quiet`): none of it helps an agent make a proof step,
+and the one actionable signal a worker restart carries already arrives as a `warning`. Set `telemetry.verbosity = full`
+to re-inline it. By default the envelope rides as JSON text in `content`; `server.response_carrier` (`structured` /
+`both`) can place it in `structuredContent` instead. Tools advertise no `outputSchema` — the Anthropic Messages API
+drops it, and deep `$defs` break strict clients.
 
 The split that matters: **Lean-domain failures** (parse errors, elaboration diagnostics, kernel rejection, meta timeout)
 ride inside the `ok` payload — a failed proof is still a successful call. **Recoverable runtime failures** (admission or

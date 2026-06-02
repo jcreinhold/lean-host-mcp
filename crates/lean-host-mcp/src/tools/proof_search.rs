@@ -55,6 +55,7 @@ pub struct SearchForProofRequest {
     /// Declaration name for file-based proof retrieval.
     #[serde(default)]
     pub declaration: Option<String>,
+    /// Where in the proof to read the goal; defaults to the main goal.
     #[serde(default)]
     pub proof_position: ProofPositionSelector,
     /// Explicit goal text when no file/declaration context is available.
@@ -228,10 +229,10 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
             },
         )
         .await?;
-        let imports = if proof_response.freshness.imports.is_empty() {
+        let imports = if proof_response.imports().is_empty() {
             req.imports.clone()
         } else {
-            proof_response.freshness.imports.clone()
+            proof_response.imports().to_vec()
         };
         let Some(proof_result) = proof_response.result else {
             return Ok(profile_from_text(

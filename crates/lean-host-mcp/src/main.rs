@@ -22,7 +22,10 @@ use tracing_subscriber::fmt;
 
 use lean_host_mcp::cli::config_init::{self, ConfigCommand};
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
-use lean_host_mcp::{BrokerConfig, ConfigFile, LeanHostService, ProjectBroker, ProjectRuntimeConfig};
+use lean_host_mcp::{
+    BrokerConfig, ConfigFile, LeanHostService, OutputBudgetOverrides, ProjectBroker, ProjectRuntimeConfig,
+    ResponseCarrier, TelemetryVerbosity, ToolConfig,
+};
 
 /// Stdio MCP server that hosts a Lean 4 environment via a worker child.
 #[derive(Debug, Parser)]
@@ -148,6 +151,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let (max_projects, idle_timeout, semantic_permits, semantic_waiters, semantic_admission_timeout) =
         BrokerConfig::pool_from_env_with_file(&file.broker)?;
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime)?;
+    let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
     let http_path_log = http.as_ref().map(|config| config.path.as_str());
@@ -186,9 +190,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         runtime_config,
     );
     if let Some(config) = http {
-        transport_http::serve(broker, config).await?;
+        transport_http::serve(broker, config, tool_config).await?;
     } else {
-        let service = LeanHostService::new(broker);
+        let service = LeanHostService::new(broker, tool_config);
         let server = service.serve(stdio()).await?;
         server.waiting().await?;
     }
@@ -197,6 +201,59 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
 fn build_broker(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<ProjectBroker> {
     ProjectBroker::new_with_runtime_config(config, runtime_config)
+}
+
+/// Resolve the presentation knobs (response carrier, telemetry verbosity, output
+/// budgets) with the standard precedence: env var > config file > built-in
+/// default. Invalid enum or integer values fail startup loudly rather than
+/// silently falling back.
+fn resolve_tool_config(file: &ConfigFile) -> anyhow::Result<ToolConfig> {
+    let carrier =
+        match tool_env_string("LEAN_HOST_MCP_RESPONSE_CARRIER").or_else(|| file.server.response_carrier.clone()) {
+            Some(value) => ResponseCarrier::parse(&value)
+                .with_context(|| format!("invalid response carrier {value:?}; expected text, structured, or both"))?,
+            None => ResponseCarrier::default(),
+        };
+    let verbosity =
+        match tool_env_string("LEAN_HOST_MCP_TELEMETRY_VERBOSITY").or_else(|| file.telemetry.verbosity.clone()) {
+            Some(value) => TelemetryVerbosity::parse(&value)
+                .with_context(|| format!("invalid telemetry verbosity {value:?}; expected quiet or full"))?,
+            None => TelemetryVerbosity::default(),
+        };
+    let output = OutputBudgetOverrides {
+        max_field_bytes: tool_env_int("LEAN_HOST_MCP_OUTPUT_MAX_FIELD_BYTES")?.or(file.output.max_field_bytes),
+        max_total_bytes: tool_env_int("LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES")?.or(file.output.max_total_bytes),
+        heartbeat_limit: tool_env_int("LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT")?.or(file.output.heartbeat_limit),
+    };
+    Ok(ToolConfig {
+        carrier,
+        verbosity,
+        output,
+    })
+}
+
+/// Read a non-empty environment variable as a trimmed `String`.
+fn tool_env_string(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read an environment variable as an integer, failing startup on a malformed
+/// value. Returns `None` when the variable is unset.
+fn tool_env_int<T>(key: &str) -> anyhow::Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match tool_env_string(key) {
+        Some(value) => value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|err| anyhow::anyhow!("invalid {key}={value:?}: {err}")),
+        None => Ok(None),
+    }
 }
 
 fn http_config(

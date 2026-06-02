@@ -204,6 +204,9 @@ pub struct ProofStateRequest {
     pub project: Option<String>,
 }
 
+/// Where in a proof to act. `default` targets the declaration's main goal;
+/// `index` selects the Nth goal; `after_text` selects the position just after a
+/// matched source fragment.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProofPositionSelector {
@@ -214,6 +217,7 @@ pub enum ProofPositionSelector {
     },
     AfterText {
         text: String,
+        /// Which match of `text` to use (0-based); defaults to the first.
         #[serde(default)]
         occurrence: Option<u32>,
     },
@@ -527,6 +531,7 @@ fn degraded_query_facts() -> ModuleQueryFacts {
 
 // --- references --------------------------------------------------------
 
+/// Search the declaration's own file only, or the whole project.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceScope {
@@ -536,14 +541,21 @@ pub enum ReferenceScope {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FindReferencesRequest {
+    /// Fully-qualified Lean name to find references to.
     pub name: String,
+    /// Search the declaration's file only, or the whole project.
     pub scope: ReferenceScope,
+    /// Anchor file whose import context resolves `name`; relative paths resolve
+    /// against the project root.
     #[serde(default)]
     pub file: Option<PathBuf>,
+    /// Restrict a `project` scan to these files; relative to the project root.
     #[serde(default)]
     pub files: Vec<PathBuf>,
+    /// Maximum references to return.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Project-root override; defaults to the server's configured Lake project.
     #[serde(default)]
     pub project: Option<String>,
 }

@@ -1,6 +1,6 @@
 //! The uniform response envelope every tool returns.
 //!
-//! Encoding contract:
+//! Encoding contract (default `quiet` telemetry verbosity):
 //!
 //! ```jsonc
 //! {
@@ -9,39 +9,41 @@
 //!   "runtime_error": null,
 //!   "freshness": {
 //!     "project_root":   "/abs/path",
-//!     "project_hash":   "sha256-hex",
-//!     "imports":        ["Mod.A", "..."],
 //!     "session_id":     "uuid",
 //!     "lean_toolchain": "leanprover/lean4:v4.x.y"
-//!   },
-//!   "runtime": {
-//!     "worker_generation": 1,
-//!     "worker_restarted": false,
-//!     "retry_count": 0,
-//!     "admission_wait_millis": 0,
-//!     "queue_wait_millis": 0,
-//!     "call_restart": null,
-//!     "last_restart": null
 //!   },
 //!   "warnings":     ["..."],     // omitted when empty
 //!   "next_actions": ["..."]      // omitted when empty
 //! }
 //! ```
 //!
-//! `project_hash` is the Lake-manifest SHA-256. Clients can branch on
-//! `(project_root, project_hash)` to detect dependency changes between
-//! tool calls without a separate declaration search first.
+//! What the model reads is kept to proof-relevant content. Operational
+//! telemetry is gated behind [`TelemetryVerbosity`](crate::tools::TelemetryVerbosity):
+//! in the default `quiet` mode the `runtime` block is omitted unless it carries
+//! an actionable signal (a worker restart — see [`RuntimeFacts::is_actionable`]),
+//! and `freshness` drops `project_hash` (the Lake-manifest SHA-256) and the full
+//! `imports` list. In `full` mode every field is emitted: `runtime` with its
+//! lifecycle/pressure counters, and `freshness` with all five fields, so a
+//! client can branch on `(project_root, project_hash)` to detect dependency
+//! changes between calls.
 //!
 //! Three volatile decisions hide behind one shape: what freshness means,
 //! how it's serialized, and what an MCP "warning" looks like. Tools don't
-//! pick the layout; they build a `Response<T>` and let rmcp serialize it.
+//! pick the layout; they build a `Response<T>` and `crate::server` serializes
+//! it after [`Response::trim_telemetry`] applies the verbosity gate.
 
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+/// The project freshness snapshot a producer builds.
+///
+/// Built by [`crate::project`]'s `freshness` and
+/// [`crate::error::WorkerUnavailable::freshness`]. Not serialized directly:
+/// [`Response::ok`] splits it into the always-emitted [`FreshnessIdentity`] and
+/// the verbosity-gated [`Telemetry`] block.
+#[derive(Debug, Clone)]
 pub struct Freshness {
     pub project_root: String,
     pub project_hash: String,
@@ -49,13 +51,42 @@ pub struct Freshness {
     pub session_id: String,
     pub lean_toolchain: String,
     /// Project-lifetime toolchain-provenance advisories (unknown pin, missing
-    /// provenance sidecar). Never serialized: every response's freshness flows
-    /// through one producer ([`crate::project`]'s `freshness`) and one drain
-    /// ([`crate::server`]'s `wrap`), which moves these into the top-level
-    /// `warnings` array so the envelope contract stays "warnings are top-level".
-    #[serde(skip)]
-    #[schemars(skip)]
+    /// provenance sidecar). Carried to the envelope, where one drain
+    /// ([`Response::drain_advisories`], called by [`crate::server`]) moves them
+    /// into the top-level `warnings` array, so "warnings are top-level" holds.
     pub(crate) toolchain_advisories: Vec<String>,
+}
+
+/// Session identity — always serialized as the envelope's `freshness`.
+///
+/// Small, stable, and occasionally relevant to a proof agent: `session_id`
+/// flips when the worker re-spawns, signalling a context reset.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct FreshnessIdentity {
+    pub project_root: String,
+    pub session_id: String,
+    pub lean_toolchain: String,
+}
+
+/// Operational telemetry, serialized as the envelope's `telemetry`.
+///
+/// Emitted only under `full`
+/// [`TelemetryVerbosity`](crate::tools::TelemetryVerbosity). It carries
+/// cache/identity metadata (`project_hash`, the full `imports` list) and the
+/// worker `runtime` facts — none of which a proof agent needs to make progress,
+/// so the default `quiet` mode drops the whole block. The one actionable signal
+/// a restart carries already reaches the agent as a top-level `warning`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Telemetry {
+    /// Lake-manifest SHA-256. Lets a client branch on `(project_root,
+    /// project_hash)` to detect dependency changes between calls.
+    pub project_hash: String,
+    /// Caller-supplied import set for this session.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    /// Worker lifecycle and admission-pressure facts for this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeFacts>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
@@ -133,13 +164,44 @@ where
     pub status: ResponseStatus,
     pub result: Option<T>,
     pub runtime_error: Option<RuntimeFailure>,
-    pub freshness: Freshness,
+    pub freshness: FreshnessIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<RuntimeFacts>,
+    pub telemetry: Option<Telemetry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub next_actions: Vec<String>,
+    /// Project-lifetime advisories awaiting the drain into `warnings`. Never
+    /// serialized; emptied by [`Response::drain_advisories`] at the boundary.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) advisories: Vec<String>,
+}
+
+/// Split a producer's [`Freshness`] snapshot into the serialized identity, the
+/// telemetry block, and the advisory list the envelope drains into `warnings`.
+fn split_freshness(freshness: Freshness, runtime: Option<RuntimeFacts>) -> (FreshnessIdentity, Telemetry, Vec<String>) {
+    let Freshness {
+        project_root,
+        project_hash,
+        imports,
+        session_id,
+        lean_toolchain,
+        toolchain_advisories,
+    } = freshness;
+    (
+        FreshnessIdentity {
+            project_root,
+            session_id,
+            lean_toolchain,
+        },
+        Telemetry {
+            project_hash,
+            imports,
+            runtime,
+        },
+        toolchain_advisories,
+    )
 }
 
 impl<T> Response<T>
@@ -147,26 +209,30 @@ where
     T: Serialize + JsonSchema,
 {
     pub fn ok(result: T, freshness: Freshness) -> Self {
+        let (freshness, telemetry, advisories) = split_freshness(freshness, None);
         Self {
             status: ResponseStatus::Ok,
             result: Some(result),
             runtime_error: None,
             freshness,
-            runtime: None,
+            telemetry: Some(telemetry),
             warnings: Vec::new(),
             next_actions: Vec::new(),
+            advisories,
         }
     }
 
     pub fn runtime_unavailable(failure: RuntimeFailure, freshness: Freshness, runtime: RuntimeFacts) -> Self {
+        let (freshness, telemetry, advisories) = split_freshness(freshness, Some(runtime));
         Self {
             status: ResponseStatus::RuntimeUnavailable,
             result: None,
             runtime_error: Some(failure),
             freshness,
-            runtime: Some(runtime),
+            telemetry: Some(telemetry),
             warnings: Vec::new(),
             next_actions: Vec::new(),
+            advisories,
         }
     }
 
@@ -174,10 +240,45 @@ where
         self.result.as_ref()
     }
 
+    /// The worker runtime facts, read from the telemetry block. `None` once the
+    /// boundary gate has dropped telemetry (quiet verbosity) or before any
+    /// runtime was attached.
+    pub fn runtime(&self) -> Option<&RuntimeFacts> {
+        self.telemetry.as_ref().and_then(|telemetry| telemetry.runtime.as_ref())
+    }
+
+    /// The caller-supplied import set, read from the telemetry block. Used by
+    /// internal tool composition (e.g. `search_for_proof` reusing a
+    /// `proof_state` response) before the boundary gate runs.
+    pub fn imports(&self) -> &[String] {
+        match &self.telemetry {
+            Some(telemetry) => &telemetry.imports,
+            None => &[],
+        }
+    }
+
     #[must_use]
     pub fn with_runtime(mut self, runtime: RuntimeFacts) -> Self {
-        self.runtime = Some(runtime);
+        if let Some(telemetry) = self.telemetry.as_mut() {
+            telemetry.runtime = Some(runtime);
+        }
         self
+    }
+
+    /// Drop the telemetry block — the default `quiet` verbosity gate, applied at
+    /// the serialization boundary. Identity, `result`, `warnings`,
+    /// `next_actions`, and `runtime_error` are untouched, so no correctness or
+    /// truncation signal is lost.
+    pub fn drop_telemetry(&mut self) {
+        self.telemetry = None;
+    }
+
+    /// Drain project-lifetime advisories into `warnings`. Called once by
+    /// [`crate::server`] just before serialization, for both `ok` and
+    /// `runtime_unavailable` responses.
+    pub(crate) fn drain_advisories(&mut self) {
+        let advisories = std::mem::take(&mut self.advisories);
+        self.warnings.extend(advisories);
     }
 
     #[must_use]

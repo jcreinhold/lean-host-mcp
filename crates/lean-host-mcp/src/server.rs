@@ -2,22 +2,24 @@
 //! [`tools`] module.
 //!
 //! Each `#[tool]` handler is a thin call into the implementation function;
-//! all real work happens in `crate::tools` and `crate::project`. Returns
-//! `Json<Response<T>>` so rmcp generates structured-content output and a
-//! schema downstream clients can introspect.
+//! all real work happens in `crate::tools` and `crate::project`. Handlers
+//! return a hand-built [`CallToolResult`] rather than `Json<Response<T>>`: the
+//! `Json` wrapper makes rmcp advertise a deep `outputSchema` that no Anthropic
+//! API client forwards to the model (it costs only wire bytes and breaks strict
+//! schema validators), so we drop it and place the serialized envelope per the
+//! configured [`ResponseCarrier`].
 
 use std::sync::Arc;
 
-use rmcp::Json;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::broker::ProjectBroker;
 use crate::envelope::Response;
 use crate::error::ServerError;
-use crate::tools::{self, ToolContext};
+use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
 // Deliberately not `use crate::error::Result;` here: the `#[tool_handler]`
 // macro emits bare `Result<...>` references that must resolve to the std
@@ -33,8 +35,8 @@ pub struct LeanHostService {
 }
 
 impl LeanHostService {
-    pub fn new(broker: Arc<ProjectBroker>) -> Self {
-        let ctx = ToolContext { broker };
+    pub fn new(broker: Arc<ProjectBroker>, config: ToolConfig) -> Self {
+        let ctx = ToolContext { broker, config };
         Self {
             ctx,
             tool_router: Self::tool_router(),
@@ -48,54 +50,54 @@ impl LeanHostService {
     async fn inspect_declaration(
         &self,
         Parameters(req): Parameters<tools::declaration::InspectDeclarationRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::DeclarationInspectionResult>>, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "inspect_declaration", "tool call");
-        wrap(tools::declaration::inspect_declaration(&self.ctx, req).await)
+        self.respond(tools::declaration::inspect_declaration(&self.ctx, req).await)
     }
 
     #[tool(description = "Return ranked declarations for the next proof step.")]
     async fn search_for_proof(
         &self,
         Parameters(req): Parameters<tools::proof_search::SearchForProofRequest>,
-    ) -> std::result::Result<Json<Response<tools::proof_search::SearchForProofResult>>, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "search_for_proof", "tool call");
-        wrap(tools::proof_search::search_for_proof(&self.ctx, req).await)
+        self.respond(tools::proof_search::search_for_proof(&self.ctx, req).await)
     }
 
     #[tool(description = "Try proof snippets in memory. Never writes files.")]
     async fn try_proof_step(
         &self,
         Parameters(req): Parameters<tools::proof_action::TryProofStepRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::ProofAttemptResult>>, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "try_proof_step", "tool call");
-        wrap(tools::proof_action::try_proof_step(&self.ctx, req).await)
+        self.respond(tools::proof_action::try_proof_step(&self.ctx, req).await)
     }
 
     #[tool(description = "Verify one declaration in memory. Never writes files.")]
     async fn verify_declaration(
         &self,
         Parameters(req): Parameters<tools::proof_action::VerifyDeclarationRequest>,
-    ) -> std::result::Result<Json<Response<crate::projections::DeclarationVerificationResult>>, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "verify_declaration", "tool call");
-        wrap(tools::proof_action::verify_declaration(&self.ctx, req).await)
+        self.respond(tools::proof_action::verify_declaration(&self.ctx, req).await)
     }
 
     #[tool(description = "Proof context for a declaration proof position.")]
     async fn proof_state(
         &self,
         Parameters(req): Parameters<tools::position::ProofStateRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::ProofStateResult>>, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "proof_state", "tool call");
-        wrap(tools::position::proof_state(&self.ctx, req).await)
+        self.respond(tools::position::proof_state(&self.ctx, req).await)
     }
 
     #[tool(description = "Find references to a fully-qualified Lean name.")]
     async fn find_references(
         &self,
         Parameters(req): Parameters<tools::position::FindReferencesRequest>,
-    ) -> std::result::Result<Json<Response<tools::position::FindReferencesResult>>, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "find_references", "tool call");
-        wrap(tools::position::find_references(&self.ctx, req).await)
+        self.respond(tools::position::find_references(&self.ctx, req).await)
     }
 }
 
@@ -121,45 +123,69 @@ impl ServerHandler for LeanHostService {
     }
 }
 
-fn wrap<T>(result: crate::error::Result<Response<T>>) -> std::result::Result<Json<Response<T>>, McpError>
-where
-    T: serde::Serialize + schemars::JsonSchema,
-{
-    match result {
-        Ok(response) => Ok(finalize(response)),
-        Err(ServerError::WorkerUnavailable(info)) => {
-            let freshness = info.freshness();
-            let failure = info.failure();
-            Ok(finalize(Response::runtime_unavailable(
-                failure,
-                freshness,
-                info.runtime.clone(),
-            )))
+impl LeanHostService {
+    /// The single funnel every tool response passes through: turn a tool's
+    /// `Result<Response<T>>` into the `CallToolResult` rmcp sends. A
+    /// `WorkerUnavailable` infrastructure error becomes a structured
+    /// `runtime_unavailable` envelope (not an MCP protocol error); every other
+    /// `ServerError` is a genuine protocol error.
+    fn respond<T>(&self, result: crate::error::Result<Response<T>>) -> std::result::Result<CallToolResult, McpError>
+    where
+        T: serde::Serialize + schemars::JsonSchema,
+    {
+        let response = match result {
+            Ok(response) => response,
+            Err(ServerError::WorkerUnavailable(info)) => {
+                Response::runtime_unavailable(info.failure(), info.freshness(), info.runtime.clone())
+            }
+            Err(err) => return Err(McpError::from(err)),
+        };
+        Ok(self.finalize(response))
+    }
+
+    /// Drain advisories into `warnings`, apply the telemetry verbosity gate, and
+    /// place the serialized envelope per the configured [`ResponseCarrier`].
+    /// Applies identically to `ok` and `runtime_unavailable` responses, so a
+    /// worker that dies mid-call keeps its advisories.
+    fn finalize<T>(&self, mut response: Response<T>) -> CallToolResult
+    where
+        T: serde::Serialize + schemars::JsonSchema,
+    {
+        response.drain_advisories();
+        if !self.ctx.config.verbosity.is_full() {
+            response.drop_telemetry();
         }
-        Err(err) => Err(McpError::from(err)),
+        carry(&response, self.ctx.config.carrier)
     }
 }
 
-/// Drain project-lifetime toolchain advisories (unknown pin, missing provenance
-/// sidecar, no smoke record) carried on `freshness` into the top-level
-/// `warnings` array.
-///
-/// This is the single funnel every tool response passes through, so the
-/// contract "warnings are top-level" holds without each handler re-plumbing
-/// them — and it applies identically to `ok` and `runtime_unavailable`
-/// responses, so a worker that dies mid-call keeps its advisories instead of
-/// silently dropping them.
-fn finalize<T>(mut response: Response<T>) -> Json<Response<T>>
+/// Serialize the envelope and place it in the tool result per the carrier:
+/// `Text` emits one `content` text block (the model's read surface), `Both`
+/// also mirrors it into `structuredContent` for code-mode clients, and
+/// `Structured` emits only `structuredContent`.
+fn carry<T>(response: &Response<T>, carrier: ResponseCarrier) -> CallToolResult
 where
     T: serde::Serialize + schemars::JsonSchema,
 {
-    let advisories = std::mem::take(&mut response.freshness.toolchain_advisories);
-    response.warnings.extend(advisories);
-    Json(response)
+    let value = match serde_json::to_value(response) {
+        Ok(value) => value,
+        Err(err) => {
+            return CallToolResult::error(vec![Content::text(format!("failed to serialize response: {err}"))]);
+        }
+    };
+    match carrier {
+        ResponseCarrier::Text => CallToolResult::success(vec![Content::text(value.to_string())]),
+        ResponseCarrier::Both => CallToolResult::structured(value),
+        ResponseCarrier::Structured => {
+            let mut result = CallToolResult::structured(value);
+            result.content.clear();
+            result
+        }
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::unreachable)]
 mod tests {
     use super::*;
     use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
@@ -181,7 +207,7 @@ mod tests {
             worker_lanes: 1,
             ..RuntimeFacts::default()
         };
-        let response = wrap::<serde_json::Value>(Err(ServerError::worker_unavailable(WorkerUnavailable {
+        let error = ServerError::worker_unavailable(WorkerUnavailable {
             retryable: true,
             worker_restarted: true,
             project_root: "/tmp/project".to_owned(),
@@ -201,11 +227,18 @@ mod tests {
             // A no-record / suspect worker carries an open-time advisory; it must
             // survive onto the failure envelope, not vanish when the worker dies.
             toolchain_advisories: vec!["worker for v4.30.0 has no runtime smoke record".to_owned()],
-        })))
-        .unwrap()
-        .0;
+        });
+        let ServerError::WorkerUnavailable(info) = error else {
+            unreachable!("constructed a WorkerUnavailable error")
+        };
+        // Build the structured envelope the way `respond` does, then drain
+        // advisories the way `finalize` does. `full` verbosity keeps `telemetry`
+        // so the runtime facts are assertable.
+        let mut response =
+            Response::<serde_json::Value>::runtime_unavailable(info.failure(), info.freshness(), info.runtime.clone());
+        response.drain_advisories();
 
-        let json = serde_json::to_value(response).unwrap();
+        let json = serde_json::to_value(&response).unwrap();
         assert_eq!(
             json.pointer("/status").and_then(serde_json::Value::as_str),
             Some("runtime_unavailable")
@@ -222,7 +255,8 @@ mod tests {
             Some("child_exit")
         );
         assert_eq!(
-            json.pointer("/runtime/retry_count").and_then(serde_json::Value::as_u64),
+            json.pointer("/telemetry/runtime/retry_count")
+                .and_then(serde_json::Value::as_u64),
             Some(1)
         );
         // Finding #3: the open-time advisory is drained onto the failure

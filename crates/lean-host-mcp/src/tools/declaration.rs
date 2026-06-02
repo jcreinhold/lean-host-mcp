@@ -22,7 +22,7 @@ use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::projections::{DeclarationInspectionResult, project_declaration_inspection};
 use crate::tools::source_input::{module_name_for_file, read_query_file};
-use crate::tools::{ToolContext, session_imports};
+use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
 
 const DEFAULT_FIELD_BYTES: u32 = 8 * 1024;
 const MIN_FIELD_BYTES: u32 = 256;
@@ -143,24 +143,25 @@ impl From<InspectDeclarationFields> for LeanWorkerDeclarationInspectionFields {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct InspectDeclarationRequest {
+    /// Fully-qualified Lean declaration name.
     pub name: String,
+    /// Path to a `.lean` file; relative paths resolve against the project root.
+    /// Its imports widen the lookup environment.
     #[serde(default)]
     pub file: Option<PathBuf>,
+    /// Imports for explicit-text mode; ignored when `file` is given.
     #[serde(default)]
     pub imports: Vec<String>,
+    /// Project-root override; defaults to the server's configured Lake project.
     #[serde(default)]
     pub project: Option<String>,
+    /// Fields to return; omit for all. Pass a subset to shrink the result.
     #[serde(default)]
     pub fields: InspectDeclarationFields,
-    /// Return the fully-elaborated `statement` term (`Expr.toString`) instead
-    /// of the default notation-aware pretty form. Rarely needed — the pretty
-    /// form is the editor-`hover`-quality signature.
+    /// Return the raw elaborated term instead of the pretty-printed signature.
+    /// Rarely needed.
     #[serde(default)]
     pub raw_statement: bool,
-    #[serde(default)]
-    pub max_field_bytes: Option<u32>,
-    #[serde(default)]
-    pub max_total_bytes: Option<u32>,
 }
 
 /// Inspect one Lean declaration by name.
@@ -175,7 +176,7 @@ pub async fn inspect_declaration(
 ) -> Result<Response<DeclarationInspectionResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
-    let budgets = budgets_for(&req);
+    let budgets = budgets_for(&ctx.config.output);
     let mut fields: LeanWorkerDeclarationInspectionFields = req.fields.into();
     if req.raw_statement {
         fields.rendering = LeanWorkerRendering::Raw;
@@ -242,13 +243,13 @@ async fn inspection_needs_build_response(
     ))
 }
 
-fn budgets_for(req: &InspectDeclarationRequest) -> LeanWorkerOutputBudgets {
+fn budgets_for(output: &OutputBudgetOverrides) -> LeanWorkerOutputBudgets {
     LeanWorkerOutputBudgets {
-        per_field_bytes: req
+        per_field_bytes: output
             .max_field_bytes
             .unwrap_or(DEFAULT_FIELD_BYTES)
             .clamp(MIN_FIELD_BYTES, MAX_FIELD_BYTES),
-        total_bytes: req
+        total_bytes: output
             .max_total_bytes
             .unwrap_or(DEFAULT_TOTAL_BYTES)
             .clamp(MIN_TOTAL_BYTES, MAX_TOTAL_BYTES),
@@ -283,16 +284,25 @@ mod tests {
 
     #[test]
     fn budgets_are_clamped() {
-        let low: InspectDeclarationRequest =
-            serde_json::from_str(r#"{"name":"Nat.add_zero","max_field_bytes":1,"max_total_bytes":1}"#).unwrap();
+        let low = OutputBudgetOverrides {
+            max_field_bytes: Some(1),
+            max_total_bytes: Some(1),
+            heartbeat_limit: None,
+        };
         assert_eq!(budgets_for(&low).per_field_bytes, MIN_FIELD_BYTES);
         assert_eq!(budgets_for(&low).total_bytes, MIN_TOTAL_BYTES);
 
-        let high: InspectDeclarationRequest =
-            serde_json::from_str(r#"{"name":"Nat.add_zero","max_field_bytes":999999,"max_total_bytes":999999}"#)
-                .unwrap();
+        let high = OutputBudgetOverrides {
+            max_field_bytes: Some(999_999),
+            max_total_bytes: Some(999_999),
+            heartbeat_limit: None,
+        };
         assert_eq!(budgets_for(&high).per_field_bytes, MAX_FIELD_BYTES);
         assert_eq!(budgets_for(&high).total_bytes, MAX_TOTAL_BYTES);
+
+        let default = OutputBudgetOverrides::default();
+        assert_eq!(budgets_for(&default).per_field_bytes, DEFAULT_FIELD_BYTES);
+        assert_eq!(budgets_for(&default).total_bytes, DEFAULT_TOTAL_BYTES);
     }
 
     #[test]

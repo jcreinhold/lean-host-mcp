@@ -31,7 +31,7 @@ use crate::projections::{
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
 use crate::tools::source_input::read_query_file;
-use crate::tools::{ToolContext, session_imports};
+use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
 
 const MAX_CANDIDATES: usize = 8;
 const DEFAULT_FIELD_BYTES: u32 = 4 * 1024;
@@ -43,40 +43,39 @@ const MAX_TOTAL_BYTES: u32 = 64 * 1024;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct TryProofStepRequest {
+    /// Path to a `.lean` file; relative paths resolve against the project root.
     pub file: PathBuf,
+    /// Declaration to target within `file`.
     pub declaration: String,
+    /// Where in the proof to act; defaults to the declaration's main goal.
     #[serde(default)]
     pub proof_position: ProofPositionSelector,
+    /// Project-root override; defaults to the server's configured Lake project.
     #[serde(default)]
     pub project: Option<String>,
+    /// Proof text to attempt at the position. Use `snippets` to try several.
     #[serde(default)]
     pub snippet: Option<String>,
+    /// Proof snippets to attempt independently at the position, in one call.
     #[serde(default)]
     pub snippets: Vec<String>,
-    #[serde(default)]
-    pub max_field_bytes: Option<u32>,
-    #[serde(default)]
-    pub max_total_bytes: Option<u32>,
-    #[serde(default)]
-    pub heartbeat_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct VerifyDeclarationRequest {
+    /// Path to a `.lean` file; relative paths resolve against the project root.
     pub file: PathBuf,
+    /// Declaration to verify within `file`.
     pub declaration: String,
+    /// Project-root override; defaults to the server's configured Lake project.
     #[serde(default)]
     pub project: Option<String>,
+    /// Treat `sorry`/`admit` as success instead of failure.
     #[serde(default)]
     pub allow_sorry: bool,
+    /// Include the axioms the proof depends on (slower).
     #[serde(default)]
     pub report_axioms: bool,
-    #[serde(default)]
-    pub max_field_bytes: Option<u32>,
-    #[serde(default)]
-    pub max_total_bytes: Option<u32>,
-    #[serde(default)]
-    pub heartbeat_limit: Option<u64>,
 }
 
 /// Try one or more proof snippets against an in-memory source overlay.
@@ -90,7 +89,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
     let file_label = input.resolved.to_string_lossy().into_owned();
-    let budgets = proof_action_budgets(req.max_field_bytes, req.max_total_bytes);
+    let budgets = proof_action_budgets(&ctx.config.output);
     let candidates = proof_candidates(&req);
     let extra_rows = capped_candidate_rows(&req);
 
@@ -131,7 +130,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
                 session_imports(imports.clone()),
                 imports.clone(),
                 request,
-                elab_options(&file_label, req.heartbeat_limit),
+                elab_options(&file_label, ctx.config.output.heartbeat_limit),
             )
             .await,
     )? {
@@ -213,7 +212,7 @@ pub async fn verify_declaration(
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
     let file_label = input.resolved.to_string_lossy().into_owned();
-    let budgets = proof_action_budgets(req.max_field_bytes, req.max_total_bytes);
+    let budgets = proof_action_budgets(&ctx.config.output);
     if req.declaration.trim().is_empty() {
         let runtime = ctx.broker.project_runtime(hint, input.imports.clone()).await?;
         return Ok(
@@ -248,7 +247,7 @@ pub async fn verify_declaration(
                 session_imports(imports.clone()),
                 imports.clone(),
                 request,
-                elab_options(&file_label, req.heartbeat_limit),
+                elab_options(&file_label, ctx.config.output.heartbeat_limit),
             )
             .await,
     )? {
@@ -442,12 +441,14 @@ fn axiom_unavailable_warning(result: &DeclarationVerificationResult, report_axio
     })
 }
 
-fn proof_action_budgets(max_field_bytes: Option<u32>, max_total_bytes: Option<u32>) -> LeanWorkerOutputBudgets {
+fn proof_action_budgets(output: &OutputBudgetOverrides) -> LeanWorkerOutputBudgets {
     LeanWorkerOutputBudgets {
-        per_field_bytes: max_field_bytes
+        per_field_bytes: output
+            .max_field_bytes
             .unwrap_or(DEFAULT_FIELD_BYTES)
             .clamp(MIN_FIELD_BYTES, MAX_FIELD_BYTES),
-        total_bytes: max_total_bytes
+        total_bytes: output
+            .max_total_bytes
             .unwrap_or(DEFAULT_TOTAL_BYTES)
             .clamp(MIN_TOTAL_BYTES, MAX_TOTAL_BYTES),
     }
@@ -571,9 +572,6 @@ mod tests {
             project: None,
             snippet: None,
             snippets,
-            max_field_bytes: None,
-            max_total_bytes: None,
-            heartbeat_limit: None,
         };
         assert_eq!(proof_candidates(&req).len(), MAX_CANDIDATES);
         let capped = capped_candidate_rows(&req);
@@ -595,13 +593,25 @@ mod tests {
 
     #[test]
     fn proof_action_budget_clamps() {
-        let low = proof_action_budgets(Some(1), Some(1));
+        let low = proof_action_budgets(&OutputBudgetOverrides {
+            max_field_bytes: Some(1),
+            max_total_bytes: Some(1),
+            heartbeat_limit: None,
+        });
         assert_eq!(low.per_field_bytes, MIN_FIELD_BYTES);
         assert_eq!(low.total_bytes, MIN_TOTAL_BYTES);
 
-        let high = proof_action_budgets(Some(u32::MAX), Some(u32::MAX));
+        let high = proof_action_budgets(&OutputBudgetOverrides {
+            max_field_bytes: Some(u32::MAX),
+            max_total_bytes: Some(u32::MAX),
+            heartbeat_limit: None,
+        });
         assert_eq!(high.per_field_bytes, MAX_FIELD_BYTES);
         assert_eq!(high.total_bytes, MAX_TOTAL_BYTES);
+
+        let default = proof_action_budgets(&OutputBudgetOverrides::default());
+        assert_eq!(default.per_field_bytes, DEFAULT_FIELD_BYTES);
+        assert_eq!(default.total_bytes, DEFAULT_TOTAL_BYTES);
     }
 
     #[test]

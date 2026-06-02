@@ -14,7 +14,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::tools::position::{
     FindReferencesRequest, FindReferencesResult, ProofPositionSelector, ProofStateRequest, ProofStateResult,
@@ -24,6 +23,7 @@ use lean_host_mcp::tools::proof_action::{
     TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
 };
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
+use lean_host_mcp::tools::{ToolConfig, ToolContext};
 use lean_host_mcp::{
     BrokerConfig, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker, ProofAttemptResult,
 };
@@ -43,7 +43,10 @@ fn open_ctx(root: &Path) -> ToolContext {
         semantic_waiters: BrokerConfig::default_semantic_waiters(),
         semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
     });
-    ToolContext { broker }
+    ToolContext {
+        broker,
+        config: ToolConfig::default(),
+    }
 }
 
 fn proof_actions_file() -> PathBuf {
@@ -90,8 +93,6 @@ async fn inspect_proof_state_try_verify_and_references() {
             project: None,
             fields: InspectDeclarationFields::default(),
             raw_statement: false,
-            max_field_bytes: Some(512),
-            max_total_bytes: Some(2048),
         },
     )
     .await
@@ -157,9 +158,6 @@ async fn inspect_proof_state_try_verify_and_references() {
             project: None,
             snippet: Some("exact definitely_missing_identifier".to_owned()),
             snippets: Vec::new(),
-            max_field_bytes: None,
-            max_total_bytes: None,
-            heartbeat_limit: None,
         },
     )
     .await
@@ -188,9 +186,6 @@ async fn inspect_proof_state_try_verify_and_references() {
             project: None,
             allow_sorry: false,
             report_axioms: true,
-            max_field_bytes: None,
-            max_total_bytes: None,
-            heartbeat_limit: None,
         },
     )
     .await
@@ -211,9 +206,6 @@ async fn inspect_proof_state_try_verify_and_references() {
             project: None,
             allow_sorry: false,
             report_axioms: true,
-            max_field_bytes: None,
-            max_total_bytes: None,
-            heartbeat_limit: None,
         },
     )
     .await
@@ -314,8 +306,6 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
             project: None,
             fields: InspectDeclarationFields::default(),
             raw_statement: false,
-            max_field_bytes: Some(512),
-            max_total_bytes: Some(2048),
         },
     );
     let verify = verify_declaration(
@@ -326,9 +316,6 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
             project: None,
             allow_sorry: false,
             report_axioms: false,
-            max_field_bytes: None,
-            max_total_bytes: None,
-            heartbeat_limit: None,
         },
     );
 
@@ -337,16 +324,15 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
     let inspect = inspect.expect("inspect_declaration should complete");
     let verify = verify.expect("verify_declaration should complete");
 
-    assert!(proof.runtime.is_some(), "proof_state should include runtime facts");
+    assert!(proof.runtime().is_some(), "proof_state should include runtime facts");
     assert!(
         inspect
-            .runtime
-            .as_ref()
+            .runtime()
             .is_some_and(|runtime| runtime.queue_wait_millis > 0 || runtime.admission_wait_millis > 0),
         "parallel calls should report queue or admission wait metadata"
     );
     assert!(
-        verify.runtime.is_some(),
+        verify.runtime().is_some(),
         "verify_declaration should include runtime facts"
     );
 }

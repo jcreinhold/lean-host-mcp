@@ -700,6 +700,9 @@ impl McpServer {
             .arg(project_root)
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("RUST_LOG", "warn")
+            // These tests read `structuredContent` and full telemetry; opt into both.
+            .env("LEAN_HOST_MCP_RESPONSE_CARRIER", "both")
+            .env("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1108,9 +1111,9 @@ fn query_timing_u64(response: &Value, field: &str) -> Option<u64> {
 
 fn runtime_facts(response: &Value) -> Option<&Value> {
     for path in [
-        "/result/structuredContent/runtime",
-        "/result/structuredContent/result/runtime",
-        "/result/result/runtime",
+        "/result/structuredContent/telemetry/runtime",
+        "/result/structuredContent/result/telemetry/runtime",
+        "/result/result/telemetry/runtime",
     ] {
         if let Some(runtime) = response.pointer(path) {
             return Some(runtime);

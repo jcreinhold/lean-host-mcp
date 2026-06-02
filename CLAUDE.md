@@ -161,7 +161,8 @@ crates/
       cli/install_worker.rs   `install-worker` subcommand
       projections.rs    worker-type -> MCP-wire projection helpers
       cache.rs          ModuleQueryCache: bounded module-query result cache
-      envelope.rs       Response<T> = { status, result, freshness, runtime, warnings, next_actions }
+      envelope.rs       Response<T> = { status, result, freshness, telemetry?, warnings, next_actions }
+      config_file.rs    on-disk [server]/[telemetry]/[output] config -> ToolConfig
       error.rs          ServerError
       lake_meta.rs      LakeProjectMeta + lakefile discovery
       index.rs          legacy SQLite DeclarationIndex (internal tests only)
@@ -188,8 +189,8 @@ Every tool returns `Response<T>` from `envelope.rs`:
 { "status": "ok",                 // or "runtime_unavailable"
   "result": { /* tool-specific; null on runtime_unavailable */ },
   "runtime_error": null,          // populated on runtime_unavailable
-  "freshness": { project_root, project_hash, imports, session_id, lean_toolchain },
-  "runtime": { /* RuntimeFacts; attached to semantic calls */ },
+  "freshness": { project_root, session_id, lean_toolchain },  // always emitted; small, stable identity
+  "telemetry": { project_hash, imports, runtime },            // omitted unless telemetry.verbosity = full
   "warnings": [...],              // omitted when empty
   "next_actions": [...]           // omitted when empty
 }
@@ -198,6 +199,16 @@ Every tool returns `Response<T>` from `envelope.rs`:
 This is the **only** shape every tool shares. Volatile decisions hide behind it: what "freshness" means, what a warning
 looks like, whether `next_actions` are present. Tools don't pick the shape; they fill it in. The full field-by-field
 contract lives in `docs/tool-catalog.md` and the README.
+
+`envelope.rs` splits a producer's `Freshness` snapshot into the always-serialized `FreshnessIdentity`
+(`project_root`/`session_id`/`lean_toolchain`) and a `Telemetry` block (`project_hash`, the full `imports` list, and the
+worker `RuntimeFacts`). `finalize` in `server.rs` drops `telemetry` entirely under the default `telemetry.verbosity =
+quiet`, because none of it helps an agent make a proof step — the one actionable signal a worker restart carries already
+surfaces as a top-level `warning`. Set `telemetry.verbosity = full` to re-inline it. Two presentation knobs ride on
+`ToolConfig` (resolved once at startup from `[server]`/`[telemetry]`/`[output]` config): `server.response_carrier`
+(`text` default / `structured` / `both`) chooses whether the JSON envelope rides in `content` text, `structuredContent`,
+or both — handlers return a bare `CallToolResult`, so rmcp advertises **no** `outputSchema` (the Anthropic Messages API
+drops it anyway, and deep `$defs` break strict clients).
 
 Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are part of the `Ok` payload, not MCP errors.
 `ServerError` is only for infrastructure failures (worker thread gone, runtime init failed, Lake project unusable).

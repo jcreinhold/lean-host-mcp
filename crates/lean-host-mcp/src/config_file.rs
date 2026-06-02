@@ -36,6 +36,10 @@ pub struct ConfigFile {
     pub broker: BrokerFileConfig,
     #[serde(default)]
     pub server: ServerFileConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryFileConfig,
+    #[serde(default)]
+    pub output: OutputFileConfig,
 }
 
 /// `[runtime]` — worker policy knobs (mirrors `ProjectRuntimeConfig`).
@@ -72,6 +76,28 @@ pub struct BrokerFileConfig {
 pub struct ServerFileConfig {
     pub bind: Option<String>,
     pub http_path: Option<String>,
+    /// Which field of the tool result carries the envelope: `text` (default),
+    /// `structured`, or `both`. See `crate::tools::ResponseCarrier`.
+    pub response_carrier: Option<String>,
+}
+
+/// `[telemetry]` — how much operational telemetry the model-facing envelope
+/// carries (`quiet` default, or `full`). See `crate::tools::TelemetryVerbosity`.
+#[derive(Debug, Default, Deserialize)]
+pub struct TelemetryFileConfig {
+    pub verbosity: Option<String>,
+}
+
+/// `[output]` — server-wide output budget overrides.
+///
+/// These replace the former per-call `max_field_bytes` / `max_total_bytes` /
+/// `heartbeat_limit` request arguments. Each is optional: unset keeps the
+/// per-tool built-in default.
+#[derive(Debug, Default, Deserialize)]
+pub struct OutputFileConfig {
+    pub max_field_bytes: Option<u32>,
+    pub max_total_bytes: Option<u32>,
+    pub heartbeat_limit: Option<u64>,
 }
 
 impl ConfigFile {

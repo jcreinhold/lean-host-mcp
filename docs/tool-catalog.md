@@ -26,10 +26,15 @@ A proof agent usually moves left to right along that arrow:
 5. **`verify_declaration`** to confirm the whole declaration type-checks, optionally rejecting `sorry` or reporting the
    axioms it depends on.
 
-Every response is wrapped in the shared envelope (`status`, `result`, `freshness`, `runtime`, …) described in the
-[README](../README.md#response-envelope). Lean-domain outcomes — a failed tactic, a rejected proof, a missing import —
-are part of a successful (`status: "ok"`) result. A full project mailbox or a restart-loop failure is reported as a
+Every response is wrapped in the shared envelope (`status`, `result`, `freshness`, optional `telemetry`, …) described in
+the [README](../README.md#response-envelope). Lean-domain outcomes — a failed tactic, a rejected proof, a missing import
+— are part of a successful (`status: "ok"`) result. A full project mailbox or a restart-loop failure is reported as a
 retryable `runtime_unavailable` response, documented in [`operations.md`](operations.md#runtime-error-contract).
+
+The cache hash, import list, and worker `runtime` facts live in a top-level `telemetry` block that is **omitted by
+default** (`telemetry.verbosity = quiet`); set `telemetry.verbosity = full` to emit it. The per-call tuning knobs that
+used to ride on these requests (`max_field_bytes`, `max_total_bytes`, `heartbeat_limit`) are now server config — see
+[`operations.md`](operations.md).
 
 ## `proof_state`
 
@@ -336,17 +341,19 @@ or the job can crash the worker and be retried. Either way the verdict was compu
 non-positive outcome — a rejection, `not_found`, a failed tactic, or empty goals — may be a casualty of the recycle
 rather than a real result.
 
-The signal comes from the call's runtime facts (`runtime.call_restart`), which the parent already attaches, not from a
-new worker outcome. Only *job-disrupting* causes count (`rss_post_job`, `child_abort`, `child_exit`, `session_missing`,
-`worker_internal`, `timeout`, `cancelled`); a pre-job `rss_import_switch` cycle runs the job on a fresh worker and is
-not flagged. `verify_declaration` relabels a non-positive verdict to `verification_status: "worker_recycled"` with
+The signal comes from the call's runtime facts (`telemetry.runtime.call_restart`), which the parent already attaches,
+not from a new worker outcome. The `worker_recycled` warning and `verification_status` are load-bearing, so they reach
+the agent regardless of `telemetry.verbosity`; the underlying `runtime` facts are only serialized under `full`. Only
+*job-disrupting* causes count (`rss_post_job`, `child_abort`, `child_exit`, `session_missing`, `worker_internal`,
+`timeout`, `cancelled`); a pre-job `rss_import_switch` cycle runs the job on a fresh worker and is not flagged.
+`verify_declaration` relabels a non-positive verdict to `verification_status: "worker_recycled"` with
 `facts.facts_trustworthy: false`; `try_proof_step` and `proof_state` keep their result shape but carry a top-level
 warning, since they have no single verdict to relabel. In every case the next action is to retry — and if it persists,
 the module is too heavy for the worker's memory budget (raise `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB`, or verify
 out-of-band with `lake build <module>` / `lake env lean <file>`). A `verified` result is left untouched: verification is
 monotone, so an accepted declaration is trustworthy even if the worker recycled afterward.
 
-To gauge *how often* this is happening, every response's `runtime` carries `restarts_total` and a per-cause breakdown
-`restarts_by_cause` over the worker's lifetime, and each recycle is logged to the server's stderr (see
-[operations.md](operations.md#observing-worker-recycles)). A high `rss_post_job` count is the cue to raise the post-job
-RSS ceiling.
+To gauge *how often* this is happening, under `telemetry.verbosity = full` every response's `telemetry.runtime` carries
+`restarts_total` and a per-cause breakdown `restarts_by_cause` over the worker's lifetime, and each recycle is logged to
+the server's stderr (see [operations.md](operations.md#observing-worker-recycles)). A high `rss_post_job` count is the
+cue to raise the post-job RSS ceiling.
