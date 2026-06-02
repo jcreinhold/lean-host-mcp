@@ -7,6 +7,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 <!-- ASSISTANT: add new entries under [Unreleased]; `release-lean-host-mcp` promotes them on tag. -->
 
+## [0.2.0] - 2026-06-02
+
+### Changed
+
+- Tools no longer advertise an `outputSchema`. Handlers return a bare `CallToolResult`, so `tools/list` carries no
+  nested `$defs` (~52 KB → ~9.6 KB). The Anthropic Messages API dropped the field before the model anyway, and deep
+  `$defs` broke strict clients (Claude Desktop, Zed) — proof agents read the JSON envelope as text either way.
+  **Breaking** for any client that validated tool responses against the advertised schema.
+- Per-call telemetry is now config-gated and omitted by default. `Freshness` splits into the always-emitted
+  `FreshnessIdentity` (`project_root`, `session_id`, `lean_toolchain`) and an optional `Telemetry` block
+  (`project_hash`, the full `imports` list, worker `RuntimeFacts`) that is dropped under the new default
+  `telemetry.verbosity = quiet`; set `full` to restore today's output. `proof_state`'s `query_facts` and
+  `search_for_proof`'s search funnel (stage counts, cache status) likewise appear only under `full`. The one actionable
+  signal a worker restart carries still surfaces as a top-level `warning`.
+- New `server.response_carrier` knob (`text` default, `structured`, `both`) selects whether the JSON envelope rides in
+  `content` text, `structuredContent`, or both, instead of always duplicating into `structuredContent`.
+
+### Removed
+
+- The per-call tuning knobs `max_field_bytes`, `max_total_bytes`, and `heartbeat_limit` left the `inspect_declaration`,
+  `try_proof_step`, and `verify_declaration` request schemas; they now live in `[output]` server config with the same
+  defaults. **Breaking** for callers that set them per request — configure them server-side instead.
+
 ## [0.1.0] - 2026-06-01
 
 ### Added
@@ -72,4 +95,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
+[0.2.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jcreinhold/lean-host-mcp/releases/tag/v0.1.0
