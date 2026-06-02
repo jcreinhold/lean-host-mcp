@@ -51,6 +51,7 @@ pub struct RuntimeFileConfig {
     pub import_switch_rss_soft_kib: Option<u64>,
     pub module_cache_rss_guard_kib: Option<u64>,
     pub module_cache_max_bytes: Option<u64>,
+    pub request_timeout_millis: Option<u64>,
     pub project_mailbox_capacity: Option<usize>,
     pub worker_restart_limit: Option<usize>,
     pub worker_restart_window_secs: Option<u64>,

@@ -45,6 +45,13 @@ const WORKER_RSS_SAMPLE_MILLIS: u64 = 250;
 const IMPORT_SWITCH_RSS_SOFT_KIB: u64 = 2 * 1024 * 1024;
 const MODULE_CACHE_RSS_GUARD_KIB: u64 = 2 * 1024 * 1024;
 const MODULE_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Per-request worker deadline. Covers one tool call end to end (live rows,
+/// diagnostics, terminal response); on expiry the worker is recycled and the
+/// call returns a retryable runtime error. Replaces the worker-parent's 10-min
+/// `long_running_requests` profile, which let whole-project scans (e.g.
+/// `find_references` at project scope) appear to hang. Raise it for unusually
+/// heavy modules whose `verify`/`proof_state` legitimately runs longer.
+const REQUEST_TIMEOUT_MILLIS: u64 = 120 * 1000;
 const MAX_JOB_RETRIES: u32 = 1;
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_mins(1);
@@ -62,6 +69,7 @@ pub struct ProjectRuntimeConfig {
     import_switch_rss_soft_kib: u64,
     module_cache_rss_guard_kib: u64,
     module_cache_max_bytes: u64,
+    request_timeout_millis: u64,
     mailbox_capacity: usize,
     max_restarts_per_window: usize,
     restart_window: Duration,
@@ -76,6 +84,7 @@ impl Default for ProjectRuntimeConfig {
             import_switch_rss_soft_kib: IMPORT_SWITCH_RSS_SOFT_KIB,
             module_cache_rss_guard_kib: MODULE_CACHE_RSS_GUARD_KIB,
             module_cache_max_bytes: MODULE_CACHE_MAX_BYTES,
+            request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
             max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
             restart_window: RESTART_WINDOW,
@@ -111,6 +120,7 @@ impl ProjectRuntimeConfig {
                 import_switch_rss_soft_kib: runtime_env_var("LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB")?,
                 module_cache_rss_guard_kib: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB")?,
                 module_cache_max_bytes: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES")?,
+                request_timeout_millis: runtime_env_var("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS")?,
                 project_mailbox_capacity: runtime_env_var("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY")?,
                 worker_restart_limit: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_LIMIT")?,
                 worker_restart_window_secs: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS")?,
@@ -150,6 +160,11 @@ impl ProjectRuntimeConfig {
     }
 
     #[must_use]
+    pub const fn request_timeout_millis(&self) -> u64 {
+        self.request_timeout_millis
+    }
+
+    #[must_use]
     pub const fn mailbox_capacity(&self) -> usize {
         self.mailbox_capacity
     }
@@ -173,6 +188,7 @@ struct RuntimeEnv {
     import_switch_rss_soft_kib: Option<String>,
     module_cache_rss_guard_kib: Option<String>,
     module_cache_max_bytes: Option<String>,
+    request_timeout_millis: Option<String>,
     project_mailbox_capacity: Option<String>,
     worker_restart_limit: Option<String>,
     worker_restart_window_secs: Option<String>,
@@ -216,6 +232,12 @@ fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig) -> Result<Pro
             env.module_cache_max_bytes.as_deref(),
             file.module_cache_max_bytes,
             defaults.module_cache_max_bytes,
+        )?,
+        request_timeout_millis: parse_nonzero_u64(
+            "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
+            env.request_timeout_millis.as_deref(),
+            file.request_timeout_millis,
+            defaults.request_timeout_millis,
         )?,
         mailbox_capacity: parse_nonzero_usize(
             "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
@@ -992,6 +1014,7 @@ struct ActorConfig {
     import_switch_rss_soft_kib: u64,
     module_cache_rss_guard_kib: u64,
     module_cache_max_bytes: u64,
+    request_timeout_millis: u64,
     mailbox_capacity: usize,
     max_restarts_per_window: usize,
     restart_window: Duration,
@@ -1092,6 +1115,7 @@ impl ActorConfig {
             import_switch_rss_soft_kib: runtime_config.import_switch_rss_soft_kib(),
             module_cache_rss_guard_kib: runtime_config.module_cache_rss_guard_kib(),
             module_cache_max_bytes: runtime_config.module_cache_max_bytes(),
+            request_timeout_millis: runtime_config.request_timeout_millis(),
             mailbox_capacity: runtime_config.mailbox_capacity(),
             max_restarts_per_window: runtime_config.max_restarts_per_window(),
             restart_window: runtime_config.restart_window(),
@@ -1775,7 +1799,7 @@ fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
             config.lean_sysroot.clone(),
         ))
         .startup_timeout(Duration::from_secs(30))
-        .long_running_requests()
+        .request_timeout(Duration::from_millis(config.request_timeout_millis))
         .restart_policy(restart_policy)
         .rss_hard_limit(
             config.worker_rss_hard_kill_kib,
@@ -1930,6 +1954,7 @@ mod tests {
                 import_switch_rss_soft_kib: Some("3".to_owned()),
                 module_cache_rss_guard_kib: Some("17".to_owned()),
                 module_cache_max_bytes: Some("19".to_owned()),
+                request_timeout_millis: Some("37".to_owned()),
                 project_mailbox_capacity: Some("23".to_owned()),
                 worker_restart_limit: Some("29".to_owned()),
                 worker_restart_window_secs: Some("31".to_owned()),
@@ -1944,9 +1969,52 @@ mod tests {
         assert_eq!(config.import_switch_rss_soft_kib(), 3);
         assert_eq!(config.module_cache_rss_guard_kib(), 17);
         assert_eq!(config.module_cache_max_bytes(), 19);
+        assert_eq!(config.request_timeout_millis(), 37);
         assert_eq!(config.mailbox_capacity(), 23);
         assert_eq!(config.max_restarts_per_window(), 29);
         assert_eq!(config.restart_window(), Duration::from_secs(31));
+    }
+
+    #[test]
+    fn request_timeout_precedence_env_over_file_over_default() {
+        let file = RuntimeFileConfig {
+            request_timeout_millis: Some(45_000),
+            ..RuntimeFileConfig::default()
+        };
+        // Env unset -> file value is used.
+        let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+        assert_eq!(config.request_timeout_millis(), 45_000);
+        // Env set -> env wins over the file.
+        let env = RuntimeEnv {
+            request_timeout_millis: Some("90000".to_owned()),
+            ..RuntimeEnv::default()
+        };
+        let config = parse_runtime_config(env, &file).unwrap();
+        assert_eq!(config.request_timeout_millis(), 90_000);
+        // Neither -> built-in default (120 s).
+        let config = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default()).unwrap();
+        assert_eq!(config.request_timeout_millis(), REQUEST_TIMEOUT_MILLIS);
+    }
+
+    #[test]
+    fn request_timeout_zero_is_rejected() {
+        // A zero deadline would time every call out instantly; parse_nonzero_u64
+        // must reject it.
+        let err = parse_runtime_config(
+            RuntimeEnv {
+                request_timeout_millis: Some("0".to_owned()),
+                ..RuntimeEnv::default()
+            },
+            &RuntimeFileConfig::default(),
+        )
+        .unwrap_err();
+        let ServerError::Internal(message) = err else {
+            panic!("expected Internal config error");
+        };
+        assert!(
+            message.contains("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS"),
+            "message: {message}"
+        );
     }
 
     #[test]
@@ -2083,6 +2151,7 @@ mod tests {
             import_switch_rss_soft_kib: IMPORT_SWITCH_RSS_SOFT_KIB,
             module_cache_rss_guard_kib: MODULE_CACHE_RSS_GUARD_KIB,
             module_cache_max_bytes: MODULE_CACHE_MAX_BYTES,
+            request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
             max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
             restart_window: RESTART_WINDOW,

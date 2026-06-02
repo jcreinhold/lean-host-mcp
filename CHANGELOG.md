@@ -37,6 +37,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `install-worker --clean [--toolchain <id>]` removes all installed workers (or one); `install-worker --prune` removes
   only unservable workers (outside the supported window, or with a failed smoke test), keeping servable-but-stale ones.
   Both are idempotent and only touch the install root.
+- Configurable per-request timeout: `runtime.request_timeout_millis` (env `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS`),
+  default **120 s**. Replaces the worker's fixed 10-minute long-running profile, which let a whole-project scan (e.g.
+  `find_references` at project scope) appear to hang. On expiry the worker is recycled and the call returns a retryable
+  runtime error; raise it for unusually heavy modules, lower it to bound scans.
 
 ## [0.2.0] - 2026-06-02
 

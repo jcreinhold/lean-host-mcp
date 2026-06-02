@@ -99,6 +99,14 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         description: "Maximum size of the per-worker module-query result cache, in bytes. Default 32 MiB.",
     },
     FieldDoc {
+        key: "runtime.request_timeout_millis",
+        ty: "integer (ms)",
+        value: "120000",
+        commented: false,
+        overrides: "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
+        description: "Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose verify/proof_state legitimately runs longer; lower it to bound whole-project scans (e.g. find_references at project scope). Default 120 s.",
+    },
+    FieldDoc {
         key: "runtime.project_mailbox_capacity",
         ty: "integer",
         value: "8",
@@ -382,6 +390,7 @@ mod tests {
             Some(rt.module_cache_rss_guard_kib())
         );
         assert_eq!(config.runtime.module_cache_max_bytes, Some(rt.module_cache_max_bytes()));
+        assert_eq!(config.runtime.request_timeout_millis, Some(rt.request_timeout_millis()));
         assert_eq!(config.runtime.project_mailbox_capacity, Some(rt.mailbox_capacity()));
         assert_eq!(config.runtime.worker_restart_limit, Some(rt.max_restarts_per_window()));
         assert_eq!(
