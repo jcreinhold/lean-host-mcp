@@ -1,0 +1,1 @@
+{"version":5,"module":"Demo.A","directImports":[],"references":{"{\"c\":{\"m\":\"Demo.A\",\"n\":\"Demo.A.foo\"}}":{"definition":[3,4,3,7],"usages":[]},"{\"c\":{\"m\":\"Init\",\"n\":\"Nat\"}}":{"definition":null,"usages":[[3,9,3,12]]}},"decls":{"Demo.A.foo":[3,4,3,7,3,4,3,7]}}

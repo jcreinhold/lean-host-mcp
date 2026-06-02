@@ -1,0 +1,1 @@
+{"version":5,"module":"Demo.B","directImports":[["Demo.A",false,false,false]],"references":{"{\"c\":{\"m\":\"Demo.A\",\"n\":\"Demo.A.foo\"}}":{"definition":null,"usages":[[5,2,5,5,"Demo.B.bar"],[6,8,6,11]]},"{\"f\":{\"m\":\"Demo.B\",\"i\":\"Demo.A.foo\"}}":{"definition":[7,0,7,3],"usages":[[8,0,8,3]]}},"decls":{}}

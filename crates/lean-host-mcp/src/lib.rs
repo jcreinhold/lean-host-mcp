@@ -30,6 +30,7 @@ pub mod config_schema;
 mod diagnosis;
 pub mod envelope;
 pub mod error;
+mod ilean;
 pub mod lake_meta;
 mod project;
 pub mod projections;
