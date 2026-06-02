@@ -26,6 +26,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - For explicit `{kind:"index"}` / `after_text` positions, a failed candidate carrying a binder-introduction diagnostic
   now surfaces a cue pointing at the entry default (or continuing from `goals_after`), so the trap is signposted even
   off the default path.
+- Worker provenance now records the building `lean-host-mcp` version. Worker and host are version-locked, so a worker
+  built by a different host is flagged as stale — closing a skew that previously served an ABI/protocol-mismatched
+  worker silently (it would fail at call time instead of with a clear message). `install-worker --list` gains a `host`
+  column (`current` / `stale` / `unknown`), and a project served by a host-skewed worker now rides a rebuild warning in
+  every envelope.
+- `install-worker --auto` (the default) now rebuilds **stale** workers — host-version skew, `lean.h` header drift, or a
+  failed/absent smoke record — not just missing ones, and skips out-of-window toolchains instead of failing on them. So
+  re-running it after a `lean-host-mcp` upgrade brings every worker back in step. `--force` rebuilds current workers too.
+- `install-worker --clean [--toolchain <id>]` removes all installed workers (or one); `install-worker --prune` removes
+  only unservable workers (outside the supported window, or with a failed smoke test), keeping servable-but-stale ones.
+  Both are idempotent and only touch the install root.
 
 ## [0.2.0] - 2026-06-02
 

@@ -185,6 +185,30 @@ The detection is "was this binary built from a checkout that still has the worke
 binary was built). Either way the worker needs a Rust toolchain on `PATH` and the matching Lean toolchain installed via
 elan; the freshly built worker is smoke-tested before it is recorded as usable.
 
+### Keeping workers in step with the host
+
+The worker and the parent share the workspace version and are protocol/ABI-coupled in lockstep: a worker built by a
+different `lean-host-mcp` may speak a different worker protocol. **After upgrading `lean-host-mcp`, rebuild your
+workers** — otherwise a skewed worker can fail at call time rather than with a clear message.
+
+The provenance sidecar records the building host version, so the tools can tell a worker is stale without running it:
+
+- `install-worker --auto` (the default) scans `~/.elan/toolchains` and (re)builds any worker that is **missing or
+  stale** — host-version skew, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that are
+  current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current workers
+  too (e.g. to re-run the smoke test or replace a corrupted binary).
+- `install-worker --toolchain <id>` builds one worker, always overwriting.
+- `install-worker --list` prints every installed worker; the `host` column reads `current` (built by the running host),
+  `stale` (a different, version-locked host — rebuild), or `unknown` (sidecar predates the field).
+- `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are
+  rebuildable artifacts, so this only deletes from the install root and never touches source. Use it for disk hygiene or
+  to force a clean rebuild after a `lean-rs` ABI change.
+- `install-worker --prune` removes only *unservable* workers — those outside the supported window or with a recorded
+  smoke-test failure. Servable-but-stale workers (header drift, host skew) are kept; rebuild those with `--auto`.
+
+At runtime, a project served by a host-skewed worker still opens but every response carries a warning naming the worker
+and host versions and the rebuild command; header drift and smoke failure remain hard refusals.
+
 ## Build, test, lint
 
 ```sh

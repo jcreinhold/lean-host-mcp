@@ -2,12 +2,18 @@
 //! specific Lean toolchain and place it under
 //! [`WorkerBinary::install_root`].
 //!
-//! Three modes:
+//! Actions:
 //!
-//! - `--toolchain <id>`: build for one toolchain.
+//! - `--toolchain <id>`: build for one toolchain (always overwrites).
 //! - no flag / `--auto`: scan `~/.elan/toolchains/leanprover--lean4---*`
-//!   and build for any missing ones.
-//! - `--list`: print a table of currently-installed workers.
+//!   and build for any that are missing or stale (host-version skew, header
+//!   drift, failed/absent smoke); `--force` rebuilds current ones too.
+//! - `--list`: print a table of currently-installed workers, including a
+//!   `host` column that flags workers built by a different (version-locked)
+//!   `lean-host-mcp` than the one running.
+//! - `--clean [--toolchain <id>]`: remove all installed workers, or just one.
+//! - `--prune`: remove only unservable workers (outside the supported window,
+//!   or with a failed smoke test), keeping servable-but-stale ones.
 //!
 //! The worker is always compiled locally per toolchain (its `build.rs` bakes an
 //! absolute rpath, so binaries don't travel), with `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>`
@@ -31,27 +37,57 @@ use tempfile::TempDir;
 
 use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WindowVerdict, WorkerBinary, WorkerSidecar, hash_lean_header};
 
-/// Mutually-exclusive flags for `install-worker`.
+/// Flags for `install-worker`.
+///
+/// The *action* (`--auto`, `--list`, `--clean`, `--prune`) is mutually
+/// exclusive; `--toolchain` is a target modifier that scopes the install or
+/// `--clean` to one toolchain (validated in [`run`]).
 #[derive(Debug, Args)]
 #[command(group(
-    clap::ArgGroup::new("mode")
-        .args(["toolchain", "auto", "list"])
+    clap::ArgGroup::new("action")
+        .args(["auto", "list", "clean", "prune"])
 ))]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a distinct CLI flag; the action flags are made \
+              mutually exclusive by the clap ArgGroup, and modeling them as one \
+              enum would fight clap's flag derivation and the established \
+              --auto/--list UX"
+)]
 pub struct InstallWorkerArgs {
-    /// Build and install for a single toolchain (e.g. `v4.30.0` or
-    /// `leanprover/lean4:v4.30.0`).
+    /// Operate on a single toolchain (e.g. `v4.30.0` or
+    /// `leanprover/lean4:v4.30.0`): build+install it, or, with `--clean`,
+    /// remove just it. Omit it to act on every discovered/installed toolchain.
     #[arg(long, value_name = "ID")]
     pub toolchain: Option<String>,
 
-    /// Scan `~/.elan/toolchains` and install for every Lean toolchain
-    /// that doesn't already have a worker. This is the default when no
-    /// mode flag is supplied.
+    /// Scan `~/.elan/toolchains` and install a worker for every supported
+    /// Lean toolchain that is missing or stale (host-version skew, header
+    /// drift, or a failed/absent smoke record). This is the default when no
+    /// action flag is supplied. Use `--force` to rebuild current ones too.
     #[arg(long)]
     pub auto: bool,
 
     /// Print a table of currently-installed worker binaries.
     #[arg(long)]
     pub list: bool,
+
+    /// Remove installed workers: all of them, or just `--toolchain <id>`.
+    /// Workers are rebuildable artifacts, so this only deletes from the
+    /// install root; it never touches source.
+    #[arg(long)]
+    pub clean: bool,
+
+    /// Remove only *unservable* workers — those outside the supported window
+    /// or with a failed runtime smoke test. Servable-but-stale workers (header
+    /// drift, host skew) are kept; rebuild them with `--auto`.
+    #[arg(long)]
+    pub prune: bool,
+
+    /// Rebuild even workers that are already current. Applies to `--auto` and
+    /// `--toolchain` installs; ignored by `--list`/`--clean`/`--prune`.
+    #[arg(long)]
+    pub force: bool,
 
     /// Workspace root to build from. Defaults to the workspace this
     /// binary was compiled in; useful when the installed binary lives
@@ -67,19 +103,54 @@ pub struct InstallWorkerArgs {
 /// Bubbles up filesystem / `cargo` failures as `anyhow::Error`. Returns
 /// a non-zero exit-code-equivalent error when any auto install fails.
 pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
+    check_arg_combination(args)?;
     if args.list {
         return run_list();
     }
+    if args.prune {
+        return run_prune();
+    }
+    if args.clean {
+        // `--clean --toolchain x` removes one; `--clean` alone removes all.
+        let target = args.toolchain.as_deref().map(ToolchainId::parse).transpose()?;
+        return run_clean(target.as_ref());
+    }
+    // Default action (no flag) and `--auto` both scan and install.
     let source = resolve_worker_source(args.source_dir.as_deref())?;
-    if args.auto {
-        run_auto(&source)
-    } else if let Some(raw) = args.toolchain.as_deref() {
+    if let Some(raw) = args.toolchain.as_deref() {
+        // `check_arg_combination` ruled out `--toolchain --auto`, so this is a
+        // single-toolchain install (always overwrites — no freshness check).
         let id = ToolchainId::parse(raw)?;
         install_one(&id, &source)?;
-        Ok(())
-    } else {
-        run_auto(&source)
+        return Ok(());
     }
+    run_auto(&source, args.force)
+}
+
+/// Validate the `--toolchain` target modifier against the chosen action. The
+/// action flags are made mutually exclusive by clap's `ArgGroup`; `--toolchain`
+/// sits outside it (it scopes an install or `--clean`), so its illegal pairings
+/// are checked here. Pure — no filesystem or build side effects, so the rules
+/// are unit-testable without the install root.
+fn check_arg_combination(args: &InstallWorkerArgs) -> anyhow::Result<()> {
+    if args.toolchain.is_some() {
+        if args.auto {
+            return Err(anyhow::anyhow!(
+                "--toolchain selects one toolchain and --auto selects all; pass one or the other"
+            ));
+        }
+        if args.list {
+            return Err(anyhow::anyhow!(
+                "--toolchain is not valid with --list; --list always shows every installed worker"
+            ));
+        }
+        if args.prune {
+            return Err(anyhow::anyhow!(
+                "--toolchain is not valid with --prune; use `--clean --toolchain <id>` to remove one"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run_list() -> anyhow::Result<()> {
@@ -128,12 +199,19 @@ fn run_list() -> anyhow::Result<()> {
             .as_ref()
             .map_or("unknown", |s| s.header_status(current.as_deref()));
         let smoke = sidecar.as_ref().map_or("untested", WorkerSidecar::smoke_status);
+        // Host-version provenance: `current` if built by this host, `stale` if
+        // by a different (version-locked) host — the skew that silently served
+        // an ABI-mismatched worker before this column existed.
+        let host = sidecar
+            .as_ref()
+            .map_or("unknown", |s| s.host_status(env!("CARGO_PKG_VERSION")));
         rows.push(ListRow {
             id: id.to_owned(),
             path: bin,
             support,
             header,
             smoke,
+            host,
             size: meta.len(),
             mtime,
             sha,
@@ -143,15 +221,15 @@ fn run_list() -> anyhow::Result<()> {
     rows.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 
     println!(
-        "{:<28}  {:<14}  {:<9}  {:<9}  {:>10}  {:<24}  sha256",
-        "toolchain", "support", "build", "runtime", "size", "built"
+        "{:<28}  {:<14}  {:<9}  {:<9}  {:<9}  {:>10}  {:<24}  sha256",
+        "toolchain", "support", "build", "runtime", "host", "size", "built"
     );
     for row in &rows {
         let mtime = humantime::format_rfc3339_seconds_or_fallback(row.mtime);
         let size = format_mib(row.size);
         println!(
-            "{:<28}  {:<14}  {:<9}  {:<9}  {:>10}  {:<24}  {}",
-            row.id, row.support, row.header, row.smoke, size, mtime, row.sha
+            "{:<28}  {:<14}  {:<9}  {:<9}  {:<9}  {:>10}  {:<24}  {}",
+            row.id, row.support, row.header, row.smoke, row.host, size, mtime, row.sha
         );
     }
     Ok(())
@@ -167,6 +245,7 @@ struct ListRow {
     support: &'static str,
     header: &'static str,
     smoke: &'static str,
+    host: &'static str,
     size: u64,
     mtime: SystemTime,
     sha: String,
@@ -174,7 +253,7 @@ struct ListRow {
     sort_key: (u8, (u32, u32, u32, u8, u32), String),
 }
 
-fn run_auto(source: &WorkerSource) -> anyhow::Result<()> {
+fn run_auto(source: &WorkerSource, force: bool) -> anyhow::Result<()> {
     let toolchains = discover_elan_toolchains()?;
     if toolchains.is_empty() {
         println!("(no Lean toolchains found under ~/.elan/toolchains)");
@@ -182,17 +261,18 @@ fn run_auto(source: &WorkerSource) -> anyhow::Result<()> {
     }
     let mut failed = false;
     for id in toolchains {
-        let target = WorkerBinary::install_root().join(id.as_str()).join(WORKER_FILE_NAME);
-        if target.is_file() {
-            println!("{id}: already-installed");
-            continue;
-        }
-        match install_one(&id, source) {
-            Ok(_) => println!("{id}: installed"),
-            Err(err) => {
-                eprintln!("{id}: failed: {err}");
-                failed = true;
+        match auto_decision(&id, force) {
+            AutoDecision::SkipUnsupported => println!("{id}: skipped (outside supported window)"),
+            AutoDecision::SkipCurrent => {
+                println!("{id}: current; skipping (use --force to rebuild)");
             }
+            AutoDecision::Install(reason) => match install_one(&id, source) {
+                Ok(_) => println!("{id}: installed ({reason})"),
+                Err(err) => {
+                    eprintln!("{id}: failed: {err}");
+                    failed = true;
+                }
+            },
         }
     }
     if failed {
@@ -200,6 +280,180 @@ fn run_auto(source: &WorkerSource) -> anyhow::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// What `--auto` should do for one discovered toolchain.
+enum AutoDecision {
+    /// (Re)build it; the `&str` is the reason, shown to the user.
+    Install(&'static str),
+    /// A current worker is already installed — skip unless `--force`.
+    SkipCurrent,
+    /// Outside the supported window: building it would only fail the
+    /// header-digest check, so don't attempt it.
+    SkipUnsupported,
+}
+
+fn auto_decision(id: &ToolchainId, force: bool) -> AutoDecision {
+    if matches!(id.window_verdict(), WindowVerdict::OutOfWindow { .. }) {
+        return AutoDecision::SkipUnsupported;
+    }
+    match worker_freshness(id) {
+        Freshness::Absent => AutoDecision::Install("new"),
+        Freshness::Stale(reason) => AutoDecision::Install(reason),
+        Freshness::Current => {
+            if force {
+                AutoDecision::Install("forced")
+            } else {
+                AutoDecision::SkipCurrent
+            }
+        }
+    }
+}
+
+/// Whether the worker already installed under [`WorkerBinary::install_root`] for
+/// `id` is current, stale, or absent. Mirrors the runtime open-gate's provenance
+/// checks ([`WorkerBinary::resolve_ready_with_override`]) but reads the install
+/// root directly — `install-worker` always writes there, regardless of the
+/// `LEAN_HOST_MCP_WORKERS_DIR` override the runtime path honors.
+enum Freshness {
+    Absent,
+    Current,
+    Stale(&'static str),
+}
+
+fn worker_freshness(id: &ToolchainId) -> Freshness {
+    worker_freshness_in(&WorkerBinary::install_root(), id)
+}
+
+/// Freshness against an explicit `root`. Split out of [`worker_freshness`] so
+/// the staleness decision is testable against a temp root (mirroring
+/// [`clean_in`] / [`prune_in`]).
+fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
+    let dir = root.join(id.as_str());
+    if !dir.join(WORKER_FILE_NAME).is_file() {
+        return Freshness::Absent;
+    }
+    let Some(sidecar) = WorkerSidecar::load(&dir) else {
+        return Freshness::Stale("no provenance record");
+    };
+    // Header drift trumps everything: the toolchain's lean.h changed under it.
+    if let Ok(elan) = id.elan_dir()
+        && let Ok(current) = hash_lean_header(&elan)
+        && !sidecar.header_matches(&current)
+    {
+        return Freshness::Stale("header drift");
+    }
+    match sidecar.smoke() {
+        Some(s) if s.failure_detail().is_some() => return Freshness::Stale("failed smoke test"),
+        None => return Freshness::Stale("no smoke record"),
+        Some(_) => {}
+    }
+    // Worker and host are version-locked; a different builder version may speak
+    // a different worker protocol. `""` means the sidecar predates the field.
+    let built = sidecar.host_version();
+    if !built.is_empty() && built != env!("CARGO_PKG_VERSION") {
+        return Freshness::Stale("host-version skew");
+    }
+    Freshness::Current
+}
+
+/// `--clean`: remove installed workers — all of them, or just `target`.
+/// Idempotent. Thin wrapper over [`clean_in`] with the real install root.
+fn run_clean(target: Option<&ToolchainId>) -> anyhow::Result<()> {
+    clean_in(&WorkerBinary::install_root(), target)
+}
+
+/// Remove worker install dirs under `root`. Pulled out of [`run_clean`] so the
+/// removal can be tested against a temp root without redirecting the real one
+/// (`install_root` reads no env override).
+fn clean_in(root: &Path, target: Option<&ToolchainId>) -> anyhow::Result<()> {
+    if !root.is_dir() {
+        println!("(no workers installed under {})", root.display());
+        return Ok(());
+    }
+    if let Some(id) = target {
+        let dir = root.join(id.as_str());
+        if dir.is_dir() {
+            fs::remove_dir_all(&dir)?;
+            println!("removed worker for {id}");
+        } else {
+            println!("no worker installed for {id}");
+        }
+        return Ok(());
+    }
+    let mut removed = 0usize;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
+        fs::remove_dir_all(&path)?;
+        println!("removed worker for {name}");
+        removed = removed.saturating_add(1);
+    }
+    println!("removed {removed} worker(s) from {}", root.display());
+    Ok(())
+}
+
+/// `--prune`: remove only *unservable* workers, leaving servable ones (even if
+/// stale) in place. Idempotent. Thin wrapper over [`prune_in`].
+fn run_prune() -> anyhow::Result<()> {
+    prune_in(&WorkerBinary::install_root())
+}
+
+/// Remove unservable worker install dirs under `root`. Pulled out of
+/// [`run_prune`] for the same testability reason as [`clean_in`].
+fn prune_in(root: &Path) -> anyhow::Result<()> {
+    if !root.is_dir() {
+        println!("(no workers installed under {})", root.display());
+        return Ok(());
+    }
+    let mut removed = 0usize;
+    let mut kept = 0usize;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Only consider real worker installs (a binary present); skip strays.
+        if !path.join(WORKER_FILE_NAME).is_file() {
+            continue;
+        }
+        if let Some(reason) = prune_reason(name, &path) {
+            fs::remove_dir_all(&path)?;
+            println!("pruned {name}: {reason}");
+            removed = removed.saturating_add(1);
+        } else {
+            kept = kept.saturating_add(1);
+        }
+    }
+    println!("pruned {removed} unservable worker(s); kept {kept}");
+    Ok(())
+}
+
+/// Why an installed worker is unservable, or `None` if it can be served. Only
+/// the two definitively-dead classes: a toolchain outside the supported window
+/// (can never load), and a recorded smoke-test failure (loads but crashes).
+/// Servable-but-stale workers (header drift, host skew) are deliberately kept —
+/// `--auto` rebuilds those; pruning them would delete a possibly-working binary.
+fn prune_reason(name: &str, install_dir: &Path) -> Option<&'static str> {
+    if let Ok(id) = ToolchainId::parse(name)
+        && matches!(id.window_verdict(), WindowVerdict::OutOfWindow { .. })
+    {
+        return Some("outside the supported window");
+    }
+    if let Some(sidecar) = WorkerSidecar::load(install_dir)
+        && sidecar.smoke().is_some_and(|s| s.failure_detail().is_some())
+    {
+        return Some("failed runtime smoke test");
+    }
+    None
 }
 
 fn install_one(id: &ToolchainId, source: &WorkerSource) -> anyhow::Result<PathBuf> {
@@ -553,7 +807,21 @@ mod tests {
 
     use clap::{Args as _, Command, FromArgMatches};
 
-    use super::{InstallWorkerArgs, WorkerSource, format_mib, resolve_worker_source};
+    use super::{
+        Freshness, InstallWorkerArgs, WorkerSource, check_arg_combination, clean_in, format_mib, prune_in,
+        prune_reason, resolve_worker_source, worker_freshness_in,
+    };
+    use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WorkerSidecar};
+
+    /// Create a fake worker install dir `<root>/<id>/` with a binary stub and a
+    /// sidecar recorded against `digest`, for the clean/prune tests.
+    fn fake_worker(root: &std::path::Path, id: &str, digest: &str) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("binary stub");
+        let tid = ToolchainId::parse(id).expect("parse id");
+        WorkerSidecar::record(&dir, &tid, digest.to_owned(), crate::smoke::SmokeOutcome::Passed).expect("sidecar");
+    }
 
     #[test]
     fn format_mib_renders_two_decimals_base_1024() {
@@ -625,5 +893,172 @@ mod tests {
             }
             WorkerSource::Registry => panic!("a checkout build should select the local workspace"),
         }
+    }
+
+    #[test]
+    fn clean_prune_force_flags_parse() {
+        let clean = parse(&["install-worker", "--clean"]).expect("--clean parses");
+        assert!(clean.clean && !clean.prune);
+
+        let prune = parse(&["install-worker", "--prune"]).expect("--prune parses");
+        assert!(prune.prune && !prune.clean);
+
+        let forced = parse(&["install-worker", "--auto", "--force"]).expect("--auto --force parses");
+        assert!(forced.auto && forced.force);
+    }
+
+    #[test]
+    fn clean_with_toolchain_parses_for_targeted_removal() {
+        let args = parse(&["install-worker", "--clean", "--toolchain", "v4.30.0"]).expect("--clean --toolchain parses");
+        assert!(args.clean);
+        assert_eq!(args.toolchain.as_deref(), Some("v4.30.0"));
+    }
+
+    #[test]
+    fn action_flags_remain_mutually_exclusive() {
+        // The new actions join --auto/--list in the exclusive group.
+        for pair in [["--clean", "--auto"], ["--prune", "--list"], ["--clean", "--prune"]] {
+            let err = parse(&["install-worker", pair[0], pair[1]]).expect_err("conflicting actions");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn toolchain_rejected_with_auto_list_prune() {
+        // `--toolchain` is a target modifier validated outside clap.
+        for action in ["--auto", "--list", "--prune"] {
+            let args = parse(&["install-worker", "--toolchain", "v4.30.0", action]).expect("parses; rejected in run()");
+            assert!(
+                check_arg_combination(&args).is_err(),
+                "--toolchain with {action} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn toolchain_allowed_for_install_and_clean() {
+        let install = parse(&["install-worker", "--toolchain", "v4.30.0"]).expect("install one");
+        check_arg_combination(&install).expect("--toolchain alone is a single-toolchain install");
+
+        let clean_one = parse(&["install-worker", "--clean", "--toolchain", "v4.30.0"]).expect("clean one");
+        check_arg_combination(&clean_one).expect("--clean --toolchain removes one");
+    }
+
+    #[test]
+    fn prune_targets_only_definitively_unservable_workers() {
+        // Out-of-window: prunable regardless of any sidecar.
+        let tmp = std::env::temp_dir().join("lhm-prune-no-such-dir");
+        assert_eq!(
+            prune_reason("v4.23.0", &tmp),
+            Some("outside the supported window"),
+            "a toolchain below the supported window is unservable"
+        );
+        // Unparseable directory name: not a recognized toolchain, no sidecar —
+        // keep it, never prune unknown content.
+        assert_eq!(
+            prune_reason("not-a-toolchain", &tmp),
+            None,
+            "unrecognized / servable workers are kept"
+        );
+    }
+
+    #[test]
+    fn clean_all_removes_every_worker_dir() {
+        let root = tempfile::tempdir().expect("tmp root");
+        fake_worker(root.path(), "v4.30.0", "d1");
+        fake_worker(root.path(), "v4.31.0-rc1", "d2");
+        clean_in(root.path(), None).expect("clean all");
+        assert!(!root.path().join("v4.30.0").exists());
+        assert!(!root.path().join("v4.31.0-rc1").exists());
+    }
+
+    #[test]
+    fn clean_one_removes_only_the_target() {
+        let root = tempfile::tempdir().expect("tmp root");
+        fake_worker(root.path(), "v4.30.0", "d1");
+        fake_worker(root.path(), "v4.31.0-rc1", "d2");
+        let target = ToolchainId::parse("v4.30.0").expect("parse");
+        clean_in(root.path(), Some(&target)).expect("clean one");
+        assert!(!root.path().join("v4.30.0").exists(), "target removed");
+        assert!(root.path().join("v4.31.0-rc1").exists(), "others untouched");
+    }
+
+    #[test]
+    fn clean_is_idempotent_on_absent_root() {
+        let missing = std::env::temp_dir().join("lhm-clean-no-such-root-xyz");
+        clean_in(&missing, None).expect("clean of a missing root is success");
+    }
+
+    #[test]
+    fn prune_removes_unservable_keeps_servable() {
+        let root = tempfile::tempdir().expect("tmp root");
+        // Out-of-window → pruned (never loadable).
+        fake_worker(root.path(), "v4.23.0", "d");
+        // Supported + passing smoke → kept.
+        fake_worker(root.path(), "v4.30.0", "d");
+        // Supported but smoke FAILED → pruned (loads but crashes).
+        let failed_dir = root.path().join("v4.29.0");
+        std::fs::create_dir_all(&failed_dir).expect("mkdir");
+        std::fs::write(failed_dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
+        WorkerSidecar::record(
+            &failed_dir,
+            &ToolchainId::parse("v4.29.0").expect("parse"),
+            "d".to_owned(),
+            crate::smoke::SmokeOutcome::Failed {
+                detail: "signal: 11 (SIGSEGV)".to_owned(),
+            },
+        )
+        .expect("sidecar");
+
+        prune_in(root.path()).expect("prune");
+        assert!(!root.path().join("v4.23.0").exists(), "out-of-window pruned");
+        assert!(!root.path().join("v4.29.0").exists(), "smoke-failed pruned");
+        assert!(root.path().join("v4.30.0").exists(), "servable worker kept");
+    }
+
+    #[test]
+    fn freshness_absent_when_no_binary() {
+        let root = tempfile::tempdir().expect("tmp root");
+        let id = ToolchainId::parse("v4.30.0").expect("parse");
+        assert!(matches!(worker_freshness_in(root.path(), &id), Freshness::Absent));
+    }
+
+    #[test]
+    fn freshness_current_when_built_by_this_host() {
+        // `fake_worker` records via `WorkerSidecar::record`, which stamps this
+        // host's version and a passing smoke. Use an id with no elan dir on this
+        // machine so the header-drift check (which hashes the toolchain's real
+        // lean.h) is skipped and the test isolates the host-version path.
+        let root = tempfile::tempdir().expect("tmp root");
+        fake_worker(root.path(), "v4.99.99", "digest");
+        let id = ToolchainId::parse("v4.99.99").expect("parse");
+        assert!(matches!(worker_freshness_in(root.path(), &id), Freshness::Current));
+    }
+
+    #[test]
+    fn freshness_stale_without_sidecar() {
+        let root = tempfile::tempdir().expect("tmp root");
+        let dir = root.path().join("v4.30.0");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
+        let id = ToolchainId::parse("v4.30.0").expect("parse");
+        assert!(matches!(worker_freshness_in(root.path(), &id), Freshness::Stale(_)));
+    }
+
+    #[test]
+    fn freshness_stale_on_host_version_skew() {
+        // Absent-from-elan id so header drift is skipped and the *host skew* is
+        // the reason; a passing smoke rules out the smoke-stale path too.
+        let root = tempfile::tempdir().expect("tmp root");
+        let dir = root.path().join("v4.99.99");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
+        let skewed = r#"{"toolchain":"v4.99.99","header_digest":"d","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","digest_supported_at_build":true,"smoke":{"result":"passed"}}"#;
+        std::fs::write(dir.join("worker.json"), skewed).expect("sidecar");
+        let id = ToolchainId::parse("v4.99.99").expect("parse");
+        assert!(matches!(
+            worker_freshness_in(root.path(), &id),
+            Freshness::Stale("host-version skew")
+        ));
     }
 }

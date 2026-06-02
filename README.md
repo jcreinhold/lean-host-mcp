@@ -36,13 +36,15 @@ workflow and the request/result schema for each tool are in [`docs/tool-catalog.
 cargo install lean-host-mcp
 
 # 2. Install a worker binary for each Lean toolchain you use. With no flag,
-#    install-worker scans ~/.elan/toolchains and builds any that are missing;
-#    each lands under ~/.local/share/lean-host-mcp/workers/<id>/. The worker is
-#    compiled locally per toolchain (it links libleanshared), so this needs a
-#    Rust toolchain on PATH and the matching Lean toolchain installed via elan.
-lean-host-mcp install-worker
+#    install-worker scans ~/.elan/toolchains and builds any that are missing or
+#    stale; each lands under ~/.local/share/lean-host-mcp/workers/<id>/. The
+#    worker is compiled locally per toolchain (it links libleanshared), so this
+#    needs a Rust toolchain on PATH and the matching Lean toolchain via elan.
+#    Worker and host are version-locked: re-run this after upgrading lean-host-mcp.
+lean-host-mcp install-worker                       # build missing/stale workers
 lean-host-mcp install-worker --toolchain v4.30.0   # or one toolchain
-lean-host-mcp install-worker --list                # see what's installed
+lean-host-mcp install-worker --list                # see what's installed (host column flags skew)
+lean-host-mcp install-worker --clean               # remove all workers (e.g. to force a clean rebuild)
 
 # 3. Run it from inside any built Lake project. The toolchain pin comes from
 #    `lean-toolchain`, the project root from `lakefile.{lean,toml}`.

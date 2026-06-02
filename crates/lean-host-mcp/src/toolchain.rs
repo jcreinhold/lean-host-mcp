@@ -335,6 +335,24 @@ impl WorkerBinary {
                         install_cmd: install_cmd(pin),
                     };
                 }
+                // Worker and host are version-locked; a worker built by a
+                // different host version may speak a different worker protocol,
+                // so surface a rebuild nudge. Soft (not a hard refuse): a
+                // protocol-compatible patch bump would otherwise force needless
+                // rebuilds, and `install-worker --auto` rebuilds skewed workers
+                // anyway. `""` means the sidecar predates the field — unknown,
+                // not skewed.
+                let host_skew = {
+                    let built = sidecar.host_version();
+                    let current = env!("CARGO_PKG_VERSION");
+                    (!built.is_empty() && built != current).then(|| {
+                        format!(
+                            "worker for {pin} was built by lean-host-mcp {built}, but this host is \
+                             {current}; worker and host are version-locked — rebuild it: {}",
+                            install_cmd(pin)
+                        )
+                    })
+                };
                 match sidecar.smoke() {
                     // A header-digest match does not imply ABI compatibility (a
                     // toolchain's libleanshared can crash this worker); the
@@ -346,15 +364,19 @@ impl WorkerBinary {
                             install_cmd: install_cmd(pin),
                         };
                     }
-                    Some(SmokeOutcome::Passed) => None,
+                    // Host skew is the more actionable nudge than a missing
+                    // smoke record, so it wins when both apply.
+                    Some(SmokeOutcome::Passed) => host_skew,
                     // Built by an older host that did not smoke-test: the header
                     // digest still guards drift, but the worker is unverified at
                     // runtime — nudge a reinstall to record a smoke result.
-                    None => Some(format!(
-                        "worker for {pin} has no runtime smoke record (installed by an older host); \
-                         reinstall to verify it can run: {}",
-                        install_cmd(pin)
-                    )),
+                    None => host_skew.or_else(|| {
+                        Some(format!(
+                            "worker for {pin} has no runtime smoke record (installed by an older host); \
+                             reinstall to verify it can run: {}",
+                            install_cmd(pin)
+                        ))
+                    }),
                 }
             }
             // A worker installed by an older host has no sidecar: not an error,
@@ -589,6 +611,13 @@ pub(crate) struct WorkerSidecar {
     header_digest: String,
     /// `lean_toolchain::LEAN_VERSION` the host was built against.
     built_against_lean_version: String,
+    /// The `lean-host-mcp` version (`CARGO_PKG_VERSION`) that built this worker.
+    /// Worker and host share the workspace version and are protocol/ABI-coupled
+    /// in lockstep, so a recorded value that differs from the running host is a
+    /// rebuild signal. `""` (serde default) for a sidecar written before this
+    /// field existed — unknown provenance, not a mismatch.
+    #[serde(default)]
+    built_by_host_version: String,
     /// Whether `supported_by_digest(header_digest)` matched at build time.
     digest_supported_at_build: bool,
     /// Outcome of the post-build runtime smoke test. `None` for a sidecar
@@ -613,6 +642,7 @@ impl WorkerSidecar {
             toolchain: id.as_str().to_owned(),
             digest_supported_at_build: lean_toolchain::supported_by_digest(&header_digest).is_some(),
             built_against_lean_version: lean_toolchain::LEAN_VERSION.to_owned(),
+            built_by_host_version: env!("CARGO_PKG_VERSION").to_owned(),
             header_digest,
             smoke: Some(smoke),
         };
@@ -630,6 +660,24 @@ impl WorkerSidecar {
     /// Whether the recorded build-time digest still matches the toolchain.
     pub(crate) fn header_matches(&self, current_digest: &str) -> bool {
         self.header_digest == current_digest
+    }
+
+    /// The `lean-host-mcp` version that built this worker, or `""` if the
+    /// sidecar predates host-version provenance.
+    pub(crate) fn host_version(&self) -> &str {
+        &self.built_by_host_version
+    }
+
+    /// One-word label for the `install-worker --list` `host` column, given the
+    /// running host's version: `current` (built by this host), `stale` (built
+    /// by a different host — rebuild), or `unknown` (sidecar predates the
+    /// field).
+    pub(crate) fn host_status(&self, current_host: &str) -> &'static str {
+        match self.built_by_host_version.as_str() {
+            "" => "unknown",
+            v if v == current_host => "current",
+            _ => "stale",
+        }
     }
 
     /// One-word label for the `install-worker --list` `build` column, given the
@@ -1000,6 +1048,51 @@ mod tests {
         assert!(
             matches!(readiness, Readiness::Ready { note: None, .. }),
             "expected Ready with no note, got {readiness:?}"
+        );
+    }
+
+    #[test]
+    fn host_version_round_trips_and_legacy_sidecar_is_unknown() {
+        // A freshly recorded sidecar carries this host's version → `current`.
+        let tmp = tempfile::tempdir().unwrap();
+        let id = ToolchainId::parse("v4.30.0").unwrap();
+        WorkerSidecar::record(tmp.path(), &id, "abc".to_owned(), SmokeOutcome::Passed).unwrap();
+        let loaded = WorkerSidecar::load(tmp.path()).unwrap();
+        assert_eq!(loaded.host_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(loaded.host_status(env!("CARGO_PKG_VERSION")), "current");
+        assert_eq!(loaded.host_status("9.9.9"), "stale");
+
+        // A sidecar written before the field existed reads back as unknown
+        // provenance (serde default ""), never a spurious mismatch.
+        let legacy = tempfile::tempdir().unwrap();
+        let json = r#"{"toolchain":"v4.30.0","header_digest":"abc","built_against_lean_version":"x","digest_supported_at_build":true,"smoke":{"result":"passed"}}"#;
+        fs::write(legacy.path().join(SIDECAR_FILE_NAME), json).unwrap();
+        let old = WorkerSidecar::load(legacy.path()).unwrap();
+        assert_eq!(old.host_version(), "");
+        assert_eq!(old.host_status(env!("CARGO_PKG_VERSION")), "unknown");
+    }
+
+    #[test]
+    fn host_version_skew_is_ready_with_rebuild_note() {
+        // A worker built by a different (version-locked) host: still spawns, but
+        // every envelope carries a rebuild nudge. Hand-write the sidecar since
+        // `record` always stamps the running host's version.
+        let tmp = tempfile::tempdir().unwrap();
+        let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
+        fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
+        let skewed = format!(
+            r#"{{"toolchain":"{}","header_digest":"digest","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","digest_supported_at_build":true,"smoke":{{"result":"passed"}}}}"#,
+            id.as_str()
+        );
+        fs::write(tmp.path().join(SIDECAR_FILE_NAME), skewed).unwrap();
+        let sysroot = tmp.path().to_path_buf();
+        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
+        let Readiness::Ready { note: Some(note), .. } = readiness else {
+            panic!("expected Ready with a rebuild note, got {readiness:?}");
+        };
+        assert!(
+            note.contains("0.0.1-old") && note.contains("version-locked"),
+            "got: {note}"
         );
     }
 
