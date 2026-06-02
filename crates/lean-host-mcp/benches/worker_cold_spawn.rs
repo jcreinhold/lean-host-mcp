@@ -11,8 +11,8 @@
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lean_host_mcp::tools::{ToolConfig, ToolContext};
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
+use lean_host_mcp::tools::{ToolConfig, ToolContext};
 use lean_host_mcp::{BrokerConfig, ProjectBroker};
 use tokio::runtime::Runtime;
 
@@ -45,7 +45,10 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
                 semantic_waiters: BrokerConfig::default_semantic_waiters(),
                 semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
             });
-            let ctx = ToolContext { broker, config: ToolConfig::default() };
+            let ctx = ToolContext {
+                broker,
+                config: ToolConfig::default(),
+            };
             rt.block_on(async {
                 inspect_declaration(
                     &ctx,
