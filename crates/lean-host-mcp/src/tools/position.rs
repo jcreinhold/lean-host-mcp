@@ -8,6 +8,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationTargetInfo, LeanWorkerDeclarationTargetResult, LeanWorkerElabOptions, LeanWorkerLocalInfo,
@@ -656,6 +657,19 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     };
     let limit = req.limit.unwrap_or(MAX_REFERENCES).min(MAX_REFERENCES);
 
+    // Project scope issues one worker request per file, so the per-request
+    // timeout bounds each query but not the aggregate sweep — a large project
+    // could fan out over hundreds of files and appear to hang. Reuse the
+    // per-request budget as an overall wall-clock deadline that runs
+    // concurrently with each in-flight query (`tokio::time::timeout` below), so
+    // the whole call stays bounded even if a single file's query stalls.
+    // Whatever was indexed before the deadline is returned with a truncation
+    // warning.
+    let scan_budget = Duration::from_millis(ctx.broker.request_timeout_millis());
+    let scan_started = tokio::time::Instant::now();
+    let files_total = files.len();
+    let mut scan_timed_out = false;
+
     let mut hits: Vec<ReferenceHit> = Vec::new();
     let mut unsupported_files: Vec<String> = Vec::new();
     let mut header_parse_failed_files: Vec<HeaderParseFailedFile> = Vec::new();
@@ -670,9 +684,29 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     let mut needs_build: Option<ServerError> = None;
 
     'outer: for path in files {
+        let remaining = scan_budget
+            .checked_sub(scan_started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            scan_timed_out = true;
+            truncated = true;
+            break 'outer;
+        }
         let display = display_path(&root, &path);
         let query = LeanWorkerModuleQuery::References { name: req.name.clone() };
-        match run_module_query(ctx, hint.clone(), &root, &path, query).await {
+        // The timer runs alongside the await: if this single query outlasts the
+        // remaining budget, the timeout fires mid-request and we stop with what
+        // we have rather than blocking on it.
+        let queried =
+            match tokio::time::timeout(remaining, run_module_query(ctx, hint.clone(), &root, &path, query)).await {
+                Ok(queried) => queried,
+                Err(_elapsed) => {
+                    scan_timed_out = true;
+                    truncated = true;
+                    break 'outer;
+                }
+            };
+        match queried {
             Ok(QueryRun {
                 outcome:
                     ModuleQueryRun::Ready {
@@ -782,6 +816,20 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
             &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
         ),
         None => response,
+    };
+    let response = if scan_timed_out {
+        let scanned = files_scanned.saturating_add(files_skipped);
+        response
+            .warn(format!(
+                "Project-scope scan hit the request time budget after {scanned} of {files_total} files; \
+                 references found so far are returned but the sweep is incomplete."
+            ))
+            .hint(
+                "Narrow the search with `files` (a subset of modules), or raise \
+                 `runtime.request_timeout_millis` (env LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS) for a longer sweep.",
+            )
+    } else {
+        response
     };
     Ok(response)
 }

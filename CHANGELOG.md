@@ -38,9 +38,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   only unservable workers (outside the supported window, or with a failed smoke test), keeping servable-but-stale ones.
   Both are idempotent and only touch the install root.
 - Configurable per-request timeout: `runtime.request_timeout_millis` (env `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS`),
-  default **120 s**. Replaces the worker's fixed 10-minute long-running profile, which let a whole-project scan (e.g.
-  `find_references` at project scope) appear to hang. On expiry the worker is recycled and the call returns a retryable
-  runtime error; raise it for unusually heavy modules, lower it to bound scans.
+  default **120 s**. Replaces the worker's fixed 10-minute long-running profile. On expiry the worker is recycled and the
+  call returns a retryable runtime error; raise it for unusually heavy modules, lower it to bound calls.
+- `find_references` at project scope is now bounded by that same budget as an overall wall-clock deadline, not just
+  per file. It fans one worker query out across every module in the project (hundreds in a large tree), so the
+  per-request timeout alone left the aggregate sweep able to run for many minutes and appear to hang. The deadline now
+  runs concurrently with each in-flight query, so even a single stalled module cannot block the call; whatever was
+  indexed before the deadline is returned with a truncation warning and a cue to narrow with `files` or raise the budget.
 
 ## [0.2.0] - 2026-06-02
 

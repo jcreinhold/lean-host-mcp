@@ -344,6 +344,15 @@ impl ProjectBroker {
         broker
     }
 
+    /// The configured per-request worker deadline, in milliseconds. Tools that
+    /// fan a single call out across many worker requests (project-scope
+    /// `find_references`) reuse it as an overall wall-clock budget so the whole
+    /// call stays bounded, not just each individual request.
+    #[must_use]
+    pub fn request_timeout_millis(&self) -> u64 {
+        self.runtime_config.request_timeout_millis()
+    }
+
     fn spawn_reaper(self: &Arc<Self>) {
         if self.config.idle_timeout.is_zero() {
             return;
