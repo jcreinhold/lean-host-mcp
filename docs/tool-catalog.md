@@ -31,10 +31,12 @@ the [README](../README.md#response-envelope). Lean-domain outcomes — a failed 
 — are part of a successful (`status: "ok"`) result. A full project mailbox or a restart-loop failure is reported as a
 retryable `runtime_unavailable` response, documented in [`operations.md`](operations.md#runtime-error-contract).
 
-The cache hash, import list, and worker `runtime` facts live in a top-level `telemetry` block that is **omitted by
-default** (`telemetry.verbosity = quiet`); set `telemetry.verbosity = full` to emit it. The per-call tuning knobs that
-used to ride on these requests (`max_field_bytes`, `max_total_bytes`, `heartbeat_limit`) are now server config — see
-[`operations.md`](operations.md).
+Operational telemetry is **omitted by default** (`telemetry.verbosity = quiet`); set `telemetry.verbosity = full` to
+emit it. This gates the top-level `telemetry` block (cache hash, import list, worker `runtime` facts) and the per-tool
+diagnostics that are pure tuning signal: `proof_state`'s `query_facts` and `search_for_proof`'s `funnel`. Load-bearing
+signals an agent acts on — truncation flags, `needs_build`, `proof_state_status`, `search_truncated` — stay regardless.
+The per-call tuning knobs that used to ride on these requests (`max_field_bytes`, `max_total_bytes`, `heartbeat_limit`)
+are now server config — see [`operations.md`](operations.md).
 
 ## `proof_state`
 
@@ -72,7 +74,7 @@ A successful response carries `status: "context"` and the context itself:
   "locals": [ { "name": "h", "type_str": { "value": "p", "truncated": false }, "value": null } ],
   "expected_type": { "value": "p ∧ q", "truncated": false },
   "truncated": false,
-  "query_facts": { "cache_status": "hit", "output_bytes": 412 /* … */ }
+  "query_facts": { "cache_status": "hit", "output_bytes": 412 /* … */ }  // full verbosity only
 }
 ```
 
@@ -112,20 +114,24 @@ name with `inspect_declaration` to read its statement or attributes.
 
 ```jsonc
 {
-  "declarations": [
+  "candidates": [
     {
       "name": "And.intro",
       "kind": "theorem",
       "module": "Init.Core",
       "score": 87,
-      "rank": 0,
       "match_reason": "conclusion_head",
+      "suggested_snippet": "exact And.intro",
       "source": { "file": "…", "start_line": 1, "start_column": 0, "end_line": 1, "end_column": 0 }
     }
     // … up to `limit` rows, ranked best-first
   ],
-  "truncated": false,
-  "facts": { "declarations_scanned": 1840, "timings": { /* … */ } }
+  "diagnostics": {
+    "proof_state_status": "context",   // where the goal came from; `context` = live proof state
+    "returned_count": 1,
+    "search_truncated": false,
+    "funnel": { "search_count": 3, "generated_count": 1840, "pruned_count": 120 /* … */ }  // full verbosity only
+  }
 }
 ```
 

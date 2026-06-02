@@ -273,13 +273,17 @@ pub enum ProofStateResult {
         ambiguous: Vec<DeclarationTargetInfo>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         budget_exceeded: Vec<SelectorMessage>,
-        query_facts: Box<ModuleQueryFacts>,
+        /// Worker-query telemetry (cache status, byte counts, timings). Pure
+        /// operational signal; emitted only under `telemetry.verbosity = full`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query_facts: Option<Box<ModuleQueryFacts>>,
     },
     HeaderParseFailed {
         summary: DiagnosticSummary,
         diagnostics: Vec<Diagnostic>,
         truncated: bool,
-        query_facts: ModuleQueryFacts,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query_facts: Option<ModuleQueryFacts>,
     },
     Unsupported,
 }
@@ -340,7 +344,9 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             facts,
             missing_imports,
         } => {
-            let query_facts = project_query_facts(facts);
+            // `ModuleQueryFacts` is pure operational telemetry; build it only
+            // when the agent opted into `full` verbosity.
+            let query_facts = ctx.config.verbosity.is_full().then(|| project_query_facts(facts));
             let mut diagnostics = DiagnosticsBlock {
                 summary: DiagnosticSummary::default(),
                 diagnostics: Vec::new(),
@@ -423,7 +429,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                     needs_build,
                     ambiguous,
                     budget_exceeded,
-                    query_facts: Box::new(query_facts.clone()),
+                    query_facts: query_facts.map(Box::new),
                 },
                 freshness,
             )
@@ -442,7 +448,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 Some(event) => crate::diagnosis::warn_execution_taint(response, event),
                 None => response,
             };
-            Ok(attach_batch_query_notes(response, &query_facts, &missing_imports))
+            Ok(warn_session_missing_imports(response, &missing_imports))
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
             let block = diagnostics_block(diagnostics);
@@ -451,7 +457,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                     summary: block.summary,
                     diagnostics: block.diagnostics,
                     truncated: block.truncated,
-                    query_facts: project_query_facts(facts),
+                    query_facts: ctx.config.verbosity.is_full().then(|| project_query_facts(facts)),
                 },
                 freshness,
             )
@@ -508,24 +514,8 @@ fn needs_build_context(message: String) -> ProofStateResult {
         }],
         ambiguous: Vec::new(),
         budget_exceeded: Vec::new(),
-        query_facts: Box::new(degraded_query_facts()),
-    }
-}
-
-/// Zeroed query facts for a degrade path where no query ran: `cache_status`
-/// "unknown" rather than a misleading hit/miss, and zero timings.
-fn degraded_query_facts() -> ModuleQueryFacts {
-    ModuleQueryFacts {
-        cache_status: "unknown",
-        output_bytes: 0,
-        cache_entry_count: None,
-        cache_approx_bytes: None,
-        timings: ModuleQueryTimings {
-            header_import_micros: 0,
-            elaboration_micros: 0,
-            projection_micros: 0,
-            rendering_micros: 0,
-        },
+        // No query ran on this degrade path, so there are no facts to report.
+        query_facts: None,
     }
 }
 
@@ -1198,26 +1188,15 @@ where
             "{kind} result cached; repeating the same query against the same file contents reuses it"
         ));
     }
-    if !missing_imports.is_empty() {
-        response.warnings.push(format!(
-            "file header referenced imports not present in the opened session: {}",
-            missing_imports.join(", ")
-        ));
-    }
-    response
+    warn_session_missing_imports(response, missing_imports)
 }
 
-fn attach_batch_query_notes<T>(
-    mut response: Response<T>,
-    facts: &ModuleQueryFacts,
-    missing_imports: &[String],
-) -> Response<T>
+/// Warn when the file header imports modules the opened worker session lacks —
+/// the agent's queries see a partial environment until those imports build.
+fn warn_session_missing_imports<T>(mut response: Response<T>, missing_imports: &[String]) -> Response<T>
 where
     T: Serialize + JsonSchema,
 {
-    response
-        .next_actions
-        .push(format!("worker module snapshot cache status: {}", facts.cache_status));
     if !missing_imports.is_empty() {
         response.warnings.push(format!(
             "file header referenced imports not present in the opened session: {}",
@@ -1351,7 +1330,9 @@ import Init -- comment
             needs_build: Vec::new(),
             ambiguous: Vec::new(),
             budget_exceeded: Vec::new(),
-            query_facts: Box::new(project_query_facts(worker_facts(LeanWorkerModuleCacheStatus::Miss))),
+            query_facts: Some(Box::new(project_query_facts(worker_facts(
+                LeanWorkerModuleCacheStatus::Miss,
+            )))),
         };
 
         let value = serde_json::to_value(&result).unwrap();

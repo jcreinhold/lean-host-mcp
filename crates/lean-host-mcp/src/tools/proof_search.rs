@@ -92,17 +92,32 @@ pub struct ProofSearchCandidate {
     pub suggested_snippet: Option<String>,
 }
 
+/// How the candidate set interpretation context an agent acts on, plus the
+/// optional search funnel an operator reads when tuning retrieval.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ProofSearchDiagnostics {
+    /// Where the goal text came from: `context` (live proof state) or a degraded
+    /// fallback (e.g. `explicit_text`). Tells the agent how much to trust ranking.
     pub proof_state_status: String,
+    pub returned_count: usize,
+    /// A search hit its fan-out cap, so the candidate set may be incomplete.
+    pub search_truncated: bool,
+    /// Retrieval funnel counts and cache status. Pure operational telemetry;
+    /// emitted only under `telemetry.verbosity = full`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funnel: Option<SearchFunnel>,
+}
+
+/// The retrieval funnel: how many declarations each stage produced and pruned.
+/// Operator-facing tuning signal, not something a proof step depends on.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SearchFunnel {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_status: Option<String>,
     pub search_count: usize,
     pub generated_count: usize,
     pub pruned_count: usize,
     pub ranked_count: usize,
-    pub returned_count: usize,
-    pub search_truncated: bool,
     pub response_bytes: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub broad_pruning: Vec<String>,
@@ -160,6 +175,7 @@ struct CandidateAccumulator {
 pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> Result<Response<SearchForProofResult>> {
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let mode = req.mode.unwrap_or_default();
+    let full = ctx.config.verbosity.is_full();
     let project = req.project.clone();
     let mut profile = target_profile(ctx, req).await?;
     let mut warnings = std::mem::take(&mut profile.warnings);
@@ -167,7 +183,7 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
 
     if searches.is_empty() {
         warnings.push("no usable goal constants, heads, or name fragments were available for retrieval".to_owned());
-        let result = empty_result(profile, warnings);
+        let result = empty_result(profile, warnings, full);
         let hint = ProjectHint::from_request(project);
         let runtime = ctx.broker.project_runtime(hint, Vec::new()).await?;
         return Ok(Response::ok(result, runtime.freshness).with_runtime(runtime.runtime));
@@ -181,7 +197,7 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
         {
             Ok(call) => call,
             Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
-                let result = empty_result(profile.clone(), warnings);
+                let result = empty_result(profile.clone(), warnings, full);
                 let hint = ProjectHint::from_request(project);
                 let project_runtime = ctx.broker.project_runtime(hint, profile.imports.clone()).await?;
                 let response = Response::ok(result, project_runtime.freshness).with_runtime(project_runtime.runtime);
@@ -199,7 +215,7 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     }
 
     let search_count = search_results.len();
-    let result = rank_results(&profile, mode, limit, search_count, search_results, warnings);
+    let result = rank_results(&profile, mode, limit, search_count, search_results, warnings, full);
     let freshness_imports = profile.imports.clone();
     let hint = ProjectHint::from_request(project);
     let project_runtime = ctx.broker.project_runtime(hint, freshness_imports).await?;
@@ -284,7 +300,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                     namespace_name,
                     imports,
                     "context".to_owned(),
-                    Some(query_facts.cache_status.to_owned()),
+                    query_facts.map(|facts| facts.cache_status.to_owned()),
                     warnings,
                 ));
             }
@@ -515,6 +531,7 @@ fn rank_results(
     search_count: usize,
     search_results: Vec<(&'static str, DeclarationSearchResult)>,
     warnings: Vec<String>,
+    full: bool,
 ) -> SearchForProofResult {
     let mut generated_count = 0usize;
     let mut pruned_count = 0usize;
@@ -581,46 +598,63 @@ fn rank_results(
         );
     }
 
+    let funnel = full.then(|| SearchFunnel {
+        cache_status: profile.cache_status.clone(),
+        search_count,
+        generated_count,
+        pruned_count,
+        ranked_count,
+        response_bytes: 0,
+        broad_pruning,
+    });
     let mut result = SearchForProofResult {
         diagnostics: ProofSearchDiagnostics {
             proof_state_status: profile.proof_state_status.clone(),
-            cache_status: profile.cache_status.clone(),
-            search_count,
-            generated_count,
-            pruned_count,
-            ranked_count,
             returned_count: candidates.len(),
             search_truncated,
-            response_bytes: 0,
-            broad_pruning,
+            funnel,
         },
         candidates,
         warnings,
     };
     result.diagnostics.returned_count = result.candidates.len();
-    result.diagnostics.response_bytes = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
+    record_response_bytes(&mut result);
     result
 }
 
-fn empty_result(profile: TargetProfile, warnings: Vec<String>) -> SearchForProofResult {
+fn empty_result(profile: TargetProfile, warnings: Vec<String>, full: bool) -> SearchForProofResult {
+    let funnel = full.then(|| SearchFunnel {
+        cache_status: profile.cache_status,
+        search_count: 0,
+        generated_count: 0,
+        pruned_count: 0,
+        ranked_count: 0,
+        response_bytes: 0,
+        broad_pruning: Vec::new(),
+    });
     let mut result = SearchForProofResult {
         candidates: Vec::new(),
         diagnostics: ProofSearchDiagnostics {
             proof_state_status: profile.proof_state_status,
-            cache_status: profile.cache_status,
-            search_count: 0,
-            generated_count: 0,
-            pruned_count: 0,
-            ranked_count: 0,
             returned_count: 0,
             search_truncated: false,
-            response_bytes: 0,
-            broad_pruning: Vec::new(),
+            funnel,
         },
         warnings,
     };
-    result.diagnostics.response_bytes = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
+    record_response_bytes(&mut result);
     result
+}
+
+/// Stamp the funnel's `response_bytes` with the serialized result size, when the
+/// funnel is present. A self-referential measurement, so it runs last.
+fn record_response_bytes(result: &mut SearchForProofResult) {
+    if result.diagnostics.funnel.is_some() {
+        let bytes = serde_json::to_vec(result).map_or(0, |bytes| bytes.len());
+        if let Some(funnel) = result.diagnostics.funnel.as_mut() {
+            funnel.response_bytes = bytes;
+        }
+    }
 }
 
 fn candidate_score(
@@ -1238,8 +1272,9 @@ mod tests {
             None,
             Vec::new(),
         );
-        let result = empty_result(profile, Vec::new());
+        let result = empty_result(profile, Vec::new(), false);
         assert_eq!(result.diagnostics.returned_count, 0);
+        assert!(result.diagnostics.funnel.is_none(), "quiet omits the search funnel");
         assert_eq!(MAX_LIMIT, 20);
     }
 

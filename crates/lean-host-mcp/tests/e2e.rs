@@ -23,7 +23,7 @@ use lean_host_mcp::tools::proof_action::{
     TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
 };
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
-use lean_host_mcp::tools::{ToolConfig, ToolContext};
+use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
     BrokerConfig, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker, ProofAttemptResult,
 };
@@ -45,7 +45,12 @@ fn open_ctx(root: &Path) -> ToolContext {
     });
     ToolContext {
         broker,
-        config: ToolConfig::default(),
+        // These tests assert on worker-query telemetry (cache hit/miss, runtime
+        // facts), which is gated behind `full` verbosity.
+        config: ToolConfig {
+            verbosity: TelemetryVerbosity::Full,
+            ..ToolConfig::default()
+        },
     }
 }
 
@@ -130,7 +135,10 @@ async fn inspect_proof_state_try_verify_and_references() {
         goals_after.len() <= 1,
         "proof state projection should be bounded and stable"
     );
-    assert_eq!(query_facts.cache_status, "miss");
+    assert_eq!(
+        query_facts.expect("query_facts under full verbosity").cache_status,
+        "miss"
+    );
 
     let warm = proof_state(
         &ctx,
@@ -146,7 +154,10 @@ async fn inspect_proof_state_try_verify_and_references() {
     let ProofStateResult::Context { query_facts, .. } = warm.result.expect("warm proof result") else {
         panic!("expected warm proof context");
     };
-    assert_eq!(query_facts.cache_status, "hit");
+    assert_eq!(
+        query_facts.expect("query_facts under full verbosity").cache_status,
+        "hit"
+    );
 
     let before = fs::read(root.join(proof_actions_file())).expect("fixture source before");
     let bad = try_proof_step(
