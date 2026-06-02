@@ -355,6 +355,141 @@ async fn inspect_proof_state_try_verify_and_references() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn find_references_project_scope_reads_index_with_cross_module_hits() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    // Project scope reads the on-disk `.ilean` index (build-fresh), not the
+    // worker — so a name defined in one module and used in another comes back
+    // whole, with no per-file elaboration.
+    let started = std::time::Instant::now();
+    let refs = find_references(
+        &ctx,
+        FindReferencesRequest {
+            name: "LeanRsFixture.ProofSearchFacts.MiniRat".to_owned(),
+            scope: ReferenceScope::Project,
+            file: None,
+            files: Vec::new(),
+            limit: Some(1000),
+            project: None,
+        },
+    )
+    .await
+    .expect("find references (project)");
+    let elapsed = started.elapsed();
+
+    let FindReferencesResult::Ok {
+        references,
+        files_scanned,
+        ..
+    } = refs.result.expect("references result")
+    else {
+        panic!("project references should succeed");
+    };
+
+    // The whole project's `.ilean` modules were indexed, not a single file.
+    assert!(
+        files_scanned > 1,
+        "project scope should index multiple modules, got {files_scanned}"
+    );
+
+    // The definition site, with exact coordinates carried from the index. The
+    // `.ilean` records `MiniRat` at 0-based `[2,10,2,17]`; the wire form is
+    // 1-based on both axes, so this pins the index→wire conversion.
+    let def = references
+        .iter()
+        .find(|reference| reference.kind == "def")
+        .expect("definition hit");
+    assert!(
+        def.file.ends_with("LeanRsFixture/ProofSearchFacts.lean"),
+        "def should live in the defining module, got {}",
+        def.file
+    );
+    assert_eq!(
+        (def.line, def.column, def.end_line, def.end_column),
+        (3, 11, 3, 18),
+        "definition coordinates should match the index, converted to 1-based"
+    );
+
+    // Cross-module usages: the defining module and a separate consumer module.
+    assert!(
+        references
+            .iter()
+            .any(|r| r.kind == "ref" && r.file.ends_with("LeanRsFixture/ProofSearchFacts.lean")),
+        "expected a usage in the defining module"
+    );
+    assert!(
+        references
+            .iter()
+            .any(|r| r.kind == "ref" && r.file.ends_with("LeanRsFixture/ProofAgent.lean")),
+        "expected a cross-module usage in ProofAgent"
+    );
+
+    // The index read involves no per-file elaboration, so it returns promptly.
+    // Generous bound: robust against a cold worker spawn for the freshness
+    // snapshot, while still catching a regression to the per-file worker sweep.
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "index-backed project scope should be prompt, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn find_references_project_scope_unbuilt_degrades_to_needs_build() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+
+    // Copy the fixture, then drop its reference index so the project reads as
+    // "never built". The honest verdict is a `needs_build` warning, not an empty
+    // "no references" answer.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(format!("{}/.", root.display()))
+        .arg(tmp.path())
+        .status()
+        .expect("copy fixture");
+    assert!(status.success(), "cp -R fixture failed");
+    let build_index = tmp.path().join(".lake/build/lib/lean");
+    if build_index.is_dir() {
+        fs::remove_dir_all(&build_index).expect("remove build index");
+    }
+
+    let ctx = open_ctx(tmp.path());
+    let refs = find_references(
+        &ctx,
+        FindReferencesRequest {
+            name: "LeanRsFixture.ProofSearchFacts.MiniRat".to_owned(),
+            scope: ReferenceScope::Project,
+            file: None,
+            files: Vec::new(),
+            limit: Some(1000),
+            project: None,
+        },
+    )
+    .await
+    .expect("find references (unbuilt)");
+
+    let warnings = refs.warnings.clone();
+    let FindReferencesResult::Ok { references, .. } = refs.result.expect("references result") else {
+        panic!("unbuilt project should still return an Ok envelope");
+    };
+    assert!(
+        references.is_empty(),
+        "an unbuilt project must not invent references, got {references:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("lake build")),
+        "unbuilt project should ride a needs_build/`lake build` warning, got {warnings:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn search_for_proof_prefers_relevant_fixture_lemmas() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");

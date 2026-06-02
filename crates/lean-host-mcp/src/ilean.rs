@@ -25,11 +25,6 @@
 //! `src/lean/Lean/Data/Lsp/Internal.lean` (`RefIdent`, `RefInfo`, `ModuleRefs`),
 //! `src/lean/Lean/Server/References.lean` (`Ilean` / `Ilean.load`).
 
-#![allow(
-    dead_code,
-    reason = "standalone reader; find_references consumes references_to in a follow-up change"
-)]
-
 use std::fmt;
 use std::path::{Path, PathBuf};
 

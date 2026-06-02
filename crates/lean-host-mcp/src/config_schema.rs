@@ -104,7 +104,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "120000",
         commented: false,
         overrides: "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
-        description: "Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose verify/proof_state legitimately runs longer; lower it to bound whole-project scans (e.g. find_references at project scope). Default 120 s.",
+        description: "Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose verify/proof_state legitimately runs longer; lower it to bound a single heavy file query. Default 120 s.",
     },
     FieldDoc {
         key: "runtime.project_mailbox_capacity",

@@ -8,7 +8,6 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationTargetInfo, LeanWorkerDeclarationTargetResult, LeanWorkerElabOptions, LeanWorkerLocalInfo,
@@ -21,14 +20,13 @@ use lean_rs_worker_parent::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 use crate::broker::ProjectHint;
 use crate::envelope::{Freshness, Response, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
 use crate::tools::source_input::{header_imports, read_query_file, resolve_path};
-use crate::tools::{ToolContext, is_ignored_dir, session_imports};
+use crate::tools::{ToolContext, session_imports};
 
 /// Hard cap on project-wide reference aggregation. File-local reference
 /// queries are also bounded by the upstream projection.
@@ -583,9 +581,16 @@ pub struct MissingImportsFile {
 pub enum FindReferencesResult {
     Ok {
         references: Vec<ReferenceHit>,
+        /// The `limit` (or `MAX_REFERENCES`) cap was hit; the returned set is a
+        /// stable prefix of the full answer.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        /// Project scope: `.ilean` modules parsed into the index. File scope:
+        /// the single anchor file, if it elaborated.
         files_scanned: usize,
+        /// Project scope: `.ilean` modules skipped because they were unreadable,
+        /// malformed, or an unsupported version. File scope: the anchor file, if
+        /// it could not be read.
         files_skipped: usize,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         unsupported_files: Vec<String>,
@@ -607,68 +612,63 @@ pub enum FindReferencesResult {
 /// infrastructure reason. Files that cannot be read are counted as skipped
 /// files so a bounded project-scope lookup can continue.
 pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> Result<Response<FindReferencesResult>> {
-    let hint = ProjectHint::from_request(req.project);
+    let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let base = ctx.broker.project_runtime(hint.clone(), Vec::new()).await?;
     let freshness = base.freshness;
-    let mut runtime = base.runtime;
+    let runtime = base.runtime;
     let root = meta.canonical_root;
-    let files = match req.scope {
-        ReferenceScope::File => {
-            let Some(file) = req.file.as_ref() else {
-                return Ok(Response::ok(
-                    FindReferencesResult::InvalidRequest {
-                        message: "find_references with scope=file requires `file`".to_owned(),
-                        semantic_based: true,
-                    },
-                    freshness,
-                )
-                .with_runtime(runtime));
-            };
-            if !req.files.is_empty() {
-                return Ok(Response::ok(
-                    FindReferencesResult::InvalidRequest {
-                        message: "find_references with scope=file accepts `file`, not `files`".to_owned(),
-                        semantic_based: true,
-                    },
-                    freshness,
-                )
-                .with_runtime(runtime));
-            }
-            vec![resolve_path(&root, file)]
-        }
-        ReferenceScope::Project => {
-            if req.file.is_some() {
-                return Ok(Response::ok(
-                    FindReferencesResult::InvalidRequest {
-                        message: "find_references with scope=project accepts `files`, not `file`".to_owned(),
-                        semantic_based: true,
-                    },
-                    freshness,
-                )
-                .with_runtime(runtime));
-            }
-            if req.files.is_empty() {
-                enumerate_lean_files(&root)
-            } else {
-                req.files.iter().map(|p| resolve_path(&root, p)).collect()
-            }
-        }
-    };
     let limit = req.limit.unwrap_or(MAX_REFERENCES).min(MAX_REFERENCES);
 
-    // Project scope issues one worker request per file, so the per-request
-    // timeout bounds each query but not the aggregate sweep — a large project
-    // could fan out over hundreds of files and appear to hang. Reuse the
-    // per-request budget as an overall wall-clock deadline that runs
-    // concurrently with each in-flight query (`tokio::time::timeout` below), so
-    // the whole call stays bounded even if a single file's query stalls.
-    // Whatever was indexed before the deadline is returned with a truncation
-    // warning.
-    let scan_budget = Duration::from_millis(ctx.broker.request_timeout_millis());
-    let scan_started = tokio::time::Instant::now();
-    let files_total = files.len();
-    let mut scan_timed_out = false;
+    // The two scopes answer genuinely different questions and so read from
+    // different sources (ch.17): `file` scope wants *edit-fresh* results for the
+    // file under the cursor, so it elaborates that one file through the worker;
+    // `project` scope wants the whole-project answer, which the on-disk `.ilean`
+    // reference index already holds — *build-fresh* — and reads in milliseconds
+    // with no worker query. The freshness asymmetry is the point, not a bug.
+    match req.scope {
+        ReferenceScope::File => find_references_in_file(ctx, hint, &root, &req, freshness, runtime, limit).await,
+        ReferenceScope::Project => Ok(find_references_in_project(&root, &req, freshness, runtime, limit)),
+    }
+}
+
+/// File scope: elaborate the single anchor file through the worker so results
+/// reflect the file's *current* source (edit-fresh). One file is already bounded
+/// by the broker's per-request timeout, so this path carries no wall-clock
+/// scan deadline.
+async fn find_references_in_file(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    root: &Path,
+    req: &FindReferencesRequest,
+    freshness: Freshness,
+    mut runtime: RuntimeFacts,
+    limit: usize,
+) -> Result<Response<FindReferencesResult>> {
+    let Some(file) = req.file.as_ref() else {
+        return Ok(Response::ok(
+            FindReferencesResult::InvalidRequest {
+                message: "find_references with scope=file requires `file`".to_owned(),
+                semantic_based: true,
+            },
+            freshness,
+        )
+        .with_runtime(runtime));
+    };
+    if !req.files.is_empty() {
+        return Ok(Response::ok(
+            FindReferencesResult::InvalidRequest {
+                message: "find_references with scope=file accepts `file`, not `files`".to_owned(),
+                semantic_based: true,
+            },
+            freshness,
+        )
+        .with_runtime(runtime));
+    }
+
+    let path = resolve_path(root, file);
+    let display = display_path(root, &path);
+    let query = LeanWorkerModuleQuery::References { name: req.name.clone() };
 
     let mut hits: Vec<ReferenceHit> = Vec::new();
     let mut unsupported_files: Vec<String> = Vec::new();
@@ -678,113 +678,85 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut any_freshly_processed = false;
-    // First missing-`.olean` error, if any. Project scope degrades to
-    // "indexed so far" (like the LSP) rather than hard-erroring on the first
-    // unbuilt dependency; this carries the `lake build` cue for the envelope.
+    // An unbuilt transitive dependency surfaces as a missing-`.olean` error; the
+    // file is skipped and the call degrades to the `needs_build` verdict (with
+    // the `lake build` cue) rather than hard-erroring.
     let mut needs_build: Option<ServerError> = None;
 
-    'outer: for path in files {
-        let remaining = scan_budget
-            .checked_sub(scan_started.elapsed())
-            .unwrap_or(Duration::ZERO);
-        if remaining.is_zero() {
-            scan_timed_out = true;
-            truncated = true;
-            break 'outer;
-        }
-        let display = display_path(&root, &path);
-        let query = LeanWorkerModuleQuery::References { name: req.name.clone() };
-        // The timer runs alongside the await: if this single query outlasts the
-        // remaining budget, the timeout fires mid-request and we stop with what
-        // we have rather than blocking on it.
-        let queried =
-            match tokio::time::timeout(remaining, run_module_query(ctx, hint.clone(), &root, &path, query)).await {
-                Ok(queried) => queried,
-                Err(_elapsed) => {
-                    scan_timed_out = true;
-                    truncated = true;
-                    break 'outer;
-                }
-            };
-        match queried {
-            Ok(QueryRun {
-                outcome:
-                    ModuleQueryRun::Ready {
-                        result: LeanWorkerModuleQueryResult::References(result),
-                        freshly_processed,
-                        missing_imports,
-                    },
-                runtime: run_runtime,
-            }) => {
-                runtime = run_runtime;
-                files_scanned = files_scanned.saturating_add(1);
-                any_freshly_processed |= freshly_processed;
-                if !missing_imports.is_empty() {
-                    missing_imports_files.push(MissingImportsFile {
-                        file: display.clone(),
-                        missing: missing_imports,
-                    });
-                }
-                if result.truncated {
-                    truncated = true;
-                }
-                for node in &result.references {
-                    if hits.len() >= limit {
-                        truncated = true;
-                        break 'outer;
-                    }
-                    hits.push(project_reference(&display, node));
-                }
-            }
-            Ok(QueryRun {
-                outcome:
-                    ModuleQueryRun::Ready {
-                        freshly_processed,
-                        missing_imports,
-                        ..
-                    },
-                runtime: run_runtime,
-            }) => {
-                runtime = run_runtime;
-                files_scanned = files_scanned.saturating_add(1);
-                any_freshly_processed |= freshly_processed;
-                if !missing_imports.is_empty() {
-                    missing_imports_files.push(MissingImportsFile {
-                        file: display,
-                        missing: missing_imports,
-                    });
-                }
-            }
-            Ok(QueryRun {
-                outcome: ModuleQueryRun::HeaderParseFailed { diagnostics },
-                runtime: run_runtime,
-            }) => {
-                runtime = run_runtime;
-                header_parse_failed_files.push(HeaderParseFailedFile {
-                    file: display,
-                    diagnostics,
+    match run_module_query(ctx, hint, root, &path, query).await {
+        Ok(QueryRun {
+            outcome:
+                ModuleQueryRun::Ready {
+                    result: LeanWorkerModuleQueryResult::References(result),
+                    freshly_processed,
+                    missing_imports,
+                },
+            runtime: run_runtime,
+        }) => {
+            runtime = run_runtime;
+            files_scanned = files_scanned.saturating_add(1);
+            any_freshly_processed |= freshly_processed;
+            if !missing_imports.is_empty() {
+                missing_imports_files.push(MissingImportsFile {
+                    file: display.clone(),
+                    missing: missing_imports,
                 });
             }
-            Ok(QueryRun {
-                outcome: ModuleQueryRun::Unsupported,
-                runtime: run_runtime,
-            }) => {
-                runtime = run_runtime;
-                unsupported_files.push(display);
+            if result.truncated {
+                truncated = true;
             }
-            Err(ServerError::Io(_)) => {
-                files_skipped = files_skipped.saturating_add(1);
-            }
-            Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
-                // An unbuilt dependency in an unrelated subtree should not make
-                // the whole query fail; skip the file and report needs_build.
-                files_skipped = files_skipped.saturating_add(1);
-                if needs_build.is_none() {
-                    needs_build = Some(err);
+            for node in &result.references {
+                if hits.len() >= limit {
+                    truncated = true;
+                    break;
                 }
+                hits.push(project_reference(&display, node));
             }
-            Err(err) => return Err(err),
         }
+        Ok(QueryRun {
+            outcome:
+                ModuleQueryRun::Ready {
+                    freshly_processed,
+                    missing_imports,
+                    ..
+                },
+            runtime: run_runtime,
+        }) => {
+            runtime = run_runtime;
+            files_scanned = files_scanned.saturating_add(1);
+            any_freshly_processed |= freshly_processed;
+            if !missing_imports.is_empty() {
+                missing_imports_files.push(MissingImportsFile {
+                    file: display,
+                    missing: missing_imports,
+                });
+            }
+        }
+        Ok(QueryRun {
+            outcome: ModuleQueryRun::HeaderParseFailed { diagnostics },
+            runtime: run_runtime,
+        }) => {
+            runtime = run_runtime;
+            header_parse_failed_files.push(HeaderParseFailedFile {
+                file: display,
+                diagnostics,
+            });
+        }
+        Ok(QueryRun {
+            outcome: ModuleQueryRun::Unsupported,
+            runtime: run_runtime,
+        }) => {
+            runtime = run_runtime;
+            unsupported_files.push(display);
+        }
+        Err(ServerError::Io(_)) => {
+            files_skipped = files_skipped.saturating_add(1);
+        }
+        Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
+            files_skipped = files_skipped.saturating_add(1);
+            needs_build = Some(err);
+        }
+        Err(err) => return Err(err),
     }
 
     hits.sort_by(|a, b| {
@@ -817,21 +789,143 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
         ),
         None => response,
     };
-    let response = if scan_timed_out {
-        let scanned = files_scanned.saturating_add(files_skipped);
-        response
-            .warn(format!(
-                "Project-scope scan hit the request time budget after {scanned} of {files_total} files; \
-                 references found so far are returned but the sweep is incomplete."
-            ))
-            .hint(
-                "Narrow the search with `files` (a subset of modules), or raise \
-                 `runtime.request_timeout_millis` (env LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS) for a longer sweep.",
-            )
-    } else {
-        response
-    };
     Ok(response)
+}
+
+/// Project scope: read the on-disk `.ilean` reference index for the whole
+/// project (build-fresh) in milliseconds, with no worker query. Returns the
+/// complete answer up to `limit`; an unbuilt project degrades to `needs_build`
+/// and an index stale relative to current source rides a freshness note.
+fn find_references_in_project(
+    root: &Path,
+    req: &FindReferencesRequest,
+    freshness: Freshness,
+    runtime: RuntimeFacts,
+    limit: usize,
+) -> Response<FindReferencesResult> {
+    if req.file.is_some() {
+        return Response::ok(
+            FindReferencesResult::InvalidRequest {
+                message: "find_references with scope=project accepts `files`, not `file`".to_owned(),
+                semantic_based: true,
+            },
+            freshness,
+        )
+        .with_runtime(runtime);
+    }
+
+    let index = crate::ilean::references_to(root, &req.name);
+
+    // A wholly-absent build directory is the honest "the project is not built"
+    // verdict — degrade to the shared `needs_build` warning, never a silent
+    // empty result (which would read as "no references"). A built tree with zero
+    // hits for the name is a legitimate empty answer, not a degrade.
+    if index.status == crate::ilean::IndexStatus::NotBuilt {
+        let response = Response::ok(empty_references_result(0, 0), freshness).with_runtime(runtime);
+        return crate::diagnosis::warn_needs_build(
+            response,
+            &crate::diagnosis::IncompleteCause::MissingImports(Vec::new()),
+        );
+    }
+
+    // The reader takes no file subset, so a `files`-restricted request reads the
+    // one whole-project index (O(ms)) and filters by relative-to-root path.
+    let restrict: Option<std::collections::HashSet<String>> = (!req.files.is_empty()).then(|| {
+        req.files
+            .iter()
+            .map(|p| display_path(root, &resolve_path(root, p)))
+            .collect()
+    });
+
+    let mut hits: Vec<ReferenceHit> = Vec::new();
+    for loc in &index.references {
+        let display = display_path(root, &loc.file);
+        if restrict.as_ref().is_some_and(|set| !set.contains(&display)) {
+            continue;
+        }
+        hits.push(index_reference(&display, loc));
+    }
+
+    // Sort then cap so the `limit` truncation is deterministic — a stable
+    // prefix, not the arbitrary partial sweep the old per-file deadline returned.
+    hits.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line.cmp(&b.line))
+            .then(a.column.cmp(&b.column))
+    });
+    let truncated = hits.len() > limit;
+    hits.truncate(limit);
+
+    let result = FindReferencesResult::Ok {
+        references: hits,
+        truncated,
+        files_scanned: index.modules_scanned,
+        files_skipped: index.modules_skipped,
+        unsupported_files: Vec::new(),
+        header_parse_failed_files: Vec::new(),
+        missing_imports_files: Vec::new(),
+        semantic_based: true,
+    };
+    let response = Response::ok(result, freshness).with_runtime(runtime);
+    if index.stale_sources.is_empty() {
+        return response;
+    }
+    let names = index
+        .stale_sources
+        .iter()
+        .take(3)
+        .map(|p| display_path(root, p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = index.stale_sources.len().saturating_sub(3);
+    let suffix = if more > 0 {
+        format!(", … (+{more} more)")
+    } else {
+        String::new()
+    };
+    response
+        .warn(format!(
+            "reference index is build-fresh, not edit-fresh: {} contributing module(s) have source newer than \
+             their .ilean ({names}{suffix}); results reflect the last `lake build`.",
+            index.stale_sources.len()
+        ))
+        .hint("re-run `lake build` to refresh the reference index for edited modules")
+}
+
+/// An empty `Ok` reference result, used for the `needs_build` degrade where the
+/// query produced no hits but the warning — not the empty list — carries the
+/// verdict.
+fn empty_references_result(files_scanned: usize, files_skipped: usize) -> FindReferencesResult {
+    FindReferencesResult::Ok {
+        references: Vec::new(),
+        truncated: false,
+        files_scanned,
+        files_skipped,
+        unsupported_files: Vec::new(),
+        header_parse_failed_files: Vec::new(),
+        missing_imports_files: Vec::new(),
+        semantic_based: true,
+    }
+}
+
+/// Project an index location onto a wire `ReferenceHit`. The index stores
+/// 0-based LSP line/column; the worker `References` path emits 1-based line and
+/// 1-based column (the shim's `FileMap.toPosition` is 1-based line / 0-based
+/// column, then `+1` on column), so `+1` on both line and column makes the two
+/// paths' coordinates identical to the caller.
+fn index_reference(file: &str, loc: &crate::ilean::ReferenceLocation) -> ReferenceHit {
+    ReferenceHit {
+        file: file.to_owned(),
+        line: loc.start_line.saturating_add(1),
+        column: loc.start_column.saturating_add(1),
+        end_line: loc.end_line.saturating_add(1),
+        end_column: loc.end_column.saturating_add(1),
+        kind: match loc.kind {
+            crate::ilean::RefKind::Def => "def",
+            crate::ilean::RefKind::Ref => "ref",
+        },
+    }
 }
 
 // --- shared plumbing ---------------------------------------------------
@@ -1267,16 +1361,6 @@ where
         ));
     }
     response
-}
-
-fn enumerate_lean_files(root: &Path) -> Vec<PathBuf> {
-    WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|entry| entry.file_name().to_str().is_none_or(|name| !is_ignored_dir(name)))
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "lean"))
-        .map(|entry| entry.into_path())
-        .collect()
 }
 
 #[cfg(test)]

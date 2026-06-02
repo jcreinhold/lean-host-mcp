@@ -129,9 +129,3 @@ pub(crate) fn session_imports(imports: Vec<String>) -> Vec<String> {
         out
     }
 }
-
-/// Directory names skipped during `.lean` file enumeration. Shared between
-/// reference scans so they agree on what counts as "the project".
-pub(crate) fn is_ignored_dir(name: &str) -> bool {
-    matches!(name, ".lake" | ".git" | "target" | "build" | "node_modules" | ".direnv")
-}

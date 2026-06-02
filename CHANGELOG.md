@@ -11,6 +11,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- `find_references` at `scope: "project"` now reads Lean's on-disk `.ilean` reference index instead of elaborating every
+  `.lean` file through the worker. The old path issued one worker module-query per file (~3 s/file → ~27 min on a
+  ~500-file project) and only returned an arbitrary truncated prefix when it hit the request-time budget. The index read
+  is sub-second, returns the **complete** result (only the `limit` cap truncates, on a stable sorted prefix), and
+  involves the worker not at all. Project-scope results are now **build-fresh** — they reflect the last `lake build` —
+  while `file` scope stays on the worker path and remains **edit-fresh** (current source); the asymmetry is documented
+  in the tool catalog. An unbuilt project degrades to the existing `needs_build` top-level warning (not an empty "no
+  references", not a hard error), and an index stale relative to current source rides a freshness note. The
+  `files_scanned`/`files_skipped` counters now report `.ilean` modules indexed / skipped at project scope. The now-moot
+  per-file wall-clock scan deadline and its "hit the request time budget" warning are gone.
 - The default proof position is now the **pristine entry goal** — the state before any tactic runs. `proof_state` and
   `try_proof_step` previously disagreed: `proof_state`'s `goals_before` showed the entry goal, but `try_proof_step`
   spliced a candidate _after_ the first tactic, so a from-scratch tactic block read off `proof_state` failed with
@@ -33,18 +43,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   every envelope.
 - `install-worker --auto` (the default) now rebuilds **stale** workers — host-version skew, `lean.h` header drift, or a
   failed/absent smoke record — not just missing ones, and skips out-of-window toolchains instead of failing on them. So
-  re-running it after a `lean-host-mcp` upgrade brings every worker back in step. `--force` rebuilds current workers too.
+  re-running it after a `lean-host-mcp` upgrade brings every worker back in step. `--force` rebuilds current workers
+  too.
 - `install-worker --clean [--toolchain <id>]` removes all installed workers (or one); `install-worker --prune` removes
   only unservable workers (outside the supported window, or with a failed smoke test), keeping servable-but-stale ones.
   Both are idempotent and only touch the install root.
 - Configurable per-request timeout: `runtime.request_timeout_millis` (env `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS`),
-  default **120 s**. Replaces the worker's fixed 10-minute long-running profile. On expiry the worker is recycled and the
-  call returns a retryable runtime error; raise it for unusually heavy modules, lower it to bound calls.
-- `find_references` at project scope is now bounded by that same budget as an overall wall-clock deadline, not just
-  per file. It fans one worker query out across every module in the project (hundreds in a large tree), so the
-  per-request timeout alone left the aggregate sweep able to run for many minutes and appear to hang. The deadline now
-  runs concurrently with each in-flight query, so even a single stalled module cannot block the call; whatever was
-  indexed before the deadline is returned with a truncation warning and a cue to narrow with `files` or raise the budget.
+  default **120 s**. Replaces the worker's fixed 10-minute long-running profile. On expiry the worker is recycled and
+  the call returns a retryable runtime error; raise it for unusually heavy modules, lower it to bound calls.
+- `find_references` at project scope is now bounded by that same budget as an overall wall-clock deadline, not just per
+  file. It fans one worker query out across every module in the project (hundreds in a large tree), so the per-request
+  timeout alone left the aggregate sweep able to run for many minutes and appear to hang. The deadline now runs
+  concurrently with each in-flight query, so even a single stalled module cannot block the call; whatever was indexed
+  before the deadline is returned with a truncation warning and a cue to narrow with `files` or raise the budget.
 
 ## [0.2.0] - 2026-06-02
 

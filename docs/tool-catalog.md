@@ -325,10 +325,30 @@ or the project, optionally narrowed to an explicit file list and a `limit` (capp
 }
 ```
 
-Project scope also reports header-parse failures, files with missing imports, and unsupported files, so a partial scan
-is visible rather than silent. If a file's query hits a missing `.olean` (an unbuilt dependency), project scope **does
-not** fail the whole request: it skips that file, continues — returning the references indexed so far, like an editor's
-"indexed so far" — and attaches a top-level `needs_build` warning naming the blocking `lake build` cue.
+### `file` vs `project`: edit-fresh vs build-fresh
+
+The two scopes deliberately read from different sources because they answer different questions:
+
+- **`file`** elaborates the one anchor file through the worker, so its results reflect that file's **current source** —
+  _edit-fresh_, no `lake build` required. `files_scanned`/`files_skipped` count the single anchor file.
+- **`project`** reads Lean's on-disk `.ilean` reference index (written by `lake build`), so it returns the whole-project
+  answer in milliseconds with **no per-file elaboration and no worker query**. Results are therefore **build-fresh**:
+  they reflect the **last `lake build`**, not unsaved or post-build edits. `files_scanned`/`files_skipped` count the
+  `.ilean` modules parsed / skipped (a malformed or unreadable index is skipped, never fatal). The complete result is
+  returned up to `limit` (then `truncated: true` on a stable, sorted prefix).
+
+So `project` is the fast, exhaustive view of the built project, and `file` is the live view of the file you are editing.
+A name with no recorded uses returns an empty `references` list — a legitimate "no references" answer, not a degrade.
+
+If the project has **never been built** (no `.lake/build/lib/lean`), project scope does **not** invent an empty "no
+references" answer: it returns `references: []` with a top-level `needs_build` warning naming the `lake build` cue — the
+same honest verdict every resolution-bearing tool gives for an unbuilt project. If the index exists but some
+contributing module's source is **newer than its `.ilean`** (edited since the last build), the result rides a freshness
+warning noting that project-scope results are build-fresh and a `lake build` will refresh them — a note, never an error.
+
+`file` scope still reports header-parse failures, files with missing imports, and unsupported files when they apply, and
+degrades a missing `.olean` (an unbuilt transitive dependency) to the same top-level `needs_build` warning rather than
+failing the request.
 
 ## The `needs_build` signal
 
