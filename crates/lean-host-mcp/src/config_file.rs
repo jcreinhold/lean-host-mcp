@@ -65,6 +65,7 @@ pub struct BrokerFileConfig {
     pub semantic_permits: Option<usize>,
     pub semantic_waiters: Option<usize>,
     pub semantic_admission_timeout_millis: Option<u64>,
+    pub semantic_lock_dir: Option<PathBuf>,
 }
 
 /// `[server]` — transport knobs.

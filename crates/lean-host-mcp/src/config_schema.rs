@@ -153,7 +153,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "1",
         commented: false,
         overrides: "LEAN_HOST_MCP_SEMANTIC_PERMITS",
-        description: "How many semantic (elaborating) calls run concurrently across all projects. Lean elaboration is single-threaded per worker, so raising this helps only when hosting several projects at once.",
+        description: "How many semantic (elaborating) calls run concurrently across all projects and parallel server processes sharing the semantic lock directory.",
     },
     FieldDoc {
         key: "broker.semantic_waiters",
@@ -170,6 +170,14 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         commented: false,
         overrides: "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS",
         description: "How long a semantic call waits for a permit before giving up with a retryable semantic_admission_timeout status. Default 60 seconds.",
+    },
+    FieldDoc {
+        key: "broker.semantic_lock_dir",
+        ty: "path",
+        value: "\"/path/to/semantic-admission-locks\"",
+        commented: true,
+        overrides: "LEAN_HOST_MCP_SEMANTIC_LOCK_DIR",
+        description: "Directory for OS-visible cross-process semantic admission locks. Unset uses the per-user cache directory. Parallel servers sharing a directory must agree on broker.semantic_permits.",
     },
     // ---- [server] — transport (CLI/env still override) ------------------
     FieldDoc {
@@ -356,6 +364,7 @@ mod tests {
             toml::from_str(&toml).unwrap_or_else(|e| panic!("generated TOML is invalid: {e}\n{toml}"));
         // The optional, commented knobs stay unset.
         assert!(config.primary_project.is_none());
+        assert!(config.broker.semantic_lock_dir.is_none());
         assert!(config.server.bind.is_none());
         assert!(config.server.http_path.is_none());
     }

@@ -51,9 +51,10 @@ description (e.g. "5 GiB") is for reading, not for setting.
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
 | `broker.max_projects` | integer | `4` | `LEAN_HOST_MCP_MAX_PROJECTS` | How many distinct Lake projects stay open at once; on overflow the least-recently-used project's worker is evicted. |
 | `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes. |
-| `broker.semantic_permits` | integer | `1` | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | How many semantic (elaborating) calls run concurrently across all projects. Lean elaboration is single-threaded per worker, so raising this helps only when hosting several projects at once. |
+| `broker.semantic_permits` | integer | `1` | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | How many semantic (elaborating) calls run concurrently across all projects and parallel server processes sharing the semantic lock directory. |
 | `broker.semantic_waiters` | integer | `16` | `LEAN_HOST_MCP_SEMANTIC_WAITERS` | How many semantic calls may queue for a permit before new ones are shed with a retryable semantic_admission_full status. |
 | `broker.semantic_admission_timeout_millis` | integer (ms) | `60000` | `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | How long a semantic call waits for a permit before giving up with a retryable semantic_admission_timeout status. Default 60 seconds. |
+| `broker.semantic_lock_dir` | path | unset | `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR` | Directory for OS-visible cross-process semantic admission locks. Unset uses the per-user cache directory. Parallel servers sharing a directory must agree on broker.semantic_permits. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
 | `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
 | `server.response_carrier` | string (text, structured, both) | `"text"` | `LEAN_HOST_MCP_RESPONSE_CARRIER` | Which field of the tool result carries the envelope. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text. |
@@ -69,6 +70,13 @@ clear `invalid RSS config: …` message otherwise (an inverted order makes the c
 `post_job` above `hard_kill` means every overrun escalates straight to an in-flight hard kill). To recycle less often
 under memory pressure, raise `post_job` toward (but below) `hard_kill` — e.g.
 `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB=8388608` for an 8 GiB post-job ceiling.
+
+`broker.semantic_permits` is enforced across all `lean-host-mcp` processes sharing `broker.semantic_lock_dir`, not just
+inside one server process. The default lock namespace lives under the current user's cache directory at
+`lean-host-mcp/semantic-admission`; set `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR` only when you need an explicit namespace.
+Permit files are visible as `permit-000.lock`, `permit-001.lock`, and so on, with best-effort holder metadata. Parallel
+servers that share a lock directory must agree on `broker.semantic_permits`; stop existing servers or choose a fresh lock
+directory before changing the limit.
 
 ## Observing worker recycles
 

@@ -46,12 +46,13 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::admission::{AdmissionError, SemanticAdmission, SemanticPermit, default_lock_dir};
 use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
 use crate::config_file::BrokerFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::lake_meta::{LakeProjectMeta, fingerprint_lake_project};
-use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig, SemanticAdmission};
+use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
 pub const DEFAULT_MAX_PROJECTS: usize = 4;
@@ -89,6 +90,8 @@ pub struct BrokerConfig {
     pub semantic_waiters: NonZeroUsize,
     /// Maximum time a caller may wait for semantic-work admission.
     pub semantic_admission_timeout: Duration,
+    /// Directory containing OS-visible cross-process semantic admission locks.
+    pub semantic_lock_dir: PathBuf,
 }
 
 impl BrokerConfig {
@@ -102,7 +105,7 @@ impl BrokerConfig {
     ///
     /// [`ServerError::Internal`] when an env var is set but unparseable
     /// (non-numeric, or `MAX_PROJECTS=0`).
-    pub fn pool_from_env() -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
+    pub fn pool_from_env() -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration, PathBuf)> {
         Self::pool_from_env_with_file(&BrokerFileConfig::default())
     }
 
@@ -116,7 +119,7 @@ impl BrokerConfig {
     /// resolved value (env or file) is zero where zero would deadlock.
     pub fn pool_from_env_with_file(
         file: &BrokerFileConfig,
-    ) -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
+    ) -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration, PathBuf)> {
         parse_pool_config(
             std::env::var("LEAN_HOST_MCP_MAX_PROJECTS").ok().as_deref(),
             std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok().as_deref(),
@@ -125,6 +128,7 @@ impl BrokerConfig {
             std::env::var("LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS")
                 .ok()
                 .as_deref(),
+            std::env::var("LEAN_HOST_MCP_SEMANTIC_LOCK_DIR").ok().as_deref(),
             file,
         )
     }
@@ -160,6 +164,12 @@ impl BrokerConfig {
     pub const fn default_semantic_admission_timeout() -> Duration {
         Duration::from_millis(DEFAULT_SEMANTIC_ADMISSION_TIMEOUT_MILLIS)
     }
+
+    /// Convenience: default per-user cross-process semantic lock directory.
+    #[must_use]
+    pub fn default_semantic_lock_dir() -> PathBuf {
+        default_lock_dir()
+    }
 }
 
 /// Pure parser shared by [`BrokerConfig::pool_from_env_with_file`] and unit
@@ -171,8 +181,9 @@ fn parse_pool_config(
     semantic: Option<&str>,
     semantic_waiters: Option<&str>,
     semantic_timeout_millis: Option<&str>,
+    semantic_lock_dir: Option<&str>,
     file: &BrokerFileConfig,
-) -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration)> {
+) -> Result<(NonZeroUsize, Duration, NonZeroUsize, NonZeroUsize, Duration, PathBuf)> {
     let max_projects = nonzero(
         resolve_usize(
             "LEAN_HOST_MCP_MAX_PROJECTS",
@@ -218,12 +229,18 @@ fn parse_pool_config(
             "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS=0 is not allowed".into(),
         ));
     }
+    let semantic_lock_dir = semantic_lock_dir
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| file.semantic_lock_dir.clone())
+        .unwrap_or_else(default_lock_dir);
     Ok((
         max_projects,
         idle_timeout,
         semantic_permits,
         semantic_waiters,
         Duration::from_millis(timeout_millis),
+        semantic_lock_dir,
     ))
 }
 
@@ -337,6 +354,7 @@ impl ProjectBroker {
                 config.semantic_permits,
                 config.semantic_waiters,
                 config.semantic_admission_timeout,
+                config.semantic_lock_dir.clone(),
             ),
             config,
         });
@@ -431,9 +449,9 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryOutcome>> {
-        let project = self.project_for(hint).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
         let call = project
-            .process_module_query(session_imports, source, query, options)
+            .process_module_query(session_imports, permit, admission_wait_millis, source, query, options)
             .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
@@ -452,9 +470,10 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryOutcome>> {
-        let project = self.project_for(hint).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
         let key = ModuleQueryKey::from_query(&query);
         if let Some(value) = project.module_query_cache().get(&path, content_hash, &key) {
+            drop(permit);
             return Ok(CachedBrokerCall {
                 value,
                 runtime: project.runtime_facts(),
@@ -463,7 +482,7 @@ impl ProjectBroker {
             });
         }
         let call = project
-            .process_module_query(session_imports, source, query, options)
+            .process_module_query(session_imports, permit, admission_wait_millis, source, query, options)
             .await?;
         let (value, runtime) = call.into_parts();
         project
@@ -492,9 +511,17 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
-        let project = self.project_for(hint).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
         let call = project
-            .process_module_query_batch(session_imports, source, selectors, budgets, options)
+            .process_module_query_batch(
+                session_imports,
+                permit,
+                admission_wait_millis,
+                source,
+                selectors,
+                budgets,
+                options,
+            )
             .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
@@ -514,9 +541,10 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
-        let project = self.project_for(hint).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
         let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
         if let Some(value) = project.module_query_cache().get_batch(&path, content_hash, &key) {
+            drop(permit);
             return Ok(CachedBrokerCall {
                 value,
                 runtime: project.runtime_facts(),
@@ -525,7 +553,15 @@ impl ProjectBroker {
             });
         }
         let call = project
-            .process_module_query_batch(session_imports, source, selectors, budgets, options)
+            .process_module_query_batch(
+                session_imports,
+                permit,
+                admission_wait_millis,
+                source,
+                selectors,
+                budgets,
+                options,
+            )
             .await?;
         let (value, runtime) = call.into_parts();
         project
@@ -551,8 +587,10 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: LeanWorkerDeclarationInspectionRequest,
     ) -> Result<BrokerCall<LeanWorkerDeclarationInspectionResult>> {
-        let project = self.project_for(hint).await?;
-        let call = project.inspect_declaration(session_imports, request).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
+        let call = project
+            .inspect_declaration(session_imports, permit, admission_wait_millis, request)
+            .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
         Ok(out)
@@ -570,8 +608,10 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: LeanWorkerDeclarationSearch,
     ) -> Result<BrokerCall<LeanWorkerDeclarationSearchResult>> {
-        let project = self.project_for(hint).await?;
-        let call = project.search_declarations(session_imports, request).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
+        let call = project
+            .search_declarations(session_imports, permit, admission_wait_millis, request)
+            .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
         Ok(out)
@@ -590,8 +630,10 @@ impl ProjectBroker {
         request: LeanWorkerProofAttemptRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerProofAttemptResult>> {
-        let project = self.project_for(hint).await?;
-        let call = project.attempt_proof(session_imports, request, options).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
+        let call = project
+            .attempt_proof(session_imports, permit, admission_wait_millis, request, options)
+            .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
         Ok(out)
@@ -610,8 +652,10 @@ impl ProjectBroker {
         request: LeanWorkerDeclarationVerificationRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationResult>> {
-        let project = self.project_for(hint).await?;
-        let call = project.verify_declaration(session_imports, request, options).await?;
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
+        let call = project
+            .verify_declaration(session_imports, permit, admission_wait_millis, request, options)
+            .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
         Ok(out)
@@ -636,6 +680,49 @@ impl ProjectBroker {
     async fn project_for(&self, hint: ProjectHint) -> Result<Arc<LeanProject>> {
         let root = self.resolve(&hint)?;
         self.acquire(root).await
+    }
+
+    async fn admit_project(
+        &self,
+        hint: ProjectHint,
+        imports: &[String],
+    ) -> Result<(Arc<LeanProject>, SemanticPermit, u64)> {
+        let started = Instant::now();
+        let permit = self
+            .semantic_admission
+            .acquire()
+            .await
+            .map_err(|err| self.admission_error(&err, imports))?;
+        let admission_wait_millis = millis_u64(started.elapsed());
+        let project = self.project_for(hint).await?;
+        Ok((project, permit, admission_wait_millis))
+    }
+
+    fn admission_error(&self, err: &AdmissionError, imports: &[String]) -> ServerError {
+        let reason = match err.detail() {
+            Some(detail) => format!("{}: {detail}", err.reason()),
+            None => err.reason().to_owned(),
+        };
+        ServerError::worker_unavailable(crate::error::WorkerUnavailable {
+            retryable: err.retryable(),
+            worker_restarted: false,
+            project_root: String::new(),
+            project_hash: String::new(),
+            imports: imports.to_vec(),
+            session_id: String::new(),
+            lean_toolchain: String::new(),
+            worker_generation: 0,
+            reason,
+            restart_cause: None,
+            rss_kib: None,
+            limit_kib: None,
+            retry_after_millis: matches!(err, AdmissionError::Timeout)
+                .then(|| millis_u64(self.config.semantic_admission_timeout)),
+            restarts_in_window: None,
+            window_millis: None,
+            runtime: RuntimeFacts::default(),
+            toolchain_advisories: Vec::new(),
+        })
     }
 
     /// Look up or open the project for `root`. Mutex is released around
@@ -719,13 +806,8 @@ impl ProjectBroker {
                 return Err(ServerError::Internal(format!("project metadata task failed: {err}")));
             }
         };
-        let admission = Arc::clone(&self.semantic_admission);
         let runtime_config = self.runtime_config.clone();
-        let opened = match tokio::task::spawn_blocking(move || {
-            LeanProject::open_with_admission(meta, admission, runtime_config)
-        })
-        .await
-        {
+        let opened = match tokio::task::spawn_blocking(move || LeanProject::open(meta, runtime_config)).await {
             Ok(Ok(project)) => project,
             Ok(Err(err)) => {
                 self.inner.lock().opening_locks.remove(&root);
@@ -886,6 +968,10 @@ fn broker_call<T>(project: &LeanProject, freshness_imports: &[String], call: Pro
     }
 }
 
+fn millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -918,6 +1004,7 @@ mod tests {
             semantic_permits: NonZeroUsize::MIN,
             semantic_waiters: BrokerConfig::default_semantic_waiters(),
             semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
+            semantic_lock_dir: default_lock_dir(),
         }
     }
 
@@ -943,7 +1030,8 @@ mod tests {
     #[test]
     fn parse_pool_config_uses_defaults_when_unset() {
         let empty = BrokerFileConfig::default();
-        let (max, idle, semantic, waiters, timeout) = parse_pool_config(None, None, None, None, None, &empty).unwrap();
+        let (max, idle, semantic, waiters, timeout, lock_dir) =
+            parse_pool_config(None, None, None, None, None, None, &empty).unwrap();
         assert_eq!(max.get(), DEFAULT_MAX_PROJECTS);
         assert_eq!(idle, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
         assert_eq!(semantic.get(), DEFAULT_SEMANTIC_PERMITS);
@@ -952,43 +1040,53 @@ mod tests {
             timeout,
             Duration::from_millis(DEFAULT_SEMANTIC_ADMISSION_TIMEOUT_MILLIS)
         );
+        assert_eq!(lock_dir, default_lock_dir());
     }
 
     #[test]
     fn parse_pool_config_accepts_explicit_values() {
         let empty = BrokerFileConfig::default();
-        let (max, idle, semantic, waiters, timeout) =
-            parse_pool_config(Some("8"), Some("30"), Some("2"), Some("12"), Some("250"), &empty).unwrap();
+        let (max, idle, semantic, waiters, timeout, lock_dir) = parse_pool_config(
+            Some("8"),
+            Some("30"),
+            Some("2"),
+            Some("12"),
+            Some("250"),
+            Some("/tmp/locks"),
+            &empty,
+        )
+        .unwrap();
         assert_eq!(max.get(), 8);
         assert_eq!(idle, Duration::from_secs(30));
         assert_eq!(semantic.get(), 2);
         assert_eq!(waiters.get(), 12);
         assert_eq!(timeout, Duration::from_millis(250));
+        assert_eq!(lock_dir, PathBuf::from("/tmp/locks"));
     }
 
     #[test]
     fn parse_pool_config_treats_zero_idle_as_disable() {
         let empty = BrokerFileConfig::default();
-        let (_, idle, _, _, _) = parse_pool_config(None, Some("0"), None, None, None, &empty).unwrap();
+        let (_, idle, _, _, _, _) = parse_pool_config(None, Some("0"), None, None, None, None, &empty).unwrap();
         assert_eq!(idle, Duration::ZERO);
     }
 
     #[test]
     fn parse_pool_config_rejects_max_projects_zero() {
         let empty = BrokerFileConfig::default();
-        let err = parse_pool_config(Some("0"), None, None, None, None, &empty).unwrap_err();
+        let err = parse_pool_config(Some("0"), None, None, None, None, None, &empty).unwrap_err();
         assert!(matches!(err, ServerError::Internal(_)), "{err:?}");
     }
 
     #[test]
     fn parse_pool_config_rejects_garbage() {
         let e = BrokerFileConfig::default();
-        assert!(parse_pool_config(Some("seven"), None, None, None, None, &e).is_err());
-        assert!(parse_pool_config(None, Some("forever"), None, None, None, &e).is_err());
-        assert!(parse_pool_config(None, None, Some("many"), None, None, &e).is_err());
-        assert!(parse_pool_config(None, None, Some("0"), None, None, &e).is_err());
-        assert!(parse_pool_config(None, None, None, Some("0"), None, &e).is_err());
-        assert!(parse_pool_config(None, None, None, None, Some("0"), &e).is_err());
+        assert!(parse_pool_config(Some("seven"), None, None, None, None, None, &e).is_err());
+        assert!(parse_pool_config(None, Some("forever"), None, None, None, None, &e).is_err());
+        assert!(parse_pool_config(None, None, Some("many"), None, None, None, &e).is_err());
+        assert!(parse_pool_config(None, None, Some("0"), None, None, None, &e).is_err());
+        assert!(parse_pool_config(None, None, None, Some("0"), None, None, &e).is_err());
+        assert!(parse_pool_config(None, None, None, None, Some("0"), None, &e).is_err());
     }
 
     #[test]
@@ -999,12 +1097,26 @@ mod tests {
             ..BrokerFileConfig::default()
         };
         // Env unset -> file value used for max_projects.
-        let (max, ..) = parse_pool_config(None, None, None, None, Some("250"), &file).unwrap();
+        let (max, ..) = parse_pool_config(None, None, None, None, Some("250"), None, &file).unwrap();
         assert_eq!(max.get(), 7);
         // Env present -> env wins over the (here invalid) file value.
-        let (max, _, _, _, timeout) = parse_pool_config(Some("3"), None, None, None, Some("250"), &file).unwrap();
+        let (max, _, _, _, timeout, _) =
+            parse_pool_config(Some("3"), None, None, None, Some("250"), None, &file).unwrap();
         assert_eq!(max.get(), 3);
         assert_eq!(timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn parse_pool_config_file_lock_dir_used_when_env_unset_and_env_wins() {
+        let file = BrokerFileConfig {
+            semantic_lock_dir: Some(PathBuf::from("/file/locks")),
+            ..BrokerFileConfig::default()
+        };
+        let (_, _, _, _, _, lock_dir) = parse_pool_config(None, None, None, None, None, None, &file).unwrap();
+        assert_eq!(lock_dir, PathBuf::from("/file/locks"));
+        let (_, _, _, _, _, lock_dir) =
+            parse_pool_config(None, None, None, None, None, Some("/env/locks"), &file).unwrap();
+        assert_eq!(lock_dir, PathBuf::from("/env/locks"));
     }
 
     #[test]
@@ -1013,6 +1125,6 @@ mod tests {
             max_projects: Some(0),
             ..BrokerFileConfig::default()
         };
-        assert!(parse_pool_config(None, None, None, None, None, &file).is_err());
+        assert!(parse_pool_config(None, None, None, None, None, None, &file).is_err());
     }
 }

@@ -26,8 +26,9 @@ use lean_rs_worker_parent::{
     LeanWorkerRestartReason,
 };
 use parking_lot::Mutex;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
+use crate::admission::SemanticPermit;
 use crate::cache::ModuleQueryCache;
 use crate::config_file::RuntimeFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts, RuntimeRestartEvent};
@@ -346,7 +347,7 @@ struct JobMeta {
     _correlation_id: uuid::Uuid,
     retry_policy: RetryPolicy,
     _active_job: ActiveJobGuard,
-    _semantic_permit: OwnedSemaphorePermit,
+    _semantic_permit: SemanticPermit,
 }
 
 enum ProjectMessage {
@@ -540,45 +541,6 @@ fn restart_cause_from_worker(reason: &LeanWorkerRestartReason) -> RestartCause {
     }
 }
 
-/// Process-wide async admission for heavy Lean semantic work.
-#[derive(Debug)]
-pub(crate) struct SemanticAdmission {
-    permits: Arc<Semaphore>,
-    waiters: Arc<Semaphore>,
-    wait_timeout: Duration,
-}
-
-impl SemanticAdmission {
-    pub(crate) fn new(permits: NonZeroUsize, waiter_capacity: NonZeroUsize, wait_timeout: Duration) -> Arc<Self> {
-        Arc::new(Self {
-            permits: Arc::new(Semaphore::new(permits.get())),
-            waiters: Arc::new(Semaphore::new(waiter_capacity.get())),
-            wait_timeout,
-        })
-    }
-
-    async fn acquire(self: &Arc<Self>) -> std::result::Result<OwnedSemaphorePermit, AdmissionError> {
-        let waiter = Arc::clone(&self.waiters).try_acquire_owned().map_err(|err| match err {
-            tokio::sync::TryAcquireError::NoPermits => AdmissionError::Full,
-            tokio::sync::TryAcquireError::Closed => AdmissionError::Closed,
-        })?;
-        let acquire = Arc::clone(&self.permits).acquire_owned();
-        let permit = tokio::time::timeout(self.wait_timeout, acquire)
-            .await
-            .map_err(|_| AdmissionError::Timeout)?
-            .map_err(|_| AdmissionError::Closed)?;
-        drop(waiter);
-        Ok(permit)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdmissionError {
-    Full,
-    Timeout,
-    Closed,
-}
-
 #[derive(Debug, Clone)]
 struct RuntimeSnapshot {
     worker_generation: u64,
@@ -624,7 +586,6 @@ pub(crate) struct LeanProject {
     /// [`Self::freshness`]; empty for a fully-vouched-for worker.
     open_warnings: Vec<String>,
     actor_tx: Mutex<Option<mpsc::Sender<ProjectMessage>>>,
-    admission: Arc<SemanticAdmission>,
     active_jobs: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
@@ -644,11 +605,7 @@ impl std::fmt::Debug for LeanProject {
 }
 
 impl LeanProject {
-    pub(crate) fn open_with_admission(
-        meta: LakeProjectMeta,
-        admission: Arc<SemanticAdmission>,
-        runtime_config: ProjectRuntimeConfig,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn open(meta: LakeProjectMeta, runtime_config: ProjectRuntimeConfig) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
             worker_generation: 1,
@@ -693,7 +650,6 @@ impl LeanProject {
             session_id,
             open_warnings,
             actor_tx: Mutex::new(Some(actor_tx)),
-            admission,
             active_jobs,
             healthy,
             runtime,
@@ -710,13 +666,20 @@ impl LeanProject {
     pub(crate) async fn process_module_query(
         &self,
         imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
         source: String,
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
             source,
             query,
             options,
@@ -734,6 +697,8 @@ impl LeanProject {
     pub(crate) async fn process_module_query_batch(
         &self,
         imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
         source: String,
         selectors: Vec<LeanWorkerModuleQuerySelector>,
         budgets: LeanWorkerOutputBudgets,
@@ -741,7 +706,12 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQueryBatch {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
             source,
             selectors,
             budgets,
@@ -760,11 +730,18 @@ impl LeanProject {
     pub(crate) async fn inspect_declaration(
         &self,
         imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
         request: LeanWorkerDeclarationInspectionRequest,
     ) -> Result<ProjectCall<LeanWorkerDeclarationInspectionResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationInspection {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
             request,
             reply,
         };
@@ -780,11 +757,18 @@ impl LeanProject {
     pub(crate) async fn search_declarations(
         &self,
         imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
         request: LeanWorkerDeclarationSearch,
     ) -> Result<ProjectCall<LeanWorkerDeclarationSearchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationSearch {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
             request,
             reply,
         };
@@ -800,12 +784,19 @@ impl LeanProject {
     pub(crate) async fn attempt_proof(
         &self,
         imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
         request: LeanWorkerProofAttemptRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<ProjectCall<LeanWorkerProofAttemptResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ProofAttempt {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
             request,
             options,
             reply,
@@ -822,12 +813,19 @@ impl LeanProject {
     pub(crate) async fn verify_declaration(
         &self,
         imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
         request: LeanWorkerDeclarationVerificationRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerification {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly).await?,
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
             request,
             options,
             reply,
@@ -835,24 +833,16 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
-    async fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy) -> Result<JobMeta> {
+    fn job_meta(
+        &self,
+        imports: Vec<String>,
+        retry_policy: RetryPolicy,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
+    ) -> JobMeta {
         let created_at = Instant::now();
-        let semantic_permit = self.admission.acquire().await.map_err(|err| {
-            let reason = match err {
-                AdmissionError::Full => "semantic_admission_full",
-                AdmissionError::Timeout => "semantic_admission_timeout",
-                AdmissionError::Closed => "semantic_admission_closed",
-            };
-            ServerError::worker_unavailable(WorkerUnavailable {
-                retryable: !matches!(err, AdmissionError::Closed),
-                worker_restarted: false,
-                reason: reason.to_owned(),
-                ..self.worker_error_context(&imports)
-            })
-        })?;
-        let admission_wait_millis = millis_u64(created_at.elapsed());
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
-        Ok(JobMeta {
+        JobMeta {
             import_fingerprint: import_fingerprint(&imports),
             imports,
             _created_at: created_at,
@@ -864,7 +854,7 @@ impl LeanProject {
                 active_jobs: Arc::clone(&self.active_jobs),
             },
             _semantic_permit: semantic_permit,
-        })
+        }
     }
 
     async fn enqueue<T>(
@@ -1919,28 +1909,6 @@ fn parse_nonzero_usize(name: &str, env: Option<&str>, file: Option<usize>, defau
 )]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn semantic_admission_bounds_waiters() {
-        let admission = SemanticAdmission::new(NonZeroUsize::MIN, NonZeroUsize::MIN, Duration::from_secs(5));
-        let held = admission.acquire().await.expect("initial permit");
-        let waiting_admission = Arc::clone(&admission);
-        let waiting = tokio::spawn(async move { waiting_admission.acquire().await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        assert_eq!(admission.acquire().await.unwrap_err(), AdmissionError::Full);
-
-        drop(held);
-        drop(waiting.await.expect("waiter task").expect("waiter permit"));
-    }
-
-    #[tokio::test]
-    async fn semantic_admission_times_out() {
-        let admission = SemanticAdmission::new(NonZeroUsize::MIN, NonZeroUsize::MIN, Duration::from_millis(10));
-        let _held = admission.acquire().await.expect("initial permit");
-
-        assert_eq!(admission.acquire().await.unwrap_err(), AdmissionError::Timeout);
-    }
 
     #[test]
     fn runtime_config_parses_runtime_policy_without_env_reads() {

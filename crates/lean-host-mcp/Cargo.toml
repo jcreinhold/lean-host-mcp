@@ -40,6 +40,7 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
+fs4 = "1.1"
 lru = "0.18"
 parking_lot = "0.12"
 regex = "1"

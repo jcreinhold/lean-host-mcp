@@ -148,7 +148,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let env_default = args.lake_root;
     let config_default = file.primary_project.clone();
-    let (max_projects, idle_timeout, semantic_permits, semantic_waiters, semantic_admission_timeout) =
+    let (max_projects, idle_timeout, semantic_permits, semantic_waiters, semantic_admission_timeout, semantic_lock_dir) =
         BrokerConfig::pool_from_env_with_file(&file.broker)?;
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime)?;
     let tool_config = resolve_tool_config(&file)?;
@@ -165,6 +165,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         semantic_permits = %semantic_permits,
         semantic_waiters = %semantic_waiters,
         semantic_admission_timeout_millis = semantic_admission_timeout.as_millis(),
+        semantic_lock_dir = %semantic_lock_dir.display(),
         worker_rss_post_job_restart_kib = runtime_config.worker_rss_post_job_restart_kib(),
         worker_rss_hard_kill_kib = runtime_config.worker_rss_hard_kill_kib(),
         worker_rss_sample_millis = runtime_config.worker_rss_sample_millis(),
@@ -186,6 +187,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             semantic_permits,
             semantic_waiters,
             semantic_admission_timeout,
+            semantic_lock_dir,
         },
         runtime_config,
     );
