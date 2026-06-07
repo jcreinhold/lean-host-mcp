@@ -67,6 +67,9 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
 lean-rs-worker-parent = "0.1.20"
+lean-semantic-search-capability = "0.1.0"
+lean-semantic-search-contract = "0.1.0"
+lean-semantic-search-retrieval = "0.1.0"
 # Non-FFI facade over lean-rs-sys (metadata-only, no link directives): supplies
 # the supported-toolchain window. Already in the parent's closure via
 # lean-rs-worker-parent, so this direct dep adds no new linkage. The parent must

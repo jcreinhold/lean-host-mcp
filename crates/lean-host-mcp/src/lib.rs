@@ -35,6 +35,7 @@ mod ilean;
 pub mod lake_meta;
 mod project;
 pub mod projections;
+mod semantic_search;
 pub mod server;
 mod smoke;
 pub mod toolchain;

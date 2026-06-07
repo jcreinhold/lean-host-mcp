@@ -17,16 +17,20 @@ use lean_rs_worker_parent::{
     LeanWorkerDeclarationFilter, LeanWorkerDeclarationNameMatch, LeanWorkerDeclarationSearch,
     LeanWorkerDeclarationSearchBias, LeanWorkerDeclarationSearchScope,
 };
+use lean_semantic_search_contract::{ProofGoalFeatureRequest, SourcePosition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::{BrokerCall, ProjectHint};
 use crate::envelope::{Response, RuntimeFacts};
-use crate::error::Result;
+use crate::error::{Result, ServerError};
 use crate::projections::{
-    DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange, project_declaration_search,
+    DeclarationFlags, DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange,
+    project_declaration_search,
 };
+use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::tools::position::{ProofPositionSelector, ProofStateRequest, ProofStateResult};
+use crate::tools::source_input::{module_name_for_file, read_query_file};
 use crate::tools::{ToolContext, session_imports};
 
 const DEFAULT_LIMIT: usize = 10;
@@ -143,6 +147,7 @@ struct TargetProfile {
     proof_state_status: String,
     cache_status: Option<String>,
     warnings: Vec<String>,
+    semantic: Option<SemanticProofSearchRequest>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -178,20 +183,37 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let mode = req.mode.unwrap_or_default();
     let full = ctx.config.verbosity.is_full();
     let project = req.project.clone();
-    let mut profile = target_profile(ctx, req).await?;
+    let mut profile = target_profile(ctx, req, limit).await?;
     let mut warnings = std::mem::take(&mut profile.warnings);
     let searches = plan_searches(&profile, mode);
+    let semantic = match run_semantic_search(ctx, project.clone(), &profile).await {
+        Ok(value) => value,
+        Err(err) => {
+            warnings.push(format!(
+                "semantic proof search unavailable; used fallback declaration search: {}",
+                semantic_error_summary(&err)
+            ));
+            None
+        }
+    };
 
     if searches.is_empty() {
-        warnings.push("no usable goal constants, heads, or name fragments were available for retrieval".to_owned());
-        let result = empty_result(profile, warnings, full);
+        if semantic.is_none() {
+            warnings.push("no usable goal constants, heads, or name fragments were available for retrieval".to_owned());
+        }
+        let semantic = semantic.map(|call| call.value);
+        let result = if semantic.is_some() {
+            rank_results(&profile, mode, limit, 1, semantic, Vec::new(), warnings, full)
+        } else {
+            empty_result(profile, warnings, full)
+        };
         let hint = ProjectHint::from_request(project);
         let runtime = ctx.broker.project_runtime(hint, Vec::new()).await?;
         return Ok(Response::ok(result, runtime.freshness).with_runtime(runtime.runtime));
     }
 
     let mut search_results = Vec::new();
-    let mut runtime: Option<RuntimeFacts> = None;
+    let mut runtime: Option<RuntimeFacts> = semantic.as_ref().map(|call| call.runtime.clone());
     for search in searches.iter().take(MAX_SEARCHES) {
         let call = match run_declaration_search(ctx, project.clone(), profile.imports.clone(), search.request.clone())
             .await
@@ -215,8 +237,18 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
         search_results.push((search.label, call.value));
     }
 
-    let search_count = search_results.len();
-    let result = rank_results(&profile, mode, limit, search_count, search_results, warnings, full);
+    let search_count = search_results.len().saturating_add(usize::from(semantic.is_some()));
+    let semantic = semantic.map(|call| call.value);
+    let result = rank_results(
+        &profile,
+        mode,
+        limit,
+        search_count,
+        semantic,
+        search_results,
+        warnings,
+        full,
+    );
     let freshness_imports = profile.imports.clone();
     let hint = ProjectHint::from_request(project);
     let project_runtime = ctx.broker.project_runtime(hint, freshness_imports).await?;
@@ -224,7 +256,7 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     Ok(Response::ok(result, project_runtime.freshness).with_runtime(runtime))
 }
 
-async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result<TargetProfile> {
+async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -> Result<TargetProfile> {
     let explicit_text = [req.goal.as_deref(), req.type_text.as_deref()]
         .into_iter()
         .flatten()
@@ -236,11 +268,14 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
         req.file.clone(),
         req.declaration.clone().filter(|value| !value.trim().is_empty()),
     ) {
+        let hint = ProjectHint::from_request(req.project.clone());
+        let meta = ctx.broker.resolve_meta(&hint)?;
+        let source_input = read_query_file(&meta.canonical_root, &file)?;
         let proof_response = crate::tools::position::proof_state(
             ctx,
             ProofStateRequest {
-                file,
-                declaration,
+                file: file.clone(),
+                declaration: declaration.clone(),
                 proof_position: req.proof_position.clone(),
                 project: req.project.clone(),
             },
@@ -259,6 +294,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                 "runtime_unavailable_degraded_to_explicit_text".to_owned(),
                 None,
                 vec!["proof-state runtime was unavailable; used explicit goal/type text".to_owned()],
+                None,
             ));
         };
         match proof_result {
@@ -296,6 +332,15 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                         .into_iter()
                         .map(|item| format!("proof-state selector budget exceeded: {}: {}", item.id, item.message)),
                 );
+                let semantic = semantic_request_for_source(
+                    &meta.canonical_root,
+                    &source_input,
+                    &declaration,
+                    &req.proof_position,
+                    namespace_name.clone(),
+                    &imports,
+                    limit,
+                );
                 return Ok(profile_from_text(
                     pieces.join("\n"),
                     namespace_name,
@@ -303,6 +348,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                     "context".to_owned(),
                     query_facts.map(|facts| facts.cache_status.to_owned()),
                     warnings,
+                    semantic,
                 ));
             }
             ProofStateResult::HeaderParseFailed { .. } => {
@@ -314,6 +360,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                         "header_parse_failed_degraded_to_explicit_text".to_owned(),
                         None,
                         vec!["proof-state header parse failed; used explicit goal/type text".to_owned()],
+                        None,
                     ));
                 }
                 return Ok(profile_from_text(
@@ -323,6 +370,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                     "header_parse_failed".to_owned(),
                     None,
                     vec!["proof-state header parse failed and no explicit goal/type text was supplied".to_owned()],
+                    None,
                 ));
             }
             ProofStateResult::Unsupported => {
@@ -334,6 +382,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                         "unsupported_degraded_to_explicit_text".to_owned(),
                         None,
                         vec!["proof-state unsupported; used explicit goal/type text".to_owned()],
+                        None,
                     ));
                 }
                 return Ok(profile_from_text(
@@ -343,6 +392,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
                     "unsupported".to_owned(),
                     None,
                     vec!["proof-state unsupported and no explicit goal/type text was supplied".to_owned()],
+                    None,
                 ));
             }
         }
@@ -355,6 +405,7 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest) -> Result
         "explicit_text".to_owned(),
         None,
         Vec::new(),
+        None,
     ))
 }
 
@@ -365,6 +416,7 @@ fn profile_from_text(
     proof_state_status: String,
     cache_status: Option<String>,
     warnings: Vec<String>,
+    semantic: Option<SemanticProofSearchRequest>,
 ) -> TargetProfile {
     let constants = extract_constants(&text);
     let heads = extract_heads(&text);
@@ -380,7 +432,104 @@ fn profile_from_text(
         proof_state_status,
         cache_status,
         warnings,
+        semantic,
     }
+}
+
+fn semantic_request_for_source(
+    root: &std::path::Path,
+    input: &crate::tools::source_input::QueryFile,
+    declaration: &str,
+    proof_position: &ProofPositionSelector,
+    namespace: Option<String>,
+    imports: &[String],
+    limit: usize,
+) -> Option<SemanticProofSearchRequest> {
+    let module = module_name_for_file(root, &input.resolved)?;
+    let candidate_modules = if imports.is_empty() {
+        input.imports.clone()
+    } else {
+        imports.to_vec()
+    };
+    if candidate_modules.is_empty() {
+        return None;
+    }
+    Some(SemanticProofSearchRequest {
+        goal: ProofGoalFeatureRequest {
+            module,
+            source_text: input.source.clone(),
+            file_label: Some(input.resolved.to_string_lossy().into_owned()),
+            declaration: Some(declaration.to_owned()),
+            position: source_position_for_selector(proof_position, &input.source),
+            namespace,
+        },
+        candidate_modules,
+        limit: limit.saturating_mul(3).clamp(10, 60),
+    })
+}
+
+fn source_position_for_selector(selector: &ProofPositionSelector, source: &str) -> Option<SourcePosition> {
+    match selector {
+        ProofPositionSelector::Default | ProofPositionSelector::Index { .. } => None,
+        ProofPositionSelector::AfterText { text, occurrence } => {
+            let occurrence = occurrence.unwrap_or(0);
+            let byte_offset = nth_match(source, text, occurrence)?;
+            let prefix = source.get(..byte_offset)?;
+            let line = u32::try_from(prefix.bytes().filter(|byte| *byte == b'\n').count().saturating_add(1)).ok()?;
+            let column_start = prefix.rfind('\n').map_or(0, |index| index.saturating_add(1));
+            let column = u32::try_from(byte_offset.saturating_sub(column_start).saturating_add(1)).ok()?;
+            Some(SourcePosition { line, column })
+        }
+    }
+}
+
+fn nth_match(source: &str, needle: &str, occurrence: u32) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut offset = 0usize;
+    for seen in 0..=occurrence {
+        let rest = source.get(offset..)?;
+        let found = rest.find(needle)?;
+        let absolute = offset.saturating_add(found);
+        if seen == occurrence {
+            return Some(absolute);
+        }
+        offset = absolute.saturating_add(needle.len());
+    }
+    None
+}
+
+async fn run_semantic_search(
+    ctx: &ToolContext,
+    project: Option<String>,
+    profile: &TargetProfile,
+) -> Result<Option<BrokerCall<SemanticProofSearchResult>>> {
+    let Some(request) = profile.semantic.clone() else {
+        return Ok(None);
+    };
+    let hint = ProjectHint::from_request(project);
+    let call = ctx
+        .broker
+        .semantic_proof_search(
+            hint,
+            session_imports(profile.imports.clone()),
+            profile.imports.clone(),
+            request,
+        )
+        .await?;
+    Ok(Some(call))
+}
+
+fn semantic_error_summary(err: &ServerError) -> String {
+    let text = err.to_string();
+    if text.contains("semantic_proof_search_unavailable") {
+        return "semantic capability unavailable for this project".to_owned();
+    }
+    if text.contains("missing") || text.contains("not found") || text.contains("unknown module") {
+        return "LeanSemanticSearch is not available in the active Lake project/import profile".to_owned();
+    }
+    "semantic capability command failed".to_owned()
 }
 
 fn plan_searches(profile: &TargetProfile, mode: ProofSearchMode) -> Vec<PlannedSearch> {
@@ -541,6 +690,7 @@ fn rank_results(
     mode: ProofSearchMode,
     limit: usize,
     search_count: usize,
+    semantic: Option<SemanticProofSearchResult>,
     search_results: Vec<(&'static str, DeclarationSearchResult)>,
     warnings: Vec<String>,
     full: bool,
@@ -550,6 +700,58 @@ fn rank_results(
     let mut search_truncated = false;
     let mut broad_pruning = Vec::new();
     let mut by_name: BTreeMap<String, CandidateAccumulator> = BTreeMap::new();
+    let mut warnings = warnings;
+
+    if let Some(semantic) = semantic {
+        generated_count = generated_count.saturating_add(semantic.declaration_rows);
+        for diagnostic in semantic.diagnostics {
+            warnings.push(format!("semantic proof search: {diagnostic}"));
+        }
+        if semantic.goal_rows == 0 {
+            warnings.push("semantic proof search produced no proof-goal features".to_owned());
+        }
+        for candidate in semantic.candidates {
+            let mut admitted_evidence = Vec::new();
+            for evidence in candidate.evidence {
+                if semantic_evidence_admits_candidate(&evidence) {
+                    admitted_evidence.push(evidence);
+                } else {
+                    broad_pruning.push(evidence);
+                }
+            }
+            if admitted_evidence.is_empty() {
+                broad_pruning.push(format!("semantic:diagnostic_only:{}", candidate.name));
+                continue;
+            }
+            let row = DeclarationSummary {
+                name: candidate.name,
+                kind: "theorem".to_owned(),
+                module: None,
+                source: candidate
+                    .source
+                    .and_then(|source| (!source.file.is_empty()).then_some(source)),
+                match_reason: "semantic".to_owned(),
+                score: candidate.score,
+                rank: 0,
+                flags: DeclarationFlags {
+                    is_private: false,
+                    is_generated: false,
+                    is_internal: false,
+                },
+            };
+            let score = candidate_score(&row, profile, mode, "semantic");
+            let entry = by_name.entry(row.name.clone()).or_insert_with(|| CandidateAccumulator {
+                row: row.clone(),
+                score,
+                reasons: BTreeSet::new(),
+            });
+            entry.score = entry.score.max(score);
+            entry.reasons.insert("semantic".to_owned());
+            for evidence in admitted_evidence {
+                entry.reasons.insert(evidence);
+            }
+        }
+    }
 
     for (label, result) in search_results {
         generated_count = generated_count.saturating_add(result.facts.after_scope_filter);
@@ -622,7 +824,6 @@ fn rank_results(
     // candidate's name matches any of them, the results are conclusion-head
     // matches (e.g. generic `Iff`/`eq` lemmas), not domain-relevant. Say so
     // rather than letting the agent mistake noise for guidance.
-    let mut warnings = warnings;
     if !candidates.is_empty()
         && !profile.name_fragments.is_empty()
         && !candidates.iter().any(|candidate| {
@@ -723,9 +924,19 @@ fn record_response_bytes(result: &mut SearchForProofResult) {
 /// generic `*_eq_*` lemmas masquerade as corroborated. Broad-head searches carry
 /// the distinct `broad_conclusion_head` label and deliberately do not match here.
 fn is_corroborated(reasons: &BTreeSet<String>) -> bool {
-    reasons
-        .iter()
-        .any(|reason| reason == "conclusion_head" || reason == "required_constants")
+    reasons.iter().any(|reason| {
+        reason == "conclusion_head"
+            || reason == "required_constants"
+            || reason.starts_with("semantic:statement_fingerprint:")
+            || reason.starts_with("semantic:safe_permutation_fingerprint:")
+            || reason.starts_with("semantic:connective_fingerprint:")
+            || reason.starts_with("semantic:conclusion_fingerprint:")
+            || reason.starts_with("semantic:role_conclusion_const:")
+    })
+}
+
+fn semantic_evidence_admits_candidate(evidence: &str) -> bool {
+    !evidence.starts_with("semantic:role_head:")
 }
 
 fn candidate_score(
@@ -1457,6 +1668,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         assert!(profile.heads.iter().any(|head| head == "LE.le"));
         let searches = plan_searches(&profile, ProofSearchMode::NextStep);
@@ -1476,6 +1688,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         let searches = plan_searches(&profile, ProofSearchMode::Exact);
         // The Eq head search still runs; a broad head carries a distinct label so
@@ -1512,6 +1725,7 @@ mod tests {
             "context".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         // A genuine LE.le head match (low base score) and a high-scoring lexical
         // suffix hit that no head/constant search corroborates.
@@ -1526,6 +1740,7 @@ mod tests {
             ProofSearchMode::NextStep,
             10,
             2,
+            None,
             vec![
                 ("conclusion_head", search_result(vec![head_row])),
                 ("name_fragment", search_result(vec![noise_row])),
@@ -1557,6 +1772,7 @@ mod tests {
             "context".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         // Only a name-fragment hit (matches the `le` fragment), nothing corroborates it.
         let row = summary("Rat.le_intCast", Some("Mathlib.Data.Rat.Cast"), 100);
@@ -1565,6 +1781,7 @@ mod tests {
             ProofSearchMode::NextStep,
             10,
             1,
+            None,
             vec![("name_fragment", search_result(vec![row]))],
             Vec::new(),
             false,
@@ -1579,6 +1796,87 @@ mod tests {
     }
 
     #[test]
+    fn semantic_candidates_rank_ahead_of_lexical_fallback() {
+        let profile = profile_from_text(
+            "⊢ ↑(c * q.num) = ↑m * q".to_owned(),
+            Some("LeanRsFixture".to_owned()),
+            Vec::new(),
+            "context".to_owned(),
+            None,
+            Vec::new(),
+            None,
+        );
+        let lexical = summary("Rat.intCast_num", Some("Mathlib.Data.Rat.Cast"), 120);
+        let semantic = SemanticProofSearchResult {
+            candidates: vec![crate::semantic_search::SemanticProofCandidate {
+                name: "LeanRsFixture.ProofSearchFacts.cast_num_den_helper".to_owned(),
+                source: None,
+                score: 130,
+                evidence: vec!["semantic:role_conclusion_const:2".to_owned()],
+            }],
+            diagnostics: Vec::new(),
+            declaration_rows: 1,
+            goal_rows: 1,
+        };
+        let result = rank_results(
+            &profile,
+            ProofSearchMode::NextStep,
+            10,
+            2,
+            Some(semantic),
+            vec![("name_fragment", search_result(vec![lexical]))],
+            Vec::new(),
+            false,
+        );
+        let first = result.candidates.first().expect("semantic candidate");
+        assert_eq!(first.name, "LeanRsFixture.ProofSearchFacts.cast_num_den_helper");
+        assert!(first.match_reason.contains("semantic:role_conclusion_const"));
+    }
+
+    #[test]
+    fn broad_head_only_semantic_evidence_is_diagnostic_only() {
+        let profile = profile_from_text(
+            "⊢ x = y".to_owned(),
+            None,
+            Vec::new(),
+            "context".to_owned(),
+            None,
+            Vec::new(),
+            None,
+        );
+        let semantic = SemanticProofSearchResult {
+            candidates: vec![crate::semantic_search::SemanticProofCandidate {
+                name: "Eq.generic_noise".to_owned(),
+                source: None,
+                score: 180,
+                evidence: vec!["semantic:role_head:1".to_owned()],
+            }],
+            diagnostics: Vec::new(),
+            declaration_rows: 1,
+            goal_rows: 1,
+        };
+        let result = rank_results(
+            &profile,
+            ProofSearchMode::NextStep,
+            10,
+            1,
+            Some(semantic),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert!(result.candidates.is_empty());
+        let funnel = result.diagnostics.funnel.expect("full telemetry funnel");
+        assert!(funnel.broad_pruning.iter().any(|item| item == "semantic:role_head:1"));
+        assert!(
+            funnel
+                .broad_pruning
+                .iter()
+                .any(|item| item == "semantic:diagnostic_only:Eq.generic_noise")
+        );
+    }
+
+    #[test]
     fn limit_clamps_to_tool_cap() {
         let profile = profile_from_text(
             "⊢ True".to_owned(),
@@ -1587,6 +1885,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         let result = empty_result(profile, Vec::new(), false);
         assert_eq!(result.diagnostics.returned_count, 0);
@@ -1603,6 +1902,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         assert!(profile.heads.iter().any(|head| head == "Eq"));
         assert!(profile.constants.iter().any(|constant| constant == "Nat.succ"));
@@ -1619,6 +1919,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         assert_eq!(profile.kind, GoalProfileKind::RatArithmetic);
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "den"));
@@ -1644,6 +1945,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         let generic = summary("Acc.ndrecOn_eq_ndrecOnC", None, 100);
         let rat_candidate = summary("Rat.num_den_helper", Some("Mathlib.Data.Rat.Lemmas"), 100);
@@ -1662,6 +1964,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         assert_eq!(profile.kind, GoalProfileKind::IntFactorization);
         assert!(
@@ -1691,6 +1994,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         assert_eq!(profile.kind, GoalProfileKind::ModelTheoryRelabel);
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "relabel"));
@@ -1715,6 +2019,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         assert_eq!(linear.kind, GoalProfileKind::LinearArithmetic);
         let factorization = profile_from_text(
@@ -1724,6 +2029,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         let solver = summary("Int.Linear.cooper_dvd", Some("Mathlib.Tactic.Omega"), 100);
         assert!(
@@ -1741,6 +2047,7 @@ mod tests {
             "explicit_text".to_owned(),
             None,
             Vec::new(),
+            None,
         );
         assert_eq!(profile.kind, GoalProfileKind::LinearArithmetic);
 

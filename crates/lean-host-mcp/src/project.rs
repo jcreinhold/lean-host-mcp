@@ -17,13 +17,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lean_rs_worker_parent::{
-    LeanWorkerChild, LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationInspectionResult,
-    LeanWorkerDeclarationSearch, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationVerificationRequest,
-    LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions, LeanWorkerError, LeanWorkerHostHandle,
-    LeanWorkerHostHandleBuilder, LeanWorkerLifecycleSnapshot, LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery,
-    LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector,
-    LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRestartPolicy,
-    LeanWorkerRestartReason,
+    LeanWorkerCapabilityBuilder, LeanWorkerChild, LeanWorkerDeclarationInspectionRequest,
+    LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationSearch, LeanWorkerDeclarationSearchResult,
+    LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions,
+    LeanWorkerError, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder, LeanWorkerLifecycleSnapshot,
+    LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome,
+    LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets,
+    LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRestartPolicy, LeanWorkerRestartReason,
 };
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
@@ -34,6 +34,7 @@ use crate::config_file::RuntimeFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
 use crate::lake_meta::LakeProjectMeta;
+use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
 
 /// LRU capacity for exact bounded module query results.
@@ -388,6 +389,11 @@ enum ProjectMessage {
         options: LeanWorkerElabOptions,
         reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationVerificationResult>>>,
     },
+    SemanticProofSearch {
+        meta: JobMeta,
+        request: SemanticProofSearchRequest,
+        reply: oneshot::Sender<Result<ProjectCall<SemanticProofSearchResult>>>,
+    },
 }
 
 impl ProjectMessage {
@@ -398,7 +404,8 @@ impl ProjectMessage {
             | Self::DeclarationInspection { meta, .. }
             | Self::DeclarationSearch { meta, .. }
             | Self::ProofAttempt { meta, .. }
-            | Self::DeclarationVerification { meta, .. } => &meta.imports,
+            | Self::DeclarationVerification { meta, .. }
+            | Self::SemanticProofSearch { meta, .. } => &meta.imports,
         }
     }
 }
@@ -775,6 +782,33 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
+    /// Run source-backed semantic proof search through this project's actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError` when semantic capability setup, mailbox enqueue,
+    /// actor reply, or worker execution fails.
+    pub(crate) async fn semantic_proof_search(
+        &self,
+        imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
+        request: SemanticProofSearchRequest,
+    ) -> Result<ProjectCall<SemanticProofSearchResult>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::SemanticProofSearch {
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
+            request,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
+
     /// Try proof fragments in-memory through this project's serialized worker actor.
     ///
     /// # Errors
@@ -993,6 +1027,8 @@ struct ActorConfig {
     lake_root: PathBuf,
     manifest_hash: String,
     toolchain_label: String,
+    package: Option<String>,
+    library: Option<String>,
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
     session_id: String,
@@ -1094,6 +1130,8 @@ impl ActorConfig {
             lake_root: meta.canonical_root.clone(),
             manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
+            package: meta.package.clone(),
+            library: meta.library.clone(),
             worker_path,
             lean_sysroot,
             session_id,
@@ -1190,6 +1228,10 @@ impl ProjectActorState {
                 let result = self.run_job(meta, |handle, imports| {
                     handle.verify_declaration_with_imports(imports, &request, &options, None, None)
                 });
+                let _ = reply.send(result);
+            }
+            ProjectMessage::SemanticProofSearch { meta, request, reply } => {
+                let result = self.run_semantic_job(meta, &request);
                 let _ = reply.send(result);
             }
         }
@@ -1341,6 +1383,65 @@ impl ProjectActorState {
                 }
             }
         }
+    }
+
+    fn run_semantic_job(
+        &self,
+        meta: JobMeta,
+        request: &SemanticProofSearchRequest,
+    ) -> Result<ProjectCall<SemanticProofSearchResult>> {
+        let _span = tracing::debug_span!(
+            "semantic_job",
+            session_id = %self.config.session_id,
+            imports = meta.imports.len(),
+            queue_wait_millis = millis_u64(meta.queued_at.elapsed()),
+        )
+        .entered();
+        let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
+        let generation_before = self.observed_generation();
+        let mut imports = meta.imports.clone();
+        if !imports.iter().any(|import| import == "LeanSemanticSearch.Capability") {
+            imports.push("LeanSemanticSearch.Capability".to_owned());
+        }
+
+        let mut capability = self.open_semantic_capability(&meta)?;
+        let result = {
+            let mut session = capability
+                .open_session_with_imports(imports, None, None)
+                .map_err(map_worker_err)?;
+            crate::semantic_search::run_semantic_proof_search(&mut session, request)
+        };
+        let runtime = self.runtime_facts(&meta, generation_before, 0, queue_wait_millis, None);
+        self.publish_runtime(&runtime);
+        result.map(|value| ProjectCall::new(value, runtime))
+    }
+
+    fn open_semantic_capability(&self, meta: &JobMeta) -> Result<lean_rs_worker_parent::LeanWorkerCapability> {
+        let package = self.config.package.as_deref().ok_or_else(|| {
+            self.worker_unavailable_for(
+                meta,
+                "semantic_proof_search_unavailable: Lake package name is unknown".to_owned(),
+                true,
+                false,
+                None,
+                None,
+                None,
+            )
+        })?;
+        let library = self.config.library.as_deref().ok_or_else(|| {
+            self.worker_unavailable_for(
+                meta,
+                "semantic_proof_search_unavailable: Lake library target is unknown".to_owned(),
+                true,
+                false,
+                None,
+                None,
+                None,
+            )
+        })?;
+        semantic_capability_builder(&self.config, package, library)
+            .open()
+            .map_err(map_worker_err)
     }
 
     fn cycle_before_import_switch_if_needed(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
@@ -1780,9 +1881,7 @@ fn bootstrap_hard_rss_unavailable(
 
 fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
     let restart_policy = LeanWorkerRestartPolicy::default().max_requests(WORKER_REQUEST_RESTARTS);
-    let module_cache_limits = LeanWorkerModuleCacheLimits::default()
-        .rss_guard_kib(config.module_cache_rss_guard_kib)
-        .max_bytes(config.module_cache_max_bytes);
+    let module_cache_limits = module_cache_limits(config);
     LeanWorkerHostHandleBuilder::shims_only(&config.lake_root, std::iter::empty::<String>())
         .worker_child(LeanWorkerChild::for_toolchain(
             config.worker_path.clone(),
@@ -1796,6 +1895,36 @@ fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
             Duration::from_millis(config.worker_rss_sample_millis),
         )
         .module_cache_limits(module_cache_limits)
+}
+
+fn semantic_capability_builder(config: &ActorConfig, package: &str, library: &str) -> LeanWorkerCapabilityBuilder {
+    let restart_policy = LeanWorkerRestartPolicy::default().max_requests(WORKER_REQUEST_RESTARTS);
+    LeanWorkerCapabilityBuilder::new(
+        config.lake_root.clone(),
+        package.to_owned(),
+        library.to_owned(),
+        ["LeanSemanticSearch.Capability"],
+    )
+    .worker_child(LeanWorkerChild::for_toolchain(
+        config.worker_path.clone(),
+        config.lean_sysroot.clone(),
+    ))
+    .startup_timeout(Duration::from_secs(30))
+    .request_timeout(Duration::from_millis(config.request_timeout_millis))
+    .restart_policy(restart_policy)
+    .rss_hard_limit(
+        config.worker_rss_hard_kill_kib,
+        Duration::from_millis(config.worker_rss_sample_millis),
+    )
+    .module_cache_limits(module_cache_limits(config))
+    .json_command_export(lean_semantic_search_capability::DECLARATION_FEATURES_EXPORT)
+    .json_command_export(lean_semantic_search_capability::PROOF_GOAL_FEATURES_EXPORT)
+}
+
+fn module_cache_limits(config: &ActorConfig) -> LeanWorkerModuleCacheLimits {
+    LeanWorkerModuleCacheLimits::default()
+        .rss_guard_kib(config.module_cache_rss_guard_kib)
+        .max_bytes(config.module_cache_max_bytes)
 }
 
 fn actor_thread_name(canonical_root: &Path) -> String {
@@ -2107,6 +2236,8 @@ mod tests {
         let config = ActorConfig {
             lake_root: PathBuf::from("/tmp/lean-host-mcp-bootstrap-rss-test"),
             manifest_hash: "sha256-test".to_owned(),
+            package: Some("lean_rs_fixture".to_owned()),
+            library: Some("LeanRsFixture".to_owned()),
             toolchain_label: "leanprover/lean4:test".to_owned(),
             worker_path: PathBuf::from("/tmp/worker"),
             lean_sysroot: PathBuf::from("/tmp/lean"),

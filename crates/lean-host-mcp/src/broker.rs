@@ -53,6 +53,7 @@ use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::lake_meta::{LakeProjectMeta, fingerprint_lake_project};
 use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
+use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
 pub const DEFAULT_MAX_PROJECTS: usize = 4;
@@ -611,6 +612,28 @@ impl ProjectBroker {
         let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
         let call = project
             .search_declarations(session_imports, permit, admission_wait_millis, request)
+            .await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Run source-backed semantic proof search through the project runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, project-open, admission, semantic capability, or
+    /// worker runtime failures.
+    pub(crate) async fn semantic_proof_search(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        request: SemanticProofSearchRequest,
+    ) -> Result<BrokerCall<SemanticProofSearchResult>> {
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
+        let call = project
+            .semantic_proof_search(session_imports, permit, admission_wait_millis, request)
             .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);

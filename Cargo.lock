@@ -1016,6 +1016,9 @@ dependencies = [
  "dirs",
  "fs4",
  "lean-rs-worker-parent",
+ "lean-semantic-search-capability",
+ "lean-semantic-search-contract",
+ "lean-semantic-search-retrieval",
  "lean-toolchain",
  "lru",
  "parking_lot",
@@ -1115,6 +1118,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74c5444b0bd681f7ecadcaccc9ab2ce66112f7334b765c177bb4cdd1c249cfa5"
 dependencies = [
  "lean-toolchain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lean-semantic-search-capability"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42362d62ed0b7b9b7f1d80bf56920d3de242a6d8b848c2db98aa502f5b422bf5"
+dependencies = [
+ "lean-semantic-search-contract",
+ "serde_json",
+]
+
+[[package]]
+name = "lean-semantic-search-contract"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35d6a1d06ef1b6b43ed5988f8f71a7aa4962e933e5e83a11211a12dae0a7bd41"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lean-semantic-search-retrieval"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f38bcb6727d7ff66c14270b0e0a95c1d4d33fa5331fd453936122b877989db6c"
+dependencies = [
+ "lean-semantic-search-contract",
  "serde",
  "serde_json",
 ]

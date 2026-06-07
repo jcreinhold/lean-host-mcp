@@ -166,9 +166,16 @@ overlay insertion, and diagnostic-locality classification stay below the worker 
 `proof_state` returns the current goals, locals, expected type, diagnostics, cache status, and timing facts for one
 declaration proof position.
 
-`search_for_proof` builds a small target profile from `proof_state` or explicit goal/type text, calls bounded lean-rs
-declaration search, and ranks metadata-only candidates. It does not render candidate types and does not build a host
-declaration index.
+`search_for_proof` builds a small target profile from `proof_state` or explicit goal/type text, then tries a private
+source-backed `lean-semantic-search` lane before falling back to bounded lean-rs declaration search. The MCP request and
+response schema stay unchanged: semantic feature rows, export names, opaque keys, retrieval policy internals, and cache
+paths never cross the public boundary. The project actor opens the generic worker capability session and runs
+`lean-semantic-search` commands; `lean-rs` only supplies the substrate for that typed JSON command. `lean-semantic-search`
+owns feature extraction and storage-neutral retrieval. `lean-host-mcp` owns proof-agent admission, fallback, response
+shaping, and proof-specific boosts such as exact target, project-local, namespace/module, and selective conclusion
+evidence. Broad head-only semantic matches are diagnostic signal, not candidate-admission evidence. The target Lake
+project/import profile must make `LeanSemanticSearch.Capability` available to the project library used by the host; if it
+does not, the tool returns the same structured fallback/runtime behavior rather than changing MCP transport errors.
 
 `inspect_declaration` inspects exactly one declaration by name. Optional `file` input is used only to derive local
 imports so project declarations can resolve. Rendered fields are capped before crossing the worker boundary and carry
