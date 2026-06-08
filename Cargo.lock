@@ -174,9 +174,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bitflags"
-version = "2.12.1"
+version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "block-buffer"
@@ -234,9 +234,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.44"
+version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
@@ -1124,9 +1124,9 @@ dependencies = [
 
 [[package]]
 name = "lean-semantic-search-capability"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42362d62ed0b7b9b7f1d80bf56920d3de242a6d8b848c2db98aa502f5b422bf5"
+checksum = "3ce514d71f19c4dfd8bec5b1401026ca0cabc3dad3cbaf11ba64cdb832089d27"
 dependencies = [
  "lean-semantic-search-contract",
  "serde_json",
@@ -1134,9 +1134,9 @@ dependencies = [
 
 [[package]]
 name = "lean-semantic-search-contract"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35d6a1d06ef1b6b43ed5988f8f71a7aa4962e933e5e83a11211a12dae0a7bd41"
+checksum = "a755ce36de183590670373060b7cbec2d661d4aed267d336c299a208947ea5aa"
 dependencies = [
  "serde",
  "serde_json",
@@ -1144,9 +1144,9 @@ dependencies = [
 
 [[package]]
 name = "lean-semantic-search-retrieval"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38bcb6727d7ff66c14270b0e0a95c1d4d33fa5331fd453936122b877989db6c"
+checksum = "0335a9066f1926e6506ee6b9d1bd089748ded0b4867bb1fb6ad8447c7041827e"
 dependencies = [
  "lean-semantic-search-contract",
  "serde",
@@ -1219,9 +1219,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.31"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lru"
@@ -2537,9 +2537,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "yoke"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",
