@@ -75,8 +75,8 @@ under memory pressure, raise `post_job` toward (but below) `hard_kill` — e.g.
 inside one server process. The default lock namespace lives under the current user's cache directory at
 `lean-host-mcp/semantic-admission`; set `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR` only when you need an explicit namespace.
 Permit files are visible as `permit-000.lock`, `permit-001.lock`, and so on, with best-effort holder metadata. Parallel
-servers that share a lock directory must agree on `broker.semantic_permits`; stop existing servers or choose a fresh lock
-directory before changing the limit.
+servers that share a lock directory must agree on `broker.semantic_permits`; stop existing servers or choose a fresh
+lock directory before changing the limit.
 
 ## Observing worker recycles
 
