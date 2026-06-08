@@ -446,11 +446,15 @@ fn semantic_request_for_source(
     limit: usize,
 ) -> Option<SemanticProofSearchRequest> {
     let module = module_name_for_file(root, &input.resolved)?;
-    let candidate_modules = if imports.is_empty() {
-        input.imports.clone()
-    } else {
-        imports.to_vec()
-    };
+    let mut candidate_modules = Vec::new();
+    for candidate in std::iter::once(&module)
+        .chain(imports.iter())
+        .chain(input.imports.iter())
+    {
+        if !candidate_modules.iter().any(|existing| existing == candidate) {
+            candidate_modules.push(candidate.clone());
+        }
+    }
     if candidate_modules.is_empty() {
         return None;
     }
@@ -459,13 +463,17 @@ fn semantic_request_for_source(
             module,
             source_text: input.source.clone(),
             file_label: Some(input.resolved.to_string_lossy().into_owned()),
-            declaration: Some(declaration.to_owned()),
+            declaration: Some(short_declaration_name(declaration).to_owned()),
             position: source_position_for_selector(proof_position, &input.source),
             namespace,
         },
         candidate_modules,
         limit: limit.saturating_mul(3).clamp(10, 60),
     })
+}
+
+fn short_declaration_name(declaration: &str) -> &str {
+    declaration.rsplit('.').next().unwrap_or(declaration)
 }
 
 fn source_position_for_selector(selector: &ProofPositionSelector, source: &str) -> Option<SourcePosition> {
@@ -523,11 +531,15 @@ async fn run_semantic_search(
 
 fn semantic_error_summary(err: &ServerError) -> String {
     let text = err.to_string();
-    if text.contains("semantic_proof_search_unavailable") {
-        return "semantic capability unavailable for this project".to_owned();
+    if text.contains("semantic runtime build failed") || text.contains("semantic capability open failed") {
+        return "semantic runtime failed for this toolchain".to_owned();
     }
-    if text.contains("missing") || text.contains("not found") || text.contains("unknown module") {
-        return "LeanSemanticSearch is not available in the active Lake project/import profile".to_owned();
+    if text.contains(".olean")
+        || text.contains("object file")
+        || text.contains("unknown module")
+        || text.contains("missing imports")
+    {
+        return "consumer project imports are not built; run lake build for the active Lake project".to_owned();
     }
     "semantic capability command failed".to_owned()
 }

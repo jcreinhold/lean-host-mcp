@@ -17,8 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   evidence stays key-free: semantic matches surface as stable `semantic:*` `match_reason` labels such as
   `semantic:role_conclusion_const` or `semantic:conclusion_fingerprint`; raw feature keys and capability command names
   stay private. If the semantic command is unavailable or fails, the tool returns the existing structural fallback with
-  a warning instead of failing the MCP call. This is still the consumer-side capability path: the consumer project must
-  expose `LeanSemanticSearch.Capability`; host-vendoring the Lean capability is future work.
+  a warning instead of failing the MCP call. The capability now comes from the package-owned
+  `lean-semantic-search-runtime` crate, so consumer projects do not expose or import `LeanSemanticSearch.Capability`.
 - Cross-process admission control for semantic/elaborating work. Parallel server processes sharing a lock directory now
   coordinate before running heavy worker calls, so semantic proof search and other elaborating requests do not stampede
   the machine. New `[broker]` knobs and env overrides:

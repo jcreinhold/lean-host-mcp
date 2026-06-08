@@ -119,6 +119,11 @@ or explicit goal/type text when you don't:
 `score`, a `match_reason`, and a ready-to-paste `suggested_snippet` — not full statements. Inspect a chosen candidate by
 name with `inspect_declaration` to read its statement or attributes.
 
+The semantic lane requires only the same built Lake project every other tool requires; consumers do not declare or
+import `lean-semantic-search`. The server obtains the capability from the package-owned
+`lean-semantic-search-runtime` crate. Declaration features are build-fresh from the consumer modules' `.olean` closure,
+while proof-goal features are edit-fresh from the source text in the request.
+
 ```jsonc
 {
   "candidates": [

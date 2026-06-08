@@ -9,11 +9,12 @@ use std::collections::HashMap;
 
 use lean_rs_worker_parent::{LeanWorkerJsonCommand, LeanWorkerSession};
 use lean_semantic_search_contract::{
-    CAPABILITY_SCHEMA_VERSION, CommandResponse, DECLARATION_FEATURE_COMMAND_VERSION, DeclarationFeatureRequest,
-    DeclarationFeatureRow, Diagnostic, DiagnosticSeverity, ModuleSpec, PROOF_GOAL_FEATURE_COMMAND_VERSION,
-    ProofGoalFeatureRequest, ProofGoalFeatureRow, SEMANTIC_FEATURE_VERSION,
+    CAPABILITY_SCHEMA_VERSION, CommandResponse, DECLARATION_FEATURE_COMMAND_VERSION, DeclarationFeatureRow, Diagnostic,
+    DiagnosticSeverity, ModuleSpec, PROOF_GOAL_FEATURE_COMMAND_VERSION, ProofGoalFeatureRequest, ProofGoalFeatureRow,
+    SEMANTIC_FEATURE_VERSION,
 };
 use lean_semantic_search_retrieval::{Anchor, SemanticIndex, retrieve_across};
+use serde::Serialize;
 
 use crate::error::{Result, ServerError};
 use crate::projections::SourceRange;
@@ -47,6 +48,13 @@ pub(crate) struct SemanticProofSearchResult {
 type DeclarationResponse = CommandResponse<DeclarationFeatureRow>;
 type ProofGoalResponse = CommandResponse<ProofGoalFeatureRow>;
 
+#[derive(Debug, Serialize)]
+struct DeclarationFeatureCommandRequest {
+    modules: Vec<ModuleSpec>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    declaration_ids: Vec<String>,
+}
+
 /// Run source-backed semantic proof search in one manifest-backed worker session.
 ///
 /// # Errors
@@ -60,7 +68,7 @@ pub(crate) fn run_semantic_proof_search(
     let goal_command = LeanWorkerJsonCommand::<ProofGoalFeatureRequest, ProofGoalResponse>::new(
         lean_semantic_search_capability::PROOF_GOAL_FEATURES_EXPORT,
     );
-    let declaration_command = LeanWorkerJsonCommand::<DeclarationFeatureRequest, DeclarationResponse>::new(
+    let declaration_command = LeanWorkerJsonCommand::<DeclarationFeatureCommandRequest, DeclarationResponse>::new(
         lean_semantic_search_capability::DECLARATION_FEATURES_EXPORT,
     );
 
@@ -73,7 +81,7 @@ pub(crate) fn run_semantic_proof_search(
         PROOF_GOAL_FEATURE_COMMAND_VERSION,
     )?;
 
-    let declaration_request = DeclarationFeatureRequest {
+    let declaration_request = DeclarationFeatureCommandRequest {
         modules: request
             .candidate_modules
             .iter()

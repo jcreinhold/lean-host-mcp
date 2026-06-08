@@ -93,8 +93,9 @@ A project the server can host needs only two things:
 
 Dependencies need no extra configuration once their own `lake build` has run: the server reads `lake-manifest.json` and
 adds each transitive package's build output to the import search path. For mathlib, `lake exe cache get` pulls
-precompiled oleans; other dependencies follow the equivalent setup. `fixtures/lean/` is the demo target the test suite
-uses, and doubles as a minimal template to copy.
+precompiled oleans; other dependencies follow the equivalent setup. Semantic proof search follows the same
+zero-consumer-setup model through the package-owned `lean-semantic-search-runtime` crate, so consumer projects do not
+declare or import it. `fixtures/lean/` is the demo target the test suite uses, and doubles as a minimal template to copy.
 
 ## Transports
 

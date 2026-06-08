@@ -495,6 +495,11 @@ async fn search_for_proof_prefers_relevant_fixture_lemmas() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
+    let manifest = fs::read_to_string(root.join("lake-manifest.json")).expect("fixture manifest");
+    assert!(
+        !manifest.contains("lean-semantic-search") && !manifest.contains("LeanSemanticSearch"),
+        "fixture must prove zero consumer semantic-search setup"
+    );
     let ctx = open_ctx(&root);
 
     let response = search_for_proof(
@@ -513,6 +518,25 @@ async fn search_for_proof_prefers_relevant_fixture_lemmas() {
     )
     .await
     .expect("search_for_proof");
+    let telemetry = response.telemetry.as_ref().expect("full telemetry");
+    assert!(
+        telemetry
+            .imports
+            .iter()
+            .all(|import| import != "LeanSemanticSearch.Capability"),
+        "semantic capability module must not leak into telemetry imports: {:?}",
+        telemetry.imports
+    );
+    assert!(
+        response.warnings.iter().all(|warning| {
+            !warning.contains("semantic capability unavailable for this project")
+                && !warning.contains("LeanSemanticSearch is not available")
+                && !warning.contains("declare")
+                && !warning.contains("import LeanSemanticSearch")
+        }),
+        "warnings must not suggest consumer semantic-search setup: {:?}",
+        response.warnings
+    );
     assert!(
         response
             .result
@@ -524,6 +548,26 @@ async fn search_for_proof_prefers_relevant_fixture_lemmas() {
                 candidate.name.contains("Rat") && (candidate.name.contains("num") || candidate.name.contains("den"))
             }),
         "fixture arithmetic search should surface Rat num/den structure above generic noise: {:?}",
+        response.result.as_ref().expect("search result").candidates
+    );
+    assert!(
+        response
+            .result
+            .as_ref()
+            .expect("search result")
+            .candidates
+            .iter()
+            .any(
+                |candidate| candidate.match_reason.contains("semantic:role_conclusion_const")
+                    || candidate.match_reason.contains("semantic:conclusion_fingerprint")
+                    || candidate.match_reason.contains("semantic:statement_fingerprint")
+                    || candidate.match_reason.contains("semantic:safe_permutation_fingerprint")
+                    || candidate.match_reason.contains("semantic:connective_fingerprint")
+            ),
+        "fixture search should include stable semantic evidence; envelope_warnings={:?}; result_warnings={:?}; diagnostics={:?}; candidates={:?}",
+        response.warnings,
+        response.result.as_ref().expect("search result").warnings,
+        response.result.as_ref().expect("search result").diagnostics,
         response.result.as_ref().expect("search result").candidates
     );
 }

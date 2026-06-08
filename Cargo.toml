@@ -2,6 +2,11 @@
 members = ["crates/*"]
 resolver = "3"
 
+# Temporary local integration for the package-owned semantic runtime crate.
+# Remove once `lean-semantic-search-runtime` is published.
+[patch.crates-io]
+lean-semantic-search-runtime = { path = "../lean-semantic-search/crates/runtime" }
+
 [workspace.package]
 authors = ["Jacob Reinhold"]
 edition = "2024"

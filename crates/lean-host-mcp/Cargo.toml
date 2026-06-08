@@ -70,6 +70,7 @@ lean-rs-worker-parent = "0.2.0"
 lean-semantic-search-capability = "0.2.0"
 lean-semantic-search-contract = "0.2.0"
 lean-semantic-search-retrieval = "0.2.0"
+lean-semantic-search-runtime = "0.2.0"
 # Link-free facade over lean-rs-abi metadata: supplies the supported-toolchain
 # window. Already in the parent's closure via lean-rs-worker-parent, so this
 # direct dep adds no new linkage. The parent must stay free of libleanshared —
