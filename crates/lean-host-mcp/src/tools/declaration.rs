@@ -137,6 +137,7 @@ impl From<InspectDeclarationFields> for LeanWorkerDeclarationInspectionFields {
             // `ppExpr`, `pp.universes false`, and falls back to Raw on failure).
             // The `raw_statement` request flag overrides this in the handler.
             rendering: LeanWorkerRendering::Pretty,
+            proof_search: false,
         }
     }
 }

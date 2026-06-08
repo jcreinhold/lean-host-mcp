@@ -1396,6 +1396,7 @@ mod tests {
             output_bytes: 123,
             cache_entry_count: Some(2),
             cache_approx_bytes: Some(4096),
+            resource: None,
         }
     }
 

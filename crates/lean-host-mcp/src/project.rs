@@ -1339,6 +1339,7 @@ impl ProjectActorState {
                     operation,
                     current_kib,
                     limit_kib,
+                    ..
                 }) => {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
@@ -1785,6 +1786,7 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
             operation,
             current_kib,
             limit_kib,
+            ..
         }) => {
             return Err(bootstrap_hard_rss_unavailable(
                 config,
@@ -1960,13 +1962,18 @@ fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
         LeanWorkerRestartReason::Explicit => RestartCause::Explicit.as_str().to_owned(),
         LeanWorkerRestartReason::MaxRequests { limit } => format!("max_requests limit={limit}"),
         LeanWorkerRestartReason::MaxImports { limit } => format!("max_imports limit={limit}"),
-        LeanWorkerRestartReason::RssCeiling { current_kib, limit_kib } => {
+        LeanWorkerRestartReason::RssCeiling {
+            current_kib,
+            limit_kib,
+            ..
+        } => {
             format!("rss_ceiling current_kib={current_kib} limit_kib={limit_kib}")
         }
         LeanWorkerRestartReason::RssHardLimit {
             operation,
             current_kib,
             limit_kib,
+            ..
         } => {
             format!("rss_hard_limit operation={operation} current_kib={current_kib} limit_kib={limit_kib}")
         }
@@ -2303,6 +2310,7 @@ mod tests {
             restart_cause_from_worker(&LeanWorkerRestartReason::RssCeiling {
                 current_kib: 2,
                 limit_kib: 1,
+                last_import_stats: None,
             })
             .as_str(),
             "rss_post_job"
@@ -2312,6 +2320,7 @@ mod tests {
                 operation: "test",
                 current_kib: 2,
                 limit_kib: 1,
+                last_import_stats: None,
             })
             .as_str(),
             "rss_hard_limit_exceeded"

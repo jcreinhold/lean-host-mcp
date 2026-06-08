@@ -7,6 +7,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 <!-- ASSISTANT: add new entries under [Unreleased]; `release-lean-host-mcp` promotes them on tag. -->
 
+## [Unreleased]
+
+### Added
+
+- `search_for_proof` now has a semantic retrieval lane for file/declaration-backed queries. When a request includes
+  source context, the tool asks `lean-semantic-search` for proof-goal features, extracts declaration features from the
+  candidate modules, ranks semantic candidates, and merges them with the existing declaration-search fallback. Public
+  evidence stays key-free: semantic matches surface as stable `semantic:*` `match_reason` labels such as
+  `semantic:role_conclusion_const` or `semantic:conclusion_fingerprint`; raw feature keys and capability command names
+  stay private. If the semantic command is unavailable or fails, the tool returns the existing structural fallback with
+  a warning instead of failing the MCP call. This is still the consumer-side capability path: the consumer project must
+  expose `LeanSemanticSearch.Capability`; host-vendoring the Lean capability is future work.
+- Cross-process admission control for semantic/elaborating work. Parallel server processes sharing a lock directory now
+  coordinate before running heavy worker calls, so semantic proof search and other elaborating requests do not stampede
+  the machine. New `[broker]` knobs and env overrides:
+  `semantic_permits` / `LEAN_HOST_MCP_SEMANTIC_PERMITS`, `semantic_waiters` /
+  `LEAN_HOST_MCP_SEMANTIC_WAITERS`, `semantic_admission_timeout_millis` /
+  `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS`, and `semantic_lock_dir` /
+  `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR`. Saturation returns retryable structured errors such as
+  `semantic_admission_full` or `semantic_admission_timeout`.
+
+### Changed
+
+- Bumped the `lean-semantic-search-*` crates to 0.2.0 and adapted to the new storage-neutral retrieval API
+  (`retrieve_across(&[&dyn Corpus], ...)` instead of `SemanticIndex::retrieve(...)`).
+- Bumped `lean-rs-worker-parent`, `lean-rs-worker-child`, and `lean-toolchain` to 0.2.0. This pulls link-free
+  `lean-rs-abi` metadata into the parent-side dependency graph, so `cargo nextest run --workspace --no-fail-fast` no
+  longer builds the parent test binary with an accidental `libleanshared` load command through workspace feature
+  unification. The worker crate still links `libleanshared`; the parent crate remains link-free.
+- Updated the host for additive `lean-rs` 0.2.0 telemetry fields: RSS/resource fields are ignored where the envelope
+  does not yet expose them, declaration inspection leaves the new proof-search facts disabled by default, and module
+  query cache-fact fixtures set `resource: None`.
+
+### Fixed
+
+- Workspace-wide nextest no longer aborts while listing parent tests on macOS with
+  `Library not loaded: @rpath/libleanshared.dylib`; the parent test binary is again free of Lean runtime linkage when
+  built together with the worker.
+
 ## [0.3.0] - 2026-06-02
 
 ### Changed
@@ -145,6 +184,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jcreinhold/lean-host-mcp/releases/tag/v0.1.0

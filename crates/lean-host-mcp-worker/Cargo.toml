@@ -15,7 +15,7 @@ name = "lean-host-mcp-worker"
 path = "src/main.rs"
 
 [dependencies]
-lean-rs-worker-child = "0.1.20"
+lean-rs-worker-child = "0.2.0"
 
 [lints]
 workspace = true
