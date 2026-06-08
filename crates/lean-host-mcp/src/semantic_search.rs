@@ -13,7 +13,7 @@ use lean_semantic_search_contract::{
     DeclarationFeatureRow, Diagnostic, DiagnosticSeverity, ModuleSpec, PROOF_GOAL_FEATURE_COMMAND_VERSION,
     ProofGoalFeatureRequest, ProofGoalFeatureRow, SEMANTIC_FEATURE_VERSION,
 };
-use lean_semantic_search_retrieval::{Anchor, SemanticIndex};
+use lean_semantic_search_retrieval::{Anchor, SemanticIndex, retrieve_across};
 
 use crate::error::{Result, ServerError};
 use crate::projections::SourceRange;
@@ -158,7 +158,7 @@ fn rank_semantic_rows(
         .collect::<HashMap<_, _>>();
     let index = SemanticIndex::from_declarations(&declaration_response.rows);
     let anchor = Anchor::from_proof_goal(goal);
-    let retrieval = index.retrieve(&anchor, limit);
+    let retrieval = retrieve_across(&[&index], &anchor, limit);
     diagnostics.extend(diagnostic_strings(&retrieval.diagnostics));
 
     let candidates = retrieval
