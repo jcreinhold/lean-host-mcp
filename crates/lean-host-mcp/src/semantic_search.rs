@@ -31,6 +31,7 @@ pub(crate) struct SemanticProofSearchRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct SemanticProofCandidate {
     pub(crate) name: String,
+    pub(crate) module: Option<String>,
     pub(crate) source: Option<SourceRange>,
     pub(crate) score: i32,
     pub(crate) evidence: Vec<String>,
@@ -179,9 +180,12 @@ fn rank_semantic_rows(
                 .into_iter()
                 .map(|explanation| format!("semantic:{}:{}", explanation.family.label(), explanation.match_count))
                 .collect::<Vec<_>>();
+            let source = source_by_id.get(&candidate.declaration_id).cloned().flatten();
+            let (module, name) = split_declaration_id(&candidate.declaration_id);
             SemanticProofCandidate {
-                source: source_by_id.get(&candidate.declaration_id).cloned().flatten(),
-                name: candidate.declaration_id,
+                name,
+                module,
+                source,
                 // Keep semantic candidates above lexical-only fallback while
                 // still allowing proof-agent boosts/penalties to reorder them.
                 score: 150_i32.saturating_sub(rank.saturating_mul(4)),
@@ -218,6 +222,22 @@ const fn severity_label(severity: DiagnosticSeverity) -> &'static str {
         DiagnosticSeverity::Pass => "pass",
         DiagnosticSeverity::Warning => "warning",
         DiagnosticSeverity::Error => "error",
+    }
+}
+
+/// Split a downstream `origin:module:declName` declaration id into its module
+/// and the clean Lean declaration name.
+///
+/// The extractor builds ids as `s!"{origin}:{module}:{declName}"`, and none of
+/// the three parts contains a colon (Lean names use `.`, the origin is a fixed
+/// label). An id that does not match that shape is returned whole as the name,
+/// so a future format change degrades to a still-usable name rather than an
+/// error.
+fn split_declaration_id(id: &str) -> (Option<String>, String) {
+    let mut parts = id.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(_origin), Some(module), Some(decl)) => (Some(module.to_owned()), decl.to_owned()),
+        _ => (None, id.to_owned()),
     }
 }
 
@@ -321,9 +341,68 @@ mod tests {
         };
         let evidence = candidate.evidence.join(",");
         assert_eq!(candidate.name, "Fixture.target_helper");
+        // A colonless id is not in `origin:module:decl` shape, so it stays whole
+        // as the name and carries no module.
+        assert!(candidate.module.is_none());
         assert!(evidence.contains("semantic:role_conclusion_const"));
         assert!(!evidence.contains("opaque-key-that-must-not-leak"));
         assert!(candidate.source.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_name_strips_origin_module_prefix() -> Result<(), String> {
+        let key = OpaqueFeatureKey::new("shared-conclusion-key");
+        let goal = lean_semantic_search_contract::ProofGoalFeatureRow {
+            goal_id: "g".to_owned(),
+            feature_version: SEMANTIC_FEATURE_VERSION.to_owned(),
+            fingerprints: fingerprints("goal"),
+            role_features: vec![RoleFeature {
+                role: "conclusion_const".to_owned(),
+                key: key.clone(),
+                display: Some("Target.const".to_owned()),
+            }],
+            low_signal_markers: Vec::new(),
+        };
+        // The downstream extractor emits ids as `origin:module:declName`.
+        let row = lean_semantic_search_contract::DeclarationFeatureRow {
+            declaration_id: "lean-host-mcp:KanProofs.Foo:My.Decl.name".to_owned(),
+            feature_version: SEMANTIC_FEATURE_VERSION.to_owned(),
+            fingerprints: fingerprints("row"),
+            role_features: vec![RoleFeature {
+                role: "conclusion_const".to_owned(),
+                key,
+                display: Some("Target.const".to_owned()),
+            }],
+            binder_count: 0,
+            low_signal_markers: Vec::new(),
+            source: None,
+        };
+        let goal_response = CommandResponse {
+            schema_version: CAPABILITY_SCHEMA_VERSION.to_owned(),
+            command: "proof_goal_features".to_owned(),
+            command_version: PROOF_GOAL_FEATURE_COMMAND_VERSION.to_owned(),
+            feature_version: SEMANTIC_FEATURE_VERSION.to_owned(),
+            rows: vec![goal],
+            diagnostics: Vec::<Diagnostic>::new(),
+        };
+        let declaration_response = CommandResponse {
+            schema_version: CAPABILITY_SCHEMA_VERSION.to_owned(),
+            command: "declaration_features".to_owned(),
+            command_version: DECLARATION_FEATURE_COMMAND_VERSION.to_owned(),
+            feature_version: SEMANTIC_FEATURE_VERSION.to_owned(),
+            rows: vec![row],
+            diagnostics: Vec::<Diagnostic>::new(),
+        };
+        let result = rank_semantic_rows(&goal_response, &declaration_response, 5);
+        let Some(candidate) = result.candidates.first() else {
+            return Err("expected a semantic candidate".to_owned());
+        };
+        // The public name is the clean Lean name; the origin/module prefix is
+        // lifted into `module` rather than leaking into `name`.
+        assert_eq!(candidate.name, "My.Decl.name");
+        assert_eq!(candidate.module.as_deref(), Some("KanProofs.Foo"));
+        assert!(!candidate.name.contains("lean-host-mcp"));
         Ok(())
     }
 }
