@@ -30,7 +30,7 @@ crates/lean-host-mcp/src/
   projections.rs    stable MCP projections from lean-rs worker types
   lake_meta.rs      minimal Lake-project metadata
   cache.rs          small LRU for bounded reference queries
-  envelope.rs       Response<T> = { status, result, freshness, runtime, warnings, next_actions }
+  envelope.rs       Response<T> = { status, result, runtime_error, freshness, telemetry?, warnings, next_actions }
 
 crates/lean-host-mcp-worker/src/
   main.rs           worker child: lean_rs_worker_child::run_worker_child_stdio()
@@ -172,8 +172,9 @@ response schema stay unchanged: semantic feature rows, export names, opaque keys
 paths never cross the public boundary. The project actor builds/loads `lean-semantic-search` through the package-owned
 runtime crate, points the session import root at the consumer Lake project, and imports only the consumer modules
 requested by the tool call. Declaration feature extraction is build-fresh: it imports the selected consumer modules from
-their built `.olean` closure. Proof-goal feature extraction is edit-fresh: it elaborates the current source text supplied
-by the tool. `lean-rs` only supplies the generic split-root worker capability substrate for those typed JSON commands.
+their built `.olean` closure. Proof-goal feature extraction is edit-fresh: it elaborates the current source text
+supplied by the tool. `lean-rs` only supplies the generic split-root worker capability substrate for those typed JSON
+commands.
 
 `lean-semantic-search` owns feature extraction and storage-neutral retrieval. `lean-host-mcp` owns proof-agent
 admission, fallback, response shaping, and proof-specific boosts such as exact target, project-local, namespace/module,
@@ -192,8 +193,11 @@ It never writes source files.
 `verify_declaration` elaborates the in-memory source snapshot and checks one declaration under the requested sorry/axiom
 policy. Policy failures are normal results.
 
-`find_references` runs semantic reference lookup for a fully-qualified name in file or bounded project scope. Project
-scope reports scanned/skipped files, header failures, missing imports, unsupported files, and truncation.
+`find_references` runs semantic reference lookup for a fully-qualified name in file or bounded project scope. File scope
+elaborates the one anchor file through the worker; project scope reads Lean's on-disk `.ilean` reference index instead
+of re-elaborating, so it answers in milliseconds with no worker query (see
+[the `.ilean` reader](ilean-reference-index.md)). Project scope reports scanned/skipped files, header failures, missing
+imports, unsupported files, and truncation.
 
 ## Scope Boundary
 
