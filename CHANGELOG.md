@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded the `lean-rs` worker crates (`lean-rs-worker-parent` / `-child`, `lean-toolchain`) to 0.2.2 and moved the
+  Lean toolchain pin to the new supported-window head, `leanprover/lean4:v4.31.0-rc2` (header-identical to `-rc1`, so
+  the ABI is unchanged). The supported window is now `4.26.0 ..= 4.31.0-rc2`.
+
 ## [0.4.1] - 2026-06-09
 
 ### Fixed
