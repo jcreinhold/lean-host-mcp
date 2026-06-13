@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+pub(crate) mod changed_coverage;
 pub mod declaration;
 pub mod declaration_inventory;
 pub mod position;

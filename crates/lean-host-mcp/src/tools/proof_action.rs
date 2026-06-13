@@ -8,7 +8,7 @@
 // worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
@@ -32,6 +32,9 @@ use crate::error::{Result, ServerError};
 use crate::projections::{
     DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProofAttemptCandidate,
     ProofAttemptEnvelope, ProofAttemptResult, project_declaration_verification, project_proof_attempt,
+};
+use crate::tools::changed_coverage::{
+    ChangedCoverageReport, ChangedCoverageRequest, ChangedCoverageResult, ChangedDeclaration, compute_changed_coverage,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
 use crate::tools::source_input::{read_query_file, source_path_for_module};
@@ -117,15 +120,32 @@ impl From<VerifyDeclarationRequest> for LeanVerifyRequest {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LeanVerifyTargetGroup {
-    Explicit { file: PathBuf, declarations: Vec<String> },
-    FileAll { file: PathBuf },
-    ModuleAll { module: String },
+    Explicit {
+        file: PathBuf,
+        declarations: Vec<String>,
+    },
+    FileAll {
+        file: PathBuf,
+    },
+    ModuleAll {
+        module: String,
+    },
+    Changed {
+        #[serde(default)]
+        base: Option<String>,
+        #[serde(default)]
+        files: Vec<PathBuf>,
+        #[serde(default)]
+        include_untracked: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct LeanVerifyResult {
     pub summary: LeanVerifySummary,
     pub results: Vec<LeanVerifyRow>,
+    #[serde(skip_serializing_if = "ChangedCoverageReport::is_empty")]
+    pub coverage: ChangedCoverageReport,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -134,6 +154,7 @@ pub struct LeanVerifySummary {
     pub verified: usize,
     pub failed: usize,
     pub needs_build: usize,
+    pub unknown_coverage: usize,
     pub truncated: bool,
 }
 
@@ -142,6 +163,8 @@ pub struct LeanVerifyRow {
     pub id: String,
     pub file: String,
     pub declaration: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub verification_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facts: Option<Box<DeclarationVerificationFacts>>,
@@ -504,6 +527,30 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                     }
                 }
             }
+            LeanVerifyTargetGroup::Changed {
+                base,
+                files,
+                include_untracked,
+            } => {
+                let coverage = compute_changed_coverage(
+                    ctx,
+                    hint.clone(),
+                    &meta.canonical_root,
+                    ChangedCoverageRequest {
+                        base: base.clone(),
+                        files: files.clone(),
+                        include_untracked: *include_untracked,
+                        project: req.project.clone(),
+                    },
+                )
+                .await?;
+                expansion.absorb_changed_coverage(&coverage);
+                if let Some(result) = coverage.result_ref() {
+                    expansion.coverage.extend(result.coverage.clone());
+                    expansion.truncated |= result.coverage.truncated;
+                    expansion.push_changed_group(group_index, &result.known);
+                }
+            }
         }
     }
 
@@ -596,7 +643,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
     }
 
     rows.sort_by_key(|row| order_by_id.get(&row.id).copied().unwrap_or(usize::MAX));
-    let summary = summarize_rows(requested, expansion.truncated, &rows);
+    let summary = summarize_rows(requested, expansion.truncated, expansion.coverage.unknown.len(), &rows);
     let (freshness, runtime) = match last_identity {
         Some(identity) => identity,
         None => {
@@ -604,9 +651,16 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
             (base.freshness, base.runtime)
         }
     };
-    let mut response = Response::ok(LeanVerifyResult { summary, results: rows }, freshness)
-        .with_runtime(runtime)
-        .with_trust_artifacts(expansion.trust_artifacts);
+    let mut response = Response::ok(
+        LeanVerifyResult {
+            summary,
+            results: rows,
+            coverage: expansion.coverage,
+        },
+        freshness,
+    )
+    .with_runtime(runtime)
+    .with_trust_artifacts(expansion.trust_artifacts);
     response.warnings.extend(expansion.warnings);
     response.next_actions.extend(expansion.next_actions);
     response
@@ -639,6 +693,7 @@ struct VerifyTarget {
     id: String,
     file: String,
     declaration: String,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -654,9 +709,27 @@ struct VerifyExpansion {
     requested: usize,
     next_order: usize,
     truncated: bool,
+    coverage: ChangedCoverageReport,
     trust_artifacts: Vec<ArtifactTrust>,
     warnings: Vec<String>,
     next_actions: Vec<String>,
+}
+
+struct VerifyDeclarationItem<'a> {
+    name: &'a str,
+    reason: Option<String>,
+}
+
+impl<'a> From<&'a str> for VerifyDeclarationItem<'a> {
+    fn from(name: &'a str) -> Self {
+        Self { name, reason: None }
+    }
+}
+
+impl<'a> From<(&'a str, Option<String>)> for VerifyDeclarationItem<'a> {
+    fn from((name, reason): (&'a str, Option<String>)) -> Self {
+        Self { name, reason }
+    }
 }
 
 impl VerifyExpansion {
@@ -668,6 +741,7 @@ impl VerifyExpansion {
             requested: 0,
             next_order: 0,
             truncated: false,
+            coverage: ChangedCoverageReport::default(),
             trust_artifacts: Vec::new(),
             warnings: Vec::new(),
             next_actions: Vec::new(),
@@ -678,7 +752,7 @@ impl VerifyExpansion {
         self.push_declarations(
             group_index,
             VerifySource::File(file.to_path_buf()),
-            declarations.iter().map(String::as_str),
+            declarations.iter().map(|name| (name.as_str(), None)),
         );
     }
 
@@ -688,13 +762,30 @@ impl VerifyExpansion {
         source: VerifySource,
         declarations: &[crate::tools::declaration_inventory::DeclarationInventoryRow],
     ) {
-        self.push_declarations(group_index, source, declarations.iter().map(|row| row.name.as_str()));
+        self.push_declarations(
+            group_index,
+            source,
+            declarations.iter().map(|row| (row.name.as_str(), None)),
+        );
     }
 
-    fn push_declarations<I>(&mut self, group_index: usize, source: VerifySource, declarations: I)
+    fn push_changed_group(&mut self, group_index: usize, declarations: &[ChangedDeclaration]) {
+        let mut by_file = BTreeMap::<String, Vec<(&str, Option<String>)>>::new();
+        for declaration in declarations {
+            by_file
+                .entry(declaration.file.clone())
+                .or_default()
+                .push((declaration.declaration.as_str(), Some(declaration.reason.clone())));
+        }
+        for (file, declarations) in by_file {
+            self.push_declarations(group_index, VerifySource::File(PathBuf::from(file)), declarations);
+        }
+    }
+
+    fn push_declarations<'a, I>(&mut self, group_index: usize, source: VerifySource, declarations: I)
     where
         I: IntoIterator,
-        I::Item: AsRef<str>,
+        I::Item: Into<VerifyDeclarationItem<'a>>,
     {
         let file = file_display(&source);
         let key = source_key(&source);
@@ -711,14 +802,15 @@ impl VerifyExpansion {
             }
         };
         for declaration in declarations {
-            let declaration = declaration.as_ref().trim();
-            if declaration.is_empty() {
+            let declaration = declaration.into();
+            let name = declaration.name.trim();
+            if name.is_empty() {
                 self.warnings
                     .push("lean_verify ignored an empty declaration target".to_owned());
                 continue;
             }
             self.requested = self.requested.saturating_add(1);
-            let mut id = format!("group_{}:{declaration}", group_index.saturating_add(1));
+            let mut id = format!("group_{}:{name}", group_index.saturating_add(1));
             if !self.seen_ids.insert(id.clone()) {
                 id = format!("{id}#{}", self.next_order.saturating_add(1));
                 let _ = self.seen_ids.insert(id.clone());
@@ -728,7 +820,8 @@ impl VerifyExpansion {
                     order: self.next_order,
                     id,
                     file: file.clone(),
-                    declaration: declaration.to_owned(),
+                    declaration: name.to_owned(),
+                    reason: declaration.reason,
                 });
             }
             self.next_order = self.next_order.saturating_add(1);
@@ -739,6 +832,12 @@ impl VerifyExpansion {
         &mut self,
         response: &Response<crate::tools::declaration_inventory::DeclarationInventoryResult>,
     ) {
+        self.trust_artifacts.extend(response.trust_artifacts.clone());
+        self.warnings.extend(response.warnings.clone());
+        self.next_actions.extend(response.next_actions.clone());
+    }
+
+    fn absorb_changed_coverage(&mut self, response: &Response<ChangedCoverageResult>) {
         self.trust_artifacts.extend(response.trust_artifacts.clone());
         self.warnings.extend(response.warnings.clone());
         self.next_actions.extend(response.next_actions.clone());
@@ -846,6 +945,7 @@ fn project_batch_rows(
                         id: target.id.clone(),
                         file: target.file.clone(),
                         declaration: target.declaration.clone(),
+                        reason: target.reason.clone(),
                         verification_status: "header_parse_failed".to_owned(),
                         facts: None,
                         missing_imports: Vec::new(),
@@ -865,6 +965,7 @@ fn project_batch_rows(
                     id: target.id.clone(),
                     file: target.file.clone(),
                     declaration: target.declaration.clone(),
+                    reason: target.reason.clone(),
                     verification_status: "unsupported".to_owned(),
                     facts: None,
                     missing_imports: Vec::new(),
@@ -883,6 +984,7 @@ fn project_batch_rows(
                     id: target.id.clone(),
                     file: target.file.clone(),
                     declaration: target.declaration.clone(),
+                    reason: target.reason.clone(),
                     verification_status: "unsupported".to_owned(),
                     facts: None,
                     missing_imports: Vec::new(),
@@ -957,6 +1059,7 @@ fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResu
             id: target.id.clone(),
             file: target.file.clone(),
             declaration: target.declaration.clone(),
+            reason: target.reason.clone(),
             verification_status,
             facts: Some(facts),
             missing_imports: Vec::new(),
@@ -971,6 +1074,7 @@ fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResu
             id: target.id.clone(),
             file: target.file.clone(),
             declaration: target.declaration.clone(),
+            reason: target.reason.clone(),
             verification_status,
             facts: Some(facts),
             missing_imports: missing,
@@ -980,6 +1084,7 @@ fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResu
             id: target.id.clone(),
             file: target.file.clone(),
             declaration: target.declaration.clone(),
+            reason: target.reason.clone(),
             verification_status: "header_parse_failed".to_owned(),
             facts: None,
             missing_imports: Vec::new(),
@@ -989,6 +1094,7 @@ fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResu
             id: target.id.clone(),
             file: target.file.clone(),
             declaration: target.declaration.clone(),
+            reason: target.reason.clone(),
             verification_status: "unsupported".to_owned(),
             facts: None,
             missing_imports: Vec::new(),
@@ -1002,6 +1108,7 @@ fn needs_build_row(target: VerifyTarget) -> LeanVerifyRow {
         id: target.id,
         file: target.file,
         declaration: target.declaration,
+        reason: target.reason,
         verification_status: NEEDS_BUILD_STATUS.to_owned(),
         facts: Some(Box::new(needs_build_facts())),
         missing_imports: Vec::new(),
@@ -1009,7 +1116,12 @@ fn needs_build_row(target: VerifyTarget) -> LeanVerifyRow {
     }
 }
 
-fn summarize_rows(requested: usize, truncated: bool, rows: &[LeanVerifyRow]) -> LeanVerifySummary {
+fn summarize_rows(
+    requested: usize,
+    truncated: bool,
+    unknown_coverage: usize,
+    rows: &[LeanVerifyRow],
+) -> LeanVerifySummary {
     let verified = rows.iter().filter(|row| row.verification_status == "verified").count();
     let needs_build = rows
         .iter()
@@ -1020,6 +1132,7 @@ fn summarize_rows(requested: usize, truncated: bool, rows: &[LeanVerifyRow]) -> 
         verified,
         failed: rows.len().saturating_sub(verified).saturating_sub(needs_build),
         needs_build,
+        unknown_coverage,
         truncated,
     }
 }
@@ -1439,6 +1552,7 @@ mod tests {
                 id: "group_1:Demo.ok".to_owned(),
                 file: "Demo.lean".to_owned(),
                 declaration: "Demo.ok".to_owned(),
+                reason: None,
                 verification_status: "verified".to_owned(),
                 facts: None,
                 missing_imports: Vec::new(),
@@ -1448,6 +1562,7 @@ mod tests {
                 id: "group_1:Demo.sorry".to_owned(),
                 file: "Demo.lean".to_owned(),
                 declaration: "Demo.sorry".to_owned(),
+                reason: None,
                 verification_status: "has_sorry".to_owned(),
                 facts: None,
                 missing_imports: Vec::new(),
@@ -1457,6 +1572,7 @@ mod tests {
                 id: "group_2:Demo.unbuilt".to_owned(),
                 file: "Demo.lean".to_owned(),
                 declaration: "Demo.unbuilt".to_owned(),
+                reason: None,
                 verification_status: NEEDS_BUILD_STATUS.to_owned(),
                 facts: None,
                 missing_imports: Vec::new(),
@@ -1464,11 +1580,12 @@ mod tests {
             },
         ];
 
-        let summary = summarize_rows(4, true, &rows);
+        let summary = summarize_rows(4, true, 2, &rows);
         assert_eq!(summary.requested, 4);
         assert_eq!(summary.verified, 1);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.needs_build, 1);
+        assert_eq!(summary.unknown_coverage, 2);
         assert!(summary.truncated);
     }
 

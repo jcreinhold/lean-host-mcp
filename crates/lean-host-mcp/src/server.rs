@@ -65,7 +65,7 @@ impl LeanHostService {
         self.respond_semantic(tools::semantic::lean_trial(&self.ctx, req).await)
     }
 
-    #[tool(description = "Verify Lean declarations from explicit, file_all, or module_all target groups.")]
+    #[tool(description = "Verify Lean declarations from explicit, file_all, module_all, or changed target groups.")]
     async fn lean_verify(
         &self,
         Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
@@ -74,7 +74,9 @@ impl LeanHostService {
         self.respond_semantic(tools::semantic::lean_verify(&self.ctx, req).await)
     }
 
-    #[tool(description = "Semantic lookup. Kinds: declaration, declarations, proof_search, references.")]
+    #[tool(
+        description = "Semantic lookup. Kinds: declaration, declarations, changed_coverage, proof_search, references."
+    )]
     async fn lean_lookup(
         &self,
         Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,

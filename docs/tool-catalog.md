@@ -176,7 +176,13 @@ Mixed target groups:
       ]
     },
     { "kind": "file_all", "file": "LeanRsFixture/ProofAgent.lean" },
-    { "kind": "module_all", "module": "LeanRsFixture.ProofActions" }
+    { "kind": "module_all", "module": "LeanRsFixture.ProofActions" },
+    {
+      "kind": "changed",
+      "base": "HEAD",
+      "files": ["LeanRsFixture/ProofActions.lean"],
+      "include_untracked": true
+    }
   ],
   "allow_sorry": false,
   "report_axioms": false
@@ -192,6 +198,7 @@ The response is a compact batch:
     "verified": 3,
     "failed": 1,
     "needs_build": 0,
+    "unknown_coverage": 1,
     "truncated": false
   },
   "results": [
@@ -199,10 +206,23 @@ The response is a compact batch:
       "id": "group_1:LeanRsFixture.ProofActions.closedTheorem",
       "file": "LeanRsFixture/ProofActions.lean",
       "declaration": "LeanRsFixture.ProofActions.closedTheorem",
+      "reason": "hunk_overlaps_body",
       "verification_status": "verified",
       "facts": {}
     }
-  ]
+  ],
+  "coverage": {
+    "unknown": [
+      {
+        "file": "LeanRsFixture/ProofActions.lean",
+        "reason": "hunk_outside_declaration",
+        "next_action": "verify the whole file or run lake build and retry"
+      }
+    ],
+    "deleted_files": [],
+    "renamed_files": [],
+    "truncated": false
+  }
 }
 ```
 
@@ -215,6 +235,17 @@ inventory or verification output was capped. `file_all` and source-backed
 `module_all` use the current source snapshot. If a module has no source file,
 `module_all` may use the `.ilean` declaration inventory, with typed artifact
 freshness facts in `trust`.
+
+`changed` runs non-interactive git commands under the project root:
+`git diff --unified=0 --no-ext-diff --find-renames <base> -- '*.lean'`, plus
+`git ls-files --others --exclude-standard -- '*.lean'` when
+`include_untracked` is true. It maps changed hunks to source-fresh declaration
+spans and verifies only known declarations. Coverage is conservative: comment
+or whitespace hunks outside any declaration, unavailable/truncated declaration
+inventory, deleted files, and renames are reported under `coverage` instead of
+being silently dropped. If coverage is unknown, verify the whole file or rebuild
+and retry; the server will not trust stale `.ilean` rows as authoritative for
+editable changed source.
 
 ## `lean_lookup`
 
@@ -268,6 +299,24 @@ and `body_span` are omitted. If neither source nor index is available, the
 result status is `missing_build` or `not_found`, never an empty successful list.
 `limit` defaults to 200 and is capped at 1000; truncation keeps a deterministic
 prefix and sets `truncated: true`.
+
+### `kind: "changed_coverage"`
+
+Reports how git hunks map to source-fresh declarations without verifying them.
+The request fields match the `lean_verify` changed target:
+
+```json
+{
+  "kind": "changed_coverage",
+  "base": "HEAD",
+  "files": ["LeanRsFixture/ProofActions.lean"],
+  "include_untracked": true
+}
+```
+
+The result has `known` changed declarations and the same `coverage` block that
+`lean_verify` returns. Unknown rows are actionable coverage gaps, not failures
+to be ignored.
 
 ### `kind: "proof_search"`
 

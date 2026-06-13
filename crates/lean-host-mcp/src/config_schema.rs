@@ -236,7 +236,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "200000",
         commented: true,
         overrides: "LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT",
-        description: "Default elaboration heartbeat budget for lean_trial proof_step and lean_verify explicit. Unset uses the worker default. Bounds runaway tactics.",
+        description: "Default elaboration heartbeat budget for lean_trial proof_step and lean_verify target groups. Unset uses the worker default. Bounds runaway tactics.",
     },
 ];
 

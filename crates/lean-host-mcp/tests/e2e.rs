@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::tools::position::{
@@ -64,6 +65,34 @@ fn proof_actions_file() -> PathBuf {
 
 fn proof_agent_file() -> PathBuf {
     PathBuf::from("LeanRsFixture/ProofAgent.lean")
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create destination dir");
+    for entry in fs::read_dir(from).expect("read source dir") {
+        let entry = entry.expect("dir entry");
+        let file_type = entry.file_type().expect("entry type");
+        let dest = to.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest);
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), dest).expect("copy file");
+        }
+    }
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn semantic_request(kind: &str, args: serde_json::Value) -> SemanticToolRequest {
@@ -602,6 +631,135 @@ async fn lean_verify_batches_explicit_file_and_module_targets() {
         file_all.pointer("/summary/requested"),
         module_all.pointer("/summary/requested"),
         "module_all source path should enumerate the same declarations as file_all"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn lean_verify_changed_targets_and_changed_coverage_report_gaps() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let tmp = tempfile::tempdir().expect("temp fixture copy");
+    let work = tmp.path().join("fixture");
+    copy_dir_recursive(&root, &work);
+    run_git(&work, &["init"]);
+    run_git(&work, &["config", "user.email", "lean-host-mcp@example.invalid"]);
+    run_git(&work, &["config", "user.name", "lean-host-mcp test"]);
+    run_git(&work, &["add", "."]);
+    run_git(&work, &["commit", "-m", "baseline"]);
+
+    let proof_actions = work.join("LeanRsFixture/ProofActions.lean");
+    let edited = fs::read_to_string(&proof_actions)
+        .expect("read proof actions")
+        .replacen(
+            "namespace LeanRsFixture.ProofActions",
+            "-- changed file header\nnamespace LeanRsFixture.ProofActions",
+            1,
+        )
+        .replacen("  trivial", "  exact True.intro", 1);
+    fs::write(&proof_actions, edited).expect("write proof actions edit");
+    fs::write(
+        work.join("LeanRsFixture/NewChanged.lean"),
+        "namespace LeanRsFixture.NewChanged\n\ntheorem fresh : True := by\n  trivial\n\nend LeanRsFixture.NewChanged\n",
+    )
+    .expect("write untracked file");
+    fs::remove_file(work.join("LeanRsFixture/Strings.lean")).expect("delete lean file");
+    run_git(
+        &work,
+        &["mv", "LeanRsFixture/Scalars.lean", "LeanRsFixture/ScalarsRenamed.lean"],
+    );
+
+    let ctx = open_ctx(&work);
+    let coverage = lean_lookup(
+        &ctx,
+        semantic_request(
+            "changed_coverage",
+            serde_json::json!({
+                "base": "HEAD",
+                "include_untracked": true
+            }),
+        ),
+    )
+    .await
+    .expect("changed coverage");
+    assert!(
+        coverage
+            .errors
+            .iter()
+            .all(|issue| issue.severity.as_deref() != Some("error")),
+        "changed coverage should not carry error issues: {:?}",
+        coverage.errors
+    );
+    let coverage_data = semantic_data(coverage);
+    let known = coverage_data["known"].as_array().expect("known coverage rows");
+    assert!(
+        known.iter().any(|row| {
+            row["declaration"].as_str() == Some("LeanRsFixture.ProofActions.closedTheorem")
+                && row["reason"].as_str() == Some("hunk_overlaps_body")
+        }),
+        "body hunk should map to closedTheorem: {known:?}"
+    );
+    assert!(
+        known
+            .iter()
+            .any(|row| row["declaration"].as_str() == Some("LeanRsFixture.NewChanged.fresh")),
+        "untracked file should select all declarations: {known:?}"
+    );
+    assert!(
+        coverage_data
+            .pointer("/coverage/unknown")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|unknown| !unknown.is_empty()),
+        "header/comment hunk should produce unknown coverage: {coverage_data:?}"
+    );
+    assert!(
+        coverage_data
+            .pointer("/coverage/deleted_files")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|deleted| !deleted.is_empty()),
+        "deleted file should be reported: {coverage_data:?}"
+    );
+    assert!(
+        coverage_data
+            .pointer("/coverage/renamed_files")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|renamed| !renamed.is_empty()),
+        "renamed file should be reported: {coverage_data:?}"
+    );
+
+    let verify = semantic_data(
+        lean_verify(
+            &ctx,
+            semantic_request_without_kind(serde_json::json!({
+                "targets": [{
+                    "kind": "changed",
+                    "base": "HEAD",
+                    "files": ["LeanRsFixture/ProofActions.lean"],
+                    "include_untracked": false
+                }],
+                "allow_sorry": false
+            })),
+        )
+        .await
+        .expect("changed verification"),
+    );
+    assert!(
+        verify
+            .pointer("/results")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["declaration"].as_str() == Some("LeanRsFixture.ProofActions.closedTheorem")
+                    && row["reason"].as_str() == Some("hunk_overlaps_body")
+            })),
+        "changed verification should verify the mapped theorem: {verify:?}"
+    );
+    assert!(
+        verify
+            .pointer("/summary/unknown_coverage")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|unknown| unknown > 0),
+        "changed verification should preserve unknown coverage gaps: {verify:?}"
     );
 }
 

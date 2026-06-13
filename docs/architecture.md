@@ -174,13 +174,15 @@ operation modules:
 - `lean_trial(kind = "proof_step")` tries tactic fragments at the selected proof position in an in-memory overlay. It
   reports per-candidate status, diagnostics, resulting goals, and the resolved declaration/proof-position summary. It
   never writes source files.
-- `lean_verify(kind = "explicit")` elaborates the in-memory source snapshot and checks one declaration under the
-  requested sorry/axiom policy. Policy failures are normal results.
+- `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, module-wide, or changed
+  declaration target groups under the requested sorry/axiom policy. Policy failures are normal results.
 - `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
   project declarations can resolve. Rendered fields are capped before crossing the worker boundary.
 - `lean_lookup(kind = "declarations")` lists declarations for a file or module. Source files use the edit-fresh worker
   declaration-outline selector; module requests fall back to the existing `.ilean` reader only when the source file is
   unavailable, reporting build-fresh or stale build artifact facts.
+- `lean_lookup(kind = "changed_coverage")` maps git hunks to source-fresh declaration spans without verifying them,
+  preserving unknown, deleted, and renamed coverage gaps.
 - `lean_lookup(kind = "proof_search")` builds a small target profile from proof context or explicit goal/type text, then
   tries a private source-backed `lean-semantic-search` lane before falling back to bounded lean-rs declaration search.
 - `lean_lookup(kind = "references")` runs semantic reference lookup for a fully-qualified name in file or bounded project
@@ -210,7 +212,7 @@ declaration, and lower-level Lean primitives stay private. Capabilities delibera
 proof-work tool that subsumes each, include:
 
 - low-level term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`) — composed inside
-  `lean_trial(kind = "proof_step")` and `lean_verify(kind = "explicit")`;
+  `lean_trial(kind = "proof_step")` and `lean_verify`;
 - LSP-shaped declaration queries (`hover_by_name`, `type_of_name`, raw `search_declarations`) — folded into
   `lean_lookup(kind = "declaration")` and `lean_lookup(kind = "proof_search")`;
 - raw module-query access (`lean_query`) — driven internally by `lean_context(kind = "proof_position")`;

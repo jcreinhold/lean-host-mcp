@@ -18,6 +18,7 @@ use crate::error::{Result, ServerError, WorkerUnavailable};
 use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolContext};
 use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus};
 
+use super::changed_coverage::{self, ChangedCoverageRequest};
 use super::declaration::{self, InspectDeclarationRequest};
 use super::declaration_inventory::{self, DeclarationInventoryRequest};
 use super::position::{self, FindReferencesRequest, ProofStateRequest};
@@ -215,8 +216,8 @@ pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 
 /// Semantic lookup and discovery.
 ///
-/// Initial public modes: `declaration`, `declarations`, `proof_search`, and
-/// `references`.
+/// Initial public modes: `declaration`, `declarations`, `changed_coverage`,
+/// `proof_search`, and `references`.
 ///
 /// # Errors
 ///
@@ -244,6 +245,16 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 ctx.config.verbosity,
             )
         }
+        Some("changed_coverage") => {
+            let request = match decode::<ChangedCoverageRequest>(req) {
+                Ok(request) => request,
+                Err(response) => return Ok(*response),
+            };
+            from_tool_response(
+                changed_coverage::changed_coverage(ctx, request).await?,
+                ctx.config.verbosity,
+            )
+        }
         Some("proof_search") => {
             let request = match decode::<SearchForProofRequest>(req) {
                 Ok(request) => request,
@@ -264,11 +275,23 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
         Some(kind) => Ok(invalid_kind(
             "lean_lookup",
             kind,
-            &["declaration", "declarations", "proof_search", "references"],
+            &[
+                "declaration",
+                "declarations",
+                "changed_coverage",
+                "proof_search",
+                "references",
+            ],
         )),
         None => Ok(missing_kind(
             "lean_lookup",
-            &["declaration", "declarations", "proof_search", "references"],
+            &[
+                "declaration",
+                "declarations",
+                "changed_coverage",
+                "proof_search",
+                "references",
+            ],
         )),
     }
 }
