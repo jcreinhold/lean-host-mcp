@@ -6,6 +6,7 @@
 //! shape (`data`, `errors`, `trust`).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -15,6 +16,7 @@ use crate::broker::{BrokerConfigSnapshot, ProjectHint};
 use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure};
 use crate::error::{Result, ServerError, WorkerUnavailable};
 use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolContext};
+use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus};
 
 use super::declaration::{self, InspectDeclarationRequest};
 use super::position::{self, FindReferencesRequest, ProofStateRequest};
@@ -43,6 +45,8 @@ pub struct SemanticTrust {
     pub project_root: String,
     pub session_id: String,
     pub lean_toolchain: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactTrust>,
 }
 
 impl SemanticTrust {
@@ -51,17 +55,23 @@ impl SemanticTrust {
             project_root: String::new(),
             session_id: "request-invalid".to_owned(),
             lean_toolchain: String::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn from_parts(freshness: FreshnessIdentity, artifacts: Vec<ArtifactTrust>) -> Self {
+        Self {
+            project_root: freshness.project_root,
+            session_id: freshness.session_id,
+            lean_toolchain: freshness.lean_toolchain,
+            artifacts,
         }
     }
 }
 
 impl From<FreshnessIdentity> for SemanticTrust {
     fn from(freshness: FreshnessIdentity) -> Self {
-        Self {
-            project_root: freshness.project_root,
-            session_id: freshness.session_id,
-            lean_toolchain: freshness.lean_toolchain,
-        }
+        Self::from_parts(freshness, Vec::new())
     }
 }
 
@@ -94,9 +104,21 @@ pub struct LeanStatusData {
     pub kind: String,
     pub project_root: String,
     pub lean_toolchain: String,
+    pub include: Vec<String>,
     pub worker_opened: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerStatusData>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactTrust>,
     pub broker: BrokerConfigSnapshot,
     pub output: OutputStatus,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorkerStatusData {
+    pub opened: bool,
+    pub status: TrustStatus,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -109,6 +131,26 @@ pub struct OutputStatus {
 struct StatusRequest {
     #[serde(default)]
     project: Option<String>,
+    #[serde(default)]
+    include: Vec<StatusInclude>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StatusInclude {
+    Toolchain,
+    Worker,
+    Artifacts,
+}
+
+impl StatusInclude {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Toolchain => "toolchain",
+            Self::Worker => "worker",
+            Self::Artifacts => "artifacts",
+        }
+    }
 }
 
 /// Proof/term context tool. Initial public mode: `proof_position`.
@@ -239,12 +281,37 @@ pub fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<Semant
             };
             let hint = ProjectHint::from_request(request.project);
             let identity = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
-            let trust = SemanticTrust::from(Response::<()>::ok((), identity.freshness).freshness);
+            let project_root = identity.freshness.project_root.clone();
+            let includes = status_includes(&request.include);
+            let mut artifacts = Vec::new();
+            let worker = includes.contains(&StatusInclude::Worker).then(|| WorkerStatusData {
+                opened: false,
+                status: TrustStatus::NotApplicable,
+                detail: "lean_status does not open a worker".to_owned(),
+            });
+            if worker.is_some() {
+                artifacts.push(ArtifactTrust::worker_toolchain_not_applicable(
+                    "lean_status did not open a worker to inspect runtime generation",
+                ));
+            }
+            if includes.contains(&StatusInclude::Artifacts) {
+                artifacts.extend(status_artifact_facts(Path::new(&project_root)));
+            }
+            let mut trust = SemanticTrust::from(Response::<()>::ok((), identity.freshness).freshness);
+            trust.artifacts.clone_from(&artifacts);
             let data = LeanStatusData {
                 kind: "project".to_owned(),
                 project_root: trust.project_root.clone(),
                 lean_toolchain: trust.lean_toolchain.clone(),
+                include: includes
+                    .iter()
+                    .copied()
+                    .map(StatusInclude::as_str)
+                    .map(str::to_owned)
+                    .collect(),
                 worker_opened: false,
+                worker,
+                artifacts,
                 broker: ctx.broker.config_snapshot(),
                 output: OutputStatus {
                     response_carrier: response_carrier_name(ctx.config.carrier).to_owned(),
@@ -262,7 +329,10 @@ pub fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<Semant
 }
 
 pub(crate) fn from_worker_unavailable(info: &WorkerUnavailable) -> SemanticResponse<Value> {
-    let mut old = Response::<Value>::runtime_unavailable(info.failure(), info.freshness(), info.runtime.clone());
+    let mut old = Response::<Value>::runtime_unavailable(info.failure(), info.freshness(), info.runtime.clone())
+        .with_trust_artifact(ArtifactTrust::worker_toolchain_unknown(
+            "worker runtime was unavailable for this request",
+        ));
     old.drain_advisories();
     from_runtime_response(old)
 }
@@ -280,18 +350,46 @@ where
         .map(serde_json::to_value)
         .transpose()
         .map_err(|err| ServerError::Internal(err.to_string()))?;
-    let trust = SemanticTrust::from(response.freshness);
+    let trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
     Ok(SemanticResponse { data, errors, trust })
 }
 
 fn from_runtime_response(response: Response<Value>) -> SemanticResponse<Value> {
-    let trust = SemanticTrust::from(response.freshness);
+    let trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
     SemanticResponse {
         data: response.result,
         errors,
         trust,
+    }
+}
+
+fn status_includes(include: &[StatusInclude]) -> Vec<StatusInclude> {
+    if include.is_empty() {
+        vec![
+            StatusInclude::Toolchain,
+            StatusInclude::Worker,
+            StatusInclude::Artifacts,
+        ]
+    } else {
+        include.to_vec()
+    }
+}
+
+fn status_artifact_facts(root: &Path) -> Vec<ArtifactTrust> {
+    let build_tree = root.join(".lake/build/lib/lean");
+    if build_tree.is_dir() {
+        let path = build_tree.to_string_lossy().into_owned();
+        vec![
+            ArtifactTrust::build_tree_unknown(path.clone(), ArtifactKind::Olean),
+            ArtifactTrust::build_tree_unknown(path, ArtifactKind::Ilean),
+        ]
+    } else {
+        vec![
+            ArtifactTrust::olean_project_missing_build(".lake/build/lib/lean is absent"),
+            ArtifactTrust::ilean_project_missing_build(),
+        ]
     }
 }
 
@@ -397,7 +495,9 @@ fn telemetry_verbosity_name(verbosity: TelemetryVerbosity) -> &'static str {
 mod tests {
     use super::*;
     use crate::broker::{BrokerConfig, ProjectBroker};
+    use crate::envelope::Freshness;
     use crate::tools::ToolConfig;
+    use crate::trust::{ArtifactKind, TrustScope};
 
     fn make_lake_dir(root: &std::path::Path) -> std::path::PathBuf {
         let dir = root.join("status");
@@ -408,8 +508,19 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
+    fn freshness(root: &std::path::Path) -> Freshness {
+        Freshness {
+            project_root: root.to_string_lossy().into_owned(),
+            project_hash: "hash".to_owned(),
+            imports: vec!["Init".to_owned()],
+            session_id: "test-session".to_owned(),
+            lean_toolchain: "leanprover/lean4:v4.31.0-rc2".to_owned(),
+            toolchain_advisories: Vec::new(),
+        }
+    }
+
     #[tokio::test]
-    async fn semantic_surface_status_does_not_open_worker() {
+    async fn lean_status_does_not_open_worker_and_reports_trust_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
@@ -432,16 +543,49 @@ mod tests {
             &ctx,
             SemanticToolRequest {
                 kind: Some("project".to_owned()),
-                args: BTreeMap::new(),
+                args: BTreeMap::from([(
+                    "include".to_owned(),
+                    serde_json::json!(["toolchain", "worker", "artifacts"]),
+                )]),
             },
         )
         .unwrap();
 
         assert!(response.errors.is_empty());
         assert_eq!(response.trust.session_id, "metadata-only");
+        assert!(response.trust.artifacts.iter().any(|artifact| {
+            artifact.artifact == ArtifactKind::Worker
+                && artifact.scope == TrustScope::Toolchain
+                && artifact.status == TrustStatus::NotApplicable
+        }));
+        assert!(response.trust.artifacts.iter().any(|artifact| {
+            artifact.artifact == ArtifactKind::Olean && artifact.status == TrustStatus::MissingBuild
+        }));
         assert!(broker.resident_paths().is_empty());
         drop(ctx);
         drop(broker);
+    }
+
+    #[test]
+    fn quiet_telemetry_does_not_drop_trust_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let response = Response::ok(serde_json::json!({"status": "ok"}), freshness(tmp.path()))
+            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build());
+
+        let semantic = from_tool_response(response, TelemetryVerbosity::Quiet).unwrap();
+        let json = serde_json::to_value(&semantic).unwrap();
+
+        assert!(json.get("telemetry").is_none());
+        assert_eq!(
+            json.pointer("/trust/artifacts/0/artifact")
+                .and_then(serde_json::Value::as_str),
+            Some("ilean")
+        );
+        assert_eq!(
+            json.pointer("/trust/artifacts/0/status")
+                .and_then(serde_json::Value::as_str),
+            Some("missing_build")
+        );
     }
 
     #[tokio::test]

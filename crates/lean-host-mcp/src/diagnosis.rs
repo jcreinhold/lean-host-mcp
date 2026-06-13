@@ -26,6 +26,7 @@ use serde::Serialize;
 
 use crate::envelope::{Response, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError};
+use crate::trust::ArtifactTrust;
 
 /// Why a query ran against an environment that was not fully built. Each
 /// variant carries only what the renderer needs to name the blocking work.
@@ -127,7 +128,27 @@ where
     T: Serialize + JsonSchema,
 {
     let (warning, next_action) = needs_build_text(&resp.freshness.project_root, cause);
-    resp.warn(warning).hint(next_action)
+    resp.with_trust_artifacts(needs_build_trust_artifacts(cause))
+        .warn(warning)
+        .hint(next_action)
+}
+
+fn needs_build_trust_artifacts(cause: &IncompleteCause) -> Vec<ArtifactTrust> {
+    match cause {
+        IncompleteCause::MissingImports(missing) if missing.is_empty() => {
+            vec![ArtifactTrust::olean_project_missing_build(
+                "project environment is missing built .olean artifacts",
+            )]
+        }
+        IncompleteCause::MissingImports(missing) => missing
+            .iter()
+            .cloned()
+            .map(ArtifactTrust::olean_module_missing_build)
+            .collect(),
+        IncompleteCause::MissingOlean(text) => {
+            vec![ArtifactTrust::olean_project_missing_build(first_line(text))]
+        }
+    }
 }
 
 /// The canonical `(warning, next_action)` pair for a genuinely ambiguous name.

@@ -821,7 +821,9 @@ fn find_references_in_project(
     // empty result (which would read as "no references"). A built tree with zero
     // hits for the name is a legitimate empty answer, not a degrade.
     if index.status == crate::ilean::IndexStatus::NotBuilt {
-        let response = Response::ok(empty_references_result(0, 0), freshness).with_runtime(runtime);
+        let response = Response::ok(empty_references_result(0, 0), freshness)
+            .with_runtime(runtime)
+            .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_missing_build());
         return crate::diagnosis::warn_needs_build(
             response,
             &crate::diagnosis::IncompleteCause::MissingImports(Vec::new()),
@@ -869,7 +871,7 @@ fn find_references_in_project(
     };
     let response = Response::ok(result, freshness).with_runtime(runtime);
     if index.stale_sources.is_empty() {
-        return response;
+        return response.with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_build_fresh());
     }
     let names = index
         .stale_sources
@@ -885,6 +887,10 @@ fn find_references_in_project(
         String::new()
     };
     response
+        .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_stale_build(format!(
+            "{} contributing module(s) have source newer than their .ilean ({names}{suffix})",
+            index.stale_sources.len()
+        )))
         .warn(format!(
             "reference index is build-fresh, not edit-fresh: {} contributing module(s) have source newer than \
              their .ilean ({names}{suffix}); results reflect the last `lake build`.",
@@ -1382,12 +1388,14 @@ mod tests {
     };
 
     use super::{
-        BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, LeanWorkerProofPositionSelector, ProofPositionSelector,
-        ProofStateRequest, ProofStateResult, RenderedText, cache_status_label, expert_query_budgets,
-        needs_build_context, project_query_facts, proof_agent_budgets, reference_query_budgets, route_batch_outcome,
-        worker_proof_position,
+        BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, FindReferencesRequest, LeanWorkerProofPositionSelector,
+        ProofPositionSelector, ProofStateRequest, ProofStateResult, ReferenceScope, RenderedText, cache_status_label,
+        expert_query_budgets, find_references_in_project, needs_build_context, project_query_facts,
+        proof_agent_budgets, reference_query_budgets, route_batch_outcome, worker_proof_position,
     };
+    use crate::envelope::{Freshness, RuntimeFacts};
     use crate::tools::source_input::{header_imports, read_query_file};
+    use crate::trust::{ArtifactKind, TrustScope, TrustStatus};
 
     fn worker_facts(status: LeanWorkerModuleCacheStatus) -> LeanWorkerModuleQueryCacheFacts {
         LeanWorkerModuleQueryCacheFacts {
@@ -1403,6 +1411,66 @@ mod tests {
             cache_approx_bytes: Some(4096),
             resource: None,
         }
+    }
+
+    fn freshness(root: &std::path::Path) -> Freshness {
+        Freshness {
+            project_root: root.to_string_lossy().into_owned(),
+            project_hash: "hash".to_owned(),
+            imports: Vec::new(),
+            session_id: "test-session".to_owned(),
+            lean_toolchain: "leanprover/lean4:v4.31.0-rc2".to_owned(),
+            toolchain_advisories: Vec::new(),
+        }
+    }
+
+    fn references_request() -> FindReferencesRequest {
+        FindReferencesRequest {
+            name: "Demo.A.foo".to_owned(),
+            scope: ReferenceScope::Project,
+            file: None,
+            files: Vec::new(),
+            limit: None,
+            project: None,
+        }
+    }
+
+    fn ilean_fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/ilean")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    fn stage_ilean_module(module: &str, fixture_name: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let relative: std::path::PathBuf = module.split('.').collect();
+        let source = tmp.path().join(&relative).with_extension("lean");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "-- source stub\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let index = tmp
+            .path()
+            .join(".lake/build/lib/lean")
+            .join(&relative)
+            .with_extension("ilean");
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(&index, ilean_fixture(fixture_name)).unwrap();
+        tmp
+    }
+
+    fn has_artifact(
+        response: &crate::envelope::Response<super::FindReferencesResult>,
+        artifact: ArtifactKind,
+        scope: TrustScope,
+        status: TrustStatus,
+    ) -> bool {
+        response
+            .trust_artifacts
+            .iter()
+            .any(|fact| fact.artifact == artifact && fact.scope == scope && fact.status == status)
     }
 
     #[test]
@@ -1424,6 +1492,76 @@ import Init -- comment
                 "Init".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn project_references_report_missing_ilean_build_fact_when_not_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Demo")).unwrap();
+        std::fs::write(tmp.path().join("Demo/A.lean"), "-- no build\n").unwrap();
+
+        let response = find_references_in_project(
+            tmp.path(),
+            &references_request(),
+            freshness(tmp.path()),
+            RuntimeFacts::default(),
+            1000,
+        );
+
+        assert!(has_artifact(
+            &response,
+            ArtifactKind::Ilean,
+            TrustScope::Project,
+            TrustStatus::MissingBuild
+        ));
+        assert!(has_artifact(
+            &response,
+            ArtifactKind::Olean,
+            TrustScope::Project,
+            TrustStatus::MissingBuild
+        ));
+    }
+
+    #[test]
+    fn project_references_report_build_fresh_ilean_fact_when_current() {
+        let project = stage_ilean_module("Demo.A", "demo_a.ilean");
+
+        let response = find_references_in_project(
+            project.path(),
+            &references_request(),
+            freshness(project.path()),
+            RuntimeFacts::default(),
+            1000,
+        );
+
+        assert!(has_artifact(
+            &response,
+            ArtifactKind::Ilean,
+            TrustScope::Project,
+            TrustStatus::BuildFresh
+        ));
+    }
+
+    #[test]
+    fn project_references_report_stale_ilean_fact_when_source_is_newer() {
+        let project = stage_ilean_module("Demo.A", "demo_a.ilean");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(project.path().join("Demo/A.lean"), "-- edited after build\n").unwrap();
+
+        let response = find_references_in_project(
+            project.path(),
+            &references_request(),
+            freshness(project.path()),
+            RuntimeFacts::default(),
+            1000,
+        );
+
+        assert!(has_artifact(
+            &response,
+            ArtifactKind::Ilean,
+            TrustScope::Project,
+            TrustStatus::StaleBuild
+        ));
     }
 
     #[test]

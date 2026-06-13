@@ -32,6 +32,7 @@ use crate::projections::{
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
 use crate::tools::source_input::read_query_file;
 use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
+use crate::trust::ArtifactTrust;
 
 const MAX_CANDIDATES: usize = 8;
 const DEFAULT_FIELD_BYTES: u32 = 4 * 1024;
@@ -89,6 +90,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
+    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved);
     let file_label = input.resolved.to_string_lossy().into_owned();
     let budgets = proof_action_budgets(&ctx.config.output);
     let candidates = proof_candidates(&req);
@@ -110,6 +112,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
             runtime.freshness,
         )
         .with_runtime(runtime.runtime)
+        .with_trust_artifact(source_fact)
         .warn("try_proof_step requires `snippet` or `snippets`"));
     }
 
@@ -138,7 +141,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
             .await,
     )? {
         CallOutcome::Ready(call) => call,
-        CallOutcome::NeedsBuild(err) => return proof_step_needs_build_response(ctx, hint, imports, err),
+        CallOutcome::NeedsBuild(err) => return proof_step_needs_build_response(ctx, hint, imports, source_fact, err),
     };
     let taint = execution_taint(&call.runtime).cloned();
     let mut response = Response::ok(
@@ -146,6 +149,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
         call.freshness,
     )
     .with_runtime(call.runtime);
+    response.trust_artifacts.push(source_fact);
     response
         .next_actions
         .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
@@ -221,10 +225,13 @@ fn proof_step_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
     imports: Vec<String>,
+    source_fact: ArtifactTrust,
     err: ServerError,
 ) -> Result<Response<ProofAttemptResult>> {
     let base = ctx.broker.project_identity_without_worker(&hint, imports.clone())?;
-    let mut response = Response::ok(needs_build_attempt_result(imports), base.freshness).with_runtime(base.runtime);
+    let mut response = Response::ok(needs_build_attempt_result(imports), base.freshness)
+        .with_runtime(base.runtime)
+        .with_trust_artifact(source_fact);
     response
         .next_actions
         .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
@@ -261,6 +268,7 @@ pub async fn verify_declaration(
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
+    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved);
     let file_label = input.resolved.to_string_lossy().into_owned();
     let budgets = proof_action_budgets(&ctx.config.output);
     if req.declaration.trim().is_empty() {
@@ -270,6 +278,7 @@ pub async fn verify_declaration(
         return Ok(
             Response::ok(DeclarationVerificationResult::Unsupported, runtime.freshness)
                 .with_runtime(runtime.runtime)
+                .with_trust_artifact(source_fact)
                 .warn("verify_declaration requires `declaration`"),
         );
     }
@@ -304,7 +313,7 @@ pub async fn verify_declaration(
             .await,
     )? {
         CallOutcome::Ready(call) => call,
-        CallOutcome::NeedsBuild(err) => return verification_needs_build_response(ctx, hint, imports, err),
+        CallOutcome::NeedsBuild(err) => return verification_needs_build_response(ctx, hint, imports, source_fact, err),
     };
     // If the worker was recycled/crashed mid-call, a non-positive verdict is a
     // likely casualty of the recycle, not a real result; relabel it honestly
@@ -320,6 +329,7 @@ pub async fn verify_declaration(
         );
     }
     let mut response = Response::ok(result, call.freshness).with_runtime(call.runtime);
+    response.trust_artifacts.push(source_fact);
     response
         .next_actions
         .push("source file was not modified by verification".to_owned());
@@ -381,11 +391,13 @@ fn verification_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
     imports: Vec<String>,
+    source_fact: ArtifactTrust,
     err: ServerError,
 ) -> Result<Response<DeclarationVerificationResult>> {
     let base = ctx.broker.project_identity_without_worker(&hint, imports.clone())?;
-    let mut response =
-        Response::ok(needs_build_verification_result(imports), base.freshness).with_runtime(base.runtime);
+    let mut response = Response::ok(needs_build_verification_result(imports), base.freshness)
+        .with_runtime(base.runtime)
+        .with_trust_artifact(source_fact);
     response
         .next_actions
         .push("source file was not modified by verification".to_owned());
@@ -601,6 +613,49 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::broker::{BrokerConfig, ProjectBroker};
+    use crate::tools::{ToolConfig, ToolContext};
+    use crate::trust::{ArtifactKind, TrustScope, TrustStatus};
+
+    fn make_lake_dir(root: &std::path::Path) -> std::path::PathBuf {
+        let dir = root.join("proof_action");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lakefile.lean"), "package proof_action\nlean_lib Demo\n").unwrap();
+        std::fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.31.0-rc2\n").unwrap();
+        std::fs::write(dir.join("lake-manifest.json"), "{}\n").unwrap();
+        std::fs::write(dir.join("Demo.lean"), "import Init\nexample : True := by trivial\n").unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn test_context(root: std::path::PathBuf) -> (ToolContext, std::sync::Arc<ProjectBroker>) {
+        let broker = ProjectBroker::new(BrokerConfig {
+            config_default: None,
+            env_default: Some(root.clone()),
+            cwd: root,
+            max_projects: BrokerConfig::default_max_projects(),
+            idle_timeout: std::time::Duration::ZERO,
+            semantic_permits: BrokerConfig::default_semantic_permits(),
+            semantic_waiters: BrokerConfig::default_semantic_waiters(),
+            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
+            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
+        });
+        (
+            ToolContext {
+                broker: std::sync::Arc::clone(&broker),
+                config: ToolConfig::default(),
+            },
+            broker,
+        )
+    }
+
+    fn assert_source_edit_fresh(response: &Response<impl serde::Serialize + JsonSchema>) {
+        assert!(response.trust_artifacts.iter().any(|artifact| {
+            artifact.artifact == ArtifactKind::Source
+                && artifact.scope == TrustScope::File
+                && artifact.status == TrustStatus::EditFresh
+                && artifact.path.as_deref() == Some("Demo.lean")
+        }));
+    }
 
     #[test]
     fn try_proof_step_request_accepts_single_snippet() {
@@ -628,6 +683,31 @@ mod tests {
         let capped = capped_candidate_rows(&req);
         assert_eq!(capped.len(), 2);
         assert_eq!(capped[0].status, "budget_exceeded");
+    }
+
+    #[tokio::test]
+    async fn try_proof_step_marks_read_source_snapshot_edit_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let (ctx, broker) = test_context(root);
+        let response = try_proof_step(
+            &ctx,
+            TryProofStepRequest {
+                file: PathBuf::from("Demo.lean"),
+                declaration: "Demo.example".to_owned(),
+                proof_position: ProofPositionSelector::Default,
+                project: None,
+                snippet: None,
+                snippets: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_source_edit_fresh(&response);
+        assert!(broker.resident_paths().is_empty());
+        drop(ctx);
+        drop(broker);
     }
 
     #[test]
@@ -662,6 +742,30 @@ mod tests {
         .unwrap();
         assert_eq!(req.declaration, "Demo.closed");
         assert!(req.report_axioms);
+    }
+
+    #[tokio::test]
+    async fn verify_declaration_marks_read_source_snapshot_edit_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let (ctx, broker) = test_context(root);
+        let response = verify_declaration(
+            &ctx,
+            VerifyDeclarationRequest {
+                file: PathBuf::from("Demo.lean"),
+                declaration: String::new(),
+                project: None,
+                allow_sorry: false,
+                report_axioms: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_source_edit_fresh(&response);
+        assert!(broker.resident_paths().is_empty());
+        drop(ctx);
+        drop(broker);
     }
 
     #[test]

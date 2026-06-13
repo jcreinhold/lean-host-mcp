@@ -184,7 +184,14 @@ operation modules:
   scope. File scope elaborates one anchor file through the worker; project scope reads Lean's on-disk `.ilean` reference
   index and does not open a worker.
 - `lean_status(kind = "project")` reports cheap project/toolchain/config status from Lake metadata and broker config. It
-  does not open a worker or consume a semantic permit.
+  accepts `include: ["toolchain", "worker", "artifacts"]`, derives only cheap filesystem facts, and does not run `lake`,
+  open a worker, or consume a semantic permit.
+
+The semantic facade also owns the public trust block. Operation modules may attach typed artifact rows for
+proof-relevant freshness: source snapshots (`source` / `file` / `edit_fresh`), built Lean artifacts (`olean` or `ilean`
+with `build_fresh`, `stale_build`, or `missing_build`), and worker/toolchain availability (`worker` / `toolchain` /
+`unknown` or `not_applicable`). Runtime counters, cache timings, and import lists remain telemetry; quiet mode drops
+telemetry but never drops trust artifacts.
 
 The rejected alternative was a single GraphQL-like `lean_query` tool with nested selections. It would make tool
 registration smaller, but it pushes mode discovery and validation into one large request grammar. The five-tool facade is

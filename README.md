@@ -138,7 +138,7 @@ project-scope `.ilean` reference reads do not open workers and do not consume pe
 ## Response Shape
 
 Every public tool returns the same semantic outer shape. `data` is mode-specific; `errors` is a structured issue channel
-for runtime failures and warnings; `trust` is the small project/session identity.
+for runtime failures and warnings; `trust` is the small project/session identity plus optional artifact facts.
 
 ```jsonc
 {
@@ -147,10 +147,23 @@ for runtime failures and warnings; `trust` is the small project/session identity
   "trust": {
     "project_root": "/abs/path",
     "session_id": "uuid-or-metadata-only",
-    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2"
+    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2",
+    "artifacts": [
+      {
+        "artifact": "source",
+        "scope": "file",
+        "status": "edit_fresh",
+        "path": "My/Module.lean"
+      }
+    ]
   }
 }
 ```
+
+Artifact facts use stable tokens: `artifact` is `source`, `olean`, `ilean`, or `worker`; `scope` is `file`, `module`,
+`project`, or `toolchain`; `status` is `edit_fresh`, `build_fresh`, `stale_build`, `missing_build`, `unknown`, or
+`not_applicable`. The `artifacts` array is omitted when no tool has a proof-relevant artifact fact to report. Quiet
+telemetry never removes these trust facts.
 
 The split that matters: **Lean-domain failures** (parse errors, elaboration diagnostics, kernel rejection, meta timeout)
 ride inside `data` — a failed proof is still a successful call. **Recoverable runtime failures** (admission or mailbox

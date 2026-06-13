@@ -42,6 +42,8 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::Serialize;
 
+use crate::trust::ArtifactTrust;
+
 /// The project freshness snapshot a producer builds.
 ///
 /// Built by [`crate::project`]'s `freshness` and
@@ -176,6 +178,10 @@ where
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub next_actions: Vec<String>,
+    /// Typed artifact-freshness facts for the semantic trust block. These are
+    /// not telemetry; quiet-mode serialization must keep them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trust_artifacts: Vec<ArtifactTrust>,
     /// Project-lifetime advisories awaiting the drain into `warnings`. Never
     /// serialized; emptied by [`Response::drain_advisories`] at the boundary.
     #[serde(skip)]
@@ -223,6 +229,7 @@ where
             telemetry: Some(telemetry),
             warnings: Vec::new(),
             next_actions: Vec::new(),
+            trust_artifacts: Vec::new(),
             advisories,
         }
     }
@@ -237,6 +244,7 @@ where
             telemetry: Some(telemetry),
             warnings: Vec::new(),
             next_actions: Vec::new(),
+            trust_artifacts: Vec::new(),
             advisories,
         }
     }
@@ -275,6 +283,18 @@ where
     /// truncation signal is lost.
     pub fn drop_telemetry(&mut self) {
         self.telemetry = None;
+    }
+
+    #[must_use]
+    pub fn with_trust_artifact(mut self, artifact: ArtifactTrust) -> Self {
+        self.trust_artifacts.push(artifact);
+        self
+    }
+
+    #[must_use]
+    pub fn with_trust_artifacts(mut self, artifacts: impl IntoIterator<Item = ArtifactTrust>) -> Self {
+        self.trust_artifacts.extend(artifacts);
+        self
     }
 
     /// Drain project-lifetime advisories into `warnings`. Called once by the

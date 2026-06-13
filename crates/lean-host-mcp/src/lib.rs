@@ -40,6 +40,7 @@ pub mod server;
 mod smoke;
 pub mod toolchain;
 pub mod tools;
+pub mod trust;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
 pub use config_file::ConfigFile;
@@ -57,3 +58,4 @@ pub use projections::{
 pub use server::LeanHostService;
 pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};
 pub use tools::{OutputBudgetOverrides, ResponseCarrier, TelemetryVerbosity, ToolConfig};
+pub use trust::{ArtifactKind, ArtifactTrust, TrustScope, TrustStatus};

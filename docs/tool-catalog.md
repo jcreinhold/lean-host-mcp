@@ -24,10 +24,29 @@ All public tools return the semantic response baseline:
   "trust": {
     "project_root": "/abs/project",
     "session_id": "metadata-only-or-worker-session",
-    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2"
+    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2",
+    "artifacts": [
+      {
+        "artifact": "ilean",
+        "scope": "project",
+        "status": "build_fresh",
+        "detail": "project reference index is current for contributing modules"
+      }
+    ]
   }
 }
 ```
+
+`trust.artifacts` is omitted when empty. Rows use these stable tokens:
+
+- `artifact`: `source`, `olean`, `ilean`, `worker`
+- `scope`: `file`, `module`, `project`, `toolchain`
+- `status`: `edit_fresh`, `build_fresh`, `stale_build`, `missing_build`, `unknown`, `not_applicable`
+
+Rows may also carry `path`, `module`, `detail`, and `next_action`. Source-overlay tools report the source file snapshot
+as `source` / `file` / `edit_fresh`; project reference lookup reports `.ilean` build freshness or missing/stale build
+state; `needs_build` degradations report missing `.olean` artifacts. Runtime counters, cache timings, and import lists
+remain telemetry, not trust.
 
 Lean-domain outcomes remain data. A failed tactic, a rejected declaration, an
 ambiguous name, or a `needs_build` verdict is not an MCP transport error.
@@ -235,7 +254,20 @@ Use `project` to override the default Lake root:
 { "kind": "project", "project": "/abs/path/to/lake/project" }
 ```
 
-Prompt 73 extends this status surface with typed trust and artifact facts.
+Use `include` to request cheap status sections. The default is all sections:
+
+```json
+{
+  "kind": "project",
+  "project": "/abs/path/to/lake/project",
+  "include": ["toolchain", "worker", "artifacts"]
+}
+```
+
+`lean_status` reads Lake metadata and cheap filesystem facts only: it does not run `lake`, does not read source files,
+and does not open a worker. When the project build tree is absent it reports `olean` and `ilean` `missing_build` facts;
+when the build tree exists but no semantic query has checked source mtimes it reports artifact freshness as `unknown`.
+Worker runtime generation is likewise `not_applicable` because this status mode deliberately avoids opening a worker.
 
 ## Maintainer Migration Table
 

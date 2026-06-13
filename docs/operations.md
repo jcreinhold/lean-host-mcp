@@ -174,7 +174,15 @@ JSON-RPC errors:
   "trust": {
     "project_root": "/abs/path",
     "session_id": "uuid",
-    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2"
+    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2",
+    "artifacts": [
+      {
+        "artifact": "worker",
+        "scope": "toolchain",
+        "status": "unknown",
+        "detail": "worker runtime was unavailable for this request"
+      }
+    ]
   }
 }
 ```
@@ -202,8 +210,10 @@ Which failures land where:
 
 The operation layer still computes freshness/import and runtime facts before semantic response adaptation. Runtime facts
 include worker generation, whether a call observed or performed a restart, retry count, admission wait, controller queue
-wait, RSS when available, import profile, profile-switch count, and restart history. Prompt 73 promotes the trust and
-artifact facts that should become public under `trust`.
+wait, RSS when available, import profile, profile-switch count, and restart history. These remain telemetry and are
+omitted at the default quiet verbosity. Proof-relevant artifact facts are public under `trust.artifacts` and survive the
+quiet telemetry gate: source snapshots (`source` / `file` / `edit_fresh`), build artifacts (`olean` or `ilean` with
+`build_fresh`, `stale_build`, or `missing_build`), and worker/toolchain availability facts.
 
 ## Capability shims and module queries
 
