@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use lean_rs_worker_parent::{
     LeanWorkerCapabilityBuilder, LeanWorkerChild, LeanWorkerDeclarationInspectionRequest,
     LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationSearch, LeanWorkerDeclarationSearchResult,
+    LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
     LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions,
     LeanWorkerError, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder, LeanWorkerLifecycleSnapshot,
     LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome,
@@ -390,6 +391,12 @@ enum ProjectMessage {
         options: LeanWorkerElabOptions,
         reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationVerificationResult>>>,
     },
+    DeclarationVerificationBatch {
+        meta: JobMeta,
+        request: LeanWorkerDeclarationVerificationBatchRequest,
+        options: LeanWorkerElabOptions,
+        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationVerificationBatchResult>>>,
+    },
     SemanticProofSearch {
         meta: JobMeta,
         request: SemanticProofSearchRequest,
@@ -406,6 +413,7 @@ impl ProjectMessage {
             | Self::DeclarationSearch { meta, .. }
             | Self::ProofAttempt { meta, .. }
             | Self::DeclarationVerification { meta, .. }
+            | Self::DeclarationVerificationBatch { meta, .. }
             | Self::SemanticProofSearch { meta, .. } => &meta.imports,
         }
     }
@@ -428,6 +436,9 @@ impl ProjectMessage {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
             Self::DeclarationVerification { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+            Self::DeclarationVerificationBatch { meta, reply, .. } => {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
             Self::SemanticProofSearch { meta, reply, .. } => {
@@ -894,6 +905,36 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
+    /// Verify several declarations in one in-memory source snapshot through
+    /// this project's serialized worker actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// worker execution fails.
+    pub(crate) async fn verify_declaration_batch(
+        &self,
+        imports: Vec<String>,
+        semantic_permit: SemanticPermit,
+        admission_wait_millis: u64,
+        request: LeanWorkerDeclarationVerificationBatchRequest,
+        options: LeanWorkerElabOptions,
+    ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationBatchResult>> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::DeclarationVerificationBatch {
+            meta: self.job_meta(
+                imports,
+                RetryPolicy::RetryOnceReadOnly,
+                semantic_permit,
+                admission_wait_millis,
+            ),
+            request,
+            options,
+            reply,
+        };
+        self.enqueue(message, rx).await
+    }
+
     fn job_meta(
         &self,
         imports: Vec<String>,
@@ -1250,6 +1291,17 @@ impl ProjectActorState {
             } => {
                 let result = self.run_job(meta, |handle, imports| {
                     handle.verify_declaration_with_imports(imports, &request, &options, None, None)
+                });
+                let _ = reply.send(result);
+            }
+            ProjectMessage::DeclarationVerificationBatch {
+                meta,
+                request,
+                options,
+                reply,
+            } => {
+                let result = self.run_job(meta, |handle, imports| {
+                    handle.verify_declaration_batch_with_imports(imports, &request, &options, None, None)
                 });
                 let _ = reply.send(result);
             }

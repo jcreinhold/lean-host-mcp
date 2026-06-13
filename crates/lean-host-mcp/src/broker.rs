@@ -37,7 +37,8 @@ use std::time::{Duration, Instant};
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationSearch,
-    LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationVerificationRequest,
+    LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationVerificationBatchRequest,
+    LeanWorkerDeclarationVerificationBatchResult, LeanWorkerDeclarationVerificationRequest,
     LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions, LeanWorkerModuleQuery,
     LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector,
     LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult,
@@ -693,6 +694,28 @@ impl ProjectBroker {
         let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
         let call = project
             .verify_declaration(session_imports, permit, admission_wait_millis, request, options)
+            .await?;
+        let out = broker_call(&project, &freshness_imports, call);
+        drop(project);
+        Ok(out)
+    }
+
+    /// Verify several declarations in one source snapshot through the project runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, project-open, admission, or worker runtime failures.
+    pub async fn verify_declaration_batch(
+        &self,
+        hint: ProjectHint,
+        session_imports: Vec<String>,
+        freshness_imports: Vec<String>,
+        request: LeanWorkerDeclarationVerificationBatchRequest,
+        options: LeanWorkerElabOptions,
+    ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
+        let (project, permit, admission_wait_millis) = self.admit_project(hint, &session_imports).await?;
+        let call = project
+            .verify_declaration_batch(session_imports, permit, admission_wait_millis, request, options)
             .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);

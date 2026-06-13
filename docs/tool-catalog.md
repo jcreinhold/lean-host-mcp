@@ -65,7 +65,7 @@ warning issues in `errors`.
    declaration's statement, docstring, attributes, and flags.
 4. Call `lean_trial` with `kind: "proof_step"` to try one or more tactics in
    memory without editing the file.
-5. Call `lean_verify` with `kind: "explicit"` to verify the target declaration.
+5. Call `lean_verify` with an explicit target group to verify the target declaration.
 
 Use `lean_lookup` with `kind: "references"` when the task is semantic reference
 discovery rather than proof search. Use `lean_status` for cheap project and host
@@ -141,23 +141,80 @@ whether the candidate set was truncated.
 
 ## `lean_verify`
 
-### `kind: "explicit"`
+Verifies declarations in memory. Targets can be explicit declaration lists,
+every declaration in a file, or every declaration in a module. The server reads
+Lean source and calls Lean's elaborator/kernel through the worker; it does not
+run `lake build`.
 
-Verifies one named declaration in a file, in memory.
+Single declaration:
 
 ```json
 {
-  "kind": "explicit",
-  "file": "LeanRsFixture/ProofActions.lean",
-  "declaration": "LeanRsFixture.ProofActions.closedTheorem",
+  "targets": [
+    {
+      "kind": "explicit",
+      "file": "LeanRsFixture/ProofActions.lean",
+      "declarations": ["LeanRsFixture.ProofActions.closedTheorem"]
+    }
+  ],
   "allow_sorry": false,
   "report_axioms": true
 }
 ```
 
-The initial mode is intentionally only a single explicit target. File-all,
-module-all, and changed-target verification are later workflow modes, not part
-of this baseline.
+Mixed target groups:
+
+```json
+{
+  "targets": [
+    {
+      "kind": "explicit",
+      "file": "LeanRsFixture/ProofActions.lean",
+      "declarations": [
+        "LeanRsFixture.ProofActions.closedTheorem",
+        "LeanRsFixture.ProofActions.sorryTheorem"
+      ]
+    },
+    { "kind": "file_all", "file": "LeanRsFixture/ProofAgent.lean" },
+    { "kind": "module_all", "module": "LeanRsFixture.ProofActions" }
+  ],
+  "allow_sorry": false,
+  "report_axioms": false
+}
+```
+
+The response is a compact batch:
+
+```json
+{
+  "summary": {
+    "requested": 4,
+    "verified": 3,
+    "failed": 1,
+    "needs_build": 0,
+    "truncated": false
+  },
+  "results": [
+    {
+      "id": "group_1:LeanRsFixture.ProofActions.closedTheorem",
+      "file": "LeanRsFixture/ProofActions.lean",
+      "declaration": "LeanRsFixture.ProofActions.closedTheorem",
+      "verification_status": "verified",
+      "facts": {}
+    }
+  ]
+}
+```
+
+`verification_status` uses the same vocabulary as the declaration-verification
+projection: `verified`, `has_sorry`, `has_unresolved_goals`,
+`has_diagnostics`, `not_found`, `ambiguous`, `needs_build`, `timeout`,
+`budget_exceeded`, `worker_recycled`, or `unsupported`. `requested` counts
+expanded targets before host-side caps; `truncated` is true when declaration
+inventory or verification output was capped. `file_all` and source-backed
+`module_all` use the current source snapshot. If a module has no source file,
+`module_all` may use the `.ilean` declaration inventory, with typed artifact
+freshness facts in `trust`.
 
 ## `lean_lookup`
 
@@ -313,7 +370,7 @@ still reused internally behind the semantic modes.
 | --- | --- |
 | `proof_state` | `lean_context`, `kind: "proof_position"` |
 | `try_proof_step` | `lean_trial`, `kind: "proof_step"` |
-| `verify_declaration` | `lean_verify`, `kind: "explicit"` |
+| `verify_declaration` | `lean_verify` with one `kind: "explicit"` target group |
 | `inspect_declaration` | `lean_lookup`, `kind: "declaration"` |
 | `search_for_proof` | `lean_lookup`, `kind: "proof_search"` |
 | `find_references` | `lean_lookup`, `kind: "references"` |

@@ -21,7 +21,7 @@ use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus};
 use super::declaration::{self, InspectDeclarationRequest};
 use super::declaration_inventory::{self, DeclarationInventoryRequest};
 use super::position::{self, FindReferencesRequest, ProofStateRequest};
-use super::proof_action::{self, TryProofStepRequest, VerifyDeclarationRequest};
+use super::proof_action::{self, LeanVerifyRequest, TryProofStepRequest};
 use super::proof_search::{self, SearchForProofRequest};
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -194,7 +194,7 @@ pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<S
     }
 }
 
-/// Declaration verification. Initial public mode: `explicit`.
+/// Declaration verification for explicit, file-wide, and module-wide target groups.
 ///
 /// # Errors
 ///
@@ -202,18 +202,14 @@ pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<S
 /// structured semantic errors.
 pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
     match req.kind() {
-        Some("explicit") => {
-            let request = match decode::<VerifyDeclarationRequest>(req) {
+        None => {
+            let request = match decode::<LeanVerifyRequest>(req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(
-                proof_action::verify_declaration(ctx, request).await?,
-                ctx.config.verbosity,
-            )
+            from_tool_response(proof_action::verify_targets(ctx, request).await?, ctx.config.verbosity)
         }
-        Some(kind) => Ok(invalid_kind("lean_verify", kind, &["explicit"])),
-        None => Ok(missing_kind("lean_verify", &["explicit"])),
+        Some(kind) => Ok(invalid_kind("lean_verify", kind, &[])),
     }
 }
 
@@ -473,11 +469,16 @@ fn missing_kind(tool: &str, allowed: &[&str]) -> SemanticResponse<Value> {
 }
 
 fn invalid_kind(tool: &str, kind: &str, allowed: &[&str]) -> SemanticResponse<Value> {
+    let message = if allowed.is_empty() {
+        format!("{tool} does not support kind `{kind}`; omit `kind` for this tool")
+    } else {
+        format!("{tool} does not support kind `{kind}`; allowed: {}", allowed.join(", "))
+    };
     SemanticResponse {
         data: None,
         errors: vec![SemanticIssue {
             code: "invalid_kind".to_owned(),
-            message: format!("{tool} does not support kind `{kind}`; allowed: {}", allowed.join(", ")),
+            message,
             severity: Some("error".to_owned()),
             next_action: None,
             retryable: Some(false),

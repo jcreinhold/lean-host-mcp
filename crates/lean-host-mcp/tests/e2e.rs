@@ -76,6 +76,16 @@ fn semantic_request(kind: &str, args: serde_json::Value) -> SemanticToolRequest 
     }
 }
 
+fn semantic_request_without_kind(args: serde_json::Value) -> SemanticToolRequest {
+    let serde_json::Value::Object(map) = args else {
+        panic!("semantic request args must be an object");
+    };
+    SemanticToolRequest {
+        kind: None,
+        args: map.into_iter().collect(),
+    }
+}
+
 fn semantic_data(response: SemanticResponse<serde_json::Value>) -> serde_json::Value {
     assert!(
         response
@@ -474,21 +484,21 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
     let verified = semantic_data(
         lean_verify(
             &ctx,
-            semantic_request(
-                "explicit",
-                serde_json::json!({
+            semantic_request_without_kind(serde_json::json!({
+                "targets": [{
+                    "kind": "explicit",
                     "file": "LeanRsFixture/ProofActions.lean",
-                    "declaration": "LeanRsFixture.ProofActions.closedTheorem",
-                    "report_axioms": true
-                }),
-            ),
+                    "declarations": ["LeanRsFixture.ProofActions.closedTheorem"]
+                }],
+                "report_axioms": true
+            })),
         )
         .await
-        .expect("lean_verify explicit"),
+        .expect("lean_verify targets"),
     );
     assert_eq!(
         verified
-            .pointer("/verification_status")
+            .pointer("/results/0/verification_status")
             .and_then(serde_json::Value::as_str),
         Some("verified")
     );
@@ -510,6 +520,89 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
         .expect("lean_lookup references"),
     );
     assert_eq!(refs.pointer("/status").and_then(serde_json::Value::as_str), Some("ok"));
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn lean_verify_batches_explicit_file_and_module_targets() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let explicit = semantic_data(
+        lean_verify(
+            &ctx,
+            semantic_request_without_kind(serde_json::json!({
+                "targets": [{
+                    "kind": "explicit",
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "declarations": [
+                        "LeanRsFixture.ProofActions.closedTheorem",
+                        "LeanRsFixture.ProofActions.sorryTheorem",
+                        "LeanRsFixture.ProofActions.notFound"
+                    ]
+                }],
+                "allow_sorry": false
+            })),
+        )
+        .await
+        .expect("lean_verify explicit batch"),
+    );
+    assert_eq!(explicit.pointer("/summary/requested"), Some(&serde_json::json!(3)));
+    assert_eq!(explicit.pointer("/summary/verified"), Some(&serde_json::json!(1)));
+    assert_eq!(explicit.pointer("/summary/failed"), Some(&serde_json::json!(2)));
+    let statuses = explicit["results"]
+        .as_array()
+        .expect("explicit results")
+        .iter()
+        .map(|row| row["verification_status"].as_str().expect("status").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["verified", "has_sorry", "not_found"]);
+
+    let file_all = semantic_data(
+        lean_verify(
+            &ctx,
+            semantic_request_without_kind(serde_json::json!({
+                "targets": [{ "kind": "file_all", "file": "LeanRsFixture/ProofActions.lean" }],
+                "allow_sorry": true
+            })),
+        )
+        .await
+        .expect("lean_verify file_all"),
+    );
+    assert!(
+        file_all
+            .pointer("/summary/requested")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|requested| requested >= 4),
+        "file_all should verify every fixture declaration: {file_all:?}"
+    );
+    assert_eq!(file_all.pointer("/summary/needs_build"), Some(&serde_json::json!(0)));
+
+    let module_all = lean_verify(
+        &ctx,
+        semantic_request_without_kind(serde_json::json!({
+            "targets": [{ "kind": "module_all", "module": "LeanRsFixture.ProofActions" }],
+            "allow_sorry": true
+        })),
+    )
+    .await
+    .expect("lean_verify module_all");
+    assert!(
+        module_all.trust.artifacts.iter().any(|artifact| {
+            artifact.artifact == lean_host_mcp::ArtifactKind::Source
+                && artifact.status == lean_host_mcp::TrustStatus::EditFresh
+        }),
+        "source-backed module_all should report source edit-fresh trust: {:?}",
+        module_all.trust.artifacts
+    );
+    let module_all = semantic_data(module_all);
+    assert_eq!(
+        file_all.pointer("/summary/requested"),
+        module_all.pointer("/summary/requested"),
+        "module_all source path should enumerate the same declarations as file_all"
+    );
 }
 
 #[tokio::test]

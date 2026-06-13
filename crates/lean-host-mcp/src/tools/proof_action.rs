@@ -8,15 +8,19 @@
 // worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
-    LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions,
-    LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofCandidate, LeanWorkerProofEditTarget,
-    LeanWorkerSorryPolicy,
+    LeanWorkerDeclarationVerificationBatchItem, LeanWorkerDeclarationVerificationBatchRequest,
+    LeanWorkerDeclarationVerificationBatchResult, LeanWorkerDeclarationVerificationBatchRow,
+    LeanWorkerDeclarationVerificationRequest,
+    LeanWorkerDeclarationVerificationResult as WorkerDeclarationVerificationResult,
+    LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions, LeanWorkerOutputBudgets,
+    LeanWorkerProofAttemptRequest, LeanWorkerProofCandidate, LeanWorkerProofEditTarget, LeanWorkerSorryPolicy,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::broker::ProjectHint;
 use crate::diagnosis::{
@@ -30,11 +34,12 @@ use crate::projections::{
     ProofAttemptEnvelope, ProofAttemptResult, project_declaration_verification, project_proof_attempt,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
-use crate::tools::source_input::read_query_file;
+use crate::tools::source_input::{read_query_file, source_path_for_module};
 use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
 use crate::trust::ArtifactTrust;
 
 const MAX_CANDIDATES: usize = 8;
+const MAX_VERIFY_TARGETS: usize = 1000;
 const DEFAULT_FIELD_BYTES: u32 = 4 * 1024;
 const MIN_FIELD_BYTES: u32 = 256;
 const MAX_FIELD_BYTES: u32 = 64 * 1024;
@@ -78,6 +83,72 @@ pub struct VerifyDeclarationRequest {
     /// Include the axioms the proof depends on (slower).
     #[serde(default)]
     pub report_axioms: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LeanVerifyRequest {
+    /// Explicit, file-wide, or module-wide declaration groups to verify.
+    pub targets: Vec<LeanVerifyTargetGroup>,
+    /// Project-root override; defaults to the server's configured Lake project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Treat `sorry`/`admit` as success instead of failure.
+    #[serde(default)]
+    pub allow_sorry: bool,
+    /// Include the axioms each proof depends on (slower).
+    #[serde(default)]
+    pub report_axioms: bool,
+}
+
+impl From<VerifyDeclarationRequest> for LeanVerifyRequest {
+    fn from(req: VerifyDeclarationRequest) -> Self {
+        Self {
+            targets: vec![LeanVerifyTargetGroup::Explicit {
+                file: req.file,
+                declarations: vec![req.declaration],
+            }],
+            project: req.project,
+            allow_sorry: req.allow_sorry,
+            report_axioms: req.report_axioms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LeanVerifyTargetGroup {
+    Explicit { file: PathBuf, declarations: Vec<String> },
+    FileAll { file: PathBuf },
+    ModuleAll { module: String },
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LeanVerifyResult {
+    pub summary: LeanVerifySummary,
+    pub results: Vec<LeanVerifyRow>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LeanVerifySummary {
+    pub requested: usize,
+    pub verified: usize,
+    pub failed: usize,
+    pub needs_build: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LeanVerifyRow {
+    pub id: String,
+    pub file: String,
+    pub declaration: String,
+    pub verification_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<Box<DeclarationVerificationFacts>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_imports: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<ElabFailure>,
 }
 
 /// Try one or more proof snippets against an in-memory source overlay.
@@ -355,6 +426,602 @@ pub async fn verify_declaration(
         response = warn_execution_taint(response, event);
     }
     Ok(response)
+}
+
+/// Verify explicit, file-wide, or module-wide declaration groups.
+///
+/// # Errors
+///
+/// Returns infrastructure failures only. Per-declaration Lean failures are
+/// projected into row verdicts.
+pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result<Response<LeanVerifyResult>> {
+    let hint = ProjectHint::from_request(req.project.clone());
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let mut expansion = VerifyExpansion::new();
+
+    for (group_index, target_group) in req.targets.iter().enumerate() {
+        match target_group {
+            LeanVerifyTargetGroup::Explicit { file, declarations } => {
+                expansion.push_explicit_group(group_index, file, declarations);
+            }
+            LeanVerifyTargetGroup::FileAll { file } => {
+                let inventory = crate::tools::declaration_inventory::declaration_inventory(
+                    ctx,
+                    crate::tools::declaration_inventory::DeclarationInventoryRequest {
+                        target: crate::tools::declaration_inventory::DeclarationInventoryTarget::File {
+                            path: file.clone(),
+                        },
+                        project: req.project.clone(),
+                        limit: Some(MAX_VERIFY_TARGETS),
+                    },
+                )
+                .await?;
+                expansion.absorb_inventory_response(&inventory);
+                if let Some(result) = inventory.result_ref() {
+                    expansion.truncated |= result.truncated;
+                    if result.status == "ok" || result.status == NEEDS_BUILD_STATUS {
+                        expansion.push_inventory_group(
+                            group_index,
+                            VerifySource::File(file.clone()),
+                            &result.declarations,
+                        );
+                    } else if let Some(message) = &result.message {
+                        expansion
+                            .warnings
+                            .push(format!("file_all inventory did not produce declarations: {message}"));
+                    }
+                }
+            }
+            LeanVerifyTargetGroup::ModuleAll { module } => {
+                let inventory = crate::tools::declaration_inventory::declaration_inventory(
+                    ctx,
+                    crate::tools::declaration_inventory::DeclarationInventoryRequest {
+                        target: crate::tools::declaration_inventory::DeclarationInventoryTarget::Module {
+                            module: module.clone(),
+                        },
+                        project: req.project.clone(),
+                        limit: Some(MAX_VERIFY_TARGETS),
+                    },
+                )
+                .await?;
+                expansion.absorb_inventory_response(&inventory);
+                if let Some(result) = inventory.result_ref() {
+                    expansion.truncated |= result.truncated;
+                    if result.status == "ok" || result.status == NEEDS_BUILD_STATUS {
+                        let source = if result.source == "ilean" {
+                            VerifySource::ModuleIndex {
+                                module: module.clone(),
+                                display_file: source_path_for_module(&meta.canonical_root, module),
+                            }
+                        } else {
+                            VerifySource::File(source_path_for_module(&meta.canonical_root, module))
+                        };
+                        expansion.push_inventory_group(group_index, source, &result.declarations);
+                    } else if let Some(message) = &result.message {
+                        expansion
+                            .warnings
+                            .push(format!("module_all inventory did not produce declarations: {message}"));
+                    }
+                }
+            }
+        }
+    }
+
+    let requested = expansion.requested;
+    if expansion.groups_total_targets() > MAX_VERIFY_TARGETS {
+        expansion.truncated = true;
+        expansion.truncate(MAX_VERIFY_TARGETS);
+    }
+
+    let mut rows = Vec::new();
+    let mut last_identity = None;
+    let mut build_causes = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut axiom_warnings = Vec::new();
+    let mut recycled = None;
+
+    let order_by_id = expansion.order_map();
+    for group in std::mem::take(&mut expansion.groups) {
+        if group.targets.is_empty() {
+            continue;
+        }
+        let prepared = prepare_verify_group(&meta.canonical_root, group)?;
+        let source_fact = prepared.source_fact.clone();
+        let target_meta = prepared
+            .targets
+            .iter()
+            .map(|target| (target.id.clone(), target.clone()))
+            .collect::<HashMap<_, _>>();
+        let request = LeanWorkerDeclarationVerificationBatchRequest {
+            source: prepared.source,
+            targets: prepared
+                .targets
+                .iter()
+                .map(|target| LeanWorkerDeclarationVerificationBatchItem {
+                    id: target.id.clone(),
+                    target: LeanWorkerDeclarationVerificationTarget::Name {
+                        name: target.declaration.clone(),
+                    },
+                })
+                .collect(),
+            sorry_policy: if req.allow_sorry {
+                LeanWorkerSorryPolicy::Allow
+            } else {
+                LeanWorkerSorryPolicy::Deny
+            },
+            report_axioms: req.report_axioms,
+            budgets: proof_action_budgets(&ctx.config.output),
+        };
+        let file_label = prepared.file_label.clone();
+        let call = match classify_missing_olean(
+            ctx.broker
+                .verify_declaration_batch(
+                    hint.clone(),
+                    session_imports(prepared.imports.clone()),
+                    prepared.imports.clone(),
+                    request,
+                    elab_options(&file_label, ctx.config.output.heartbeat_limit),
+                )
+                .await,
+        )? {
+            CallOutcome::Ready(call) => call,
+            CallOutcome::NeedsBuild(err) => {
+                let base = ctx
+                    .broker
+                    .project_identity_without_worker(&hint, prepared.imports.clone())?;
+                last_identity = Some((base.freshness, base.runtime));
+                build_causes.push(IncompleteCause::MissingOlean(err.to_string()));
+                rows.extend(prepared.targets.into_iter().map(needs_build_row));
+                if let Some(fact) = source_fact {
+                    expansion.trust_artifacts.push(fact);
+                }
+                continue;
+            }
+        };
+        let taint = execution_taint(&call.runtime).cloned();
+        last_identity = Some((call.freshness.clone(), call.runtime.clone()));
+        if let Some(fact) = source_fact {
+            expansion.trust_artifacts.push(fact);
+        }
+        let projected = project_batch_rows(call.value, &target_meta, req.report_axioms, taint.as_ref());
+        if projected.recycled
+            && let Some(event) = taint
+        {
+            recycled = Some(event);
+        }
+        build_causes.extend(projected.build_causes);
+        ambiguous.extend(projected.ambiguous);
+        axiom_warnings.extend(projected.axiom_warnings);
+        rows.extend(projected.rows);
+    }
+
+    rows.sort_by_key(|row| order_by_id.get(&row.id).copied().unwrap_or(usize::MAX));
+    let summary = summarize_rows(requested, expansion.truncated, &rows);
+    let (freshness, runtime) = match last_identity {
+        Some(identity) => identity,
+        None => {
+            let base = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
+            (base.freshness, base.runtime)
+        }
+    };
+    let mut response = Response::ok(LeanVerifyResult { summary, results: rows }, freshness)
+        .with_runtime(runtime)
+        .with_trust_artifacts(expansion.trust_artifacts);
+    response.warnings.extend(expansion.warnings);
+    response.next_actions.extend(expansion.next_actions);
+    response
+        .next_actions
+        .push("source files were not modified by verification".to_owned());
+    for cause in build_causes {
+        response = warn_needs_build(response, &cause);
+    }
+    response = crate::diagnosis::warn_ambiguous(response, &ambiguous);
+    for warning in axiom_warnings {
+        if !response.warnings.contains(&warning) {
+            response.warnings.push(warning);
+        }
+    }
+    if let Some(event) = recycled.as_ref() {
+        response = warn_execution_taint(response, event);
+    }
+    Ok(response)
+}
+
+#[derive(Debug, Clone)]
+enum VerifySource {
+    File(PathBuf),
+    ModuleIndex { module: String, display_file: PathBuf },
+}
+
+#[derive(Debug, Clone)]
+struct VerifyTarget {
+    order: usize,
+    id: String,
+    file: String,
+    declaration: String,
+}
+
+#[derive(Debug, Clone)]
+struct VerifyGroup {
+    source: VerifySource,
+    targets: Vec<VerifyTarget>,
+}
+
+struct VerifyExpansion {
+    groups: Vec<VerifyGroup>,
+    group_by_key: HashMap<String, usize>,
+    seen_ids: HashSet<String>,
+    requested: usize,
+    next_order: usize,
+    truncated: bool,
+    trust_artifacts: Vec<ArtifactTrust>,
+    warnings: Vec<String>,
+    next_actions: Vec<String>,
+}
+
+impl VerifyExpansion {
+    fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            group_by_key: HashMap::new(),
+            seen_ids: HashSet::new(),
+            requested: 0,
+            next_order: 0,
+            truncated: false,
+            trust_artifacts: Vec::new(),
+            warnings: Vec::new(),
+            next_actions: Vec::new(),
+        }
+    }
+
+    fn push_explicit_group(&mut self, group_index: usize, file: &Path, declarations: &[String]) {
+        self.push_declarations(
+            group_index,
+            VerifySource::File(file.to_path_buf()),
+            declarations.iter().map(String::as_str),
+        );
+    }
+
+    fn push_inventory_group(
+        &mut self,
+        group_index: usize,
+        source: VerifySource,
+        declarations: &[crate::tools::declaration_inventory::DeclarationInventoryRow],
+    ) {
+        self.push_declarations(group_index, source, declarations.iter().map(|row| row.name.as_str()));
+    }
+
+    fn push_declarations<I>(&mut self, group_index: usize, source: VerifySource, declarations: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let file = file_display(&source);
+        let key = source_key(&source);
+        let group_idx = match self.group_by_key.get(&key).copied() {
+            Some(idx) => idx,
+            None => {
+                let idx = self.groups.len();
+                self.groups.push(VerifyGroup {
+                    source,
+                    targets: Vec::new(),
+                });
+                self.group_by_key.insert(key, idx);
+                idx
+            }
+        };
+        for declaration in declarations {
+            let declaration = declaration.as_ref().trim();
+            if declaration.is_empty() {
+                self.warnings
+                    .push("lean_verify ignored an empty declaration target".to_owned());
+                continue;
+            }
+            self.requested = self.requested.saturating_add(1);
+            let mut id = format!("group_{}:{declaration}", group_index.saturating_add(1));
+            if !self.seen_ids.insert(id.clone()) {
+                id = format!("{id}#{}", self.next_order.saturating_add(1));
+                let _ = self.seen_ids.insert(id.clone());
+            }
+            if let Some(group) = self.groups.get_mut(group_idx) {
+                group.targets.push(VerifyTarget {
+                    order: self.next_order,
+                    id,
+                    file: file.clone(),
+                    declaration: declaration.to_owned(),
+                });
+            }
+            self.next_order = self.next_order.saturating_add(1);
+        }
+    }
+
+    fn absorb_inventory_response(
+        &mut self,
+        response: &Response<crate::tools::declaration_inventory::DeclarationInventoryResult>,
+    ) {
+        self.trust_artifacts.extend(response.trust_artifacts.clone());
+        self.warnings.extend(response.warnings.clone());
+        self.next_actions.extend(response.next_actions.clone());
+    }
+
+    fn groups_total_targets(&self) -> usize {
+        self.groups.iter().map(|group| group.targets.len()).sum()
+    }
+
+    fn truncate(&mut self, limit: usize) {
+        let mut remaining = limit;
+        for group in &mut self.groups {
+            if remaining >= group.targets.len() {
+                remaining = remaining.saturating_sub(group.targets.len());
+            } else {
+                group.targets.truncate(remaining);
+                remaining = 0;
+            }
+        }
+    }
+
+    fn order_map(&self) -> HashMap<String, usize> {
+        self.groups
+            .iter()
+            .flat_map(|group| group.targets.iter())
+            .map(|target| (target.id.clone(), target.order))
+            .collect()
+    }
+}
+
+struct PreparedVerifyGroup {
+    source: String,
+    imports: Vec<String>,
+    file_label: String,
+    source_fact: Option<ArtifactTrust>,
+    targets: Vec<VerifyTarget>,
+}
+
+fn prepare_verify_group(root: &Path, group: VerifyGroup) -> Result<PreparedVerifyGroup> {
+    match group.source {
+        VerifySource::File(path) => {
+            let input = read_query_file(root, &path)?;
+            let file_label = input.resolved.to_string_lossy().into_owned();
+            Ok(PreparedVerifyGroup {
+                source: input.source,
+                imports: input.imports,
+                file_label,
+                source_fact: Some(ArtifactTrust::source_file_edit_fresh(root, &input.resolved)),
+                targets: group.targets,
+            })
+        }
+        VerifySource::ModuleIndex { module, display_file } => Ok(PreparedVerifyGroup {
+            source: String::new(),
+            imports: vec![module],
+            file_label: display_file.to_string_lossy().into_owned(),
+            source_fact: None,
+            targets: group.targets,
+        }),
+    }
+}
+
+fn source_key(source: &VerifySource) -> String {
+    match source {
+        VerifySource::File(path) => format!("file:{}", path.to_string_lossy()),
+        VerifySource::ModuleIndex { module, .. } => format!("module_index:{module}"),
+    }
+}
+
+fn file_display(source: &VerifySource) -> String {
+    match source {
+        VerifySource::File(path) => path.to_string_lossy().into_owned(),
+        VerifySource::ModuleIndex { display_file, .. } => display_file.to_string_lossy().into_owned(),
+    }
+}
+
+struct ProjectedBatchRows {
+    rows: Vec<LeanVerifyRow>,
+    build_causes: Vec<IncompleteCause>,
+    ambiguous: Vec<crate::diagnosis::CompetingDecl>,
+    axiom_warnings: Vec<String>,
+    recycled: bool,
+}
+
+fn project_batch_rows(
+    result: LeanWorkerDeclarationVerificationBatchResult,
+    target_meta: &HashMap<String, VerifyTarget>,
+    report_axioms: bool,
+    taint: Option<&crate::envelope::RuntimeRestartEvent>,
+) -> ProjectedBatchRows {
+    match result {
+        LeanWorkerDeclarationVerificationBatchResult::Ok { results, imports } => {
+            project_batch_verdict_rows(results, imports, None, target_meta, report_axioms, taint)
+        }
+        LeanWorkerDeclarationVerificationBatchResult::MissingImports {
+            results,
+            imports,
+            missing,
+        } => project_batch_verdict_rows(results, imports, Some(missing), target_meta, report_axioms, taint),
+        LeanWorkerDeclarationVerificationBatchResult::HeaderParseFailed { diagnostics } => {
+            let diagnostics = crate::projections::project_failure(&diagnostics);
+            ProjectedBatchRows {
+                rows: target_meta
+                    .values()
+                    .map(|target| LeanVerifyRow {
+                        id: target.id.clone(),
+                        file: target.file.clone(),
+                        declaration: target.declaration.clone(),
+                        verification_status: "header_parse_failed".to_owned(),
+                        facts: None,
+                        missing_imports: Vec::new(),
+                        diagnostics: Some(diagnostics.clone()),
+                    })
+                    .collect(),
+                build_causes: Vec::new(),
+                ambiguous: Vec::new(),
+                axiom_warnings: Vec::new(),
+                recycled: false,
+            }
+        }
+        LeanWorkerDeclarationVerificationBatchResult::Unsupported => ProjectedBatchRows {
+            rows: target_meta
+                .values()
+                .map(|target| LeanVerifyRow {
+                    id: target.id.clone(),
+                    file: target.file.clone(),
+                    declaration: target.declaration.clone(),
+                    verification_status: "unsupported".to_owned(),
+                    facts: None,
+                    missing_imports: Vec::new(),
+                    diagnostics: None,
+                })
+                .collect(),
+            build_causes: Vec::new(),
+            ambiguous: Vec::new(),
+            axiom_warnings: Vec::new(),
+            recycled: false,
+        },
+        _ => ProjectedBatchRows {
+            rows: target_meta
+                .values()
+                .map(|target| LeanVerifyRow {
+                    id: target.id.clone(),
+                    file: target.file.clone(),
+                    declaration: target.declaration.clone(),
+                    verification_status: "unsupported".to_owned(),
+                    facts: None,
+                    missing_imports: Vec::new(),
+                    diagnostics: None,
+                })
+                .collect(),
+            build_causes: Vec::new(),
+            ambiguous: Vec::new(),
+            axiom_warnings: Vec::new(),
+            recycled: false,
+        },
+    }
+}
+
+fn project_batch_verdict_rows(
+    rows: Vec<LeanWorkerDeclarationVerificationBatchRow>,
+    imports: Vec<String>,
+    missing: Option<Vec<String>>,
+    target_meta: &HashMap<String, VerifyTarget>,
+    report_axioms: bool,
+    taint: Option<&crate::envelope::RuntimeRestartEvent>,
+) -> ProjectedBatchRows {
+    let mut out = ProjectedBatchRows {
+        rows: Vec::with_capacity(rows.len()),
+        build_causes: Vec::new(),
+        ambiguous: Vec::new(),
+        axiom_warnings: Vec::new(),
+        recycled: false,
+    };
+    if let Some(missing) = missing.as_ref() {
+        out.build_causes.push(IncompleteCause::MissingImports(missing.clone()));
+    }
+    for row in rows {
+        let Some(target) = target_meta.get(&row.id) else {
+            continue;
+        };
+        let mut projected = match missing.clone() {
+            Some(missing) => project_declaration_verification(WorkerDeclarationVerificationResult::MissingImports {
+                verification_status: row.verification_status,
+                facts: row.facts,
+                imports: imports.clone(),
+                missing,
+            }),
+            None => project_declaration_verification(WorkerDeclarationVerificationResult::Ok {
+                verification_status: row.verification_status,
+                facts: row.facts,
+                imports: imports.clone(),
+            }),
+        };
+        if taint.is_some() && relabel_recycled_verdict(&mut projected) {
+            out.recycled = true;
+        }
+        if let Some(cause) = verification_incomplete_cause(&projected) {
+            out.build_causes.push(cause);
+        }
+        out.ambiguous.extend(verification_ambiguous_candidates(&projected));
+        if let Some(warning) = axiom_unavailable_warning(&projected, report_axioms) {
+            out.axiom_warnings.push(warning);
+        }
+        out.rows.push(row_from_projected(target, projected));
+    }
+    out
+}
+
+fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResult) -> LeanVerifyRow {
+    match result {
+        DeclarationVerificationResult::Ok {
+            verification_status,
+            facts,
+            ..
+        } => LeanVerifyRow {
+            id: target.id.clone(),
+            file: target.file.clone(),
+            declaration: target.declaration.clone(),
+            verification_status,
+            facts: Some(facts),
+            missing_imports: Vec::new(),
+            diagnostics: None,
+        },
+        DeclarationVerificationResult::MissingImports {
+            verification_status,
+            facts,
+            missing,
+            ..
+        } => LeanVerifyRow {
+            id: target.id.clone(),
+            file: target.file.clone(),
+            declaration: target.declaration.clone(),
+            verification_status,
+            facts: Some(facts),
+            missing_imports: missing,
+            diagnostics: None,
+        },
+        DeclarationVerificationResult::HeaderParseFailed { diagnostics } => LeanVerifyRow {
+            id: target.id.clone(),
+            file: target.file.clone(),
+            declaration: target.declaration.clone(),
+            verification_status: "header_parse_failed".to_owned(),
+            facts: None,
+            missing_imports: Vec::new(),
+            diagnostics: Some(diagnostics),
+        },
+        DeclarationVerificationResult::Unsupported => LeanVerifyRow {
+            id: target.id.clone(),
+            file: target.file.clone(),
+            declaration: target.declaration.clone(),
+            verification_status: "unsupported".to_owned(),
+            facts: None,
+            missing_imports: Vec::new(),
+            diagnostics: None,
+        },
+    }
+}
+
+fn needs_build_row(target: VerifyTarget) -> LeanVerifyRow {
+    LeanVerifyRow {
+        id: target.id,
+        file: target.file,
+        declaration: target.declaration,
+        verification_status: NEEDS_BUILD_STATUS.to_owned(),
+        facts: Some(Box::new(needs_build_facts())),
+        missing_imports: Vec::new(),
+        diagnostics: None,
+    }
+}
+
+fn summarize_rows(requested: usize, truncated: bool, rows: &[LeanVerifyRow]) -> LeanVerifySummary {
+    let verified = rows.iter().filter(|row| row.verification_status == "verified").count();
+    let needs_build = rows
+        .iter()
+        .filter(|row| row.verification_status == NEEDS_BUILD_STATUS)
+        .count();
+    LeanVerifySummary {
+        requested,
+        verified,
+        failed: rows.len().saturating_sub(verified).saturating_sub(needs_build),
+        needs_build,
+        truncated,
+    }
 }
 
 /// When the worker was recycled mid-call, a non-positive verification verdict is
@@ -742,6 +1409,90 @@ mod tests {
         .unwrap();
         assert_eq!(req.declaration, "Demo.closed");
         assert!(req.report_axioms);
+    }
+
+    #[test]
+    fn lean_verify_request_accepts_target_groups() {
+        let req: LeanVerifyRequest = serde_json::from_value(json!({
+            "targets": [
+                {
+                    "kind": "explicit",
+                    "file": "Demo.lean",
+                    "declarations": ["Demo.closed", "Demo.other"]
+                },
+                { "kind": "file_all", "file": "Other.lean" },
+                { "kind": "module_all", "module": "Demo.Other" }
+            ],
+            "allow_sorry": true,
+            "report_axioms": true
+        }))
+        .unwrap();
+        assert_eq!(req.targets.len(), 3);
+        assert!(req.allow_sorry);
+        assert!(req.report_axioms);
+    }
+
+    #[test]
+    fn lean_verify_summary_separates_needs_build_from_failures() {
+        let rows = vec![
+            LeanVerifyRow {
+                id: "group_1:Demo.ok".to_owned(),
+                file: "Demo.lean".to_owned(),
+                declaration: "Demo.ok".to_owned(),
+                verification_status: "verified".to_owned(),
+                facts: None,
+                missing_imports: Vec::new(),
+                diagnostics: None,
+            },
+            LeanVerifyRow {
+                id: "group_1:Demo.sorry".to_owned(),
+                file: "Demo.lean".to_owned(),
+                declaration: "Demo.sorry".to_owned(),
+                verification_status: "has_sorry".to_owned(),
+                facts: None,
+                missing_imports: Vec::new(),
+                diagnostics: None,
+            },
+            LeanVerifyRow {
+                id: "group_2:Demo.unbuilt".to_owned(),
+                file: "Demo.lean".to_owned(),
+                declaration: "Demo.unbuilt".to_owned(),
+                verification_status: NEEDS_BUILD_STATUS.to_owned(),
+                facts: None,
+                missing_imports: Vec::new(),
+                diagnostics: None,
+            },
+        ];
+
+        let summary = summarize_rows(4, true, &rows);
+        assert_eq!(summary.requested, 4);
+        assert_eq!(summary.verified, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.needs_build, 1);
+        assert!(summary.truncated);
+    }
+
+    #[test]
+    fn lean_verify_expansion_coalesces_targets_by_source() {
+        let mut expansion = VerifyExpansion::new();
+        expansion.push_explicit_group(
+            0,
+            std::path::Path::new("Demo.lean"),
+            &["Demo.a".to_owned(), "Demo.b".to_owned()],
+        );
+        expansion.push_explicit_group(1, std::path::Path::new("Demo.lean"), &["Demo.c".to_owned()]);
+
+        assert_eq!(expansion.groups.len(), 1);
+        assert_eq!(expansion.groups[0].targets.len(), 3);
+        assert_eq!(expansion.requested, 3);
+        assert_eq!(
+            expansion.groups[0]
+                .targets
+                .iter()
+                .map(|target| target.declaration.as_str())
+                .collect::<Vec<_>>(),
+            ["Demo.a", "Demo.b", "Demo.c"]
+        );
     }
 
     #[tokio::test]

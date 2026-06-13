@@ -12,11 +12,11 @@ and launches the matching pre-built worker.
 
 ## What it gives an agent
 
-Five semantic tools, each with a `kind` mode:
+Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups directly:
 
 - **`lean_context`** — proof context. Initial mode: `proof_position`.
 - **`lean_trial`** — non-mutating experiments. Initial mode: `proof_step`.
-- **`lean_verify`** — declaration verification. Initial mode: `explicit`.
+- **`lean_verify`** — declaration verification for explicit, file-wide, or module-wide target groups.
 - **`lean_lookup`** — declaration inspection, declaration inventory, proof search, and references. Initial modes:
   `declaration`, `declarations`, `proof_search`, and `references`.
 - **`lean_status`** — cheap project/toolchain/config status that does not open a worker.

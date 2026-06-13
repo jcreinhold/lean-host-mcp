@@ -65,7 +65,7 @@ impl LeanHostService {
         self.respond_semantic(tools::semantic::lean_trial(&self.ctx, req).await)
     }
 
-    #[tool(description = "Verify Lean declarations. Use kind=\"explicit\" for one named declaration in one file.")]
+    #[tool(description = "Verify Lean declarations from explicit, file_all, or module_all target groups.")]
     async fn lean_verify(
         &self,
         Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
