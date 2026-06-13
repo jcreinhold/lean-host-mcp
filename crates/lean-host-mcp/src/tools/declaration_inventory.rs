@@ -1,11 +1,13 @@
 //! Declaration inventory for `lean_lookup(kind = "declarations")`.
 //!
-//! Source files use the edit-fresh worker declaration-outline selector. Module
-//! requests fall back to the build-fresh `.ilean` declaration index only when
+//! Source files use the edit-fresh worker declaration-outline selector, then
+//! supplement missing names from a fresh module `.ilean` when one is available.
+//! Module requests fall back to the build-fresh `.ilean` declaration index when
 //! the source file is unavailable.
 
 #![allow(clippy::needless_pass_by_value)]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
@@ -21,7 +23,7 @@ use crate::diagnosis::{CallOutcome, IncompleteCause, classify_missing_olean, war
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::projections::{ElabFailure, project_failure};
-use crate::tools::source_input::{read_query_file, resolve_path, source_path_for_module};
+use crate::tools::source_input::{module_name_for_file, read_query_file, resolve_path, source_path_for_module};
 use crate::tools::{ToolContext, session_imports};
 use crate::trust::{ArtifactTrust, display_path};
 
@@ -106,12 +108,12 @@ pub async fn declaration_inventory(
                     )),
                 );
             }
-            worker_declarations(ctx, hint, &meta.canonical_root, &path, limit).await
+            worker_declarations(ctx, hint, &meta.canonical_root, &path, None, limit).await
         }
         DeclarationInventoryTarget::Module { module } => {
             let path = source_path_for_module(&meta.canonical_root, &module);
             if path.is_file() {
-                worker_declarations(ctx, hint, &meta.canonical_root, &path, limit).await
+                worker_declarations(ctx, hint, &meta.canonical_root, &path, Some(module), limit).await
             } else {
                 index_declarations(ctx, hint, &meta.canonical_root, &module, limit)
             }
@@ -124,10 +126,12 @@ async fn worker_declarations(
     hint: ProjectHint,
     root: &Path,
     path: &Path,
+    module_hint: Option<String>,
     limit: usize,
 ) -> Result<Response<DeclarationInventoryResult>> {
     let input = read_query_file(root, path)?;
     let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved);
+    let module = module_hint.or_else(|| module_name_for_file(root, &input.resolved));
     let file_label = input.resolved.to_string_lossy().into_owned();
     let selectors = vec![LeanWorkerModuleQuerySelector::DeclarationOutline {
         id: DECLARATION_OUTLINE_ID.to_owned(),
@@ -150,9 +154,18 @@ async fn worker_declarations(
         CallOutcome::Ready(call) => call,
         CallOutcome::NeedsBuild(err) => return worker_needs_build_response(ctx, hint, err),
     };
-    let mut response = Response::ok(project_worker_outline(call.value, limit), call.freshness)
+    let mut result = project_worker_outline(call.value, limit);
+    let index_fact = if let Some(module) = module.as_deref() {
+        supplement_with_fresh_index(root, module, &mut result, limit)
+    } else {
+        None
+    };
+    let mut response = Response::ok(result, call.freshness)
         .with_runtime(call.runtime)
         .with_trust_artifact(source_fact);
+    if let Some(fact) = index_fact {
+        response = response.with_trust_artifact(fact);
+    }
     if matches!(response.result_ref().map(|r| r.status.as_str()), Some("needs_build")) {
         response = warn_needs_build(response, &IncompleteCause::MissingImports(Vec::new()));
     }
@@ -358,6 +371,47 @@ fn index_declarations_rows(index: &crate::ilean::ModuleDeclarationIndex) -> Vec<
         .collect()
 }
 
+fn supplement_with_fresh_index(
+    root: &Path,
+    module: &str,
+    result: &mut DeclarationInventoryResult,
+    limit: usize,
+) -> Option<ArtifactTrust> {
+    if result.status != "ok" {
+        return None;
+    }
+    let index = crate::ilean::declarations_in_module(root, module);
+    if index.status != crate::ilean::ModuleDeclarationIndexStatus::Present || index.stale {
+        return None;
+    }
+
+    let mut seen = result
+        .declarations
+        .iter()
+        .map(|row| row.name.clone())
+        .collect::<HashSet<_>>();
+    let original_len = result.declarations.len();
+    let mut omitted_for_limit = false;
+    for row in index_declarations_rows(&index) {
+        if !seen.insert(row.name.clone()) {
+            continue;
+        }
+        if result.declarations.len() >= limit {
+            omitted_for_limit = true;
+            continue;
+        }
+        result.declarations.push(row);
+    }
+    if result.declarations.len() > original_len {
+        "worker+ilean".clone_into(&mut result.source);
+    }
+    result.truncated |= omitted_for_limit;
+    Some(ArtifactTrust::ilean_module_build_fresh(
+        index.module,
+        display_path(root, &index.index),
+    ))
+}
+
 fn truncate(mut declarations: Vec<DeclarationInventoryRow>, limit: usize) -> (Vec<DeclarationInventoryRow>, bool) {
     let truncated = declarations.len() > limit;
     declarations.truncate(limit);
@@ -430,7 +484,7 @@ const fn outline_budgets() -> LeanWorkerOutputBudgets {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use crate::broker::{BrokerConfig, ProjectBroker};
@@ -481,6 +535,23 @@ mod tests {
         index
     }
 
+    fn row(name: &str, line: u32) -> DeclarationInventoryRow {
+        let span = DeclarationSpan {
+            start_line: line,
+            start_column: 1,
+            end_line: line,
+            end_column: 4,
+        };
+        DeclarationInventoryRow {
+            name: name.to_owned(),
+            short_name: short_name(name),
+            kind: None,
+            declaration_span: span.clone(),
+            name_span: span,
+            body_span: None,
+        }
+    }
+
     fn has_fact(
         response: &Response<DeclarationInventoryResult>,
         artifact: ArtifactKind,
@@ -495,47 +566,66 @@ mod tests {
 
     #[test]
     fn lean_lookup_declarations_limit_truncates_deterministically() {
-        let rows = vec![
-            DeclarationInventoryRow {
-                name: "A.one".to_owned(),
-                short_name: "one".to_owned(),
-                kind: None,
-                declaration_span: DeclarationSpan {
-                    start_line: 1,
-                    start_column: 1,
-                    end_line: 1,
-                    end_column: 4,
-                },
-                name_span: DeclarationSpan {
-                    start_line: 1,
-                    start_column: 1,
-                    end_line: 1,
-                    end_column: 4,
-                },
-                body_span: None,
-            },
-            DeclarationInventoryRow {
-                name: "A.two".to_owned(),
-                short_name: "two".to_owned(),
-                kind: None,
-                declaration_span: DeclarationSpan {
-                    start_line: 2,
-                    start_column: 1,
-                    end_line: 2,
-                    end_column: 4,
-                },
-                name_span: DeclarationSpan {
-                    start_line: 2,
-                    start_column: 1,
-                    end_line: 2,
-                    end_column: 4,
-                },
-                body_span: None,
-            },
-        ];
+        let rows = vec![row("A.one", 1), row("A.two", 2)];
         let (rows, truncated) = truncate(rows, 1);
         assert!(truncated);
         assert_eq!(rows[0].name, "A.one");
+    }
+
+    #[test]
+    fn worker_outline_supplements_missing_names_from_fresh_ilean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        copy_ilean(&root, "Demo.A", "demo_a.ilean");
+        let mut result = DeclarationInventoryResult {
+            status: "ok".to_owned(),
+            declarations: vec![row("Demo.A.bar", 1)],
+            truncated: false,
+            source: "worker".to_owned(),
+            files_scanned: 1,
+            message: None,
+            diagnostics: None,
+        };
+
+        let Some(fact) = supplement_with_fresh_index(&root, "Demo.A", &mut result, 200) else {
+            panic!("fresh index should produce a trust fact");
+        };
+
+        let names = result
+            .declarations
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Demo.A.bar", "Demo.A.foo"]);
+        assert_eq!(result.source, "worker+ilean");
+        assert!(!result.truncated);
+        assert_eq!(fact.artifact, ArtifactKind::Ilean);
+        assert_eq!(fact.status, TrustStatus::BuildFresh);
+    }
+
+    #[test]
+    fn worker_outline_does_not_supplement_from_stale_ilean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        copy_ilean(&root, "Demo.A", "demo_a.ilean");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::create_dir_all(root.join("Demo")).unwrap();
+        std::fs::write(root.join("Demo/A.lean"), "-- edited after build\n").unwrap();
+        let mut result = DeclarationInventoryResult {
+            status: "ok".to_owned(),
+            declarations: vec![row("Demo.A.bar", 1)],
+            truncated: false,
+            source: "worker".to_owned(),
+            files_scanned: 1,
+            message: None,
+            diagnostics: None,
+        };
+
+        let fact = supplement_with_fresh_index(&root, "Demo.A", &mut result, 200);
+
+        assert!(fact.is_none());
+        assert_eq!(result.declarations.len(), 1);
+        assert_eq!(result.source, "worker");
     }
 
     #[test]

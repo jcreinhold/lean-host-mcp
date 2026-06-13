@@ -215,10 +215,23 @@ pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(proof_action::verify_targets(ctx, request).await?, ctx.config.verbosity)
+            lean_verify_targets(ctx, request).await
         }
         Some(kind) => Ok(invalid_kind("lean_verify", kind, &[])),
     }
+}
+
+/// Typed declaration-verification entry point for the public MCP handler.
+///
+/// Unlike the kind-dispatched semantic families, `lean_verify` has no `kind`
+/// namespace: its top-level request is the target-group batch itself.
+///
+/// # Errors
+///
+/// Returns infrastructure failures only; per-declaration Lean failures remain
+/// structured semantic data.
+pub async fn lean_verify_targets(ctx: &ToolContext, request: LeanVerifyRequest) -> Result<SemanticResponse<Value>> {
+    from_tool_response(proof_action::verify_targets(ctx, request).await?, ctx.config.verbosity)
 }
 
 /// Semantic lookup and discovery.

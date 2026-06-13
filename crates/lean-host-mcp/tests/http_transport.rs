@@ -64,6 +64,21 @@ async fn streamable_http_initialize_and_tools_list() {
             tool.get("name").and_then(Value::as_str).unwrap_or("?")
         );
     }
+    let verify_tool = listed
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("lean_verify"))
+        .expect("lean_verify should be listed");
+    let verify_schema = verify_tool
+        .get("inputSchema")
+        .expect("lean_verify should advertise an inputSchema");
+    assert!(
+        verify_schema.pointer("/properties/targets").is_some(),
+        "lean_verify inputSchema must advertise the target-group request shape: {verify_schema:?}"
+    );
+    assert!(
+        verify_schema.pointer("/properties/kind").is_none(),
+        "lean_verify has no public kind namespace and must not advertise the generic semantic schema: {verify_schema:?}"
+    );
 
     server.shutdown().await;
 }

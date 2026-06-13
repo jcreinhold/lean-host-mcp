@@ -68,10 +68,10 @@ impl LeanHostService {
     #[tool(description = "Verify Lean declarations from explicit, file_all, module_all, or changed target groups.")]
     async fn lean_verify(
         &self,
-        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
+        Parameters(req): Parameters<tools::proof_action::LeanVerifyRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_verify", "tool call");
-        self.respond_semantic(tools::semantic::lean_verify(&self.ctx, req).await)
+        self.respond_semantic(tools::semantic::lean_verify_targets(&self.ctx, req).await)
     }
 
     #[tool(
@@ -109,8 +109,9 @@ impl ServerHandler for LeanHostService {
         info.instructions = Some(
             "MCP server hosting Lean 4 in-process via lean-rs. \
              Tools expose five semantic Lean job families: context, trial, \
-             verification, lookup, and status. Select a mode with each tool's \
-             `kind` field."
+             verification, lookup, and status. Context, trial, lookup, and \
+             status select a mode with `kind`; verification takes explicit \
+             target groups."
                 .to_owned(),
         );
         info
