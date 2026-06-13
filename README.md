@@ -15,11 +15,12 @@ and launches the matching pre-built worker.
 Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups directly:
 
 - **`lean_context`** — proof context. Initial mode: `proof_position`.
-- **`lean_trial`** — non-mutating experiments. Initial mode: `proof_step`.
+- **`lean_trial`** — non-mutating experiments. Modes: `proof_step` and `command`.
 - **`lean_verify`** — declaration verification for explicit, file-wide, module-wide, or changed target groups.
 - **`lean_lookup`** — declaration inspection, declaration inventory, changed-diff coverage, proof search, and references.
   Initial modes: `declaration`, `declarations`, `changed_coverage`, `proof_search`, and `references`.
-- **`lean_status`** — cheap project/toolchain/config status that does not open a worker.
+- **`lean_status`** — project/toolchain/config status and current-source file diagnostics. Modes: `project` and
+  `file_diagnostics`.
 
 Every call is non-mutating: the server reads source and elaborates in memory, and never touches your files. The typical
 workflow and the request/result schema for each tool are in [`docs/tool-catalog.md`](docs/tool-catalog.md).

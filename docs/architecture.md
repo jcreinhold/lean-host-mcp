@@ -157,7 +157,7 @@ Proof tools share the same anchor shape:
 `proof_position` is intent-shaped:
 
 - `{"kind":"default"}` (or omitting the field) selects the pristine entry goal — the state before any tactic runs;
-  `lean_trial(kind = "proof_step")` splices before the first tactic there.
+  `lean_trial(kind = "proof_step")` splices tactic text before the first tactic there.
 - `{"kind":"index","index":N}` selects the state after the Nth tactic (`index:0` = after the first tactic).
 - `{"kind":"after_text","text":"...","occurrence":N}` selects a tactic/source fragment inside the declaration body.
 
@@ -174,6 +174,9 @@ operation modules:
 - `lean_trial(kind = "proof_step")` tries tactic fragments at the selected proof position in an in-memory overlay. It
   reports per-candidate status, diagnostics, resulting goals, and the resolved declaration/proof-position summary. It
   never writes source files.
+- `lean_trial(kind = "command")` runs bounded Lean command text such as `#check` or `#print axioms`, either under
+  explicit imports or after a current file source snapshot. Info messages become rendered output; warnings and errors
+  stay in diagnostics.
 - `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, module-wide, or changed
   declaration target groups under the requested sorry/axiom policy. Policy failures are normal results.
 - `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
@@ -191,6 +194,9 @@ operation modules:
 - `lean_status(kind = "project")` reports cheap project/toolchain/config status from Lake metadata and broker config. It
   accepts `include: ["toolchain", "worker", "artifacts"]`, derives only cheap filesystem facts, and does not run `lake`,
   open a worker, or consume a semantic permit.
+- `lean_status(kind = "file_diagnostics")` elaborates the current source snapshot for one file and returns bounded
+  diagnostics with edit-fresh source trust. It is not a replacement for `lake build`, `lake exe lint`, or project
+  linters.
 
 The semantic facade also owns the public trust block. Operation modules may attach typed artifact rows for
 proof-relevant freshness: source snapshots (`source` / `file` / `edit_fresh`), built Lean artifacts (`olean` or `ilean`
@@ -212,10 +218,11 @@ declaration, and lower-level Lean primitives stay private. Capabilities delibera
 proof-work tool that subsumes each, include:
 
 - low-level term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`) — composed inside
-  `lean_trial(kind = "proof_step")` and `lean_verify`;
+  `lean_trial(kind = "proof_step")`, `lean_trial(kind = "command")`, and `lean_verify`;
 - LSP-shaped declaration queries (`hover_by_name`, `type_of_name`, raw `search_declarations`) — folded into
   `lean_lookup(kind = "declaration")` and `lean_lookup(kind = "proof_search")`;
-- raw module-query access (`lean_query`) — driven internally by `lean_context(kind = "proof_position")`;
+- raw module-query access (`lean_query`) — driven internally by `lean_context(kind = "proof_position")`,
+  `lean_trial(kind = "command")`, and `lean_status(kind = "file_diagnostics")`;
 - text search and placement policy (`source_search`, `project_scan`, `mathlib_placement`);
 - split reference aliases (`references_in_file`, `references_in_project`) — unified under
   `lean_lookup(kind = "references")`.

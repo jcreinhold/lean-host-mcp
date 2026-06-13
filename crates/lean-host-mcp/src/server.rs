@@ -56,7 +56,7 @@ impl LeanHostService {
         self.respond_semantic(tools::semantic::lean_context(&self.ctx, req).await)
     }
 
-    #[tool(description = "Non-mutating Lean experiments. Use kind=\"proof_step\" to try proof snippets in memory.")]
+    #[tool(description = "Non-mutating Lean experiments. Kinds: proof_step, command.")]
     async fn lean_trial(
         &self,
         Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
@@ -85,13 +85,13 @@ impl LeanHostService {
         self.respond_semantic(tools::semantic::lean_lookup(&self.ctx, req).await)
     }
 
-    #[tool(description = "Cheap project, toolchain, and host status. Does not open a Lean worker.")]
+    #[tool(description = "Project/toolchain status and source diagnostics. Kinds: project, file_diagnostics.")]
     async fn lean_status(
         &self,
         Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_status", "tool call");
-        self.respond_semantic(tools::semantic::lean_status(&self.ctx, req))
+        self.respond_semantic(tools::semantic::lean_status(&self.ctx, req).await)
     }
 }
 

@@ -139,6 +139,37 @@ Use `snippets` to try a bounded list independently:
 The response reports each candidate's status, diagnostics, resulting goals, and
 whether the candidate set was truncated.
 
+### `kind: "command"`
+
+Runs bounded Lean command text as a non-mutating trial. Use it for import-context
+snippets such as `#check` and `#print axioms`; it is not a replacement for
+project-wide shell workflows.
+
+Explicit imports:
+
+```json
+{
+  "kind": "command",
+  "imports": ["Init"],
+  "commands": "#check Nat.add\n#print axioms Nat.add_assoc"
+}
+```
+
+File-derived context prepends the current source snapshot before the command
+text, so declarations in that file are visible to later commands:
+
+```json
+{
+  "kind": "command",
+  "file": "LeanRsFixture/ProofActions.lean",
+  "commands": "#check LeanRsFixture.ProofActions.closedTheorem"
+}
+```
+
+Info-level command messages are collected into `output.value`; errors and
+warnings remain in the bounded diagnostics block. Invalid command snippets are
+normal results with diagnostics, not MCP transport failures.
+
 ## `lean_verify`
 
 Verifies declarations in memory. Targets can be explicit declaration lists,
@@ -409,6 +440,23 @@ Use `include` to request cheap status sections. The default is all sections:
 and does not open a worker. When the project build tree is absent it reports `olean` and `ilean` `missing_build` facts;
 when the build tree exists but no semantic query has checked source mtimes it reports artifact freshness as `unknown`.
 Worker runtime generation is likewise `not_applicable` because this status mode deliberately avoids opening a worker.
+
+### `kind: "file_diagnostics"`
+
+Elaborates the current source snapshot and returns the same bounded diagnostics
+block shape used by proof context. This surfaces Lean diagnostics and linter
+messages produced while elaborating the file; it does not run `lake build`,
+`lake exe lint`, or other external project-specific lint commands.
+
+```json
+{
+  "kind": "file_diagnostics",
+  "file": "LeanRsFixture/ProofActions.lean"
+}
+```
+
+The result includes `diagnostics` and the header `imports` used for the worker
+session, with a source `edit_fresh` trust fact for the file snapshot.
 
 ## Maintainer Migration Table
 

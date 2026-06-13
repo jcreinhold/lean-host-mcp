@@ -27,6 +27,7 @@ use crate::error::{Result, ServerError};
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
 use crate::tools::source_input::{header_imports, read_query_file, resolve_path};
 use crate::tools::{ToolContext, session_imports};
+use crate::trust::{ArtifactKind, ArtifactTrust, TrustScope, TrustStatus};
 
 /// Hard cap on project-wide reference aggregation. File-local reference
 /// queries are also bounded by the upstream projection.
@@ -81,6 +82,44 @@ pub struct DiagnosticsBlock {
     pub summary: DiagnosticSummary,
     pub diagnostics: Vec<Diagnostic>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CommandTrialRequest {
+    /// Optional file whose current source snapshot is prepended before
+    /// `commands`; its header imports become the session imports.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+    /// Explicit imports when `file` is omitted.
+    #[serde(default)]
+    pub imports: Vec<String>,
+    /// Lean command text, such as `#check Nat.add`.
+    pub commands: String,
+    /// Project-root override; defaults to the server's configured Lake project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CommandTrialResult {
+    pub output: RenderedText,
+    pub diagnostics: DiagnosticsBlock,
+    pub imports: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FileDiagnosticsRequest {
+    /// Path to a `.lean` file; relative paths resolve against the project root.
+    pub file: PathBuf,
+    /// Project-root override; defaults to the server's configured Lake project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct FileDiagnosticsResult {
+    pub diagnostics: DiagnosticsBlock,
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -530,6 +569,271 @@ fn needs_build_context(message: String) -> ProofStateResult {
         budget_exceeded: Vec::new(),
         // No query ran on this degrade path, so there are no facts to report.
         query_facts: None,
+    }
+}
+
+/// Run bounded Lean command text as a non-mutating trial.
+///
+/// # Errors
+///
+/// Returns infrastructure failures only. Invalid Lean commands are returned as
+/// diagnostics in the result.
+pub async fn command_trial(ctx: &ToolContext, req: CommandTrialRequest) -> Result<Response<CommandTrialResult>> {
+    let hint = ProjectHint::from_request(req.project.clone());
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let commands = req.commands.trim();
+    if commands.is_empty() {
+        let base = ctx.broker.project_identity_without_worker(&hint, req.imports.clone())?;
+        return Ok(
+            Response::ok(command_result(empty_diagnostics(), req.imports), base.freshness)
+                .with_runtime(base.runtime)
+                .with_trust_artifact(source_not_applicable())
+                .warn("lean_trial command mode requires non-empty `commands`"),
+        );
+    }
+
+    let (source, imports, source_fact, file_label) = match req.file {
+        Some(file) => {
+            let input = read_query_file(&meta.canonical_root, &file)?;
+            let label = input.resolved.to_string_lossy().into_owned();
+            (
+                format!("{}\n\n{commands}\n", input.source),
+                input.imports,
+                ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved),
+                label,
+            )
+        }
+        None => (
+            format!("{commands}\n"),
+            req.imports,
+            source_not_applicable(),
+            "<lean_trial command>".to_owned(),
+        ),
+    };
+    let selectors = vec![LeanWorkerModuleQuerySelector::Diagnostics {
+        id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
+    }];
+    let call = match crate::diagnosis::classify_missing_olean(
+        ctx.broker
+            .process_module_query_batch(
+                hint.clone(),
+                session_imports(imports.clone()),
+                imports.clone(),
+                source,
+                selectors,
+                proof_agent_budgets(),
+                LeanWorkerElabOptions::new().file_label(&file_label),
+            )
+            .await,
+    )? {
+        crate::diagnosis::CallOutcome::Ready(call) => call,
+        crate::diagnosis::CallOutcome::NeedsBuild(err) => {
+            return command_needs_build_response(ctx, hint, imports, source_fact, err);
+        }
+    };
+    let (block, missing_imports) = diagnostics_from_batch_outcome(call.value);
+    let mut response = Response::ok(command_result(block, imports), call.freshness)
+        .with_runtime(call.runtime)
+        .with_trust_artifact(source_fact);
+    if let Some(event) = response.runtime().and_then(crate::diagnosis::execution_taint).cloned() {
+        response = crate::diagnosis::warn_execution_taint(response, &event);
+    }
+    Ok(warn_command_missing_imports(response, missing_imports))
+}
+
+/// Return diagnostics for a current source-file snapshot.
+///
+/// # Errors
+///
+/// Returns infrastructure failures only. Lean diagnostics are result data.
+pub async fn file_diagnostics(
+    ctx: &ToolContext,
+    req: FileDiagnosticsRequest,
+) -> Result<Response<FileDiagnosticsResult>> {
+    let hint = ProjectHint::from_request(req.project.clone());
+    let meta = ctx.broker.resolve_meta(&hint)?;
+    let input = read_query_file(&meta.canonical_root, &req.file)?;
+    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved);
+    let file_label = input.resolved.to_string_lossy().into_owned();
+    let imports = input.imports.clone();
+    let selectors = vec![LeanWorkerModuleQuerySelector::Diagnostics {
+        id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
+    }];
+    let call = match crate::diagnosis::classify_missing_olean(
+        ctx.broker
+            .process_cached_module_query_batch(
+                hint.clone(),
+                input.resolved,
+                input.hash,
+                session_imports(imports.clone()),
+                imports.clone(),
+                input.source,
+                selectors,
+                proof_agent_budgets(),
+                LeanWorkerElabOptions::new().file_label(&file_label),
+            )
+            .await,
+    )? {
+        crate::diagnosis::CallOutcome::Ready(call) => call,
+        crate::diagnosis::CallOutcome::NeedsBuild(err) => {
+            return file_diagnostics_needs_build_response(ctx, hint, imports, source_fact, err);
+        }
+    };
+    let (block, missing_imports) = diagnostics_from_batch_outcome(call.value);
+    let mut response = Response::ok(
+        FileDiagnosticsResult {
+            diagnostics: block,
+            imports,
+        },
+        call.freshness,
+    )
+    .with_runtime(call.runtime)
+    .with_trust_artifact(source_fact);
+    if let Some(event) = response.runtime().and_then(crate::diagnosis::execution_taint).cloned() {
+        response = crate::diagnosis::warn_execution_taint(response, &event);
+    }
+    Ok(warn_file_diagnostics_missing_imports(response, missing_imports))
+}
+
+fn command_needs_build_response(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    imports: Vec<String>,
+    source_fact: ArtifactTrust,
+    err: ServerError,
+) -> Result<Response<CommandTrialResult>> {
+    let base = ctx.broker.project_identity_without_worker(&hint, imports.clone())?;
+    let response = Response::ok(command_result(empty_diagnostics(), imports), base.freshness)
+        .with_runtime(base.runtime)
+        .with_trust_artifact(source_fact);
+    Ok(crate::diagnosis::warn_needs_build(
+        response,
+        &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+    ))
+}
+
+fn file_diagnostics_needs_build_response(
+    ctx: &ToolContext,
+    hint: ProjectHint,
+    imports: Vec<String>,
+    source_fact: ArtifactTrust,
+    err: ServerError,
+) -> Result<Response<FileDiagnosticsResult>> {
+    let base = ctx.broker.project_identity_without_worker(&hint, imports.clone())?;
+    let response = Response::ok(
+        FileDiagnosticsResult {
+            diagnostics: empty_diagnostics(),
+            imports,
+        },
+        base.freshness,
+    )
+    .with_runtime(base.runtime)
+    .with_trust_artifact(source_fact);
+    Ok(crate::diagnosis::warn_needs_build(
+        response,
+        &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+    ))
+}
+
+fn diagnostics_from_batch_outcome(outcome: LeanWorkerModuleQueryBatchOutcome) -> (DiagnosticsBlock, Vec<String>) {
+    match route_batch_outcome(outcome) {
+        BatchQueryRun::Ready {
+            result,
+            missing_imports,
+            ..
+        } => (
+            result
+                .items
+                .into_iter()
+                .find_map(|item| match project_batch_item(item, None) {
+                    ProjectedBatchItem::Ok {
+                        result: BatchProjection::Diagnostics(block),
+                        ..
+                    } => Some(block),
+                    ProjectedBatchItem::Ok {
+                        result:
+                            BatchProjection::ProofState(_)
+                            | BatchProjection::TypeAt(_)
+                            | BatchProjection::References(_)
+                            | BatchProjection::DeclarationTarget(_)
+                            | BatchProjection::SurroundingDeclaration(_),
+                        ..
+                    }
+                    | ProjectedBatchItem::Unavailable { .. }
+                    | ProjectedBatchItem::BudgetExceeded { .. } => None,
+                })
+                .unwrap_or_else(empty_diagnostics),
+            missing_imports,
+        ),
+        BatchQueryRun::HeaderParseFailed { diagnostics, .. } => (diagnostics_block(diagnostics), Vec::new()),
+        BatchQueryRun::Unsupported => (empty_diagnostics(), Vec::new()),
+    }
+}
+
+fn command_result(block: DiagnosticsBlock, imports: Vec<String>) -> CommandTrialResult {
+    let info_messages = block
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| matches!(diagnostic.severity, Severity::Info))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    let output = RenderedText {
+        value: info_messages.join("\n"),
+        truncated: block.truncated,
+    };
+    CommandTrialResult {
+        output,
+        diagnostics: DiagnosticsBlock {
+            summary: block.summary,
+            diagnostics: block
+                .diagnostics
+                .into_iter()
+                .filter(|diagnostic| !matches!(diagnostic.severity, Severity::Info))
+                .collect(),
+            truncated: block.truncated,
+        },
+        imports,
+    }
+}
+
+fn empty_diagnostics() -> DiagnosticsBlock {
+    DiagnosticsBlock {
+        summary: DiagnosticSummary::default(),
+        diagnostics: Vec::new(),
+        truncated: false,
+    }
+}
+
+fn source_not_applicable() -> ArtifactTrust {
+    ArtifactTrust::new(ArtifactKind::Source, TrustScope::Project, TrustStatus::NotApplicable)
+        .detail("command trial used explicit imports and no source file snapshot")
+}
+
+fn warn_command_missing_imports(
+    response: Response<CommandTrialResult>,
+    missing_imports: Vec<String>,
+) -> Response<CommandTrialResult> {
+    if missing_imports.is_empty() {
+        response
+    } else {
+        crate::diagnosis::warn_needs_build(
+            response,
+            &crate::diagnosis::IncompleteCause::MissingImports(missing_imports),
+        )
+    }
+}
+
+fn warn_file_diagnostics_missing_imports(
+    response: Response<FileDiagnosticsResult>,
+    missing_imports: Vec<String>,
+) -> Response<FileDiagnosticsResult> {
+    if missing_imports.is_empty() {
+        response
+    } else {
+        crate::diagnosis::warn_needs_build(
+            response,
+            &crate::diagnosis::IncompleteCause::MissingImports(missing_imports),
+        )
     }
 }
 
@@ -1390,10 +1694,11 @@ mod tests {
     use super::{
         BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, FindReferencesRequest, LeanWorkerProofPositionSelector,
         ProofPositionSelector, ProofStateRequest, ProofStateResult, ReferenceScope, RenderedText, cache_status_label,
-        expert_query_budgets, find_references_in_project, needs_build_context, project_query_facts,
+        command_result, expert_query_budgets, find_references_in_project, needs_build_context, project_query_facts,
         proof_agent_budgets, reference_query_budgets, route_batch_outcome, worker_proof_position,
     };
     use crate::envelope::{Freshness, RuntimeFacts};
+    use crate::projections::{Diagnostic, Severity};
     use crate::tools::source_input::{header_imports, read_query_file};
     use crate::trust::{ArtifactKind, TrustScope, TrustStatus};
 
@@ -1411,6 +1716,69 @@ mod tests {
             cache_approx_bytes: Some(4096),
             resource: None,
         }
+    }
+
+    #[test]
+    fn lean_trial_command_result_splits_info_output_from_diagnostics() {
+        let result = command_result(
+            DiagnosticsBlock {
+                summary: DiagnosticSummary {
+                    errors: 1,
+                    warnings: 0,
+                    info: 1,
+                },
+                diagnostics: vec![
+                    Diagnostic {
+                        severity: Severity::Info,
+                        message: "Nat.add : Nat -> Nat -> Nat".to_owned(),
+                        position: None,
+                        file: None,
+                    },
+                    Diagnostic {
+                        severity: Severity::Error,
+                        message: "unknown identifier `missing`".to_owned(),
+                        position: None,
+                        file: None,
+                    },
+                ],
+                truncated: false,
+            },
+            vec!["Init".to_owned()],
+        );
+
+        assert!(result.output.value.contains("Nat.add"));
+        assert_eq!(result.diagnostics.summary.errors, 1);
+        assert_eq!(result.diagnostics.summary.info, 1);
+        assert_eq!(result.diagnostics.diagnostics.len(), 1);
+        assert_eq!(result.imports, ["Init"]);
+    }
+
+    #[test]
+    fn lean_status_diagnostics_summary_counts_severities() {
+        let summary = DiagnosticSummary::from_diagnostics(&[
+            Diagnostic {
+                severity: Severity::Error,
+                message: "error".to_owned(),
+                position: None,
+                file: None,
+            },
+            Diagnostic {
+                severity: Severity::Warning,
+                message: "warning".to_owned(),
+                position: None,
+                file: None,
+            },
+            Diagnostic {
+                severity: Severity::Info,
+                message: "info".to_owned(),
+                position: None,
+                file: None,
+            },
+        ]);
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.warnings, 1);
+        assert_eq!(summary.info, 1);
     }
 
     fn freshness(root: &std::path::Path) -> Freshness {

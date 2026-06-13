@@ -25,7 +25,7 @@ use lean_host_mcp::tools::proof_action::{
 };
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
 use lean_host_mcp::tools::semantic::{
-    SemanticResponse, SemanticToolRequest, lean_context, lean_lookup, lean_trial, lean_verify,
+    SemanticResponse, SemanticToolRequest, lean_context, lean_lookup, lean_status, lean_trial, lean_verify,
 };
 use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
@@ -760,6 +760,123 @@ async fn lean_verify_changed_targets_and_changed_coverage_report_gaps() {
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|unknown| unknown > 0),
         "changed verification should preserve unknown coverage gaps: {verify:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn lean_trial_command_and_lean_status_file_diagnostics() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let command = semantic_data(
+        lean_trial(
+            &ctx,
+            semantic_request(
+                "command",
+                serde_json::json!({
+                    "imports": ["Init"],
+                    "commands": "#check Nat.add\n#print axioms Nat.add_assoc"
+                }),
+            ),
+        )
+        .await
+        .expect("lean_trial command explicit imports"),
+    );
+    assert!(
+        command
+            .pointer("/output/value")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|output| output.contains("Nat.add") && output.contains("Nat.add_assoc")),
+        "command output should contain #check and #print axioms messages: {command:?}"
+    );
+    assert_eq!(
+        command
+            .pointer("/diagnostics/summary/errors")
+            .and_then(serde_json::Value::as_u64),
+        Some(0)
+    );
+
+    let file_command = semantic_data(
+        lean_trial(
+            &ctx,
+            semantic_request(
+                "command",
+                serde_json::json!({
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "commands": "#check LeanRsFixture.ProofActions.closedTheorem"
+                }),
+            ),
+        )
+        .await
+        .expect("lean_trial command file imports"),
+    );
+    assert!(
+        file_command
+            .pointer("/output/value")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|output| output.contains("closedTheorem")),
+        "file-derived command should see declarations from the current source: {file_command:?}"
+    );
+
+    let invalid = semantic_data(
+        lean_trial(
+            &ctx,
+            semantic_request(
+                "command",
+                serde_json::json!({
+                    "imports": ["Init"],
+                    "commands": "#check definitelyMissingCommandMessage"
+                }),
+            ),
+        )
+        .await
+        .expect("lean_trial invalid command"),
+    );
+    assert!(
+        invalid
+            .pointer("/diagnostics/summary/errors")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|errors| errors > 0),
+        "invalid command should return diagnostics, not fail transport: {invalid:?}"
+    );
+
+    let tmp = tempfile::tempdir().expect("temp fixture copy");
+    let work = tmp.path().join("fixture");
+    copy_dir_recursive(&root, &work);
+    let proof_actions = work.join("LeanRsFixture/ProofActions.lean");
+    let edited =
+        fs::read_to_string(&proof_actions).expect("read proof actions") + "\n#check definitelyMissingFileDiagnostic\n";
+    fs::write(&proof_actions, edited).expect("write diagnostics edit");
+    let ctx = open_ctx(&work);
+    let diagnostics = lean_status(
+        &ctx,
+        semantic_request(
+            "file_diagnostics",
+            serde_json::json!({
+                "file": "LeanRsFixture/ProofActions.lean"
+            }),
+        ),
+    )
+    .await
+    .expect("lean_status file diagnostics");
+    assert!(
+        diagnostics.trust.artifacts.iter().any(|artifact| {
+            artifact.artifact == lean_host_mcp::ArtifactKind::Source
+                && artifact.status == lean_host_mcp::TrustStatus::EditFresh
+        }),
+        "file diagnostics should report source edit-fresh trust: {:?}",
+        diagnostics.trust.artifacts
+    );
+    let diagnostics = semantic_data(diagnostics);
+    assert!(
+        diagnostics
+            .pointer("/diagnostics/summary/errors")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|errors| errors > 0),
+        "file diagnostics should report current-source errors: {diagnostics:?}"
     );
 }
 

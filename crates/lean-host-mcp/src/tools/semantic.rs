@@ -21,7 +21,7 @@ use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus};
 use super::changed_coverage::{self, ChangedCoverageRequest};
 use super::declaration::{self, InspectDeclarationRequest};
 use super::declaration_inventory::{self, DeclarationInventoryRequest};
-use super::position::{self, FindReferencesRequest, ProofStateRequest};
+use super::position::{self, CommandTrialRequest, FileDiagnosticsRequest, FindReferencesRequest, ProofStateRequest};
 use super::proof_action::{self, LeanVerifyRequest, TryProofStepRequest};
 use super::proof_search::{self, SearchForProofRequest};
 
@@ -175,7 +175,7 @@ pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result
     }
 }
 
-/// Non-mutating Lean experiments. Initial public mode: `proof_step`.
+/// Non-mutating Lean experiments.
 ///
 /// # Errors
 ///
@@ -190,8 +190,15 @@ pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<S
             };
             from_tool_response(proof_action::try_proof_step(ctx, request).await?, ctx.config.verbosity)
         }
-        Some(kind) => Ok(invalid_kind("lean_trial", kind, &["proof_step"])),
-        None => Ok(missing_kind("lean_trial", &["proof_step"])),
+        Some("command") => {
+            let request = match decode::<CommandTrialRequest>(req) {
+                Ok(request) => request,
+                Err(response) => return Ok(*response),
+            };
+            from_tool_response(position::command_trial(ctx, request).await?, ctx.config.verbosity)
+        }
+        Some(kind) => Ok(invalid_kind("lean_trial", kind, &["proof_step", "command"])),
+        None => Ok(missing_kind("lean_trial", &["proof_step", "command"])),
     }
 }
 
@@ -302,7 +309,7 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 ///
 /// Returns Lake-project resolution failures. Invalid semantic modes are
 /// returned as structured semantic errors.
-pub fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
+pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
     let kind = req.kind().unwrap_or("project").to_owned();
     match kind.as_str() {
         "project" => {
@@ -355,7 +362,14 @@ pub fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<Semant
                 trust,
             })
         }
-        other => Ok(invalid_kind("lean_status", other, &["project"])),
+        "file_diagnostics" => {
+            let request = match decode::<FileDiagnosticsRequest>(req) {
+                Ok(request) => request,
+                Err(response) => return Ok(*response),
+            };
+            from_tool_response(position::file_diagnostics(ctx, request).await?, ctx.config.verbosity)
+        }
+        other => Ok(invalid_kind("lean_status", other, &["project", "file_diagnostics"])),
     }
 }
 
@@ -585,6 +599,7 @@ mod tests {
                 )]),
             },
         )
+        .await
         .unwrap();
 
         assert!(response.errors.is_empty());
