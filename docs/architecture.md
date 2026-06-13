@@ -6,16 +6,17 @@
 `lean-host-mcp` is a thin MCP server over `lean-rs-worker`. The design thesis is a **declaration-centric** public API:
 agents name a declaration and, when needed, a proof position inside it — never cursor coordinates, source spans, byte
 offsets, or replacement ranges. The host translates those names into bounded, read-only semantic jobs against a
-supervised worker child, and projects the worker's results into one stable response envelope.
+supervised worker child, and projects the worker's results into one stable semantic response shape.
 
 The model-facing tools are:
 
 ```text
-proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> verify_declaration
+lean_context -> lean_lookup -> lean_trial -> lean_verify
+                         \-> lean_status
 ```
 
-`find_references` is the bounded semantic support tool. Text grep, Mathlib placement policy, raw hover/type queries, and
-low-level term/meta primitives are not part of the public MCP surface.
+`lean_lookup` owns declaration inspection, proof search, and semantic references. Text grep, Mathlib placement policy,
+raw hover/type queries, and low-level term/meta primitives are not part of the public MCP surface.
 
 ## Crate Layout
 
@@ -26,11 +27,11 @@ crates/lean-host-mcp/src/
   server.rs         LeanHostService tool registration
   broker.rs         ProjectBroker: LRU pool, idle eviction, per-call routing
   project.rs        LeanProject serialized controller for one Lake project
-  tools/            declaration.rs, proof_search.rs, proof_action.rs, position.rs
+  tools/            semantic.rs facade; declaration/proof_search/proof_action/position internals
   projections.rs    stable MCP projections from lean-rs worker types
   lake_meta.rs      minimal Lake-project metadata
   cache.rs          small LRU for bounded reference queries
-  envelope.rs       Response<T> = { status, result, runtime_error, freshness, telemetry?, warnings, next_actions }
+  envelope.rs       internal operation envelope adapted to { data, errors, trust } at the public boundary
 
 crates/lean-host-mcp-worker/src/
   main.rs           worker child: lean_rs_worker_child::run_worker_child_stdio()
@@ -52,9 +53,8 @@ single Streamable HTTP server for that run. HTTP sessions are independent rmcp s
 process-wide semantic permit gate, bounded project queue, RSS policy, and worker lifecycle presentation.
 
 Runtime pressure is not a transport error. Admission pressure, mailbox pressure, worker death, session loss, and restart
-recovery continue to surface through the normal tool response envelope as `status = "runtime_unavailable"` with
-structured runtime metadata. HTTP status codes are reserved for transport/protocol failures such as invalid headers or
-bad HTTP paths.
+recovery continue to surface through the semantic response `errors` channel with structured runtime metadata. HTTP
+status codes are reserved for transport/protocol failures such as invalid headers or bad HTTP paths.
 
 ## Project And Worker Boundary
 
@@ -70,7 +70,7 @@ The broker also owns a process-wide semantic permit gate, defaulting to one perm
 serialized unless the deployment explicitly raises `LEAN_HOST_MCP_SEMANTIC_PERMITS`. The same gate is backed by
 per-user advisory lock files, so parallel server processes that share `broker.semantic_lock_dir` share one permit pool.
 Any path that can open or run a worker must pass through `admit_project`; degraded responses and pure `.ilean` reads use
-`project_identity_without_worker` so they can fill envelope identity without spawning. A full project queue is a
+`project_identity_without_worker` so they can fill semantic trust identity without spawning. A full project queue is a
 structured retryable infrastructure error rather than unbounded memory growth.
 
 The controller samples worker RSS before import-profile switches. If the worker is above the configured soft threshold,
@@ -83,9 +83,9 @@ recovery and lifecycle history.
 
 Each semantic tool opens a short-lived worker session with imports derived from the source header or explicit request.
 Lean-domain failures such as parse errors, elaboration diagnostics, missing imports, unsupported shim exports, failed
-proof snippets, and sorry policy failures are structured tool results. Recoverable runtime failures are
-`runtime_unavailable` tool responses. MCP errors are reserved for invalid requests, I/O/config failures, internal
-invariants, and unusable Lake projects.
+proof snippets, and sorry policy failures are structured tool data. Recoverable runtime failures are semantic `errors`
+with `code: "runtime_unavailable"`. MCP errors are reserved for I/O/config failures, internal invariants, and unusable
+Lake projects.
 
 The core capabilities the worker exercises across that boundary are the `lean_rs_host_*` symbols (28 mandatory, 6
 optional) that ship inside `lean-rs-host` as a vendored Lake package. The semantic proof-search lane uses the same
@@ -119,9 +119,9 @@ recorded runtime smoke result. The verdicts:
 
 `project.rs` maps the hard verdicts to one typed `ServerError::BadProject` sentence carrying the corrective command;
 `UnknownPin` and the soft `Ready` note ride along as project-lifetime advisories that `LeanProject::freshness` attaches
-and `server::wrap` drains into the top-level envelope `warnings`. Those advisories are also carried on
-`WorkerUnavailable`, so a worker that dies mid-call surfaces them on the `runtime_unavailable` envelope rather than
-dropping them exactly when a suspect worker is most worth flagging. `install-worker` consults only the pure
+and the semantic facade drains into warning issues. Those advisories are also carried on `WorkerUnavailable`, so a worker
+that dies mid-call surfaces them in `errors` rather than dropping them exactly when a suspect worker is most worth
+flagging. `install-worker` consults only the pure
 `ToolchainId::window_verdict` *before* its multi-minute build, refusing an out-of-window pin and warning on an unknown
 one. The digest is hashed once on the cold open/resolve path; the warm broker-reuse path (manifest-hash + health check)
 never re-hashes.
@@ -157,7 +157,7 @@ Proof tools share the same anchor shape:
 `proof_position` is intent-shaped:
 
 - `{"kind":"default"}` (or omitting the field) selects the pristine entry goal — the state before any tactic runs;
-  `try_proof_step` splices before the first tactic there.
+  `lean_trial(kind = "proof_step")` splices before the first tactic there.
 - `{"kind":"index","index":N}` selects the state after the Nth tactic (`index:0` = after the first tactic).
 - `{"kind":"after_text","text":"...","occurrence":N}` selects a tactic/source fragment inside the declaration body.
 
@@ -166,41 +166,32 @@ overlay insertion, and diagnostic-locality classification stay below the worker 
 
 ## Tool Semantics
 
-`proof_state` returns the current goals, locals, expected type, diagnostics, cache status, and timing facts for one
-declaration proof position.
+`tools::semantic` is the public facade. It exposes five MCP tools and routes each `kind` mode to the existing typed
+operation modules:
 
-`search_for_proof` builds a small target profile from `proof_state` or explicit goal/type text, then tries a private
-source-backed `lean-semantic-search` lane before falling back to bounded lean-rs declaration search. The MCP request and
-response schema stay unchanged: semantic feature rows, export names, opaque keys, retrieval policy internals, and cache
-paths never cross the public boundary. The project actor builds/loads `lean-semantic-search` through the package-owned
-runtime crate, points the session import root at the consumer Lake project, and imports only the consumer modules
-requested by the tool call. Declaration feature extraction is build-fresh: it imports the selected consumer modules from
-their built `.olean` closure. Proof-goal feature extraction is edit-fresh: it elaborates the current source text
-supplied by the tool. `lean-rs` only supplies the generic split-root worker capability substrate for those typed JSON
-commands.
+- `lean_context(kind = "proof_position")` returns the current goals, locals, expected type, diagnostics, cache status,
+  and timing facts for one declaration proof position.
+- `lean_trial(kind = "proof_step")` tries tactic fragments at the selected proof position in an in-memory overlay. It
+  reports per-candidate status, diagnostics, resulting goals, and the resolved declaration/proof-position summary. It
+  never writes source files.
+- `lean_verify(kind = "explicit")` elaborates the in-memory source snapshot and checks one declaration under the
+  requested sorry/axiom policy. Policy failures are normal results.
+- `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
+  project declarations can resolve. Rendered fields are capped before crossing the worker boundary.
+- `lean_lookup(kind = "proof_search")` builds a small target profile from proof context or explicit goal/type text, then
+  tries a private source-backed `lean-semantic-search` lane before falling back to bounded lean-rs declaration search.
+- `lean_lookup(kind = "references")` runs semantic reference lookup for a fully-qualified name in file or bounded project
+  scope. File scope elaborates one anchor file through the worker; project scope reads Lean's on-disk `.ilean` reference
+  index and does not open a worker.
+- `lean_status(kind = "project")` reports cheap project/toolchain/config status from Lake metadata and broker config. It
+  does not open a worker or consume a semantic permit.
 
-`lean-semantic-search` owns feature extraction and storage-neutral retrieval. `lean-host-mcp` owns proof-agent
-admission, fallback, response shaping, and proof-specific boosts such as exact target, project-local, namespace/module,
-and selective conclusion evidence. Broad head-only semantic matches are diagnostic signal, not candidate-admission
-evidence. If the consumer `.olean` closure is missing or stale, the tool returns the same structured fallback/runtime
-behavior and `lake build` guidance rather than changing MCP transport errors.
+The rejected alternative was a single GraphQL-like `lean_query` tool with nested selections. It would make tool
+registration smaller, but it pushes mode discovery and validation into one large request grammar. The five-tool facade is
+clearer for agents: each tool name is a job family, and `kind` selects one stable mode inside that family.
 
-`inspect_declaration` inspects exactly one declaration by name. Optional `file` input is used only to derive local
-imports so project declarations can resolve. Rendered fields are capped before crossing the worker boundary and carry
-their own truncation flags.
-
-`try_proof_step` tries tactic fragments at the selected proof position in an in-memory overlay. It reports per-candidate
-status, local diagnostics, downstream diagnostics, resulting goals, and the resolved declaration/proof-position summary.
-It never writes source files.
-
-`verify_declaration` elaborates the in-memory source snapshot and checks one declaration under the requested sorry/axiom
-policy. Policy failures are normal results.
-
-`find_references` runs semantic reference lookup for a fully-qualified name in file or bounded project scope. File scope
-elaborates the one anchor file through the worker; project scope reads Lean's on-disk `.ilean` reference index instead
-of re-elaborating, so it answers in milliseconds with no worker query (see
-[the `.ilean` reader](ilean-reference-index.md)). Project scope reports scanned/skipped files, header failures, missing
-imports, unsupported files, and truncation.
+The internal operation names remain in source because they describe narrower implementation jobs. They are not public MCP
+registrations.
 
 ## Scope Boundary
 
@@ -209,12 +200,13 @@ declaration, and lower-level Lean primitives stay private. Capabilities delibera
 proof-work tool that subsumes each, include:
 
 - low-level term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`) — composed inside
-  `try_proof_step` and `verify_declaration`;
+  `lean_trial(kind = "proof_step")` and `lean_verify(kind = "explicit")`;
 - LSP-shaped declaration queries (`hover_by_name`, `type_of_name`, raw `search_declarations`) — folded into
-  `inspect_declaration` and `search_for_proof`;
-- raw module-query access (`lean_query`) — driven internally by `proof_state`;
+  `lean_lookup(kind = "declaration")` and `lean_lookup(kind = "proof_search")`;
+- raw module-query access (`lean_query`) — driven internally by `lean_context(kind = "proof_position")`;
 - text search and placement policy (`source_search`, `project_scan`, `mathlib_placement`);
-- split reference aliases (`references_in_file`, `references_in_project`) — unified under `find_references`.
+- split reference aliases (`references_in_file`, `references_in_project`) — unified under
+  `lean_lookup(kind = "references")`.
 
 When one of these is needed to implement a deeper tool, keep it private and compose it inside the host or worker. A need
 to expose it directly is treated as evidence that a better proof-work abstraction is missing.

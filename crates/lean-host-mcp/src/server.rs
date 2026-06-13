@@ -3,7 +3,7 @@
 //!
 //! Each `#[tool]` handler is a thin call into the implementation function;
 //! all real work happens in `crate::tools` and `crate::project`. Handlers
-//! return a hand-built [`CallToolResult`] rather than `Json<Response<T>>`: the
+//! return a hand-built [`CallToolResult`] rather than `Json<T>`: the
 //! `Json` wrapper makes rmcp advertise a deep `outputSchema` that no Anthropic
 //! API client forwards to the model (it costs only wire bytes and breaks strict
 //! schema validators), so we drop it and place the serialized envelope per the
@@ -17,7 +17,6 @@ use rmcp::model::{CallToolResult, Content, Implementation, ProtocolVersion, Serv
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::broker::ProjectBroker;
-use crate::envelope::Response;
 use crate::error::ServerError;
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
@@ -46,58 +45,51 @@ impl LeanHostService {
 
 #[tool_router]
 impl LeanHostService {
-    #[tool(description = "Inspect one Lean declaration by name.")]
-    async fn inspect_declaration(
+    #[tool(
+        description = "Lean proof or term context. Use kind=\"proof_position\" for proof state at a declaration position."
+    )]
+    async fn lean_context(
         &self,
-        Parameters(req): Parameters<tools::declaration::InspectDeclarationRequest>,
+        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "inspect_declaration", "tool call");
-        self.respond(tools::declaration::inspect_declaration(&self.ctx, req).await)
+        tracing::debug!(tool = "lean_context", "tool call");
+        self.respond_semantic(tools::semantic::lean_context(&self.ctx, req).await)
     }
 
-    #[tool(description = "Return ranked declarations for the next proof step.")]
-    async fn search_for_proof(
+    #[tool(description = "Non-mutating Lean experiments. Use kind=\"proof_step\" to try proof snippets in memory.")]
+    async fn lean_trial(
         &self,
-        Parameters(req): Parameters<tools::proof_search::SearchForProofRequest>,
+        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "search_for_proof", "tool call");
-        self.respond(tools::proof_search::search_for_proof(&self.ctx, req).await)
+        tracing::debug!(tool = "lean_trial", "tool call");
+        self.respond_semantic(tools::semantic::lean_trial(&self.ctx, req).await)
     }
 
-    #[tool(description = "Try proof snippets in memory. Never writes files.")]
-    async fn try_proof_step(
+    #[tool(description = "Verify Lean declarations. Use kind=\"explicit\" for one named declaration in one file.")]
+    async fn lean_verify(
         &self,
-        Parameters(req): Parameters<tools::proof_action::TryProofStepRequest>,
+        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "try_proof_step", "tool call");
-        self.respond(tools::proof_action::try_proof_step(&self.ctx, req).await)
+        tracing::debug!(tool = "lean_verify", "tool call");
+        self.respond_semantic(tools::semantic::lean_verify(&self.ctx, req).await)
     }
 
-    #[tool(description = "Verify one declaration in memory. Never writes files.")]
-    async fn verify_declaration(
+    #[tool(description = "Semantic lookup. Kinds: declaration, proof_search, references.")]
+    async fn lean_lookup(
         &self,
-        Parameters(req): Parameters<tools::proof_action::VerifyDeclarationRequest>,
+        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "verify_declaration", "tool call");
-        self.respond(tools::proof_action::verify_declaration(&self.ctx, req).await)
+        tracing::debug!(tool = "lean_lookup", "tool call");
+        self.respond_semantic(tools::semantic::lean_lookup(&self.ctx, req).await)
     }
 
-    #[tool(description = "Proof context for a declaration proof position.")]
-    async fn proof_state(
+    #[tool(description = "Cheap project, toolchain, and host status. Does not open a Lean worker.")]
+    async fn lean_status(
         &self,
-        Parameters(req): Parameters<tools::position::ProofStateRequest>,
+        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "proof_state", "tool call");
-        self.respond(tools::position::proof_state(&self.ctx, req).await)
-    }
-
-    #[tool(description = "Find references to a fully-qualified Lean name.")]
-    async fn find_references(
-        &self,
-        Parameters(req): Parameters<tools::position::FindReferencesRequest>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "find_references", "tool call");
-        self.respond(tools::position::find_references(&self.ctx, req).await)
+        tracing::debug!(tool = "lean_status", "tool call");
+        self.respond_semantic(tools::semantic::lean_status(&self.ctx, req))
     }
 }
 
@@ -114,9 +106,9 @@ impl ServerHandler for LeanHostService {
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
         info.instructions = Some(
             "MCP server hosting Lean 4 in-process via lean-rs. \
-             Tools expose a bounded proof-agent workflow: proof context, \
-             proof retrieval, declaration inspection, non-mutating proof \
-             attempts and verification, and semantic reference lookup."
+             Tools expose five semantic Lean job families: context, trial, \
+             verification, lookup, and status. Select a mode with each tool's \
+             `kind` field."
                 .to_owned(),
         );
         info
@@ -124,46 +116,24 @@ impl ServerHandler for LeanHostService {
 }
 
 impl LeanHostService {
-    /// The single funnel every tool response passes through: turn a tool's
-    /// `Result<Response<T>>` into the `CallToolResult` rmcp sends. A
-    /// `WorkerUnavailable` infrastructure error becomes a structured
-    /// `runtime_unavailable` envelope (not an MCP protocol error); every other
-    /// `ServerError` is a genuine protocol error.
-    fn respond<T>(&self, result: crate::error::Result<Response<T>>) -> std::result::Result<CallToolResult, McpError>
-    where
-        T: serde::Serialize + schemars::JsonSchema,
-    {
+    fn respond_semantic(
+        &self,
+        result: crate::error::Result<tools::semantic::SemanticResponse<serde_json::Value>>,
+    ) -> std::result::Result<CallToolResult, McpError> {
         let response = match result {
             Ok(response) => response,
-            Err(ServerError::WorkerUnavailable(info)) => {
-                Response::runtime_unavailable(info.failure(), info.freshness(), info.runtime.clone())
-            }
+            Err(ServerError::WorkerUnavailable(info)) => tools::semantic::from_worker_unavailable(&info),
             Err(err) => return Err(McpError::from(err)),
         };
-        Ok(self.finalize(response))
-    }
-
-    /// Drain advisories into `warnings`, apply the telemetry verbosity gate, and
-    /// place the serialized envelope per the configured [`ResponseCarrier`].
-    /// Applies identically to `ok` and `runtime_unavailable` responses, so a
-    /// worker that dies mid-call keeps its advisories.
-    fn finalize<T>(&self, mut response: Response<T>) -> CallToolResult
-    where
-        T: serde::Serialize + schemars::JsonSchema,
-    {
-        response.drain_advisories();
-        if !self.ctx.config.verbosity.is_full() {
-            response.drop_telemetry();
-        }
-        carry(&response, self.ctx.config.carrier)
+        Ok(carry(&response, self.ctx.config.carrier))
     }
 }
 
-/// Serialize the envelope and place it in the tool result per the carrier:
+/// Serialize the response and place it in the tool result per the carrier:
 /// `Text` emits one `content` text block (the model's read surface), `Both`
 /// also mirrors it into `structuredContent` for code-mode clients, and
 /// `Structured` emits only `structuredContent`.
-fn carry<T>(response: &Response<T>, carrier: ResponseCarrier) -> CallToolResult
+fn carry<T>(response: &T, carrier: ResponseCarrier) -> CallToolResult
 where
     T: serde::Serialize + schemars::JsonSchema,
 {
@@ -225,44 +195,36 @@ mod tests {
             window_millis: Some(60_000),
             runtime,
             // A no-record / suspect worker carries an open-time advisory; it must
-            // survive onto the failure envelope, not vanish when the worker dies.
+            // survive onto the semantic issue channel, not vanish when the worker dies.
             toolchain_advisories: vec!["worker for v4.30.0 has no runtime smoke record".to_owned()],
         });
         let ServerError::WorkerUnavailable(info) = error else {
             unreachable!("constructed a WorkerUnavailable error")
         };
-        // Build the structured envelope the way `respond` does, then drain
-        // advisories the way `finalize` does. `full` verbosity keeps `telemetry`
-        // so the runtime facts are assertable.
-        let mut response =
-            Response::<serde_json::Value>::runtime_unavailable(info.failure(), info.freshness(), info.runtime.clone());
-        response.drain_advisories();
+        let response = tools::semantic::from_worker_unavailable(&info);
 
         let json = serde_json::to_value(&response).unwrap();
+        assert!(json.pointer("/data").is_none_or(serde_json::Value::is_null));
         assert_eq!(
-            json.pointer("/status").and_then(serde_json::Value::as_str),
+            json.pointer("/errors/0/code").and_then(serde_json::Value::as_str),
             Some("runtime_unavailable")
         );
-        assert!(json.pointer("/result").is_none_or(serde_json::Value::is_null));
         assert_eq!(
-            json.pointer("/runtime_error/retryable")
-                .and_then(serde_json::Value::as_bool),
+            json.pointer("/errors/0/retryable").and_then(serde_json::Value::as_bool),
             Some(true)
         );
         assert_eq!(
-            json.pointer("/runtime_error/restart_cause")
+            json.pointer("/errors/0/details/restart_cause")
                 .and_then(serde_json::Value::as_str),
             Some("child_exit")
         );
         assert_eq!(
-            json.pointer("/telemetry/runtime/retry_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
+            json.pointer("/trust/session_id").and_then(serde_json::Value::as_str),
+            Some("session")
         );
-        // Finding #3: the open-time advisory is drained onto the failure
-        // envelope's top-level warnings rather than dropped.
+        // The open-time advisory is preserved as a warning issue.
         assert_eq!(
-            json.pointer("/warnings/0").and_then(serde_json::Value::as_str),
+            json.pointer("/errors/1/message").and_then(serde_json::Value::as_str),
             Some("worker for v4.30.0 has no runtime smoke record")
         );
     }

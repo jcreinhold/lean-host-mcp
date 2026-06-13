@@ -5,8 +5,9 @@
 
 ## Why this exists
 
-Project-scope `find_references` used to re-elaborate every `.lean` module in the worker (~3 s/file → ~27 min on a
-~500-module project). `lake build` already writes the answer to disk: one **`.ilean`** file per module under
+Project-scope reference lookup, now exposed as `lean_lookup(kind = "references")`, used to re-elaborate every `.lean`
+module in the worker (~3 s/file → ~27 min on a ~500-module project). `lake build` already writes the answer to disk:
+one **`.ilean`** file per module under
 `<project>/.lake/build/lib/lean/`, the LSP reference index. It records, per name, the definition site and every usage
 site *within that module's source*, so "find references to `N`" is a disk read plus a JSON parse, no Lean runtime.
 
@@ -17,9 +18,9 @@ deliberately serial: no parallelism, no thread pool, because the worst-case work
 ## Where the reader lives
 
 It is a private module in `lean-host-mcp` (`src/ilean.rs`), not a separate `lean-rs` crate and not a worker capability.
-`find_references` is its sole consumer, so a published crate would be a premature boundary; and `.ilean` is pure data,
-so routing it through the worker would needlessly drag the `libleanshared` link concern into something that reads JSON
-off disk. The reader stays pure Rust + `serde_json` (already dependencies), adding no new dependency and no Lean
+The references lookup mode is its sole consumer, so a published crate would be a premature boundary; and `.ilean` is pure
+data, so routing it through the worker would needlessly drag the `libleanshared` link concern into something that reads
+JSON off disk. The reader stays pure Rust + `serde_json` (already dependencies), adding no new dependency and no Lean
 linkage, and so preserves the parent ⊥ `libleanshared` invariant. The volatile on-disk format is sealed behind the
 version gate below.
 
@@ -34,7 +35,7 @@ pub(crate) fn references_to(project_root: &Path, name: &str) -> ReferenceIndex;
   is counted in `modules_skipped`, never fatal. `stale_sources` flags contributing modules whose `.lean` is newer than
   its `.ilean` (bounded by the result set, off the hot path).
 - `ReferenceLocation { file, start_line, start_column, end_line, end_column, kind }` — 0-based LSP coordinates, mapping
-  directly onto `find_references`'s `ReferenceHit`.
+  directly onto the references mode's `ReferenceHit`.
 - `IleanError` (typed, recoverable) lives one layer down on the private per-file loader so the version gate is
   unit-testable directly. Everything else — the raw JSON shapes — is private to the module.
 

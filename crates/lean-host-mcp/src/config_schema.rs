@@ -104,7 +104,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "120000",
         commented: false,
         overrides: "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
-        description: "Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose verify/proof_state legitimately runs longer; lower it to bound a single heavy file query. Default 120 s.",
+        description: "Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose lean_verify/lean_context work legitimately runs longer; lower it to bound a single heavy file query. Default 120 s.",
     },
     FieldDoc {
         key: "runtime.project_mailbox_capacity",
@@ -202,7 +202,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "\"text\"",
         commented: false,
         overrides: "LEAN_HOST_MCP_RESPONSE_CARRIER",
-        description: "Which field of the tool result carries the envelope. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text.",
+        description: "Which field of the tool result carries the semantic response. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text.",
     },
     // ---- [telemetry] — model-facing envelope verbosity ------------------
     FieldDoc {
@@ -211,7 +211,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "\"quiet\"",
         commented: false,
         overrides: "LEAN_HOST_MCP_TELEMETRY_VERBOSITY",
-        description: "How much operational telemetry the envelope carries. quiet keeps proof-relevant content and drops the runtime block, manifest hash, and full import list; full emits everything for debugging. Default quiet.",
+        description: "How much operational telemetry the internal operation envelope keeps before semantic response adaptation. quiet keeps proof-relevant content and drops the runtime block, manifest hash, and full import list; full emits everything for debugging. Default quiet.",
     },
     // ---- [output] — per-call output budget overrides --------------------
     FieldDoc {
@@ -236,7 +236,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "200000",
         commented: true,
         overrides: "LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT",
-        description: "Default elaboration heartbeat budget for try_proof_step and verify_declaration. Unset uses the worker default. Bounds runaway tactics.",
+        description: "Default elaboration heartbeat budget for lean_trial proof_step and lean_verify explicit. Unset uses the worker default. Bounds runaway tactics.",
     },
 ];
 

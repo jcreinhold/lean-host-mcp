@@ -1,8 +1,8 @@
 # lean-host-mcp
 
 A Model Context Protocol server that gives an AI agent direct, read-only access to a Lean 4 project's elaborator and
-kernel. The agent can read the goal state at any point in a proof, get ranked lemma suggestions for the next step, test
-tactics, and check whether a declaration type-checks — all without editing a single file.
+kernel. The agent can read proof context, get ranked lemma suggestions, inspect declarations, test tactics, verify
+declarations, and find semantic references — all without editing a single file.
 
 It hosts Lean **in-process**: the elaborator and kernel run inside a supervised worker child and are reached as
 in-process calls, not as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child, and the
@@ -12,19 +12,14 @@ and launches the matching pre-built worker.
 
 ## What it gives an agent
 
-Six tools, covering the loop of working on a proof:
+Five semantic tools, each with a `kind` mode:
 
-- **`proof_state`** — the goal state at a point in a proof: open goals, local hypotheses, the expected type, and any
-  diagnostics.
-- **`search_for_proof`** — ranked declarations (lemmas, theorems) relevant to the current goal, with a ready-to-paste
-  tactic snippet for applicable search modes.
-- **`inspect_declaration`** — the statement, docstring, attributes, and flags of one declaration, by name.
-- **`try_proof_step`** — runs one or more candidate tactics at a proof position and reports what each does to the goals.
-  Never writes files.
-- **`verify_declaration`** — checks whether a declaration type-checks, under a configurable `sorry`/axiom policy. Never
-  writes files.
-- **`find_references`** — semantic (not textual) lookup of every use of a fully-qualified name, in one file or across
-  the project.
+- **`lean_context`** — proof context. Initial mode: `proof_position`.
+- **`lean_trial`** — non-mutating experiments. Initial mode: `proof_step`.
+- **`lean_verify`** — declaration verification. Initial mode: `explicit`.
+- **`lean_lookup`** — declaration inspection, proof search, and references. Initial modes: `declaration`,
+  `proof_search`, and `references`.
+- **`lean_status`** — cheap project/toolchain/config status that does not open a worker.
 
 Every call is non-mutating: the server reads source and elaborates in memory, and never touches your files. The typical
 workflow and the request/result schema for each tool are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
@@ -140,49 +135,33 @@ vars. Run `lean-host-mcp config init` to write a documented starter with every o
 semantic lock directory queue worker-opening semantic calls until a permit is free. Metadata-only degraded responses and
 project-scope `.ilean` reference reads do not open workers and do not consume permits.
 
-## Response envelope
+## Response Shape
 
-Every tool returns the same outer shape. `result` is tool-specific; `status` is `ok` for any successful call — including
-one whose Lean-domain outcome was a failure.
+Every public tool returns the same semantic outer shape. `data` is mode-specific; `errors` is a structured issue channel
+for runtime failures and warnings; `trust` is the small project/session identity.
 
 ```jsonc
 {
-  "status": "ok",                    // or "runtime_unavailable"
-  "result":   { /* tool-specific */ },
-  "runtime_error": null,              // populated when status is "runtime_unavailable"
-  "freshness": {
-    "project_root":   "/abs/path",
-    "session_id":     "uuid",          // project-actor identity; changes only on re-spawn (LRU/idle/manifest)
-    "lean_toolchain": "leanprover/lean4:v4.29.1"
-  },
-  // Operational telemetry, omitted by default; set `telemetry.verbosity = full` to emit it.
-  "telemetry": {
-    "project_hash": "sha256-hex of lake-manifest.json",
-    "imports":      ["Mod.A", "..."],
-    "runtime":      { /* worker generation, restart/retry facts */ }
-  },
-  "warnings":     ["..."],     // omitted when empty
-  "next_actions": ["..."]      // omitted when empty
+  "data": { /* mode-specific */ },
+  "errors": [],
+  "trust": {
+    "project_root": "/abs/path",
+    "session_id": "uuid-or-metadata-only",
+    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2"
+  }
 }
 ```
 
-`freshness` is always emitted — a small, stable identity. The `telemetry` block (cache hash, import list, worker
-`runtime` facts) is **omitted by default** (`telemetry.verbosity = quiet`): none of it helps an agent make a proof step,
-and the one actionable signal a worker restart carries already arrives as a `warning`. Set `telemetry.verbosity = full`
-to re-inline it. By default the envelope rides as JSON text in `content`; `server.response_carrier` (`structured` /
-`both`) can place it in `structuredContent` instead. Tools advertise no `outputSchema` — the Anthropic Messages API
-drops it, and deep `$defs` break strict clients.
-
 The split that matters: **Lean-domain failures** (parse errors, elaboration diagnostics, kernel rejection, meta timeout)
-ride inside the `ok` payload — a failed proof is still a successful call. **Recoverable runtime failures** (admission or
-mailbox pressure, worker death, session loss) return `status: "runtime_unavailable"` with a retryable `runtime_error`.
-**MCP errors** are reserved for invalid requests, I/O and config failures, and unusable Lake projects. The full
-`runtime_unavailable` shape and the field-by-field `runtime`/`freshness` reference are in
-[`docs/operations.md`](docs/operations.md#runtime-error-contract).
+ride inside `data` — a failed proof is still a successful call. **Recoverable runtime failures** (admission or mailbox
+pressure, worker death, session loss) appear in `errors` with a retryable flag and structured details. **MCP errors** are
+reserved for I/O/config failures and unusable Lake projects. By default the semantic response rides as JSON text in
+`content`; `server.response_carrier` (`structured` / `both`) can place it in `structuredContent` instead. Tools
+advertise no `outputSchema` — the Anthropic Messages API drops it, and deep `$defs` break strict clients.
 
 ## Documentation
 
-- [`docs/tool-catalog.md`](docs/tool-catalog.md) — the proof workflow and the per-tool request/result schema.
+- [`docs/tool-catalog.md`](docs/tool-catalog.md) — the semantic tool workflow and the per-mode request/result schema.
 - [`docs/operations.md`](docs/operations.md) — tuning knobs, transport internals, the runtime-error contract, and the
   test/perf harness.
 - [`docs/architecture.md`](docs/architecture.md) — how the server is built (for contributors).

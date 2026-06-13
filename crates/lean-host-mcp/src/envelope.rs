@@ -1,6 +1,11 @@
-//! The uniform response envelope every tool returns.
+//! Internal operation response envelope.
 //!
-//! Encoding contract (default `quiet` telemetry verbosity):
+//! Public MCP tools adapt this shape into the semantic `{ data, errors, trust }`
+//! response in [`crate::tools::semantic`]. The operation envelope remains useful
+//! below that facade because implementation modules share warning rendering,
+//! runtime-unavailable projection, and telemetry gating.
+//!
+//! Internal encoding contract (default `quiet` telemetry verbosity):
 //!
 //! ```jsonc
 //! {
@@ -17,7 +22,7 @@
 //! }
 //! ```
 //!
-//! What the model reads is kept to proof-relevant content. Operational
+//! What the semantic adapter reads is kept to proof-relevant content. Operational
 //! telemetry is gated behind [`TelemetryVerbosity`](crate::tools::TelemetryVerbosity):
 //! in the default `quiet` mode the `runtime` block is omitted unless it carries
 //! an actionable signal (a worker restart — see [`RuntimeFacts::is_actionable`]),
@@ -27,10 +32,10 @@
 //! client can branch on `(project_root, project_hash)` to detect dependency
 //! changes between calls.
 //!
-//! Three volatile decisions hide behind one shape: what freshness means,
-//! how it's serialized, and what an MCP "warning" looks like. Tools don't
-//! pick the layout; they build a `Response<T>` and `crate::server` serializes
-//! it after [`Response::trim_telemetry`] applies the verbosity gate.
+//! Three volatile decisions hide behind one shape: what freshness means, how
+//! warning text is rendered, and how worker failure becomes structured data.
+//! Operation modules build a `Response<T>`; the semantic facade translates it
+//! before `crate::server` serializes the public tool result.
 
 use std::collections::BTreeMap;
 
@@ -248,8 +253,7 @@ where
     }
 
     /// The caller-supplied import set, read from the telemetry block. Used by
-    /// internal tool composition (e.g. `search_for_proof` reusing a
-    /// `proof_state` response) before the boundary gate runs.
+    /// internal tool composition before the semantic boundary gate runs.
     pub fn imports(&self) -> &[String] {
         match &self.telemetry {
             Some(telemetry) => &telemetry.imports,
@@ -273,9 +277,9 @@ where
         self.telemetry = None;
     }
 
-    /// Drain project-lifetime advisories into `warnings`. Called once by
-    /// [`crate::server`] just before serialization, for both `ok` and
-    /// `runtime_unavailable` responses.
+    /// Drain project-lifetime advisories into `warnings`. Called once by the
+    /// semantic facade before public response adaptation, for both `ok` and
+    /// `runtime_unavailable` operation responses.
     pub(crate) fn drain_advisories(&mut self) {
         let advisories = std::mem::take(&mut self.advisories);
         self.warnings.extend(advisories);

@@ -1,6 +1,8 @@
 //! Tool implementations.
 //!
-//! Split by what plumbing they share rather than one file per tool:
+//! Public MCP calls enter through [`semantic`], the five-tool facade. The
+//! remaining modules are internal operation building blocks, split by what
+//! plumbing they share rather than one file per public tool:
 //!
 //! - [`declaration`]: `inspect_declaration`, the bounded single-declaration
 //!   proof-work inspection tool.
@@ -17,6 +19,7 @@ pub mod declaration;
 pub mod position;
 pub mod proof_action;
 pub mod proof_search;
+pub mod semantic;
 pub(crate) mod source_input;
 
 use crate::broker::ProjectBroker;

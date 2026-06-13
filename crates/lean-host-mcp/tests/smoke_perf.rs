@@ -195,8 +195,9 @@ async fn black_box_pipelined_admission_pressure_returns_structured_statuses() {
         .request(
             "tools/call",
             json!({
-                "name": "proof_state",
+                "name": "lean_context",
                 "arguments": {
+                    "kind": "proof_position",
                     "file": "LeanRsFixture/SourceRanges.lean",
                     "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
                 }
@@ -352,28 +353,22 @@ async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
         .flatten()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
-    assert!(tool_names.contains("proof_state"), "tools/list must expose proof_state");
-    assert!(
-        tool_names.contains("inspect_declaration"),
-        "tools/list must expose inspect_declaration"
-    );
-    assert!(
-        tool_names.contains("search_for_proof"),
-        "tools/list must expose search_for_proof"
-    );
-    assert!(
-        tool_names.contains("try_proof_step"),
-        "tools/list must expose try_proof_step"
-    );
-    assert!(
-        tool_names.contains("verify_declaration"),
-        "tools/list must expose verify_declaration"
-    );
-    assert!(
-        tool_names.contains("find_references"),
-        "tools/list must expose find_references"
-    );
+    for expected in [
+        "lean_context",
+        "lean_trial",
+        "lean_verify",
+        "lean_lookup",
+        "lean_status",
+    ] {
+        assert!(tool_names.contains(expected), "tools/list must expose {expected}");
+    }
     for removed in [
+        "proof_state",
+        "search_for_proof",
+        "inspect_declaration",
+        "try_proof_step",
+        "verify_declaration",
+        "find_references",
         "lean_query",
         "source_search",
         "mathlib_placement",
@@ -507,27 +502,30 @@ fn fixture_calls() -> Vec<ToolCall> {
     vec![
         ToolCall {
             label: "inspect_nat_add_zero",
-            tool_name: "inspect_declaration",
+            tool_name: "lean_lookup",
             category: "declaration",
             arguments: json!({
+                "kind": "declaration",
                 "name": "Nat.add_zero",
                 "imports": ["LeanRsFixture.Handles"]
             }),
         },
         ToolCall {
             label: "inspect_known_theorem",
-            tool_name: "inspect_declaration",
+            tool_name: "lean_lookup",
             category: "declaration",
             arguments: json!({
+                "kind": "declaration",
                 "name": "LeanRsFixture.SourceRanges.knownTheorem",
                 "file": "LeanRsFixture/SourceRanges.lean",
             }),
         },
         ToolCall {
             label: "inspect_large_statement_truncated",
-            tool_name: "inspect_declaration",
+            tool_name: "lean_lookup",
             category: "declaration",
             arguments: json!({
+                "kind": "declaration",
                 "name": "Lean.Meta.forallTelescopeReducing",
                 "imports": ["Lean"],
                 "max_field_bytes": 256
@@ -535,9 +533,10 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "try_proof_step_trivial",
-            tool_name: "try_proof_step",
+            tool_name: "lean_trial",
             category: "proof_action",
             arguments: json!({
+                "kind": "proof_step",
                 "file": "LeanRsFixture/ProofActions.lean",
                 "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "snippet": "trivial"
@@ -545,9 +544,10 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "try_proof_step_bad",
-            tool_name: "try_proof_step",
+            tool_name: "lean_trial",
             category: "proof_action",
             arguments: json!({
+                "kind": "proof_step",
                 "file": "LeanRsFixture/ProofActions.lean",
                 "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "snippet": "exact missingIdentifier"
@@ -555,9 +555,10 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "try_proof_step_many",
-            tool_name: "try_proof_step",
+            tool_name: "lean_trial",
             category: "proof_action",
             arguments: json!({
+                "kind": "proof_step",
                 "file": "LeanRsFixture/ProofActions.lean",
                 "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "snippets": [
@@ -575,9 +576,10 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "verify_known_theorem",
-            tool_name: "verify_declaration",
+            tool_name: "lean_verify",
             category: "proof_action",
             arguments: json!({
+                "kind": "explicit",
                 "file": "LeanRsFixture/ProofActions.lean",
                 "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "report_axioms": true
@@ -585,36 +587,40 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "verify_sorry_theorem",
-            tool_name: "verify_declaration",
+            tool_name: "lean_verify",
             category: "proof_action",
             arguments: json!({
+                "kind": "explicit",
                 "file": "LeanRsFixture/ProofActions.lean",
                 "declaration": "LeanRsFixture.ProofActions.sorryTheorem"
             }),
         },
         ToolCall {
             label: "proof_state_trivial_cold",
-            tool_name: "proof_state",
+            tool_name: "lean_context",
             category: "position",
             arguments: json!({
+                "kind": "proof_position",
                 "file": "LeanRsFixture/SourceRanges.lean",
                 "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
             }),
         },
         ToolCall {
             label: "proof_state_trivial_warm_repeat",
-            tool_name: "proof_state",
+            tool_name: "lean_context",
             category: "position",
             arguments: json!({
+                "kind": "proof_position",
                 "file": "LeanRsFixture/SourceRanges.lean",
                 "declaration": "LeanRsFixture.SourceRanges.knownTheorem"
             }),
         },
         ToolCall {
             label: "search_for_proof_trivial_declaration",
-            tool_name: "search_for_proof",
+            tool_name: "lean_lookup",
             category: "proof_search",
             arguments: json!({
+                "kind": "proof_search",
                 "file": "LeanRsFixture/SourceRanges.lean",
                 "declaration": "LeanRsFixture.SourceRanges.knownTheorem",
                 "limit": 10
@@ -622,9 +628,10 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "search_for_proof_explicit_true",
-            tool_name: "search_for_proof",
+            tool_name: "lean_lookup",
             category: "proof_search",
             arguments: json!({
+                "kind": "proof_search",
                 "goal": "⊢ True",
                 "imports": ["LeanRsFixture.SourceRanges"],
                 "mode": "exact",
@@ -633,9 +640,10 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "find_references_file_known_theorem",
-            tool_name: "find_references",
+            tool_name: "lean_lookup",
             category: "position",
             arguments: json!({
+                "kind": "references",
                 "scope": "file",
                 "file": "LeanRsFixture/SourceRanges.lean",
                 "name": "LeanRsFixture.SourceRanges.knownTheorem"
@@ -643,9 +651,10 @@ fn fixture_calls() -> Vec<ToolCall> {
         },
         ToolCall {
             label: "find_references_project_known_theorem",
-            tool_name: "find_references",
+            tool_name: "lean_lookup",
             category: "position",
             arguments: json!({
+                "kind": "references",
                 "scope": "project",
                 "name": "LeanRsFixture.SourceRanges.knownTheorem",
                 "files": ["LeanRsFixture/SourceRanges.lean"],
@@ -658,9 +667,9 @@ fn fixture_calls() -> Vec<ToolCall> {
 fn external_project_calls() -> Vec<ToolCall> {
     let mut calls = vec![ToolCall {
         label: "inspect_nat_add_zero_no_imports",
-        tool_name: "inspect_declaration",
+        tool_name: "lean_lookup",
         category: "declaration",
-        arguments: json!({ "name": "Nat.add_zero", "imports": [] }),
+        arguments: json!({ "kind": "declaration", "name": "Nat.add_zero", "imports": [] }),
     }];
     if let (Ok(file), Ok(declaration)) = (
         std::env::var("LEAN_HOST_MCP_SMOKE_FILE"),
@@ -668,9 +677,10 @@ fn external_project_calls() -> Vec<ToolCall> {
     ) {
         calls.push(ToolCall {
             label: "proof_state_env_declaration",
-            tool_name: "proof_state",
+            tool_name: "lean_context",
             category: "position",
             arguments: json!({
+                "kind": "proof_position",
                 "file": file,
                 "declaration": declaration
             }),
@@ -1034,6 +1044,14 @@ fn response_status(response: &Value) -> String {
     if let Some(code) = response.pointer("/error/code").and_then(Value::as_i64) {
         return format!("mcp_error:{code}");
     }
+    if let Some(code) = semantic_error_code(response) {
+        return code;
+    }
+    for path in ["/result/structuredContent/data", "/result/result/data"] {
+        if response.pointer(path).is_some_and(|value| !value.is_null()) {
+            return "ok".to_owned();
+        }
+    }
     for path in [
         "/result/structuredContent/result/status",
         "/result/structuredContent/status",
@@ -1052,16 +1070,15 @@ fn response_status(response: &Value) -> String {
 }
 
 fn envelope_status(response: &Value) -> String {
-    for path in ["/result/structuredContent/status", "/result/result/status"] {
-        if let Some(status) = response.pointer(path).and_then(Value::as_str) {
-            return status.to_owned();
-        }
-    }
     response_status(response)
 }
 
 fn runtime_error_reason(response: &Value) -> Option<String> {
     for path in [
+        "/result/structuredContent/errors/0/details/reason",
+        "/result/structuredContent/errors/0/message",
+        "/result/result/errors/0/details/reason",
+        "/result/result/errors/0/message",
         "/result/structuredContent/runtime_error/reason",
         "/result/structuredContent/result/runtime_error/reason",
         "/result/result/runtime_error/reason",
@@ -1075,20 +1092,41 @@ fn runtime_error_reason(response: &Value) -> Option<String> {
 
 fn warnings_count(response: &Value) -> usize {
     response
-        .pointer("/result/structuredContent/warnings")
+        .pointer("/result/structuredContent/errors")
         .and_then(Value::as_array)
-        .map_or(0, Vec::len)
+        .map_or(0, |errors| {
+            errors
+                .iter()
+                .filter(|error| error.get("severity").and_then(Value::as_str) == Some("warning"))
+                .count()
+        })
 }
 
 fn session_id(response: &Value) -> Option<String> {
     response
-        .pointer("/result/structuredContent/freshness/session_id")
+        .pointer("/result/structuredContent/trust/session_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
 
 fn query_facts(response: &Value) -> Option<&Value> {
-    response.pointer("/result/structuredContent/result/query_facts")
+    response.pointer("/result/structuredContent/data/query_facts")
+}
+
+fn semantic_error_code(response: &Value) -> Option<String> {
+    for path in ["/result/structuredContent/errors", "/result/result/errors"] {
+        let Some(errors) = response.pointer(path).and_then(Value::as_array) else {
+            continue;
+        };
+        for error in errors {
+            if error.get("severity").and_then(Value::as_str) == Some("error")
+                && let Some(code) = error.get("code").and_then(Value::as_str)
+            {
+                return Some(code.to_owned());
+            }
+        }
+    }
+    None
 }
 
 fn query_fact_str(response: &Value, field: &str) -> Option<String> {

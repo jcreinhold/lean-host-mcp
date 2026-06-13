@@ -23,6 +23,9 @@ use lean_host_mcp::tools::proof_action::{
     TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
 };
 use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest, search_for_proof};
+use lean_host_mcp::tools::semantic::{
+    SemanticResponse, SemanticToolRequest, lean_context, lean_lookup, lean_trial, lean_verify,
+};
 use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
     BrokerConfig, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker, ProofAttemptResult,
@@ -61,6 +64,28 @@ fn proof_actions_file() -> PathBuf {
 
 fn proof_agent_file() -> PathBuf {
     PathBuf::from("LeanRsFixture/ProofAgent.lean")
+}
+
+fn semantic_request(kind: &str, args: serde_json::Value) -> SemanticToolRequest {
+    let serde_json::Value::Object(map) = args else {
+        panic!("semantic request args must be an object");
+    };
+    SemanticToolRequest {
+        kind: Some(kind.to_owned()),
+        args: map.into_iter().collect(),
+    }
+}
+
+fn semantic_data(response: SemanticResponse<serde_json::Value>) -> serde_json::Value {
+    assert!(
+        response
+            .errors
+            .iter()
+            .all(|issue| issue.severity.as_deref() != Some("error")),
+        "semantic response should not carry error-severity issues: {:?}",
+        response.errors
+    );
+    response.data.expect("semantic data")
 }
 
 #[test]
@@ -352,6 +377,139 @@ async fn inspect_proof_state_try_verify_and_references() {
         references.iter().any(|reference| reference.kind == "def"),
         "semantic reference lookup should include the declaration site"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn semantic_surface_ports_existing_shipped_behaviors() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let inspected = semantic_data(
+        lean_lookup(
+            &ctx,
+            semantic_request(
+                "declaration",
+                serde_json::json!({
+                    "name": "LeanRsFixture.ProofActions.closedTheorem",
+                    "file": "LeanRsFixture/ProofActions.lean"
+                }),
+            ),
+        )
+        .await
+        .expect("lean_lookup declaration"),
+    );
+    assert_eq!(
+        inspected.pointer("/status").and_then(serde_json::Value::as_str),
+        Some("found")
+    );
+
+    let proof = semantic_data(
+        lean_context(
+            &ctx,
+            semantic_request(
+                "proof_position",
+                serde_json::json!({
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "declaration": "LeanRsFixture.ProofActions.stepTheorem"
+                }),
+            ),
+        )
+        .await
+        .expect("lean_context proof_position"),
+    );
+    assert_eq!(
+        proof.pointer("/status").and_then(serde_json::Value::as_str),
+        Some("context")
+    );
+
+    let search = semantic_data(
+        lean_lookup(
+            &ctx,
+            semantic_request(
+                "proof_search",
+                serde_json::json!({
+                    "file": "LeanRsFixture/ProofAgent.lean",
+                    "declaration": "LeanRsFixture.ProofAgent.miniRatDenominatorStep",
+                    "limit": 5
+                }),
+            ),
+        )
+        .await
+        .expect("lean_lookup proof_search"),
+    );
+    assert!(
+        search
+            .pointer("/candidates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|candidates| !candidates.is_empty()),
+        "proof search should return candidates: {search:?}"
+    );
+
+    let before = fs::read(root.join(proof_actions_file())).expect("fixture source before");
+    let attempt = semantic_data(
+        lean_trial(
+            &ctx,
+            semantic_request(
+                "proof_step",
+                serde_json::json!({
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+                    "snippet": "trivial"
+                }),
+            ),
+        )
+        .await
+        .expect("lean_trial proof_step"),
+    );
+    assert_eq!(
+        attempt.pointer("/status").and_then(serde_json::Value::as_str),
+        Some("ok")
+    );
+    let after = fs::read(root.join(proof_actions_file())).expect("fixture source after");
+    assert_eq!(before, after, "lean_trial must not mutate source files");
+
+    let verified = semantic_data(
+        lean_verify(
+            &ctx,
+            semantic_request(
+                "explicit",
+                serde_json::json!({
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "declaration": "LeanRsFixture.ProofActions.closedTheorem",
+                    "report_axioms": true
+                }),
+            ),
+        )
+        .await
+        .expect("lean_verify explicit"),
+    );
+    assert_eq!(
+        verified
+            .pointer("/verification_status")
+            .and_then(serde_json::Value::as_str),
+        Some("verified")
+    );
+
+    let refs = semantic_data(
+        lean_lookup(
+            &ctx,
+            semantic_request(
+                "references",
+                serde_json::json!({
+                    "name": "LeanRsFixture.ProofActions.closedTheorem",
+                    "scope": "file",
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "limit": 10
+                }),
+            ),
+        )
+        .await
+        .expect("lean_lookup references"),
+    );
+    assert_eq!(refs.pointer("/status").and_then(serde_json::Value::as_str), Some("ok"));
 }
 
 #[tokio::test]

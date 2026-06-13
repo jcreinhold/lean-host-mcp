@@ -16,13 +16,20 @@ use tokio::process::{Child, ChildStderr, Command};
 
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const EXPECTED_TOOLS: [&str; 6] = [
-    "find_references",
-    "inspect_declaration",
+const EXPECTED_TOOLS: [&str; 5] = [
+    "lean_context",
+    "lean_lookup",
+    "lean_status",
+    "lean_trial",
+    "lean_verify",
+];
+const REMOVED_TOOLS: [&str; 6] = [
     "proof_state",
     "search_for_proof",
+    "inspect_declaration",
     "try_proof_step",
     "verify_declaration",
+    "find_references",
 ];
 
 #[tokio::test]
@@ -34,7 +41,14 @@ async fn streamable_http_initialize_and_tools_list() {
         .request("tools/list", json!({}))
         .await
         .expect("tools/list response");
-    assert_eq!(tool_names(&tools.json), expected_tools());
+    let names = tool_names(&tools.json);
+    assert_eq!(names, expected_tools());
+    for removed in REMOVED_TOOLS {
+        assert!(
+            !names.contains(removed),
+            "old public tool {removed} must not be advertised"
+        );
+    }
 
     // Handlers return a bare `CallToolResult`, so rmcp advertises no `outputSchema`.
     // The Anthropic Messages API drops it anyway, and deep `$defs` break strict clients.
@@ -112,15 +126,16 @@ async fn streamable_http_fixture_tool_call() {
         .request(
             "tools/call",
             json!({
-                "name": "proof_state",
+                "name": "lean_context",
                 "arguments": {
+                    "kind": "proof_position",
                     "file": "LeanRsFixture/ProofActions.lean",
                     "declaration": "LeanRsFixture.ProofActions.stepTheorem"
                 }
             }),
         )
         .await
-        .expect("proof_state over HTTP");
+        .expect("lean_context over HTTP");
 
     assert!(
         response.http_status.is_success(),
@@ -128,10 +143,32 @@ async fn streamable_http_fixture_tool_call() {
     );
     assert!(
         response.json.get("error").is_none(),
-        "proof_state must not return JSON-RPC error: {:?}",
+        "lean_context must not return JSON-RPC error: {:?}",
         response.json
     );
     assert_eq!(envelope_status(&response.json), "ok");
+
+    let invalid = session
+        .request(
+            "tools/call",
+            json!({
+                "name": "lean_context",
+                "arguments": {
+                    "kind": "not_a_context_mode",
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "declaration": "LeanRsFixture.ProofActions.stepTheorem"
+                }
+            }),
+        )
+        .await
+        .expect("invalid lean_context mode");
+    assert!(invalid.http_status.is_success());
+    assert!(
+        invalid.json.get("error").is_none(),
+        "invalid semantic mode should not be a JSON-RPC error: {:?}",
+        invalid.json
+    );
+    assert_eq!(semantic_error_code(&invalid.json).as_deref(), Some("invalid_kind"));
 
     server.shutdown().await;
 }
@@ -227,15 +264,16 @@ async fn streamable_http_semantic_admission_concurrent_sessions_surface_structur
         .request(
             "tools/call",
             json!({
-                "name": "proof_state",
+                "name": "lean_context",
                 "arguments": {
+                    "kind": "proof_position",
                     "file": "LeanRsFixture/ProofActions.lean",
                     "declaration": "LeanRsFixture.ProofActions.stepTheorem"
                 }
             }),
         )
         .await
-        .expect("healthy follow-up proof_state");
+        .expect("healthy follow-up lean_context");
     assert!(response.http_status.is_success());
     assert!(response.json.get("error").is_none());
 
@@ -531,30 +569,34 @@ fn fixture_root() -> PathBuf {
 fn fixture_calls() -> Vec<(&'static str, Value)> {
     vec![
         (
-            "proof_state",
+            "lean_context",
             json!({
+                "kind": "proof_position",
                 "file": "LeanRsFixture/ProofActions.lean",
                 "declaration": "LeanRsFixture.ProofActions.stepTheorem"
             }),
         ),
         (
-            "inspect_declaration",
+            "lean_lookup",
             json!({
+                "kind": "declaration",
                 "name": "LeanRsFixture.SourceRanges.knownTheorem",
                 "file": "LeanRsFixture/SourceRanges.lean"
             }),
         ),
         (
-            "verify_declaration",
+            "lean_verify",
             json!({
+                "kind": "explicit",
                 "file": "LeanRsFixture/ProofActions.lean",
                 "declaration": "LeanRsFixture.ProofActions.stepTheorem",
                 "report_axioms": true
             }),
         ),
         (
-            "find_references",
+            "lean_lookup",
             json!({
+                "kind": "references",
                 "name": "LeanRsFixture.ProofActions.stepTheorem",
                 "scope": "file",
                 "file": "LeanRsFixture/ProofActions.lean",
@@ -565,9 +607,12 @@ fn fixture_calls() -> Vec<(&'static str, Value)> {
 }
 
 fn envelope_status(response: &Value) -> String {
-    for path in ["/result/structuredContent/status", "/result/result/status"] {
-        if let Some(status) = response.pointer(path).and_then(Value::as_str) {
-            return status.to_owned();
+    if semantic_error_code(response).is_some() {
+        return semantic_error_code(response).unwrap_or_default();
+    }
+    for path in ["/result/structuredContent/data", "/result/result/data"] {
+        if response.pointer(path).is_some_and(|value| !value.is_null()) {
+            return "ok".to_owned();
         }
     }
     "ok".to_owned()
@@ -575,9 +620,10 @@ fn envelope_status(response: &Value) -> String {
 
 fn runtime_error_reason(response: &Value) -> Option<String> {
     for path in [
-        "/result/structuredContent/runtime_error/reason",
-        "/result/structuredContent/result/runtime_error/reason",
-        "/result/result/runtime_error/reason",
+        "/result/structuredContent/errors/0/details/reason",
+        "/result/structuredContent/errors/0/message",
+        "/result/result/errors/0/details/reason",
+        "/result/result/errors/0/message",
     ] {
         if let Some(reason) = response.pointer(path).and_then(Value::as_str) {
             return Some(reason.to_owned());
@@ -588,7 +634,23 @@ fn runtime_error_reason(response: &Value) -> Option<String> {
 
 fn runtime_u64(response: &Value, field: &str) -> Option<u64> {
     response
-        .pointer("/result/structuredContent/telemetry/runtime")
+        .pointer("/result/structuredContent/errors/0/details")
         .and_then(|runtime| runtime.get(field))
         .and_then(Value::as_u64)
+}
+
+fn semantic_error_code(response: &Value) -> Option<String> {
+    for path in ["/result/structuredContent/errors", "/result/result/errors"] {
+        let Some(errors) = response.pointer(path).and_then(Value::as_array) else {
+            continue;
+        };
+        for error in errors {
+            if error.get("severity").and_then(Value::as_str) == Some("error")
+                && let Some(code) = error.get("code").and_then(Value::as_str)
+            {
+                return Some(code.to_owned());
+            }
+        }
+    }
+    None
 }

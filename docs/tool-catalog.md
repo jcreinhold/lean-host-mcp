@@ -1,404 +1,254 @@
 # Tool Catalog
 
-`lean-host-mcp` exposes a small, declaration-centric proof-agent surface. You name a declaration — and, when it matters,
-a position inside its proof — and the tools read the goal state, retrieve relevant lemmas, inspect declarations, test
-tactics, and verify results. There are no raw span, hover, type-at, source-grep, or arbitrary-query tools; the surface
-is the proof workflow, not a mirror of Lean's internals.
+`lean-host-mcp` exposes five semantic Lean tools. Each tool has a `kind` field
+that selects a mode inside that job family. The surface is intentionally small:
+it gives an agent proof context, safe experiments, verification, semantic
+lookup, and cheap status without exposing raw Lean worker primitives.
 
 ```text
-proof_state -> search_for_proof -> inspect_declaration -> try_proof_step -> verify_declaration
+lean_context -> lean_lookup -> lean_trial -> lean_verify
+                         \-> lean_status
 ```
 
-`find_references` is the companion semantic-lookup tool.
+Every call is read-only. The server reads files, elaborates in memory, and never
+writes source.
 
-## Typical workflow
+## Response Shape
 
-A proof agent usually moves left to right along that arrow:
+All public tools return the semantic response baseline:
 
-1. **`proof_state`** to read what's left to prove at the current position — the open *goals* (the propositions still to
-   be shown), the local hypotheses, and the expected type.
-2. **`search_for_proof`** to get a ranked list of declarations that might close or advance the goal. Each row is
-   lightweight metadata only.
-3. **`inspect_declaration`** on a promising candidate to read its full statement, docstring, and attributes before
-   committing to it.
-4. **`try_proof_step`** to run a candidate tactic at the position and see whether it closes the goal or what new goals
-   it leaves — all in memory, without editing the file.
-5. **`verify_declaration`** to confirm the whole declaration type-checks, optionally rejecting `sorry` or reporting the
-   axioms it depends on.
-
-Every response is wrapped in the shared envelope (`status`, `result`, `freshness`, optional `telemetry`, …) described in
-the [README](../README.md#response-envelope). Lean-domain outcomes — a failed tactic, a rejected proof, a missing import
-— are part of a successful (`status: "ok"`) result. A full project mailbox or a restart-loop failure is reported as a
-retryable `runtime_unavailable` response, documented in [`operations.md`](operations.md#runtime-error-contract).
-
-Operational telemetry is **omitted by default** (`telemetry.verbosity = quiet`); set `telemetry.verbosity = full` to
-emit it. This gates the top-level `telemetry` block (cache hash, import list, worker `runtime` facts) and the per-tool
-diagnostics that are pure tuning signal: `proof_state`'s `query_facts` and `search_for_proof`'s `funnel`. Load-bearing
-signals an agent acts on — truncation flags, `needs_build`, `proof_state_status`, `search_truncated` — stay regardless.
-The per-call tuning knobs that used to ride on these requests (`max_field_bytes`, `max_total_bytes`, `heartbeat_limit`)
-are now server config — see [`operations.md`](operations.md).
-
-## `proof_state`
-
-The proof context at one position inside a declaration: open goals, local hypotheses, expected type, and diagnostics. A
-*proof position* is a point in the tactic block; a *tactic state* is the set of goals open there.
-
-```json
+```jsonc
 {
-  "file": "LeanRsFixture/ProofActions.lean",
-  "declaration": "LeanRsFixture.ProofActions.stepTheorem"
+  "data": { "...": "mode-specific result" },
+  "errors": [],
+  "trust": {
+    "project_root": "/abs/project",
+    "session_id": "metadata-only-or-worker-session",
+    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2"
+  }
 }
 ```
 
-`proof_position` is optional. When omitted (the default), it targets the **pristine entry goal** — the proof state
-*before any tactic runs*. There, no tactic has executed yet, so `goals_before` and `goals_after` are equal: both are the
-declaration's opening goal. This is the goal a from-scratch tactic block submitted to `try_proof_step` (also at its
-default) will elaborate against — the two tools agree on where the default proof starts.
+Lean-domain outcomes remain data. A failed tactic, a rejected declaration, an
+ambiguous name, or a `needs_build` verdict is not an MCP transport error.
+Infrastructure failures that the client can retry, such as worker admission
+pressure or restart-loop exhaustion, appear in `errors` with structured details.
+Warnings and next actions from the underlying implementation are also carried as
+warning issues in `errors`.
 
-To inspect a *tactic state* instead — the goals open **after** a tactic has run — select it by index:
+## Typical Workflow
+
+1. Call `lean_context` with `kind: "proof_position"` to read the current proof
+   goals, locals, expected type, and diagnostics for a declaration position.
+2. Call `lean_lookup` with `kind: "proof_search"` to retrieve ranked
+   declarations for the goal.
+3. Call `lean_lookup` with `kind: "declaration"` to inspect a promising
+   declaration's statement, docstring, attributes, and flags.
+4. Call `lean_trial` with `kind: "proof_step"` to try one or more tactics in
+   memory without editing the file.
+5. Call `lean_verify` with `kind: "explicit"` to verify the target declaration.
+
+Use `lean_lookup` with `kind: "references"` when the task is semantic reference
+discovery rather than proof search. Use `lean_status` for cheap project and host
+status before spending a worker permit.
+
+## `lean_context`
+
+### `kind: "proof_position"`
+
+Returns proof context for one declaration proof position. The request fields are
+the existing declaration anchor plus an optional proof-position selector:
 
 ```json
-{ "kind": "index", "index": 1 }
+{
+  "kind": "proof_position",
+  "file": "LeanRsFixture/ProofActions.lean",
+  "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+  "proof_position": { "kind": "default" }
+}
 ```
 
-(so `{ "kind": "index", "index": 0 }` is the state after the first tactic), or by the source text just before it:
+When `proof_position` is omitted, the default is the pristine entry goal: the
+state before any tactic runs. This is the same position where a default
+`lean_trial(kind="proof_step")` snippet is spliced.
+
+Other selectors are:
+
+```json
+{ "kind": "index", "index": 0 }
+```
+
+for the state after the first tactic, and:
 
 ```json
 { "kind": "after_text", "text": "skip", "occurrence": 0 }
 ```
 
-For these, `goals_before` is the state entering that tactic and `goals_after` is the state after it; continue a
-`try_proof_step` snippet from `goals_after`, not from `goals_before`.
+for the state after a matched source fragment.
 
-A successful response carries `status: "context"` and the context itself:
+The `data` payload is the proof context result previously produced internally by
+the proof-position operation: status, diagnostics, goals, locals, expected type,
+truncation, and any `needs_build` or ambiguity facts.
 
-```jsonc
-{
-  "status": "context",
-  "declaration_name": "LeanRsFixture.ProofActions.stepTheorem",
-  "goals_before": ["⊢ p ∧ q"],          // goals entering this position
-  "goals_after":  ["⊢ q"],               // goals after the position's tactic (== goals_before at the entry default)
-  "locals": [ { "name": "h", "type_str": { "value": "p", "truncated": false }, "value": null } ],
-  "expected_type": { "value": "p ∧ q", "truncated": false },
-  "truncated": false,
-  "query_facts": { "cache_status": "hit", "output_bytes": 412 /* … */ }  // full verbosity only
-}
-```
+## `lean_trial`
 
-A header that doesn't parse returns `status: "header_parse_failed"`; a worker without the optional module-query shim
-returns `status: "unsupported"`. The source spans in responses are diagnostic evidence, not edit handles. When a
-selector cannot resolve because the project build is incomplete, it appears in a `needs_build` array (distinct from
-`unavailable`) and a top-level warning names the `lake build` cue — see
-[The `needs_build` signal](#the-needs_build-signal).
+### `kind: "proof_step"`
 
-## `search_for_proof`
-
-Ranked declarations relevant to the next proof step. Give it a declaration target when you have a file:
+Tries one or more proof snippets at a declaration proof position against an
+in-memory source snapshot. It never writes files.
 
 ```json
 {
-  "file": "LeanRsFixture/ProofActions.lean",
-  "declaration": "LeanRsFixture.ProofActions.stepTheorem",
-  "mode": "next_step",
-  "limit": 10
-}
-```
-
-or explicit goal/type text when you don't:
-
-```json
-{
-  "goal": "⊢ True",
-  "imports": ["LeanRsFixture.SourceRanges"],
-  "mode": "exact"
-}
-```
-
-`mode` shapes the ranking and the suggested snippet — `next_step` (default), `exact`, `apply`, `rewrite`, or `simp`.
-`limit` is clamped to 1–20 (default 10). Rows carry bounded metadata only — name, kind, module, source, a relevance
-`score`, a `match_reason`, and a ready-to-paste `suggested_snippet` — not full statements. Inspect a chosen candidate by
-name with `inspect_declaration` to read its statement or attributes.
-
-The semantic lane requires only the same built Lake project every other tool requires; consumers do not declare or
-import `lean-semantic-search`. The server obtains the capability from the package-owned
-`lean-semantic-search-runtime` crate. Declaration features are build-fresh from the consumer modules' `.olean` closure,
-while proof-goal features are edit-fresh from the source text in the request.
-
-```jsonc
-{
-  "candidates": [
-    {
-      "name": "And.intro",
-      "kind": "theorem",
-      "module": "Init.Core",
-      "score": 87,
-      "match_reason": "conclusion_head",
-      "suggested_snippet": "exact And.intro",
-      "source": { "file": "…", "start_line": 1, "start_column": 0, "end_line": 1, "end_column": 0 }
-    }
-    // … up to `limit` rows, ranked best-first
-  ],
-  "diagnostics": {
-    "proof_state_status": "context",   // where the goal came from; `context` = live proof state
-    "returned_count": 1,
-    "search_truncated": false,
-    "funnel": { "search_count": 3, "generated_count": 1840, "pruned_count": 120 /* … */ }  // full verbosity only
-  }
-}
-```
-
-## `inspect_declaration`
-
-Everything known about one declaration, by name: source location, statement, docstring, attributes, and flags.
-
-```json
-{
-  "name": "Nat.add_zero",
-  "imports": ["Mathlib.Data.Nat.Basic"],
-  "fields": ["statement", "attributes"]
-}
-```
-
-`fields` selects which parts to return (all default on). For a project declaration, pass `file` to derive the local
-imports needed to resolve it:
-
-```json
-{
-  "name": "LeanRsFixture.SourceRanges.knownTheorem",
-  "file": "LeanRsFixture/SourceRanges.lean"
-}
-```
-
-`statement` is pretty-printed by default (notation-aware, `pp.universes false`) — an editor-`hover`-quality signature
-rather than a fully-elaborated term. `statement_rendering` reports the path that produced it (`"pretty"`, or `"raw"`
-when the pretty-printer fell back). Set `"raw_statement": true` for the fully-elaborated `Expr.toString` form.
-
-The result is one of `found`, `not_found`, `needs_build`, or `unsupported`. `needs_build` means the name's import
-closure reached an unbuilt `.olean`, so it could not be resolved against a complete environment — distinct from
-`not_found`, which would falsely claim the declaration does not exist (see
-[The `needs_build` signal](#the-needs_build-signal)). A `found` declaration looks like:
-
-```jsonc
-{
-  "status": "found",
-  "declaration": {
-    "name": "Nat.add_zero",
-    "kind": "theorem",
-    "module": "Init.Data.Nat.Basic",
-    "statement": { "value": "∀ (n : Nat), n + 0 = n", "truncated": false },
-    "statement_rendering": "pretty",
-    "docstring": { "value": "…", "truncated": false },
-    "attributes": ["simp"],
-    "flags": { "is_private": false, "is_generated": false, "is_internal": false }
-  }
-}
-```
-
-Rendered text fields always carry their own `truncated` flag, since output is capped before crossing the worker
-boundary.
-
-## `try_proof_step`
-
-Runs one or more candidate tactics at a proof position and reports what each does — in an in-memory overlay. **It never
-writes source files.** Apply a snippet you like yourself.
-
-```json
-{
+  "kind": "proof_step",
   "file": "LeanRsFixture/ProofActions.lean",
   "declaration": "LeanRsFixture.ProofActions.stepTheorem",
   "snippet": "trivial"
 }
 ```
 
-`proof_position` shares the [`proof_state` selector](#proof_state). When omitted (the default), the snippet is spliced
-*before the first tactic* and elaborates against the pristine entry goal — the same goal `proof_state`'s default reports
-as `goals_before`. So a from-scratch tactic block read off `proof_state` works at the default. To continue *after* an
-existing tactic instead, target `{ "kind": "index", "index": N }` / `after_text` and write a snippet that picks up from
-that position's `goals_after`; a from-scratch block there will re-introduce binders already in scope and fail (the
-response flags this).
-
-Pass `snippets` (a list) to try several at once; up to 8 candidates are attempted, the rest reported as
-`budget_exceeded`. Each candidate reports its status (`closed`, `progressed`, `failed`, `timeout`, …), the diagnostics
-it produced, the goals it leaves behind, and the resolved declaration/position it ran against:
-
-```jsonc
-{
-  "status": "ok",
-  "result": {
-    "candidates": [
-      {
-        "id": "0",
-        "status": "closed",                 // this snippet closed the goal
-        "snippet": { "value": "trivial", "truncated": false },
-        "goals": [],                          // none left
-        "diagnostics": { "diagnostics": [], "truncated": false }
-      }
-    ],
-    "candidate_limit": 8,
-    "candidates_truncated": false
-  }
-}
-```
-
-## `verify_declaration`
-
-Elaborates an in-memory snapshot and checks whether one declaration type-checks, under the requested `sorry`/axiom
-policy. **It never writes source files.**
+Use `snippets` to try a bounded list independently:
 
 ```json
 {
+  "kind": "proof_step",
   "file": "LeanRsFixture/ProofActions.lean",
   "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+  "snippets": ["simp", "exact h"]
+}
+```
+
+The response reports each candidate's status, diagnostics, resulting goals, and
+whether the candidate set was truncated.
+
+## `lean_verify`
+
+### `kind: "explicit"`
+
+Verifies one named declaration in a file, in memory.
+
+```json
+{
+  "kind": "explicit",
+  "file": "LeanRsFixture/ProofActions.lean",
+  "declaration": "LeanRsFixture.ProofActions.closedTheorem",
   "allow_sorry": false,
   "report_axioms": true
 }
 ```
 
-`verification_status` is the verdict — `verified`, `has_sorry`, `has_unresolved_goals`, `has_diagnostics`, `not_found`,
-`needs_build`, `ambiguous`, `worker_recycled`, and so on. A policy failure (e.g. a `sorry` when `allow_sorry` is false)
-is a normal structured result, not an infrastructure error.
+The initial mode is intentionally only a single explicit target. File-all,
+module-all, and changed-target verification are later workflow modes, not part
+of this baseline.
 
-`worker_recycled` means the worker was recycled or restarted *during* this call (a memory-pressure recycle on a heavy
-module, or a crash-and-retry), so a non-positive verdict here is a likely casualty of the recycle rather than a real
-result. `facts.facts_trustworthy` is `false` and a top-level warning names the cause and suggests a retry. A `verified`
-verdict is never relabeled — verification is monotone, so an accepted declaration stays trustworthy even under duress.
-See [The `worker_recycled` signal](#the-worker_recycled-signal).
+## `lean_lookup`
 
-`needs_build` means the name could not be resolved against a complete project environment — usually because the project
-is not fully built — so the facts were computed against a degraded environment. `ambiguous` means the name genuinely
-resolves to more than one declaration; `facts.candidates` names the competitors (fully-qualified) so you can
-disambiguate. In both cases `facts.facts_trustworthy` is `false` and a top-level `warning` carries the cue (`lake build`
-for `needs_build`, fully-qualify for `ambiguous`); it is `true` only for clean verdicts that checked a resolved target.
-Do not read a clean `contains_sorry:false` / `unresolved_goals:[]` as "verified" when `facts_trustworthy` is `false`.
+### `kind: "declaration"`
 
-`facts.axioms_available` distinguishes "checked, no nontrivial axioms" (`true` with empty `axioms`) from "could not
-check" (`false` — target unresolved or budget exhausted); when `false` and `report_axioms` was requested, a warning says
-the axiom list is not authoritative.
-
-```jsonc
-{
-  "status": "ok",
-  "result": {
-    "status": "ok",
-    "verification_status": "verified",
-    "facts": {
-      "contains_sorry": false,
-      "unresolved_goals": [],
-      "axioms": ["propext", "Classical.choice", "Quot.sound"],  // when report_axioms is true
-      "axioms_available": true,
-      "diagnostics": { "diagnostics": [], "truncated": false },
-      "facts_trustworthy": true
-    }
-  }
-}
-```
-
-## `find_references`
-
-Semantic — not textual — lookup of every use of a fully-qualified name. Binders are reported as `kind: "def"`, uses as
-`kind: "ref"`. Scope is one file:
+Inspects one declaration by name. Use `file` when local imports or namespace
+context are needed; use `imports` for explicit import context.
 
 ```json
 {
-  "name": "LeanRsFixture.SourceRanges.knownTheorem",
+  "kind": "declaration",
+  "name": "Nat.add_zero",
+  "imports": ["Init"]
+}
+```
+
+Optional `fields` can select `source`, `statement`, `docstring`, `attributes`,
+and `flags`; `raw_statement` asks for the raw elaborated term.
+
+### `kind: "proof_search"`
+
+Returns ranked declarations relevant to a proof goal. The target can come from a
+file/declaration position:
+
+```json
+{
+  "kind": "proof_search",
+  "file": "LeanRsFixture/ProofAgent.lean",
+  "declaration": "LeanRsFixture.ProofAgent.miniRatDenominatorStep",
+  "mode": "next_step",
+  "limit": 10
+}
+```
+
+or from explicit goal/type text:
+
+```json
+{
+  "kind": "proof_search",
+  "goal": "⊢ True",
+  "imports": ["LeanRsFixture.SourceRanges"],
+  "mode": "exact"
+}
+```
+
+Modes are `next_step`, `exact`, `apply`, `rewrite`, and `simp`. `limit` is
+clamped to the tool cap.
+
+### `kind: "references"`
+
+Finds semantic references to a fully-qualified Lean name.
+
+File scope elaborates one anchor file through the worker, so it reflects the
+current source snapshot:
+
+```json
+{
+  "kind": "references",
+  "name": "LeanRsFixture.ProofActions.closedTheorem",
   "scope": "file",
-  "file": "LeanRsFixture/SourceRanges.lean"
-}
-```
-
-or the project, optionally narrowed to an explicit file list and a `limit` (capped at 1000):
-
-```json
-{
-  "name": "LeanRsFixture.SourceRanges.knownTheorem",
-  "scope": "project",
-  "files": ["LeanRsFixture/SourceRanges.lean"],
+  "file": "LeanRsFixture/ProofActions.lean",
   "limit": 20
 }
 ```
 
-```jsonc
+Project scope reads the on-disk `.ilean` reference index and does not open a
+worker:
+
+```json
 {
-  "status": "ok",
-  "references": [
-    { "file": "…/SourceRanges.lean", "line": 12, "column": 8, "end_line": 12, "end_column": 20, "kind": "def" },
-    { "file": "…/Uses.lean",         "line": 7,  "column": 4, "end_line": 7,  "end_column": 16, "kind": "ref" }
-  ],
-  "truncated": false,
-  "files_scanned": 2,
-  "files_skipped": 0
+  "kind": "references",
+  "name": "LeanRsFixture.ProofSearchFacts.MiniRat",
+  "scope": "project",
+  "files": ["LeanRsFixture/ProofSearchFacts.lean"],
+  "limit": 100
 }
 ```
 
-### `file` vs `project`: edit-fresh vs build-fresh
+## `lean_status`
 
-The two scopes deliberately read from different sources because they answer different questions:
+### `kind: "project"`
 
-- **`file`** elaborates the one anchor file through the worker, so its results reflect that file's **current source** —
-  _edit-fresh_, no `lake build` required. `files_scanned`/`files_skipped` count the single anchor file.
-- **`project`** reads Lean's on-disk `.ilean` reference index (written by `lake build`), so it returns the whole-project
-  answer in milliseconds with **no per-file elaboration and no worker query**. Results are therefore **build-fresh**:
-  they reflect the **last `lake build`**, not unsaved or post-build edits. `files_scanned`/`files_skipped` count the
-  `.ilean` modules parsed / skipped (a malformed or unreadable index is skipped, never fatal). The complete result is
-  returned up to `limit` (then `truncated: true` on a stable, sorted prefix).
+Returns cheap project, toolchain, output, broker, and admission configuration.
+This mode uses Lake metadata only and does not open a worker or consume a
+semantic permit.
 
-So `project` is the fast, exhaustive view of the built project, and `file` is the live view of the file you are editing.
-A name with no recorded uses returns an empty `references` list — a legitimate "no references" answer, not a degrade.
+```json
+{ "kind": "project" }
+```
 
-If the project has **never been built** (no `.lake/build/lib/lean`), project scope does **not** invent an empty "no
-references" answer: it returns `references: []` with a top-level `needs_build` warning naming the `lake build` cue — the
-same honest verdict every resolution-bearing tool gives for an unbuilt project. If the index exists but some
-contributing module's source is **newer than its `.ilean`** (edited since the last build), the result rides a freshness
-warning noting that project-scope results are build-fresh and a `lake build` will refresh them — a note, never an error.
+Use `project` to override the default Lake root:
 
-`file` scope still reports header-parse failures, files with missing imports, and unsupported files when they apply, and
-degrades a missing `.olean` (an unbuilt transitive dependency) to the same top-level `needs_build` warning rather than
-failing the request.
+```json
+{ "kind": "project", "project": "/abs/path/to/lake/project" }
+```
 
-## The `needs_build` signal
+Prompt 73 extends this status surface with typed trust and artifact facts.
 
-Every resolution-bearing tool shares one honest verdict for "the project environment is incomplete."
-`verify_declaration` reports it as `verification_status: "needs_build"`; `inspect_declaration` as
-`status: "needs_build"`; `proof_state` collects the affected selectors in a `needs_build` array (distinct from
-`unavailable`); `try_proof_step` returns an empty `missing_imports` envelope; `find_references` and `search_for_proof`
-surface it as a top-level warning. In every case the warning text and a `lake build` next action are identical. The fix
-is always the same: run `lake build`, resolve errors, then retry.
+## Maintainer Migration Table
 
-The environment can be incomplete two ways, and both now reach the same verdict. The worker reports a *requested* import
-it could not load as a typed missing-imports/`needs_build` outcome. Separately, when the target's own import closure
-reaches an unbuilt **transitive** dependency, the header import fails with a missing `.olean` — and
-`verify_declaration`, `inspect_declaration`, `proof_state`, and `try_proof_step` now degrade that to `needs_build` too
-(previously it escaped as a hard error), exactly as `find_references` and `search_for_proof` already did. So every
-resolution-bearing tool shares one verdict whichever way the build is incomplete; the warning names the blocking
-`lake build`.
+The old public tools are no longer registered. Existing implementation code is
+still reused internally behind the semantic modes.
 
-This replaces what used to be a misleading `"ambiguous"` verdict with no candidates, or a hard error. The worker now
-classifies resolution at its own boundary, so `"ambiguous"` is reserved for *genuine* multiple-resolution and always
-arrives with the competing declarations named (`proof_state`'s `ambiguous` array, `verify_declaration`'s
-`facts.candidates`), with a fully-qualify next action.
+| Old public tool | New public tool and mode |
+| --- | --- |
+| `proof_state` | `lean_context`, `kind: "proof_position"` |
+| `try_proof_step` | `lean_trial`, `kind: "proof_step"` |
+| `verify_declaration` | `lean_verify`, `kind: "explicit"` |
+| `inspect_declaration` | `lean_lookup`, `kind: "declaration"` |
+| `search_for_proof` | `lean_lookup`, `kind: "proof_search"` |
+| `find_references` | `lean_lookup`, `kind: "references"` |
 
-## The `worker_recycled` signal
-
-`needs_build` and `ambiguous` are about the *input* (the environment was incomplete, or the name was ambiguous).
-`worker_recycled` is about the *execution*: the worker was recycled or restarted while the call was in flight. On a
-heavy module the worker's resident memory can cross its post-job RSS budget, triggering a recycle right after the job;
-or the job can crash the worker and be retried. Either way the verdict was computed under infrastructure duress, so a
-non-positive outcome — a rejection, `not_found`, a failed tactic, or empty goals — may be a casualty of the recycle
-rather than a real result.
-
-The signal comes from the call's runtime facts (`telemetry.runtime.call_restart`), which the parent already attaches,
-not from a new worker outcome. The `worker_recycled` warning and `verification_status` are load-bearing, so they reach
-the agent regardless of `telemetry.verbosity`; the underlying `runtime` facts are only serialized under `full`. Only
-*job-disrupting* causes count (`rss_post_job`, `child_abort`, `child_exit`, `session_missing`, `worker_internal`,
-`timeout`, `cancelled`); a pre-job `rss_import_switch` cycle runs the job on a fresh worker and is not flagged.
-`verify_declaration` relabels a non-positive verdict to `verification_status: "worker_recycled"` with
-`facts.facts_trustworthy: false`; `try_proof_step` and `proof_state` keep their result shape but carry a top-level
-warning, since they have no single verdict to relabel. In every case the next action is to retry — and if it persists,
-the module is too heavy for the worker's memory budget (raise `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB`, or verify
-out-of-band with `lake build <module>` / `lake env lean <file>`). A `verified` result is left untouched: verification is
-monotone, so an accepted declaration is trustworthy even if the worker recycled afterward.
-
-To gauge *how often* this is happening, under `telemetry.verbosity = full` every response's `telemetry.runtime` carries
-`restarts_total` and a per-cause breakdown `restarts_by_cause` over the worker's lifetime, and each recycle is logged to
-the server's stderr (see [operations.md](operations.md#observing-worker-recycles)). A high `rss_post_job` count is the
-cue to raise the post-job RSS ceiling.
+Do not re-add compatibility aliases for the old names.

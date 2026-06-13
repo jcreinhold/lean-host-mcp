@@ -2,8 +2,8 @@
 
 Operational reference for `lean-host-mcp`: tuning knobs, transport internals, the full runtime-error contract, and the
 test and performance harness. Most users need none of this — start with the [README](../README.md) and the
-[tool catalog](tool-catalog.md). Reach for this page when you are sizing a deployment, debugging a `runtime_unavailable`
-response, or working on the server itself.
+[tool catalog](tool-catalog.md). Reach for this page when you are sizing a deployment, debugging a retryable runtime
+issue in `errors`, or working on the server itself.
 
 ## Configuration file
 
@@ -45,7 +45,7 @@ description (e.g. "5 GiB") is for reading, not for setting.
 | `runtime.import_switch_rss_soft_kib` | integer (KiB) | `2097152` | `LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB` | Soft restart ceiling applied when a call needs a different import set than the live worker holds. Must not exceed the post-job ceiling. Default 2 GiB. |
 | `runtime.module_cache_rss_guard_kib` | integer (KiB) | `2097152` | `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Resident-memory ceiling above which the per-worker module-query cache stops growing. Default 2 GiB. |
 | `runtime.module_cache_max_bytes` | integer (bytes) | `33554432` | `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Maximum size of the per-worker module-query result cache, in bytes. Default 32 MiB. |
-| `runtime.request_timeout_millis` | integer (ms) | `120000` | `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS` | Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose verify/proof_state legitimately runs longer; lower it to bound a single heavy file query. Default 120 s. |
+| `runtime.request_timeout_millis` | integer (ms) | `120000` | `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS` | Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose lean_verify/lean_context work legitimately runs longer; lower it to bound a single heavy file query. Default 120 s. |
 | `runtime.project_mailbox_capacity` | integer | `8` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls may queue for one project's worker before new calls are shed with a retryable busy status. |
 | `runtime.worker_restart_limit` | integer | `3` | `LEAN_HOST_MCP_WORKER_RESTART_LIMIT` | How many worker restarts are tolerated within the restart window before the project is marked unhealthy. |
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
@@ -57,11 +57,11 @@ description (e.g. "5 GiB") is for reading, not for setting.
 | `broker.semantic_lock_dir` | path | unset | `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR` | Directory for OS-visible cross-process semantic admission locks. Unset uses the per-user cache directory. Parallel servers sharing a directory must agree on broker.semantic_permits. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
 | `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
-| `server.response_carrier` | string (text, structured, both) | `"text"` | `LEAN_HOST_MCP_RESPONSE_CARRIER` | Which field of the tool result carries the envelope. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text. |
-| `telemetry.verbosity` | string (quiet, full) | `"quiet"` | `LEAN_HOST_MCP_TELEMETRY_VERBOSITY` | How much operational telemetry the envelope carries. quiet keeps proof-relevant content and drops the runtime block, manifest hash, and full import list; full emits everything for debugging. Default quiet. |
+| `server.response_carrier` | string (text, structured, both) | `"text"` | `LEAN_HOST_MCP_RESPONSE_CARRIER` | Which field of the tool result carries the semantic response. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text. |
+| `telemetry.verbosity` | string (quiet, full) | `"quiet"` | `LEAN_HOST_MCP_TELEMETRY_VERBOSITY` | How much operational telemetry the internal operation envelope keeps before semantic response adaptation. quiet keeps proof-relevant content and drops the runtime block, manifest hash, and full import list; full emits everything for debugging. Default quiet. |
 | `output.max_field_bytes` | integer (bytes) | unset | `LEAN_HOST_MCP_OUTPUT_MAX_FIELD_BYTES` | Override the per-field output byte cap for all tools. Unset keeps each tool's built-in default (8 KiB for inspection, 4 KiB for proof actions). Clamped to 256 bytes to 64 KiB. |
 | `output.max_total_bytes` | integer (bytes) | unset | `LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES` | Override the total output byte cap for all tools. Unset keeps the built-in 64 KiB default. Clamped to 1 KiB to 64 KiB. |
-| `output.heartbeat_limit` | integer (heartbeats) | unset | `LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT` | Default elaboration heartbeat budget for try_proof_step and verify_declaration. Unset uses the worker default. Bounds runaway tactics. |
+| `output.heartbeat_limit` | integer (heartbeats) | unset | `LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT` | Default elaboration heartbeat budget for lean_trial proof_step and lean_verify explicit. Unset uses the worker default. Bounds runaway tactics. |
 
 <!-- END GENERATED -->
 
@@ -143,66 +143,79 @@ an executable name, command substring, or port number.
 
 ## Runtime-error contract
 
-Every tool returns the same envelope (the `ok` shape is in the [README](../README.md#response-envelope)). Recoverable
-runtime and project-controller failures are normal tool responses with `status: "runtime_unavailable"`, not JSON-RPC
-errors:
+Every public tool returns the same semantic shape (see the [README](../README.md#response-shape)). Recoverable runtime
+and project-controller failures are normal tool responses with `data: null` and a structured issue in `errors`, not
+JSON-RPC errors:
 
 ```jsonc
 {
-  "status": "runtime_unavailable",
-  "result": null,
-  "runtime_error": {
-    "reason": "semantic_admission_timeout",
-    "retryable": true,
+  "data": null,
+  "errors": [
+    {
+      "code": "runtime_unavailable",
+      "message": "semantic_admission_timeout",
+      "severity": "error",
+      "retryable": true,
+      "details": {
+        "reason": "semantic_admission_timeout",
+        "project_root": "/abs/path",
+        "session_id": "uuid",
+        "worker_generation": 3,
+        "worker_restarted": false,
+        "restart_cause": null,
+        "rss_kib": 2097152,
+        "limit_kib": null,
+        "retry_after_millis": 60000,
+        "restarts_in_window": 1,
+        "window_millis": 60000
+      }
+    }
+  ],
+  "trust": {
     "project_root": "/abs/path",
     "session_id": "uuid",
-    "worker_generation": 3,
-    "worker_restarted": false,
-    "restart_cause": null,
-    "rss_kib": 2097152,
-    "limit_kib": null,
-    "retry_after_millis": 60000,
-    "restarts_in_window": 1,
-    "window_millis": 60000
-  },
-  "freshness": { /* same shape as the ok envelope */ },
-  "runtime": { /* best-known runtime facts */ },
-  "warnings": [],
-  "next_actions": []
+    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2"
+  }
+}
+```
+
+Warnings and next actions from operation-level results are warning issues:
+
+```jsonc
+{
+  "code": "warning",
+  "message": "the project may not be fully built...",
+  "severity": "warning",
+  "next_action": "lake build # complete the project environment, then retry"
 }
 ```
 
 Which failures land where:
 
-- **Lean-domain failures** — parse errors, elaboration diagnostics, kernel rejection, meta timeout — are part of the
-  `ok` payload. A failed proof is a successful tool call.
+- **Lean-domain failures** — parse errors, elaboration diagnostics, kernel rejection, meta timeout — are part of `data`.
+  A failed proof is a successful tool call.
 - **Retryable runtime failures** — admission pressure, mailbox pressure (`busy`), worker death, session loss, RSS
-  hard-kill — are `runtime_unavailable` responses with `retryable: true`.
-- **MCP errors** are reserved for invalid requests, I/O and config failures, internal-invariant violations, and unusable
-  Lake projects.
+  hard-kill — are `errors` with `code: "runtime_unavailable"` and `retryable: true`.
+- **MCP errors** are reserved for I/O and config failures, internal-invariant violations, and unusable Lake projects.
 
-### `freshness` and `runtime` fields
+### Internal runtime facts
 
-`freshness.imports` is the import vector used for that call: explicit request imports for declaration and proof-search
-tools, file-header imports for module-query tools. An empty array means the call used no extra imports beyond the
-worker's base environment.
-
-`runtime` is attached to semantic tool calls. It reports the current worker generation, whether this call observed or
-performed a restart, retry count, admission wait, actor queue wait, RSS when available, the import profile,
-profile-switch count, `call_restart` for this call, and `last_restart` as lifecycle history. These let a client
-distinguish a Lean-domain result from infrastructure recovery.
+The operation layer still computes freshness/import and runtime facts before semantic response adaptation. Runtime facts
+include worker generation, whether a call observed or performed a restart, retry count, admission wait, controller queue
+wait, RSS when available, import profile, profile-switch count, and restart history. Prompt 73 promotes the trust and
+artifact facts that should become public under `trust`.
 
 ## Capability shims and module queries
 
-`proof_state` is the common proof-agent call: one request returns a compact context — diagnostics, goals, locals,
-expected type, target declaration, and the surrounding declaration. It depends on the optional bounded
+`lean_context(kind = "proof_position")` is the common proof-agent context call: one request returns compact diagnostics,
+goals, locals, expected type, target declaration, and the surrounding declaration. It depends on the optional bounded
 `lean_rs_host_process_module_query_batch` shim; a worker whose bundled shims lack that capability answers
 `{ "status": "unsupported" }`. No public tool requests or caches whole-file info trees. Successful responses carry
 `query_facts` (worker cache status, output bytes, phase timings), and repeated calls reach the worker snapshot cache, so
 warm behavior is observable.
 
 Files whose header imports modules the server's open env doesn't have are still processed; missing imports surface as an
-envelope warning. Files using Lean 4's module-system header syntax — `module`, `public import`, `import all`, and
+semantic warning issue. Files using Lean 4's module-system header syntax — `module`, `public import`, `import all`, and
 `meta import` — are supported. A header that doesn't parse short-circuits to `header_parse_failed`.
 
 Unlike an external LSP process, the host can still start when unrelated project modules are broken. Calls whose imports
@@ -273,8 +286,9 @@ members and silently links `libleanshared` into the parent. The invariant is ass
 The ignored `smoke_perf` integration test is the black-box baseline harness for proof-agent work. It starts the compiled
 stdio MCP server, calls `tools/list`, runs representative tool calls, and emits JSONL rows with wall time, serialized
 response bytes, 32 KiB / 64 KiB budget flags, status, warning count, observable project-session changes, and process RSS
-when the platform exposes it. For `proof_state`, rows also include the worker module-cache status, worker-reported
-output bytes, phase timings, and optional worker cache size facts. The budget constants are test-only guardrails:
+when the platform exposes it. For `lean_context(kind = "proof_position")`, rows also include the worker module-cache
+status, worker-reported output bytes, phase timings, and optional worker cache size facts. The budget constants are
+test-only guardrails:
 ordinary model-facing responses should aim for 16–32 KiB, with 64 KiB as the default hard ceiling. Production truncation
 is still tool-specific policy.
 

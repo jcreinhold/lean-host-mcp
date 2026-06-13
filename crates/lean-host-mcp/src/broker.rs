@@ -372,6 +372,21 @@ impl ProjectBroker {
         self.runtime_config.request_timeout_millis()
     }
 
+    /// Return the cheap broker-status fields that do not require opening a
+    /// project or touching a worker.
+    #[must_use]
+    pub fn config_snapshot(&self) -> BrokerConfigSnapshot {
+        BrokerConfigSnapshot {
+            max_projects: self.config.max_projects.get(),
+            idle_timeout_secs: self.config.idle_timeout.as_secs(),
+            semantic_permits: self.config.semantic_permits.get(),
+            semantic_waiters: self.config.semantic_waiters.get(),
+            semantic_admission_timeout_millis: millis_u64(self.config.semantic_admission_timeout),
+            semantic_lock_dir: self.config.semantic_lock_dir.to_string_lossy().into_owned(),
+            request_timeout_millis: self.runtime_config.request_timeout_millis(),
+        }
+    }
+
     fn spawn_reaper(self: &Arc<Self>) {
         if self.config.idle_timeout.is_zero() {
             return;
@@ -1047,6 +1062,17 @@ fn broker_call<T>(project: &LeanProject, freshness_imports: &[String], call: Pro
         runtime,
         freshness: project.freshness(freshness_imports),
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct BrokerConfigSnapshot {
+    pub max_projects: usize,
+    pub idle_timeout_secs: u64,
+    pub semantic_permits: usize,
+    pub semantic_waiters: usize,
+    pub semantic_admission_timeout_millis: u64,
+    pub semantic_lock_dir: String,
+    pub request_timeout_millis: u64,
 }
 
 fn freshness_from_meta(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
