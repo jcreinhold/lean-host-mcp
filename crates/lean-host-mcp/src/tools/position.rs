@@ -347,7 +347,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             let imports = read_query_file(&meta.canonical_root, &req.file)
                 .map(|input| input.imports)
                 .unwrap_or_default();
-            return proof_state_needs_build_response(ctx, hint, imports, err).await;
+            return proof_state_needs_build_response(ctx, hint, imports, err);
         }
     };
     let freshness = run.freshness.clone();
@@ -487,15 +487,15 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
 /// closure hit an unbuilt `.olean`: the batch could not run, so report a
 /// `needs_build` selector plus the canonical `lake build` warning — the same
 /// honest verdict the worker-typed `NeedsBuild` routing produces, rather than a
-/// raw transport error. Freshness/runtime come from a registry-hit
-/// `project_runtime` (no worker round-trip), paid only on this rare arm.
-async fn proof_state_needs_build_response(
+/// raw transport error. Freshness/runtime come from the non-spawning broker
+/// identity path, paid only on this rare arm.
+fn proof_state_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
     imports: Vec<String>,
     err: ServerError,
 ) -> Result<Response<ProofStateResult>> {
-    let base = ctx.broker.project_runtime(hint, imports).await?;
+    let base = ctx.broker.project_identity_without_worker(&hint, imports)?;
     let message = err.to_string().lines().next().unwrap_or_default().trim().to_owned();
     let response = Response::ok(needs_build_context(message), base.freshness).with_runtime(base.runtime);
     Ok(crate::diagnosis::warn_needs_build(
@@ -614,7 +614,7 @@ pub enum FindReferencesResult {
 pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> Result<Response<FindReferencesResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
-    let base = ctx.broker.project_runtime(hint.clone(), Vec::new()).await?;
+    let base = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
     let freshness = base.freshness;
     let runtime = base.runtime;
     let root = meta.canonical_root;

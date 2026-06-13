@@ -184,7 +184,7 @@ pub async fn inspect_declaration(
     }
 
     if req.name.trim().is_empty() {
-        let runtime = ctx.broker.project_runtime(hint, req.imports.clone()).await?;
+        let runtime = ctx.broker.project_identity_without_worker(&hint, req.imports.clone())?;
         return Ok(
             Response::ok(DeclarationInspectionResult::NotFound { name: None }, runtime.freshness)
                 .with_runtime(runtime.runtime)
@@ -214,7 +214,7 @@ pub async fn inspect_declaration(
             .await,
     )? {
         CallOutcome::Ready(call) => call,
-        CallOutcome::NeedsBuild(err) => return inspection_needs_build_response(ctx, hint, imports, err).await,
+        CallOutcome::NeedsBuild(err) => return inspection_needs_build_response(ctx, hint, imports, err),
     };
     let projected = project_declaration_inspection(call.value);
     let bare_name_without_context = req.file.is_none() && req.imports.is_empty();
@@ -228,15 +228,15 @@ pub async fn inspect_declaration(
 }
 
 /// Build the degraded inspection verdict when the file's import closure hit an
-/// unbuilt `.olean`. Freshness/runtime come from a registry-hit
-/// `project_runtime` (no worker round-trip), paid only on this rare arm.
-async fn inspection_needs_build_response(
+/// unbuilt `.olean`. Freshness/runtime come from the non-spawning broker
+/// identity path, paid only on this rare arm.
+fn inspection_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
     imports: Vec<String>,
     err: ServerError,
 ) -> Result<Response<DeclarationInspectionResult>> {
-    let base = ctx.broker.project_runtime(hint, imports).await?;
+    let base = ctx.broker.project_identity_without_worker(&hint, imports)?;
     let response = Response::ok(DeclarationInspectionResult::NeedsBuild, base.freshness).with_runtime(base.runtime);
     Ok(warn_needs_build(
         response,

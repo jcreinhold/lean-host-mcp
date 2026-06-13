@@ -75,8 +75,14 @@ under memory pressure, raise `post_job` toward (but below) `hard_kill` — e.g.
 inside one server process. The default lock namespace lives under the current user's cache directory at
 `lean-host-mcp/semantic-admission`; set `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR` only when you need an explicit namespace.
 Permit files are visible as `permit-000.lock`, `permit-001.lock`, and so on, with best-effort holder metadata. Parallel
-servers that share a lock directory must agree on `broker.semantic_permits`; stop existing servers or choose a fresh
-lock directory before changing the limit.
+servers are serialized only when they share the same lock directory. Servers that share a lock directory must also agree
+on `broker.semantic_permits`; a process that requests a different count while another permit is active is rejected with
+`semantic_admission_config`. Stop existing servers or choose a fresh lock directory before changing the limit.
+
+The admission boundary covers every path that may open, spawn, restart, or run a Lean worker. Cheap metadata paths use
+the Lake files directly and do not acquire a semantic permit: degraded `needs_build` responses, invalid-request
+responses, and project-scope `.ilean` reference reads can report project identity without opening a worker. File-scope
+reference lookup and all declaration/proof operations still acquire a permit before the project can open.
 
 ## Observing worker recycles
 

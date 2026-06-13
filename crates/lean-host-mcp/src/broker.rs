@@ -684,18 +684,41 @@ impl ProjectBroker {
         Ok(out)
     }
 
-    /// Return runtime/freshness metadata for a project without submitting worker work.
+    /// Return project identity without opening a worker.
     ///
     /// # Errors
     ///
-    /// Returns resolution or project-open failures.
-    pub async fn project_runtime(&self, hint: ProjectHint, freshness_imports: Vec<String>) -> Result<BrokerCall<()>> {
-        let project = self.project_for(hint).await?;
+    /// Returns resolution or Lake metadata failures.
+    pub fn project_identity_without_worker(
+        &self,
+        hint: &ProjectHint,
+        freshness_imports: Vec<String>,
+    ) -> Result<BrokerCall<()>> {
+        let meta = self.resolve_meta(hint)?;
+        Ok(BrokerCall {
+            value: (),
+            runtime: RuntimeFacts::default(),
+            freshness: freshness_from_meta(&meta, freshness_imports),
+        })
+    }
+
+    /// Return runtime/freshness metadata for a project, admitting any worker open.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, admission, or project-open failures.
+    pub async fn admitted_project_runtime(
+        &self,
+        hint: ProjectHint,
+        freshness_imports: Vec<String>,
+    ) -> Result<BrokerCall<()>> {
+        let (project, permit, _admission_wait_millis) = self.admit_project(hint, &freshness_imports).await?;
         let out = BrokerCall {
             value: (),
             runtime: project.runtime_facts(),
             freshness: project.freshness(&freshness_imports),
         };
+        drop(permit);
         drop(project);
         Ok(out)
     }
@@ -1026,6 +1049,17 @@ fn broker_call<T>(project: &LeanProject, freshness_imports: &[String], call: Pro
     }
 }
 
+fn freshness_from_meta(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
+    Freshness {
+        project_root: meta.canonical_root.to_string_lossy().into_owned(),
+        project_hash: meta.manifest_hash.clone(),
+        imports,
+        session_id: "metadata-only".to_owned(),
+        lean_toolchain: meta.toolchain.clone(),
+        toolchain_advisories: Vec::new(),
+    }
+}
+
 fn millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1049,6 +1083,8 @@ mod tests {
             format!("package {name}\nlean_lib {}\n", name.replace('-', "_")),
         )
         .unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.31.0-rc2\n").unwrap();
+        fs::write(dir.join("lake-manifest.json"), "{}\n").unwrap();
         dir.canonicalize().unwrap()
     }
 
@@ -1128,6 +1164,29 @@ mod tests {
         broker.shutdown_all();
         broker.shutdown_all();
         assert!(broker.resident_paths().is_empty());
+        drop(broker);
+    }
+
+    #[test]
+    fn identity_without_worker_does_not_open_resident_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_lake_dir(tmp.path(), "identity");
+        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None, None));
+
+        let call = broker
+            .project_identity_without_worker(&ProjectHint::Explicit(proj.clone()), vec!["Init".to_owned()])
+            .unwrap();
+
+        assert_eq!(call.freshness.project_root, proj.to_string_lossy());
+        assert_eq!(call.freshness.session_id, "metadata-only");
+        assert_eq!(call.freshness.imports, vec!["Init"]);
+        assert_eq!(call.runtime.worker_generation, 0);
+        assert!(!call.runtime.worker_restarted);
+        assert_eq!(call.runtime.restarts_total, 0);
+        assert!(
+            broker.resident_paths().is_empty(),
+            "identity path must not open a LeanProject"
+        );
         drop(broker);
     }
 

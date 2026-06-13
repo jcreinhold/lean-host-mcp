@@ -64,7 +64,10 @@ fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize) -> Arc<
 }
 
 async fn touch(broker: &Arc<ProjectBroker>, hint: ProjectHint) {
-    broker.project_runtime(hint, Vec::new()).await.expect("project_runtime");
+    broker
+        .admitted_project_runtime(hint, Vec::new())
+        .await
+        .expect("admitted_project_runtime");
 }
 
 fn bench_warm(c: &mut Criterion, rt: &Runtime, root: &Path) {

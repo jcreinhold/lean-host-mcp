@@ -136,8 +136,9 @@ All tunable knobs (worker memory ceilings, pool sizing, transport) can also be s
 vars. Run `lean-host-mcp config init` to write a documented starter with every option at its default, then edit it. See
 [Configuration file](docs/operations.md#configuration-file) for discovery and precedence, and
 [Configuration reference](docs/operations.md#configuration-reference) for the full per-knob table.
-`broker.semantic_permits` is a per-user cross-process admission limit by default; parallel servers sharing the same
-semantic lock directory queue semantic calls until a permit is free.
+`broker.semantic_permits` is a per-user cross-process admission limit by default; parallel servers that share the same
+semantic lock directory queue worker-opening semantic calls until a permit is free. Metadata-only degraded responses and
+project-scope `.ilean` reference reads do not open workers and do not consume permits.
 
 ## Response envelope
 

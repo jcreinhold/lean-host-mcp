@@ -95,7 +95,9 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     let extra_rows = capped_candidate_rows(&req);
 
     if candidates.is_empty() {
-        let runtime = ctx.broker.project_runtime(hint, input.imports.clone()).await?;
+        let runtime = ctx
+            .broker
+            .project_identity_without_worker(&hint, input.imports.clone())?;
         return Ok(Response::ok(
             ProofAttemptResult::Ok {
                 result: ProofAttemptEnvelope {
@@ -136,7 +138,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
             .await,
     )? {
         CallOutcome::Ready(call) => call,
-        CallOutcome::NeedsBuild(err) => return proof_step_needs_build_response(ctx, hint, imports, err).await,
+        CallOutcome::NeedsBuild(err) => return proof_step_needs_build_response(ctx, hint, imports, err),
     };
     let taint = execution_taint(&call.runtime).cloned();
     let mut response = Response::ok(
@@ -215,13 +217,13 @@ fn attempt_reintroduces_bound_binders(response: &Response<ProofAttemptResult>) -
 /// hit an unbuilt `.olean`: no candidate could run against an incomplete
 /// environment. Mirrors the verify degrade — a `missing_imports` result plus
 /// the canonical `needs_build` warning naming the blocking olean.
-async fn proof_step_needs_build_response(
+fn proof_step_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
     imports: Vec<String>,
     err: ServerError,
 ) -> Result<Response<ProofAttemptResult>> {
-    let base = ctx.broker.project_runtime(hint, imports.clone()).await?;
+    let base = ctx.broker.project_identity_without_worker(&hint, imports.clone())?;
     let mut response = Response::ok(needs_build_attempt_result(imports), base.freshness).with_runtime(base.runtime);
     response
         .next_actions
@@ -262,7 +264,9 @@ pub async fn verify_declaration(
     let file_label = input.resolved.to_string_lossy().into_owned();
     let budgets = proof_action_budgets(&ctx.config.output);
     if req.declaration.trim().is_empty() {
-        let runtime = ctx.broker.project_runtime(hint, input.imports.clone()).await?;
+        let runtime = ctx
+            .broker
+            .project_identity_without_worker(&hint, input.imports.clone())?;
         return Ok(
             Response::ok(DeclarationVerificationResult::Unsupported, runtime.freshness)
                 .with_runtime(runtime.runtime)
@@ -300,7 +304,7 @@ pub async fn verify_declaration(
             .await,
     )? {
         CallOutcome::Ready(call) => call,
-        CallOutcome::NeedsBuild(err) => return verification_needs_build_response(ctx, hint, imports, err).await,
+        CallOutcome::NeedsBuild(err) => return verification_needs_build_response(ctx, hint, imports, err),
     };
     // If the worker was recycled/crashed mid-call, a non-positive verdict is a
     // likely casualty of the recycle, not a real result; relabel it honestly
@@ -371,16 +375,15 @@ fn relabel_recycled_verdict(result: &mut DeclarationVerificationResult) -> bool 
 }
 
 /// Build the degraded verdict + envelope when `verify_declaration`'s target
-/// import closure hit an unbuilt `.olean`. Freshness/runtime come from
-/// [`crate::broker::ProjectBroker::project_runtime`], a registry hit with no
-/// worker round-trip, so only this rare arm pays for it.
-async fn verification_needs_build_response(
+/// import closure hit an unbuilt `.olean`. Freshness/runtime come from the
+/// non-spawning broker identity path, so only this rare arm pays for it.
+fn verification_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
     imports: Vec<String>,
     err: ServerError,
 ) -> Result<Response<DeclarationVerificationResult>> {
-    let base = ctx.broker.project_runtime(hint, imports.clone()).await?;
+    let base = ctx.broker.project_identity_without_worker(&hint, imports.clone())?;
     let mut response =
         Response::ok(needs_build_verification_result(imports), base.freshness).with_runtime(base.runtime);
     response

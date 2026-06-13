@@ -7,8 +7,8 @@
 //! [`Freshness`](lean_host_mcp::Freshness) envelope) as the identity
 //! signal: the broker re-allocates `session_id` on every successful
 //! opening a private project runtime, so a value change between two
-//! [`ProjectBroker::project_runtime`] calls means the underlying actor was
-//! shut down and replaced.
+//! [`ProjectBroker::admitted_project_runtime`] calls means the underlying
+//! controller was shut down and replaced.
 //!
 //! A second "project" is synthesized from the real fixture: a tempdir
 //! containing the four files [`LakeProjectMeta::from_explicit`] reads
@@ -80,9 +80,9 @@ fn make_synthetic_project(fixture_root: &Path) -> (tempfile::TempDir, PathBuf) {
 
 async fn session_id_for(broker: &Arc<ProjectBroker>, hint: ProjectHint) -> String {
     broker
-        .project_runtime(hint, Vec::new())
+        .admitted_project_runtime(hint, Vec::new())
         .await
-        .expect("project_runtime")
+        .expect("admitted_project_runtime")
         .freshness
         .session_id
 }

@@ -138,7 +138,7 @@ async fn streamable_http_fixture_tool_call() {
 
 #[tokio::test]
 #[ignore = "requires built Lean fixture and worker binary"]
-async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
+async fn streamable_http_semantic_admission_concurrent_sessions_surface_structured_pressure() {
     let root = fixture_root();
     let root_s = root.to_string_lossy().into_owned();
     let server = HttpMcpServer::start_with_env(

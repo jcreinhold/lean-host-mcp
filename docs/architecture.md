@@ -67,7 +67,10 @@ and the last import profile. A bounded project queue turns overload into a retry
 unbounded memory growth. The parent binary never links `libleanshared`; the per-toolchain worker child does.
 
 The broker also owns a process-wide semantic permit gate, defaulting to one permit, so cross-project heavy calls are
-serialized unless the deployment explicitly raises `LEAN_HOST_MCP_SEMANTIC_PERMITS`. A full project queue is a
+serialized unless the deployment explicitly raises `LEAN_HOST_MCP_SEMANTIC_PERMITS`. The same gate is backed by
+per-user advisory lock files, so parallel server processes that share `broker.semantic_lock_dir` share one permit pool.
+Any path that can open or run a worker must pass through `admit_project`; degraded responses and pure `.ilean` reads use
+`project_identity_without_worker` so they can fill envelope identity without spawning. A full project queue is a
 structured retryable infrastructure error rather than unbounded memory growth.
 
 The controller samples worker RSS before import-profile switches. If the worker is above the configured soft threshold,

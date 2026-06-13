@@ -208,8 +208,8 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
             empty_result(profile, warnings, full)
         };
         let hint = ProjectHint::from_request(project);
-        let runtime = ctx.broker.project_runtime(hint, Vec::new()).await?;
-        return Ok(Response::ok(result, runtime.freshness).with_runtime(runtime.runtime));
+        let identity = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
+        return Ok(Response::ok(result, identity.freshness).with_runtime(identity.runtime));
     }
 
     let mut search_results = Vec::new();
@@ -222,8 +222,10 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
             Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
                 let result = empty_result(profile.clone(), warnings, full);
                 let hint = ProjectHint::from_request(project);
-                let project_runtime = ctx.broker.project_runtime(hint, profile.imports.clone()).await?;
-                let response = Response::ok(result, project_runtime.freshness).with_runtime(project_runtime.runtime);
+                let identity = ctx
+                    .broker
+                    .project_identity_without_worker(&hint, profile.imports.clone())?;
+                let response = Response::ok(result, identity.freshness).with_runtime(identity.runtime);
                 let response = crate::diagnosis::warn_needs_build(
                     response,
                     &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
@@ -251,9 +253,9 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     );
     let freshness_imports = profile.imports.clone();
     let hint = ProjectHint::from_request(project);
-    let project_runtime = ctx.broker.project_runtime(hint, freshness_imports).await?;
-    let runtime = runtime.unwrap_or(project_runtime.runtime);
-    Ok(Response::ok(result, project_runtime.freshness).with_runtime(runtime))
+    let identity = ctx.broker.project_identity_without_worker(&hint, freshness_imports)?;
+    let runtime = runtime.unwrap_or(identity.runtime);
+    Ok(Response::ok(result, identity.freshness).with_runtime(runtime))
 }
 
 async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -> Result<TargetProfile> {
