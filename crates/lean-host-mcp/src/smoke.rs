@@ -111,8 +111,8 @@ pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &Toolcha
     };
 
     // Best-effort graceful shutdown; the verdict is already decided and a
-    // terminate error on an already-dead child is not news.
-    drop(handle.terminate());
+    // shutdown error on an already-dead child is not news.
+    drop(handle.shutdown());
     outcome
 }
 

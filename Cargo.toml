@@ -2,6 +2,18 @@
 members = ["crates/*"]
 resolver = "3"
 
+# Temporary local override while the lean-rs worker-runtime changes are ahead
+# of the latest crates.io release.
+[patch.crates-io]
+lean-rs = { path = "../lean-rs/crates/lean-rs" }
+lean-rs-abi = { path = "../lean-rs/crates/lean-rs-abi" }
+lean-rs-host = { path = "../lean-rs/crates/lean-rs-host" }
+lean-rs-sys = { path = "../lean-rs/crates/lean-rs-sys" }
+lean-rs-worker-child = { path = "../lean-rs/crates/lean-rs-worker-child" }
+lean-rs-worker-parent = { path = "../lean-rs/crates/lean-rs-worker-parent" }
+lean-rs-worker-protocol = { path = "../lean-rs/crates/lean-rs-worker-protocol" }
+lean-toolchain = { path = "../lean-rs/crates/lean-toolchain" }
+
 [workspace.package]
 authors = ["Jacob Reinhold"]
 edition = "2024"
