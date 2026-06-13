@@ -1,10 +1,10 @@
 //! `LeanProject`—the unit of Lean semantic execution.
 //!
-//! One Lake project owns one private actor. The actor serializes all semantic
-//! worker calls, owns the child-process supervisor, applies memory/restart
-//! policy, and exposes only typed request/reply calls to tool modules. Worker
-//! handles, channels, queue internals, and restart mechanics stay below this
-//! boundary.
+//! One Lake project owns one private serialized controller. The controller
+//! submits one worker request at a time, applies host memory/retry policy, and
+//! exposes only typed request/reply calls to tool modules. The lower
+//! `lean-rs-worker-parent` service owns child-process shutdown, generation
+//! separation, terminal outcomes, and primitive restart mechanics.
 
 #![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
@@ -409,6 +409,32 @@ impl ProjectMessage {
             | Self::SemanticProofSearch { meta, .. } => &meta.imports,
         }
     }
+
+    fn reject(self, state: &ProjectActorState, reason: &'static str) {
+        match self {
+            Self::ModuleQuery { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+            Self::ModuleQueryBatch { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+            Self::DeclarationInspection { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+            Self::DeclarationSearch { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+            Self::ProofAttempt { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+            Self::DeclarationVerification { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+            Self::SemanticProofSearch { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -580,8 +606,8 @@ impl RuntimeSnapshot {
     }
 }
 
-/// One Lake project, one supervised worker actor, one in-memory cache. Cheap
-/// to clone via `Arc`.
+/// One Lake project, one serialized worker controller, one in-memory cache.
+/// Cheap to clone via `Arc`.
 pub(crate) struct LeanProject {
     canonical_root: PathBuf,
     toolchain: String,
@@ -1694,6 +1720,10 @@ impl ProjectActorState {
         })
     }
 
+    fn shutdown_unavailable(&self, meta: &JobMeta, reason: &'static str) -> ServerError {
+        self.worker_unavailable_for(meta, reason.to_owned(), true, false, None, None, None)
+    }
+
     fn restart_limit_error(&self, imports: &[String], limit: RestartLimitExceeded) -> ServerError {
         let snapshot = self.runtime.lock().facts();
         ServerError::worker_unavailable(WorkerUnavailable {
@@ -1755,7 +1785,25 @@ fn actor_main(
     }
 
     while let Some(message) = rx.blocking_recv() {
+        if !config.healthy.load(Ordering::Acquire) {
+            message.reject(&state, "project_shutting_down");
+            continue;
+        }
         state.handle_message(message);
+    }
+
+    match state.handle.shutdown() {
+        Ok(report) => {
+            tracing::debug!(
+                outcome = ?report.outcome,
+                elapsed_millis = millis_u64(report.elapsed),
+                wait_millis = millis_u64(report.wait_elapsed),
+                "project worker shutdown complete"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "project worker shutdown failed");
+        }
     }
 }
 

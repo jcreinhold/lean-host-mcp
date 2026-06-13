@@ -1142,6 +1142,11 @@ fn project_batch_result(result: LeanWorkerModuleQueryBatchResult, file: Option<&
         LeanWorkerModuleQueryBatchResult::SurroundingDeclaration(result) => {
             BatchProjection::SurroundingDeclaration(project_surrounding_declaration_result(result))
         }
+        LeanWorkerModuleQueryBatchResult::DeclarationOutline(_) => BatchProjection::Diagnostics(DiagnosticsBlock {
+            summary: DiagnosticSummary::default(),
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
         _ => BatchProjection::Diagnostics(DiagnosticsBlock {
             summary: DiagnosticSummary::default(),
             diagnostics: Vec::new(),

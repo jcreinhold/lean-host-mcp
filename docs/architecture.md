@@ -25,7 +25,7 @@ crates/lean-host-mcp/src/
   transport_http.rs private axum/rmcp Streamable HTTP entry
   server.rs         LeanHostService tool registration
   broker.rs         ProjectBroker: LRU pool, idle eviction, per-call routing
-  project.rs        LeanProject worker actor for one Lake project
+  project.rs        LeanProject serialized controller for one Lake project
   tools/            declaration.rs, proof_search.rs, proof_action.rs, position.rs
   projections.rs    stable MCP projections from lean-rs worker types
   lake_meta.rs      minimal Lake-project metadata
@@ -37,7 +37,7 @@ crates/lean-host-mcp-worker/src/
 ```
 
 `server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when needed,
-and send one typed read-only semantic job to the project worker actor.
+and send one typed read-only semantic job to the project controller.
 
 ## Transport Boundary
 
@@ -48,8 +48,8 @@ reach the tool, broker, or project-runtime layers.
 
 Stdio remains the default process model: one client launches one server and EOF ends the process. `--bind` selects a
 single Streamable HTTP server for that run. HTTP sessions are independent rmcp sessions, but the cloned
-`LeanHostService` values share one broker, so all sessions still obey the same per-project FIFO actor, process-wide
-semantic permit gate, bounded mailbox, RSS policy, and worker restart semantics.
+`LeanHostService` values share one broker, so all sessions still obey the same per-project serialized controller,
+process-wide semantic permit gate, bounded project queue, RSS policy, and worker lifecycle presentation.
 
 Runtime pressure is not a transport error. Admission pressure, mailbox pressure, worker death, session loss, and restart
 recovery continue to surface through the normal tool response envelope as `status = "runtime_unavailable"` with
@@ -59,24 +59,24 @@ bad HTTP paths.
 ## Project And Worker Boundary
 
 `ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction, manifest
-invalidation, multi-project routing, and coalescing concurrent opens for the same canonical root. `LeanProject` owns the
-supervised `lean-rs-worker` child and a dedicated actor thread; that thread is the sole owner of the worker handle, so
-"exactly one owner of the Lean runtime at a time" is a structural fact rather than a lock discipline. It services one
-semantic job at a time in FIFO order and tracks a worker generation counter, the last restart reason, and the last
-import profile. A bounded mailbox turns overload into a retryable `busy` failure instead of unbounded memory growth. The
-parent binary never links `libleanshared`; the per-toolchain worker child does.
+invalidation, multi-project routing, and coalescing concurrent opens for the same canonical root. `LeanProject` owns a
+dedicated controller thread; that thread is the sole owner of the `lean-rs-worker-parent` host handle, so "exactly one
+owner of the Lean runtime at a time" is a structural fact rather than a lock discipline. It submits one semantic job at
+a time in FIFO order and tracks host presentation facts such as the current worker generation, the last restart reason,
+and the last import profile. A bounded project queue turns overload into a retryable `busy` failure instead of
+unbounded memory growth. The parent binary never links `libleanshared`; the per-toolchain worker child does.
 
-Each project actor runs one semantic job at a time in FIFO mailbox order. The broker also owns a process-wide semantic
-permit gate, defaulting to one permit, so cross-project heavy calls are serialized unless the deployment explicitly
-raises `LEAN_HOST_MCP_SEMANTIC_PERMITS`. A full project mailbox is a structured retryable infrastructure error rather
-than unbounded memory growth.
+The broker also owns a process-wide semantic permit gate, defaulting to one permit, so cross-project heavy calls are
+serialized unless the deployment explicitly raises `LEAN_HOST_MCP_SEMANTIC_PERMITS`. A full project queue is a
+structured retryable infrastructure error rather than unbounded memory growth.
 
-The actor samples worker RSS before import-profile switches. If the worker is above the configured soft threshold, it
-cycles the child before opening the next session. The supervisor also enforces a parent-side hard RSS watchdog during
-long-running requests. Fatal child exits are caught inside the actor: the worker is rebuilt, the generation is bumped,
-and read-only semantic jobs are retried once. Responses carry runtime facts (`worker_generation`, `worker_restarted`,
-`retry_count`, `admission_wait_millis`, `queue_wait_millis`, `call_restart`, `last_restart`) so clients can distinguish
-Lean-domain results from infrastructure recovery and lifecycle history.
+The controller samples worker RSS before import-profile switches. If the worker is above the configured soft threshold,
+it asks `lean-rs-worker-parent` to cycle the service before opening the next session. The worker supervisor enforces the
+parent-side hard RSS watchdog during long-running requests. Fatal child exits are reported by the worker layer; the host
+maps those structured outcomes once into MCP runtime facts and retries selected read-only semantic jobs once. Responses
+carry runtime facts (`worker_generation`, `worker_restarted`, `retry_count`, `admission_wait_millis`,
+`queue_wait_millis`, `call_restart`, `last_restart`) so clients can distinguish Lean-domain results from infrastructure
+recovery and lifecycle history.
 
 Each semantic tool opens a short-lived worker session with imports derived from the source header or explicit request.
 Lean-domain failures such as parse errors, elaboration diagnostics, missing imports, unsupported shim exports, failed

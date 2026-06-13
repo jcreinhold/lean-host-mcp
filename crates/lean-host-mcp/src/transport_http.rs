@@ -7,6 +7,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::future;
+
 use anyhow::Context;
 use axum::Router;
 use rmcp::transport::streamable_http_server::{
@@ -54,13 +56,39 @@ pub(crate) async fn serve(
 
     let shutdown_token = cancellation.clone();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::warn!(error = %err, "failed to wait for shutdown signal");
-        }
+        shutdown_signal().await;
         shutdown_token.cancel();
     });
 
     let result = server.await.context("serve Streamable HTTP transport");
     cancellation.cancel();
     result
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to install SIGTERM handler");
+                return wait_for_ctrl_c().await;
+            }
+        };
+        tokio::select! {
+            () = wait_for_ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        wait_for_ctrl_c().await;
+    }
+}
+
+async fn wait_for_ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %err, "failed to wait for Ctrl-C");
+        future::pending::<()>().await;
+    }
 }

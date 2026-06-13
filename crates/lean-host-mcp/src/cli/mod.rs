@@ -8,3 +8,4 @@
 
 pub mod config_init;
 pub mod install_worker;
+pub mod processes;

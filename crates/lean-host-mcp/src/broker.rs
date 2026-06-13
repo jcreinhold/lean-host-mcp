@@ -7,7 +7,7 @@
 //!    path via the five-step chain
 //!    *explicit → env → cwd-walk → config-default → error*.
 //! 2. **Dispatch** typed semantic operations to a private per-project
-//!    runtime, opening the project lazily on first use, reusing it on
+//!    controller, opening the project lazily on first use, reusing it on
 //!    subsequent calls, and evicting under LRU and idle pressure.
 //!
 //! Tool modules call narrow domain methods such as
@@ -26,7 +26,7 @@
 //!
 //! **Slow-path concurrency.** The registry mutex is never held across
 //! worker spawn or command execution. Concurrent misses for the same
-//! canonical root are coalesced so only one project actor is opened. Heavy semantic jobs are
+//! canonical root are coalesced so only one project controller is opened. Heavy semantic jobs are
 //! additionally gated by a process-wide permit owned by the broker.
 
 use std::collections::HashMap;
@@ -945,6 +945,35 @@ impl ProjectBroker {
         }
     }
 
+    /// Stop all resident projects and clear broker-local project state.
+    ///
+    /// This is the host-level shutdown policy above `lean-rs-worker-parent`:
+    /// stop accepting new project work, terminalize any queued project messages,
+    /// and let each project controller drive its worker child through the upstream
+    /// bounded shutdown path. It is idempotent so both explicit server exits
+    /// and `Drop` can call it.
+    pub fn shutdown_all(&self) {
+        let projects: Vec<Arc<LeanProject>> = {
+            let mut inner = self.inner.lock();
+            let paths: Vec<PathBuf> = inner.registry.iter().map(|(path, _)| path.clone()).collect();
+            let mut projects = Vec::with_capacity(paths.len());
+            for path in paths {
+                if let Some(project) = inner.registry.pop(&path) {
+                    projects.push(project);
+                }
+                inner.last_used.remove(&path);
+            }
+            inner.opening_locks.clear();
+            projects
+        };
+        if !projects.is_empty() {
+            tracing::info!(project_count = projects.len(), "shutting down resident projects");
+        }
+        for project in projects {
+            project.shutdown();
+        }
+    }
+
     /// Snapshot of paths currently resident in the pool, ordered MRU-first.
     /// Public so integration tests can assert eviction without going
     /// through a tool call.
@@ -952,6 +981,12 @@ impl ProjectBroker {
     pub fn resident_paths(&self) -> Vec<PathBuf> {
         let inner = self.inner.lock();
         inner.registry.iter().map(|(p, _)| p.clone()).collect()
+    }
+}
+
+impl Drop for ProjectBroker {
+    fn drop(&mut self) {
+        self.shutdown_all();
     }
 }
 
@@ -1085,6 +1120,15 @@ mod tests {
         assert_eq!(waiters.get(), 12);
         assert_eq!(timeout, Duration::from_millis(250));
         assert_eq!(lock_dir, PathBuf::from("/tmp/locks"));
+    }
+
+    #[test]
+    fn shutdown_all_without_resident_projects_is_idempotent() {
+        let broker = ProjectBroker::new(cfg(PathBuf::from("/"), None, None));
+        broker.shutdown_all();
+        broker.shutdown_all();
+        assert!(broker.resident_paths().is_empty());
+        drop(broker);
     }
 
     #[test]

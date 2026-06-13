@@ -105,16 +105,41 @@ when no recycle has happened).
 
 ## Process lifetime
 
-The idle reaper (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`) governs the per-project worker sub-actors, not the parent server
-process. A stdio server exits when its transport closes: it serves until the client closes the server's stdin (the
-normal disconnect path), so a well-behaved launcher reaps it automatically. Orphaned `lean-host-mcp` parents left
-running are launcher artifacts (a client that spawned a server and never closed its stdin), not leaked sessions — the
-server holds no project resident once its transport is gone.
+The idle reaper (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`) governs resident per-project controllers, not the parent server
+process. A stdio server exits when its transport closes: it serves until the client closes the server's stdin. An HTTP
+server exits on Ctrl-C, SIGTERM, or ordinary process shutdown. Both transport exit paths call
+`ProjectBroker::shutdown_all`, which closes resident projects before the process returns.
+
+Project shutdown is bounded by the worker layer. The host stops accepting new project work, queued messages receive
+`runtime_unavailable` with reason `project_shutting_down`, and the controller then lets `lean-rs-worker-parent` perform
+its structured child shutdown: terminate, bounded graceful wait, kill escalation if needed, and reap. An active request
+may finish normally or run until the configured request timeout before the worker layer reports a terminal runtime
+outcome. Abrupt parent death can still skip Rust `Drop`; child-side parent-loss handling is best effort, and stronger
+containment remains a launcher or process-manager responsibility.
+
+Every running server writes a PID record under the per-user cache directory at `lean-host-mcp/processes/` and removes it
+on normal shutdown. Inspect records with:
+
+```sh
+lean-host-mcp doctor processes
+```
+
+The output lists only host-written records: PID, liveness, executable-match status when the platform exposes it,
+transport, bind/path, working directory, and direct child PIDs. It does not scan for process names. Clean records left
+behind by abruptly killed servers with:
+
+```sh
+lean-host-mcp doctor processes --cleanup-stale-records
+```
+
+Cleanup removes records whose PID is no longer alive. It does not kill live processes and does not infer ownership from
+an executable name, command substring, or port number.
 
 ## Runtime-error contract
 
 Every tool returns the same envelope (the `ok` shape is in the [README](../README.md#response-envelope)). Recoverable
-runtime and actor failures are normal tool responses with `status: "runtime_unavailable"`, not JSON-RPC errors:
+runtime and project-controller failures are normal tool responses with `status: "runtime_unavailable"`, not JSON-RPC
+errors:
 
 ```jsonc
 {

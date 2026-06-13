@@ -12,8 +12,8 @@
 //! - [`broker`]: `ProjectBroker`, the mediator that resolves a per-call
 //!   project hint into typed operations on a private project runtime via the
 //!   env / cwd-walk / config-default chain.
-//! - `project`: private per-project actor runtime. Owns one supervised worker
-//!   actor and the bounded module-query cache for one Lake project.
+//! - `project`: private per-project serialized controller. Owns one worker
+//!   service handle and the bounded module-query cache for one Lake project.
 //! - [`projections`]: pure data-shuffle projection types and helpers from
 //!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.
 //! - [`lake_meta`]: `LakeProjectMeta`, the minimal description of a Lake

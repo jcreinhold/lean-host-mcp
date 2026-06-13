@@ -182,6 +182,31 @@ async fn idle_reaper_evicts_stale_project() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn shutdown_all_evicts_resident_projects() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let canonical_root = root.canonicalize().expect("canonicalise fixture");
+    let broker = make_broker(Some(canonical_root), NonZeroUsize::new(4).unwrap(), Duration::ZERO);
+
+    let _id_first = session_id_for(&broker, ProjectHint::Default).await;
+    assert!(!broker.resident_paths().is_empty(), "project should be resident");
+
+    broker.shutdown_all();
+    assert!(
+        broker.resident_paths().is_empty(),
+        "shutdown_all must clear resident projects"
+    );
+
+    let id_after_shutdown = session_id_for(&broker, ProjectHint::Default).await;
+    assert!(
+        !id_after_shutdown.is_empty(),
+        "broker should reopen a project after explicit shutdown"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn manifest_mutation_triggers_respawn() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");

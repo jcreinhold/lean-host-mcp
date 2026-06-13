@@ -22,6 +22,7 @@ use tracing_subscriber::fmt;
 
 use lean_host_mcp::cli::config_init::{self, ConfigCommand};
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
+use lean_host_mcp::cli::processes::{self, DoctorProcessesArgs};
 use lean_host_mcp::{
     BrokerConfig, ConfigFile, LeanHostService, OutputBudgetOverrides, ProjectBroker, ProjectRuntimeConfig,
     ResponseCarrier, TelemetryVerbosity, ToolConfig,
@@ -49,6 +50,17 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Inspect host-written server process records.
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    /// List registered lean-host-mcp server PIDs and remove stale records.
+    Processes(DoctorProcessesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +100,15 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("lean-host-mcp config: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Doctor {
+            command: DoctorCommand::Processes(args),
+        }) => match processes::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("lean-host-mcp doctor processes: {err}");
                 ExitCode::FAILURE
             }
         },
@@ -191,14 +212,18 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         },
         runtime_config,
     );
-    if let Some(config) = http {
-        transport_http::serve(broker, config, tool_config).await?;
+    let _process_record = processes::ServerProcessRecord::register(transport, bind_display.clone(), http_path_log)?;
+    let result = if let Some(config) = http {
+        transport_http::serve(Arc::clone(&broker), config, tool_config).await
     } else {
-        let service = LeanHostService::new(broker, tool_config);
-        let server = service.serve(stdio()).await?;
-        server.waiting().await?;
-    }
-    Ok(())
+        let service = LeanHostService::new(Arc::clone(&broker), tool_config);
+        match service.serve(stdio()).await {
+            Ok(server) => server.waiting().await.map(|_| ()).map_err(anyhow::Error::from),
+            Err(err) => Err(anyhow::Error::from(err)),
+        }
+    };
+    broker.shutdown_all();
+    result
 }
 
 fn build_broker(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<ProjectBroker> {

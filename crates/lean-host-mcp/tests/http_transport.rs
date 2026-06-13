@@ -86,6 +86,20 @@ async fn invalid_http_startup_config_exits() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn streamable_http_sigterm_shutdown_exits() {
+    let server = HttpMcpServer::start(&[]).await;
+    let pid = server.child.id().expect("server pid");
+    let status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success(), "kill -TERM should succeed: {status}");
+    server.wait_for_exit().await;
+}
+
 #[tokio::test]
 #[ignore = "requires built Lean fixture and worker binary"]
 async fn streamable_http_fixture_tool_call() {
@@ -292,6 +306,19 @@ impl HttpMcpServer {
             eprintln!("HTTP test server kill failed: {err}");
         }
         drop(tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await);
+        self.finish().await;
+    }
+
+    async fn wait_for_exit(mut self) {
+        let status = tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .expect("HTTP test server should exit")
+            .expect("wait for HTTP test server");
+        assert!(status.success(), "HTTP test server exit status: {status}");
+        self.finish().await;
+    }
+
+    async fn finish(self) {
         let stderr = self.stderr_task.await.unwrap_or_default();
         if !stderr.trim().is_empty() {
             eprintln!("HTTP test server stderr:\n{stderr}");
