@@ -587,9 +587,11 @@ fn fixture_calls() -> Vec<(&'static str, Value)> {
         (
             "lean_verify",
             json!({
-                "kind": "explicit",
-                "file": "LeanRsFixture/ProofActions.lean",
-                "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+                "targets": [{
+                    "kind": "explicit",
+                    "file": "LeanRsFixture/ProofActions.lean",
+                    "declarations": ["LeanRsFixture.ProofActions.stepTheorem"]
+                }],
                 "report_axioms": true
             }),
         ),

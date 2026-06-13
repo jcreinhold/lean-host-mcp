@@ -9,11 +9,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- New semantic MCP surface with five public tools: `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup`, and
+  `lean_status`. The surface carries stable `data` / `errors` / `trust` responses, preserving proof-relevant artifact
+  freshness facts even when telemetry is quiet.
+- `lean_verify` batch target groups for explicit declarations, all declarations in a file or module, and changed-target
+  verification. Changed verification reports conservative coverage gaps for unmapped hunks, deleted files, renames, and
+  truncation instead of silently dropping edits.
+- `lean_lookup(kind = "declarations")` for source-fresh declaration inventory with `.ilean` build-fresh fallback, and
+  `lean_lookup(kind = "changed_coverage")` for changed-hunk-to-declaration mapping without verification.
+- `lean_trial(kind = "command")` for bounded non-mutating command snippets such as `#check` and `#print axioms`, and
+  `lean_status(kind = "file_diagnostics")` for current-source Lean diagnostics.
+- Runtime lifecycle hardening for server shutdown, queued-job terminal outcomes, process registry diagnostics, and
+  stale-record cleanup that only removes host-owned dead PID records.
+
 ### Changed
 
 - Upgraded the `lean-rs` worker crates (`lean-rs-worker-parent` / `-child`, `lean-toolchain`) to 0.2.2 and moved the
   Lean toolchain pin to the new supported-window head, `leanprover/lean4:v4.31.0-rc2` (header-identical to `-rc1`, so
   the ABI is unchanged). The supported window is now `4.26.0 ..= 4.31.0-rc2`.
+- Public MCP registration is now the semantic five-tool surface. The old six proof-workflow tool names and temporary
+  compatibility probes are not advertised; existing internal operation modules are reused behind semantic modes.
 
 ## [0.4.1] - 2026-06-09
 

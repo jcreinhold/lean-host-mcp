@@ -206,6 +206,39 @@ Which failures land where:
   hard-kill — are `errors` with `code: "runtime_unavailable"` and `retryable: true`.
 - **MCP errors** are reserved for I/O and config failures, internal-invariant violations, and unusable Lake projects.
 
+## Prompt-stack verification through MCP
+
+The `check_stack.py` checker used by the KanProofs formalization prompt stacks keeps its Lake/checkdecls backend as the
+default. It can also verify through the semantic MCP surface when you start a loopback HTTP server yourself:
+
+```sh
+lean-host-mcp --lake-root /path/to/kan-proofs --bind 127.0.0.1:8765
+
+/path/to/check_stack.py /path/to/prompt-workspace \
+  --verify \
+  --backend mcp \
+  --mcp-url http://127.0.0.1:8765/mcp
+```
+
+The checker does not start or manage the server. Use a built Lake project, and rebuild/install workers after upgrading
+the host so the server and worker protocol stay in step. The MCP backend calls `lean_verify` with sorry rejection and
+axiom reporting, using `lean_trial(kind = "command")` only for declarations that verification cannot row-report, such
+as definitions whose axiom set must still be checked. `--changed REF --backend mcp` preserves the checker's
+file-level changed-prompt selection and uses MCP verification for the selected prompts.
+
+Fallback is explicit:
+
+```sh
+/path/to/check_stack.py /path/to/prompt-workspace \
+  --verify \
+  --backend mcp \
+  --mcp-url http://127.0.0.1:8765/mcp \
+  --fallback lake
+```
+
+Without `--fallback lake`, connection failures, missing tools, or runtime-unavailable setup failures are script errors.
+With fallback, the checker reports the fallback and uses the Lake backend for the affected run.
+
 ### Internal runtime facts
 
 The operation layer still computes freshness/import and runtime facts before semantic response adaptation. Runtime facts
