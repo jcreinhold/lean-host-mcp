@@ -19,6 +19,7 @@ use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolContext};
 use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus};
 
 use super::declaration::{self, InspectDeclarationRequest};
+use super::declaration_inventory::{self, DeclarationInventoryRequest};
 use super::position::{self, FindReferencesRequest, ProofStateRequest};
 use super::proof_action::{self, TryProofStepRequest, VerifyDeclarationRequest};
 use super::proof_search::{self, SearchForProofRequest};
@@ -218,7 +219,8 @@ pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 
 /// Semantic lookup and discovery.
 ///
-/// Initial public modes: `declaration`, `proof_search`, and `references`.
+/// Initial public modes: `declaration`, `declarations`, `proof_search`, and
+/// `references`.
 ///
 /// # Errors
 ///
@@ -233,6 +235,16 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
             };
             from_tool_response(
                 declaration::inspect_declaration(ctx, request).await?,
+                ctx.config.verbosity,
+            )
+        }
+        Some("declarations") => {
+            let request = match decode::<DeclarationInventoryRequest>(req) {
+                Ok(request) => request,
+                Err(response) => return Ok(*response),
+            };
+            from_tool_response(
+                declaration_inventory::declaration_inventory(ctx, request).await?,
                 ctx.config.verbosity,
             )
         }
@@ -256,11 +268,11 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
         Some(kind) => Ok(invalid_kind(
             "lean_lookup",
             kind,
-            &["declaration", "proof_search", "references"],
+            &["declaration", "declarations", "proof_search", "references"],
         )),
         None => Ok(missing_kind(
             "lean_lookup",
-            &["declaration", "proof_search", "references"],
+            &["declaration", "declarations", "proof_search", "references"],
         )),
     }
 }

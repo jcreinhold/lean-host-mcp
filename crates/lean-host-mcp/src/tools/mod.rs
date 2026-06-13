@@ -6,6 +6,8 @@
 //!
 //! - [`declaration`]: `inspect_declaration`, the bounded single-declaration
 //!   proof-work inspection tool.
+//! - [`declaration_inventory`]: source-fresh and `.ilean`-backed declaration
+//!   listings for `lean_lookup(kind = "declarations")`.
 //! - [`proof_search`]: `search_for_proof`, the proof-agent retrieval tool
 //!   built from bounded proof-state and declaration-search calls.
 //! - [`proof_action`]: `try_proof_step` and `verify_declaration`, the
@@ -16,6 +18,7 @@
 use std::sync::Arc;
 
 pub mod declaration;
+pub mod declaration_inventory;
 pub mod position;
 pub mod proof_action;
 pub mod proof_search;

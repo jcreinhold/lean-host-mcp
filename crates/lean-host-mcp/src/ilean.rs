@@ -25,6 +25,7 @@
 //! `src/lean/Lean/Data/Lsp/Internal.lean` (`RefIdent`, `RefInfo`, `ModuleRefs`),
 //! `src/lean/Lean/Server/References.lean` (`Ilean` / `Ilean.load`).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -88,6 +89,40 @@ pub(crate) struct ReferenceIndex {
     /// (the recorded locations may be stale). Bounded by the result set, not
     /// the project size.
     pub stale_sources: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModuleDeclarationIndexStatus {
+    /// `<root>/.lake/build/lib/lean` is missing — the project was never built.
+    ProjectNotBuilt,
+    /// The build tree exists, but this module has no `.ilean` file.
+    ModuleNotBuilt,
+    /// The module index exists and was parsed.
+    Present,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedDeclaration {
+    pub name: String,
+    pub declaration_span: DeclSpan,
+    pub selection_span: DeclSpan,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeclSpan {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleDeclarationIndex {
+    pub status: ModuleDeclarationIndexStatus,
+    pub module: String,
+    pub index: PathBuf,
+    pub declarations: Vec<IndexedDeclaration>,
+    pub stale: bool,
 }
 
 /// A recoverable failure loading a single `.ilean` file.
@@ -176,6 +211,63 @@ pub(crate) fn references_to(project_root: &Path, name: &str) -> ReferenceIndex {
     }
 }
 
+pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> ModuleDeclarationIndex {
+    let build_dir = project_root.join(BUILD_LIB_REL);
+    let source = module_to_source(project_root, module);
+    let index = module_to_index(project_root, module);
+    if !build_dir.is_dir() {
+        return ModuleDeclarationIndex {
+            status: ModuleDeclarationIndexStatus::ProjectNotBuilt,
+            module: module.to_owned(),
+            index,
+            declarations: Vec::new(),
+            stale: false,
+        };
+    }
+    if !index.is_file() {
+        return ModuleDeclarationIndex {
+            status: ModuleDeclarationIndexStatus::ModuleNotBuilt,
+            module: module.to_owned(),
+            index,
+            declarations: Vec::new(),
+            stale: false,
+        };
+    }
+    let Ok(raw) = load(&index) else {
+        return ModuleDeclarationIndex {
+            status: ModuleDeclarationIndexStatus::ModuleNotBuilt,
+            module: module.to_owned(),
+            index,
+            declarations: Vec::new(),
+            stale: false,
+        };
+    };
+    let mut declarations = raw
+        .decls
+        .into_iter()
+        .map(|(name, info)| IndexedDeclaration {
+            name,
+            declaration_span: decl_span(&info.range),
+            selection_span: decl_span(&info.selection_range),
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_by(|a, b| {
+        a.declaration_span
+            .start_line
+            .cmp(&b.declaration_span.start_line)
+            .then(a.declaration_span.start_column.cmp(&b.declaration_span.start_column))
+            .then(a.name.cmp(&b.name))
+    });
+    let stale = source_newer_than_index(&source, &index);
+    ModuleDeclarationIndex {
+        status: ModuleDeclarationIndexStatus::Present,
+        module: raw.module,
+        index,
+        declarations,
+        stale,
+    }
+}
+
 /// Read, version-gate, and parse one `.ilean` file.
 ///
 /// # Errors
@@ -212,6 +304,11 @@ fn load(path: &Path) -> Result<IleanRaw, IleanError> {
 fn module_to_source(root: &Path, module: &str) -> PathBuf {
     let relative: PathBuf = module.split('.').collect();
     root.join(relative).with_extension("lean")
+}
+
+fn module_to_index(root: &Path, module: &str) -> PathBuf {
+    let relative: PathBuf = module.split('.').collect();
+    root.join(BUILD_LIB_REL).join(relative).with_extension("ilean")
 }
 
 /// True when `key` is a `const` `RefIdent` whose identifier equals `name`.
@@ -290,6 +387,8 @@ struct IleanRaw {
     module: String,
     /// Compressed-`RefIdent` key → reference info.
     references: std::collections::HashMap<String, RefInfoRaw>,
+    #[serde(default)]
+    decls: BTreeMap<String, DeclInfoRaw>,
 }
 
 /// Definition site (optional) and usage sites of one reference.
@@ -310,6 +409,68 @@ struct LocationRaw {
     start_column: u32,
     end_line: u32,
     end_column: u32,
+}
+
+struct DeclInfoRaw {
+    range: DeclInfoRangeRaw,
+    selection_range: DeclInfoRangeRaw,
+}
+
+struct DeclInfoRangeRaw {
+    start_line: u32,
+    start_column: u32,
+    end_line: u32,
+    end_column: u32,
+}
+
+fn decl_span(range: &DeclInfoRangeRaw) -> DeclSpan {
+    DeclSpan {
+        start_line: range.start_line,
+        start_column: range.start_column,
+        end_line: range.end_line,
+        end_column: range.end_column,
+    }
+}
+
+impl<'de> Deserialize<'de> for DeclInfoRaw {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DeclInfoVisitor;
+
+        impl<'de> Visitor<'de> for DeclInfoVisitor {
+            type Value = DeclInfoRaw;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an 8-element .ilean declaration info array")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<DeclInfoRaw, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let range = DeclInfoRangeRaw {
+                    start_line: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?,
+                    start_column: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(1, &self))?,
+                    end_line: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(2, &self))?,
+                    end_column: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(3, &self))?,
+                };
+                let selection_range = DeclInfoRangeRaw {
+                    start_line: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(4, &self))?,
+                    start_column: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(5, &self))?,
+                    end_line: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(6, &self))?,
+                    end_column: seq.next_element()?.ok_or_else(|| de::Error::invalid_length(7, &self))?,
+                };
+                if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::invalid_length(9, &self));
+                }
+                Ok(DeclInfoRaw { range, selection_range })
+            }
+        }
+
+        deserializer.deserialize_seq(DeclInfoVisitor)
+    }
 }
 
 impl<'de> Deserialize<'de> for LocationRaw {
@@ -524,6 +685,44 @@ mod tests {
             stale.contains(&source),
             "expected {source:?} flagged stale, got {stale:?}"
         );
+    }
+
+    #[test]
+    fn declarations_in_module_reads_decl_ranges_from_ilean() {
+        let project = stage(&[("Demo.A", "demo_a.ilean")]);
+        let index = declarations_in_module(project.path(), "Demo.A");
+
+        assert_eq!(index.status, ModuleDeclarationIndexStatus::Present);
+        assert_eq!(index.declarations.len(), 1);
+        let declaration = index.declarations.first().unwrap();
+        assert_eq!(declaration.name, "Demo.A.foo");
+        assert_eq!(declaration.declaration_span.start_line, 3);
+        assert_eq!(declaration.selection_span.start_column, 4);
+    }
+
+    #[test]
+    fn declarations_in_module_reports_missing_module_index() {
+        let project = stage(&[("Demo.A", "demo_a.ilean")]);
+        let index = declarations_in_module(project.path(), "Demo.Missing");
+
+        assert_eq!(index.status, ModuleDeclarationIndexStatus::ModuleNotBuilt);
+        assert!(index.declarations.is_empty());
+    }
+
+    #[test]
+    fn declarations_in_module_reports_project_not_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = declarations_in_module(tmp.path(), "Demo.A");
+
+        assert_eq!(index.status, ModuleDeclarationIndexStatus::ProjectNotBuilt);
+        assert!(index.declarations.is_empty());
+    }
+
+    #[test]
+    fn declaration_info_array_arity_is_exact() {
+        assert!(serde_json::from_str::<DeclInfoRaw>("[1,2,3,4,5,6,7,8]").is_ok());
+        assert!(serde_json::from_str::<DeclInfoRaw>("[1,2,3,4,5,6,7]").is_err());
+        assert!(serde_json::from_str::<DeclInfoRaw>("[1,2,3,4,5,6,7,8,9]").is_err());
     }
 
     /// Measurement, not a gate. Point at a real built project to sanity-check

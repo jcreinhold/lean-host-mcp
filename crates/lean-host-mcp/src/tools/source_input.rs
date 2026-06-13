@@ -46,6 +46,11 @@ pub(crate) fn module_name_for_file(root: &Path, path: &Path) -> Option<String> {
     if parts.is_empty() { None } else { Some(parts.join(".")) }
 }
 
+pub(crate) fn source_path_for_module(root: &Path, module: &str) -> PathBuf {
+    let relative: PathBuf = module.split('.').collect();
+    root.join(relative).with_extension("lean")
+}
+
 pub(crate) fn header_imports(source: &str) -> Vec<String> {
     source
         .lines()

@@ -178,6 +178,9 @@ operation modules:
   requested sorry/axiom policy. Policy failures are normal results.
 - `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
   project declarations can resolve. Rendered fields are capped before crossing the worker boundary.
+- `lean_lookup(kind = "declarations")` lists declarations for a file or module. Source files use the edit-fresh worker
+  declaration-outline selector; module requests fall back to the existing `.ilean` reader only when the source file is
+  unavailable, reporting build-fresh or stale build artifact facts.
 - `lean_lookup(kind = "proof_search")` builds a small target profile from proof context or explicit goal/type text, then
   tries a private source-backed `lean-semantic-search` lane before falling back to bounded lean-rs declaration search.
 - `lean_lookup(kind = "references")` runs semantic reference lookup for a fully-qualified name in file or bounded project

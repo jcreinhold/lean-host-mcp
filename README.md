@@ -17,8 +17,8 @@ Five semantic tools, each with a `kind` mode:
 - **`lean_context`** — proof context. Initial mode: `proof_position`.
 - **`lean_trial`** — non-mutating experiments. Initial mode: `proof_step`.
 - **`lean_verify`** — declaration verification. Initial mode: `explicit`.
-- **`lean_lookup`** — declaration inspection, proof search, and references. Initial modes: `declaration`,
-  `proof_search`, and `references`.
+- **`lean_lookup`** — declaration inspection, declaration inventory, proof search, and references. Initial modes:
+  `declaration`, `declarations`, `proof_search`, and `references`.
 - **`lean_status`** — cheap project/toolchain/config status that does not open a worker.
 
 Every call is non-mutating: the server reads source and elaborates in memory, and never touches your files. The typical

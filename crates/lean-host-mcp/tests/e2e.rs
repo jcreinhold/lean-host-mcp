@@ -649,6 +649,87 @@ async fn find_references_project_scope_unbuilt_degrades_to_needs_build() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn lean_lookup_declarations_file_and_module_are_source_fresh() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+
+    let file = lean_lookup(
+        &ctx,
+        semantic_request(
+            "declarations",
+            serde_json::json!({
+                "target": { "kind": "file", "path": "LeanRsFixture/ProofAgent.lean" },
+                "limit": 20
+            }),
+        ),
+    )
+    .await
+    .expect("file declaration inventory");
+    assert!(
+        file.errors
+            .iter()
+            .all(|issue| issue.severity.as_deref() != Some("error")),
+        "file inventory should not carry error-severity issues: {:?}",
+        file.errors
+    );
+    assert!(file.trust.artifacts.iter().any(|artifact| {
+        artifact.artifact == lean_host_mcp::ArtifactKind::Source
+            && artifact.status == lean_host_mcp::TrustStatus::EditFresh
+    }));
+    let file_data = semantic_data(file);
+    assert_eq!(file_data["status"], "ok");
+    assert_eq!(file_data["source"], "worker");
+    let file_names = file_data["declarations"]
+        .as_array()
+        .expect("declarations array")
+        .iter()
+        .map(|row| row["name"].as_str().expect("name").to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        file_names.contains(&"LeanRsFixture.ProofAgent.miniRatDenominatorStep".to_owned()),
+        "file declaration inventory should include theorem, got {file_names:?}"
+    );
+
+    let module = lean_lookup(
+        &ctx,
+        semantic_request(
+            "declarations",
+            serde_json::json!({
+                "target": { "kind": "module", "module": "LeanRsFixture.ProofAgent" },
+                "limit": 20
+            }),
+        ),
+    )
+    .await
+    .expect("module declaration inventory");
+    assert!(
+        module
+            .errors
+            .iter()
+            .all(|issue| issue.severity.as_deref() != Some("error")),
+        "module inventory should not carry error-severity issues: {:?}",
+        module.errors
+    );
+    assert!(module.trust.artifacts.iter().any(|artifact| {
+        artifact.artifact == lean_host_mcp::ArtifactKind::Source
+            && artifact.status == lean_host_mcp::TrustStatus::EditFresh
+    }));
+    let module_data = semantic_data(module);
+    assert_eq!(module_data["status"], "ok");
+    assert_eq!(module_data["source"], "worker");
+    let module_names = module_data["declarations"]
+        .as_array()
+        .expect("declarations array")
+        .iter()
+        .map(|row| row["name"].as_str().expect("name").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(file_names, module_names);
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn search_for_proof_prefers_relevant_fixture_lemmas() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");

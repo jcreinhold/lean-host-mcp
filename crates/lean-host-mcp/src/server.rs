@@ -74,7 +74,7 @@ impl LeanHostService {
         self.respond_semantic(tools::semantic::lean_verify(&self.ctx, req).await)
     }
 
-    #[tool(description = "Semantic lookup. Kinds: declaration, proof_search, references.")]
+    #[tool(description = "Semantic lookup. Kinds: declaration, declarations, proof_search, references.")]
     async fn lean_lookup(
         &self,
         Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,

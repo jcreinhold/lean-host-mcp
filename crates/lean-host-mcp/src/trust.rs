@@ -113,6 +113,35 @@ impl ArtifactTrust {
             .next_action("lake build # produce .ilean files, then retry")
     }
 
+    pub fn ilean_module_build_fresh(module: impl Into<String>, path: impl Into<String>) -> Self {
+        let module = module.into();
+        Self::new(ArtifactKind::Ilean, TrustScope::Module, TrustStatus::BuildFresh)
+            .module(module.clone())
+            .path(path)
+            .detail(format!(
+                "module `{module}` declaration index is available from the last build"
+            ))
+    }
+
+    pub fn ilean_module_stale_build(module: impl Into<String>, path: impl Into<String>) -> Self {
+        let module = module.into();
+        Self::new(ArtifactKind::Ilean, TrustScope::Module, TrustStatus::StaleBuild)
+            .module(module.clone())
+            .path(path)
+            .detail(format!(
+                "module `{module}` source is newer than its .ilean declaration index"
+            ))
+            .next_action(format!("lake build {module} # refresh stale .ilean, then retry"))
+    }
+
+    pub fn ilean_module_missing_build(module: impl Into<String>) -> Self {
+        let module = module.into();
+        Self::new(ArtifactKind::Ilean, TrustScope::Module, TrustStatus::MissingBuild)
+            .module(module.clone())
+            .detail(format!("module `{module}` has no built .ilean declaration index"))
+            .next_action(format!("lake build {module} # produce .ilean, then retry"))
+    }
+
     pub fn olean_project_missing_build(detail: impl Into<String>) -> Self {
         Self::new(ArtifactKind::Olean, TrustScope::Project, TrustStatus::MissingBuild)
             .detail(detail)
