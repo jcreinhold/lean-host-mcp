@@ -382,8 +382,43 @@ Use `snippets` to try a bounded list independently:
 }
 ```
 
-The response reports each candidate's status, diagnostics, resulting goals, and
-whether the candidate set was truncated.
+The worker attempts candidates in request order and returns at most 16 ordered
+rows. `candidate_limit` records that cap, `candidates_truncated` is true when
+more candidates were requested than could be represented, and `summary` gives
+the batch counts:
+
+```json
+{
+  "candidates": [
+    { "id": "candidate_1", "status": "closed" },
+    { "id": "candidate_2", "status": "failed" }
+  ],
+  "candidate_limit": 16,
+  "candidates_truncated": false,
+  "summary": {
+    "requested_candidates": 2,
+    "returned_candidates": 2,
+    "candidate_limit": 16,
+    "candidates_truncated": false,
+    "partial": false,
+    "closed": 1,
+    "progressed": 0,
+    "failed": 1,
+    "timeout": 0,
+    "budget_exceeded": 0,
+    "not_attempted": 0,
+    "unsupported": 0,
+    "output_truncated": 0
+  }
+}
+```
+
+Candidate status is one of `closed`, `progressed`, `failed`, `timeout`,
+`budget_exceeded`, `not_attempted`, or `unsupported`. A batch is partial when
+some rows timed out, exceeded the total output budget, were skipped after that
+budget was exhausted, or had truncated output. In that case the envelope also
+includes warnings/next actions suggesting a smaller batch, a single-candidate
+retry, or a larger `output.max_total_bytes` budget.
 
 Proof-step diagnostics label their coordinate space. Candidate-local diagnostics
 usually point into the synthetic trial buffer, so use `synthetic_range` for

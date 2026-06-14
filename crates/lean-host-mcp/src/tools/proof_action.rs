@@ -33,8 +33,8 @@ use crate::diagnosis::{
 use crate::envelope::Response;
 use crate::error::{Result, ServerError};
 use crate::projections::{
-    DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProofAttemptCandidate,
-    ProofAttemptEnvelope, ProofAttemptResult, project_declaration_verification, project_proof_attempt,
+    DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProofAttemptEnvelope, ProofAttemptResult,
+    project_declaration_verification, project_proof_attempt,
 };
 use crate::tools::changed_coverage::{
     ChangedCoverageReport, ChangedCoverageRequest, ChangedCoverageResult, ChangedDeclaration, compute_changed_coverage,
@@ -44,7 +44,7 @@ use crate::tools::source_input::{read_query_file, source_path_for_module};
 use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
 use crate::trust::ArtifactTrust;
 
-const MAX_CANDIDATES: usize = 8;
+const MAX_CANDIDATES: usize = 16;
 const MAX_VERIFY_TARGETS: usize = 1000;
 const DEFAULT_FIELD_BYTES: u32 = 4 * 1024;
 const MIN_FIELD_BYTES: u32 = 256;
@@ -219,7 +219,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     let file_label = input.resolved.to_string_lossy().into_owned();
     let budgets = proof_action_budgets(&ctx.config.output);
     let candidates = proof_candidates(&req);
-    let extra_rows = capped_candidate_rows(&req);
+    let requested_count = candidates.len();
 
     if candidates.is_empty() {
         let runtime = ctx
@@ -227,11 +227,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
             .project_identity_without_worker(&hint, input.imports.clone())?;
         return Ok(Response::ok(
             ProofAttemptResult::Ok {
-                result: ProofAttemptEnvelope {
-                    candidates: extra_rows,
-                    candidate_limit: MAX_CANDIDATES as u32,
-                    candidates_truncated: false,
-                },
+                result: empty_proof_attempt_envelope(),
                 imports: input.imports,
             },
             runtime.freshness,
@@ -270,7 +266,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     };
     let taint = execution_taint(&call.runtime).cloned();
     let mut response = Response::ok(
-        append_capped_rows(project_proof_attempt(call.value), extra_rows),
+        refresh_proof_attempt_summary(project_proof_attempt(call.value), requested_count),
         call.freshness,
     )
     .with_runtime(call.runtime);
@@ -292,6 +288,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     if let Some(event) = &taint {
         response = warn_execution_taint(response, event);
     }
+    warn_partial_proof_attempt(&mut response);
     // A from-scratch tactic block submitted to an explicit `index` / `after_text`
     // position can fail because the binders it re-introduces are already in scope
     // from earlier tactics. The default targets the pristine entry goal, so this
@@ -370,11 +367,7 @@ fn proof_step_needs_build_response(
 /// `missing_imports` envelope (nothing ran). Pure, for unit testing.
 fn needs_build_attempt_result(imports: Vec<String>) -> ProofAttemptResult {
     ProofAttemptResult::MissingImports {
-        result: ProofAttemptEnvelope {
-            candidates: Vec::new(),
-            candidate_limit: MAX_CANDIDATES as u32,
-            candidates_truncated: false,
-        },
+        result: empty_proof_attempt_envelope(),
         imports,
         missing: Vec::new(),
     }
@@ -1344,39 +1337,10 @@ fn elab_options(file_label: &str, heartbeat_limit: Option<u64>) -> LeanWorkerEla
 fn proof_candidates(req: &TryProofStepRequest) -> Vec<LeanWorkerProofCandidate> {
     requested_snippets(req)
         .into_iter()
-        .take(MAX_CANDIDATES)
         .enumerate()
         .map(|(idx, text)| LeanWorkerProofCandidate {
             id: format!("candidate_{}", idx.saturating_add(1)),
             text,
-        })
-        .collect()
-}
-
-fn capped_candidate_rows(req: &TryProofStepRequest) -> Vec<ProofAttemptCandidate> {
-    requested_snippets(req)
-        .into_iter()
-        .enumerate()
-        .skip(MAX_CANDIDATES)
-        .map(|(idx, text)| ProofAttemptCandidate {
-            id: format!("candidate_{}", idx.saturating_add(1)),
-            status: "budget_exceeded".to_owned(),
-            snippet: crate::projections::RenderedText {
-                value: text,
-                truncated: false,
-            },
-            diagnostics: ElabFailure {
-                diagnostics: Vec::new(),
-                truncated: false,
-            },
-            downstream_diagnostics: ElabFailure {
-                diagnostics: Vec::new(),
-                truncated: false,
-            },
-            goals: Vec::new(),
-            declaration: None,
-            proof_position: None,
-            output_truncated: false,
         })
         .collect()
 }
@@ -1390,10 +1354,35 @@ fn requested_snippets(req: &TryProofStepRequest) -> Vec<String> {
     snippets
 }
 
-fn append_capped_rows(result: ProofAttemptResult, extra_rows: Vec<ProofAttemptCandidate>) -> ProofAttemptResult {
+fn empty_proof_attempt_envelope() -> ProofAttemptEnvelope {
+    let mut envelope = ProofAttemptEnvelope {
+        candidates: Vec::new(),
+        candidate_limit: MAX_CANDIDATES as u32,
+        candidates_truncated: false,
+        summary: crate::projections::ProofAttemptSummary {
+            requested_candidates: 0,
+            returned_candidates: 0,
+            candidate_limit: MAX_CANDIDATES as u32,
+            candidates_truncated: false,
+            partial: false,
+            closed: 0,
+            progressed: 0,
+            failed: 0,
+            timeout: 0,
+            budget_exceeded: 0,
+            not_attempted: 0,
+            unsupported: 0,
+            output_truncated: 0,
+        },
+    };
+    envelope.refresh_summary(0);
+    envelope
+}
+
+fn refresh_proof_attempt_summary(result: ProofAttemptResult, requested_count: usize) -> ProofAttemptResult {
     match result {
         ProofAttemptResult::Ok { result, imports } => ProofAttemptResult::Ok {
-            result: append_rows(result, extra_rows),
+            result: refresh_envelope_summary(result, requested_count),
             imports,
         },
         ProofAttemptResult::MissingImports {
@@ -1401,7 +1390,7 @@ fn append_capped_rows(result: ProofAttemptResult, extra_rows: Vec<ProofAttemptCa
             imports,
             missing,
         } => ProofAttemptResult::MissingImports {
-            result: append_rows(result, extra_rows),
+            result: refresh_envelope_summary(result, requested_count),
             imports,
             missing,
         },
@@ -1410,11 +1399,43 @@ fn append_capped_rows(result: ProofAttemptResult, extra_rows: Vec<ProofAttemptCa
     }
 }
 
-fn append_rows(mut envelope: ProofAttemptEnvelope, mut extra_rows: Vec<ProofAttemptCandidate>) -> ProofAttemptEnvelope {
-    envelope.candidates.append(&mut extra_rows);
-    envelope.candidate_limit = MAX_CANDIDATES as u32;
-    envelope.candidates_truncated = envelope.candidates_truncated || envelope.candidates.len() > MAX_CANDIDATES;
+fn refresh_envelope_summary(mut envelope: ProofAttemptEnvelope, requested_count: usize) -> ProofAttemptEnvelope {
+    envelope.refresh_summary(requested_count);
     envelope
+}
+
+fn warn_partial_proof_attempt(response: &mut Response<ProofAttemptResult>) {
+    let Some(summary) = response.result_ref().and_then(proof_attempt_summary).cloned() else {
+        return;
+    };
+    if summary.candidates_truncated {
+        response.warnings.push(format!(
+            "proof candidate batch was truncated at {} of {} requested snippets",
+            summary.returned_candidates, summary.requested_candidates
+        ));
+        response
+            .next_actions
+            .push("submit fewer proof snippets if you need a verdict for every candidate".to_owned());
+    }
+    if summary.budget_exceeded > 0 || summary.not_attempted > 0 || summary.output_truncated > 0 {
+        response.warnings.push(format!(
+            "proof candidate batch returned partial output: budget_exceeded={}, not_attempted={}, output_truncated={}",
+            summary.budget_exceeded, summary.not_attempted, summary.output_truncated
+        ));
+        response.next_actions.push(
+            "retry promising snippets individually or raise output.max_total_bytes for a larger batch response"
+                .to_owned(),
+        );
+    }
+}
+
+fn proof_attempt_summary(result: &ProofAttemptResult) -> Option<&crate::projections::ProofAttemptSummary> {
+    match result {
+        ProofAttemptResult::Ok { result, .. } | ProofAttemptResult::MissingImports { result, .. } => {
+            Some(&result.summary)
+        }
+        ProofAttemptResult::HeaderParseFailed { .. } | ProofAttemptResult::Unsupported => None,
+    }
 }
 
 #[cfg(test)]
@@ -1485,8 +1506,8 @@ mod tests {
     }
 
     #[test]
-    fn try_proof_step_request_accepts_snippet_list_and_caps_rows() {
-        let snippets = (0..10).map(|idx| format!("exact h{idx}")).collect::<Vec<_>>();
+    fn try_proof_step_request_accepts_snippet_list_for_upstream_batching() {
+        let snippets = (0..20).map(|idx| format!("exact h{idx}")).collect::<Vec<_>>();
         let req = TryProofStepRequest {
             file: PathBuf::from("Demo.lean"),
             declaration: "Demo.closed".to_owned(),
@@ -1495,10 +1516,60 @@ mod tests {
             snippet: None,
             snippets,
         };
-        assert_eq!(proof_candidates(&req).len(), MAX_CANDIDATES);
-        let capped = capped_candidate_rows(&req);
-        assert_eq!(capped.len(), 2);
-        assert_eq!(capped[0].status, "budget_exceeded");
+        let candidates = proof_candidates(&req);
+        assert_eq!(candidates.len(), 20);
+        assert_eq!(candidates[MAX_CANDIDATES].id, "candidate_17");
+    }
+
+    #[test]
+    fn proof_step_partial_summary_counts_upstream_not_attempted_rows() {
+        use crate::projections::{ProofAttemptCandidate, RenderedText};
+        let candidate = |id: &str, status: &str, output_truncated: bool| ProofAttemptCandidate {
+            id: id.to_owned(),
+            status: status.to_owned(),
+            snippet: RenderedText {
+                value: "trivial".to_owned(),
+                truncated: false,
+            },
+            diagnostics: ElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
+            downstream_diagnostics: ElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
+            goals: Vec::new(),
+            declaration: None,
+            proof_position: None,
+            output_truncated,
+        };
+        let result = refresh_proof_attempt_summary(
+            ProofAttemptResult::Ok {
+                result: ProofAttemptEnvelope {
+                    candidates: vec![
+                        candidate("candidate_1", "closed", false),
+                        candidate("candidate_2", "budget_exceeded", true),
+                        candidate("candidate_3", "not_attempted", false),
+                    ],
+                    candidate_limit: MAX_CANDIDATES as u32,
+                    candidates_truncated: false,
+                    summary: empty_proof_attempt_envelope().summary,
+                },
+                imports: Vec::new(),
+            },
+            3,
+        );
+        let Some(summary) = proof_attempt_summary(&result) else {
+            panic!("proof attempt should have a summary");
+        };
+        assert_eq!(summary.requested_candidates, 3);
+        assert_eq!(summary.returned_candidates, 3);
+        assert_eq!(summary.closed, 1);
+        assert_eq!(summary.budget_exceeded, 1);
+        assert_eq!(summary.not_attempted, 1);
+        assert_eq!(summary.output_truncated, 1);
+        assert!(summary.partial);
     }
 
     #[tokio::test]

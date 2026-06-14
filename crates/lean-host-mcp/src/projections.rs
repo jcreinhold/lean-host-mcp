@@ -301,6 +301,27 @@ pub struct ProofAttemptCandidate {
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "summary exposes independent proof-attempt batch facts for agents"
+)]
+pub struct ProofAttemptSummary {
+    pub requested_candidates: u32,
+    pub returned_candidates: u32,
+    pub candidate_limit: u32,
+    pub candidates_truncated: bool,
+    pub partial: bool,
+    pub closed: u32,
+    pub progressed: u32,
+    pub failed: u32,
+    pub timeout: u32,
+    pub budget_exceeded: u32,
+    pub not_attempted: u32,
+    pub unsupported: u32,
+    pub output_truncated: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct ProofPositionSummary {
     pub index: u32,
     pub tactic: RenderedText,
@@ -311,6 +332,18 @@ pub struct ProofAttemptEnvelope {
     pub candidates: Vec<ProofAttemptCandidate>,
     pub candidate_limit: u32,
     pub candidates_truncated: bool,
+    pub summary: ProofAttemptSummary,
+}
+
+impl ProofAttemptEnvelope {
+    pub(crate) fn refresh_summary(&mut self, requested_candidates: usize) {
+        self.summary = proof_attempt_summary(
+            &self.candidates,
+            self.candidate_limit,
+            self.candidates_truncated,
+            requested_candidates,
+        );
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -713,10 +746,18 @@ pub fn project_proof_attempt(result: LeanWorkerProofAttemptResult) -> ProofAttem
 }
 
 pub(crate) fn project_proof_attempt_envelope(envelope: LeanWorkerProofAttemptEnvelope) -> ProofAttemptEnvelope {
+    let candidates: Vec<_> = envelope.candidates.into_iter().map(project_proof_attempt_row).collect();
+    let summary = proof_attempt_summary(
+        &candidates,
+        envelope.candidate_limit,
+        envelope.candidates_truncated,
+        candidates.len(),
+    );
     ProofAttemptEnvelope {
-        candidates: envelope.candidates.into_iter().map(project_proof_attempt_row).collect(),
+        candidates,
         candidate_limit: envelope.candidate_limit,
         candidates_truncated: envelope.candidates_truncated,
+        summary,
     }
 }
 
@@ -744,9 +785,58 @@ fn proof_attempt_status(status: LeanWorkerProofAttemptStatus) -> &'static str {
         LeanWorkerProofAttemptStatus::Failed => "failed",
         LeanWorkerProofAttemptStatus::Timeout => "timeout",
         LeanWorkerProofAttemptStatus::BudgetExceeded => "budget_exceeded",
+        LeanWorkerProofAttemptStatus::NotAttempted => "not_attempted",
         LeanWorkerProofAttemptStatus::Unsupported => "unsupported",
         _ => "unsupported",
     }
+}
+
+fn proof_attempt_summary(
+    candidates: &[ProofAttemptCandidate],
+    candidate_limit: u32,
+    candidates_truncated: bool,
+    requested_candidates: usize,
+) -> ProofAttemptSummary {
+    let mut summary = ProofAttemptSummary {
+        requested_candidates: requested_candidates.try_into().unwrap_or(u32::MAX),
+        returned_candidates: candidates.len().try_into().unwrap_or(u32::MAX),
+        candidate_limit,
+        candidates_truncated,
+        partial: candidates_truncated,
+        closed: 0,
+        progressed: 0,
+        failed: 0,
+        timeout: 0,
+        budget_exceeded: 0,
+        not_attempted: 0,
+        unsupported: 0,
+        output_truncated: 0,
+    };
+    for candidate in candidates {
+        match candidate.status.as_str() {
+            "closed" => summary.closed = summary.closed.saturating_add(1),
+            "progressed" => summary.progressed = summary.progressed.saturating_add(1),
+            "failed" => summary.failed = summary.failed.saturating_add(1),
+            "timeout" => {
+                summary.timeout = summary.timeout.saturating_add(1);
+                summary.partial = true;
+            }
+            "budget_exceeded" => {
+                summary.budget_exceeded = summary.budget_exceeded.saturating_add(1);
+                summary.partial = true;
+            }
+            "not_attempted" => {
+                summary.not_attempted = summary.not_attempted.saturating_add(1);
+                summary.partial = true;
+            }
+            _ => summary.unsupported = summary.unsupported.saturating_add(1),
+        }
+        if candidate.output_truncated {
+            summary.output_truncated = summary.output_truncated.saturating_add(1);
+            summary.partial = true;
+        }
+    }
+    summary
 }
 
 pub fn project_declaration_verification(
@@ -909,6 +999,59 @@ mod tests {
             name_span: span.clone(),
             body_span: span,
         }
+    }
+
+    fn rendered(value: &str) -> LeanWorkerRenderedInfo {
+        LeanWorkerRenderedInfo {
+            value: value.to_owned(),
+            truncated: false,
+        }
+    }
+
+    fn no_failure() -> LeanWorkerElabFailure {
+        LeanWorkerElabFailure {
+            diagnostics: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn proof_attempt_projection_preserves_not_attempted_status_and_summary() {
+        let envelope = project_proof_attempt_envelope(LeanWorkerProofAttemptEnvelope {
+            candidates: vec![
+                LeanWorkerProofAttemptRow {
+                    id: "candidate_1".to_owned(),
+                    status: LeanWorkerProofAttemptStatus::Closed,
+                    candidate_text: rendered("trivial"),
+                    diagnostics: no_failure(),
+                    downstream_diagnostics: no_failure(),
+                    goals: Vec::new(),
+                    declaration: None,
+                    proof_position: None,
+                    output_truncated: false,
+                },
+                LeanWorkerProofAttemptRow {
+                    id: "candidate_2".to_owned(),
+                    status: LeanWorkerProofAttemptStatus::NotAttempted,
+                    candidate_text: rendered("exact later"),
+                    diagnostics: no_failure(),
+                    downstream_diagnostics: no_failure(),
+                    goals: Vec::new(),
+                    declaration: None,
+                    proof_position: None,
+                    output_truncated: false,
+                },
+            ],
+            candidate_limit: 16,
+            candidates_truncated: false,
+        });
+        assert_eq!(
+            envelope.candidates.get(1).map(|candidate| candidate.status.as_str()),
+            Some("not_attempted")
+        );
+        assert_eq!(envelope.summary.closed, 1);
+        assert_eq!(envelope.summary.not_attempted, 1);
+        assert!(envelope.summary.partial);
     }
 
     #[test]

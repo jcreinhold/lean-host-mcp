@@ -12,11 +12,14 @@
 )]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
+use lean_host_mcp::tools::position::ProofPositionSelector;
+use lean_host_mcp::tools::proof_action::{TryProofStepRequest, try_proof_step};
 use lean_host_mcp::tools::{ToolConfig, ToolContext};
-use lean_host_mcp::{BrokerConfig, ProjectBroker};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, ProofAttemptEnvelope, ProofAttemptResult};
 use tokio::runtime::Runtime;
 
 fn fixture_root() -> Option<PathBuf> {
@@ -85,7 +88,70 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
             });
         });
     });
+
+    for candidate_count in [1_usize, 3, 10] {
+        let request = proof_step_request(candidate_count);
+        let probe = rt
+            .block_on(async { try_proof_step(&ctx, request.clone()).await })
+            .expect("proof_step probe");
+        eprintln!(
+            "proof_step_batch_probe count={candidate_count} bytes={} statuses={:?}",
+            serde_json::to_vec(&probe).expect("serialize probe response").len(),
+            proof_attempt_status_counts(proof_attempt_envelope(
+                probe.result.as_ref().expect("proof_step probe result")
+            ))
+        );
+
+        c.bench_function(&format!("worker_roundtrip/proof_step_batch/{candidate_count}"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    std::hint::black_box(
+                        try_proof_step(&ctx, proof_step_request(candidate_count))
+                            .await
+                            .expect("try_proof_step"),
+                    )
+                });
+            });
+        });
+    }
 }
 
-criterion_group!(benches, bench_worker_roundtrip);
+fn proof_step_request(candidate_count: usize) -> TryProofStepRequest {
+    let snippets = (0..candidate_count).map(|_| "trivial".to_owned()).collect();
+    TryProofStepRequest {
+        file: PathBuf::from("LeanRsFixture/ProofActions.lean"),
+        declaration: "LeanRsFixture.ProofActions.stepTheorem".to_owned(),
+        proof_position: ProofPositionSelector::Default,
+        project: None,
+        snippet: None,
+        snippets,
+    }
+}
+
+fn proof_attempt_envelope(result: &ProofAttemptResult) -> &ProofAttemptEnvelope {
+    match result {
+        ProofAttemptResult::Ok { result, .. } | ProofAttemptResult::MissingImports { result, .. } => result,
+        other @ (ProofAttemptResult::HeaderParseFailed { .. } | ProofAttemptResult::Unsupported) => {
+            panic!("expected proof-attempt envelope, got {other:?}")
+        }
+    }
+}
+
+fn proof_attempt_status_counts(envelope: &ProofAttemptEnvelope) -> std::collections::BTreeMap<&str, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for candidate in &envelope.candidates {
+        let count = counts.entry(candidate.status.as_str()).or_insert(0_usize);
+        *count = count.saturating_add(1);
+    }
+    counts
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(3));
+    targets = bench_worker_roundtrip
+}
 criterion_main!(benches);

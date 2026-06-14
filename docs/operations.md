@@ -65,6 +65,12 @@ description (e.g. "5 GiB") is for reading, not for setting.
 
 <!-- END GENERATED -->
 
+`output.max_field_bytes` and `output.max_total_bytes` bound model-facing payloads before they leave the worker. Tight
+caps are useful for smoke tests and for very large proof states, but they can also make proof-step batches partial:
+once the total proof-action budget is exhausted the current candidate reports `budget_exceeded` and later candidates
+report `not_attempted`. Retry the promising snippet alone, or raise `LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES`, when the
+response summary shows nonzero `budget_exceeded`, `not_attempted`, or `output_truncated` counts.
+
 The three RSS ceilings must satisfy `import_switch <= post_job <= hard_kill`; the server **refuses to start** with a
 clear `invalid RSS config: …` message otherwise (an inverted order makes the cheaper planned cycle unreachable — e.g.
 `post_job` above `hard_kill` means every overrun escalates straight to an in-flight hard kill). To recycle less often

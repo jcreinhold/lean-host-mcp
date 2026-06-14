@@ -27,7 +27,7 @@ use lean_host_mcp::tools::proof_search::{ProofSearchMode, SearchForProofRequest,
 use lean_host_mcp::tools::semantic::{
     SemanticResponse, SemanticToolRequest, lean_context, lean_lookup, lean_status, lean_trial, lean_verify,
 };
-use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
+use lean_host_mcp::tools::{OutputBudgetOverrides, TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
     BrokerConfig, CoordinateSpace, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker,
     ProofAttemptResult,
@@ -38,6 +38,16 @@ fn fixture_root() -> Option<PathBuf> {
 }
 
 fn open_ctx(root: &Path) -> ToolContext {
+    open_ctx_with_config(
+        root,
+        ToolConfig {
+            verbosity: TelemetryVerbosity::Full,
+            ..ToolConfig::default()
+        },
+    )
+}
+
+fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
     let broker = ProjectBroker::new(BrokerConfig {
         config_default: None,
         env_default: Some(root.to_path_buf()),
@@ -49,15 +59,7 @@ fn open_ctx(root: &Path) -> ToolContext {
         semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
         semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
     });
-    ToolContext {
-        broker,
-        // These tests assert on worker-query telemetry (cache hit/miss, runtime
-        // facts), which is gated behind `full` verbosity.
-        config: ToolConfig {
-            verbosity: TelemetryVerbosity::Full,
-            ..ToolConfig::default()
-        },
-    }
+    ToolContext { broker, config }
 }
 
 fn proof_actions_file() -> PathBuf {
@@ -334,6 +336,100 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
     assert!(
         !goals_before.is_empty() || !goals_after.is_empty(),
         "candidate selector should return usable proof goals"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn try_proof_step_batch_returns_all_ordered_rows_under_worker_limit() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let snippets = (0..10).map(|_| "trivial".to_owned()).collect::<Vec<_>>();
+
+    let response = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: proof_actions_file(),
+            declaration: "LeanRsFixture.ProofActions.stepTheorem".to_owned(),
+            proof_position: ProofPositionSelector::Default,
+            project: None,
+            snippet: None,
+            snippets,
+        },
+    )
+    .await
+    .expect("batch proof_step");
+    let ProofAttemptResult::Ok { result, .. } = response.result.expect("batch proof-step result") else {
+        panic!("expected ok proof-step result");
+    };
+    assert_eq!(result.candidate_limit, 16);
+    assert!(!result.candidates_truncated);
+    assert_eq!(result.candidates.len(), 10);
+    assert_eq!(result.summary.requested_candidates, 10);
+    assert_eq!(result.summary.returned_candidates, 10);
+    assert_eq!(result.summary.closed, 10);
+    assert_eq!(result.summary.budget_exceeded, 0);
+    assert_eq!(result.summary.not_attempted, 0);
+    assert!(
+        result
+            .candidates
+            .iter()
+            .enumerate()
+            .all(|(idx, candidate)| candidate.id == format!("candidate_{}", idx + 1)),
+        "candidate rows should preserve request order: {:?}",
+        result.candidates
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn try_proof_step_partial_budget_surfaces_batch_summary() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx_with_config(
+        &root,
+        ToolConfig {
+            verbosity: TelemetryVerbosity::Full,
+            output: OutputBudgetOverrides {
+                max_total_bytes: Some(1024),
+                ..OutputBudgetOverrides::default()
+            },
+            ..ToolConfig::default()
+        },
+    );
+    let snippets = (0..16)
+        .map(|idx| format!("exact definitely_missing_identifier_with_a_long_name_to_fill_budget_{idx}"))
+        .collect::<Vec<_>>();
+
+    let response = try_proof_step(
+        &ctx,
+        TryProofStepRequest {
+            file: proof_actions_file(),
+            declaration: "LeanRsFixture.ProofActions.stepTheorem".to_owned(),
+            proof_position: ProofPositionSelector::Default,
+            project: None,
+            snippet: None,
+            snippets,
+        },
+    )
+    .await
+    .expect("partial proof_step");
+    let warnings = response.warnings.clone();
+    let ProofAttemptResult::Ok { result, .. } = response.result.expect("partial proof-step result") else {
+        panic!("expected ok proof-step result");
+    };
+    assert!(result.summary.partial, "expected a partial batch summary: {result:?}");
+    assert!(
+        result.summary.budget_exceeded > 0 || result.summary.not_attempted > 0 || result.summary.output_truncated > 0,
+        "partial summary should identify the limiting budget fact: {:?}",
+        result.summary
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("partial output")),
+        "partial proof-step response should warn clearly: {warnings:?}"
     );
 }
 
