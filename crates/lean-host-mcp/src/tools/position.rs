@@ -251,8 +251,10 @@ pub struct ProofStateRequest {
 /// from-scratch tactic block elaborates against this goal.
 ///
 /// `index` selects the state *after* the Nth tactic has run (so `index: 0` is
-/// the first-tactic state — read `goals_after` and continue from there);
-/// `after_text` selects the state just after a matched source fragment.
+/// the first-tactic state — read `goals_after` and continue from there).
+/// `after_text` selects a worker-recognized proof-state boundary matching a
+/// source fragment; read the returned `goals_before`/`goals_after` rather than
+/// assuming every substring maps to a post-tactic state.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProofPositionSelector {
@@ -467,7 +469,8 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
 
             let needs_build_cue = (!needs_build.is_empty()).then(|| needs_build_missing.clone());
             let ambiguous_cue = competing_decls(&ambiguous);
-            let response = Response::ok(
+            let selector_unresolved = unavailable.iter().any(selector_unresolved);
+            let mut response = Response::ok(
                 ProofStateResult::Context {
                     diagnostics,
                     declaration_name,
@@ -486,7 +489,14 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 },
                 freshness,
             )
-            .with_runtime(run.runtime.clone());
+            .with_runtime(run.runtime.clone())
+            .with_trust_artifact(run.source_fact);
+            if selector_unresolved {
+                response = response.warn(
+                    "proof_position selector did not resolve to a proof-state boundary; `after_text` matches worker-recognized tactic/source boundaries, not arbitrary substrings",
+                )
+                .hint("Try `proof_position:{\"kind\":\"default\"}` for the entry goal, `{\"kind\":\"index\",\"index\":0}` for the first boundary, or use text from a complete tactic line.");
+            }
             let response = match needs_build_cue {
                 Some(missing) => crate::diagnosis::warn_needs_build(
                     response,
@@ -1261,6 +1271,7 @@ struct BatchRun {
     outcome: BatchQueryRun,
     runtime: RuntimeFacts,
     freshness: Freshness,
+    source_fact: ArtifactTrust,
 }
 
 enum BatchQueryRun {
@@ -1313,6 +1324,7 @@ async fn run_module_query_batch(
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<BatchRun> {
     let input = read_query_file(root, path)?;
+    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved);
     let file_label = input.resolved.to_string_lossy().into_owned();
     let session_imports = session_imports(header_imports(&input.source));
     let call = ctx
@@ -1333,7 +1345,12 @@ async fn run_module_query_batch(
         outcome: route_batch_outcome(call.value),
         runtime: call.runtime,
         freshness: call.freshness,
+        source_fact,
     })
+}
+
+fn selector_unresolved(message: &SelectorMessage) -> bool {
+    message.id == PROOF_STATE_CONTEXT_ID && message.message.contains("proof position matching the selector")
 }
 
 fn proof_agent_budgets() -> LeanWorkerOutputBudgets {

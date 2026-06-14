@@ -193,6 +193,45 @@ async fn invalid_http_startup_config_exits() {
     }
 }
 
+#[tokio::test]
+async fn lean_verify_invalid_target_group_is_structured_tool_error() {
+    let server = HttpMcpServer::start(&[]).await;
+    let mut session = server.new_session().await;
+
+    let response = session
+        .request(
+            "tools/call",
+            json!({
+                "name": "lean_verify",
+                "arguments": {
+                    "targets": [{
+                        "kind": "bogus_group",
+                        "file": "LeanRsFixture/ProofActions.lean"
+                    }]
+                }
+            }),
+        )
+        .await
+        .expect("invalid lean_verify target group");
+
+    assert!(response.http_status.is_success());
+    assert!(
+        response.json.get("error").is_none(),
+        "invalid lean_verify target group should not be a JSON-RPC error: {:?}",
+        response.json
+    );
+    assert_eq!(semantic_error_code(&response.json).as_deref(), Some("invalid_request"));
+    assert_eq!(
+        response
+            .json
+            .pointer("/result/structuredContent/errors/0/details/example/targets/0/kind")
+            .and_then(Value::as_str),
+        Some("explicit")
+    );
+
+    server.shutdown().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn streamable_http_sigterm_shutdown_exits() {

@@ -68,10 +68,10 @@ impl LeanHostService {
     #[tool(description = "Verify Lean declarations from explicit, file_all, module_all, or changed target groups.")]
     async fn lean_verify(
         &self,
-        Parameters(req): Parameters<tools::proof_action::LeanVerifyRequest>,
+        Parameters(req): Parameters<tools::proof_action::LeanVerifyToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_verify", "tool call");
-        self.respond_semantic(tools::semantic::lean_verify_targets(&self.ctx, req).await)
+        self.respond_semantic(tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await)
     }
 
     #[tool(

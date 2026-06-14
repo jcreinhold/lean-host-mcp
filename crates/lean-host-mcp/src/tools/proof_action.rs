@@ -19,8 +19,11 @@ use lean_rs_worker_parent::{
     LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions, LeanWorkerOutputBudgets,
     LeanWorkerProofAttemptRequest, LeanWorkerProofCandidate, LeanWorkerProofEditTarget, LeanWorkerSorryPolicy,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::broker::ProjectHint;
 use crate::diagnosis::{
@@ -101,6 +104,34 @@ pub struct LeanVerifyRequest {
     /// Include the axioms each proof depends on (slower).
     #[serde(default)]
     pub report_axioms: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeanVerifyToolRequest(Value);
+
+impl LeanVerifyToolRequest {
+    pub fn into_inner(self) -> Value {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for LeanVerifyToolRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Value::deserialize(deserializer).map(Self)
+    }
+}
+
+impl JsonSchema for LeanVerifyToolRequest {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("LeanVerifyRequest")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        LeanVerifyRequest::json_schema(generator)
+    }
 }
 
 impl From<VerifyDeclarationRequest> for LeanVerifyRequest {
@@ -663,6 +694,11 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
     .with_trust_artifacts(expansion.trust_artifacts);
     response.warnings.extend(expansion.warnings);
     response.next_actions.extend(expansion.next_actions);
+    if req.targets.is_empty() {
+        response = response
+            .warn("lean_verify received no target groups; no declarations were checked")
+            .hint("Provide at least one target group, for example `{\"kind\":\"explicit\",\"file\":\"...\",\"declarations\":[\"...\"]}`.");
+    }
     response
         .next_actions
         .push("source files were not modified by verification".to_owned());
@@ -1631,6 +1667,44 @@ mod tests {
         .unwrap();
 
         assert_source_edit_fresh(&response);
+        assert!(broker.resident_paths().is_empty());
+        drop(ctx);
+        drop(broker);
+    }
+
+    #[tokio::test]
+    async fn lean_verify_empty_targets_warns_that_nothing_was_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let (ctx, broker) = test_context(root);
+
+        let response = verify_targets(
+            &ctx,
+            LeanVerifyRequest {
+                targets: Vec::new(),
+                project: None,
+                allow_sorry: false,
+                report_axioms: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = response.result_ref().unwrap();
+        assert_eq!(result.summary.requested, 0);
+        assert!(result.results.is_empty());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no target groups"))
+        );
+        assert!(
+            response
+                .next_actions
+                .iter()
+                .any(|action| action.contains("\"kind\":\"explicit\""))
+        );
         assert!(broker.resident_paths().is_empty());
         drop(ctx);
         drop(broker);

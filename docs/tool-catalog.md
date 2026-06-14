@@ -295,7 +295,9 @@ for the state after the first tactic, and:
 { "kind": "after_text", "text": "skip", "occurrence": 0 }
 ```
 
-for the state after a matched source fragment.
+for a worker-recognized proof-state boundary matching a source fragment. Not
+every substring is a boundary; inspect the returned `goals_before` and
+`goals_after` to determine the exact state available at the match.
 
 The `data` payload is the proof context result previously produced internally by
 the proof-position operation: status, diagnostics, goals, locals, expected type,

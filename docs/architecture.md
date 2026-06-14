@@ -159,7 +159,8 @@ Proof tools share the same anchor shape:
 - `{"kind":"default"}` (or omitting the field) selects the pristine entry goal — the state before any tactic runs;
   `lean_trial(kind = "proof_step")` splices tactic text before the first tactic there.
 - `{"kind":"index","index":N}` selects the state after the Nth tactic (`index:0` = after the first tactic).
-- `{"kind":"after_text","text":"...","occurrence":N}` selects a tactic/source fragment inside the declaration body.
+- `{"kind":"after_text","text":"...","occurrence":N}` selects a worker-recognized proof-state boundary matching a
+  tactic/source fragment inside the declaration body. It is not an arbitrary substring cursor.
 
 The Lean shim resolves these selectors to private source evidence. Raw offsets, line offsets, syntax spans, indentation,
 overlay insertion, and diagnostic-locality classification stay below the worker boundary.

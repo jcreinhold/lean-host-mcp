@@ -152,7 +152,7 @@ fn proof_position_selector_schema() -> Value {
         "properties": {
             "kind": {
                 "enum": ["default", "index", "after_text"],
-                "description": "`default` uses the entry goal; `index` requires `index`; `after_text` requires `text` and accepts optional `occurrence`."
+                "description": "`default` uses the entry goal; `index` requires `index`; `after_text` requires `text` and accepts optional `occurrence`. For matched text, inspect returned `goals_before`/`goals_after`; not every substring is a proof-state boundary."
             },
             "index": { "type": "integer", "minimum": 0 },
             "text": { "type": "string" },
@@ -263,7 +263,24 @@ fn lean_lookup_schema() -> Schema {
                     "name": { "type": "string" },
                     "file": { "type": ["string", "null"] },
                     "imports": { "type": "array", "items": { "type": "string" } },
-                    "fields": { "description": "Optional field-selection object or string list." },
+                    "fields": {
+                        "description": "Optional field selection. Use an object of booleans or a string list naming fields to include.",
+                        "type": ["object", "array", "null"],
+                        "properties": {
+                            "source": { "type": "boolean", "default": true },
+                            "statement": { "type": "boolean", "default": true },
+                            "docstring": { "type": "boolean", "default": true },
+                            "attributes": { "type": "boolean", "default": true },
+                            "flags": { "type": "boolean", "default": true }
+                        },
+                        "items": {
+                            "enum": ["source", "statement", "type", "docstring", "docs", "attributes", "flags"]
+                        },
+                        "examples": [
+                            ["statement", "docstring"],
+                            { "statement": true, "docstring": true, "source": false, "attributes": false, "flags": false }
+                        ]
+                    },
                     "raw_statement": { "type": "boolean" },
                     "project": { "type": ["string", "null"] }
                 },
@@ -403,7 +420,8 @@ fn semantic_example(tool: &str, kind: &str) -> Option<Value> {
         ("lean_lookup", "declaration") => Some(json!({
             "kind": "declaration",
             "name": "Nat.add_zero",
-            "imports": ["Init"]
+            "imports": ["Init"],
+            "fields": ["statement", "docstring"]
         })),
         ("lean_lookup", "declarations") => Some(json!({
             "kind": "declarations",
@@ -627,6 +645,32 @@ pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
         }
         Some(kind) => Ok(invalid_kind("lean_verify", kind, &[])),
     }
+}
+
+/// Declaration-verification entry point for the public MCP handler.
+///
+/// `lean_verify` is intentionally not kind-dispatched, but the MCP handler
+/// accepts raw JSON so malformed target groups can be reported through the same
+/// structured semantic envelope as the other public tools.
+///
+/// # Errors
+///
+/// Returns infrastructure failures only; malformed requests are structured
+/// semantic data.
+pub async fn lean_verify_raw(ctx: &ToolContext, value: Value) -> Result<SemanticResponse<Value>> {
+    if let Some(kind) = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+    {
+        return Ok(invalid_kind("lean_verify", kind, &[]));
+    }
+    let request = match decode_value::<LeanVerifyRequest>(value, semantic_example("lean_verify", "targets")) {
+        Ok(request) => request,
+        Err(response) => return Ok(*response),
+    };
+    lean_verify_targets(ctx, request).await
 }
 
 /// Typed declaration-verification entry point for the public MCP handler.
@@ -899,6 +943,13 @@ where
     T: DeserializeOwned,
 {
     let value = Value::Object(req.args.into_iter().collect());
+    decode_value(value, example)
+}
+
+fn decode_value<T>(value: Value, example: Option<Value>) -> std::result::Result<T, Box<SemanticResponse<Value>>>
+where
+    T: DeserializeOwned,
+{
     serde_json::from_value(value).map_err(|err| {
         let has_example = example.is_some();
         let details = example.map(|example| json!({ "example": example }));
@@ -1152,6 +1203,55 @@ mod tests {
                 .as_deref()
                 .is_some_and(|action| action.contains("details.example"))
         );
+        drop(ctx);
+        drop(broker);
+    }
+
+    #[tokio::test]
+    async fn lean_verify_raw_invalid_target_group_is_payload_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let broker = ProjectBroker::new(BrokerConfig {
+            config_default: None,
+            env_default: Some(root),
+            cwd: tmp.path().to_path_buf(),
+            max_projects: BrokerConfig::default_max_projects(),
+            idle_timeout: std::time::Duration::ZERO,
+            semantic_permits: BrokerConfig::default_semantic_permits(),
+            semantic_waiters: BrokerConfig::default_semantic_waiters(),
+            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
+            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
+        });
+        let ctx = ToolContext {
+            broker: std::sync::Arc::clone(&broker),
+            config: ToolConfig::default(),
+        };
+
+        let response = lean_verify_raw(
+            &ctx,
+            json!({
+                "targets": [{
+                    "kind": "bogus_group",
+                    "file": "LeanRsFixture/ProofActions.lean"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.data.is_none());
+        let error = response.errors.first().unwrap();
+        assert_eq!(error.code, "invalid_request");
+        assert!(error.message.contains("bogus_group"));
+        assert_eq!(
+            error.details.as_ref().and_then(|details| {
+                details
+                    .pointer("/example/targets/0/kind")
+                    .and_then(serde_json::Value::as_str)
+            }),
+            Some("explicit")
+        );
+        assert!(matches!(error.retryable, Some(false)));
         drop(ctx);
         drop(broker);
     }
