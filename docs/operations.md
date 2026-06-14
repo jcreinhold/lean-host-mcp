@@ -118,8 +118,9 @@ when no recycle has happened).
 ## Process lifetime
 
 The idle reaper (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`) governs resident per-project controllers, not the parent server
-process. A stdio server exits when its transport closes: it serves until the client closes the server's stdin. An HTTP
-server exits on Ctrl-C, SIGTERM, or ordinary process shutdown. Both transport exit paths call
+process. A stdio server exits when its transport closes: it serves until the client closes the server's stdin. It also
+watches the process that launched it and exits if that parent PID disappears or changes without a clean MCP shutdown.
+An HTTP server is separate: it exits on Ctrl-C, SIGTERM, or ordinary process shutdown. Both transport exit paths call
 `ProjectBroker::shutdown_all`, which closes resident projects before the process returns.
 
 Project shutdown is bounded by the worker layer. The host stops accepting new project work, queued messages receive
@@ -130,22 +131,26 @@ outcome. Abrupt parent death can still skip Rust `Drop`; child-side parent-loss 
 containment remains a launcher or process-manager responsibility.
 
 Every running server writes a PID record under the per-user cache directory at `lean-host-mcp/processes/` and removes it
-on normal shutdown. Inspect records with:
+on normal shutdown. The record contains the exact server PID, executable path, working directory, transport, bind/path,
+startup parent PID, and process group. Inspect records with:
 
 ```sh
 lean-host-mcp doctor processes
 ```
 
 The output lists only host-written records: PID, liveness, executable-match status when the platform exposes it,
-transport, bind/path, working directory, and direct child PIDs. It does not scan for process names. Clean records left
-behind by abruptly killed servers with:
+transport, bind/path, working directory, startup/current parent PID, process group, stale-stdio-client status, and
+direct child PIDs. It does not scan for process names. If a live stdio server is reparented, the output suggests an
+exact PID command such as `kill -TERM <pid>` for the recorded server PID. Clean records left behind by abruptly killed
+servers with:
 
 ```sh
 lean-host-mcp doctor processes --cleanup-stale-records
 ```
 
 Cleanup removes records whose PID is no longer alive. It does not kill live processes and does not infer ownership from
-an executable name, command substring, or port number.
+an executable name, command substring, or port number. Do not use broad process-name cleanup; identify the exact PID from
+the registry or from `ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
 
 ## Runtime-error contract
 

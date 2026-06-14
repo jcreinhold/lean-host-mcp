@@ -49,6 +49,8 @@ impl ServerProcessRecord {
             executable: std::env::current_exe().context("resolve current executable")?,
             cwd: std::env::current_dir().context("resolve current working directory")?,
             started_unix_millis: unix_millis(),
+            parent_pid_at_start: current_parent_pid(),
+            process_group_id: current_process_group_id(),
             transport: transport.to_owned(),
             bind,
             http_path: http_path.map(ToOwned::to_owned),
@@ -75,6 +77,10 @@ struct ProcessRecord {
     executable: PathBuf,
     cwd: PathBuf,
     started_unix_millis: u128,
+    #[serde(default)]
+    parent_pid_at_start: Option<u32>,
+    #[serde(default)]
+    process_group_id: Option<u32>,
     transport: String,
     bind: Option<String>,
     http_path: Option<String>,
@@ -86,6 +92,9 @@ struct ListedRecord {
     record: ProcessRecord,
     alive: bool,
     executable_match: Option<bool>,
+    current_parent_pid: Option<u32>,
+    current_process_group_id: Option<u32>,
+    parent_alive_at_start: Option<bool>,
     child_pids: Vec<u32>,
 }
 
@@ -99,7 +108,7 @@ pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
     let records = list_records()?;
     for listed in &records {
         println!(
-            "pid={} alive={} executable_match={} transport={} bind={} http_path={} cwd={} record={}",
+            "pid={} alive={} executable_match={} transport={} bind={} http_path={} cwd={} started_unix_millis={} parent_pid_at_start={} current_parent_pid={} parent_alive_at_start={} process_group_id={} current_process_group_id={} stale_client={} record={}",
             listed.record.pid,
             listed.alive,
             display_match(listed.executable_match),
@@ -107,10 +116,22 @@ pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
             listed.record.bind.as_deref().unwrap_or("-"),
             listed.record.http_path.as_deref().unwrap_or("-"),
             listed.record.cwd.display(),
+            listed.record.started_unix_millis,
+            display_u32(listed.record.parent_pid_at_start),
+            display_u32(listed.current_parent_pid),
+            display_bool(listed.parent_alive_at_start),
+            display_u32(listed.record.process_group_id),
+            display_u32(listed.current_process_group_id),
+            stale_stdio_client(listed),
             listed.path.display(),
         );
         if !listed.child_pids.is_empty() {
             println!("  child_pids={}", join_u32(&listed.child_pids));
+        }
+        if !listed.alive {
+            println!("  stale_record_cleanup=lean-host-mcp doctor processes --cleanup-stale-records");
+        } else if stale_stdio_client(listed) {
+            println!("  exact_terminate=kill -TERM {}", listed.record.pid);
         }
     }
     if args.cleanup_stale_records {
@@ -144,12 +165,18 @@ fn list_records() -> Result<Vec<ListedRecord>> {
         let executable_match = alive
             .then(|| executable_matches(record.pid, &record.executable))
             .flatten();
+        let current_parent_pid = alive.then(|| parent_pid(record.pid)).flatten();
+        let current_process_group_id = alive.then(|| process_group_id(record.pid)).flatten();
+        let parent_alive_at_start = record.parent_pid_at_start.map(process_alive);
         let child_pids = if alive { child_pids(record.pid) } else { Vec::new() };
         out.push(ListedRecord {
             path,
             record,
             alive,
             executable_match,
+            current_parent_pid,
+            current_process_group_id,
+            parent_alive_at_start,
             child_pids,
         });
     }
@@ -179,22 +206,64 @@ fn display_match(value: Option<bool>) -> &'static str {
     }
 }
 
+fn display_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn display_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| "-".to_owned(), |pid| pid.to_string())
+}
+
+fn stale_stdio_client(listed: &ListedRecord) -> bool {
+    listed.alive
+        && listed.record.transport == "stdio"
+        && listed
+            .record
+            .parent_pid_at_start
+            .is_some_and(|recorded| recorded > 1 && Some(recorded) != listed.current_parent_pid)
+}
+
 fn join_u32(values: &[u32]) -> String {
     values.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
 }
 
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
 
 #[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
+pub fn process_alive(_pid: u32) -> bool {
     false
+}
+
+#[cfg(unix)]
+pub fn current_parent_pid() -> Option<u32> {
+    parent_pid(std::process::id())
+}
+
+#[cfg(not(unix))]
+pub fn current_parent_pid() -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn current_process_group_id() -> Option<u32> {
+    process_group_id(std::process::id())
+}
+
+#[cfg(not(unix))]
+fn current_process_group_id() -> Option<u32> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -221,6 +290,38 @@ fn executable_matches(pid: u32, expected: &Path) -> Option<bool> {
 #[cfg(not(unix))]
 fn executable_matches(_pid: u32, _expected: &Path) -> Option<bool> {
     None
+}
+
+#[cfg(unix)]
+fn parent_pid(pid: u32) -> Option<u32> {
+    ps_single_u32(pid, "ppid=")
+}
+
+#[cfg(not(unix))]
+fn parent_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn process_group_id(pid: u32) -> Option<u32> {
+    ps_single_u32(pid, "pgid=")
+}
+
+#[cfg(not(unix))]
+fn process_group_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn ps_single_u32(pid: u32, field: &str) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", field, "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 #[cfg(unix)]
@@ -257,5 +358,38 @@ mod tests {
         assert_eq!(display_match(None), "unknown");
         assert_eq!(display_match(Some(false)), "no");
         assert_eq!(display_match(Some(true)), "yes");
+    }
+
+    #[test]
+    fn doctor_stale_stdio_client_requires_exact_parent_change() {
+        let listed = ListedRecord {
+            path: PathBuf::from("record.json"),
+            record: ProcessRecord {
+                pid: 100,
+                executable: PathBuf::from("/bin/lean-host-mcp"),
+                cwd: PathBuf::from("/tmp/project"),
+                started_unix_millis: 1,
+                parent_pid_at_start: Some(50),
+                process_group_id: Some(25),
+                transport: "stdio".to_owned(),
+                bind: None,
+                http_path: None,
+            },
+            alive: true,
+            executable_match: Some(true),
+            current_parent_pid: Some(1),
+            current_process_group_id: Some(25),
+            parent_alive_at_start: Some(false),
+            child_pids: vec![101],
+        };
+        assert!(stale_stdio_client(&listed));
+
+        let mut current = listed;
+        current.current_parent_pid = Some(50);
+        assert!(!stale_stdio_client(&current));
+
+        current.record.transport = "http".to_owned();
+        current.current_parent_pid = Some(1);
+        assert!(!stale_stdio_client(&current));
     }
 }

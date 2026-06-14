@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
@@ -216,14 +217,87 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let result = if let Some(config) = http {
         transport_http::serve(Arc::clone(&broker), config, tool_config).await
     } else {
-        let service = LeanHostService::new(Arc::clone(&broker), tool_config);
-        match service.serve(stdio()).await {
-            Ok(server) => server.waiting().await.map(|_| ()).map_err(anyhow::Error::from),
-            Err(err) => Err(anyhow::Error::from(err)),
-        }
+        serve_stdio(Arc::clone(&broker), tool_config).await
     };
     broker.shutdown_all();
     result
+}
+
+// Stdio lifecycle model:
+// - startup registers an exact-PID process record, then waits for MCP initialize
+//   and tools/list through rmcp's stdio server.
+// - initialize/tools-list failures are transport results; they unwind through
+//   `server.waiting()` or `serve(stdio())`.
+// - stdin EOF and client-side pipe loss resolve `server.waiting()`; dropping the
+//   server lets broker shutdown drain/cancel resident project actors.
+// - if the launching process disappears without a clean MCP shutdown, the
+//   stdio parent watcher exits the server path; HTTP is intentionally separate
+//   and runs until its signal/shutdown token fires.
+// - broker shutdown clears resident projects; each project actor owns exactly
+//   one worker child and invokes the upstream bounded worker shutdown.
+// - doctor diagnostics only use registry PID, parent PID, process group, and
+//   direct child metadata; cleanup removes stale records, never live processes.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the rmcp server handle must stay alive across the selected transport-wait and parent-loss futures"
+)]
+async fn serve_stdio(broker: Arc<ProjectBroker>, tool_config: ToolConfig) -> anyhow::Result<()> {
+    let parent_pid = processes::current_parent_pid();
+    let service = LeanHostService::new(broker, tool_config);
+    let server = match service.serve(stdio()).await {
+        Ok(server) => server,
+        Err(err) => {
+            let err = anyhow::Error::from(err);
+            if stdio_connection_closed(&err) {
+                tracing::info!(error = %err, "stdio transport closed before initialization completed");
+                return Ok(());
+            }
+            tracing::warn!(error = %err, "stdio server failed before wait loop");
+            return Err(err);
+        }
+    };
+
+    tokio::select! {
+        result = server.waiting() => {
+            match &result {
+                Ok(_) => tracing::info!("stdio transport closed"),
+                Err(err) => tracing::warn!(error = %err, "stdio transport closed with error"),
+            }
+            match result {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    let err = anyhow::Error::from(err);
+                    if stdio_connection_closed(&err) {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        }
+        () = wait_for_parent_loss(parent_pid) => {
+            tracing::warn!(parent_pid = parent_pid, "stdio parent process disappeared");
+            Ok(())
+        }
+    }
+}
+
+fn stdio_connection_closed(err: &anyhow::Error) -> bool {
+    err.to_string().contains("connection closed")
+}
+
+async fn wait_for_parent_loss(parent_pid: Option<u32>) {
+    let Some(parent_pid) = parent_pid.filter(|pid| *pid > 1) else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        if !processes::process_alive(parent_pid) || processes::current_parent_pid() != Some(parent_pid) {
+            return;
+        }
+    }
 }
 
 fn build_broker(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<ProjectBroker> {
