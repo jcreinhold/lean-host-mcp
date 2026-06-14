@@ -1009,7 +1009,7 @@ async fn find_references_in_file(
     hint: ProjectHint,
     root: &Path,
     req: &FindReferencesRequest,
-    freshness: Freshness,
+    mut freshness: Freshness,
     mut runtime: RuntimeFacts,
     limit: usize,
 ) -> Result<Response<FindReferencesResult>> {
@@ -1046,6 +1046,7 @@ async fn find_references_in_file(
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut any_freshly_processed = false;
+    let mut source_fact = None;
     // An unbuilt transitive dependency surfaces as a missing-`.olean` error; the
     // file is skipped and the call degrades to the `needs_build` verdict (with
     // the `lake build` cue) rather than hard-erroring.
@@ -1060,8 +1061,12 @@ async fn find_references_in_file(
                     missing_imports,
                 },
             runtime: run_runtime,
+            freshness: run_freshness,
+            source_fact: run_source_fact,
         }) => {
             runtime = run_runtime;
+            freshness = run_freshness;
+            source_fact = Some(run_source_fact);
             files_scanned = files_scanned.saturating_add(1);
             any_freshly_processed |= freshly_processed;
             if !missing_imports.is_empty() {
@@ -1089,8 +1094,12 @@ async fn find_references_in_file(
                     ..
                 },
             runtime: run_runtime,
+            freshness: run_freshness,
+            source_fact: run_source_fact,
         }) => {
             runtime = run_runtime;
+            freshness = run_freshness;
+            source_fact = Some(run_source_fact);
             files_scanned = files_scanned.saturating_add(1);
             any_freshly_processed |= freshly_processed;
             if !missing_imports.is_empty() {
@@ -1103,8 +1112,12 @@ async fn find_references_in_file(
         Ok(QueryRun {
             outcome: ModuleQueryRun::HeaderParseFailed { diagnostics },
             runtime: run_runtime,
+            freshness: run_freshness,
+            source_fact: run_source_fact,
         }) => {
             runtime = run_runtime;
+            freshness = run_freshness;
+            source_fact = Some(run_source_fact);
             header_parse_failed_files.push(HeaderParseFailedFile {
                 file: display,
                 diagnostics,
@@ -1113,8 +1126,12 @@ async fn find_references_in_file(
         Ok(QueryRun {
             outcome: ModuleQueryRun::Unsupported,
             runtime: run_runtime,
+            freshness: run_freshness,
+            source_fact: run_source_fact,
         }) => {
             runtime = run_runtime;
+            freshness = run_freshness;
+            source_fact = Some(run_source_fact);
             unsupported_files.push(display);
         }
         Err(ServerError::Io(_)) => {
@@ -1145,7 +1162,9 @@ async fn find_references_in_file(
         semantic_based: true,
     };
     let response = attach_query_notes(
-        Response::ok(result, freshness).with_runtime(runtime),
+        Response::ok(result, freshness)
+            .with_runtime(runtime)
+            .with_trust_artifacts(source_fact),
         any_freshly_processed,
         &[],
         false,
@@ -1307,6 +1326,8 @@ fn index_reference(file: &str, loc: &crate::ilean::ReferenceLocation) -> Referen
 struct QueryRun {
     outcome: ModuleQueryRun,
     runtime: RuntimeFacts,
+    freshness: Freshness,
+    source_fact: ArtifactTrust,
 }
 
 enum ModuleQueryRun {
@@ -1349,6 +1370,7 @@ async fn run_module_query(
     query: LeanWorkerModuleQuery,
 ) -> Result<QueryRun> {
     let input = read_query_file(root, path)?;
+    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved);
     let session_imports = session_imports(header_imports(&input.source));
     let call = ctx
         .broker
@@ -1366,6 +1388,8 @@ async fn run_module_query(
     Ok(QueryRun {
         outcome: route_query_outcome(call.value, call.freshly_processed),
         runtime: call.runtime,
+        freshness: call.freshness,
+        source_fact,
     })
 }
 

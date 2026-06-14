@@ -4,12 +4,13 @@
 //! source/build/worker artifacts a verdict depends on. Operational counters,
 //! cache timings, and import lists stay in telemetry.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustStatus {
     EditFresh,
@@ -20,7 +21,7 @@ pub enum TrustStatus {
     NotApplicable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     Source,
@@ -29,7 +30,7 @@ pub enum ArtifactKind {
     Worker,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustScope {
     File,
@@ -38,7 +39,7 @@ pub enum TrustScope {
     Toolchain,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ArtifactTrust {
     pub artifact: ArtifactKind,
     pub scope: TrustScope,
@@ -172,6 +173,36 @@ impl ArtifactTrust {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ArtifactTrustDeduper {
+    seen: HashSet<ArtifactTrust>,
+    artifacts: Vec<ArtifactTrust>,
+}
+
+impl ArtifactTrustDeduper {
+    pub(crate) fn push(&mut self, artifact: ArtifactTrust) {
+        if self.seen.insert(artifact.clone()) {
+            self.artifacts.push(artifact);
+        }
+    }
+
+    pub(crate) fn extend(&mut self, artifacts: impl IntoIterator<Item = ArtifactTrust>) {
+        for artifact in artifacts {
+            self.push(artifact);
+        }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<ArtifactTrust> {
+        self.artifacts
+    }
+}
+
+pub(crate) fn dedupe_artifacts(artifacts: impl IntoIterator<Item = ArtifactTrust>) -> Vec<ArtifactTrust> {
+    let mut deduper = ArtifactTrustDeduper::default();
+    deduper.extend(artifacts);
+    deduper.into_vec()
+}
+
 pub fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
 }
@@ -214,5 +245,25 @@ mod tests {
             Some("edit_fresh")
         );
         assert_eq!(serde_json::from_value::<ArtifactTrust>(json).unwrap(), fact);
+    }
+
+    #[test]
+    fn trust_deduplication_preserves_first_occurrence_order() {
+        let source = ArtifactTrust::source_file_edit_fresh(Path::new("/tmp/project"), Path::new("/tmp/project/A.lean"));
+        let ilean = ArtifactTrust::ilean_project_build_fresh();
+        let deduped = dedupe_artifacts([source.clone(), ilean.clone(), source.clone()]);
+        assert_eq!(deduped, vec![source, ilean]);
+    }
+
+    #[test]
+    fn display_path_prefers_project_relative_paths_inside_root() {
+        assert_eq!(
+            display_path(Path::new("/tmp/project"), Path::new("/tmp/project/A/B.lean")),
+            "A/B.lean"
+        );
+        assert_eq!(
+            display_path(Path::new("/tmp/project"), Path::new("/other/A.lean")),
+            "/other/A.lean"
+        );
     }
 }

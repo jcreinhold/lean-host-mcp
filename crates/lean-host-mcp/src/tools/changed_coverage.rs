@@ -22,6 +22,7 @@ use crate::tools::declaration_inventory::{
     declaration_inventory,
 };
 use crate::tools::source_input::resolve_path;
+use crate::trust::ArtifactTrustDeduper;
 
 const DEFAULT_BASE: &str = "HEAD";
 
@@ -166,7 +167,7 @@ pub(crate) async fn compute_changed_coverage(
             .collect(),
         truncated: false,
     };
-    let mut trust_artifacts = Vec::new();
+    let mut trust_artifacts = ArtifactTrustDeduper::default();
     let mut warnings = Vec::new();
     let mut next_actions = Vec::new();
 
@@ -182,7 +183,7 @@ pub(crate) async fn compute_changed_coverage(
             },
         )
         .await?;
-        trust_artifacts.extend(inventory.trust_artifacts.clone());
+        trust_artifacts.extend(inventory.trust_artifacts.iter().cloned());
         warnings.extend(inventory.warnings.clone());
         next_actions.extend(inventory.next_actions.clone());
         let Some(result) = inventory.result_ref() else {
@@ -219,7 +220,7 @@ pub(crate) async fn compute_changed_coverage(
         base.freshness,
     )
     .with_runtime(base.runtime)
-    .with_trust_artifacts(trust_artifacts);
+    .with_trust_artifacts(trust_artifacts.into_vec());
     response.warnings.extend(warnings);
     response.next_actions.extend(next_actions);
     Ok(response)

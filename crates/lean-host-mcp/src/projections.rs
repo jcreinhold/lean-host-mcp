@@ -370,6 +370,7 @@ pub enum ProofAttemptResult {
     reason = "verification booleans mirror independent lean-rs wire facts for proof policy decisions"
 )]
 pub struct DeclarationVerificationFacts {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<ProofActionDeclarationTarget>,
     pub diagnostics: ElabFailure,
     pub unresolved_goals: Vec<RenderedText>,

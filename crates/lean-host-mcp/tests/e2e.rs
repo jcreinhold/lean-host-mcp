@@ -733,22 +733,35 @@ async fn semantic_surface_ports_existing_shipped_behaviors() {
         Some("verified")
     );
 
-    let refs = semantic_data(
-        lean_lookup(
-            &ctx,
-            semantic_request(
-                "references",
-                serde_json::json!({
-                    "name": "LeanRsFixture.ProofActions.closedTheorem",
-                    "scope": "file",
-                    "file": "LeanRsFixture/ProofActions.lean",
-                    "limit": 10
-                }),
-            ),
-        )
-        .await
-        .expect("lean_lookup references"),
+    let refs_response = lean_lookup(
+        &ctx,
+        semantic_request(
+            "references",
+            serde_json::json!({
+                "name": "LeanRsFixture.ProofActions.closedTheorem",
+                "scope": "file",
+                "file": "LeanRsFixture/ProofActions.lean",
+                "limit": 10
+            }),
+        ),
+    )
+    .await
+    .expect("lean_lookup references");
+    assert_ne!(
+        refs_response.trust.session_id, "metadata-only",
+        "file-scope references elaborate the source snapshot and should carry a worker session"
     );
+    assert!(
+        refs_response.trust.artifacts.iter().any(|artifact| {
+            artifact.artifact == lean_host_mcp::ArtifactKind::Source
+                && artifact.scope == lean_host_mcp::TrustScope::File
+                && artifact.status == lean_host_mcp::TrustStatus::EditFresh
+                && artifact.path.as_deref() == Some("LeanRsFixture/ProofActions.lean")
+        }),
+        "file-scope references should report source edit-fresh trust: {:?}",
+        refs_response.trust.artifacts
+    );
+    let refs = semantic_data(refs_response);
     assert_eq!(refs.pointer("/status").and_then(serde_json::Value::as_str), Some("ok"));
 }
 
@@ -837,6 +850,74 @@ async fn lean_verify_batches_explicit_file_and_module_targets() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn lean_verify_normalizes_paths_dedupes_trust_and_compacts_rows() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let response = lean_verify(
+        &ctx,
+        semantic_request_without_kind(serde_json::json!({
+            "targets": [
+                { "kind": "explicit", "file": "LeanRsFixture/ProofActions.lean", "declarations": ["LeanRsFixture.ProofActions.closedTheorem"] },
+                { "kind": "file_all", "file": "LeanRsFixture/ProofActions.lean" },
+                { "kind": "module_all", "module": "LeanRsFixture.ProofActions" }
+            ],
+            "allow_sorry": true
+        })),
+    )
+    .await
+    .expect("lean_verify mixed targets");
+
+    let mut artifact_values = std::collections::BTreeSet::new();
+    for artifact in &response.trust.artifacts {
+        let encoded = serde_json::to_string(artifact).expect("trust artifact encodes");
+        assert!(
+            artifact_values.insert(encoded),
+            "duplicate trust artifact: {artifact:?}"
+        );
+    }
+
+    let data = semantic_data(response);
+    let rows = data["results"].as_array().expect("verify results");
+    assert!(!rows.is_empty(), "verify should produce rows: {data:?}");
+    for row in rows {
+        assert_eq!(
+            row["file"].as_str(),
+            Some("LeanRsFixture/ProofActions.lean"),
+            "every row should use project-relative file paths: {row:?}"
+        );
+        assert!(
+            row.pointer("/facts/target").is_none(),
+            "compact verify rows should not repeat target span blocks: {row:?}"
+        );
+        assert!(
+            row.pointer("/facts/candidates")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)),
+            "compact verify rows should not repeat ambiguous candidate span blocks: {row:?}"
+        );
+    }
+
+    let full = semantic_data(
+        lean_verify(
+            &ctx,
+            semantic_request_without_kind(serde_json::json!({
+                "targets": [{ "kind": "explicit", "file": "LeanRsFixture/ProofActions.lean", "declarations": ["LeanRsFixture.ProofActions.closedTheorem"] }],
+                "allow_sorry": true,
+                "detail": "full"
+            })),
+        )
+        .await
+        .expect("lean_verify full detail"),
+    );
+    assert!(
+        full.pointer("/results/0/facts/target").is_some(),
+        "full detail should preserve target span facts: {full:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn lean_verify_changed_targets_and_changed_coverage_report_gaps() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -891,6 +972,16 @@ async fn lean_verify_changed_targets_and_changed_coverage_report_gaps() {
             .all(|issue| issue.severity.as_deref() != Some("error")),
         "changed coverage should not carry error issues: {:?}",
         coverage.errors
+    );
+    assert!(
+        coverage.trust.artifacts.iter().any(|artifact| {
+            artifact.artifact == lean_host_mcp::ArtifactKind::Source
+                && artifact.scope == lean_host_mcp::TrustScope::File
+                && artifact.status == lean_host_mcp::TrustStatus::EditFresh
+                && artifact.path.as_deref() == Some("LeanRsFixture/ProofActions.lean")
+        }),
+        "changed coverage should report source edit-fresh trust for mapped files: {:?}",
+        coverage.trust.artifacts
     );
     let coverage_data = semantic_data(coverage);
     let known = coverage_data["known"].as_array().expect("known coverage rows");

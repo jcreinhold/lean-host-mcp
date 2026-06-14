@@ -40,9 +40,9 @@ use crate::tools::changed_coverage::{
     ChangedCoverageReport, ChangedCoverageRequest, ChangedCoverageResult, ChangedDeclaration, compute_changed_coverage,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
-use crate::tools::source_input::{read_query_file, source_path_for_module};
+use crate::tools::source_input::{read_query_file, resolve_path, source_path_for_module};
 use crate::tools::{OutputBudgetOverrides, ToolContext, session_imports};
-use crate::trust::ArtifactTrust;
+use crate::trust::{ArtifactTrust, ArtifactTrustDeduper, display_path};
 
 const MAX_CANDIDATES: usize = 16;
 const MAX_VERIFY_TARGETS: usize = 1000;
@@ -104,6 +104,18 @@ pub struct LeanVerifyRequest {
     /// Include the axioms each proof depends on (slower).
     #[serde(default)]
     pub report_axioms: bool,
+    /// Verification row verbosity. `compact` omits repeated target/candidate
+    /// span blocks; `full` preserves them.
+    #[serde(default)]
+    pub detail: LeanVerifyDetail,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LeanVerifyDetail {
+    #[default]
+    Compact,
+    Full,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +156,7 @@ impl From<VerifyDeclarationRequest> for LeanVerifyRequest {
             project: req.project,
             allow_sorry: req.allow_sorry,
             report_axioms: req.report_axioms,
+            detail: LeanVerifyDetail::Compact,
         }
     }
 }
@@ -484,7 +497,7 @@ pub async fn verify_declaration(
 pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result<Response<LeanVerifyResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
-    let mut expansion = VerifyExpansion::new();
+    let mut expansion = VerifyExpansion::new(meta.canonical_root.clone());
 
     for (group_index, target_group) in req.targets.iter().enumerate() {
         match target_group {
@@ -654,7 +667,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
         if let Some(fact) = source_fact {
             expansion.trust_artifacts.push(fact);
         }
-        let projected = project_batch_rows(call.value, &target_meta, req.report_axioms, taint.as_ref());
+        let projected = project_batch_rows(call.value, &target_meta, req.report_axioms, req.detail, taint.as_ref());
         if projected.recycled
             && let Some(event) = taint
         {
@@ -684,7 +697,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
         freshness,
     )
     .with_runtime(runtime)
-    .with_trust_artifacts(expansion.trust_artifacts);
+    .with_trust_artifacts(expansion.trust_artifacts.into_vec());
     response.warnings.extend(expansion.warnings);
     response.next_actions.extend(expansion.next_actions);
     if req.targets.is_empty() {
@@ -732,6 +745,7 @@ struct VerifyGroup {
 }
 
 struct VerifyExpansion {
+    root: PathBuf,
     groups: Vec<VerifyGroup>,
     group_by_key: HashMap<String, usize>,
     seen_ids: HashSet<String>,
@@ -739,7 +753,7 @@ struct VerifyExpansion {
     next_order: usize,
     truncated: bool,
     coverage: ChangedCoverageReport,
-    trust_artifacts: Vec<ArtifactTrust>,
+    trust_artifacts: ArtifactTrustDeduper,
     warnings: Vec<String>,
     next_actions: Vec<String>,
 }
@@ -762,8 +776,9 @@ impl<'a> From<(&'a str, Option<String>)> for VerifyDeclarationItem<'a> {
 }
 
 impl VerifyExpansion {
-    fn new() -> Self {
+    fn new(root: PathBuf) -> Self {
         Self {
+            root,
             groups: Vec::new(),
             group_by_key: HashMap::new(),
             seen_ids: HashSet::new(),
@@ -771,7 +786,7 @@ impl VerifyExpansion {
             next_order: 0,
             truncated: false,
             coverage: ChangedCoverageReport::default(),
-            trust_artifacts: Vec::new(),
+            trust_artifacts: ArtifactTrustDeduper::default(),
             warnings: Vec::new(),
             next_actions: Vec::new(),
         }
@@ -816,8 +831,8 @@ impl VerifyExpansion {
         I: IntoIterator,
         I::Item: Into<VerifyDeclarationItem<'a>>,
     {
-        let file = file_display(&source);
-        let key = source_key(&source);
+        let file = file_display(&self.root, &source);
+        let key = source_key(&self.root, &source);
         let group_idx = match self.group_by_key.get(&key).copied() {
             Some(idx) => idx,
             None => {
@@ -861,13 +876,13 @@ impl VerifyExpansion {
         &mut self,
         response: &Response<crate::tools::declaration_inventory::DeclarationInventoryResult>,
     ) {
-        self.trust_artifacts.extend(response.trust_artifacts.clone());
+        self.trust_artifacts.extend(response.trust_artifacts.iter().cloned());
         self.warnings.extend(response.warnings.clone());
         self.next_actions.extend(response.next_actions.clone());
     }
 
     fn absorb_changed_coverage(&mut self, response: &Response<ChangedCoverageResult>) {
-        self.trust_artifacts.extend(response.trust_artifacts.clone());
+        self.trust_artifacts.extend(response.trust_artifacts.iter().cloned());
         self.warnings.extend(response.warnings.clone());
         self.next_actions.extend(response.next_actions.clone());
     }
@@ -928,17 +943,17 @@ fn prepare_verify_group(root: &Path, group: VerifyGroup) -> Result<PreparedVerif
     }
 }
 
-fn source_key(source: &VerifySource) -> String {
+fn source_key(root: &Path, source: &VerifySource) -> String {
     match source {
-        VerifySource::File(path) => format!("file:{}", path.to_string_lossy()),
+        VerifySource::File(path) => format!("file:{}", display_path(root, &resolve_path(root, path))),
         VerifySource::ModuleIndex { module, .. } => format!("module_index:{module}"),
     }
 }
 
-fn file_display(source: &VerifySource) -> String {
+fn file_display(root: &Path, source: &VerifySource) -> String {
     match source {
-        VerifySource::File(path) => path.to_string_lossy().into_owned(),
-        VerifySource::ModuleIndex { display_file, .. } => display_file.to_string_lossy().into_owned(),
+        VerifySource::File(path) => display_path(root, &resolve_path(root, path)),
+        VerifySource::ModuleIndex { display_file, .. } => display_path(root, display_file),
     }
 }
 
@@ -954,17 +969,26 @@ fn project_batch_rows(
     result: LeanWorkerDeclarationVerificationBatchResult,
     target_meta: &HashMap<String, VerifyTarget>,
     report_axioms: bool,
+    detail: LeanVerifyDetail,
     taint: Option<&crate::envelope::RuntimeRestartEvent>,
 ) -> ProjectedBatchRows {
     match result {
         LeanWorkerDeclarationVerificationBatchResult::Ok { results, imports } => {
-            project_batch_verdict_rows(results, imports, None, target_meta, report_axioms, taint)
+            project_batch_verdict_rows(results, imports, None, target_meta, report_axioms, detail, taint)
         }
         LeanWorkerDeclarationVerificationBatchResult::MissingImports {
             results,
             imports,
             missing,
-        } => project_batch_verdict_rows(results, imports, Some(missing), target_meta, report_axioms, taint),
+        } => project_batch_verdict_rows(
+            results,
+            imports,
+            Some(missing),
+            target_meta,
+            report_axioms,
+            detail,
+            taint,
+        ),
         LeanWorkerDeclarationVerificationBatchResult::HeaderParseFailed { diagnostics } => {
             let diagnostics = crate::projections::project_failure(&diagnostics);
             ProjectedBatchRows {
@@ -1034,6 +1058,7 @@ fn project_batch_verdict_rows(
     missing: Option<Vec<String>>,
     target_meta: &HashMap<String, VerifyTarget>,
     report_axioms: bool,
+    detail: LeanVerifyDetail,
     taint: Option<&crate::envelope::RuntimeRestartEvent>,
 ) -> ProjectedBatchRows {
     let mut out = ProjectedBatchRows {
@@ -1073,12 +1098,16 @@ fn project_batch_verdict_rows(
         if let Some(warning) = axiom_unavailable_warning(&projected, report_axioms) {
             out.axiom_warnings.push(warning);
         }
-        out.rows.push(row_from_projected(target, projected));
+        out.rows.push(row_from_projected(target, projected, detail));
     }
     out
 }
 
-fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResult) -> LeanVerifyRow {
+fn row_from_projected(
+    target: &VerifyTarget,
+    result: DeclarationVerificationResult,
+    detail: LeanVerifyDetail,
+) -> LeanVerifyRow {
     match result {
         DeclarationVerificationResult::Ok {
             verification_status,
@@ -1090,7 +1119,7 @@ fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResu
             declaration: target.declaration.clone(),
             reason: target.reason.clone(),
             verification_status,
-            facts: Some(facts),
+            facts: Some(apply_verify_detail(facts, detail)),
             missing_imports: Vec::new(),
             diagnostics: None,
         },
@@ -1105,7 +1134,7 @@ fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResu
             declaration: target.declaration.clone(),
             reason: target.reason.clone(),
             verification_status,
-            facts: Some(facts),
+            facts: Some(apply_verify_detail(facts, detail)),
             missing_imports: missing,
             diagnostics: None,
         },
@@ -1130,6 +1159,17 @@ fn row_from_projected(target: &VerifyTarget, result: DeclarationVerificationResu
             diagnostics: None,
         },
     }
+}
+
+fn apply_verify_detail(
+    mut facts: Box<DeclarationVerificationFacts>,
+    detail: LeanVerifyDetail,
+) -> Box<DeclarationVerificationFacts> {
+    if detail == LeanVerifyDetail::Compact {
+        facts.target = None;
+        facts.candidates.clear();
+    }
+    facts
 }
 
 fn needs_build_row(target: VerifyTarget) -> LeanVerifyRow {
@@ -1702,7 +1742,7 @@ mod tests {
 
     #[test]
     fn lean_verify_expansion_coalesces_targets_by_source() {
-        let mut expansion = VerifyExpansion::new();
+        let mut expansion = VerifyExpansion::new(std::path::PathBuf::from("/tmp/project"));
         expansion.push_explicit_group(
             0,
             std::path::Path::new("Demo.lean"),
@@ -1760,6 +1800,7 @@ mod tests {
                 project: None,
                 allow_sorry: false,
                 report_axioms: false,
+                detail: LeanVerifyDetail::Compact,
             },
         )
         .await

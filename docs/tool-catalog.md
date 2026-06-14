@@ -59,10 +59,12 @@ All public tools return the semantic response baseline:
 - `scope`: `file`, `module`, `project`, `toolchain`
 - `status`: `edit_fresh`, `build_fresh`, `stale_build`, `missing_build`, `unknown`, `not_applicable`
 
-Rows may also carry `path`, `module`, `detail`, and `next_action`. Source-overlay tools and source-backed declaration
-inventory report the source file snapshot as `source` / `file` / `edit_fresh`; project reference lookup and index-backed
-declaration inventory report `.ilean` build freshness or missing/stale build state; `needs_build` degradations report
-missing `.olean` artifacts. Runtime counters, cache timings, and import lists remain telemetry, not trust.
+Rows may also carry `path`, `module`, `detail`, and `next_action`. Paths are rendered project-relative when the file is
+inside the resolved Lake root, and absolute only for files outside that root. Source-overlay tools and source-backed
+declaration inventory report the source file snapshot as `source` / `file` / `edit_fresh`; project reference lookup and
+index-backed declaration inventory report `.ilean` build freshness or missing/stale build state; `needs_build`
+degradations report missing `.olean` artifacts. Duplicate trust rows are collapsed while preserving first occurrence
+order. Runtime counters, cache timings, and import lists remain telemetry, not trust.
 
 Lean-domain outcomes remain data. A failed tactic, a rejected declaration, an
 ambiguous name, or a `needs_build` verdict is not an MCP transport error.
@@ -494,7 +496,8 @@ Single declaration:
     }
   ],
   "allow_sorry": false,
-  "report_axioms": true
+  "report_axioms": true,
+  "detail": "compact"
 }
 ```
 
@@ -521,7 +524,8 @@ Mixed target groups:
     }
   ],
   "allow_sorry": false,
-  "report_axioms": false
+  "report_axioms": false,
+  "detail": "compact"
 }
 ```
 
@@ -568,9 +572,15 @@ projection: `verified`, `has_sorry`, `has_unresolved_goals`,
 `budget_exceeded`, `worker_recycled`, or `unsupported`. `requested` counts
 expanded targets before host-side caps; `truncated` is true when declaration
 inventory or verification output was capped. `file_all` and source-backed
-`module_all` use the current source snapshot. If a module has no source file,
-`module_all` may use the `.ilean` declaration inventory, with typed artifact
-freshness facts in `trust`.
+`module_all` use the current source snapshot and report the same project-relative
+file paths in rows. If a module has no source file, `module_all` may use the
+`.ilean` declaration inventory, with typed artifact freshness facts in `trust`.
+
+`detail` defaults to `"compact"`, which keeps the row-level declaration name,
+file, status, reason, diagnostics, sorry/admit facts, axiom facts, and
+trustworthiness flags, but omits repeated target-span and ambiguous-candidate
+span blocks. Use `"detail": "full"` when you need those source spans in each
+row.
 
 `changed` runs non-interactive git commands under the project root:
 `git diff --unified=0 --no-ext-diff --find-renames <base> -- '*.lean'`, plus
@@ -651,8 +661,10 @@ The request fields match the `lean_verify` changed target:
 ```
 
 The result has `known` changed declarations and the same `coverage` block that
-`lean_verify` returns. Unknown rows are actionable coverage gaps, not failures
-to be ignored.
+`lean_verify` returns. Source-backed coverage rows carry `source` / `file` /
+`edit_fresh` trust facts for the mapped files, so a gate can tell the mapping
+was computed from the current source snapshot. Unknown rows are actionable
+coverage gaps, not failures to be ignored.
 
 ### `kind: "proof_search"`
 
@@ -688,7 +700,8 @@ clamped to the tool cap.
 Finds semantic references to a fully-qualified Lean name.
 
 File scope elaborates one anchor file through the worker, so it reflects the
-current source snapshot:
+current source snapshot and carries a worker session id plus a `source` /
+`file` / `edit_fresh` trust fact:
 
 ```json
 {

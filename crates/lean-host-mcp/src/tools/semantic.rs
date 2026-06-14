@@ -17,7 +17,7 @@ use crate::broker::{BrokerConfigSnapshot, ProjectHint};
 use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure};
 use crate::error::{Result, ServerError, WorkerUnavailable};
 use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolContext};
-use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus};
+use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus, dedupe_artifacts};
 
 use super::changed_coverage::{self, ChangedCoverageRequest};
 use super::declaration::{self, InspectDeclarationRequest};
@@ -492,7 +492,7 @@ impl SemanticTrust {
             project_root: freshness.project_root,
             session_id: freshness.session_id,
             lean_toolchain: freshness.lean_toolchain,
-            artifacts,
+            artifacts: dedupe_artifacts(artifacts),
         }
     }
 }
