@@ -51,7 +51,8 @@ async fn streamable_http_initialize_and_tools_list() {
     }
 
     // Handlers return a bare `CallToolResult`, so rmcp advertises no `outputSchema`.
-    // The Anthropic Messages API drops it anyway, and deep `$defs` break strict clients.
+    // Keep tool input schemas in the narrow object/properties/required subset that
+    // strict MCP clients reliably ingest.
     let listed = tools
         .json
         .pointer("/result/tools")
@@ -76,6 +77,11 @@ async fn streamable_http_initialize_and_tools_list() {
             "tool {} must advertise top-level inputSchema properties for strict MCP clients: {tool:?}",
             tool.get("name").and_then(Value::as_str).unwrap_or("?")
         );
+        assert!(
+            tool.pointer("/inputSchema/oneOf").is_none(),
+            "tool {} must not advertise root-level oneOf; strict MCP clients may hide it: {tool:?}",
+            tool.get("name").and_then(Value::as_str).unwrap_or("?")
+        );
     }
     let verify_tool = listed
         .iter()
@@ -98,10 +104,6 @@ async fn streamable_http_initialize_and_tools_list() {
         .and_then(|tool| tool.get("inputSchema"))
         .expect("lean_lookup should advertise an inputSchema");
     let lookup_schema_text = lookup_schema.to_string();
-    assert!(
-        lookup_schema.pointer("/oneOf").is_some(),
-        "lean_lookup inputSchema should advertise per-kind variants: {lookup_schema:?}"
-    );
     assert_eq!(
         lookup_schema
             .pointer("/properties/kind/enum")
@@ -120,6 +122,10 @@ async fn streamable_http_initialize_and_tools_list() {
             "lean_lookup schema should expose {expected:?}: {lookup_schema:?}"
         );
     }
+    assert!(
+        !lookup_schema_text.contains("oneOf") && !lookup_schema_text.contains("$defs"),
+        "lean_lookup schema should avoid compatibility-sensitive JSON Schema combinators: {lookup_schema:?}"
+    );
     let context_schema = listed
         .iter()
         .find(|tool| tool.get("name").and_then(Value::as_str) == Some("lean_context"))

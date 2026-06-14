@@ -96,7 +96,6 @@ fn semantic_schema(title: &str, description: &str, variants: &[Value]) -> Schema
         "type": "object",
         "properties": properties,
         "additionalProperties": true,
-        "oneOf": variants,
     }))
 }
 
@@ -149,62 +148,43 @@ fn push_unique_kind(kinds: &mut Vec<Value>, kind: Value) {
 fn proof_position_selector_schema() -> Value {
     json!({
         "description": "Where in the declaration proof to inspect or edit. Omit for the pristine entry goal.",
-        "oneOf": [
-            {
-                "type": "object",
-                "required": ["kind"],
-                "properties": { "kind": { "const": "default" } },
-                "additionalProperties": false
+        "type": "object",
+        "properties": {
+            "kind": {
+                "enum": ["default", "index", "after_text"],
+                "description": "`default` uses the entry goal; `index` requires `index`; `after_text` requires `text` and accepts optional `occurrence`."
             },
-            {
-                "type": "object",
-                "required": ["kind", "index"],
-                "properties": {
-                    "kind": { "const": "index" },
-                    "index": { "type": "integer", "minimum": 0 }
-                },
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "required": ["kind", "text"],
-                "properties": {
-                    "kind": { "const": "after_text" },
-                    "text": { "type": "string" },
-                    "occurrence": { "type": "integer", "minimum": 0, "default": 0 }
-                },
-                "additionalProperties": false
-            }
+            "index": { "type": "integer", "minimum": 0 },
+            "text": { "type": "string" },
+            "occurrence": { "type": "integer", "minimum": 0, "default": 0 }
+        },
+        "required": ["kind"],
+        "additionalProperties": false,
+        "examples": [
+            { "kind": "default" },
+            { "kind": "index", "index": 0 },
+            { "kind": "after_text", "text": "intro h", "occurrence": 0 }
         ]
     })
 }
 
 fn target_schema() -> Value {
     json!({
-        "description": "Declaration inventory target.",
-        "oneOf": [
-            {
-                "type": "object",
-                "description": "Read declarations from a Lean source file.",
-                "required": ["kind", "path"],
-                "properties": {
-                    "kind": { "const": "file" },
-                    "path": { "type": "string", "description": "Path to a .lean file, relative to the project root unless absolute." }
-                },
-                "additionalProperties": false,
-                "examples": [{ "kind": "file", "path": "LeanRsFixture/ProofAgent.lean" }]
+        "description": "Declaration inventory target. Use `kind: \"file\"` with `path`, or `kind: \"module\"` with `module`.",
+        "type": "object",
+        "properties": {
+            "kind": {
+                "enum": ["file", "module"],
+                "description": "`file` reads declarations from a Lean source file; `module` reads a Lean module using source when available and a fresh .ilean supplement/fallback when needed."
             },
-            {
-                "type": "object",
-                "description": "Read declarations from a Lean module. Uses source when available and a fresh .ilean supplement/fallback when needed.",
-                "required": ["kind", "module"],
-                "properties": {
-                    "kind": { "const": "module" },
-                    "module": { "type": "string", "description": "Dotted Lean module name." }
-                },
-                "additionalProperties": false,
-                "examples": [{ "kind": "module", "module": "LeanRsFixture.ProofAgent" }]
-            }
+            "path": { "type": "string", "description": "Path to a .lean file, relative to the project root unless absolute. Required when kind is `file`." },
+            "module": { "type": "string", "description": "Dotted Lean module name. Required when kind is `module`." }
+        },
+        "required": ["kind"],
+        "additionalProperties": false,
+        "examples": [
+            { "kind": "file", "path": "LeanRsFixture/ProofAgent.lean" },
+            { "kind": "module", "module": "LeanRsFixture.ProofAgent" }
         ]
     })
 }
