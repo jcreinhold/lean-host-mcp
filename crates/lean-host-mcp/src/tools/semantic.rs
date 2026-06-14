@@ -92,6 +92,7 @@ fn semantic_schema(title: &str, description: &str, variants: &[Value]) -> Schema
     schema_from_value(json!({
         "title": title,
         "description": description,
+        "type": "object",
         "oneOf": variants,
     }))
 }

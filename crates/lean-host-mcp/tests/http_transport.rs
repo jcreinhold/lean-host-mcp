@@ -63,6 +63,12 @@ async fn streamable_http_initialize_and_tools_list() {
             "tool {} should not advertise an outputSchema: {tool:?}",
             tool.get("name").and_then(Value::as_str).unwrap_or("?")
         );
+        assert_eq!(
+            tool.pointer("/inputSchema/type").and_then(Value::as_str),
+            Some("object"),
+            "tool {} must advertise an object inputSchema for strict MCP clients: {tool:?}",
+            tool.get("name").and_then(Value::as_str).unwrap_or("?")
+        );
     }
     let verify_tool = listed
         .iter()
