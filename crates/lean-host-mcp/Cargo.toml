@@ -67,6 +67,7 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
 lean-rs-worker-parent = "0.2.4"
+lean-rs-worker-protocol = "0.2.4"
 lean-semantic-search-capability = "0.3.1"
 lean-semantic-search-contract = "0.3.1"
 lean-semantic-search-retrieval = "0.3.1"

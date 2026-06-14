@@ -20,7 +20,7 @@ use lean_rs_worker_parent::{
     LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerModuleSourceSpan,
     LeanWorkerProofAttemptEnvelope, LeanWorkerProofAttemptResult, LeanWorkerProofAttemptRow,
     LeanWorkerProofAttemptStatus, LeanWorkerRendered, LeanWorkerRenderedInfo, LeanWorkerRendering,
-    LeanWorkerSourceRange,
+    LeanWorkerSourceCoordinateSpace, LeanWorkerSourceRange,
 };
 
 /// Source-range projection with public fields mirroring `LeanWorkerSourceRange`.
@@ -39,6 +39,15 @@ pub struct Position {
     pub column: u32,
     pub end_line: Option<u32>,
     pub end_column: Option<u32>,
+}
+
+/// Coordinate space for a Lean diagnostic position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinateSpace {
+    OriginalSource,
+    SyntheticBuffer,
+    Unknown,
 }
 
 /// Wire-stable severity classification. The three Lean severities map to
@@ -68,12 +77,24 @@ impl Severity {
 pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
+    pub coordinate_space: CoordinateSpace,
     pub position: Option<Position>,
+    /// Original source range when the worker can map this diagnostic back to
+    /// the caller's file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_range: Option<SourceRange>,
+    /// Range in the synthetic buffer used for a trial overlay. Present only
+    /// when the buffer-local coordinates are the honest coordinates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthetic_range: Option<Position>,
     /// Real source path when Lean attached one. Omitted for the synthetic
     /// `<elaborate>` label that elaboration-buffer calls always produce;
     /// the caller already knows which file they asked about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Short mapping note for diagnostics whose coordinate space is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinate_note: Option<String>,
 }
 
 /// Structured failure payload: the projection of `LeanWorkerElabFailure`
@@ -372,11 +393,38 @@ pub fn project_diagnostic(d: &LeanWorkerDiagnostic) -> Diagnostic {
         end_line: d.end_line,
         end_column: d.end_column,
     });
+    let coordinate_space = project_coordinate_space(d.coordinate_space);
+    let synthetic_range = match coordinate_space {
+        CoordinateSpace::SyntheticBuffer => position.clone(),
+        CoordinateSpace::OriginalSource | CoordinateSpace::Unknown => None,
+    };
+    let coordinate_note = match coordinate_space {
+        CoordinateSpace::Unknown => {
+            Some("worker did not report whether this diagnostic uses original source or a synthetic buffer".to_owned())
+        }
+        CoordinateSpace::OriginalSource | CoordinateSpace::SyntheticBuffer => None,
+    };
     Diagnostic {
         severity: Severity::from_worker(&d.severity),
         message: d.message.clone(),
+        coordinate_space,
         position,
+        original_range: d.original_range.clone().map(project_source_range),
+        synthetic_range,
         file: meaningful_file_label(&d.file_label),
+        coordinate_note,
+    }
+}
+
+fn project_coordinate_space(space: LeanWorkerSourceCoordinateSpace) -> CoordinateSpace {
+    match space {
+        LeanWorkerSourceCoordinateSpace::OriginalSource => CoordinateSpace::OriginalSource,
+        LeanWorkerSourceCoordinateSpace::SyntheticBuffer => CoordinateSpace::SyntheticBuffer,
+        LeanWorkerSourceCoordinateSpace::Unknown => CoordinateSpace::Unknown,
+        // `LeanWorkerSourceCoordinateSpace` is non-exhaustive. Unknown future
+        // variants degrade to the explicit unknown label until the host learns
+        // how to present them.
+        _ => CoordinateSpace::Unknown,
     }
 }
 
@@ -861,6 +909,62 @@ mod tests {
             name_span: span.clone(),
             body_span: span,
         }
+    }
+
+    #[test]
+    fn diagnostic_projection_labels_coordinate_spaces() {
+        let original = project_diagnostic(&LeanWorkerDiagnostic {
+            severity: "error".to_owned(),
+            message: "unknown identifier".to_owned(),
+            file_label: "/tmp/Demo.lean".to_owned(),
+            line: Some(2),
+            column: Some(9),
+            end_line: Some(2),
+            end_column: Some(16),
+            coordinate_space: LeanWorkerSourceCoordinateSpace::OriginalSource,
+            original_range: Some(LeanWorkerSourceRange {
+                file: "/tmp/Demo.lean".to_owned(),
+                start_line: 2,
+                start_column: 9,
+                end_line: 2,
+                end_column: 16,
+            }),
+        });
+        assert_eq!(original.coordinate_space, CoordinateSpace::OriginalSource);
+        assert_eq!(
+            original.original_range.as_ref().map(|range| range.file.as_str()),
+            Some("/tmp/Demo.lean")
+        );
+        assert!(original.synthetic_range.is_none());
+
+        let synthetic = project_diagnostic(&LeanWorkerDiagnostic {
+            severity: "error".to_owned(),
+            message: "unknown tactic".to_owned(),
+            file_label: "<proof-step>".to_owned(),
+            line: Some(82),
+            column: Some(3),
+            end_line: Some(82),
+            end_column: Some(12),
+            coordinate_space: LeanWorkerSourceCoordinateSpace::SyntheticBuffer,
+            original_range: None,
+        });
+        assert_eq!(synthetic.coordinate_space, CoordinateSpace::SyntheticBuffer);
+        assert!(synthetic.original_range.is_none());
+        assert_eq!(synthetic.synthetic_range.as_ref().map(|range| range.line), Some(82));
+
+        let unknown = project_diagnostic(&LeanWorkerDiagnostic {
+            severity: "warning".to_owned(),
+            message: "mapping unavailable".to_owned(),
+            file_label: String::new(),
+            line: None,
+            column: None,
+            end_line: None,
+            end_column: None,
+            coordinate_space: LeanWorkerSourceCoordinateSpace::Unknown,
+            original_range: None,
+        });
+        assert_eq!(unknown.coordinate_space, CoordinateSpace::Unknown);
+        assert!(unknown.coordinate_note.is_some());
     }
 
     #[test]

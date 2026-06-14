@@ -299,6 +299,58 @@ for a worker-recognized proof-state boundary matching a source fragment. Not
 every substring is a boundary; inspect the returned `goals_before` and
 `goals_after` to determine the exact state available at the match.
 
+If an `after_text` selector does not resolve, the result stays a normal
+Lean-domain response and includes valid `proof_boundaries`:
+
+```json
+{
+  "kind": "proof_position",
+  "file": "LeanRsFixture/ProofActions.lean",
+  "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+  "proof_position": { "kind": "after_text", "text": "not a boundary" }
+}
+```
+
+```json
+{
+  "status": "context",
+  "unavailable": [
+    {
+      "id": "proof_state",
+      "message": "declaration has no proof position matching the selector"
+    }
+  ],
+  "proof_boundaries": [
+    {
+      "index": 0,
+      "kind": "entry",
+      "selector": { "kind": "default" },
+      "source": { "start_line": 2, "start_column": 3, "end_line": 2, "end_column": 10 },
+      "excerpt": { "value": "intro h", "truncated": false }
+    },
+    {
+      "index": 1,
+      "kind": "after_tactic",
+      "selector": { "kind": "index", "index": 1 },
+      "source": { "start_line": 3, "start_column": 3, "end_line": 3, "end_column": 10 },
+      "excerpt": { "value": "exact h", "truncated": false }
+    }
+  ],
+  "proof_boundaries_truncated": false
+}
+```
+
+Retry with the returned selector:
+
+```json
+{
+  "kind": "proof_position",
+  "file": "LeanRsFixture/ProofActions.lean",
+  "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+  "proof_position": { "kind": "index", "index": 1 }
+}
+```
+
 The `data` payload is the proof context result previously produced internally by
 the proof-position operation: status, diagnostics, goals, locals, expected type,
 truncation, and any `needs_build` or ambiguity facts.
@@ -332,6 +384,30 @@ Use `snippets` to try a bounded list independently:
 
 The response reports each candidate's status, diagnostics, resulting goals, and
 whether the candidate set was truncated.
+
+Proof-step diagnostics label their coordinate space. Candidate-local diagnostics
+usually point into the synthetic trial buffer, so use `synthetic_range` for
+display and do not treat it as an editable file range unless `original_range` is
+also present:
+
+```json
+{
+  "id": "candidate_1",
+  "status": "failed",
+  "diagnostics": {
+    "diagnostics": [
+      {
+        "severity": "error",
+        "message": "unknown identifier 'definitely_missing_identifier'",
+        "coordinate_space": "synthetic_buffer",
+        "position": { "line": 82, "column": 9, "end_line": 82, "end_column": 39 },
+        "synthetic_range": { "line": 82, "column": 9, "end_line": 82, "end_column": 39 }
+      }
+    ],
+    "truncated": false
+  }
+}
+```
 
 ### `kind: "command"`
 

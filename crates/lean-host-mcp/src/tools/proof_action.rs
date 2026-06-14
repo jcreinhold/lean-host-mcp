@@ -1528,13 +1528,17 @@ mod tests {
 
     #[test]
     fn binder_reintroduction_diagnostics_drive_the_cue() {
-        use crate::projections::{Diagnostic, Severity};
+        use crate::projections::{CoordinateSpace, Diagnostic, Severity};
         let with = |message: &str| ElabFailure {
             diagnostics: vec![Diagnostic {
                 severity: Severity::Error,
                 message: message.to_owned(),
+                coordinate_space: CoordinateSpace::Unknown,
                 position: None,
+                original_range: None,
+                synthetic_range: None,
                 file: None,
+                coordinate_note: None,
             }],
             truncated: false,
         };

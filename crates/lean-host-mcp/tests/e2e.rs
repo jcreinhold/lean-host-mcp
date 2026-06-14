@@ -17,8 +17,8 @@ use std::process::Command;
 
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::tools::position::{
-    FindReferencesRequest, FindReferencesResult, ProofPositionSelector, ProofStateRequest, ProofStateResult,
-    ReferenceScope, find_references, proof_state,
+    FindReferencesRequest, FindReferencesResult, ProofBoundarySelector, ProofPositionSelector, ProofStateRequest,
+    ProofStateResult, ReferenceScope, find_references, proof_state,
 };
 use lean_host_mcp::tools::proof_action::{
     TryProofStepRequest, VerifyDeclarationRequest, try_proof_step, verify_declaration,
@@ -29,7 +29,8 @@ use lean_host_mcp::tools::semantic::{
 };
 use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
-    BrokerConfig, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker, ProofAttemptResult,
+    BrokerConfig, CoordinateSpace, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker,
+    ProofAttemptResult,
 };
 
 fn fixture_root() -> Option<PathBuf> {
@@ -249,6 +250,95 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let declaration = "LeanRsFixture.ProofActions.stepTheorem".to_owned();
+
+    let unresolved = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: proof_actions_file(),
+            declaration: declaration.clone(),
+            proof_position: ProofPositionSelector::AfterText {
+                text: "not a complete tactic boundary".to_owned(),
+                occurrence: None,
+            },
+            project: None,
+        },
+    )
+    .await
+    .expect("unresolved after_text proof_state");
+    let ProofStateResult::Context {
+        unavailable,
+        proof_boundaries,
+        proof_boundaries_truncated,
+        ..
+    } = unresolved.result.expect("unresolved proof-state result")
+    else {
+        panic!("expected context payload");
+    };
+
+    assert!(
+        unavailable.iter().any(|entry| entry.id == "proof_state"),
+        "unresolved selector should be reported as a Lean-domain unavailable selector: {unavailable:?}"
+    );
+    assert!(
+        !proof_boundaries.is_empty(),
+        "unresolved selector should return candidate proof boundaries"
+    );
+    assert!(
+        !proof_boundaries_truncated,
+        "small fixture should not truncate proof boundaries"
+    );
+    for pair in proof_boundaries.windows(2) {
+        assert!(
+            pair[0].index <= pair[1].index,
+            "candidate indices should be stable and source ordered: {proof_boundaries:?}"
+        );
+    }
+
+    let retry_position = proof_boundaries
+        .iter()
+        .find_map(|candidate| match candidate.selector {
+            ProofBoundarySelector::Default => None,
+            ProofBoundarySelector::Index { index } => Some(ProofPositionSelector::Index { index }),
+        })
+        .expect("fixture should expose at least one index candidate");
+    let retry = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: proof_actions_file(),
+            declaration,
+            proof_position: retry_position,
+            project: None,
+        },
+    )
+    .await
+    .expect("retry proof_state with candidate selector");
+    let ProofStateResult::Context {
+        unavailable,
+        goals_before,
+        goals_after,
+        ..
+    } = retry.result.expect("retry proof-state result")
+    else {
+        panic!("expected retry context payload");
+    };
+    assert!(
+        unavailable.is_empty(),
+        "candidate selector should resolve without another unavailable message: {unavailable:?}"
+    );
+    assert!(
+        !goals_before.is_empty() || !goals_after.is_empty(),
+        "candidate selector should return usable proof goals"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn inspect_proof_state_try_verify_and_references() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -351,6 +441,21 @@ async fn inspect_proof_state_try_verify_and_references() {
             .iter()
             .any(|d| d.message.contains("definitely_missing_identifier")),
         "bad candidate should report local unknown identifier"
+    );
+    let diagnostic = result.candidates[0]
+        .diagnostics
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("definitely_missing_identifier"))
+        .expect("missing identifier diagnostic present");
+    assert_eq!(diagnostic.coordinate_space, CoordinateSpace::SyntheticBuffer);
+    assert!(
+        diagnostic.synthetic_range.is_some(),
+        "proof-step diagnostics should expose the synthetic trial range"
+    );
+    assert!(
+        diagnostic.original_range.is_none(),
+        "synthetic proof-step diagnostics should not pretend to have original source ranges"
     );
     let after = fs::read(root.join(proof_actions_file())).expect("fixture source after");
     assert_eq!(before, after, "try_proof_step must not mutate source files");

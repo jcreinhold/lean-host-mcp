@@ -173,6 +173,14 @@ reserved for I/O/config failures and unusable Lake projects. By default the sema
 `content`; `server.response_carrier` (`structured` / `both`) can place it in `structuredContent` instead. Tools
 advertise no `outputSchema` — the Anthropic Messages API drops it, and deep `$defs` break strict clients.
 
+Two proof-agent details are worth calling out:
+
+- An unresolved `lean_context(kind="proof_position")` `after_text` selector returns bounded `proof_boundaries`, each
+  with a copyable follow-up selector such as `{ "kind": "index", "index": 1 }`.
+- `lean_trial(kind="proof_step")` diagnostics label their coordinate space. Candidate-local errors usually report
+  `coordinate_space: "synthetic_buffer"` with a `synthetic_range`; original file ranges appear only as
+  `original_range` when the worker can map them honestly.
+
 ## Documentation
 
 - [`docs/tool-catalog.md`](docs/tool-catalog.md) — the semantic tool workflow and the per-mode request/result schema.

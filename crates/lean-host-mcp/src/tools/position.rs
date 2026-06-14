@@ -18,6 +18,7 @@ use lean_rs_worker_parent::{
     LeanWorkerProofPositionSelector, LeanWorkerProofStateInfo, LeanWorkerProofStateResult, LeanWorkerRenderedInfo,
     LeanWorkerSurroundingDeclarationResult, LeanWorkerTypeAtResult,
 };
+use lean_rs_worker_protocol::types::LeanWorkerProofBoundaryCandidate as WorkerProofBoundaryCandidate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -187,15 +188,46 @@ pub struct ProofStateContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_type: Option<RenderedText>,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proof_boundaries: Vec<ProofBoundaryCandidate>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub proof_boundaries_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProofStateProjection {
-    State { info: Box<ProofStateContext> },
-    Unavailable { message: String },
-    Ambiguous { candidates: Vec<DeclarationTargetInfo> },
-    NeedsBuild { missing: Vec<String> },
+    State {
+        info: Box<ProofStateContext>,
+    },
+    Unavailable {
+        message: String,
+        proof_boundaries: Vec<ProofBoundaryCandidate>,
+        proof_boundaries_truncated: bool,
+    },
+    Ambiguous {
+        candidates: Vec<DeclarationTargetInfo>,
+    },
+    NeedsBuild {
+        missing: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ProofBoundaryCandidate {
+    pub index: u32,
+    pub kind: String,
+    /// Selector that can be copied into a follow-up `proof_position`.
+    pub selector: ProofBoundarySelector,
+    pub source: SourceSpan,
+    pub excerpt: RenderedText,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProofBoundarySelector {
+    Default,
+    Index { index: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -293,6 +325,10 @@ pub struct SelectorMessage {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public proof-state response keeps a flat JSON shape; boxing fields would only hide the same payload"
+)]
 pub enum ProofStateResult {
     Context {
         diagnostics: DiagnosticsBlock,
@@ -310,6 +346,10 @@ pub enum ProofStateResult {
         expected_type: Option<RenderedText>,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        proof_boundaries: Vec<ProofBoundaryCandidate>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        proof_boundaries_truncated: bool,
         total_truncated: bool,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         unavailable: Vec<SelectorMessage>,
@@ -414,6 +454,8 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             let mut locals = Vec::new();
             let mut expected_type = None;
             let mut truncated = false;
+            let mut proof_boundaries = Vec::new();
+            let mut proof_boundaries_truncated = false;
             let mut unavailable = Vec::new();
             let mut needs_build = Vec::new();
             let mut needs_build_missing: Vec<String> = Vec::new();
@@ -436,8 +478,16 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                                 locals = info.locals;
                                 expected_type = info.expected_type;
                                 truncated = info.truncated;
+                                proof_boundaries = info.proof_boundaries;
+                                proof_boundaries_truncated = info.proof_boundaries_truncated;
                             }
-                            ProofStateProjection::Unavailable { message } => {
+                            ProofStateProjection::Unavailable {
+                                message,
+                                proof_boundaries: candidates,
+                                proof_boundaries_truncated: candidates_truncated,
+                            } => {
+                                proof_boundaries = candidates;
+                                proof_boundaries_truncated = candidates_truncated;
                                 unavailable.push(SelectorMessage { id, message });
                             }
                             // The worker (protocol 8) classifies an incomplete
@@ -480,6 +530,8 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                     locals,
                     expected_type,
                     truncated,
+                    proof_boundaries,
+                    proof_boundaries_truncated,
                     total_truncated: result.total_truncated,
                     unavailable,
                     needs_build,
@@ -569,6 +621,8 @@ fn needs_build_context(message: String) -> ProofStateResult {
         locals: Vec::new(),
         expected_type: None,
         truncated: false,
+        proof_boundaries: Vec::new(),
+        proof_boundaries_truncated: false,
         total_truncated: false,
         unavailable: Vec::new(),
         needs_build: vec![SelectorMessage {
@@ -1487,13 +1541,23 @@ fn project_proof_state_result(result: LeanWorkerProofStateResult) -> ProofStateP
         LeanWorkerProofStateResult::State { info } => ProofStateProjection::State {
             info: Box::new(project_proof_state_info(*info)),
         },
-        LeanWorkerProofStateResult::Unavailable { message } => ProofStateProjection::Unavailable { message },
+        LeanWorkerProofStateResult::Unavailable {
+            message,
+            proof_boundaries,
+            proof_boundaries_truncated,
+        } => ProofStateProjection::Unavailable {
+            message,
+            proof_boundaries: proof_boundaries.into_iter().map(project_proof_boundary).collect(),
+            proof_boundaries_truncated,
+        },
         LeanWorkerProofStateResult::Ambiguous { candidates } => ProofStateProjection::Ambiguous {
             candidates: candidates.into_iter().map(project_declaration_target_info).collect(),
         },
         LeanWorkerProofStateResult::NeedsBuild { missing } => ProofStateProjection::NeedsBuild { missing },
         _ => ProofStateProjection::Unavailable {
             message: "worker returned an unknown proof-state result".to_owned(),
+            proof_boundaries: Vec::new(),
+            proof_boundaries_truncated: false,
         },
     }
 }
@@ -1507,6 +1571,23 @@ fn project_proof_state_info(info: LeanWorkerProofStateInfo) -> ProofStateContext
         locals: info.locals.into_iter().map(project_local_info).collect(),
         expected_type: info.expected_type.map(rendered_text),
         truncated: info.truncated,
+        proof_boundaries: info.proof_boundaries.into_iter().map(project_proof_boundary).collect(),
+        proof_boundaries_truncated: info.proof_boundaries_truncated,
+    }
+}
+
+fn project_proof_boundary(candidate: WorkerProofBoundaryCandidate) -> ProofBoundaryCandidate {
+    let selector = if candidate.kind == "entry" {
+        ProofBoundarySelector::Default
+    } else {
+        ProofBoundarySelector::Index { index: candidate.index }
+    };
+    ProofBoundaryCandidate {
+        index: candidate.index,
+        kind: candidate.kind,
+        selector,
+        source: span_of_module(candidate.source),
+        excerpt: rendered_text(candidate.excerpt),
     }
 }
 
@@ -1706,13 +1787,16 @@ mod tests {
     use lean_rs_worker_parent::{
         LeanWorkerElabFailure, LeanWorkerModuleCacheStatus, LeanWorkerModuleQueryBatchEnvelope,
         LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryCacheFacts, LeanWorkerModuleQueryTimings,
+        LeanWorkerModuleSourceSpan, LeanWorkerProofStateResult, LeanWorkerRenderedInfo,
     };
+    use lean_rs_worker_protocol::types::LeanWorkerProofBoundaryCandidate as WorkerProofBoundaryCandidate;
 
     use super::{
         BatchQueryRun, DiagnosticSummary, DiagnosticsBlock, FindReferencesRequest, LeanWorkerProofPositionSelector,
-        ProofPositionSelector, ProofStateRequest, ProofStateResult, ReferenceScope, RenderedText, cache_status_label,
-        command_result, expert_query_budgets, find_references_in_project, needs_build_context, project_query_facts,
-        proof_agent_budgets, reference_query_budgets, route_batch_outcome, worker_proof_position,
+        ProofBoundaryCandidate, ProofBoundarySelector, ProofPositionSelector, ProofStateProjection, ProofStateRequest,
+        ProofStateResult, ReferenceScope, RenderedText, SourceSpan, cache_status_label, command_result,
+        expert_query_budgets, find_references_in_project, needs_build_context, project_proof_state_result,
+        project_query_facts, proof_agent_budgets, reference_query_budgets, route_batch_outcome, worker_proof_position,
     };
     use crate::envelope::{Freshness, RuntimeFacts};
     use crate::projections::{Diagnostic, Severity};
@@ -1748,14 +1832,22 @@ mod tests {
                     Diagnostic {
                         severity: Severity::Info,
                         message: "Nat.add : Nat -> Nat -> Nat".to_owned(),
+                        coordinate_space: crate::projections::CoordinateSpace::Unknown,
                         position: None,
+                        original_range: None,
+                        synthetic_range: None,
                         file: None,
+                        coordinate_note: None,
                     },
                     Diagnostic {
                         severity: Severity::Error,
                         message: "unknown identifier `missing`".to_owned(),
+                        coordinate_space: crate::projections::CoordinateSpace::Unknown,
                         position: None,
+                        original_range: None,
+                        synthetic_range: None,
                         file: None,
+                        coordinate_note: None,
                     },
                 ],
                 truncated: false,
@@ -1776,20 +1868,32 @@ mod tests {
             Diagnostic {
                 severity: Severity::Error,
                 message: "error".to_owned(),
+                coordinate_space: crate::projections::CoordinateSpace::Unknown,
                 position: None,
+                original_range: None,
+                synthetic_range: None,
                 file: None,
+                coordinate_note: None,
             },
             Diagnostic {
                 severity: Severity::Warning,
                 message: "warning".to_owned(),
+                coordinate_space: crate::projections::CoordinateSpace::Unknown,
                 position: None,
+                original_range: None,
+                synthetic_range: None,
                 file: None,
+                coordinate_note: None,
             },
             Diagnostic {
                 severity: Severity::Info,
                 message: "info".to_owned(),
+                coordinate_space: crate::projections::CoordinateSpace::Unknown,
                 position: None,
+                original_range: None,
+                synthetic_range: None,
                 file: None,
+                coordinate_note: None,
             },
         ]);
 
@@ -2017,6 +2121,22 @@ import Init -- comment
                 truncated: false,
             }),
             truncated: false,
+            proof_boundaries: vec![ProofBoundaryCandidate {
+                index: 0,
+                kind: "entry".to_owned(),
+                selector: ProofBoundarySelector::Default,
+                source: SourceSpan {
+                    start_line: 2,
+                    start_column: 3,
+                    end_line: 2,
+                    end_column: 10,
+                },
+                excerpt: RenderedText {
+                    value: "exact h".to_owned(),
+                    truncated: false,
+                },
+            }],
+            proof_boundaries_truncated: false,
             total_truncated: false,
             unavailable: Vec::new(),
             needs_build: Vec::new(),
@@ -2033,10 +2153,62 @@ import Init -- comment
         assert_eq!(value["namespace_name"], "Demo");
         assert_eq!(value["goals_before"][0], "⊢ True");
         assert_eq!(value["expected_type"]["value"], "True");
+        assert_eq!(value["proof_boundaries"][0]["selector"]["kind"], "default");
+        assert_eq!(value["proof_boundaries"][0]["excerpt"]["value"], "exact h");
         assert!(value.get("span").is_none());
         assert!(value.get("safe_edit").is_none());
         assert!(value.get("proof_state").is_none());
         assert!(value.get("declaration_target").is_none());
+    }
+
+    #[test]
+    fn unavailable_proof_state_projects_boundary_candidates() {
+        let span = LeanWorkerModuleSourceSpan {
+            start_line: 3,
+            start_column: 5,
+            end_line: 3,
+            end_column: 12,
+        };
+        let result = project_proof_state_result(LeanWorkerProofStateResult::Unavailable {
+            message: "declaration has no proof position matching the selector".to_owned(),
+            proof_boundaries: vec![
+                WorkerProofBoundaryCandidate {
+                    index: 0,
+                    kind: "entry".to_owned(),
+                    source: span.clone(),
+                    excerpt: LeanWorkerRenderedInfo {
+                        value: "intro h".to_owned(),
+                        truncated: false,
+                    },
+                },
+                WorkerProofBoundaryCandidate {
+                    index: 1,
+                    kind: "after_tactic".to_owned(),
+                    source: span,
+                    excerpt: LeanWorkerRenderedInfo {
+                        value: "exact h".to_owned(),
+                        truncated: false,
+                    },
+                },
+            ],
+            proof_boundaries_truncated: true,
+        });
+        let ProofStateProjection::Unavailable {
+            proof_boundaries,
+            proof_boundaries_truncated,
+            ..
+        } = result
+        else {
+            panic!("expected unavailable proof-state projection");
+        };
+        assert!(proof_boundaries_truncated);
+        assert_eq!(proof_boundaries[0].index, 0);
+        assert!(matches!(proof_boundaries[0].selector, ProofBoundarySelector::Default));
+        assert_eq!(proof_boundaries[1].index, 1);
+        assert!(matches!(
+            proof_boundaries[1].selector,
+            ProofBoundarySelector::Index { index: 1 }
+        ));
     }
 
     #[test]

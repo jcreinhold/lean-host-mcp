@@ -231,4 +231,62 @@ mod tests {
             Some("worker for v4.30.0 has no runtime smoke record")
         );
     }
+
+    #[test]
+    fn carriers_preserve_actionable_metadata() {
+        let response = serde_json::json!({
+            "data": {
+                "proof_boundaries": [{
+                    "index": 1,
+                    "selector": { "kind": "index", "index": 1 },
+                    "excerpt": { "value": "exact h", "truncated": false }
+                }],
+                "candidates": [{
+                    "diagnostics": {
+                        "diagnostics": [{
+                            "message": "unknown identifier",
+                            "coordinate_space": "synthetic_buffer",
+                            "synthetic_range": { "line": 82, "column": 3 }
+                        }]
+                    }
+                }]
+            },
+            "errors": [],
+            "trust": {
+                "project_root": "/tmp/project",
+                "session_id": "session",
+                "lean_toolchain": "leanprover/lean4:v4.31.0-rc2"
+            }
+        });
+
+        let text = serde_json::to_value(carry(&response, ResponseCarrier::Text)).unwrap();
+        let text_blob = text.to_string();
+        assert!(text_blob.contains("proof_boundaries"));
+        assert!(text_blob.contains("synthetic_buffer"));
+
+        let structured = serde_json::to_value(carry(&response, ResponseCarrier::Structured)).unwrap();
+        assert_eq!(
+            structured
+                .pointer("/structuredContent/data/proof_boundaries/0/selector/kind")
+                .and_then(serde_json::Value::as_str),
+            Some("index")
+        );
+        assert_eq!(
+            structured
+                .pointer("/structuredContent/data/candidates/0/diagnostics/diagnostics/0/coordinate_space")
+                .and_then(serde_json::Value::as_str),
+            Some("synthetic_buffer")
+        );
+
+        let both = serde_json::to_value(carry(&response, ResponseCarrier::Both)).unwrap();
+        assert_eq!(
+            both.pointer("/structuredContent/data/proof_boundaries/0/index")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            both.to_string().contains("synthetic_buffer"),
+            "both carrier should keep metadata on the model-visible content path too: {both:?}"
+        );
+    }
 }

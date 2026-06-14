@@ -1015,6 +1015,7 @@ dependencies = [
  "dirs",
  "fs4",
  "lean-rs-worker-parent",
+ "lean-rs-worker-protocol",
  "lean-semantic-search-capability",
  "lean-semantic-search-contract",
  "lean-semantic-search-retrieval",

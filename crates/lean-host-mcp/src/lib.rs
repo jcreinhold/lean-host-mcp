@@ -49,11 +49,12 @@ pub use error::{Result, ServerError};
 pub use lake_meta::LakeProjectMeta;
 pub use project::ProjectRuntimeConfig;
 pub use projections::{
-    DeclarationFlags, DeclarationInspection, DeclarationInspectionResult, DeclarationProofSearchFacts, DeclarationRow,
-    DeclarationSearchFacts, DeclarationSearchPruning, DeclarationSearchResult, DeclarationSearchTimings,
-    DeclarationSummary, DeclarationVerificationFacts, DeclarationVerificationResult, Diagnostic, ElabFailure,
-    ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome, ModuleSourceSpan, Position, ProofActionDeclarationTarget,
-    ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, RenderedText, Severity, SourceRange,
+    CoordinateSpace, DeclarationFlags, DeclarationInspection, DeclarationInspectionResult, DeclarationProofSearchFacts,
+    DeclarationRow, DeclarationSearchFacts, DeclarationSearchPruning, DeclarationSearchResult,
+    DeclarationSearchTimings, DeclarationSummary, DeclarationVerificationFacts, DeclarationVerificationResult,
+    Diagnostic, ElabFailure, ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome, ModuleSourceSpan, Position,
+    ProofActionDeclarationTarget, ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, RenderedText,
+    Severity, SourceRange,
 };
 pub use server::LeanHostService;
 pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};
