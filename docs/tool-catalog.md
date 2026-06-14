@@ -1,9 +1,11 @@
 # Tool Catalog
 
-`lean-host-mcp` exposes five semantic Lean tools. Each tool has a `kind` field
-that selects a mode inside that job family. The surface is intentionally small:
-it gives an agent proof context, safe experiments, verification, semantic
-lookup, and cheap status without exposing raw Lean worker primitives.
+`lean-host-mcp` exposes five semantic Lean tools. Four tools use a `kind` field
+to select a mode inside that job family: `lean_context`, `lean_trial`,
+`lean_lookup`, and `lean_status`. `lean_verify` takes target groups directly.
+The surface is intentionally small: it gives an agent proof context, safe
+experiments, verification, semantic lookup, and cheap status without exposing
+raw Lean worker primitives.
 
 ```text
 lean_context -> lean_lookup -> lean_trial -> lean_verify
@@ -12,6 +14,20 @@ lean_context -> lean_lookup -> lean_trial -> lean_verify
 
 Every call is read-only. The server reads files, elaborates in memory, and never
 writes source.
+
+## Tool Roles
+
+- `lean_status`: cheap project, toolchain, build-artifact, and diagnostics
+  status. Use it before spending a worker permit or when you need file
+  diagnostics.
+- `lean_context`: local proof state at a declaration position. Use it to see
+  goals, locals, expected type, and diagnostics before choosing a tactic.
+- `lean_trial`: non-mutating probes. Use `proof_step` to try tactics and
+  `command` for `#check`, `#eval`, or `#print axioms`.
+- `lean_lookup`: semantic discovery. Use it for declarations, declaration
+  inventory, proof search, reference search, and changed-declaration coverage.
+- `lean_verify`: verification gates. Use it when a declaration or changed set
+  must be checked with `sorry` policy and optional axiom reporting.
 
 ## Response Shape
 
@@ -55,7 +71,151 @@ pressure or restart-loop exhaustion, appear in `errors` with structured details.
 Warnings and next actions from the underlying implementation are also carried as
 warning issues in `errors`.
 
-## Typical Workflow
+## Output Carrier
+
+By default, the serialized semantic response is placed in MCP `content` text so
+model clients can read it reliably. Programmatic clients can request structured
+output at server startup:
+
+```sh
+LEAN_HOST_MCP_RESPONSE_CARRIER=structured lean-host-mcp --lake-root /path/to/project --bind 127.0.0.1:8765
+```
+
+Use `LEAN_HOST_MCP_RESPONSE_CARRIER=both` to mirror the same JSON into both
+`content` and `structuredContent`.
+
+## Common Workflows
+
+### Inspect Project Status
+
+```json
+{
+  "name": "lean_status",
+  "arguments": {
+    "kind": "project",
+    "include": ["toolchain", "worker", "artifacts"]
+  }
+}
+```
+
+When artifact freshness is `unknown`, `lean_status` has only checked cheap
+filesystem facts. Run `lean_lookup(kind="references")`,
+`lean_lookup(kind="declarations")`, or `lake build` to establish freshness for a
+specific semantic task.
+
+### Get Diagnostics For A File
+
+```json
+{
+  "name": "lean_status",
+  "arguments": {
+    "kind": "file_diagnostics",
+    "file": "LeanRsFixture/ProofActions.lean"
+  }
+}
+```
+
+### Query Declarations By Name Or Inventory
+
+Inspect one known declaration:
+
+```json
+{
+  "name": "lean_lookup",
+  "arguments": {
+    "kind": "declaration",
+    "name": "Nat.add_zero",
+    "imports": ["Init"]
+  }
+}
+```
+
+List declarations in a module:
+
+```json
+{
+  "name": "lean_lookup",
+  "arguments": {
+    "kind": "declarations",
+    "target": { "kind": "module", "module": "LeanRsFixture.ProofAgent" },
+    "limit": 200
+  }
+}
+```
+
+List declarations in a file:
+
+```json
+{
+  "name": "lean_lookup",
+  "arguments": {
+    "kind": "declarations",
+    "target": { "kind": "file", "path": "LeanRsFixture/ProofAgent.lean" },
+    "limit": 200
+  }
+}
+```
+
+For prefix-style browsing, use the file or module inventory call and filter the
+returned declaration names on the client.
+
+### Inspect Proof State At A Position
+
+```json
+{
+  "name": "lean_context",
+  "arguments": {
+    "kind": "proof_position",
+    "file": "LeanRsFixture/ProofActions.lean",
+    "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+    "proof_position": { "kind": "default" }
+  }
+}
+```
+
+### Verify One Declaration With Axiom Reporting
+
+The old user-facing phrase `verify_declaration` maps to `lean_verify` with one
+explicit target group:
+
+```json
+{
+  "name": "lean_verify",
+  "arguments": {
+    "targets": [
+      {
+        "kind": "explicit",
+        "file": "LeanRsFixture/ProofActions.lean",
+        "declarations": ["LeanRsFixture.ProofActions.closedTheorem"]
+      }
+    ],
+    "allow_sorry": false,
+    "report_axioms": true
+  }
+}
+```
+
+### Verify Changed Declarations
+
+```json
+{
+  "name": "lean_verify",
+  "arguments": {
+    "targets": [
+      {
+        "kind": "changed",
+        "base": "HEAD",
+        "files": ["LeanRsFixture/ProofActions.lean"],
+        "include_untracked": true
+      }
+    ],
+    "allow_sorry": false,
+    "report_axioms": true
+  }
+}
+```
+
+## Proof Workflow
 
 1. Call `lean_context` with `kind: "proof_position"` to read the current proof
    goals, locals, expected type, and diagnostics for a declaration position.
@@ -70,6 +230,38 @@ warning issues in `errors`.
 Use `lean_lookup` with `kind: "references"` when the task is semantic reference
 discovery rather than proof search. Use `lean_status` for cheap project and host
 status before spending a worker permit.
+
+### Tagged Request Shapes
+
+Several arguments are tagged enums. The tag is always a string field named
+`kind`.
+
+`DeclarationInventoryTarget` for `lean_lookup(kind="declarations")`:
+
+```json
+{ "kind": "file", "path": "LeanRsFixture/ProofAgent.lean" }
+```
+
+or:
+
+```json
+{ "kind": "module", "module": "LeanRsFixture.ProofAgent" }
+```
+
+`ProofPositionSelector` for `lean_context(kind="proof_position")`,
+`lean_trial(kind="proof_step")`, and `lean_lookup(kind="proof_search")`:
+
+```json
+{ "kind": "default" }
+```
+
+```json
+{ "kind": "index", "index": 0 }
+```
+
+```json
+{ "kind": "after_text", "text": "skip", "occurrence": 0 }
+```
 
 ## `lean_context`
 

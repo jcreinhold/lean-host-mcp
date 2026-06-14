@@ -167,7 +167,8 @@ impl ArtifactTrust {
     pub fn build_tree_unknown(path: impl Into<String>, artifact: ArtifactKind) -> Self {
         Self::new(artifact, TrustScope::Project, TrustStatus::Unknown)
             .path(path)
-            .detail("build tree exists; exact freshness requires a semantic query or `lake build`")
+            .detail("build tree exists; lean_status does not compare source mtimes")
+            .next_action("run lean_lookup(kind=\"references\" or kind=\"declarations\") for semantic freshness, or `lake build` to refresh artifacts")
     }
 }
 

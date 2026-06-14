@@ -79,6 +79,31 @@ async fn streamable_http_initialize_and_tools_list() {
         verify_schema.pointer("/properties/kind").is_none(),
         "lean_verify has no public kind namespace and must not advertise the generic semantic schema: {verify_schema:?}"
     );
+    let lookup_schema = listed
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("lean_lookup"))
+        .and_then(|tool| tool.get("inputSchema"))
+        .expect("lean_lookup should advertise an inputSchema");
+    let lookup_schema_text = lookup_schema.to_string();
+    assert!(
+        lookup_schema.pointer("/oneOf").is_some(),
+        "lean_lookup inputSchema should advertise per-kind variants: {lookup_schema:?}"
+    );
+    for expected in ["declarations", "target", "module", "path"] {
+        assert!(
+            lookup_schema_text.contains(expected),
+            "lean_lookup schema should expose {expected:?}: {lookup_schema:?}"
+        );
+    }
+    let context_schema = listed
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("lean_context"))
+        .and_then(|tool| tool.get("inputSchema"))
+        .expect("lean_context should advertise an inputSchema");
+    assert!(
+        context_schema.to_string().contains("proof_position"),
+        "lean_context schema should expose proof_position examples: {context_schema:?}"
+    );
 
     server.shutdown().await;
 }

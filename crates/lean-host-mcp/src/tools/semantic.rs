@@ -5,12 +5,13 @@
 //! five semantic tools, each with a small `kind` namespace, and one response
 //! shape (`data`, `errors`, `trust`).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 
 use crate::broker::{BrokerConfigSnapshot, ProjectHint};
 use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure};
@@ -36,10 +37,387 @@ pub struct SemanticToolRequest {
     pub args: BTreeMap<String, Value>,
 }
 
+macro_rules! semantic_tool_request_wrapper {
+    ($name:ident, $schema_name:literal, $schema_fn:ident) => {
+        #[derive(Debug, Clone)]
+        pub struct $name(pub SemanticToolRequest);
+
+        impl $name {
+            pub fn into_inner(self) -> SemanticToolRequest {
+                self.0
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                SemanticToolRequest::deserialize(deserializer).map(Self)
+            }
+        }
+
+        impl JsonSchema for $name {
+            fn schema_name() -> Cow<'static, str> {
+                Cow::Borrowed($schema_name)
+            }
+
+            fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+                $schema_fn()
+            }
+        }
+    };
+}
+
+semantic_tool_request_wrapper!(LeanContextToolRequest, "LeanContextToolRequest", lean_context_schema);
+semantic_tool_request_wrapper!(LeanTrialToolRequest, "LeanTrialToolRequest", lean_trial_schema);
+semantic_tool_request_wrapper!(LeanLookupToolRequest, "LeanLookupToolRequest", lean_lookup_schema);
+semantic_tool_request_wrapper!(LeanStatusToolRequest, "LeanStatusToolRequest", lean_status_schema);
+
 impl SemanticToolRequest {
     fn kind(&self) -> Option<&str> {
         self.kind.as_deref().map(str::trim).filter(|kind| !kind.is_empty())
     }
+}
+
+fn schema_from_value(value: Value) -> Schema {
+    match value {
+        Value::Object(map) => map.into(),
+        Value::Bool(value) => value.into(),
+        Value::Null | Value::Number(_) | Value::String(_) | Value::Array(_) => true.into(),
+    }
+}
+
+fn semantic_schema(title: &str, description: &str, variants: &[Value]) -> Schema {
+    schema_from_value(json!({
+        "title": title,
+        "description": description,
+        "oneOf": variants,
+    }))
+}
+
+fn proof_position_selector_schema() -> Value {
+    json!({
+        "description": "Where in the declaration proof to inspect or edit. Omit for the pristine entry goal.",
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "const": "default" } },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "required": ["kind", "index"],
+                "properties": {
+                    "kind": { "const": "index" },
+                    "index": { "type": "integer", "minimum": 0 }
+                },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "required": ["kind", "text"],
+                "properties": {
+                    "kind": { "const": "after_text" },
+                    "text": { "type": "string" },
+                    "occurrence": { "type": "integer", "minimum": 0, "default": 0 }
+                },
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn target_schema() -> Value {
+    json!({
+        "description": "Declaration inventory target.",
+        "oneOf": [
+            {
+                "type": "object",
+                "description": "Read declarations from a Lean source file.",
+                "required": ["kind", "path"],
+                "properties": {
+                    "kind": { "const": "file" },
+                    "path": { "type": "string", "description": "Path to a .lean file, relative to the project root unless absolute." }
+                },
+                "additionalProperties": false,
+                "examples": [{ "kind": "file", "path": "LeanRsFixture/ProofAgent.lean" }]
+            },
+            {
+                "type": "object",
+                "description": "Read declarations from a Lean module. Uses source when available and a fresh .ilean supplement/fallback when needed.",
+                "required": ["kind", "module"],
+                "properties": {
+                    "kind": { "const": "module" },
+                    "module": { "type": "string", "description": "Dotted Lean module name." }
+                },
+                "additionalProperties": false,
+                "examples": [{ "kind": "module", "module": "LeanRsFixture.ProofAgent" }]
+            }
+        ]
+    })
+}
+
+fn lean_context_schema() -> Schema {
+    semantic_schema(
+        "LeanContextToolRequest",
+        "Lean proof or term context. Select a mode with kind.",
+        &[json!({
+            "type": "object",
+            "description": "Read proof context at a declaration proof position.",
+            "required": ["kind", "file", "declaration"],
+            "properties": {
+                "kind": { "const": "proof_position" },
+                "file": { "type": "string", "description": "Path to a .lean file, relative to the project root unless absolute." },
+                "declaration": { "type": "string", "description": "Fully-qualified or file-local declaration name." },
+                "proof_position": proof_position_selector_schema(),
+                "project": { "type": ["string", "null"], "description": "Optional project-root override." }
+            },
+            "additionalProperties": false,
+            "examples": [semantic_example("lean_context", "proof_position").unwrap_or(Value::Null)]
+        })],
+    )
+}
+
+fn lean_trial_schema() -> Schema {
+    semantic_schema(
+        "LeanTrialToolRequest",
+        "Non-mutating Lean experiments. Select proof_step or command with kind.",
+        &[
+            json!({
+                "type": "object",
+                "description": "Try one or more proof snippets against an in-memory source snapshot.",
+                "required": ["kind", "file", "declaration"],
+                "properties": {
+                    "kind": { "const": "proof_step" },
+                    "file": { "type": "string" },
+                    "declaration": { "type": "string" },
+                    "proof_position": proof_position_selector_schema(),
+                    "snippet": { "type": ["string", "null"] },
+                    "snippets": { "type": "array", "items": { "type": "string" } },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_trial", "proof_step").unwrap_or(Value::Null)]
+            }),
+            json!({
+                "type": "object",
+                "description": "Run bounded Lean command text, such as #check or #print axioms.",
+                "required": ["kind", "commands"],
+                "properties": {
+                    "kind": { "const": "command" },
+                    "commands": { "type": "string" },
+                    "file": { "type": ["string", "null"], "description": "Optional source file whose contents precede the command." },
+                    "imports": { "type": "array", "items": { "type": "string" } },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_trial", "command").unwrap_or(Value::Null)]
+            }),
+        ],
+    )
+}
+
+fn lean_lookup_schema() -> Schema {
+    semantic_schema(
+        "LeanLookupToolRequest",
+        "Semantic lookup and discovery. Select a mode with kind.",
+        &[
+            json!({
+                "type": "object",
+                "description": "Inspect one declaration by name.",
+                "required": ["kind", "name"],
+                "properties": {
+                    "kind": { "const": "declaration" },
+                    "name": { "type": "string" },
+                    "file": { "type": ["string", "null"] },
+                    "imports": { "type": "array", "items": { "type": "string" } },
+                    "fields": { "description": "Optional field-selection object or string list." },
+                    "raw_statement": { "type": "boolean" },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_lookup", "declaration").unwrap_or(Value::Null)]
+            }),
+            json!({
+                "type": "object",
+                "description": "List declarations in one source file or module.",
+                "required": ["kind", "target"],
+                "properties": {
+                    "kind": { "const": "declarations" },
+                    "target": target_schema(),
+                    "limit": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000, "default": 200 },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_lookup", "declarations").unwrap_or(Value::Null)]
+            }),
+            json!({
+                "type": "object",
+                "description": "Map git hunks to declarations without verifying them.",
+                "required": ["kind"],
+                "properties": {
+                    "kind": { "const": "changed_coverage" },
+                    "base": { "type": ["string", "null"], "default": "HEAD" },
+                    "files": { "type": "array", "items": { "type": "string" } },
+                    "include_untracked": { "type": "boolean", "default": false },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_lookup", "changed_coverage").unwrap_or(Value::Null)]
+            }),
+            json!({
+                "type": "object",
+                "description": "Retrieve proof-search candidates from a file/declaration position or explicit goal text.",
+                "required": ["kind"],
+                "properties": {
+                    "kind": { "const": "proof_search" },
+                    "file": { "type": ["string", "null"] },
+                    "declaration": { "type": ["string", "null"] },
+                    "proof_position": proof_position_selector_schema(),
+                    "goal": { "type": ["string", "null"] },
+                    "type_text": { "type": ["string", "null"] },
+                    "imports": { "type": "array", "items": { "type": "string" } },
+                    "mode": { "enum": ["next_step", "exact", "apply", "rewrite", "simp"] },
+                    "limit": { "type": ["integer", "null"], "minimum": 1, "maximum": 20 },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_lookup", "proof_search").unwrap_or(Value::Null)]
+            }),
+            json!({
+                "type": "object",
+                "description": "Find semantic references to a fully-qualified Lean name.",
+                "required": ["kind", "name", "scope"],
+                "properties": {
+                    "kind": { "const": "references" },
+                    "name": { "type": "string" },
+                    "scope": { "enum": ["file", "project"] },
+                    "file": { "type": ["string", "null"], "description": "Required for file scope." },
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Optional file restriction for project scope." },
+                    "limit": { "type": ["integer", "null"], "minimum": 1 },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_lookup", "references").unwrap_or(Value::Null)]
+            }),
+        ],
+    )
+}
+
+fn lean_status_schema() -> Schema {
+    semantic_schema(
+        "LeanStatusToolRequest",
+        "Project/toolchain status and source diagnostics. Select a mode with kind; omitted kind defaults to project.",
+        &[
+            json!({
+                "type": "object",
+                "description": "Read cheap project, toolchain, worker, and artifact status without opening a worker.",
+                "properties": {
+                    "kind": { "const": "project", "default": "project" },
+                    "project": { "type": ["string", "null"], "description": "Optional project-root override." },
+                    "include": {
+                        "type": "array",
+                        "items": { "enum": ["toolchain", "worker", "artifacts"] },
+                        "description": "Sections to include. Omit for all sections."
+                    }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_status", "project").unwrap_or(Value::Null)]
+            }),
+            json!({
+                "type": "object",
+                "description": "Elaborate one source file and return bounded diagnostics.",
+                "required": ["kind", "file"],
+                "properties": {
+                    "kind": { "const": "file_diagnostics" },
+                    "file": { "type": "string" },
+                    "project": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false,
+                "examples": [semantic_example("lean_status", "file_diagnostics").unwrap_or(Value::Null)]
+            }),
+        ],
+    )
+}
+
+fn semantic_example(tool: &str, kind: &str) -> Option<Value> {
+    match (tool, kind) {
+        ("lean_context", "proof_position") => Some(json!({
+            "kind": "proof_position",
+            "file": "LeanRsFixture/ProofActions.lean",
+            "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+            "proof_position": { "kind": "default" }
+        })),
+        ("lean_trial", "proof_step") => Some(json!({
+            "kind": "proof_step",
+            "file": "LeanRsFixture/ProofActions.lean",
+            "declaration": "LeanRsFixture.ProofActions.stepTheorem",
+            "snippet": "trivial"
+        })),
+        ("lean_trial", "command") => Some(json!({
+            "kind": "command",
+            "imports": ["Init"],
+            "commands": "#check Nat.add\n#print axioms Nat.add_assoc"
+        })),
+        ("lean_verify", "targets") => Some(json!({
+            "targets": [{
+                "kind": "explicit",
+                "file": "LeanRsFixture/ProofActions.lean",
+                "declarations": ["LeanRsFixture.ProofActions.closedTheorem"]
+            }],
+            "allow_sorry": false,
+            "report_axioms": true
+        })),
+        ("lean_lookup", "declaration") => Some(json!({
+            "kind": "declaration",
+            "name": "Nat.add_zero",
+            "imports": ["Init"]
+        })),
+        ("lean_lookup", "declarations") => Some(json!({
+            "kind": "declarations",
+            "target": { "kind": "module", "module": "LeanRsFixture.ProofAgent" },
+            "limit": 200
+        })),
+        ("lean_lookup", "changed_coverage") => Some(json!({
+            "kind": "changed_coverage",
+            "base": "HEAD",
+            "files": ["LeanRsFixture/ProofActions.lean"],
+            "include_untracked": true
+        })),
+        ("lean_lookup", "proof_search") => Some(json!({
+            "kind": "proof_search",
+            "file": "LeanRsFixture/ProofAgent.lean",
+            "declaration": "LeanRsFixture.ProofAgent.miniRatDenominatorStep",
+            "mode": "next_step",
+            "limit": 10
+        })),
+        ("lean_lookup", "references") => Some(json!({
+            "kind": "references",
+            "name": "LeanRsFixture.ProofActions.closedTheorem",
+            "scope": "file",
+            "file": "LeanRsFixture/ProofActions.lean",
+            "limit": 20
+        })),
+        ("lean_status", "project") => Some(json!({
+            "kind": "project",
+            "include": ["toolchain", "worker", "artifacts"]
+        })),
+        ("lean_status", "file_diagnostics") => Some(json!({
+            "kind": "file_diagnostics",
+            "file": "LeanRsFixture/ProofActions.lean"
+        })),
+        _ => None,
+    }
+}
+
+fn semantic_examples(tool: &str, allowed: &[&str]) -> Option<Value> {
+    let examples = allowed
+        .iter()
+        .filter_map(|kind| semantic_example(tool, kind).map(|example| ((*kind).to_owned(), example)))
+        .collect::<serde_json::Map<_, _>>();
+    (!examples.is_empty()).then_some(Value::Object(examples))
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -164,7 +542,7 @@ impl StatusInclude {
 pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
     match req.kind() {
         Some("proof_position") => {
-            let request = match decode::<ProofStateRequest>(req) {
+            let request = match decode::<ProofStateRequest>(req, semantic_example("lean_context", "proof_position")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -184,14 +562,14 @@ pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result
 pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
     match req.kind() {
         Some("proof_step") => {
-            let request = match decode::<TryProofStepRequest>(req) {
+            let request = match decode::<TryProofStepRequest>(req, semantic_example("lean_trial", "proof_step")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
             from_tool_response(proof_action::try_proof_step(ctx, request).await?, ctx.config.verbosity)
         }
         Some("command") => {
-            let request = match decode::<CommandTrialRequest>(req) {
+            let request = match decode::<CommandTrialRequest>(req, semantic_example("lean_trial", "command")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -211,7 +589,7 @@ pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<S
 pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
     match req.kind() {
         None => {
-            let request = match decode::<LeanVerifyRequest>(req) {
+            let request = match decode::<LeanVerifyRequest>(req, semantic_example("lean_verify", "targets")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -246,7 +624,8 @@ pub async fn lean_verify_targets(ctx: &ToolContext, request: LeanVerifyRequest) 
 pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
     match req.kind() {
         Some("declaration") => {
-            let request = match decode::<InspectDeclarationRequest>(req) {
+            let request = match decode::<InspectDeclarationRequest>(req, semantic_example("lean_lookup", "declaration"))
+            {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -256,27 +635,29 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
             )
         }
         Some("declarations") => {
-            let request = match decode::<DeclarationInventoryRequest>(req) {
-                Ok(request) => request,
-                Err(response) => return Ok(*response),
-            };
+            let request =
+                match decode::<DeclarationInventoryRequest>(req, semantic_example("lean_lookup", "declarations")) {
+                    Ok(request) => request,
+                    Err(response) => return Ok(*response),
+                };
             from_tool_response(
                 declaration_inventory::declaration_inventory(ctx, request).await?,
                 ctx.config.verbosity,
             )
         }
         Some("changed_coverage") => {
-            let request = match decode::<ChangedCoverageRequest>(req) {
-                Ok(request) => request,
-                Err(response) => return Ok(*response),
-            };
+            let request =
+                match decode::<ChangedCoverageRequest>(req, semantic_example("lean_lookup", "changed_coverage")) {
+                    Ok(request) => request,
+                    Err(response) => return Ok(*response),
+                };
             from_tool_response(
                 changed_coverage::changed_coverage(ctx, request).await?,
                 ctx.config.verbosity,
             )
         }
         Some("proof_search") => {
-            let request = match decode::<SearchForProofRequest>(req) {
+            let request = match decode::<SearchForProofRequest>(req, semantic_example("lean_lookup", "proof_search")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -286,7 +667,7 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
             )
         }
         Some("references") => {
-            let request = match decode::<FindReferencesRequest>(req) {
+            let request = match decode::<FindReferencesRequest>(req, semantic_example("lean_lookup", "references")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -326,7 +707,7 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
     let kind = req.kind().unwrap_or("project").to_owned();
     match kind.as_str() {
         "project" => {
-            let request = match decode::<StatusRequest>(req) {
+            let request = match decode::<StatusRequest>(req, semantic_example("lean_status", "project")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -376,10 +757,11 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
             })
         }
         "file_diagnostics" => {
-            let request = match decode::<FileDiagnosticsRequest>(req) {
-                Ok(request) => request,
-                Err(response) => return Ok(*response),
-            };
+            let request =
+                match decode::<FileDiagnosticsRequest>(req, semantic_example("lean_status", "file_diagnostics")) {
+                    Ok(request) => request,
+                    Err(response) => return Ok(*response),
+                };
             from_tool_response(position::file_diagnostics(ctx, request).await?, ctx.config.verbosity)
         }
         other => Ok(invalid_kind("lean_status", other, &["project", "file_diagnostics"])),
@@ -482,21 +864,23 @@ fn semantic_issues(
     out
 }
 
-fn decode<T>(req: SemanticToolRequest) -> std::result::Result<T, Box<SemanticResponse<Value>>>
+fn decode<T>(req: SemanticToolRequest, example: Option<Value>) -> std::result::Result<T, Box<SemanticResponse<Value>>>
 where
     T: DeserializeOwned,
 {
     let value = Value::Object(req.args.into_iter().collect());
     serde_json::from_value(value).map_err(|err| {
+        let has_example = example.is_some();
+        let details = example.map(|example| json!({ "example": example }));
         Box::new(SemanticResponse {
             data: None,
             errors: vec![SemanticIssue {
                 code: "invalid_request".to_owned(),
                 message: err.to_string(),
                 severity: Some("error".to_owned()),
-                next_action: None,
+                next_action: has_example.then(|| "Retry with a request shaped like `details.example`.".to_owned()),
                 retryable: Some(false),
-                details: None,
+                details,
             }],
             trust: SemanticTrust::unknown(),
         })
@@ -510,9 +894,9 @@ fn missing_kind(tool: &str, allowed: &[&str]) -> SemanticResponse<Value> {
             code: "missing_kind".to_owned(),
             message: format!("{tool} requires `kind`; allowed: {}", allowed.join(", ")),
             severity: Some("error".to_owned()),
-            next_action: None,
+            next_action: Some("Choose one of the allowed modes; see `details.examples`.".to_owned()),
             retryable: Some(false),
-            details: None,
+            details: semantic_examples(tool, allowed).map(|examples| json!({ "examples": examples })),
         }],
         trust: SemanticTrust::unknown(),
     }
@@ -530,9 +914,10 @@ fn invalid_kind(tool: &str, kind: &str, allowed: &[&str]) -> SemanticResponse<Va
             code: "invalid_kind".to_owned(),
             message,
             severity: Some("error".to_owned()),
-            next_action: None,
+            next_action: (!allowed.is_empty())
+                .then(|| "Choose one of the allowed modes; see `details.examples`.".to_owned()),
             retryable: Some(false),
-            details: None,
+            details: semantic_examples(tool, allowed).map(|examples| json!({ "examples": examples })),
         }],
         trust: SemanticTrust::unknown(),
     }
@@ -690,6 +1075,57 @@ mod tests {
         drop(broker);
     }
 
+    #[tokio::test]
+    async fn invalid_request_error_carries_kind_example() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let broker = ProjectBroker::new(BrokerConfig {
+            config_default: None,
+            env_default: Some(root),
+            cwd: tmp.path().to_path_buf(),
+            max_projects: BrokerConfig::default_max_projects(),
+            idle_timeout: std::time::Duration::ZERO,
+            semantic_permits: BrokerConfig::default_semantic_permits(),
+            semantic_waiters: BrokerConfig::default_semantic_waiters(),
+            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
+            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
+        });
+        let ctx = ToolContext {
+            broker: std::sync::Arc::clone(&broker),
+            config: ToolConfig::default(),
+        };
+
+        let response = lean_lookup(
+            &ctx,
+            SemanticToolRequest {
+                kind: Some("declarations".to_owned()),
+                args: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.data.is_none());
+        let error = response.errors.first().unwrap();
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            error.details.as_ref().and_then(|details| {
+                details
+                    .pointer("/example/target/kind")
+                    .and_then(serde_json::Value::as_str)
+            }),
+            Some("module")
+        );
+        assert!(
+            error
+                .next_action
+                .as_deref()
+                .is_some_and(|action| action.contains("details.example"))
+        );
+        drop(ctx);
+        drop(broker);
+    }
+
     #[test]
     fn tool_catalog_documents_semantic_surface() {
         let catalog = include_str!("../../../../docs/tool-catalog.md");
@@ -701,6 +1137,17 @@ mod tests {
             "lean_status",
         ] {
             assert!(catalog.contains(tool), "catalog should document {tool}");
+        }
+        for phrase in [
+            "Common Workflows",
+            "Verify One Declaration With Axiom Reporting",
+            "Tagged Request Shapes",
+            "LEAN_HOST_MCP_RESPONSE_CARRIER=structured",
+            "lean_trial",
+            "lean_context",
+            "lean_verify",
+        ] {
+            assert!(catalog.contains(phrase), "catalog should document {phrase}");
         }
         for old_heading in [
             "## `proof_state`",

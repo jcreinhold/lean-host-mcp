@@ -50,19 +50,19 @@ impl LeanHostService {
     )]
     async fn lean_context(
         &self,
-        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
+        Parameters(req): Parameters<tools::semantic::LeanContextToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_context", "tool call");
-        self.respond_semantic(tools::semantic::lean_context(&self.ctx, req).await)
+        self.respond_semantic(tools::semantic::lean_context(&self.ctx, req.into_inner()).await)
     }
 
     #[tool(description = "Non-mutating Lean experiments. Kinds: proof_step, command.")]
     async fn lean_trial(
         &self,
-        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
+        Parameters(req): Parameters<tools::semantic::LeanTrialToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_trial", "tool call");
-        self.respond_semantic(tools::semantic::lean_trial(&self.ctx, req).await)
+        self.respond_semantic(tools::semantic::lean_trial(&self.ctx, req.into_inner()).await)
     }
 
     #[tool(description = "Verify Lean declarations from explicit, file_all, module_all, or changed target groups.")]
@@ -79,19 +79,19 @@ impl LeanHostService {
     )]
     async fn lean_lookup(
         &self,
-        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
+        Parameters(req): Parameters<tools::semantic::LeanLookupToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_lookup", "tool call");
-        self.respond_semantic(tools::semantic::lean_lookup(&self.ctx, req).await)
+        self.respond_semantic(tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await)
     }
 
     #[tool(description = "Project/toolchain status and source diagnostics. Kinds: project, file_diagnostics.")]
     async fn lean_status(
         &self,
-        Parameters(req): Parameters<tools::semantic::SemanticToolRequest>,
+        Parameters(req): Parameters<tools::semantic::LeanStatusToolRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_status", "tool call");
-        self.respond_semantic(tools::semantic::lean_status(&self.ctx, req).await)
+        self.respond_semantic(tools::semantic::lean_status(&self.ctx, req.into_inner()).await)
     }
 }
 
