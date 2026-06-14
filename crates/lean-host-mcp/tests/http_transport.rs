@@ -69,6 +69,13 @@ async fn streamable_http_initialize_and_tools_list() {
             "tool {} must advertise an object inputSchema for strict MCP clients: {tool:?}",
             tool.get("name").and_then(Value::as_str).unwrap_or("?")
         );
+        assert!(
+            tool.pointer("/inputSchema/properties")
+                .and_then(Value::as_object)
+                .is_some(),
+            "tool {} must advertise top-level inputSchema properties for strict MCP clients: {tool:?}",
+            tool.get("name").and_then(Value::as_str).unwrap_or("?")
+        );
     }
     let verify_tool = listed
         .iter()
@@ -95,6 +102,18 @@ async fn streamable_http_initialize_and_tools_list() {
         lookup_schema.pointer("/oneOf").is_some(),
         "lean_lookup inputSchema should advertise per-kind variants: {lookup_schema:?}"
     );
+    assert_eq!(
+        lookup_schema
+            .pointer("/properties/kind/enum")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(5),
+        "lean_lookup top-level kind property should summarize every lookup mode: {lookup_schema:?}"
+    );
+    assert!(
+        lookup_schema.pointer("/properties/target").is_some(),
+        "lean_lookup top-level properties should expose the declarations target shape: {lookup_schema:?}"
+    );
     for expected in ["declarations", "target", "module", "path"] {
         assert!(
             lookup_schema_text.contains(expected),
@@ -107,8 +126,30 @@ async fn streamable_http_initialize_and_tools_list() {
         .and_then(|tool| tool.get("inputSchema"))
         .expect("lean_context should advertise an inputSchema");
     assert!(
+        context_schema.pointer("/properties/declaration").is_some(),
+        "lean_context top-level properties should expose declaration: {context_schema:?}"
+    );
+    assert!(
         context_schema.to_string().contains("proof_position"),
         "lean_context schema should expose proof_position examples: {context_schema:?}"
+    );
+    let trial_schema = listed
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("lean_trial"))
+        .and_then(|tool| tool.get("inputSchema"))
+        .expect("lean_trial should advertise an inputSchema");
+    assert!(
+        trial_schema.pointer("/properties/commands").is_some(),
+        "lean_trial top-level properties should expose command-trial fields: {trial_schema:?}"
+    );
+    let status_schema = listed
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("lean_status"))
+        .and_then(|tool| tool.get("inputSchema"))
+        .expect("lean_status should advertise an inputSchema");
+    assert!(
+        status_schema.pointer("/properties/include").is_some(),
+        "lean_status top-level properties should expose project-status fields: {status_schema:?}"
     );
 
     server.shutdown().await;

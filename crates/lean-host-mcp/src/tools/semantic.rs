@@ -11,7 +11,7 @@ use std::path::Path;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::broker::{BrokerConfigSnapshot, ProjectHint};
 use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure};
@@ -89,12 +89,61 @@ fn schema_from_value(value: Value) -> Schema {
 }
 
 fn semantic_schema(title: &str, description: &str, variants: &[Value]) -> Schema {
+    let properties = top_level_semantic_properties(variants);
     schema_from_value(json!({
         "title": title,
         "description": description,
         "type": "object",
+        "properties": properties,
+        "additionalProperties": true,
         "oneOf": variants,
     }))
+}
+
+fn top_level_semantic_properties(variants: &[Value]) -> Value {
+    let mut properties = Map::new();
+    let mut kinds = Vec::new();
+    for variant in variants {
+        let Some(variant_properties) = variant.get("properties").and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, schema) in variant_properties {
+            if name == "kind" {
+                collect_kind_values(schema, &mut kinds);
+                continue;
+            }
+            properties.entry(name.clone()).or_insert_with(|| schema.clone());
+        }
+    }
+    if !kinds.is_empty() {
+        let defaults_to_project = kinds.iter().any(|kind| kind.as_str() == Some("project"));
+        let mut kind_schema = json!({
+            "description": "Mode within this semantic tool family.",
+            "enum": kinds,
+        });
+        if defaults_to_project && let Value::Object(schema) = &mut kind_schema {
+            schema.insert("default".to_owned(), Value::String("project".to_owned()));
+        }
+        properties.insert("kind".to_owned(), kind_schema);
+    }
+    Value::Object(properties)
+}
+
+fn collect_kind_values(schema: &Value, kinds: &mut Vec<Value>) {
+    if let Some(kind) = schema.get("const") {
+        push_unique_kind(kinds, kind.clone());
+    }
+    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+        for kind in enum_values {
+            push_unique_kind(kinds, kind.clone());
+        }
+    }
+}
+
+fn push_unique_kind(kinds: &mut Vec<Value>, kind: Value) {
+    if !kinds.contains(&kind) {
+        kinds.push(kind);
+    }
 }
 
 fn proof_position_selector_schema() -> Value {
