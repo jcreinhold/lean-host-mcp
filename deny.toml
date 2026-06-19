@@ -77,10 +77,24 @@ highlight = "all"
 allow = []
 
 # List of crates to deny
+# Pin the lean-rs crate family to a single semver-compatible line. lean-rs is
+# 0.x, so 0.2.x and 0.3.x are incompatible: if an old transitive pin (e.g. a
+# not-yet-upgraded lean-semantic-search) drags a pre-0.3 copy into the graph
+# alongside the 0.3 crates this workspace builds against, their shared types
+# (e.g. lean_toolchain::LeanBuiltCapability) stop unifying and surface as a
+# confusing deep E0308. Denying anything below the floor makes that partial
+# upgrade fail `cargo deny check` loudly instead. Raise the floor in lockstep on
+# the next lean-rs major (0.x) bump.
 deny = [
-  # Each entry can be either a crate name to ban all versions
-  # or a name and version range to ban specific versions
-  # { name = "openssl", version = "*" }, # Prefer rustls
+  { name = "lean-rs-abi", version = "<0.3" },
+  { name = "lean-rs-sys", version = "<0.3" },
+  { name = "lean-rs", version = "<0.3" },
+  { name = "lean-rs-host", version = "<0.3" },
+  { name = "lean-rs-interop-shims", version = "<0.3" },
+  { name = "lean-rs-worker-protocol", version = "<0.3" },
+  { name = "lean-rs-worker-parent", version = "<0.3" },
+  { name = "lean-rs-worker-child", version = "<0.3" },
+  { name = "lean-toolchain", version = "<0.3" },
 ]
 
 # Certain crates/versions that will be skipped when doing duplicate detection.

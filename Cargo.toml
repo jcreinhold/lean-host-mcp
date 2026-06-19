@@ -2,18 +2,6 @@
 members = ["crates/*"]
 resolver = "3"
 
-# Temporary local override while the lean-rs worker-runtime changes are ahead
-# of the latest crates.io release.
-[patch.crates-io]
-lean-rs = { path = "../lean-rs/crates/lean-rs" }
-lean-rs-abi = { path = "../lean-rs/crates/lean-rs-abi" }
-lean-rs-host = { path = "../lean-rs/crates/lean-rs-host" }
-lean-rs-sys = { path = "../lean-rs/crates/lean-rs-sys" }
-lean-rs-worker-child = { path = "../lean-rs/crates/lean-rs-worker-child" }
-lean-rs-worker-parent = { path = "../lean-rs/crates/lean-rs-worker-parent" }
-lean-rs-worker-protocol = { path = "../lean-rs/crates/lean-rs-worker-protocol" }
-lean-toolchain = { path = "../lean-rs/crates/lean-toolchain" }
-
 [workspace.package]
 authors = ["Jacob Reinhold"]
 edition = "2024"
@@ -21,6 +9,22 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/jcreinhold/lean-host-mcp"
 rust-version = "1.91"
 version = "0.4.1"
+
+# Single version knob for the semver-fragile, version-coupled crate families.
+# The lean-rs stack is 0.x (0.2.x / 0.3.x are incompatible) and the
+# lean-semantic-search stack re-exports lean-rs types in its public API, so the
+# two must always advance on the same lean-rs line. Declaring the versions once
+# here (members reference them via `.workspace = true`) removes per-crate drift;
+# `deny.toml` enforces the no-duplicate-version invariant across the full graph.
+[workspace.dependencies]
+lean-rs-worker-parent = "0.3"
+lean-rs-worker-protocol = "0.3"
+lean-rs-worker-child = "0.3"
+lean-toolchain = "0.3"
+lean-semantic-search-capability = "0.4"
+lean-semantic-search-contract = "0.4"
+lean-semantic-search-retrieval = "0.4"
+lean-semantic-search-runtime = "0.4"
 
 [workspace.lints.rust]
 future-incompatible = "warn"

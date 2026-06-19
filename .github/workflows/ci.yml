@@ -10,6 +10,20 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # Enforces the lean-rs version-floor ban in deny.toml: a partial upgrade
+      # that drags a pre-0.3 lean-rs copy back into the graph fails here with a
+      # named diagnostic instead of as a deep E0308 in a consumer.
+      - name: cargo deny check
+        run: cargo deny check
+
   check:
     runs-on: ubuntu-latest
     steps:

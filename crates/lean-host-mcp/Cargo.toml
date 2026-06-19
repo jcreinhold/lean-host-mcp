@@ -55,7 +55,6 @@ schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-# Throwaway working directory for the install-time worker smoke test (smoke.rs).
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -66,17 +65,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
-lean-rs-worker-parent = "0.2.4"
-lean-rs-worker-protocol = "0.2.4"
-lean-semantic-search-capability = "0.3.1"
-lean-semantic-search-contract = "0.3.1"
-lean-semantic-search-retrieval = "0.3.1"
-lean-semantic-search-runtime = "0.3.1"
+lean-rs-worker-parent.workspace = true
+lean-rs-worker-protocol.workspace = true
+lean-semantic-search-capability.workspace = true
+lean-semantic-search-contract.workspace = true
+lean-semantic-search-retrieval.workspace = true
+lean-semantic-search-runtime.workspace = true
 # Link-free facade over lean-rs-abi metadata: supplies the supported-toolchain
 # window. Already in the parent's closure via lean-rs-worker-parent, so this
 # direct dep adds no new linkage. The parent must stay free of libleanshared —
 # see the link-set assertion in AGENTS.md.
-lean-toolchain = "0.2.4"
+lean-toolchain.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
