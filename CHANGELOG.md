@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-19
+
 ### Added
 
 - New semantic MCP surface with five public tools: `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup`, and
@@ -26,11 +28,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Upgraded the `lean-rs` worker crates (`lean-rs-worker-parent` / `-child`, `lean-toolchain`) to 0.2.2 and moved the
-  Lean toolchain pin to the new supported-window head, `leanprover/lean4:v4.31.0-rc2` (header-identical to `-rc1`, so
-  the ABI is unchanged). The supported window is now `4.26.0 ..= 4.31.0-rc2`.
+- Upgraded the `lean-rs` worker crates (`lean-rs-worker-parent` / `-child`, `lean-toolchain`) to 0.3 and the
+  `lean-semantic-search` crates to 0.4 (which themselves build on `lean-rs` 0.3), so the entire dependency graph now
+  resolves to a single `lean-rs` 0.x line. The Lean toolchain pin remains `leanprover/lean4:v4.31.0-rc2`.
 - Public MCP registration is now the semantic five-tool surface. The old six proof-workflow tool names and temporary
   compatibility probes are not advertised; existing internal operation modules are reused behind semantic modes.
+
+### Internal
+
+- Centralized the `lean-rs` and `lean-semantic-search` dependency versions in `[workspace.dependencies]` (members
+  reference them via `.workspace = true`) and added a `cargo-deny` CI job whose `deny.toml` floor-bans the `lean-rs`
+  crate family below `0.3`. A future partial upgrade that drags a pre-0.3 copy back into the graph now fails
+  `cargo deny check` with a named diagnostic instead of a deep `E0308` type mismatch.
 
 ## [0.4.1] - 2026-06-09
 

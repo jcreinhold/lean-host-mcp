@@ -86,14 +86,14 @@ allow = []
 # upgrade fail `cargo deny check` loudly instead. Raise the floor in lockstep on
 # the next lean-rs major (0.x) bump.
 deny = [
-  { name = "lean-rs-abi", version = "<0.3" },
-  { name = "lean-rs-sys", version = "<0.3" },
   { name = "lean-rs", version = "<0.3" },
+  { name = "lean-rs-abi", version = "<0.3" },
   { name = "lean-rs-host", version = "<0.3" },
   { name = "lean-rs-interop-shims", version = "<0.3" },
-  { name = "lean-rs-worker-protocol", version = "<0.3" },
-  { name = "lean-rs-worker-parent", version = "<0.3" },
+  { name = "lean-rs-sys", version = "<0.3" },
   { name = "lean-rs-worker-child", version = "<0.3" },
+  { name = "lean-rs-worker-parent", version = "<0.3" },
+  { name = "lean-rs-worker-protocol", version = "<0.3" },
   { name = "lean-toolchain", version = "<0.3" },
 ]
 
