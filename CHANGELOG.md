@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Moved the head toolchain the server is built and tested against from `leanprover/lean4:v4.31.0-rc2` to
+  `leanprover/lean4:v4.32.0-rc1` (fixture pin and the `src/` head literals). No dependency bump was required: the
+  already-adopted `lean-rs` 0.3 / `lean-semantic-search` 0.4 lines (via `lean-toolchain` 0.3 →
+  `lean-rs-abi::SUPPORTED_TOOLCHAINS`) already cover `4.32.0-rc1`, extending the supported window to
+  `4.26.0 ..= 4.32.0-rc1`. Also refreshed the README "Versions" matrix, which had lagged at the pre-0.5.0 `lean-rs`
+  0.2.2 line.
+
 ## [0.5.0] - 2026-06-19
 
 ### Added

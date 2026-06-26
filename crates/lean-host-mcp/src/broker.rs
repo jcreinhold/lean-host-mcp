@@ -1132,7 +1132,7 @@ mod tests {
             format!("package {name}\nlean_lib {}\n", name.replace('-', "_")),
         )
         .unwrap();
-        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.31.0-rc2\n").unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.32.0-rc1\n").unwrap();
         fs::write(dir.join("lake-manifest.json"), "{}\n").unwrap();
         dir.canonicalize().unwrap()
     }

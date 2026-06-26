@@ -17,8 +17,8 @@ Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups d
 - **`lean_context`** — proof context. Initial mode: `proof_position`.
 - **`lean_trial`** — non-mutating experiments. Modes: `proof_step` and `command`.
 - **`lean_verify`** — declaration verification for explicit, file-wide, module-wide, or changed target groups.
-- **`lean_lookup`** — declaration inspection, declaration inventory, changed-diff coverage, proof search, and references.
-  Initial modes: `declaration`, `declarations`, `changed_coverage`, `proof_search`, and `references`.
+- **`lean_lookup`** — declaration inspection, declaration inventory, changed-diff coverage, proof search, and
+  references. Initial modes: `declaration`, `declarations`, `changed_coverage`, `proof_search`, and `references`.
 - **`lean_status`** — project/toolchain/config status and current-source file diagnostics. Modes: `project` and
   `file_diagnostics`.
 
@@ -148,7 +148,7 @@ for runtime failures and warnings; `trust` is the small project/session identity
   "trust": {
     "project_root": "/abs/path",
     "session_id": "uuid-or-metadata-only",
-    "lean_toolchain": "leanprover/lean4:v4.31.0-rc2",
+    "lean_toolchain": "leanprover/lean4:v4.32.0-rc1",
     "artifacts": [
       {
         "artifact": "source",
@@ -168,8 +168,8 @@ telemetry never removes these trust facts.
 
 The split that matters: **Lean-domain failures** (parse errors, elaboration diagnostics, kernel rejection, meta timeout)
 ride inside `data` — a failed proof is still a successful call. **Recoverable runtime failures** (admission or mailbox
-pressure, worker death, session loss) appear in `errors` with a retryable flag and structured details. **MCP errors** are
-reserved for I/O/config failures and unusable Lake projects. By default the semantic response rides as JSON text in
+pressure, worker death, session loss) appear in `errors` with a retryable flag and structured details. **MCP errors**
+are reserved for I/O/config failures and unusable Lake projects. By default the semantic response rides as JSON text in
 `content`; `server.response_carrier` (`structured` / `both`) can place it in `structuredContent` instead. Tools
 advertise no `outputSchema` — the Anthropic Messages API drops it, and deep `$defs` break strict clients.
 
@@ -178,8 +178,8 @@ Two proof-agent details are worth calling out:
 - An unresolved `lean_context(kind="proof_position")` `after_text` selector returns bounded `proof_boundaries`, each
   with a copyable follow-up selector such as `{ "kind": "index", "index": 1 }`.
 - `lean_trial(kind="proof_step")` diagnostics label their coordinate space. Candidate-local errors usually report
-  `coordinate_space: "synthetic_buffer"` with a `synthetic_range`; original file ranges appear only as
-  `original_range` when the worker can map them honestly.
+  `coordinate_space: "synthetic_buffer"` with a `synthetic_range`; original file ranges appear only as `original_range`
+  when the worker can map them honestly.
 
 ## Documentation
 
@@ -190,9 +190,9 @@ Two proof-agent details are worth calling out:
 
 ## Versions
 
-`lean-host-mcp` 0.4.1 builds on `lean-rs-worker-parent` / `-child` 0.2.2, which transitively pin `lean-rs` /
-`lean-rs-host` 0.2.2. It supports the Lean window `4.26.0 ..= 4.31.0-rc2` and is built and tested against the head of
-that window, Lean **4.31.0-rc2**.
+`lean-host-mcp` 0.5.0 builds on `lean-rs-worker-parent` / `-child` 0.3, which transitively pin `lean-rs` /
+`lean-rs-host` 0.3. It supports the Lean window `4.26.0 ..= 4.32.0-rc1` and is built and tested against the head of that
+window, Lean **4.32.0-rc1**.
 
 A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long
 as it falls inside the supported window. The window is read directly from `lean-toolchain::SUPPORTED_TOOLCHAINS` (itself

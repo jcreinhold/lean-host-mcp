@@ -1498,7 +1498,7 @@ mod tests {
         let dir = root.join("proof_action");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("lakefile.lean"), "package proof_action\nlean_lib Demo\n").unwrap();
-        std::fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.31.0-rc2\n").unwrap();
+        std::fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.32.0-rc1\n").unwrap();
         std::fs::write(dir.join("lake-manifest.json"), "{}\n").unwrap();
         std::fs::write(dir.join("Demo.lean"), "import Init\nexample : True := by trivial\n").unwrap();
         dir.canonicalize().unwrap()

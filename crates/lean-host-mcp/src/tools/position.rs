@@ -1932,7 +1932,7 @@ mod tests {
             project_hash: "hash".to_owned(),
             imports: Vec::new(),
             session_id: "test-session".to_owned(),
-            lean_toolchain: "leanprover/lean4:v4.31.0-rc2".to_owned(),
+            lean_toolchain: "leanprover/lean4:v4.32.0-rc1".to_owned(),
             toolchain_advisories: Vec::new(),
         }
     }
