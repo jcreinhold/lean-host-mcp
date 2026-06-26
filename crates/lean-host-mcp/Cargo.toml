@@ -44,7 +44,7 @@ fs4 = "1.1"
 lru = "0.18"
 parking_lot = "0.12"
 regex = "1"
-rmcp = { version = "1.7", features = [
+rmcp = { version = "1.8", features = [
   "macros",
   "schemars",
   "server",
