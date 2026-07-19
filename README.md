@@ -190,7 +190,7 @@ Two proof-agent details are worth calling out:
 
 ## Versions
 
-`lean-host-mcp` 0.5.1 builds on `lean-rs-worker-parent` / `-child` 0.4, which transitively pin `lean-rs` /
+`lean-host-mcp` 0.6.0 builds on `lean-rs-worker-parent` / `-child` 0.4, which transitively pin `lean-rs` /
 `lean-rs-host` 0.4. It supports the Lean window `4.26.0 ..= 4.33.0-rc1` and is built and tested against the head of that
 window, Lean **4.33.0-rc1**.
 

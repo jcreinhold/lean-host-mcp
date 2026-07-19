@@ -8,7 +8,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jcreinhold/lean-host-mcp"
 rust-version = "1.91"
-version = "0.5.1"
+version = "0.6.0"
 
 # Single version knob for the semver-fragile, version-coupled crate families.
 # The lean-rs stack is 0.x (0.2.x / 0.3.x are incompatible) and the
