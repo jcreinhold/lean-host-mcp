@@ -23,7 +23,7 @@ run_cmd do
     }
   let addCoreDecl (decl : Declaration) : CoreM Unit := do
     let env ← getEnv
-    let env ← ofExceptKernelException <| env.addDeclCore 0 decl none
+    let env ← ofExceptKernelException <| env.addDeclCore 0 0 decl none
     setEnv env
   let privateName := mkPrivateNameCore `LeanRsFixture.SourceRanges (ns ++ `privateSynthetic)
   Lean.Elab.Command.liftCoreM <| addDecl <| mkDef (ns ++ `syntheticNoRange) 0

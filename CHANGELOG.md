@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Adopted the `lean-rs` 0.4 line (`lean-rs-worker-{child,parent,protocol}` and `lean-toolchain` 0.3 → 0.4, alongside the
+  already-current `lean-semantic-search` 0.4 stack), widening the supported window to `4.26.0 ..= 4.33.0-rc1` via
+  `lean-toolchain` 0.4 → `lean-rs-abi::SUPPORTED_TOOLCHAINS`.
+- Moved the head toolchain the server is built and tested against from `leanprover/lean4:v4.32.0` to
+  `leanprover/lean4:v4.33.0-rc1` (fixture pin, the `src/` head literals, and the README "Versions" matrix / doc JSON
+  examples). No Rust-floor change.
+- Adapted the `SourceRanges` Lean fixture to the `v4.33.0-rc1` `Environment.addDeclCore` signature, which gained a
+  `maxRecDepth : USize` parameter after `maxHeartbeats` (`env.addDeclCore 0 decl none` →
+  `env.addDeclCore 0 0 decl none`, mirroring core Lean's own call site).
+
 ## [0.5.1] - 2026-07-14
 
 ### Changed
