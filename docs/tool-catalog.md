@@ -448,6 +448,15 @@ usually point into the synthetic trial buffer, so use `synthetic_range` for
 display and do not treat it as an editable file range unless `original_range` is
 also present:
 
+Across all candidate statuses, the first error-severity diagnostic in
+`diagnostics` is a reliable failure signal: a `closed` candidate's
+`diagnostics` and `downstream_diagnostics` carry only non-error advisory notes
+(warnings and info). Error-severity entries a closed candidate produced after
+closing its goal — for example the original downstream tactics reporting "no
+goals" — are moved, never deleted, into the advisory
+`post_closure_diagnostics` field, which is omitted from the JSON when empty
+and appears only on `closed` candidates.
+
 ```json
 {
   "id": "candidate_1",

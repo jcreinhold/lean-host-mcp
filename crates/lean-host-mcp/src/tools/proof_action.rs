@@ -1744,6 +1744,10 @@ mod tests {
                 diagnostics: Vec::new(),
                 truncated: false,
             },
+            post_closure_diagnostics: ElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
             goals: Vec::new(),
             declaration: None,
             proof_position: None,
@@ -2169,6 +2173,10 @@ mod tests {
                 truncated: false,
             },
             downstream_diagnostics: ElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
+            post_closure_diagnostics: ElabFailure {
                 diagnostics: Vec::new(),
                 truncated: false,
             },

@@ -30,7 +30,7 @@ use lean_host_mcp::tools::semantic::{
 use lean_host_mcp::tools::{OutputBudgetOverrides, TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
     BrokerConfig, CoordinateSpace, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker,
-    ProofAttemptResult,
+    ProofAttemptResult, Severity,
 };
 
 fn fixture_root() -> Option<PathBuf> {
@@ -399,6 +399,19 @@ async fn try_proof_step_batch_returns_all_ordered_rows_under_worker_limit() {
         "stepTheorem has no hypotheses at its pristine goal: {:?}",
         result.locals
     );
+    for candidate in &result.candidates {
+        assert_eq!(candidate.status, "closed");
+        assert!(
+            candidate
+                .diagnostics
+                .diagnostics
+                .iter()
+                .chain(candidate.downstream_diagnostics.diagnostics.iter())
+                .all(|diagnostic| !matches!(diagnostic.severity, Severity::Error)),
+            "a closed candidate's diagnostics carry no error-severity entries: {:?}",
+            candidate.diagnostics
+        );
+    }
 }
 
 #[tokio::test]

@@ -102,7 +102,7 @@ pub struct Diagnostic {
 /// Structured failure payload: the projection of `LeanWorkerElabFailure`
 /// sent over JSON. Failure is part of a successful tool call; this is never
 /// an MCP error.
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct ElabFailure {
     pub diagnostics: Vec<Diagnostic>,
     pub truncated: bool,
@@ -296,10 +296,27 @@ pub struct ProofAttemptCandidate {
     pub snippet: RenderedText,
     pub diagnostics: ElabFailure,
     pub downstream_diagnostics: ElabFailure,
+    /// Post-closure error diagnostics, advisory only. A `closed` candidate
+    /// closed its goal, so error-severity entries in its `diagnostics` /
+    /// `downstream_diagnostics` describe what happened *after* closure (e.g.
+    /// the original downstream tactics reporting "no goals") and must not read
+    /// as candidate failures; they are moved here, never deleted. Empty for
+    /// every non-`closed` status and omitted from the JSON when empty, so
+    /// "first error-severity diagnostic in `diagnostics`" is a reliable
+    /// failure signal across all statuses.
+    #[serde(skip_serializing_if = "elab_failure_is_empty", default)]
+    pub post_closure_diagnostics: ElabFailure,
     pub goals: Vec<RenderedText>,
     pub declaration: Option<ProofActionDeclarationTarget>,
     pub proof_position: Option<ProofPositionSummary>,
     pub output_truncated: bool,
+}
+
+/// True when an [`ElabFailure`] carries no information: no diagnostics and no
+/// truncation. A truncated-but-empty failure still means "output was cut", so
+/// it serializes.
+fn elab_failure_is_empty(failure: &ElabFailure) -> bool {
+    failure.diagnostics.is_empty() && !failure.truncated
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -776,12 +793,33 @@ pub(crate) fn project_proof_attempt_envelope(envelope: LeanWorkerProofAttemptEnv
 }
 
 pub(crate) fn project_proof_attempt_row(row: LeanWorkerProofAttemptRow) -> ProofAttemptCandidate {
+    let status = proof_attempt_status(row.status).to_owned();
+    let mut diagnostics = project_failure(&row.diagnostics);
+    let mut downstream_diagnostics = project_failure(&row.downstream_diagnostics);
+    let mut post_closure_diagnostics = ElabFailure {
+        diagnostics: Vec::new(),
+        truncated: false,
+    };
+    // `closed` is the only authoritative-success status: error-severity
+    // entries in its diagnostic fields are post-closure noise, not candidate
+    // failures. Move them — never delete — into the advisory field. The kept
+    // fields retain their own `truncated` flags (they describe the retained
+    // content); the advisory field's flag is the OR of both sources, since a
+    // truncated source may have held unrendered post-closure errors.
+    if status == "closed" {
+        post_closure_diagnostics.diagnostics = take_error_diagnostics(&mut diagnostics);
+        post_closure_diagnostics
+            .diagnostics
+            .extend(take_error_diagnostics(&mut downstream_diagnostics));
+        post_closure_diagnostics.truncated = diagnostics.truncated || downstream_diagnostics.truncated;
+    }
     ProofAttemptCandidate {
         id: row.id,
-        status: proof_attempt_status(row.status).to_owned(),
+        status,
         snippet: project_rendered_info(row.candidate_text),
-        diagnostics: project_failure(&row.diagnostics),
-        downstream_diagnostics: project_failure(&row.downstream_diagnostics),
+        diagnostics,
+        downstream_diagnostics,
+        post_closure_diagnostics,
         goals: row.goals.into_iter().map(project_rendered_info).collect(),
         declaration: row.declaration.map(project_proof_action_target),
         proof_position: row.proof_position.map(|position| ProofPositionSummary {
@@ -790,6 +828,17 @@ pub(crate) fn project_proof_attempt_row(row: LeanWorkerProofAttemptRow) -> Proof
         }),
         output_truncated: row.output_truncated,
     }
+}
+
+/// Partition error-severity entries out of `failure`, preserving order and
+/// leaving warning/info entries in place. The failure's own `truncated` flag
+/// is untouched.
+fn take_error_diagnostics(failure: &mut ElabFailure) -> Vec<Diagnostic> {
+    let (errors, kept) = std::mem::take(&mut failure.diagnostics)
+        .into_iter()
+        .partition(|diagnostic| matches!(diagnostic.severity, Severity::Error));
+    failure.diagnostics = kept;
+    errors
 }
 
 fn proof_attempt_status(status: LeanWorkerProofAttemptStatus) -> &'static str {
@@ -1121,6 +1170,160 @@ mod tests {
         let json = serde_json::to_value(&envelope).expect("envelope serializes");
         assert!(json.get("entry_goals").is_none(), "empty entry_goals omitted: {json}");
         assert!(json.get("locals").is_none(), "empty locals omitted: {json}");
+    }
+
+    fn attempt_row_with_diagnostics(
+        status: LeanWorkerProofAttemptStatus,
+        local: &[&str],
+        downstream: &[&str],
+        local_truncated: bool,
+        downstream_truncated: bool,
+    ) -> LeanWorkerProofAttemptRow {
+        let diagnostic = |severity: &str| LeanWorkerDiagnostic {
+            severity: severity.to_owned(),
+            message: format!("{severity} message"),
+            file_label: "<proof-step>".to_owned(),
+            line: None,
+            column: None,
+            end_line: None,
+            end_column: None,
+            coordinate_space: LeanWorkerSourceCoordinateSpace::SyntheticBuffer,
+            original_range: None,
+        };
+        let failure = |severities: &[&str], truncated: bool| LeanWorkerElabFailure {
+            diagnostics: severities.iter().map(|severity| diagnostic(severity)).collect(),
+            truncated,
+        };
+        LeanWorkerProofAttemptRow {
+            id: "candidate".to_owned(),
+            status,
+            candidate_text: rendered("trivial"),
+            diagnostics: failure(local, local_truncated),
+            downstream_diagnostics: failure(downstream, downstream_truncated),
+            goals: Vec::new(),
+            declaration: None,
+            proof_position: None,
+            output_truncated: false,
+        }
+    }
+
+    fn error_count(failure: &ElabFailure) -> usize {
+        failure
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| matches!(diagnostic.severity, Severity::Error))
+            .count()
+    }
+
+    #[test]
+    fn closed_candidate_moves_error_diagnostics_to_post_closure_field() {
+        let candidate = project_proof_attempt_row(attempt_row_with_diagnostics(
+            LeanWorkerProofAttemptStatus::Closed,
+            &["warning", "error"],
+            &["info", "error"],
+            false,
+            false,
+        ));
+        assert_eq!(candidate.status, "closed");
+        assert_eq!(error_count(&candidate.diagnostics), 0, "closed candidate diagnostics carry no errors");
+        assert_eq!(error_count(&candidate.downstream_diagnostics), 0);
+        assert_eq!(candidate.diagnostics.diagnostics.len(), 1, "warning retained in place");
+        assert_eq!(candidate.downstream_diagnostics.diagnostics.len(), 1, "info retained in place");
+        assert_eq!(candidate.post_closure_diagnostics.diagnostics.len(), 2, "both errors moved");
+        assert_eq!(error_count(&candidate.post_closure_diagnostics), 2);
+        assert!(!candidate.post_closure_diagnostics.truncated);
+    }
+
+    #[test]
+    fn failed_candidate_keeps_error_diagnostics_in_place() {
+        let candidate = project_proof_attempt_row(attempt_row_with_diagnostics(
+            LeanWorkerProofAttemptStatus::Failed,
+            &["error"],
+            &["error"],
+            false,
+            false,
+        ));
+        assert_eq!(candidate.status, "failed");
+        assert_eq!(error_count(&candidate.diagnostics), 1, "failed candidate keeps its errors");
+        assert_eq!(error_count(&candidate.downstream_diagnostics), 1);
+        assert!(candidate.post_closure_diagnostics.diagnostics.is_empty());
+        assert!(!candidate.post_closure_diagnostics.truncated);
+        let json = serde_json::to_value(&candidate).expect("candidate serializes");
+        assert!(
+            json.get("post_closure_diagnostics").is_none(),
+            "empty advisory field is omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn closed_candidate_with_only_warnings_and_info_keeps_advisory_field_empty() {
+        let candidate = project_proof_attempt_row(attempt_row_with_diagnostics(
+            LeanWorkerProofAttemptStatus::Closed,
+            &["warning"],
+            &["info"],
+            false,
+            false,
+        ));
+        assert_eq!(candidate.diagnostics.diagnostics.len(), 1);
+        assert_eq!(candidate.downstream_diagnostics.diagnostics.len(), 1);
+        assert!(candidate.post_closure_diagnostics.diagnostics.is_empty());
+        assert!(!candidate.post_closure_diagnostics.truncated);
+        let json = serde_json::to_value(&candidate).expect("candidate serializes");
+        assert!(json.get("post_closure_diagnostics").is_none());
+    }
+
+    #[test]
+    fn closed_candidate_with_no_diagnostics_has_empty_advisory_field() {
+        let candidate = project_proof_attempt_row(attempt_row_with_diagnostics(
+            LeanWorkerProofAttemptStatus::Closed,
+            &[],
+            &[],
+            false,
+            false,
+        ));
+        assert!(candidate.post_closure_diagnostics.diagnostics.is_empty());
+        assert!(!candidate.post_closure_diagnostics.truncated);
+        let json = serde_json::to_value(&candidate).expect("candidate serializes");
+        assert!(json.get("post_closure_diagnostics").is_none());
+    }
+
+    #[test]
+    fn closed_candidate_truncation_maps_to_advisory_or_of_sources() {
+        let candidate = project_proof_attempt_row(attempt_row_with_diagnostics(
+            LeanWorkerProofAttemptStatus::Closed,
+            &[],
+            &["error"],
+            true,
+            false,
+        ));
+        assert!(
+            candidate.diagnostics.truncated,
+            "the retained field keeps its own truncated flag"
+        );
+        assert!(!candidate.downstream_diagnostics.truncated);
+        assert!(
+            candidate.post_closure_diagnostics.truncated,
+            "a truncated source may have held unrendered post-closure errors"
+        );
+        assert_eq!(candidate.post_closure_diagnostics.diagnostics.len(), 1);
+        // A truncated-but-diagnostic-free advisory field still serializes: it
+        // carries the truncation fact.
+        let json = serde_json::to_value(&candidate).expect("candidate serializes");
+        assert!(json.get("post_closure_diagnostics").is_some());
+    }
+
+    #[test]
+    fn populated_advisory_field_serializes() {
+        let candidate = project_proof_attempt_row(attempt_row_with_diagnostics(
+            LeanWorkerProofAttemptStatus::Closed,
+            &["error"],
+            &[],
+            false,
+            false,
+        ));
+        let json = serde_json::to_value(&candidate).expect("candidate serializes");
+        let advisory = json.get("post_closure_diagnostics").expect("populated advisory field present");
+        assert_eq!(advisory["diagnostics"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
