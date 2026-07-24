@@ -381,6 +381,21 @@ async fn try_proof_step_batch_returns_all_ordered_rows_under_worker_limit() {
         "candidate rows should preserve request order: {:?}",
         result.candidates
     );
+    assert!(
+        !result.entry_goals.is_empty(),
+        "trial envelope must carry the entry goals once per batch: {:?}",
+        result.entry_goals
+    );
+    assert!(
+        result.entry_goals.iter().any(|goal| goal.value.contains("True")),
+        "entry goals at the default position of stepTheorem are the pristine True goal: {:?}",
+        result.entry_goals
+    );
+    assert!(
+        result.locals.is_empty(),
+        "stepTheorem has no hypotheses at its pristine goal: {:?}",
+        result.locals
+    );
 }
 
 #[tokio::test]
@@ -1527,3 +1542,4 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
         "verify_declaration should include runtime facts"
     );
 }
+

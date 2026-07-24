@@ -26,6 +26,23 @@ lean-semantic-search-retrieval = "0.4"
 lean-semantic-search-runtime = "0.4"
 lean-toolchain = "0.4"
 
+# TEMPORARY scaffolding for the trial self-containment stack: develop against
+# the local lean-rs checkout (which carries the unreleased attempt-envelope
+# `entry_goals`/`locals` wire fields) while the crates.io pin stays at "0.4".
+# Removal owner: prompt 09 (`09-release-and-cutover.md`) of
+# prompts/lean-rs/stacks/01-trial-self-containment-and-verdict-reliability —
+# it publishes lean-rs 0.5.0, bumps the pins above to "0.5", and deletes this
+# section. The stack is not complete while this patch exists.
+[patch.crates-io]
+lean-rs = { path = "../lean-rs/crates/lean-rs" }
+lean-rs-abi = { path = "../lean-rs/crates/lean-rs-abi" }
+lean-rs-host = { path = "../lean-rs/crates/lean-rs-host" }
+lean-rs-sys = { path = "../lean-rs/crates/lean-rs-sys" }
+lean-rs-worker-child = { path = "../lean-rs/crates/lean-rs-worker-child" }
+lean-rs-worker-parent = { path = "../lean-rs/crates/lean-rs-worker-parent" }
+lean-rs-worker-protocol = { path = "../lean-rs/crates/lean-rs-worker-protocol" }
+lean-toolchain = { path = "../lean-rs/crates/lean-toolchain" }
+
 [workspace.lints.rust]
 future-incompatible = "warn"
 let-underscore = "warn"

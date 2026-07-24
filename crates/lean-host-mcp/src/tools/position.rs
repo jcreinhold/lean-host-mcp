@@ -1615,7 +1615,7 @@ fn project_proof_boundary(candidate: WorkerProofBoundaryCandidate) -> ProofBound
     }
 }
 
-fn project_local_info(info: LeanWorkerLocalInfo) -> LocalInfo {
+pub(crate) fn project_local_info(info: LeanWorkerLocalInfo) -> LocalInfo {
     LocalInfo {
         name: info.name,
         binder_info: info.binder_info,

@@ -23,6 +23,8 @@ use lean_rs_worker_parent::{
     LeanWorkerSourceCoordinateSpace, LeanWorkerSourceRange,
 };
 
+use crate::tools::position::{LocalInfo, project_local_info};
+
 /// Source-range projection with public fields mirroring `LeanWorkerSourceRange`.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct SourceRange {
@@ -333,6 +335,15 @@ pub struct ProofAttemptEnvelope {
     pub candidate_limit: u32,
     pub candidates_truncated: bool,
     pub summary: ProofAttemptSummary,
+    /// Goal state at the resolved proof position before any candidate ran —
+    /// shared by every candidate in the batch and rendered once per batch by
+    /// the worker. Omitted when the entry state is degraded or unresolvable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entry_goals: Vec<RenderedText>,
+    /// Local hypotheses at the resolved proof position, in the same shape the
+    /// `lean_context` proof-position response reports. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locals: Vec<LocalInfo>,
 }
 
 impl ProofAttemptEnvelope {
@@ -759,6 +770,8 @@ pub(crate) fn project_proof_attempt_envelope(envelope: LeanWorkerProofAttemptEnv
         candidate_limit: envelope.candidate_limit,
         candidates_truncated: envelope.candidates_truncated,
         summary,
+        entry_goals: envelope.entry_goals.into_iter().map(project_rendered_info).collect(),
+        locals: envelope.locals.into_iter().map(project_local_info).collect(),
     }
 }
 
@@ -959,6 +972,8 @@ fn project_proof_search_facts(facts: LeanWorkerDeclarationProofSearchFacts) -> D
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
     clippy::panic,
     reason = "unit tests fail directly on the wrong variant"
 )]
@@ -1045,6 +1060,8 @@ mod tests {
             ],
             candidate_limit: 16,
             candidates_truncated: false,
+            entry_goals: Vec::new(),
+            locals: Vec::new(),
         });
         assert_eq!(
             envelope.candidates.get(1).map(|candidate| candidate.status.as_str()),
@@ -1053,6 +1070,57 @@ mod tests {
         assert_eq!(envelope.summary.closed, 1);
         assert_eq!(envelope.summary.not_attempted, 1);
         assert!(envelope.summary.partial);
+    }
+
+    #[test]
+    fn proof_attempt_projection_carries_entry_goals_and_locals() {
+        let wire_local = lean_rs_worker_parent::LeanWorkerLocalInfo {
+            name: "n".to_owned(),
+            binder_info: "explicit".to_owned(),
+            type_str: rendered("Nat"),
+            value: Some(rendered("zero")),
+        };
+        let envelope = project_proof_attempt_envelope(LeanWorkerProofAttemptEnvelope {
+            candidates: Vec::new(),
+            candidate_limit: 16,
+            candidates_truncated: false,
+            entry_goals: vec![rendered("n : Nat ⊢ n = n")],
+            locals: vec![wire_local.clone()],
+        });
+        assert_eq!(envelope.entry_goals.len(), 1);
+        let entry_goal = envelope.entry_goals.first().expect("one entry goal");
+        assert_eq!(entry_goal.value, "n : Nat ⊢ n = n");
+        assert!(!entry_goal.truncated);
+        // Trial locals reuse the context path's `LocalInfo` and projection, so
+        // both tools parse identically.
+        let context_local = project_local_info(wire_local);
+        assert_eq!(envelope.locals.len(), 1);
+        let trial_local = envelope.locals.first().expect("one local");
+        assert_eq!(trial_local.name, context_local.name);
+        assert_eq!(trial_local.binder_info, context_local.binder_info);
+        assert_eq!(trial_local.type_str.value, context_local.type_str.value);
+        assert_eq!(trial_local.type_str.truncated, context_local.type_str.truncated);
+        assert_eq!(
+            trial_local.value.as_ref().map(|value| value.value.as_str()),
+            context_local.value.as_ref().map(|value| value.value.as_str())
+        );
+        let json = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert!(json.get("entry_goals").is_some());
+        assert!(json.get("locals").is_some());
+    }
+
+    #[test]
+    fn proof_attempt_projection_omits_empty_entry_goals_and_locals() {
+        let envelope = project_proof_attempt_envelope(LeanWorkerProofAttemptEnvelope {
+            candidates: Vec::new(),
+            candidate_limit: 16,
+            candidates_truncated: false,
+            entry_goals: Vec::new(),
+            locals: Vec::new(),
+        });
+        let json = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert!(json.get("entry_goals").is_none(), "empty entry_goals omitted: {json}");
+        assert!(json.get("locals").is_none(), "empty locals omitted: {json}");
     }
 
     #[test]

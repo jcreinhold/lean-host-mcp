@@ -226,7 +226,9 @@ explicit target group:
 3. Call `lean_lookup` with `kind: "declaration"` to inspect a promising
    declaration's statement, docstring, attributes, and flags.
 4. Call `lean_trial` with `kind: "proof_step"` to try one or more tactics in
-   memory without editing the file.
+   memory without editing the file. The trial envelope is self-contained: it
+   carries `entry_goals` and `locals` for the resolved position, so iterating
+   proof steps does not require a `lean_context` round-trip before each trial.
 5. Call `lean_verify` with an explicit target group to verify the target declaration.
 
 Use `lean_lookup` with `kind: "references"` when the task is semantic reference
@@ -421,6 +423,16 @@ some rows timed out, exceeded the total output budget, were skipped after that
 budget was exhausted, or had truncated output. In that case the envelope also
 includes warnings/next actions suggesting a smaller batch, a single-candidate
 retry, or a larger `output.max_total_bytes` budget.
+
+The envelope also carries `entry_goals` and `locals`: the goal state and local
+hypotheses at the resolved proof position before any candidate was spliced —
+the same values `lean_context(kind="proof_position")` reports as
+`goals_before` and `locals` at that position. They are rendered once per batch
+and shared by every candidate row, and both are omitted from the JSON when
+empty (a degraded or unresolvable entry state yields empty arrays, never an
+error). A trial loop therefore no longer needs a `lean_context` call before
+each step: read the context once to navigate, then drive subsequent steps from
+the trial envelopes alone.
 
 Proof-step diagnostics label their coordinate space. Candidate-local diagnostics
 usually point into the synthetic trial buffer, so use `synthetic_range` for

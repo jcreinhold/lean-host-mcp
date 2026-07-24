@@ -1414,6 +1414,8 @@ fn empty_proof_attempt_envelope() -> ProofAttemptEnvelope {
             unsupported: 0,
             output_truncated: 0,
         },
+        entry_goals: Vec::new(),
+        locals: Vec::new(),
     };
     envelope.refresh_summary(0);
     envelope
@@ -1595,6 +1597,8 @@ mod tests {
                     candidate_limit: MAX_CANDIDATES as u32,
                     candidates_truncated: false,
                     summary: empty_proof_attempt_envelope().summary,
+                    entry_goals: Vec::new(),
+                    locals: Vec::new(),
                 },
                 imports: Vec::new(),
             },
