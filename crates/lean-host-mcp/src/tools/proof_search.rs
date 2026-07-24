@@ -274,12 +274,16 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: us
         let hint = ProjectHint::from_request(req.project.clone());
         let meta = ctx.broker.resolve_meta(&hint)?;
         let source_input = read_query_file(&meta.canonical_root, &file)?;
-        let proof_response = crate::tools::position::proof_state(
+        let (proof_response, namespace_name) = crate::tools::position::proof_state_internal(
             ctx,
             ProofStateRequest {
                 file: file.clone(),
                 declaration: declaration.clone(),
                 proof_position: req.proof_position.clone(),
+                // Proof search ranks against the expected type, so it opts in;
+                // it never reads the boundary list.
+                include_boundaries: false,
+                include_expected_type: true,
                 project: req.project.clone(),
             },
         )
@@ -306,7 +310,6 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: us
                 goals_after,
                 locals,
                 expected_type,
-                namespace_name,
                 query_facts,
                 unavailable,
                 budget_exceeded,

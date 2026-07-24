@@ -231,7 +231,10 @@ explicit target group:
 ## Proof Workflow
 
 1. Call `lean_context` with `kind: "proof_position"` to read the current proof
-   goals, locals, expected type, and diagnostics for a declaration position.
+   goals, locals, and diagnostics for a declaration position. Add
+   `include_boundaries: true` when you need the boundary list to pick a
+   selector, and `include_expected_type: true` when you need the goal's
+   expected type; both default to `false`.
 2. Call `lean_lookup` with `kind: "proof_search"` to retrieve ranked
    declarations for the goal.
 3. Call `lean_lookup` with `kind: "declaration"` to inspect a promising
@@ -294,6 +297,21 @@ the existing declaration anchor plus an optional proof-position selector:
 }
 ```
 
+**Breaking change (context trim).** The response no longer echoes
+`declaration_name` or `namespace_name` — the caller already named the
+declaration in the request. Two heavier payload fields are now opt-in flags
+on the request, both defaulting to `false`:
+
+- `include_boundaries: true` returns the `proof_boundaries` navigation list
+  (and `proof_boundaries_truncated`). Request it once per declaration to pick
+  a position selector.
+- `include_expected_type: true` returns the goal's `expected_type`.
+
+The intended loop: call `lean_context` with `include_boundaries: true` once
+per declaration to navigate, then drive every step with self-contained
+`lean_trial(kind="proof_step")` calls (which carry their own `entry_goals`
+and `locals`), instead of re-reading context at each step.
+
 When `proof_position` is omitted, the default is the pristine entry goal: the
 state before any tactic runs. This is the same position where a default
 `lean_trial(kind="proof_step")` snippet is spliced.
@@ -315,14 +333,16 @@ every substring is a boundary; inspect the returned `goals_before` and
 `goals_after` to determine the exact state available at the match.
 
 If an `after_text` selector does not resolve, the result stays a normal
-Lean-domain response and includes valid `proof_boundaries`:
+Lean-domain response and — when `include_boundaries` is set — includes valid
+`proof_boundaries`:
 
 ```json
 {
   "kind": "proof_position",
   "file": "LeanRsFixture/ProofActions.lean",
   "declaration": "LeanRsFixture.ProofActions.stepTheorem",
-  "proof_position": { "kind": "after_text", "text": "not a boundary" }
+  "proof_position": { "kind": "after_text", "text": "not a boundary" },
+  "include_boundaries": true
 }
 ```
 

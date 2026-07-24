@@ -273,6 +273,16 @@ pub struct ProofStateRequest {
     pub declaration: String,
     #[serde(default)]
     pub proof_position: ProofPositionSelector,
+    /// Opt in to the proof-boundary list (`proof_boundaries`). Defaults to
+    /// `false`: once `lean_trial(kind="proof_step")` is self-contained, the
+    /// boundaries are navigation metadata most calls never read. Set `true`
+    /// once per declaration to pick a position selector, then trial from it.
+    #[serde(default)]
+    pub include_boundaries: bool,
+    /// Opt in to the goal's expected type (`expected_type`). Defaults to
+    /// `false`; the goal text already carries the target for most steps.
+    #[serde(default)]
+    pub include_expected_type: bool,
     /// Optional explicit project root for this call.
     #[serde(default)]
     pub project: Option<String>,
@@ -336,10 +346,6 @@ pub struct SelectorMessage {
 pub enum ProofStateResult {
     Context {
         diagnostics: DiagnosticsBlock,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        declaration_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        namespace_name: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         goals_before: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -402,6 +408,19 @@ enum BatchProjection {
 /// Returns `ServerError::Io` when the file cannot be read and
 /// `ServerError::Lean` for worker infrastructure failures.
 pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Response<ProofStateResult>> {
+    let (response, _namespace) = proof_state_internal(ctx, req).await?;
+    Ok(response)
+}
+
+/// [`proof_state`] plus the worker-reported namespace of the resolved
+/// declaration. The namespace is deliberately not part of the public response
+/// (it echoes what the caller already named), but internal readers that
+/// qualify names against the live environment still need the worker's
+/// resolution rather than the request's possibly file-local string.
+pub(crate) async fn proof_state_internal(
+    ctx: &ToolContext,
+    req: ProofStateRequest,
+) -> Result<(Response<ProofStateResult>, Option<String>)> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let selectors = vec![
@@ -432,7 +451,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             let imports = read_query_file(&meta.canonical_root, &req.file)
                 .map(|input| input.imports)
                 .unwrap_or_default();
-            return proof_state_needs_build_response(ctx, hint, imports, err);
+            return proof_state_needs_build_response(ctx, hint, imports, err).map(|r| (r, None));
         }
     };
     let freshness = run.freshness.clone();
@@ -451,9 +470,8 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 diagnostics: Vec::new(),
                 truncated: false,
             };
-            let mut declaration_name = None;
-            let mut namespace_name = None;
             let mut goals_before = Vec::new();
+            let mut namespace_name = None;
             let mut goals_after = Vec::new();
             let mut locals = Vec::new();
             let mut expected_type = None;
@@ -475,23 +493,31 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                         (PROOF_STATE_CONTEXT_ID, BatchProjection::ProofState(value)) => match value {
                             ProofStateProjection::State { info } => {
                                 let info = *info;
-                                declaration_name = info.declaration_name;
-                                namespace_name = Some(info.namespace_name);
                                 goals_before = info.goals_before;
+                                namespace_name = Some(info.namespace_name);
                                 goals_after = info.goals_after;
                                 locals = info.locals;
-                                expected_type = info.expected_type;
+                                // Skip the projection, not just the
+                                // serialization: the opt-out path never
+                                // materializes these fields into the response.
+                                if req.include_expected_type {
+                                    expected_type = info.expected_type;
+                                }
                                 truncated = info.truncated;
-                                proof_boundaries = info.proof_boundaries;
-                                proof_boundaries_truncated = info.proof_boundaries_truncated;
+                                if req.include_boundaries {
+                                    proof_boundaries = info.proof_boundaries;
+                                    proof_boundaries_truncated = info.proof_boundaries_truncated;
+                                }
                             }
                             ProofStateProjection::Unavailable {
                                 message,
                                 proof_boundaries: candidates,
                                 proof_boundaries_truncated: candidates_truncated,
                             } => {
-                                proof_boundaries = candidates;
-                                proof_boundaries_truncated = candidates_truncated;
+                                if req.include_boundaries {
+                                    proof_boundaries = candidates;
+                                    proof_boundaries_truncated = candidates_truncated;
+                                }
                                 unavailable.push(SelectorMessage { id, message });
                             }
                             // The worker (protocol 8) classifies an incomplete
@@ -527,8 +553,6 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             let mut response = Response::ok(
                 ProofStateResult::Context {
                     diagnostics,
-                    declaration_name,
-                    namespace_name,
                     goals_before,
                     goals_after,
                     locals,
@@ -567,23 +591,29 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 Some(event) => crate::diagnosis::warn_execution_taint(response, event),
                 None => response,
             };
-            Ok(warn_session_missing_imports(response, &missing_imports))
+            Ok((warn_session_missing_imports(response, &missing_imports), namespace_name))
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
             let block = diagnostics_block(diagnostics);
-            Ok(Response::ok(
-                ProofStateResult::HeaderParseFailed {
-                    summary: block.summary,
-                    diagnostics: block.diagnostics,
-                    truncated: block.truncated,
-                    query_facts: ctx.config.verbosity.is_full().then(|| project_query_facts(facts)),
-                },
-                freshness,
-            )
-            .with_runtime(run.runtime))
+            Ok((
+                Response::ok(
+                    ProofStateResult::HeaderParseFailed {
+                        summary: block.summary,
+                        diagnostics: block.diagnostics,
+                        truncated: block.truncated,
+                        query_facts: ctx.config.verbosity.is_full().then(|| project_query_facts(facts)),
+                    },
+                    freshness,
+                )
+                .with_runtime(run.runtime),
+                None,
+            ))
         }
         BatchQueryRun::Unsupported => {
-            Ok(Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime))
+            Ok((
+                Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime),
+                None,
+            ))
         }
     }
 }
@@ -618,8 +648,6 @@ fn needs_build_context(message: String) -> ProofStateResult {
             diagnostics: Vec::new(),
             truncated: false,
         },
-        declaration_name: None,
-        namespace_name: None,
         goals_before: Vec::new(),
         goals_after: Vec::new(),
         locals: Vec::new(),
@@ -2139,8 +2167,6 @@ import Init -- comment
                 diagnostics: Vec::new(),
                 truncated: false,
             },
-            declaration_name: Some("Demo.proof".to_owned()),
-            namespace_name: Some("Demo".to_owned()),
             goals_before: vec!["⊢ True".to_owned()],
             goals_after: Vec::new(),
             locals: Vec::new(),
@@ -2177,8 +2203,10 @@ import Init -- comment
 
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["status"], "context");
-        assert_eq!(value["declaration_name"], "Demo.proof");
-        assert_eq!(value["namespace_name"], "Demo");
+        // The echo fields are gone from the response: the caller already
+        // named the declaration in its request.
+        assert!(value.get("declaration_name").is_none(), "echo field removed: {value}");
+        assert!(value.get("namespace_name").is_none(), "echo field removed: {value}");
         assert_eq!(value["goals_before"][0], "⊢ True");
         assert_eq!(value["expected_type"]["value"], "True");
         assert_eq!(value["proof_boundaries"][0]["selector"]["kind"], "default");
@@ -2187,6 +2215,26 @@ import Init -- comment
         assert!(value.get("safe_edit").is_none());
         assert!(value.get("proof_state").is_none());
         assert!(value.get("declaration_target").is_none());
+    }
+
+    #[test]
+    fn proof_state_request_defaults_opt_out_of_boundaries_and_expected_type() {
+        let request: ProofStateRequest = serde_json::from_value(serde_json::json!({
+            "file": "Demo.lean",
+            "declaration": "Demo.proof"
+        }))
+        .unwrap();
+        assert!(!request.include_boundaries, "boundaries are opt-in");
+        assert!(!request.include_expected_type, "expected_type is opt-in");
+        let request: ProofStateRequest = serde_json::from_value(serde_json::json!({
+            "file": "Demo.lean",
+            "declaration": "Demo.proof",
+            "include_boundaries": true,
+            "include_expected_type": true
+        }))
+        .unwrap();
+        assert!(request.include_boundaries);
+        assert!(request.include_expected_type);
     }
 
     #[test]

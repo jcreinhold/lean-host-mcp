@@ -202,6 +202,8 @@ fn lean_context_schema() -> Schema {
                 "file": { "type": "string", "description": "Path to a .lean file, relative to the project root unless absolute." },
                 "declaration": { "type": "string", "description": "Fully-qualified or file-local declaration name." },
                 "proof_position": proof_position_selector_schema(),
+                "include_boundaries": { "type": "boolean", "default": false, "description": "Opt in to the proof-boundary list (proof_boundaries). Default false: boundaries are navigation metadata; request them once per declaration to pick a position selector, then drive steps with self-contained lean_trial calls." },
+                "include_expected_type": { "type": "boolean", "default": false, "description": "Opt in to the goal's expected type (expected_type). Default false." },
                 "project": { "type": ["string", "null"], "description": "Optional project-root override." }
             },
             "additionalProperties": false,

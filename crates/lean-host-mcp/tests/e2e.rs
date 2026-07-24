@@ -172,6 +172,8 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
             file: proof_actions_file(),
             declaration: decl.clone(),
             proof_position: ProofPositionSelector::default(),
+            include_boundaries: false,
+            include_expected_type: false,
             project: None,
         },
     )
@@ -270,6 +272,8 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
                 text: "not a complete tactic boundary".to_owned(),
                 occurrence: None,
             },
+            include_boundaries: true,
+            include_expected_type: false,
             project: None,
         },
     )
@@ -317,6 +321,8 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
             file: proof_actions_file(),
             declaration,
             proof_position: retry_position,
+            include_boundaries: false,
+            include_expected_type: false,
             project: None,
         },
     )
@@ -338,6 +344,85 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
     assert!(
         !goals_before.is_empty() || !goals_after.is_empty(),
         "candidate selector should return usable proof goals"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn context_trim_defaults_omit_boundaries_expected_type_and_echo_fields() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let declaration = "LeanRsFixture.ProofActions.stepTheorem".to_owned();
+
+    // Default request: the declaration HAS tactics (so boundary data exists
+    // on the wire) and a goal with an expected type, yet the response must
+    // carry none of the opt-in or echo keys — the projection never
+    // materializes them, proving the skipped code path, not just empty JSON.
+    let lean = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: proof_actions_file(),
+            declaration: declaration.clone(),
+            proof_position: ProofPositionSelector::default(),
+            include_boundaries: false,
+            include_expected_type: false,
+            project: None,
+        },
+    )
+    .await
+    .expect("default proof_state");
+    let lean_json = serde_json::to_value(lean.result.as_ref().expect("default proof result")).unwrap();
+    for key in ["proof_boundaries", "expected_type", "declaration_name", "namespace_name"] {
+        assert!(
+            lean_json.get(key).is_none(),
+            "default request must not carry {key}: {lean_json}"
+        );
+    }
+    assert!(
+        lean_json["goals_before"].as_array().is_some_and(|goals| !goals.is_empty()),
+        "default response still carries the goals: {lean_json}"
+    );
+
+    // Opt-in request: same declaration, both flags set — boundaries and the
+    // expected type return exactly as before the trim.
+    let full = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: proof_actions_file(),
+            declaration,
+            proof_position: ProofPositionSelector::default(),
+            include_boundaries: true,
+            include_expected_type: true,
+            project: None,
+        },
+    )
+    .await
+    .expect("opt-in proof_state");
+    let full_json = serde_json::to_value(full.result.as_ref().expect("opt-in proof result")).unwrap();
+    assert!(
+        full_json["proof_boundaries"].as_array().is_some_and(|b| !b.is_empty()),
+        "include_boundaries: true returns the boundary list for a tactic block: {full_json}"
+    );
+    // `expected_type` is absent even under the opt-in at a tactic position:
+    // the shim populates it only in the cursor-based `runProofState` term arm
+    // (InfoTree.lean `runProofState`), while `ProofStateInDeclaration` always
+    // reports `none`. The flag is honest forward plumbing, verified here to
+    // not invent data.
+    assert!(
+        full_json.get("expected_type").is_none(),
+        "tactic positions carry no expected_type on the wire: {full_json}"
+    );
+    // The echo fields stay removed even under the opt-ins.
+    assert!(full_json.get("declaration_name").is_none());
+    assert!(full_json.get("namespace_name").is_none());
+
+    // Quantify the trim on this representative call for the result note.
+    eprintln!(
+        "context-trim sizes: default={}B opt_in={}B",
+        serde_json::to_string(&lean_json).unwrap().len(),
+        serde_json::to_string(&full_json).unwrap().len()
     );
 }
 
@@ -497,13 +582,14 @@ async fn inspect_proof_state_try_verify_and_references() {
             file: proof_actions_file(),
             declaration: "LeanRsFixture.ProofActions.stepTheorem".to_owned(),
             proof_position: ProofPositionSelector::default(),
+            include_boundaries: false,
+            include_expected_type: false,
             project: None,
         },
     )
     .await
     .expect("proof_state");
     let ProofStateResult::Context {
-        declaration_name,
         goals_after,
         query_facts,
         ..
@@ -511,10 +597,6 @@ async fn inspect_proof_state_try_verify_and_references() {
     else {
         panic!("expected proof context");
     };
-    assert_eq!(
-        declaration_name.as_deref(),
-        Some("LeanRsFixture.ProofActions.stepTheorem")
-    );
     assert!(
         goals_after.len() <= 1,
         "proof state projection should be bounded and stable"
@@ -530,6 +612,8 @@ async fn inspect_proof_state_try_verify_and_references() {
             file: proof_actions_file(),
             declaration: "LeanRsFixture.ProofActions.stepTheorem".to_owned(),
             proof_position: ProofPositionSelector::default(),
+            include_boundaries: false,
+            include_expected_type: false,
             project: None,
         },
     )
@@ -1520,6 +1604,8 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
             file: proof_actions_file(),
             declaration: "LeanRsFixture.ProofActions.stepTheorem".to_owned(),
             proof_position: ProofPositionSelector::default(),
+            include_boundaries: false,
+            include_expected_type: false,
             project: None,
         },
     );
