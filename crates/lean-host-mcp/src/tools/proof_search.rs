@@ -106,6 +106,7 @@ pub struct ProofSearchDiagnostics {
     pub proof_state_status: String,
     pub returned_count: usize,
     /// A search hit its fan-out cap, so the candidate set may be incomplete.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub search_truncated: bool,
     /// Retrieval funnel counts and cache status. Pure operational telemetry;
     /// emitted only under `telemetry.verbosity = full`.

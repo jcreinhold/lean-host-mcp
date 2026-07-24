@@ -53,6 +53,7 @@ pub enum DeclarationInventoryTarget {
 pub struct DeclarationInventoryResult {
     pub status: String,
     pub declarations: Vec<DeclarationInventoryRow>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     pub source: String,
     pub files_scanned: usize,

@@ -52,6 +52,7 @@ pub struct SourceSpan {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RenderedText {
     pub value: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 
@@ -82,6 +83,7 @@ impl DiagnosticSummary {
 pub struct DiagnosticsBlock {
     pub summary: DiagnosticSummary,
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 
@@ -187,6 +189,7 @@ pub struct ProofStateContext {
     pub locals: Vec<LocalInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_type: Option<RenderedText>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub proof_boundaries: Vec<ProofBoundaryCandidate>,
@@ -257,6 +260,7 @@ pub struct ReferenceHit {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReferencesProjection {
     pub references: Vec<ReferenceHit>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 

@@ -105,6 +105,7 @@ pub struct Diagnostic {
 #[derive(Debug, Clone, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct ElabFailure {
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 
@@ -162,6 +163,7 @@ pub struct DeclarationRow {
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct RenderedText {
     pub value: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 
@@ -227,6 +229,7 @@ pub struct DeclarationSearchFacts {
     pub after_scope_filter: usize,
     pub source_lookups: usize,
     pub broad_pruning: Vec<DeclarationSearchPruning>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     pub timings: DeclarationSearchTimings,
 }
@@ -234,6 +237,7 @@ pub struct DeclarationSearchFacts {
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DeclarationSearchResult {
     pub declarations: Vec<DeclarationSummary>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     pub facts: DeclarationSearchFacts,
 }
@@ -309,6 +313,7 @@ pub struct ProofAttemptCandidate {
     pub goals: Vec<RenderedText>,
     pub declaration: Option<ProofActionDeclarationTarget>,
     pub proof_position: Option<ProofPositionSummary>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,
 }
 
@@ -328,7 +333,9 @@ pub struct ProofAttemptSummary {
     pub requested_candidates: u32,
     pub returned_candidates: u32,
     pub candidate_limit: u32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub candidates_truncated: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
     pub closed: u32,
     pub progressed: u32,
@@ -350,6 +357,7 @@ pub struct ProofPositionSummary {
 pub struct ProofAttemptEnvelope {
     pub candidates: Vec<ProofAttemptCandidate>,
     pub candidate_limit: u32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub candidates_truncated: bool,
     pub summary: ProofAttemptSummary,
     /// Goal state at the resolved proof position before any candidate ran —
@@ -406,12 +414,14 @@ pub struct DeclarationVerificationFacts {
     pub contains_admit: bool,
     pub contains_sorry_ax: bool,
     pub axioms: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub axioms_truncated: bool,
     /// `false` when the axiom dependency set could not be computed (target
     /// unresolved, or `report_axioms` not requested): an empty `axioms` then
     /// means "not computed", not "no axioms". `true` with empty `axioms` is a
     /// genuine no-nontrivial-axioms result.
     pub axioms_available: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,
     /// Competing declarations when `verification_status` is `ambiguous`; empty
     /// otherwise. The fully-qualified names to disambiguate between.
@@ -1310,6 +1320,104 @@ mod tests {
         // carries the truncation fact.
         let json = serde_json::to_value(&candidate).expect("candidate serializes");
         assert!(json.get("post_closure_diagnostics").is_some());
+    }
+
+    #[test]
+    fn rendered_text_omits_false_truncated_and_emits_true() {
+        let quiet = serde_json::to_value(&RenderedText {
+            value: "True".to_owned(),
+            truncated: false,
+        })
+        .expect("serializes");
+        assert!(quiet.get("truncated").is_none(), "false truncated omitted: {quiet}");
+        let loud = serde_json::to_value(&RenderedText {
+            value: "True".to_owned(),
+            truncated: true,
+        })
+        .expect("serializes");
+        assert_eq!(loud.get("truncated"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn closed_candidate_omits_false_output_truncated() {
+        let candidate = project_proof_attempt_row(attempt_row_with_diagnostics(
+            LeanWorkerProofAttemptStatus::Failed,
+            &[],
+            &[],
+            false,
+            false,
+        ));
+        let json = serde_json::to_value(&candidate).expect("serializes");
+        assert!(
+            json.get("output_truncated").is_none(),
+            "false output_truncated omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn envelope_omits_false_candidates_truncated_and_elab_failure_false_truncated() {
+        let envelope = project_proof_attempt_envelope(LeanWorkerProofAttemptEnvelope {
+            candidates: Vec::new(),
+            candidate_limit: 16,
+            candidates_truncated: false,
+            entry_goals: Vec::new(),
+            locals: Vec::new(),
+        });
+        let json = serde_json::to_value(&envelope).expect("serializes");
+        assert!(
+            json.get("candidates_truncated").is_none(),
+            "false candidates_truncated omitted: {json}"
+        );
+        let failure = serde_json::to_value(ElabFailure::default()).expect("serializes");
+        assert!(failure.get("truncated").is_none(), "false ElabFailure.truncated omitted: {failure}");
+    }
+
+    #[test]
+    fn verification_facts_still_emit_false_verdict_and_trust_flags() {
+        let facts = DeclarationVerificationFacts {
+            target: None,
+            diagnostics: ElabFailure::default(),
+            unresolved_goals: Vec::new(),
+            contains_sorry: false,
+            contains_admit: false,
+            contains_sorry_ax: false,
+            axioms: Vec::new(),
+            axioms_truncated: false,
+            axioms_available: false,
+            output_truncated: false,
+            candidates: Vec::new(),
+            facts_trustworthy: false,
+        };
+        let json = serde_json::to_value(facts).expect("serializes");
+        // Verdict and trust flags always serialize: a client must never
+        // silently default a sorry-check or a trust flag.
+        for key in ["contains_sorry", "contains_admit", "contains_sorry_ax", "facts_trustworthy"] {
+            assert_eq!(
+                json.get(key),
+                Some(&serde_json::Value::Bool(false)),
+                "{key} must always serialize"
+            );
+        }
+        // Truncation-class flags omit when false.
+        assert!(json.get("axioms_truncated").is_none(), "false axioms_truncated omitted");
+        assert!(json.get("output_truncated").is_none(), "false output_truncated omitted");
+    }
+
+    #[test]
+    fn declaration_flags_still_emit_false() {
+        let flags = serde_json::to_value(&DeclarationFlags {
+            is_private: false,
+            is_generated: false,
+            is_internal: false,
+        })
+        .expect("serializes");
+        for key in ["is_private", "is_generated", "is_internal"] {
+            assert_eq!(
+                flags.get(key),
+                Some(&serde_json::Value::Bool(false)),
+                "{key} is a categorical fact and must serialize"
+            );
+        }
     }
 
     #[test]

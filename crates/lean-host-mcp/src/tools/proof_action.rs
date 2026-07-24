@@ -226,6 +226,7 @@ pub struct LeanVerifySummary {
     pub failed: usize,
     pub needs_build: usize,
     pub unknown_coverage: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 

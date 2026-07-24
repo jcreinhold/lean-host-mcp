@@ -73,6 +73,17 @@ pressure or restart-loop exhaustion, appear in `errors` with structured details.
 Warnings and next actions from the underlying implementation are also carried as
 warning issues in `errors`.
 
+Omission convention: completeness flags named `*_truncated` (plus
+`RenderedText.truncated`, `partial`, and advisory containers such as
+`post_closure_diagnostics`, `entry_goals`, and `locals`) are omitted from the
+JSON when they carry their empty/default value (`false` or empty); an absent
+flag means complete/untruncated. The examples below show `true`/populated
+cases where relevant and may omit the default-valued keys. Verdict and trust
+facts — `contains_sorry`, `contains_admit`, `contains_sorry_ax`,
+`axioms_available`, `facts_trustworthy`, and declaration attribute flags —
+always serialize, `false` included, so a client never silently defaults a
+check that matters.
+
 ## Output Carrier
 
 By default, the serialized semantic response is placed in MCP `content` text so
@@ -330,17 +341,16 @@ Lean-domain response and includes valid `proof_boundaries`:
       "kind": "entry",
       "selector": { "kind": "default" },
       "source": { "start_line": 2, "start_column": 3, "end_line": 2, "end_column": 10 },
-      "excerpt": { "value": "intro h", "truncated": false }
+      "excerpt": { "value": "intro h" }
     },
     {
       "index": 1,
       "kind": "after_tactic",
       "selector": { "kind": "index", "index": 1 },
       "source": { "start_line": 3, "start_column": 3, "end_line": 3, "end_column": 10 },
-      "excerpt": { "value": "exact h", "truncated": false }
+      "excerpt": { "value": "exact h" }
     }
-  ],
-  "proof_boundaries_truncated": false
+  ]
 }
 ```
 
@@ -398,13 +408,10 @@ the batch counts:
     { "id": "candidate_2", "status": "failed" }
   ],
   "candidate_limit": 16,
-  "candidates_truncated": false,
   "summary": {
     "requested_candidates": 2,
     "returned_candidates": 2,
     "candidate_limit": 16,
-    "candidates_truncated": false,
-    "partial": false,
     "closed": 1,
     "progressed": 0,
     "failed": 1,
@@ -470,8 +477,7 @@ and appears only on `closed` candidates.
         "position": { "line": 82, "column": 9, "end_line": 82, "end_column": 39 },
         "synthetic_range": { "line": 82, "column": 9, "end_line": 82, "end_column": 39 }
       }
-    ],
-    "truncated": false
+    ]
   }
 }
 ```
@@ -568,8 +574,7 @@ The response is a compact batch:
     "verified": 3,
     "failed": 1,
     "needs_build": 0,
-    "unknown_coverage": 1,
-    "truncated": false
+    "unknown_coverage": 1
   },
   "results": [
     {
@@ -590,8 +595,7 @@ The response is a compact batch:
       }
     ],
     "deleted_files": [],
-    "renamed_files": [],
-    "truncated": false
+    "renamed_files": []
   }
 }
 ```

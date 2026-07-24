@@ -54,6 +54,7 @@ pub struct ChangedCoverageReport {
     pub unknown: Vec<UnknownCoverage>,
     pub deleted_files: Vec<DeletedFile>,
     pub renamed_files: Vec<RenamedFile>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 
