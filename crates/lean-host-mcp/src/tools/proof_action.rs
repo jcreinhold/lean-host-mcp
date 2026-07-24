@@ -16,8 +16,9 @@ use lean_rs_worker_parent::{
     LeanWorkerDeclarationVerificationBatchResult, LeanWorkerDeclarationVerificationBatchRow,
     LeanWorkerDeclarationVerificationRequest,
     LeanWorkerDeclarationVerificationResult as WorkerDeclarationVerificationResult,
-    LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions, LeanWorkerOutputBudgets,
-    LeanWorkerProofAttemptRequest, LeanWorkerProofCandidate, LeanWorkerProofEditTarget, LeanWorkerSorryPolicy,
+    LeanWorkerDeclarationVerificationStatus, LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions,
+    LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofCandidate, LeanWorkerProofEditTarget,
+    LeanWorkerSorryPolicy,
 };
 use std::borrow::Cow;
 
@@ -72,6 +73,14 @@ pub struct TryProofStepRequest {
     /// Proof snippets to attempt independently at the position, in one call.
     #[serde(default)]
     pub snippets: Vec<String>,
+    /// Opt-in: when the worker was recycled mid-call and the batch is
+    /// non-positive (no candidate `closed` or `progressed`), re-issue the
+    /// attempt once server-side and return the retry's rows. Default `false`:
+    /// the server reports the taint with a warning and delegates the retry
+    /// decision to the client. At most one retry; the retry is surfaced
+    /// through `runtime.retry_count`.
+    #[serde(default)]
+    pub retry_tainted_non_positive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -89,6 +98,14 @@ pub struct VerifyDeclarationRequest {
     /// Include the axioms the proof depends on (slower).
     #[serde(default)]
     pub report_axioms: bool,
+    /// Opt-in: when the worker was recycled mid-call and the verdict is
+    /// non-positive, re-issue the verification once server-side and return the
+    /// retry's verdict. A `verified` verdict is never retried (verification is
+    /// monotone). Default `false`: the server relabels to `worker_recycled`,
+    /// warns, and delegates the retry decision to the client. At most one
+    /// retry; the retry is surfaced through `runtime.retry_count`.
+    #[serde(default)]
+    pub retry_tainted_non_positive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -108,6 +125,15 @@ pub struct LeanVerifyRequest {
     /// span blocks; `full` preserves them.
     #[serde(default)]
     pub detail: LeanVerifyDetail,
+    /// Opt-in: when the worker was recycled mid-call and a target-group batch
+    /// comes back non-positive (any row that would be relabeled
+    /// `worker_recycled`), re-issue that batch once server-side. `verified`
+    /// rows are never retried (verification is monotone). Default `false`:
+    /// the server relabels, warns, and delegates the retry decision to the
+    /// client. At most one retry per batch; retries are surfaced through
+    /// `runtime.retry_count`.
+    #[serde(default)]
+    pub retry_tainted_non_positive: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -157,6 +183,7 @@ impl From<VerifyDeclarationRequest> for LeanVerifyRequest {
             allow_sorry: req.allow_sorry,
             report_axioms: req.report_axioms,
             detail: LeanVerifyDetail::Compact,
+            retry_tainted_non_positive: req.retry_tainted_non_positive,
         }
     }
 }
@@ -263,26 +290,54 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     // A missing-`.olean` in the target's own import closure means the worker
     // could not assemble the environment to attempt anything; degrade to the
     // shared needs_build verdict instead of letting the raw error propagate.
+    let options = elab_options(&file_label, ctx.config.output.heartbeat_limit);
     let call = match classify_missing_olean(
         ctx.broker
             .attempt_proof(
                 hint.clone(),
                 session_imports(imports.clone()),
                 imports.clone(),
-                request,
-                elab_options(&file_label, ctx.config.output.heartbeat_limit),
+                request.clone(),
+                options.clone(),
             )
             .await,
     )? {
         CallOutcome::Ready(call) => call,
         CallOutcome::NeedsBuild(err) => return proof_step_needs_build_response(ctx, hint, imports, source_fact, err),
     };
-    let taint = execution_taint(&call.runtime).cloned();
-    let mut response = Response::ok(
-        refresh_proof_attempt_summary(project_proof_attempt(call.value), requested_count),
-        call.freshness,
-    )
-    .with_runtime(call.runtime);
+    let mut result = refresh_proof_attempt_summary(project_proof_attempt(call.value), requested_count);
+    let mut freshness = call.freshness;
+    let mut runtime = call.runtime;
+    let mut taint = execution_taint(&runtime).cloned();
+    // Opt-in one-shot retry: a non-positive batch produced while the worker was
+    // recycled mid-call is a likely casualty of the recycle, so re-issue the
+    // attempt once instead of returning the suspect rows.
+    if req.retry_tainted_non_positive && taint.is_some() && attempt_is_non_positive(&result) {
+        match classify_missing_olean(
+            ctx.broker
+                .attempt_proof(
+                    hint.clone(),
+                    session_imports(imports.clone()),
+                    imports.clone(),
+                    request,
+                    options,
+                )
+                .await,
+        )? {
+            CallOutcome::Ready(retry_call) => {
+                result = refresh_proof_attempt_summary(project_proof_attempt(retry_call.value), requested_count);
+                freshness = retry_call.freshness;
+                runtime = retry_call.runtime;
+                record_taint_retry(&mut runtime);
+                taint = execution_taint(&runtime).cloned();
+                tracing::debug!("retried tainted non-positive proof attempt once");
+            }
+            CallOutcome::NeedsBuild(err) => {
+                return proof_step_needs_build_response(ctx, hint, imports, source_fact, err);
+            }
+        }
+    }
+    let mut response = Response::ok(result, freshness).with_runtime(runtime);
     response.trust_artifacts.push(source_fact);
     response
         .next_actions
@@ -432,14 +487,15 @@ pub async fn verify_declaration(
     // A missing-`.olean` in the target's own import closure means the worker
     // could not assemble the environment to check anything; degrade to the
     // shared needs_build verdict instead of letting the raw error propagate.
+    let options = elab_options(&file_label, ctx.config.output.heartbeat_limit);
     let call = match classify_missing_olean(
         ctx.broker
             .verify_declaration(
                 hint.clone(),
                 session_imports(imports.clone()),
                 imports.clone(),
-                request,
-                elab_options(&file_label, ctx.config.output.heartbeat_limit),
+                request.clone(),
+                options.clone(),
             )
             .await,
     )? {
@@ -450,8 +506,37 @@ pub async fn verify_declaration(
     // likely casualty of the recycle, not a real result; relabel it honestly
     // before it reaches the agent (verification is monotone, so a `verified`
     // verdict is left trustworthy even under duress).
-    let taint = execution_taint(&call.runtime).cloned();
     let mut result = project_declaration_verification(call.value);
+    let mut freshness = call.freshness;
+    let mut runtime = call.runtime;
+    let mut taint = execution_taint(&runtime).cloned();
+    // Opt-in one-shot retry: re-issue the verification once and, when the
+    // retry comes back clean, return its verdict instead of the suspect one.
+    if req.retry_tainted_non_positive && taint.is_some() && verdict_is_non_positive(&result) {
+        match classify_missing_olean(
+            ctx.broker
+                .verify_declaration(
+                    hint.clone(),
+                    session_imports(imports.clone()),
+                    imports.clone(),
+                    request,
+                    options,
+                )
+                .await,
+        )? {
+            CallOutcome::Ready(retry_call) => {
+                result = project_declaration_verification(retry_call.value);
+                freshness = retry_call.freshness;
+                runtime = retry_call.runtime;
+                record_taint_retry(&mut runtime);
+                taint = execution_taint(&runtime).cloned();
+                tracing::debug!("retried tainted non-positive verification once");
+            }
+            CallOutcome::NeedsBuild(err) => {
+                return verification_needs_build_response(ctx, hint, imports, source_fact, err);
+            }
+        }
+    }
     let recycled = taint.is_some() && relabel_recycled_verdict(&mut result);
     if recycled && let Some(event) = taint.as_ref() {
         tracing::debug!(
@@ -459,7 +544,7 @@ pub async fn verify_declaration(
             "relabeled verification verdict to worker_recycled (execution taint)"
         );
     }
-    let mut response = Response::ok(result, call.freshness).with_runtime(call.runtime);
+    let mut response = Response::ok(result, freshness).with_runtime(runtime);
     response.trust_artifacts.push(source_fact);
     response
         .next_actions
@@ -637,17 +722,28 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
             budgets: proof_action_budgets(&ctx.config.output),
         };
         let file_label = prepared.file_label.clone();
-        let call = match classify_missing_olean(
-            ctx.broker
-                .verify_declaration_batch(
-                    hint.clone(),
-                    session_imports(prepared.imports.clone()),
-                    prepared.imports.clone(),
-                    request,
-                    elab_options(&file_label, ctx.config.output.heartbeat_limit),
-                )
-                .await,
-        )? {
+        let issue = |request: LeanWorkerDeclarationVerificationBatchRequest| {
+            ctx.broker.verify_declaration_batch(
+                hint.clone(),
+                session_imports(prepared.imports.clone()),
+                prepared.imports.clone(),
+                request,
+                elab_options(&file_label, ctx.config.output.heartbeat_limit),
+            )
+        };
+        let mut outcome = classify_missing_olean(issue(request.clone()).await)?;
+        // Opt-in one-shot retry per batch: a batch that comes back tainted and
+        // non-positive is re-issued once before its rows are relabeled.
+        let mut retried = false;
+        if req.retry_tainted_non_positive
+            && let CallOutcome::Ready(call) = &outcome
+            && execution_taint(&call.runtime).is_some()
+            && worker_batch_is_non_positive(&call.value)
+        {
+            retried = true;
+            outcome = classify_missing_olean(issue(request).await)?;
+        }
+        let mut call = match outcome {
             CallOutcome::Ready(call) => call,
             CallOutcome::NeedsBuild(err) => {
                 let base = ctx
@@ -662,6 +758,10 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                 continue;
             }
         };
+        if retried {
+            record_taint_retry(&mut call.runtime);
+            tracing::debug!("retried tainted non-positive verification batch once");
+        }
         let taint = execution_taint(&call.runtime).cloned();
         last_identity = Some((call.freshness.clone(), call.runtime.clone()));
         if let Some(fact) = source_fact {
@@ -1213,6 +1313,9 @@ fn summarize_rows(
 /// unchanged, and only touches the `Ok` variant — a `MissingImports` verdict's
 /// honest action is `lake build`, not a recycle notice. Pure, for unit testing.
 fn relabel_recycled_verdict(result: &mut DeclarationVerificationResult) -> bool {
+    if !verdict_is_non_positive(result) {
+        return false;
+    }
     let DeclarationVerificationResult::Ok {
         verification_status,
         facts,
@@ -1221,16 +1324,75 @@ fn relabel_recycled_verdict(result: &mut DeclarationVerificationResult) -> bool 
     else {
         return false;
     };
-    let status = verification_status.as_str();
-    // `verified` is monotone-trustworthy; `needs_build` / `ambiguous` carry their
-    // own honest verdict; and the relabel is idempotent (already `worker_recycled`).
-    if status == "verified" || status == NEEDS_BUILD_STATUS || status == "ambiguous" || status == WORKER_RECYCLED_STATUS
-    {
-        return false;
-    }
     WORKER_RECYCLED_STATUS.clone_into(verification_status);
     facts.facts_trustworthy = false;
     true
+}
+
+/// A verification status a mid-call recycle could plausibly have tainted:
+/// anything but the monotone-trustworthy `verified` or the already-honest
+/// `needs_build` / `ambiguous` / `worker_recycled` verdicts.
+fn verdict_status_is_non_positive(status: &str) -> bool {
+    !(status == "verified" || status == NEEDS_BUILD_STATUS || status == "ambiguous" || status == WORKER_RECYCLED_STATUS)
+}
+
+/// True when `relabel_recycled_verdict` would relabel `result`: an `Ok`
+/// variant whose verdict is non-positive. This is the verify-side retry
+/// condition for `retry_tainted_non_positive`. Pure, for unit testing.
+fn verdict_is_non_positive(result: &DeclarationVerificationResult) -> bool {
+    let DeclarationVerificationResult::Ok {
+        verification_status, ..
+    } = result
+    else {
+        return false;
+    };
+    verdict_status_is_non_positive(verification_status)
+}
+
+/// True when a target-group batch came back non-positive: an `Ok` batch with
+/// at least one row `relabel_recycled_verdict` would relabel. `MissingImports`
+/// and `HeaderParseFailed` batches carry their own honest handling and are
+/// never retried. Pure, for unit testing.
+fn worker_batch_is_non_positive(result: &LeanWorkerDeclarationVerificationBatchResult) -> bool {
+    let LeanWorkerDeclarationVerificationBatchResult::Ok { results, .. } = result else {
+        return false;
+    };
+    results
+        .iter()
+        .any(|row| worker_verification_status_is_non_positive(row.verification_status))
+}
+
+/// The wire-level form of [`verdict_status_is_non_positive`]: anything but
+/// `Accepted` (projects to the monotone-trustworthy `verified`) or the
+/// already-honest `NeedsBuild` / `Ambiguous`.
+fn worker_verification_status_is_non_positive(status: LeanWorkerDeclarationVerificationStatus) -> bool {
+    !matches!(
+        status,
+        LeanWorkerDeclarationVerificationStatus::Accepted
+            | LeanWorkerDeclarationVerificationStatus::NeedsBuild
+            | LeanWorkerDeclarationVerificationStatus::Ambiguous
+    )
+}
+
+/// True when no candidate in an `Ok` attempt envelope `closed` or
+/// `progressed` — a non-positive batch. Uses the projection's status mapping,
+/// not the wire enum. `MissingImports`, `HeaderParseFailed`, and `Unsupported`
+/// carry their own honest handling and are never retried. Pure, for unit
+/// testing.
+fn attempt_is_non_positive(result: &ProofAttemptResult) -> bool {
+    let ProofAttemptResult::Ok { result, .. } = result else {
+        return false;
+    };
+    !result
+        .candidates
+        .iter()
+        .any(|candidate| candidate.status == "closed" || candidate.status == "progressed")
+}
+
+/// Surface one opt-in taint retry through the existing retry counter, on top
+/// of any worker-death retries the retried call itself performed.
+fn record_taint_retry(runtime: &mut crate::envelope::RuntimeFacts) {
+    runtime.retry_count = runtime.retry_count.saturating_add(1);
 }
 
 /// Build the degraded verdict + envelope when `verify_declaration`'s target
@@ -1557,6 +1719,7 @@ mod tests {
             project: None,
             snippet: None,
             snippets,
+            retry_tainted_non_positive: false,
         };
         let candidates = proof_candidates(&req);
         assert_eq!(candidates.len(), 20);
@@ -1630,6 +1793,7 @@ mod tests {
                 project: None,
                 snippet: None,
                 snippets: Vec::new(),
+                retry_tainted_non_positive: false,
             },
         )
         .await
@@ -1780,6 +1944,7 @@ mod tests {
                 project: None,
                 allow_sorry: false,
                 report_axioms: false,
+                retry_tainted_non_positive: false,
             },
         )
         .await
@@ -1805,6 +1970,7 @@ mod tests {
                 allow_sorry: false,
                 report_axioms: false,
                 detail: LeanVerifyDetail::Compact,
+                retry_tainted_non_positive: false,
             },
         )
         .await
@@ -1928,6 +2094,160 @@ mod tests {
         // needs_build path — not a recycle notice.
         let mut verdict = needs_build_verification_result(vec!["Foo.Bar".to_owned()]);
         assert!(!relabel_recycled_verdict(&mut verdict));
+    }
+
+    #[test]
+    fn retry_tainted_non_positive_defaults_to_false_and_parses_absent_field() {
+        let step: TryProofStepRequest = serde_json::from_value(json!({
+            "file": "Demo.lean",
+            "declaration": "Demo.closed"
+        }))
+        .unwrap();
+        assert!(!step.retry_tainted_non_positive);
+        let step_opt_in: TryProofStepRequest = serde_json::from_value(json!({
+            "file": "Demo.lean",
+            "declaration": "Demo.closed",
+            "retry_tainted_non_positive": true
+        }))
+        .unwrap();
+        assert!(step_opt_in.retry_tainted_non_positive);
+
+        let verify: VerifyDeclarationRequest = serde_json::from_value(json!({
+            "file": "Demo.lean",
+            "declaration": "Demo.closed"
+        }))
+        .unwrap();
+        assert!(!verify.retry_tainted_non_positive);
+
+        let batch: LeanVerifyRequest = serde_json::from_value(json!({
+            "targets": [{ "kind": "explicit", "file": "Demo.lean", "declarations": ["Demo.closed"] }]
+        }))
+        .unwrap();
+        assert!(!batch.retry_tainted_non_positive);
+        let batch_opt_in: LeanVerifyRequest = serde_json::from_value(json!({
+            "targets": [{ "kind": "explicit", "file": "Demo.lean", "declarations": ["Demo.closed"] }],
+            "retry_tainted_non_positive": true
+        }))
+        .unwrap();
+        assert!(batch_opt_in.retry_tainted_non_positive);
+    }
+
+    #[test]
+    fn non_positive_verdict_predicate_matches_the_relabel_condition() {
+        for status in ["failed", "not_found", "has_sorry", "timeout", "unsupported"] {
+            assert!(
+                verdict_is_non_positive(&ok_verdict(status, true)),
+                "{status} is non-positive and retriable"
+            );
+        }
+        // `verified` is never retried (verification is monotone); the honest
+        // verdicts carry their own handling and the relabel is idempotent.
+        for status in ["verified", NEEDS_BUILD_STATUS, "ambiguous", WORKER_RECYCLED_STATUS] {
+            assert!(
+                !verdict_is_non_positive(&ok_verdict(status, true)),
+                "{status} must not be retried"
+            );
+        }
+        // A MissingImports verdict's honest action is `lake build` — not retriable.
+        assert!(!verdict_is_non_positive(&needs_build_verification_result(vec![
+            "Foo.Bar".to_owned()
+        ])));
+    }
+
+    #[test]
+    fn non_positive_attempt_predicate_uses_projection_status_mapping() {
+        use crate::projections::{ProofAttemptCandidate, RenderedText};
+        let candidate = |status: &str| ProofAttemptCandidate {
+            id: "candidate".to_owned(),
+            status: status.to_owned(),
+            snippet: RenderedText {
+                value: "trivial".to_owned(),
+                truncated: false,
+            },
+            diagnostics: ElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
+            downstream_diagnostics: ElabFailure {
+                diagnostics: Vec::new(),
+                truncated: false,
+            },
+            goals: Vec::new(),
+            declaration: None,
+            proof_position: None,
+            output_truncated: false,
+        };
+        let attempt_with = |statuses: &[&str]| {
+            let mut envelope = empty_proof_attempt_envelope();
+            envelope.candidates = statuses.iter().map(|status| candidate(status)).collect();
+            ProofAttemptResult::Ok {
+                result: envelope,
+                imports: Vec::new(),
+            }
+        };
+        assert!(attempt_is_non_positive(&attempt_with(&["failed", "timeout"])));
+        assert!(attempt_is_non_positive(&attempt_with(&[])));
+        assert!(!attempt_is_non_positive(&attempt_with(&["failed", "closed"])));
+        assert!(!attempt_is_non_positive(&attempt_with(&["progressed"])));
+        // MissingImports carries its own honest needs_build handling — not retriable.
+        assert!(!attempt_is_non_positive(&ProofAttemptResult::MissingImports {
+            result: empty_proof_attempt_envelope(),
+            imports: Vec::new(),
+            missing: vec!["Foo.Bar".to_owned()],
+        }));
+    }
+
+    #[test]
+    fn non_positive_batch_predicate_reads_wire_statuses() {
+        use lean_rs_worker_parent::LeanWorkerDeclarationVerificationFacts;
+        let row = |status: LeanWorkerDeclarationVerificationStatus| LeanWorkerDeclarationVerificationBatchRow {
+            id: "row".to_owned(),
+            target: LeanWorkerDeclarationVerificationTarget::Name {
+                name: "Demo.closed".to_owned(),
+            },
+            verification_status: status,
+            facts: Box::new(LeanWorkerDeclarationVerificationFacts::unavailable()),
+        };
+        let batch = |statuses: &[LeanWorkerDeclarationVerificationStatus]| {
+            LeanWorkerDeclarationVerificationBatchResult::Ok {
+                results: statuses.iter().map(|status| row(*status)).collect(),
+                imports: Vec::new(),
+            }
+        };
+        assert!(worker_batch_is_non_positive(&batch(&[
+            LeanWorkerDeclarationVerificationStatus::Rejected
+        ])));
+        assert!(worker_batch_is_non_positive(&batch(&[
+            LeanWorkerDeclarationVerificationStatus::Accepted,
+            LeanWorkerDeclarationVerificationStatus::Timeout,
+        ])));
+        assert!(!worker_batch_is_non_positive(&batch(&[
+            LeanWorkerDeclarationVerificationStatus::Accepted
+        ])));
+        assert!(!worker_batch_is_non_positive(&batch(&[
+            LeanWorkerDeclarationVerificationStatus::NeedsBuild,
+            LeanWorkerDeclarationVerificationStatus::Ambiguous,
+        ])));
+        // A MissingImports batch's honest action is `lake build` — not retriable.
+        assert!(
+            !worker_batch_is_non_positive(&LeanWorkerDeclarationVerificationBatchResult::MissingImports {
+                results: vec![row(LeanWorkerDeclarationVerificationStatus::Rejected)],
+                imports: Vec::new(),
+                missing: vec!["Foo.Bar".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn taint_retry_surfaces_through_retry_count() {
+        let mut runtime = crate::envelope::RuntimeFacts::default();
+        assert_eq!(runtime.retry_count, 0);
+        record_taint_retry(&mut runtime);
+        assert_eq!(runtime.retry_count, 1);
+        // Death retries the retried call itself performed are preserved.
+        runtime.retry_count = 2;
+        record_taint_retry(&mut runtime);
+        assert_eq!(runtime.retry_count, 3);
     }
 
     #[test]

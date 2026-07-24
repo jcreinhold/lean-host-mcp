@@ -226,6 +226,11 @@ fn lean_trial_schema() -> Schema {
                     "proof_position": proof_position_selector_schema(),
                     "snippet": { "type": ["string", "null"] },
                     "snippets": { "type": "array", "items": { "type": "string" } },
+                    "retry_tainted_non_positive": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Opt-in: retry once server-side when the worker was recycled mid-call and the batch is non-positive (no candidate closed or progressed)."
+                    },
                     "project": { "type": ["string", "null"] }
                 },
                 "additionalProperties": false,

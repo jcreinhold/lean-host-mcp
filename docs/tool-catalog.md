@@ -434,6 +434,15 @@ error). A trial loop therefore no longer needs a `lean_context` call before
 each step: read the context once to navigate, then drive subsequent steps from
 the trial envelopes alone.
 
+`retry_tainted_non_positive` (default `false`) opts into one server-side
+retry: when the worker was recycled mid-call and the batch is non-positive
+(no candidate `closed` or `progressed`), the server re-issues the attempt once
+and returns the retry's rows instead of the suspect ones. If the retry is
+also tainted and non-positive, the response keeps the usual execution-taint
+warning and the retry decision returns to the client. At most one retry per
+call; it is surfaced through `runtime.retry_count`. With the flag unset the
+behavior is unchanged: the server reports the taint and the client decides.
+
 Proof-step diagnostics label their coordinate space. Candidate-local diagnostics
 usually point into the synthetic trial buffer, so use `synthetic_range` for
 display and do not treat it as an editable file range unless `original_range` is
@@ -593,6 +602,15 @@ file, status, reason, diagnostics, sorry/admit facts, axiom facts, and
 trustworthiness flags, but omits repeated target-span and ambiguous-candidate
 span blocks. Use `"detail": "full"` when you need those source spans in each
 row.
+
+`retry_tainted_non_positive` (default `false`) opts into one server-side
+retry per target-group batch: when the worker was recycled mid-call and the
+batch comes back non-positive (any row that would be relabeled
+`worker_recycled`), the server re-issues that batch once. `verified` rows are
+never retried — verification is monotone. If the retry is also tainted and
+non-positive, the rows are relabeled to `worker_recycled` with the usual
+warning, exactly as with the flag unset. At most one retry per batch; it is
+surfaced through `runtime.retry_count`.
 
 `changed` runs non-interactive git commands under the project root:
 `git diff --unified=0 --no-ext-diff --find-renames <base> -- '*.lean'`, plus

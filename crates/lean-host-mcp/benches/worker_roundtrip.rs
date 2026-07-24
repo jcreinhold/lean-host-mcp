@@ -125,6 +125,7 @@ fn proof_step_request(candidate_count: usize) -> TryProofStepRequest {
         project: None,
         snippet: None,
         snippets,
+        retry_tainted_non_positive: false,
     }
 }
 

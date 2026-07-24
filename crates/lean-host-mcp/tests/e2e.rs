@@ -205,6 +205,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
             project: None,
             snippet: Some(from_scratch.clone()),
             snippets: Vec::new(),
+            retry_tainted_non_positive: false,
         },
     )
     .await
@@ -229,6 +230,7 @@ async fn default_position_is_pristine_entry_and_closes_from_scratch_blocks() {
             project: None,
             snippet: Some(from_scratch),
             snippets: Vec::new(),
+            retry_tainted_non_positive: false,
         },
     )
     .await
@@ -357,6 +359,7 @@ async fn try_proof_step_batch_returns_all_ordered_rows_under_worker_limit() {
             project: None,
             snippet: None,
             snippets,
+            retry_tainted_non_positive: false,
         },
     )
     .await
@@ -428,6 +431,7 @@ async fn try_proof_step_partial_budget_surfaces_batch_summary() {
             project: None,
             snippet: None,
             snippets,
+            retry_tainted_non_positive: false,
         },
     )
     .await
@@ -536,6 +540,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             project: None,
             snippet: Some("exact definitely_missing_identifier".to_owned()),
             snippets: Vec::new(),
+            retry_tainted_non_positive: false,
         },
     )
     .await
@@ -579,6 +584,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             project: None,
             allow_sorry: false,
             report_axioms: true,
+            retry_tainted_non_positive: false,
         },
     )
     .await
@@ -599,6 +605,7 @@ async fn inspect_proof_state_try_verify_and_references() {
             project: None,
             allow_sorry: false,
             report_axioms: true,
+            retry_tainted_non_positive: false,
         },
     )
     .await
@@ -1522,6 +1529,7 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
             project: None,
             allow_sorry: false,
             report_axioms: false,
+            retry_tainted_non_positive: false,
         },
     );
 
