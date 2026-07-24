@@ -79,7 +79,10 @@ parent-side hard RSS watchdog during long-running requests. Fatal child exits ar
 maps those structured outcomes once into MCP runtime facts and retries selected read-only semantic jobs once. Responses
 carry runtime facts (`worker_generation`, `worker_restarted`, `retry_count`, `admission_wait_millis`,
 `queue_wait_millis`, `call_restart`, `last_restart`) so clients can distinguish Lean-domain results from infrastructure
-recovery and lifecycle history.
+recovery and lifecycle history. The server reports these facts and the client decides policy; the single exception is
+opt-in: `retry_tainted_non_positive` on trial/verify requests asks the server to apply one specific policy itself —
+re-issuing a non-positive verdict once when the runtime was recycled mid-call — and the retry is still surfaced
+through the same `retry_count` fact rather than hidden.
 
 Each semantic tool opens a short-lived worker session with imports derived from the source header or explicit request.
 Lean-domain failures such as parse errors, elaboration diagnostics, missing imports, unsupported shim exports, failed

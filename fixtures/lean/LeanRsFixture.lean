@@ -10,6 +10,7 @@ import LeanRsFixture.SourceRanges
 import LeanRsFixture.ProofActions
 import LeanRsFixture.ProofSearchFacts
 import LeanRsFixture.ProofAgent
+import LeanRsFixture.ScanForms
 
 /-! Roll-up module for the `LeanRsFixture` Lake library.
 

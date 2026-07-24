@@ -540,6 +540,13 @@ every declaration in a file, or every declaration in a module. The server reads
 Lean source and calls Lean's elaborator/kernel through the worker; it does not
 run `lake build`.
 
+By-name targets resolve every surface declaration form the elaborator knows:
+multi-clause equation `def`s and theorems, `where`-structure defs,
+`structure`/`class` commands, and anonymous `instance`s (under their generated
+`inst…` names — discover them via `lean_lookup(kind="declarations")`). A
+`not_found` verdict means the name is genuinely absent from the file, never
+that the declaration uses one of these forms.
+
 Single declaration:
 
 ```json

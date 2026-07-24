@@ -349,6 +349,102 @@ async fn unresolved_after_text_returns_boundary_candidates_and_retry_selector() 
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn verify_resolves_every_declaration_scan_form_by_name() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let file = PathBuf::from("LeanRsFixture/ScanForms.lean");
+
+    // Every syntax form the candidate scan used to drop verifies by name
+    // instead of returning not_found (the kan-proofs field report).
+    for name in [
+        "LeanRsFixture.ScanForms.multi",
+        "LeanRsFixture.ScanForms.zeroOrSucc",
+        "LeanRsFixture.ScanForms.origin",
+        "LeanRsFixture.ScanForms.Point",
+        "LeanRsFixture.ScanForms.Default",
+        "LeanRsFixture.ScanForms.namedDefault",
+    ] {
+        let verified = verify_declaration(
+            &ctx,
+            VerifyDeclarationRequest {
+                file: file.clone(),
+                declaration: name.to_owned(),
+                project: None,
+                allow_sorry: false,
+                report_axioms: false,
+                retry_tainted_non_positive: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("verify {name} should complete: {err}"));
+        let result = verified.result.expect("verification result");
+        assert!(
+            matches!(
+                result,
+                DeclarationVerificationResult::Ok {
+                    ref verification_status,
+                    ..
+                } if verification_status == "verified"
+            ),
+            "{name} should verify by name, got {result:?}"
+        );
+    }
+
+    // The anonymous instance resolves under its generated name: discover it
+    // through the declaration inventory, then verify that name.
+    let inventory = lean_lookup(
+        &ctx,
+        semantic_request(
+            "declarations",
+            serde_json::json!({
+                "target": { "kind": "file", "path": "LeanRsFixture/ScanForms.lean" },
+                "limit": 20
+            }),
+        ),
+    )
+    .await
+    .expect("scan-forms declaration inventory");
+    let inventory_data = semantic_data(inventory);
+    let generated = inventory_data["declarations"]
+        .as_array()
+        .expect("inventory rows")
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .find(|name| name.contains("instDefaultPoint"))
+        .unwrap_or_else(|| {
+            panic!("anonymous instance should be catalogued under its generated name: {inventory_data}")
+        })
+        .to_owned();
+    let verified = verify_declaration(
+        &ctx,
+        VerifyDeclarationRequest {
+            file,
+            declaration: generated.clone(),
+            project: None,
+            allow_sorry: false,
+            report_axioms: false,
+            retry_tainted_non_positive: false,
+        },
+    )
+    .await
+    .expect("verify anonymous instance");
+    let result = verified.result.expect("verification result");
+    assert!(
+        matches!(
+            result,
+            DeclarationVerificationResult::Ok {
+                ref verification_status,
+                ..
+            } if verification_status == "verified"
+        ),
+        "anonymous instance should verify under {generated}, got {result:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn context_trim_defaults_omit_boundaries_expected_type_and_echo_fields() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
@@ -497,6 +593,71 @@ async fn try_proof_step_batch_returns_all_ordered_rows_under_worker_limit() {
             candidate.diagnostics
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn trial_loop_runs_with_zero_per_step_context_calls() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let ctx = open_ctx(&root);
+    let declaration = "LeanRsFixture.ProofActions.stepTheorem".to_owned();
+
+    // The intended loop: ONE navigation call per declaration...
+    let navigate = proof_state(
+        &ctx,
+        ProofStateRequest {
+            file: proof_actions_file(),
+            declaration: declaration.clone(),
+            proof_position: ProofPositionSelector::default(),
+            include_boundaries: true,
+            include_expected_type: false,
+            project: None,
+        },
+    )
+    .await
+    .expect("navigation proof_state");
+    let navigate_json =
+        serde_json::to_value(navigate.result.as_ref().expect("navigation result")).unwrap();
+
+    // ...then every step is a self-contained trial. Two batches at two
+    // positions stand in for a stepping loop; no lean_context call between
+    // them, and each envelope re-proves it carries its own entry state.
+    let mut envelope_bytes = Vec::new();
+    for position in [
+        ProofPositionSelector::Default,
+        ProofPositionSelector::Index { index: 0 },
+    ] {
+        let response = try_proof_step(
+            &ctx,
+            TryProofStepRequest {
+                file: proof_actions_file(),
+                declaration: declaration.clone(),
+                proof_position: position,
+                project: None,
+                snippet: None,
+                snippets: vec!["trivial".to_owned(), "skip".to_owned()],
+                retry_tainted_non_positive: false,
+            },
+        )
+        .await
+        .expect("trial batch");
+        let ProofAttemptResult::Ok { result, .. } = response.result.expect("trial batch result") else {
+            panic!("expected ok proof-step result");
+        };
+        assert!(
+            !result.entry_goals.is_empty(),
+            "every envelope in the loop carries its entry goals: {:?}",
+            result.entry_goals
+        );
+        envelope_bytes.push(serde_json::to_string(&result).unwrap().len());
+    }
+    // The eliminated per-step cost is a full context response per trial.
+    eprintln!(
+        "trial-loop sizes: navigation={}B envelopes={envelope_bytes:?}B (per-step lean_context eliminated)",
+        serde_json::to_string(&navigate_json).unwrap().len()
+    );
 }
 
 #[tokio::test]
