@@ -9,6 +9,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-24
+
+### Added
+
+- `lean_trial(kind="proof_step")` envelopes are self-contained: every batch result carries the entry goals and local
+  hypotheses of the selected proof position (`entry_goals` / `locals`), rendered once per envelope through the existing
+  rendering machinery. A proof-stepping trial loop no longer needs a per-step `lean_context` call; boundaries stay
+  available as a one-shot navigation call.
+- `retry_tainted_non_positive` (default `false`) on `lean_trial` and `lean_verify` opts into one server-side retry of a
+  non-positive verdict when the worker was recycled mid-call (tainted by the RSS watchdog). With the flag off,
+  behavior is byte-for-byte unchanged: the taint is still reported via `execution_taint` and the existing
+  relabel-to-`worker_recycled` policy.
+- Batch trial results gain `post_closure_diagnostics`: error-severity entries are moved off `closed` candidates, so a
+  `closed` candidate's own diagnostics are error-free and the post-closure consequences (e.g. `no goals` from a
+  follow-on tactic) travel in their own bucket.
+- By-name verification and the declaration outline now resolve every surface declaration form — multi-clause equation
+  `def`s and theorems, `where`-structure defs, `structure`/`class` commands, and anonymous `instance`s under their
+  generated `inst…` names — via the lean-rs 0.5.0 shim's declaration-candidate scan repair. `not_found` now means the
+  name is genuinely absent.
+
+### Changed
+
+- **Breaking:** `lean_context` drops the declaration echo fields from its default response and makes the boundary
+  list and `expected_type` opt-in (`include_boundaries`, `include_expected_type`, both default `false`). The trimmed
+  default response is roughly half the old size; set the flags for the old shape.
+- Adopted the `lean-rs` 0.5 line (`lean-rs-worker-{child,parent,protocol}` and `lean-toolchain` 0.4 → 0.5) and the
+  `lean-semantic-search` 0.5 stack; the supported Lean window is unchanged (`4.26.0 ..= 4.33.0-rc1`).
+- Completeness flags that equal their default are omitted from MCP responses instead of serialized (`verified`,
+  `truncated: false`, `tainted: false`, zero counts, empty arrays, absent axiom facts), so absent unambiguously means
+  "complete / nothing to report".
+
 ## [0.6.0] - 2026-07-19
 
 ### Changed
@@ -253,7 +284,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.4.1...v0.5.0
