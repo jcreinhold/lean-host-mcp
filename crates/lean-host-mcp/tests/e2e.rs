@@ -413,9 +413,7 @@ async fn verify_resolves_every_declaration_scan_form_by_name() {
         .iter()
         .filter_map(|row| row["name"].as_str())
         .find(|name| name.contains("instDefaultPoint"))
-        .unwrap_or_else(|| {
-            panic!("anonymous instance should be catalogued under its generated name: {inventory_data}")
-        })
+        .unwrap_or_else(|| panic!("anonymous instance should be catalogued under its generated name: {inventory_data}"))
         .to_owned();
     let verified = verify_declaration(
         &ctx,
@@ -470,14 +468,21 @@ async fn context_trim_defaults_omit_boundaries_expected_type_and_echo_fields() {
     .await
     .expect("default proof_state");
     let lean_json = serde_json::to_value(lean.result.as_ref().expect("default proof result")).unwrap();
-    for key in ["proof_boundaries", "expected_type", "declaration_name", "namespace_name"] {
+    for key in [
+        "proof_boundaries",
+        "expected_type",
+        "declaration_name",
+        "namespace_name",
+    ] {
         assert!(
             lean_json.get(key).is_none(),
             "default request must not carry {key}: {lean_json}"
         );
     }
     assert!(
-        lean_json["goals_before"].as_array().is_some_and(|goals| !goals.is_empty()),
+        lean_json["goals_before"]
+            .as_array()
+            .is_some_and(|goals| !goals.is_empty()),
         "default response still carries the goals: {lean_json}"
     );
 
@@ -618,8 +623,7 @@ async fn trial_loop_runs_with_zero_per_step_context_calls() {
     )
     .await
     .expect("navigation proof_state");
-    let navigate_json =
-        serde_json::to_value(navigate.result.as_ref().expect("navigation result")).unwrap();
+    let navigate_json = serde_json::to_value(navigate.result.as_ref().expect("navigation result")).unwrap();
 
     // ...then every step is a self-contained trial. Two batches at two
     // positions stand in for a stepping loop; no lean_context call between
@@ -1810,4 +1814,3 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
         "verify_declaration should include runtime facts"
     );
 }
-

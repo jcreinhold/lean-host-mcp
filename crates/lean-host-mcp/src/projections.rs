@@ -1235,11 +1235,23 @@ mod tests {
             false,
         ));
         assert_eq!(candidate.status, "closed");
-        assert_eq!(error_count(&candidate.diagnostics), 0, "closed candidate diagnostics carry no errors");
+        assert_eq!(
+            error_count(&candidate.diagnostics),
+            0,
+            "closed candidate diagnostics carry no errors"
+        );
         assert_eq!(error_count(&candidate.downstream_diagnostics), 0);
         assert_eq!(candidate.diagnostics.diagnostics.len(), 1, "warning retained in place");
-        assert_eq!(candidate.downstream_diagnostics.diagnostics.len(), 1, "info retained in place");
-        assert_eq!(candidate.post_closure_diagnostics.diagnostics.len(), 2, "both errors moved");
+        assert_eq!(
+            candidate.downstream_diagnostics.diagnostics.len(),
+            1,
+            "info retained in place"
+        );
+        assert_eq!(
+            candidate.post_closure_diagnostics.diagnostics.len(),
+            2,
+            "both errors moved"
+        );
         assert_eq!(error_count(&candidate.post_closure_diagnostics), 2);
         assert!(!candidate.post_closure_diagnostics.truncated);
     }
@@ -1254,7 +1266,11 @@ mod tests {
             false,
         ));
         assert_eq!(candidate.status, "failed");
-        assert_eq!(error_count(&candidate.diagnostics), 1, "failed candidate keeps its errors");
+        assert_eq!(
+            error_count(&candidate.diagnostics),
+            1,
+            "failed candidate keeps its errors"
+        );
         assert_eq!(error_count(&candidate.downstream_diagnostics), 1);
         assert!(candidate.post_closure_diagnostics.diagnostics.is_empty());
         assert!(!candidate.post_closure_diagnostics.truncated);
@@ -1369,7 +1385,10 @@ mod tests {
             "false candidates_truncated omitted: {json}"
         );
         let failure = serde_json::to_value(ElabFailure::default()).expect("serializes");
-        assert!(failure.get("truncated").is_none(), "false ElabFailure.truncated omitted: {failure}");
+        assert!(
+            failure.get("truncated").is_none(),
+            "false ElabFailure.truncated omitted: {failure}"
+        );
     }
 
     #[test]
@@ -1391,7 +1410,12 @@ mod tests {
         let json = serde_json::to_value(facts).expect("serializes");
         // Verdict and trust flags always serialize: a client must never
         // silently default a sorry-check or a trust flag.
-        for key in ["contains_sorry", "contains_admit", "contains_sorry_ax", "facts_trustworthy"] {
+        for key in [
+            "contains_sorry",
+            "contains_admit",
+            "contains_sorry_ax",
+            "facts_trustworthy",
+        ] {
             assert_eq!(
                 json.get(key),
                 Some(&serde_json::Value::Bool(false)),
@@ -1430,7 +1454,9 @@ mod tests {
             false,
         ));
         let json = serde_json::to_value(&candidate).expect("candidate serializes");
-        let advisory = json.get("post_closure_diagnostics").expect("populated advisory field present");
+        let advisory = json
+            .get("post_closure_diagnostics")
+            .expect("populated advisory field present");
         assert_eq!(advisory["diagnostics"].as_array().map(Vec::len), Some(1));
     }
 

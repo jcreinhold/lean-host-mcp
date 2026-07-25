@@ -609,12 +609,10 @@ pub(crate) async fn proof_state_internal(
                 None,
             ))
         }
-        BatchQueryRun::Unsupported => {
-            Ok((
-                Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime),
-                None,
-            ))
-        }
+        BatchQueryRun::Unsupported => Ok((
+            Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime),
+            None,
+        )),
     }
 }
 

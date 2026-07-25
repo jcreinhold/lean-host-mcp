@@ -2217,12 +2217,11 @@ mod tests {
             verification_status: status,
             facts: Box::new(LeanWorkerDeclarationVerificationFacts::unavailable()),
         };
-        let batch = |statuses: &[LeanWorkerDeclarationVerificationStatus]| {
-            LeanWorkerDeclarationVerificationBatchResult::Ok {
+        let batch =
+            |statuses: &[LeanWorkerDeclarationVerificationStatus]| LeanWorkerDeclarationVerificationBatchResult::Ok {
                 results: statuses.iter().map(|status| row(*status)).collect(),
                 imports: Vec::new(),
-            }
-        };
+            };
         assert!(worker_batch_is_non_positive(&batch(&[
             LeanWorkerDeclarationVerificationStatus::Rejected
         ])));
@@ -2238,13 +2237,13 @@ mod tests {
             LeanWorkerDeclarationVerificationStatus::Ambiguous,
         ])));
         // A MissingImports batch's honest action is `lake build` — not retriable.
-        assert!(
-            !worker_batch_is_non_positive(&LeanWorkerDeclarationVerificationBatchResult::MissingImports {
+        assert!(!worker_batch_is_non_positive(
+            &LeanWorkerDeclarationVerificationBatchResult::MissingImports {
                 results: vec![row(LeanWorkerDeclarationVerificationStatus::Rejected)],
                 imports: Vec::new(),
                 missing: vec!["Foo.Bar".to_owned()],
-            })
-        );
+            }
+        ));
     }
 
     #[test]
