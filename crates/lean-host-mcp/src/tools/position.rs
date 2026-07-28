@@ -26,7 +26,7 @@ use crate::broker::ProjectHint;
 use crate::envelope::{Freshness, Response, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::projections::{Diagnostic, ElabFailure, Severity, project_failure};
-use crate::tools::source_input::{header_imports, read_query_file, resolve_path};
+use crate::tools::source_input::{QueryFile, read_query_file, resolve_path};
 use crate::tools::{ToolContext, session_imports};
 use crate::trust::{ArtifactKind, ArtifactTrust, TrustScope, TrustStatus};
 
@@ -408,21 +408,31 @@ enum BatchProjection {
 /// Returns `ServerError::Io` when the file cannot be read and
 /// `ServerError::Lean` for worker infrastructure failures.
 pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Response<ProofStateResult>> {
-    let (response, _namespace) = proof_state_internal(ctx, req).await?;
-    Ok(response)
+    Ok(proof_state_internal(ctx, req).await?.response)
 }
 
-/// [`proof_state`] plus the worker-reported namespace of the resolved
-/// declaration. The namespace is deliberately not part of the public response
-/// (it echoes what the caller already named), but internal readers that
-/// qualify names against the live environment still need the worker's
-/// resolution rather than the request's possibly file-local string.
-pub(crate) async fn proof_state_internal(
-    ctx: &ToolContext,
-    req: ProofStateRequest,
-) -> Result<(Response<ProofStateResult>, Option<String>)> {
+/// [`proof_state`] plus the two things an internal reader needs and the public
+/// response deliberately withholds.
+pub(crate) struct ProofStateInternal {
+    /// Exactly what [`proof_state`] returns.
+    pub response: Response<ProofStateResult>,
+    /// Worker-reported namespace of the resolved declaration. Not public
+    /// because it echoes what the caller already named, but a reader that
+    /// qualifies names against the live environment needs the worker's
+    /// resolution rather than the request's possibly file-local string.
+    pub namespace: Option<String>,
+    /// The source file this call elaborated. Handed back rather than left for
+    /// the caller to read again: it is the same path, the same bytes, and the
+    /// same header scan, and a second read is also a second chance to disagree
+    /// with the elaboration that produced `response`.
+    pub source: QueryFile,
+}
+
+/// The internal form of [`proof_state`]. See [`ProofStateInternal`].
+pub(crate) async fn proof_state_internal(ctx: &ToolContext, req: ProofStateRequest) -> Result<ProofStateInternal> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
+    let source = read_query_file(&meta.canonical_root, &req.file)?;
     let selectors = vec![
         LeanWorkerModuleQuerySelector::Diagnostics {
             id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
@@ -441,17 +451,18 @@ pub(crate) async fn proof_state_internal(
     // could not run; degrade to the shared needs_build verdict instead of
     // letting the raw error propagate as an MCP transport error.
     let run = match crate::diagnosis::classify_missing_olean(
-        run_module_query_batch(ctx, hint.clone(), &meta.canonical_root, &req.file, selectors, budgets).await,
+        run_module_query_batch(ctx, hint.clone(), &meta.canonical_root, &source, selectors, budgets).await,
     )? {
         crate::diagnosis::CallOutcome::Ready(run) => run,
         crate::diagnosis::CallOutcome::NeedsBuild(err) => {
             // Forward the file's real header imports so the degraded envelope's
-            // `freshness.imports` matches the success path (re-read on this rare
-            // arm only; empty if the file is now unreadable).
-            let imports = read_query_file(&meta.canonical_root, &req.file)
-                .map(|input| input.imports)
-                .unwrap_or_default();
-            return proof_state_needs_build_response(ctx, hint, imports, err).map(|r| (r, None));
+            // `freshness.imports` matches the success path.
+            let response = proof_state_needs_build_response(ctx, hint, source.imports.clone(), err)?;
+            return Ok(ProofStateInternal {
+                response,
+                namespace: None,
+                source,
+            });
         }
     };
     let freshness = run.freshness.clone();
@@ -591,12 +602,16 @@ pub(crate) async fn proof_state_internal(
                 Some(event) => crate::diagnosis::warn_execution_taint(response, event),
                 None => response,
             };
-            Ok((warn_session_missing_imports(response, &missing_imports), namespace_name))
+            Ok(ProofStateInternal {
+                response: warn_session_missing_imports(response, &missing_imports),
+                namespace: namespace_name,
+                source,
+            })
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
             let block = diagnostics_block(diagnostics);
-            Ok((
-                Response::ok(
+            Ok(ProofStateInternal {
+                response: Response::ok(
                     ProofStateResult::HeaderParseFailed {
                         summary: block.summary,
                         diagnostics: block.diagnostics,
@@ -606,13 +621,15 @@ pub(crate) async fn proof_state_internal(
                     freshness,
                 )
                 .with_runtime(run.runtime),
-                None,
-            ))
+                namespace: None,
+                source,
+            })
         }
-        BatchQueryRun::Unsupported => Ok((
-            Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime),
-            None,
-        )),
+        BatchQueryRun::Unsupported => Ok(ProofStateInternal {
+            response: Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime),
+            namespace: None,
+            source,
+        }),
     }
 }
 
@@ -983,8 +1000,11 @@ pub enum FindReferencesResult {
         /// stable prefix of the full answer.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
-        /// Project scope: `.ilean` modules parsed into the index. File scope:
-        /// the single anchor file, if it elaborated.
+        /// Project scope: `.ilean` modules parsed into the index — which a
+        /// `files`-restricted request narrows to just the modules that can
+        /// produce a hit in those files, so it is the work done, not the size
+        /// of the project. File scope: the single anchor file, if it
+        /// elaborated.
         files_scanned: usize,
         /// Project scope: `.ilean` modules skipped because they were unreadable,
         /// malformed, or an unsupported version. File scope: the anchor file, if
@@ -1026,7 +1046,7 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     // with no worker query. The freshness asymmetry is the point, not a bug.
     match req.scope {
         ReferenceScope::File => find_references_in_file(ctx, hint, &root, &req, freshness, runtime, limit).await,
-        ReferenceScope::Project => Ok(find_references_in_project(&root, &req, freshness, runtime, limit)),
+        ReferenceScope::Project => find_references_in_project(&root, &req, freshness, runtime, limit).await,
     }
 }
 
@@ -1082,7 +1102,14 @@ async fn find_references_in_file(
     // the `lake build` cue) rather than hard-erroring.
     let mut needs_build: Option<ServerError> = None;
 
-    match run_module_query(ctx, hint, root, &path, query).await {
+    // A read failure lands in the same `Err` arms below that it reached through
+    // `run_module_query` before the file became a parameter — an unreadable file
+    // is a skipped file, not a failed call.
+    let run = match read_query_file(root, &path) {
+        Ok(source) => run_module_query(ctx, hint, root, &source, query).await,
+        Err(err) => Err(err),
+    };
+    match run {
         Ok(QueryRun {
             outcome:
                 ModuleQueryRun::Ready {
@@ -1213,25 +1240,41 @@ async fn find_references_in_file(
 /// project (build-fresh) in milliseconds, with no worker query. Returns the
 /// complete answer up to `limit`; an unbuilt project degrades to `needs_build`
 /// and an index stale relative to current source rides a freshness note.
-fn find_references_in_project(
+///
+/// The scan is file I/O and JSON parsing from first byte to last — hundreds of
+/// milliseconds on a large project even after the reader stopped materializing
+/// what it discards — so it runs on a blocking thread rather than stalling a
+/// tokio worker for its whole duration. The request validation above it stays on
+/// the async thread so a rejected request never pays for the hop.
+async fn find_references_in_project(
     root: &Path,
     req: &FindReferencesRequest,
     freshness: Freshness,
     runtime: RuntimeFacts,
     limit: usize,
-) -> Response<FindReferencesResult> {
+) -> Result<Response<FindReferencesResult>> {
     if req.file.is_some() {
-        return Response::ok(
+        return Ok(Response::ok(
             FindReferencesResult::InvalidRequest {
                 message: "find_references with scope=project accepts `files`, not `file`".to_owned(),
                 semantic_based: true,
             },
             freshness,
         )
-        .with_runtime(runtime);
+        .with_runtime(runtime));
     }
 
-    let index = crate::ilean::references_to(root, &req.name);
+    let index = {
+        let scan_root = root.to_path_buf();
+        let scan_name = req.name.clone();
+        let scan_files = req.files.clone();
+        tokio::task::spawn_blocking(move || {
+            let subset = (!scan_files.is_empty()).then_some(scan_files.as_slice());
+            crate::ilean::references_to(&scan_root, &scan_name, subset)
+        })
+        .await
+        .map_err(|err| ServerError::Internal(format!("reference index scan task failed: {err}")))?
+    };
 
     // A wholly-absent build directory is the honest "the project is not built"
     // verdict — degrade to the shared `needs_build` warning, never a silent
@@ -1241,14 +1284,16 @@ fn find_references_in_project(
         let response = Response::ok(empty_references_result(0, 0), freshness)
             .with_runtime(runtime)
             .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_missing_build());
-        return crate::diagnosis::warn_needs_build(
+        return Ok(crate::diagnosis::warn_needs_build(
             response,
             &crate::diagnosis::IncompleteCause::MissingImports(Vec::new()),
-        );
+        ));
     }
 
-    // The reader takes no file subset, so a `files`-restricted request reads the
-    // one whole-project index (O(ms)) and filters by relative-to-root path.
+    // The reader narrows its walk to the same subset when it can invert the
+    // paths, but it falls back to the whole project when it cannot, so this
+    // filter is what actually enforces the restriction. It stays either way:
+    // narrowing decides which files are *read*, never which hits survive.
     let restrict: Option<std::collections::HashSet<String>> = (!req.files.is_empty()).then(|| {
         req.files
             .iter()
@@ -1288,7 +1333,7 @@ fn find_references_in_project(
     };
     let response = Response::ok(result, freshness).with_runtime(runtime);
     if index.stale_sources.is_empty() {
-        return response.with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_build_fresh());
+        return Ok(response.with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_build_fresh()));
     }
     let names = index
         .stale_sources
@@ -1303,7 +1348,7 @@ fn find_references_in_project(
     } else {
         String::new()
     };
-    response
+    Ok(response
         .with_trust_artifact(crate::trust::ArtifactTrust::ilean_project_stale_build(format!(
             "{} contributing module(s) have source newer than their .ilean ({names}{suffix})",
             index.stale_sources.len()
@@ -1313,7 +1358,7 @@ fn find_references_in_project(
              their .ilean ({names}{suffix}); results reflect the last `lake build`.",
             index.stale_sources.len()
         ))
-        .hint("re-run `lake build` to refresh the reference index for edited modules")
+        .hint("re-run `lake build` to refresh the reference index for edited modules"))
 }
 
 /// An empty `Ok` reference result, used for the `needs_build` degrade where the
@@ -1392,25 +1437,31 @@ enum BatchQueryRun {
     Unsupported,
 }
 
+/// Run one query against an already-read source file.
+///
+/// The file is a parameter rather than a path this reads for itself so that a
+/// handler which needs the bytes for its own reasons — `search_for_proof` ranks
+/// against them, `proof_state` reports the header imports on its degraded arm —
+/// reads once. Two reads of one path are not merely two syscalls: they are two
+/// chances to see different bytes, so the second could hash a file the
+/// elaboration never saw. See `tools::source_input` for the rule.
 async fn run_module_query(
     ctx: &ToolContext,
     hint: ProjectHint,
     root: &Path,
-    path: &Path,
+    source: &QueryFile,
     query: LeanWorkerModuleQuery,
 ) -> Result<QueryRun> {
-    let input = read_query_file(root, path)?;
-    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved);
-    let session_imports = session_imports(header_imports(&input.source));
+    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &source.resolved);
     let call = ctx
         .broker
         .process_cached_module_query(
             hint,
-            input.resolved,
-            input.hash,
-            session_imports,
-            input.imports,
-            input.source,
+            source.resolved.clone(),
+            source.hash,
+            session_imports(source.imports.clone()),
+            source.imports.clone(),
+            source.source.clone(),
             query,
             LeanWorkerElabOptions::new(),
         )
@@ -1423,27 +1474,26 @@ async fn run_module_query(
     })
 }
 
+/// Batch companion of [`run_module_query`]; the same rule applies.
 async fn run_module_query_batch(
     ctx: &ToolContext,
     hint: ProjectHint,
     root: &Path,
-    path: &Path,
+    source: &QueryFile,
     selectors: Vec<LeanWorkerModuleQuerySelector>,
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<BatchRun> {
-    let input = read_query_file(root, path)?;
-    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved);
-    let file_label = input.resolved.to_string_lossy().into_owned();
-    let session_imports = session_imports(header_imports(&input.source));
+    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &source.resolved);
+    let file_label = source.resolved.to_string_lossy().into_owned();
     let call = ctx
         .broker
         .process_cached_module_query_batch(
             hint,
-            input.resolved,
-            input.hash,
-            session_imports,
-            input.imports.clone(),
-            input.source,
+            source.resolved.clone(),
+            source.hash,
+            session_imports(source.imports.clone()),
+            source.imports.clone(),
+            source.source.clone(),
             selectors,
             budgets,
             LeanWorkerElabOptions::new().file_label(&file_label),
@@ -2037,8 +2087,94 @@ import Init -- comment
         );
     }
 
+    /// `QueryFile::imports` is the header-import scan of `QueryFile::source`,
+    /// not a separately-derived list. Both module-query paths build their
+    /// session imports from that field instead of rescanning the source, so
+    /// this equivalence is a contract rather than an implementation detail.
     #[test]
-    fn project_references_report_missing_ilean_build_fact_when_not_built() {
+    fn read_query_file_imports_are_the_header_scan_of_its_source() {
+        let source = "\
+module
+
+public import Foo.Bar
+meta import Baz.Qux
+import all Project.Internal
+import Init -- comment
+
+#check Nat
+";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Basic.lean"), source).unwrap();
+
+        let input = read_query_file(dir.path(), std::path::Path::new("Basic.lean")).unwrap();
+
+        assert_eq!(input.imports, header_imports(&input.source));
+        assert_eq!(input.imports, header_imports(source));
+    }
+
+    /// A file that cannot be read is a *skipped* file, not a failed call.
+    ///
+    /// `find_references` scope=file surveys sources, and an agent that names a
+    /// path which has since been renamed or deleted should get an empty,
+    /// well-formed answer that says so — not an MCP transport error. The skip
+    /// used to come from `run_module_query` doing the read; it now comes from
+    /// the caller, so the behaviour needs an assertion of its own rather than
+    /// riding on where the read happens to live.
+    #[tokio::test]
+    async fn file_scope_references_skip_a_file_that_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lakefile.lean"), "package proj\nlean_lib Proj\n").unwrap();
+        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.33.0-rc1\n").unwrap();
+        std::fs::write(root.join("lake-manifest.json"), "{}\n").unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let broker = crate::broker::ProjectBroker::new(crate::broker::BrokerConfig {
+            config_default: None,
+            env_default: Some(root.clone()),
+            cwd: root,
+            max_projects: crate::broker::BrokerConfig::default_max_projects(),
+            idle_timeout: std::time::Duration::ZERO,
+        });
+        let ctx = crate::tools::ToolContext {
+            broker: std::sync::Arc::clone(&broker),
+            config: crate::ToolConfig::default(),
+        };
+
+        let response = super::find_references(
+            &ctx,
+            FindReferencesRequest {
+                name: "Nat.add".to_owned(),
+                scope: ReferenceScope::File,
+                file: Some(std::path::PathBuf::from("Gone.lean")),
+                files: Vec::new(),
+                limit: None,
+                project: None,
+            },
+        )
+        .await
+        // An `Err` here is the regression: a missing file used to be — and must
+        // stay — a skip rather than an MCP transport error.
+        .unwrap();
+
+        let super::FindReferencesResult::Ok {
+            references,
+            files_scanned,
+            files_skipped,
+            ..
+        } = response.result.unwrap()
+        else {
+            panic!("expected the ok verdict, not an invalid-request one");
+        };
+        assert!(references.is_empty());
+        assert_eq!(files_scanned, 0);
+        assert_eq!(files_skipped, 1);
+        broker.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn project_references_report_missing_ilean_build_fact_when_not_built() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("Demo")).unwrap();
         std::fs::write(tmp.path().join("Demo/A.lean"), "-- no build\n").unwrap();
@@ -2049,7 +2185,9 @@ import Init -- comment
             freshness(tmp.path()),
             RuntimeFacts::default(),
             1000,
-        );
+        )
+        .await
+        .unwrap();
 
         assert!(has_artifact(
             &response,
@@ -2065,8 +2203,8 @@ import Init -- comment
         ));
     }
 
-    #[test]
-    fn project_references_report_build_fresh_ilean_fact_when_current() {
+    #[tokio::test]
+    async fn project_references_report_build_fresh_ilean_fact_when_current() {
         let project = stage_ilean_module("Demo.A", "demo_a.ilean");
 
         let response = find_references_in_project(
@@ -2075,7 +2213,9 @@ import Init -- comment
             freshness(project.path()),
             RuntimeFacts::default(),
             1000,
-        );
+        )
+        .await
+        .unwrap();
 
         assert!(has_artifact(
             &response,
@@ -2085,8 +2225,8 @@ import Init -- comment
         ));
     }
 
-    #[test]
-    fn project_references_report_stale_ilean_fact_when_source_is_newer() {
+    #[tokio::test]
+    async fn project_references_report_stale_ilean_fact_when_source_is_newer() {
         let project = stage_ilean_module("Demo.A", "demo_a.ilean");
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(project.path().join("Demo/A.lean"), "-- edited after build\n").unwrap();
@@ -2097,7 +2237,9 @@ import Init -- comment
             freshness(project.path()),
             RuntimeFacts::default(),
             1000,
-        );
+        )
+        .await
+        .unwrap();
 
         assert!(has_artifact(
             &response,

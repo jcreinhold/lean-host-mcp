@@ -204,6 +204,10 @@ pub async fn inspect_declaration(
         fields,
         budgets,
     };
+    // Uncached on purpose: this names a declaration rather than supplying
+    // source, so there is no content hash to invalidate the answer. See the
+    // module doc of `crate::cache`.
+    //
     // A missing-`.olean` in the file's import closure means the name could not
     // be resolved against a complete environment; degrade to the shared
     // needs_build verdict rather than letting the raw error propagate (and

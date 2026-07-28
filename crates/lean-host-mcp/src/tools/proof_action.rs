@@ -288,6 +288,11 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
         candidates,
         budgets,
     };
+    // Uncached on purpose, for one reason more than the lookup tools have: on
+    // top of having no content hash to invalidate against, the request carries
+    // a heartbeat budget, so a cached success would answer a question about a
+    // different elaboration budget than the one asked. See `crate::cache`.
+    //
     // A missing-`.olean` in the target's own import closure means the worker
     // could not assemble the environment to attempt anything; degrade to the
     // shared needs_build verdict instead of letting the raw error propagate.
@@ -485,6 +490,9 @@ pub async fn verify_declaration(
         budgets,
     };
     let imports = input.imports;
+    // Uncached on purpose, for the same two reasons as `attempt_proof` above:
+    // no content hash, and a heartbeat budget in the request. See `crate::cache`.
+    //
     // A missing-`.olean` in the target's own import closure means the worker
     // could not assemble the environment to check anything; degrade to the
     // shared needs_build verdict instead of letting the raw error propagate.
@@ -1676,10 +1684,6 @@ mod tests {
             cwd: root,
             max_projects: BrokerConfig::default_max_projects(),
             idle_timeout: std::time::Duration::ZERO,
-            semantic_permits: BrokerConfig::default_semantic_permits(),
-            semantic_waiters: BrokerConfig::default_semantic_waiters(),
-            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
         });
         (
             ToolContext {

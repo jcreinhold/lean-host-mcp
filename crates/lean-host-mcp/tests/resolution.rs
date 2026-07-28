@@ -39,10 +39,6 @@ fn cfg(cwd: PathBuf, env_default: Option<PathBuf>, config_default: Option<PathBu
         cwd,
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: std::time::Duration::ZERO,
-        semantic_permits: BrokerConfig::default_semantic_permits(),
-        semantic_waiters: BrokerConfig::default_semantic_waiters(),
-        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-        semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
     }
 }
 

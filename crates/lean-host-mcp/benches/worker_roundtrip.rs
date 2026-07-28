@@ -41,10 +41,6 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
         cwd: root,
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: BrokerConfig::default_idle_timeout(),
-        semantic_permits: BrokerConfig::default_semantic_permits(),
-        semantic_waiters: BrokerConfig::default_semantic_waiters(),
-        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-        semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
     });
     let ctx = ToolContext {
         broker,
@@ -85,6 +81,41 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
                 )
                 .await
                 .expect("inspect_declaration")
+            });
+        });
+    });
+
+    // The same call, alternating between two import profiles. Before the worker
+    // child pooled sessions this arm paid a full re-import on every iteration,
+    // and a child respawn on every other one; with a pool that holds both it
+    // should land on the non-switching median above, because a pool hit is a key
+    // comparison and a round trip. Both profiles are primed first, so the
+    // measurement is of switching and not of the two cold imports.
+    const SWITCH_PROFILES: [&[&str]; 2] = [
+        &["LeanRsFixture.Handles"],
+        &["LeanRsFixture.Strings", "LeanRsFixture.Scalars"],
+    ];
+    let switch_request = |profile: &[&str]| InspectDeclarationRequest {
+        name: "Nat.add_zero".to_owned(),
+        file: None,
+        imports: profile.iter().map(|name| (*name).to_owned()).collect(),
+        project: None,
+        fields: InspectDeclarationFields::default(),
+        raw_statement: false,
+    };
+    rt.block_on(async {
+        for profile in SWITCH_PROFILES {
+            drop(inspect_declaration(&ctx, switch_request(profile)).await);
+        }
+    });
+    let mut rotation = SWITCH_PROFILES.iter().cycle();
+    c.bench_function("worker_roundtrip/inspect_declaration_alternating_imports", |b| {
+        b.iter(|| {
+            let profile = rotation.next().expect("cycle over a non-empty array never ends");
+            rt.block_on(async {
+                inspect_declaration(&ctx, switch_request(profile))
+                    .await
+                    .expect("inspect_declaration")
             });
         });
     });

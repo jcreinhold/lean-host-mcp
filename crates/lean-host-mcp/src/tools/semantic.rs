@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 use crate::broker::{BrokerConfigSnapshot, ProjectHint};
-use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure};
+use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure, Telemetry};
 use crate::error::{Result, ServerError, WorkerUnavailable};
 use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolContext};
 use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus, dedupe_artifacts};
@@ -532,6 +532,17 @@ where
     pub data: Option<T>,
     pub errors: Vec<SemanticIssue>,
     pub trust: SemanticTrust,
+    /// Operational telemetry — worker generation, restart history, RSS, the
+    /// full import list — present only under `telemetry.verbosity = full`, and
+    /// omitted entirely at the default `quiet`.
+    ///
+    /// This is the *only* way a client can observe whether a worker recycled,
+    /// which is what `scripts/memory_stability.py` and the `smoke_perf`
+    /// harness read. Without it the knob was documented but had no effect on
+    /// the wire: `from_tool_response` dropped the block at `quiet` and then
+    /// discarded it at `full` too, because this field did not exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<Telemetry>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -835,6 +846,7 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 data: Some(serde_json::to_value(data).map_err(|err| ServerError::Internal(err.to_string()))?),
                 errors: Vec::new(),
                 trust,
+                telemetry: None,
             })
         }
         "file_diagnostics" => {
@@ -873,7 +885,13 @@ where
         .map_err(|err| ServerError::Internal(err.to_string()))?;
     let trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
-    Ok(SemanticResponse { data, errors, trust })
+    Ok(SemanticResponse {
+        data,
+        errors,
+        trust,
+        // `None` at `quiet`, because `drop_telemetry` above already cleared it.
+        telemetry: response.telemetry,
+    })
 }
 
 fn from_runtime_response(response: Response<Value>) -> SemanticResponse<Value> {
@@ -883,6 +901,7 @@ fn from_runtime_response(response: Response<Value>) -> SemanticResponse<Value> {
         data: response.result,
         errors,
         trust,
+        telemetry: response.telemetry,
     }
 }
 
@@ -971,6 +990,7 @@ where
                 details,
             }],
             trust: SemanticTrust::unknown(),
+            telemetry: None,
         })
     })
 }
@@ -987,6 +1007,7 @@ fn missing_kind(tool: &str, allowed: &[&str]) -> SemanticResponse<Value> {
             details: semantic_examples(tool, allowed).map(|examples| json!({ "examples": examples })),
         }],
         trust: SemanticTrust::unknown(),
+        telemetry: None,
     }
 }
 
@@ -1008,6 +1029,7 @@ fn invalid_kind(tool: &str, kind: &str, allowed: &[&str]) -> SemanticResponse<Va
             details: semantic_examples(tool, allowed).map(|examples| json!({ "examples": examples })),
         }],
         trust: SemanticTrust::unknown(),
+        telemetry: None,
     }
 }
 
@@ -1031,7 +1053,7 @@ fn telemetry_verbosity_name(verbosity: TelemetryVerbosity) -> &'static str {
 mod tests {
     use super::*;
     use crate::broker::{BrokerConfig, ProjectBroker};
-    use crate::envelope::Freshness;
+    use crate::envelope::{Freshness, RuntimeFacts};
     use crate::tools::ToolConfig;
     use crate::trust::{ArtifactKind, TrustScope};
 
@@ -1055,6 +1077,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn telemetry_verbosity_full_is_what_puts_the_runtime_block_on_the_wire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let runtime = RuntimeFacts {
+            worker_generation: 7,
+            ..RuntimeFacts::default()
+        };
+        let build = || Response::ok(json!({"probe": true}), freshness(&root)).with_runtime(runtime.clone());
+
+        let quiet = from_tool_response(build(), TelemetryVerbosity::Quiet).unwrap();
+        assert!(
+            quiet.telemetry.is_none(),
+            "the default verbosity must not ship operational telemetry to the model"
+        );
+
+        let full = from_tool_response(build(), TelemetryVerbosity::Full).unwrap();
+        let telemetry = full.telemetry.unwrap();
+        assert_eq!(
+            telemetry.runtime.map(|facts| facts.worker_generation),
+            Some(7),
+            "the runtime facts are the point of `full`: a client that cannot read \
+             worker_generation cannot tell that a worker recycled"
+        );
+
+        // Serialization, not just the struct: the field is `skip_serializing_if
+        // = "Option::is_none"`, so a quiet response must have no `telemetry`
+        // key at all rather than an explicit null.
+        let quiet_json = serde_json::to_value(from_tool_response(build(), TelemetryVerbosity::Quiet).unwrap()).unwrap();
+        assert!(quiet_json.get("telemetry").is_none(), "quiet: {quiet_json}");
+        let full_json = serde_json::to_value(from_tool_response(build(), TelemetryVerbosity::Full).unwrap()).unwrap();
+        assert!(
+            full_json.pointer("/telemetry/runtime/worker_generation").is_some(),
+            "full: {full_json}"
+        );
+    }
+
     #[tokio::test]
     async fn lean_status_does_not_open_worker_and_reports_trust_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1065,10 +1124,6 @@ mod tests {
             cwd: root,
             max_projects: BrokerConfig::default_max_projects(),
             idle_timeout: std::time::Duration::ZERO,
-            semantic_permits: BrokerConfig::default_semantic_permits(),
-            semantic_waiters: BrokerConfig::default_semantic_waiters(),
-            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),
@@ -1135,10 +1190,6 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
             idle_timeout: std::time::Duration::ZERO,
-            semantic_permits: BrokerConfig::default_semantic_permits(),
-            semantic_waiters: BrokerConfig::default_semantic_waiters(),
-            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),
@@ -1173,10 +1224,6 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
             idle_timeout: std::time::Duration::ZERO,
-            semantic_permits: BrokerConfig::default_semantic_permits(),
-            semantic_waiters: BrokerConfig::default_semantic_waiters(),
-            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),
@@ -1224,10 +1271,6 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
             idle_timeout: std::time::Duration::ZERO,
-            semantic_permits: BrokerConfig::default_semantic_permits(),
-            semantic_waiters: BrokerConfig::default_semantic_waiters(),
-            semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-            semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),

@@ -49,10 +49,6 @@ fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize, idle_ti
         cwd,
         max_projects,
         idle_timeout,
-        semantic_permits: BrokerConfig::default_semantic_permits(),
-        semantic_waiters: BrokerConfig::default_semantic_waiters(),
-        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-        semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
     })
 }
 
@@ -230,4 +226,69 @@ async fn manifest_mutation_triggers_respawn() {
         id_first, id_second,
         "manifest mutation must invalidate the cached project and re-spawn"
     );
+}
+
+/// Two projects are two workers, so calls against them run at the same time.
+///
+/// This is the contract that replaced the process-wide semantic-admission
+/// semaphore. With one global permit, a call to project B waited for project
+/// A's unrelated call to finish; the only thing that distinguishes the two
+/// regimes is wall clock, so the assertion has to be a wall-clock one. It is
+/// framed as an A/B against the *same* workload measured serially rather than
+/// against an absolute latency budget: a slow or loaded machine inflates both
+/// arms, so the ratio stays meaningful where a fixed millisecond bound would
+/// not. Both projects are warmed first so worker bootstrap is outside both
+/// measurements.
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn concurrent_calls_across_projects_do_not_queue() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    let canonical_root = root.canonicalize().expect("canonicalise fixture");
+    let (_synth_keep, synth_root) = make_synthetic_project(&canonical_root);
+    let broker = make_broker(None, NonZeroUsize::new(2).unwrap(), Duration::ZERO);
+
+    let a = ProjectHint::Explicit(canonical_root);
+    let b = ProjectHint::Explicit(synth_root);
+
+    // Warm both workers; the first call to each pays the worker spawn.
+    inspect(&broker, a.clone()).await;
+    inspect(&broker, b.clone()).await;
+
+    let serial_start = std::time::Instant::now();
+    inspect(&broker, a.clone()).await;
+    inspect(&broker, b.clone()).await;
+    let serial = serial_start.elapsed();
+
+    let concurrent_start = std::time::Instant::now();
+    let (first, second) = tokio::join!(inspect(&broker, a), inspect(&broker, b));
+    let concurrent = concurrent_start.elapsed();
+
+    assert!(
+        first && second,
+        "both projects must have resolved the declaration, or the timing compares nothing"
+    );
+    assert!(
+        concurrent.as_secs_f64() < serial.as_secs_f64() * 0.8,
+        "calls to different projects must overlap, not serialize; serial={serial:?} concurrent={concurrent:?}"
+    );
+}
+
+/// One real (elaborating) worker call against a core declaration, reporting
+/// whether it resolved so the caller can confirm the timed arms did real work.
+async fn inspect(broker: &Arc<ProjectBroker>, hint: ProjectHint) -> bool {
+    use lean_rs_worker_parent::{LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationInspectionResult};
+
+    let imports = vec!["Init".to_owned()];
+    let call = broker
+        .inspect_declaration(
+            hint,
+            imports.clone(),
+            imports,
+            LeanWorkerDeclarationInspectionRequest::new("Nat.add_zero"),
+        )
+        .await
+        .expect("inspect_declaration");
+    matches!(call.value, LeanWorkerDeclarationInspectionResult::Found { .. })
 }

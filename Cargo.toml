@@ -26,6 +26,20 @@ lean-semantic-search-retrieval = "0.5"
 lean-semantic-search-runtime = "0.5"
 lean-toolchain = "0.5"
 
+# TEMPORARY: development override against the local lean-rs checkout while the
+# worker session-reuse fix is unreleased. `[patch]` is honoured only at the
+# workspace root and applies graph-wide, so the `lean-semantic-search-*` crates
+# resolve against the patched sources too — which is why the patched checkout
+# must stay on the 0.5.x line (`deny.toml` forbids duplicate versions).
+# Remove this block, and `cargo update -p` to the published release, before
+# tagging. Note the worker child is a separately installed binary: rerun
+# `lean-host-mcp install-worker` after building, or the running host will talk
+# to an unpatched child.
+[patch.crates-io]
+lean-rs-worker-child = { path = "../lean-rs/crates/lean-rs-worker-child" }
+lean-rs-worker-parent = { path = "../lean-rs/crates/lean-rs-worker-parent" }
+lean-rs-worker-protocol = { path = "../lean-rs/crates/lean-rs-worker-protocol" }
+lean-toolchain = { path = "../lean-rs/crates/lean-toolchain" }
 
 [workspace.lints.rust]
 future-incompatible = "warn"

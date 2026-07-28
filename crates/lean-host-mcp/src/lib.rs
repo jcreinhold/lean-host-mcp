@@ -22,7 +22,6 @@
 //! - [`tools`]: tool implementations, grouped by proof workflow stage.
 //! - [`server`]: rmcp glue.
 
-mod admission;
 pub mod broker;
 mod cache;
 pub mod cli;

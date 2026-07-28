@@ -988,7 +988,6 @@ dependencies = [
  "clap",
  "criterion",
  "dirs",
- "fs4",
  "lean-rs-worker-parent",
  "lean-rs-worker-protocol",
  "lean-semantic-search-capability",
@@ -1026,8 +1025,6 @@ dependencies = [
 [[package]]
 name = "lean-rs"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4da8771196d9023e75e96e860f8c8e266c086452238e2161f83df20b06696b6"
 dependencies = [
  "lean-rs-sys",
  "lean-toolchain",
@@ -1041,14 +1038,10 @@ dependencies = [
 [[package]]
 name = "lean-rs-abi"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f75430a3ca0108c0bd1f230fa28769f146e02226ab2109d3765a146fe09c51e"
 
 [[package]]
 name = "lean-rs-host"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e00e986204c0ac418f096cc985ee5441a94c1b5d18d6e1052461a0163944e62"
 dependencies = [
  "lean-rs",
  "lean-toolchain",
@@ -1060,8 +1053,6 @@ dependencies = [
 [[package]]
 name = "lean-rs-sys"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43258b51c227be214218decb2d98824fbe2833f3233e794aa1ad47f221fc3f81"
 dependencies = [
  "lean-rs-abi",
  "sha2",
@@ -1070,8 +1061,6 @@ dependencies = [
 [[package]]
 name = "lean-rs-worker-child"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5734ba878e5c51839586c3bf9657296a20a05bb69ebce351c29044a50f6fd781"
 dependencies = [
  "lean-rs",
  "lean-rs-host",
@@ -1086,8 +1075,6 @@ dependencies = [
 [[package]]
 name = "lean-rs-worker-parent"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bbc760b8c6f2327d3d033a45fd11daa030841108fdfb38d82d204e5b6c44ac7"
 dependencies = [
  "lean-rs-worker-protocol",
  "lean-toolchain",
@@ -1098,8 +1085,6 @@ dependencies = [
 [[package]]
 name = "lean-rs-worker-protocol"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4216283d86185e495ecc55f1079ca91707bbe372738dfcf144b444e978888ccc"
 dependencies = [
  "lean-toolchain",
  "serde",
@@ -1157,8 +1142,6 @@ dependencies = [
 [[package]]
 name = "lean-toolchain"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b69e6cb0ee5dc5edab7d213df7578aaff96a9e178476d7439f7ed7b9612a1857"
 dependencies = [
  "fs4",
  "lean-rs-abi",

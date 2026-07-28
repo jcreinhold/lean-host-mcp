@@ -68,7 +68,6 @@ struct SmokeRecord {
     runtime_worker_generation: Option<u64>,
     runtime_worker_restarted: Option<bool>,
     runtime_retry_count: Option<u64>,
-    runtime_admission_wait_millis: Option<u64>,
     runtime_queue_wait_millis: Option<u64>,
     runtime_rss_kib: Option<u64>,
     runtime_call_restart_cause: Option<String>,
@@ -144,28 +143,22 @@ async fn black_box_mcp_smoke_perf_baseline() {
 }
 
 #[tokio::test]
-#[ignore = "manual black-box MCP burst with tight admission limits"]
-async fn black_box_pipelined_admission_pressure_returns_structured_statuses() {
+#[ignore = "manual black-box MCP burst against a single project's mailbox"]
+async fn black_box_pipelined_mailbox_pressure_returns_structured_statuses() {
     let scenario = Scenario {
-        label: "fixture_admission_pressure",
+        label: "fixture_mailbox_pressure",
         project_root: fixture_root(),
         calls: fixture_calls(),
     };
-    let mut server = McpServer::start_with_env(
-        &scenario.project_root,
-        &[
-            ("LEAN_HOST_MCP_SEMANTIC_PERMITS", "1"),
-            ("LEAN_HOST_MCP_SEMANTIC_WAITERS", "1"),
-            ("LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS", "1"),
-        ],
-    )
-    .await;
+    // One project in the pool concentrates the whole burst on one worker's
+    // mailbox, which is the server's only admission mechanism.
+    let mut server = McpServer::start_with_env(&scenario.project_root, &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")]).await;
 
     let burst = scenario.calls.iter().cycle().take(12).collect::<Vec<_>>();
     let responses = server
         .pipeline_tool_calls(&burst)
         .await
-        .expect("pipelined MCP admission-pressure burst should complete");
+        .expect("pipelined MCP mailbox-pressure burst should complete");
 
     for (call, response) in burst.iter().zip(responses.iter()) {
         assert!(
@@ -184,8 +177,11 @@ async fn black_box_pipelined_admission_pressure_returns_structured_statuses() {
         if status == "runtime_unavailable" {
             let reason = runtime_error_reason(&response.json).unwrap_or_default();
             assert!(
-                reason.starts_with("semantic_admission_") || reason == "mailbox_full",
-                "runtime pressure should be structured admission/mailbox pressure, got {reason}: {:?}",
+                matches!(
+                    reason.as_str(),
+                    "mailbox_full" | "mailbox_closed" | "project_pool_busy_all_entries_active"
+                ),
+                "runtime pressure should be structured mailbox/pool pressure, got {reason}: {:?}",
                 response.json
             );
         }
@@ -214,115 +210,199 @@ async fn black_box_pipelined_admission_pressure_returns_structured_statuses() {
     server.shutdown().await;
 }
 
-#[tokio::test]
-#[ignore = "manual RSS policy sweep for future threshold tuning"]
-async fn rss_threshold_sweep_fixture_sequence_reports_metrics() {
-    let scenario = Scenario {
-        label: "fixture_rss_sweep",
-        project_root: fixture_root(),
-        calls: fixture_calls(),
-    };
-    for threshold in [3_u64 * 1024 * 1024, 5_u64 * 1024 * 1024, 7_u64 * 1024 * 1024] {
-        let threshold_s = threshold.to_string();
-        let mut server = McpServer::start_with_env(
-            &scenario.project_root,
-            &[("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB", threshold_s.as_str())],
-        )
-        .await;
-        let started = Instant::now();
-        let mut status_counts = BTreeMap::<String, usize>::new();
-        let mut sessions = BTreeSet::<String>::new();
-        let mut cache_hits = 0usize;
-        let mut peak_server_rss_kib = server.rss_kib().unwrap_or_default();
-        let mut peak_runtime_rss_kib = 0_u64;
-        let mut max_worker_generation = 0_u64;
-        let mut final_worker_generation = None::<u64>;
-        let mut worker_restarted_true_count = 0usize;
-        let mut call_restart_count = 0usize;
-        let mut planned_restart_count = 0usize;
-        let mut unplanned_restart_count = 0usize;
-        let mut call_restart_causes = BTreeMap::<String, usize>::new();
-        let mut last_restart_causes = BTreeMap::<String, usize>::new();
-        let mut retry_count_total = 0_u64;
-        let mut max_retry_count = 0_u64;
-        let mut max_admission_wait_millis = 0_u64;
-        let mut max_queue_wait_millis = 0_u64;
-        let mut last_session_id = None;
+/// What one long replay observed about the worker, for the stability tests.
+#[derive(Debug)]
+struct StabilityReplay {
+    calls: usize,
+    wall_ms: u128,
+    generations: BTreeSet<u64>,
+    restart_causes: BTreeMap<String, usize>,
+    statuses: BTreeMap<String, usize>,
+    peak_runtime_rss_kib: u64,
+}
 
-        for call in &scenario.calls {
-            let record = server.call_tool("fixture_rss_sweep", call, &mut last_session_id).await;
-            *status_counts.entry(record.status.clone()).or_default() += 1;
-            if let Some(session) = last_session_id.as_ref() {
-                sessions.insert(session.clone());
-            }
-            if record.worker_cache_status.as_deref() == Some("hit") {
-                cache_hits = cache_hits.saturating_add(1);
-            }
-            if let Some(rss) = record.rss_after_kib {
-                peak_server_rss_kib = peak_server_rss_kib.max(rss);
-            }
-            if let Some(rss) = record.runtime_rss_kib {
-                peak_runtime_rss_kib = peak_runtime_rss_kib.max(rss);
-            }
+/// Replay `calls` against one server until `target` calls have completed.
+async fn replay_for_stability(label: &str, calls: &[ToolCall], target: usize) -> StabilityReplay {
+    assert!(!calls.is_empty(), "stability workload must not be empty");
+    let mut server = McpServer::start(&fixture_root()).await;
+    let started = Instant::now();
+    let mut last_session_id = None;
+    let mut replay = StabilityReplay {
+        calls: 0,
+        wall_ms: 0,
+        generations: BTreeSet::new(),
+        restart_causes: BTreeMap::new(),
+        statuses: BTreeMap::new(),
+        peak_runtime_rss_kib: 0,
+    };
+
+    while replay.calls < target {
+        for call in calls {
+            let record = server.call_tool(label, call, &mut last_session_id).await;
             if let Some(generation) = record.runtime_worker_generation {
-                max_worker_generation = max_worker_generation.max(generation);
-                final_worker_generation = Some(generation);
-            }
-            if record.runtime_worker_restarted == Some(true) {
-                worker_restarted_true_count = worker_restarted_true_count.saturating_add(1);
-            }
-            if let Some(count) = record.runtime_retry_count {
-                retry_count_total = retry_count_total.saturating_add(count);
-                max_retry_count = max_retry_count.max(count);
-            }
-            if let Some(wait) = record.runtime_admission_wait_millis {
-                max_admission_wait_millis = max_admission_wait_millis.max(wait);
-            }
-            if let Some(wait) = record.runtime_queue_wait_millis {
-                max_queue_wait_millis = max_queue_wait_millis.max(wait);
+                replay.generations.insert(generation);
             }
             if let Some(cause) = record.runtime_call_restart_cause.as_ref() {
-                call_restart_count = call_restart_count.saturating_add(1);
-                *call_restart_causes.entry(cause.clone()).or_default() += 1;
-                match record.runtime_call_restart_planned {
-                    Some(true) => planned_restart_count = planned_restart_count.saturating_add(1),
-                    Some(false) => unplanned_restart_count = unplanned_restart_count.saturating_add(1),
-                    None => {}
-                }
+                let seen = replay.restart_causes.entry(cause.clone()).or_default();
+                *seen = seen.saturating_add(1);
             }
-            if let Some(cause) = record.runtime_last_restart_cause.as_ref() {
-                *last_restart_causes.entry(cause.clone()).or_default() += 1;
+            if let Some(rss) = record.runtime_rss_kib {
+                replay.peak_runtime_rss_kib = replay.peak_runtime_rss_kib.max(rss);
             }
+            let seen = replay.statuses.entry(record.status.clone()).or_default();
+            *seen = seen.saturating_add(1);
+            replay.calls = replay.calls.saturating_add(1);
         }
-
-        println!(
-            "{}",
-            serde_json::to_string(&json!({
-                "event": "rss_threshold_sweep",
-                "threshold_kib": threshold,
-                "wall_ms": started.elapsed().as_millis(),
-                "session_count": sessions.len(),
-                "cache_hits": cache_hits,
-                "peak_server_rss_kib": peak_server_rss_kib,
-                "peak_runtime_rss_kib": peak_runtime_rss_kib,
-                "max_worker_generation": max_worker_generation,
-                "final_worker_generation": final_worker_generation,
-                "worker_restarted_true_count": worker_restarted_true_count,
-                "call_restart_count": call_restart_count,
-                "planned_restart_count": planned_restart_count,
-                "unplanned_restart_count": unplanned_restart_count,
-                "call_restart_causes": call_restart_causes,
-                "last_restart_causes": last_restart_causes,
-                "retry_count_total": retry_count_total,
-                "max_retry_count": max_retry_count,
-                "max_admission_wait_millis": max_admission_wait_millis,
-                "max_queue_wait_millis": max_queue_wait_millis,
-                "status_counts": status_counts,
-            }))
-            .expect("serialize RSS sweep record")
-        );
-        server.shutdown().await;
     }
+    replay.wall_ms = started.elapsed().as_millis();
+
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "event": "worker_stability",
+            "workload": label,
+            "calls": replay.calls,
+            "wall_ms": replay.wall_ms,
+            "worker_generations": replay.generations.iter().copied().collect::<Vec<u64>>(),
+            "restart_causes": replay.restart_causes,
+            "statuses": replay.statuses,
+            "peak_runtime_rss_kib": replay.peak_runtime_rss_kib,
+        }))
+        .expect("serialize worker stability record")
+    );
+    server.shutdown().await;
+    replay
+}
+
+/// One import profile, repeated: the worker must never recycle.
+///
+/// This is the direct statement of what session reuse bought. Before the worker
+/// child learned to reuse a matching session, the child re-imported on every
+/// call and a forced recycle every 64 requests contained the growth — so this
+/// fails at call 64 against that build, which is exactly the regression it
+/// exists to catch. It is also the arm that must stay free of the
+/// `WORKER_MAX_IMPORTS` cycle: a reused session is not an import.
+///
+/// **One profile, deliberately.** The mixed `fixture_calls()` workload rotates
+/// five import profiles — one more than `WORKER_MAX_IMPORTS`, so it cannot fit
+/// in the child's session pool and every full rotation does cycle. Two
+/// profiles, which do fit, are the subject of the
+/// `alternating_import_profiles_*` test below.
+///
+/// Ignored because it needs a built Lake fixture and takes minutes; it is the
+/// in-repo counterpart to `scripts/memory_stability.py` for a foreign project.
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; long-running worker-stability check"]
+async fn repeated_calls_on_one_import_profile_never_recycle_the_worker() {
+    // 200 calls: past the deleted `max_requests(64)` recycle by a wide enough
+    // margin that a reintroduction of any per-N-requests hygiene cycle is
+    // caught, not just squeaked past.
+    const TARGET_CALLS: usize = 200;
+
+    let calls = vec![ToolCall {
+        label: "steady_profile",
+        tool_name: "lean_lookup",
+        category: "declaration",
+        arguments: json!({
+            "kind": "declaration",
+            "name": "Nat.add_zero",
+            "imports": ["LeanRsFixture.Handles"]
+        }),
+    }];
+    let replay = replay_for_stability("worker_stability_steady", &calls, TARGET_CALLS).await;
+
+    assert!(
+        replay.restart_causes.is_empty(),
+        "{} calls on one import profile must not recycle the worker; causes: {:?}",
+        replay.calls,
+        replay.restart_causes
+    );
+    assert_eq!(
+        replay.generations.len(),
+        1,
+        "the worker generation must never advance across {} calls; saw {:?}",
+        replay.calls,
+        replay.generations
+    );
+}
+
+/// Alternating import profiles: the same contract as repeating one.
+///
+/// That equivalence is the point. A Lean environment imported with
+/// `loadExts := true` is never reclaimed, so a child that re-imports on every
+/// switch grows without bound — measured at about +1 GiB per switch, reaching
+/// 11.2 GiB and a `SIGKILL` from the OS before call 180. `WORKER_MAX_IMPORTS`
+/// bounded that by cycling the child, and this test used to assert *which*
+/// cause fired, because a cycle every other call was the price of switching.
+///
+/// The child now pools imported sessions instead of dropping the outgoing one,
+/// so returning to a profile it already holds is a key compare rather than an
+/// import. Two profiles are inside `WORKER_MAX_IMPORTS`, so this workload
+/// performs two imports in total and never reaches the bound — making it the
+/// same assertion as
+/// [`repeated_calls_on_one_import_profile_never_recycle_the_worker`], which is
+/// exactly the claim: **under pooling, switching profiles and repeating one are
+/// the same workload.**
+///
+/// The RSS ceiling stays as the CI backstop. Two live environments measured
+/// 1.68 GiB against 1.65 GiB for one live plus one dropped — the pool costs
+/// ~30 MB per extra environment — while the pre-pool alternating build passed
+/// 4 GiB before call 30.
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; long-running worker-stability check"]
+async fn alternating_import_profiles_reuse_pooled_sessions_and_never_recycle() {
+    const TARGET_CALLS: usize = 200;
+    const RSS_CEILING_KIB: u64 = 4 * 1024 * 1024;
+
+    let calls = vec![
+        ToolCall {
+            label: "alternating_profile_a",
+            tool_name: "lean_lookup",
+            category: "declaration",
+            arguments: json!({
+                "kind": "declaration",
+                "name": "Nat.add_zero",
+                "imports": ["LeanRsFixture.Handles"]
+            }),
+        },
+        ToolCall {
+            label: "alternating_profile_b",
+            tool_name: "lean_lookup",
+            category: "declaration",
+            arguments: json!({
+                "kind": "declaration",
+                "name": "Nat.add_zero",
+                "imports": ["LeanRsFixture.Strings", "LeanRsFixture.Scalars"]
+            }),
+        },
+    ];
+    let replay = replay_for_stability("worker_stability_alternating", &calls, TARGET_CALLS).await;
+
+    assert!(
+        replay.restart_causes.is_empty(),
+        "{} calls alternating two pooled import profiles must not recycle the worker; causes: {:?}",
+        replay.calls,
+        replay.restart_causes
+    );
+    assert_eq!(
+        replay.generations.len(),
+        1,
+        "the worker generation must never advance across {} calls; saw {:?}",
+        replay.calls,
+        replay.generations
+    );
+    assert_eq!(
+        replay.statuses.get("ok").copied().unwrap_or_default(),
+        replay.calls,
+        "every call must still answer across the cycles; statuses: {:?}",
+        replay.statuses
+    );
+    assert!(
+        replay.peak_runtime_rss_kib < RSS_CEILING_KIB,
+        "worker memory must stay bounded across {} import switches; peaked at {} KiB",
+        replay.calls,
+        replay.peak_runtime_rss_kib
+    );
 }
 
 async fn run_scenario(scenario: &Scenario, summary: &mut Summary) {
@@ -716,6 +796,11 @@ impl McpServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Prefer the worker built alongside this test over the developer's
+        // installed set. See `support::built_workers_dir`.
+        if let Some(dir) = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp")) {
+            command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
+        }
         for (key, value) in envs {
             command.env(key, value);
         }
@@ -813,7 +898,6 @@ impl McpServer {
                     runtime_worker_generation: runtime_u64(&response.json, "worker_generation"),
                     runtime_worker_restarted: runtime_bool(&response.json, "worker_restarted"),
                     runtime_retry_count: runtime_u64(&response.json, "retry_count"),
-                    runtime_admission_wait_millis: runtime_u64(&response.json, "admission_wait_millis"),
                     runtime_queue_wait_millis: runtime_u64(&response.json, "queue_wait_millis"),
                     runtime_rss_kib: runtime_u64(&response.json, "rss_kib"),
                     runtime_call_restart_cause: runtime_restart_str(&response.json, "call_restart", "cause"),
@@ -850,7 +934,6 @@ impl McpServer {
                 runtime_worker_generation: None,
                 runtime_worker_restarted: None,
                 runtime_retry_count: None,
-                runtime_admission_wait_millis: None,
                 runtime_queue_wait_millis: None,
                 runtime_rss_kib: None,
                 runtime_call_restart_cause: None,

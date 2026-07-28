@@ -68,7 +68,7 @@ order. Runtime counters, cache timings, and import lists remain telemetry, not t
 
 Lean-domain outcomes remain data. A failed tactic, a rejected declaration, an
 ambiguous name, or a `needs_build` verdict is not an MCP transport error.
-Infrastructure failures that the client can retry, such as worker admission
+Infrastructure failures that the client can retry, such as project mailbox
 pressure or restart-loop exhaustion, appear in `errors` with structured details.
 Warnings and next actions from the underlying implementation are also carried as
 warning issues in `errors`.
@@ -800,9 +800,8 @@ worker:
 
 ### `kind: "project"`
 
-Returns cheap project, toolchain, output, broker, and admission configuration.
-This mode uses Lake metadata only and does not open a worker or consume a
-semantic permit.
+Returns cheap project, toolchain, output, and broker configuration. This mode
+uses Lake metadata only and does not open a worker.
 
 ```json
 { "kind": "project" }

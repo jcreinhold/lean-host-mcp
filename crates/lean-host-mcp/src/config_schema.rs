@@ -51,52 +51,12 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
     },
     // ---- [runtime] — worker memory + lifecycle --------------------------
     FieldDoc {
-        key: "runtime.worker_rss_post_job_restart_kib",
+        key: "runtime.lean_max_memory_kib",
         ty: "integer (KiB)",
-        value: "5242880",
+        value: "8388608",
         commented: false,
-        overrides: "LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB",
-        description: "Post-job soft restart ceiling: after a call finishes, the worker is recycled if its resident memory is at or above this. Raise toward the hard-kill ceiling to recycle less often. Default 5 GiB.",
-    },
-    FieldDoc {
-        key: "runtime.worker_rss_hard_kill_kib",
-        ty: "integer (KiB)",
-        value: "16777216",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB",
-        description: "In-flight hard-kill ceiling: a call whose worker crosses this is killed mid-call so a runaway tactic cannot exhaust the machine. Must be at least the post-job ceiling. Default 16 GiB.",
-    },
-    FieldDoc {
-        key: "runtime.worker_rss_sample_millis",
-        ty: "integer (ms)",
-        value: "250",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS",
-        description: "How often the supervisor samples worker resident memory for the in-flight hard-kill watchdog.",
-    },
-    FieldDoc {
-        key: "runtime.import_switch_rss_soft_kib",
-        ty: "integer (KiB)",
-        value: "2097152",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB",
-        description: "Soft restart ceiling applied when a call needs a different import set than the live worker holds. Must not exceed the post-job ceiling. Default 2 GiB.",
-    },
-    FieldDoc {
-        key: "runtime.module_cache_rss_guard_kib",
-        ty: "integer (KiB)",
-        value: "2097152",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB",
-        description: "Resident-memory ceiling above which the per-worker module-query cache stops growing. Default 2 GiB.",
-    },
-    FieldDoc {
-        key: "runtime.module_cache_max_bytes",
-        ty: "integer (bytes)",
-        value: "33554432",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES",
-        description: "Maximum size of the per-worker module-query result cache, in bytes. Default 32 MiB.",
+        overrides: "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
+        description: "Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. An elaboration that crosses it fails as an ordinary Lean error inside the tool result, so the worker is not killed and other calls are unaffected. This replaced four resident-memory thresholds, which measured shared mmapped .olean pages and so fired on healthy workers. Default 8 GiB.",
     },
     FieldDoc {
         key: "runtime.request_timeout_millis",
@@ -109,10 +69,10 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
     FieldDoc {
         key: "runtime.project_mailbox_capacity",
         ty: "integer",
-        value: "8",
+        value: "16",
         commented: false,
         overrides: "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
-        description: "How many calls may queue for one project's worker before new calls are shed with a retryable busy status.",
+        description: "How many calls may queue for one project's worker before new calls are shed with a retryable busy status. This is the server's only admission mechanism; it applies per project, so distinct projects never contend for one budget.",
     },
     FieldDoc {
         key: "runtime.worker_restart_limit",
@@ -130,7 +90,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         overrides: "LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS",
         description: "Rolling window, in seconds, over which worker_restart_limit is counted.",
     },
-    // ---- [broker] — project pool + semantic admission -------------------
+    // ---- [broker] — project pool ---------------------------------------
     FieldDoc {
         key: "broker.max_projects",
         ty: "integer",
@@ -146,38 +106,6 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         commented: false,
         overrides: "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS",
         description: "Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes.",
-    },
-    FieldDoc {
-        key: "broker.semantic_permits",
-        ty: "integer",
-        value: "1",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_SEMANTIC_PERMITS",
-        description: "How many semantic (elaborating) calls run concurrently across all projects and parallel server processes sharing the semantic lock directory.",
-    },
-    FieldDoc {
-        key: "broker.semantic_waiters",
-        ty: "integer",
-        value: "16",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_SEMANTIC_WAITERS",
-        description: "How many semantic calls may queue for a permit before new ones are shed with a retryable semantic_admission_full status.",
-    },
-    FieldDoc {
-        key: "broker.semantic_admission_timeout_millis",
-        ty: "integer (ms)",
-        value: "60000",
-        commented: false,
-        overrides: "LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS",
-        description: "How long a semantic call waits for a permit before giving up with a retryable semantic_admission_timeout status. Default 60 seconds.",
-    },
-    FieldDoc {
-        key: "broker.semantic_lock_dir",
-        ty: "path",
-        value: "\"/path/to/semantic-admission-locks\"",
-        commented: true,
-        overrides: "LEAN_HOST_MCP_SEMANTIC_LOCK_DIR",
-        description: "Directory for OS-visible cross-process semantic admission locks. Unset uses the per-user cache directory. Parallel servers sharing a directory must agree on broker.semantic_permits.",
     },
     // ---- [server] — transport (CLI/env still override) ------------------
     FieldDoc {
@@ -364,7 +292,6 @@ mod tests {
             toml::from_str(&toml).unwrap_or_else(|e| panic!("generated TOML is invalid: {e}\n{toml}"));
         // The optional, commented knobs stay unset.
         assert!(config.primary_project.is_none());
-        assert!(config.broker.semantic_lock_dir.is_none());
         assert!(config.server.bind.is_none());
         assert!(config.server.http_path.is_none());
     }
@@ -378,27 +305,7 @@ mod tests {
         let config: ConfigFile = toml::from_str(&render_default_toml()).unwrap();
         let rt = ProjectRuntimeConfig::default();
 
-        assert_eq!(
-            config.runtime.worker_rss_post_job_restart_kib,
-            Some(rt.worker_rss_post_job_restart_kib())
-        );
-        assert_eq!(
-            config.runtime.worker_rss_hard_kill_kib,
-            Some(rt.worker_rss_hard_kill_kib())
-        );
-        assert_eq!(
-            config.runtime.worker_rss_sample_millis,
-            Some(rt.worker_rss_sample_millis())
-        );
-        assert_eq!(
-            config.runtime.import_switch_rss_soft_kib,
-            Some(rt.import_switch_rss_soft_kib())
-        );
-        assert_eq!(
-            config.runtime.module_cache_rss_guard_kib,
-            Some(rt.module_cache_rss_guard_kib())
-        );
-        assert_eq!(config.runtime.module_cache_max_bytes, Some(rt.module_cache_max_bytes()));
+        assert_eq!(config.runtime.lean_max_memory_kib, Some(rt.lean_max_memory_kib()));
         assert_eq!(config.runtime.request_timeout_millis, Some(rt.request_timeout_millis()));
         assert_eq!(config.runtime.project_mailbox_capacity, Some(rt.mailbox_capacity()));
         assert_eq!(config.runtime.worker_restart_limit, Some(rt.max_restarts_per_window()));
@@ -409,12 +316,6 @@ mod tests {
 
         assert_eq!(config.broker.max_projects, Some(broker::DEFAULT_MAX_PROJECTS));
         assert_eq!(config.broker.idle_timeout_secs, Some(broker::DEFAULT_IDLE_TIMEOUT_SECS));
-        assert_eq!(config.broker.semantic_permits, Some(broker::DEFAULT_SEMANTIC_PERMITS));
-        assert_eq!(config.broker.semantic_waiters, Some(broker::DEFAULT_SEMANTIC_WAITERS));
-        assert_eq!(
-            config.broker.semantic_admission_timeout_millis,
-            Some(broker::DEFAULT_SEMANTIC_ADMISSION_TIMEOUT_MILLIS)
-        );
     }
 
     /// Reduce a Markdown table to a grid of trimmed cells, normalising the

@@ -30,7 +30,7 @@ use crate::projections::{
 };
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::tools::position::{ProofPositionSelector, ProofStateRequest, ProofStateResult};
-use crate::tools::source_input::{module_name_for_file, read_query_file};
+use crate::tools::source_input::module_name_for_file;
 use crate::tools::{ToolContext, session_imports};
 
 const DEFAULT_LIMIT: usize = 10;
@@ -213,32 +213,41 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
         return Ok(Response::ok(result, identity.freshness).with_runtime(identity.runtime));
     }
 
-    let mut search_results = Vec::new();
-    let mut runtime: Option<RuntimeFacts> = semantic.as_ref().map(|call| call.runtime.clone());
-    for search in searches.iter().take(MAX_SEARCHES) {
-        let call = match run_declaration_search(ctx, project.clone(), profile.imports.clone(), search.request.clone())
-            .await
-        {
-            Ok(call) => call,
-            Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
-                let result = empty_result(profile.clone(), warnings, full);
-                let hint = ProjectHint::from_request(project);
-                let identity = ctx
-                    .broker
-                    .project_identity_without_worker(&hint, profile.imports.clone())?;
-                let response = Response::ok(result, identity.freshness).with_runtime(identity.runtime);
-                let response = crate::diagnosis::warn_needs_build(
-                    response,
-                    &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
-                );
-                return Ok(response
-                    .hint("supply a valid file or explicit imports; search_for_proof will not broad-import Mathlib as fallback"));
-            }
-            Err(err) => return Err(err),
-        };
-        runtime = Some(call.runtime);
-        search_results.push((search.label, call.value));
-    }
+    // One call for the whole group: the searches share an import set, so they
+    // share a session, and issuing them separately paid a session open — and
+    // therefore a full re-import — per search.
+    let group: Vec<_> = searches.iter().take(MAX_SEARCHES).collect();
+    let call = match run_declaration_searches(
+        ctx,
+        project.clone(),
+        profile.imports.clone(),
+        group.iter().map(|search| search.request.clone()).collect(),
+    )
+    .await
+    {
+        Ok(call) => call,
+        Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
+            let result = empty_result(profile.clone(), warnings, full);
+            let hint = ProjectHint::from_request(project);
+            let identity = ctx
+                .broker
+                .project_identity_without_worker(&hint, profile.imports.clone())?;
+            let response = Response::ok(result, identity.freshness).with_runtime(identity.runtime);
+            let response = crate::diagnosis::warn_needs_build(
+                response,
+                &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+            );
+            return Ok(response.hint(
+                "supply a valid file or explicit imports; search_for_proof will not broad-import Mathlib as fallback",
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    // The search group's facts, not the semantic call's: it is the later of the
+    // two and the one whose worker generation the response describes.
+    let runtime: RuntimeFacts = call.runtime;
+    // Results come back in request order, so labels re-pair positionally.
+    let search_results: Vec<_> = group.iter().map(|search| search.label).zip(call.value).collect();
 
     let search_count = search_results.len().saturating_add(usize::from(semantic.is_some()));
     let semantic = semantic.map(|call| call.value);
@@ -255,7 +264,6 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let freshness_imports = profile.imports.clone();
     let hint = ProjectHint::from_request(project);
     let identity = ctx.broker.project_identity_without_worker(&hint, freshness_imports)?;
-    let runtime = runtime.unwrap_or(identity.runtime);
     Ok(Response::ok(result, identity.freshness).with_runtime(runtime))
 }
 
@@ -273,8 +281,14 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: us
     ) {
         let hint = ProjectHint::from_request(req.project.clone());
         let meta = ctx.broker.resolve_meta(&hint)?;
-        let source_input = read_query_file(&meta.canonical_root, &file)?;
-        let (proof_response, namespace_name) = crate::tools::position::proof_state_internal(
+        // `proof_state_internal` reads the file to elaborate it and hands the
+        // same `QueryFile` back, so the semantic ranking below scores exactly
+        // the bytes that produced the goal state.
+        let crate::tools::position::ProofStateInternal {
+            response: proof_response,
+            namespace: namespace_name,
+            source: source_input,
+        } = crate::tools::position::proof_state_internal(
             ctx,
             ProofStateRequest {
                 file: file.clone(),
@@ -685,19 +699,23 @@ fn dedupe_searches(searches: Vec<PlannedSearch>) -> Vec<PlannedSearch> {
     out
 }
 
-async fn run_declaration_search(
+/// Run a group of searches against one session; results keep request order.
+async fn run_declaration_searches(
     ctx: &ToolContext,
     project: Option<String>,
     imports: Vec<String>,
-    search: LeanWorkerDeclarationSearch,
-) -> Result<BrokerCall<DeclarationSearchResult>> {
+    searches: Vec<LeanWorkerDeclarationSearch>,
+) -> Result<BrokerCall<Vec<DeclarationSearchResult>>> {
     let hint = ProjectHint::from_request(project);
+    // Uncached on purpose: a search names an environment, not a source file, so
+    // there is no content hash to invalidate the answer. See the module doc of
+    // `crate::cache`.
     let call = ctx
         .broker
-        .search_declarations(hint, session_imports(imports.clone()), imports, search)
+        .search_declarations(hint, session_imports(imports.clone()), imports, searches)
         .await?;
     Ok(BrokerCall {
-        value: project_declaration_search(call.value),
+        value: call.value.into_iter().map(project_declaration_search).collect(),
         runtime: call.runtime,
         freshness: call.freshness,
     })

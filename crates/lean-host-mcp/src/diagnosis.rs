@@ -193,12 +193,8 @@ pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 /// recycle, not a real result.
 ///
 /// Returns the `call_restart` event for a job-disrupting cause; `None`
-/// otherwise. The benign causes are deliberately excluded:
-/// - `rss_import_switch` / `import_profile_switch` cycle the worker *before* the
-///   job runs, so the job then executes on a fresh worker — its verdict is
-///   sound.
-/// - `max_requests` / `max_imports` / `idle` / `explicit` are planned hygiene
-///   cycles, not duress.
+/// otherwise. `max_requests` / `max_imports` / `idle` / `explicit` are excluded:
+/// they are planned hygiene cycles, not duress.
 ///
 /// `rss_post_job` *is* job-disrupting even though it fires after the job
 /// returned `Ok`: crossing the post-job RSS budget means the job elaborated
@@ -208,6 +204,13 @@ pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 /// value rather than crashing, so "the job returned `Ok`" is not evidence the
 /// verdict is sound. A `verified` verdict is never relabeled regardless, so a
 /// marginal-overage false positive only costs a retry hint.
+///
+/// This server no longer configures either RSS threshold — one Lean *heap*
+/// budget replaced them — so `rss_post_job` and `rss_hard_limit_exceeded`
+/// cannot fire under the shipped policy. They stay classified because
+/// `restart_cause_from_worker` still maps the upstream causes, and a
+/// classifier that silently reclassifies a cause it stops expecting is worse
+/// than one that keeps a quiet arm.
 ///
 /// The cause strings mirror `crate::project::RestartCause::as_str`; the unit
 /// test below pins the disrupting set so a new cause there is a conscious
@@ -241,7 +244,7 @@ pub(crate) fn execution_taint_text(event: &RuntimeRestartEvent) -> (String, Stri
         "the worker was recycled or restarted during this call ({cause}){rss}; any non-positive outcome here — a \
          rejection, `not_found`, a failed tactic, or empty goals — may be a casualty of the recycle rather than a real \
          result, and is not trustworthy. Retry; if it persists, the module is too heavy for the worker's memory budget \
-         (raise LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB or verify with `lake build` / `lake env lean`).",
+         (raise LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB or verify with `lake build` / `lake env lean`).",
         cause = event.cause,
     );
     let next_action = "retry; if it persists, verify with `lake build <module>` or `lake env lean <file>`".to_owned();
@@ -360,16 +363,8 @@ mod tests {
                 "{cause} should taint the verdict"
             );
         }
-        // A pre-job clean cycle and planned hygiene cycles do not: the job ran
-        // on a fresh worker, or the cycle was routine.
-        for cause in [
-            "rss_import_switch",
-            "import_profile_switch",
-            "max_requests",
-            "max_imports",
-            "idle",
-            "explicit",
-        ] {
+        // Planned hygiene cycles do not: the cycle was routine.
+        for cause in ["max_requests", "max_imports", "idle", "explicit"] {
             assert!(
                 execution_taint(&facts_with_restart(cause)).is_none(),
                 "{cause} should not taint the verdict"

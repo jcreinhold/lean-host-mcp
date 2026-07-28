@@ -56,10 +56,6 @@ fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize) -> Arc<
         cwd,
         max_projects,
         idle_timeout: Duration::ZERO,
-        semantic_permits: BrokerConfig::default_semantic_permits(),
-        semantic_waiters: BrokerConfig::default_semantic_waiters(),
-        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-        semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
     })
 }
 

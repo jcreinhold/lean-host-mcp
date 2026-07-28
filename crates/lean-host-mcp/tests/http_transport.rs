@@ -2,6 +2,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -307,16 +309,14 @@ async fn streamable_http_fixture_tool_call() {
 
 #[tokio::test]
 #[ignore = "requires built Lean fixture and worker binary"]
-async fn streamable_http_semantic_admission_concurrent_sessions_surface_structured_pressure() {
+async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
     let root = fixture_root();
     let root_s = root.to_string_lossy().into_owned();
+    // One project in the pool, so all six sessions contend for one worker's
+    // mailbox — the server's only admission mechanism.
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_str())],
-        &[
-            ("LEAN_HOST_MCP_SEMANTIC_PERMITS", "1"),
-            ("LEAN_HOST_MCP_SEMANTIC_WAITERS", "1"),
-            ("LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS", "1"),
-        ],
+        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
     )
     .await;
     let mut sessions = Vec::new();
@@ -358,7 +358,6 @@ async fn streamable_http_semantic_admission_concurrent_sessions_surface_structur
         match envelope_status(&response.json).as_str() {
             "ok" => {
                 *outcomes.entry("ok".to_owned()).or_default() += 1;
-                saw_wait |= runtime_u64(&response.json, "admission_wait_millis").unwrap_or_default() > 0;
                 saw_wait |= runtime_u64(&response.json, "queue_wait_millis").unwrap_or_default() > 0;
             }
             "runtime_unavailable" => {
@@ -366,7 +365,7 @@ async fn streamable_http_semantic_admission_concurrent_sessions_surface_structur
                 assert!(
                     matches!(
                         reason.as_str(),
-                        "semantic_admission_full" | "semantic_admission_timeout" | "mailbox_full"
+                        "mailbox_full" | "mailbox_closed" | "project_pool_busy_all_entries_active"
                     ),
                     "unexpected runtime_unavailable reason {reason}: {:?}",
                     response.json
@@ -377,10 +376,10 @@ async fn streamable_http_semantic_admission_concurrent_sessions_surface_structur
             other => panic!("unexpected envelope status {other}: {:?}", response.json),
         }
     }
-    assert!(
-        saw_pressure || saw_wait,
-        "concurrent HTTP sessions should reach broker admission/queue pressure"
-    );
+    // The contract under test is that runtime pressure is never an HTTP or
+    // JSON-RPC error — asserted per response above. Six sessions against a
+    // 16-deep mailbox need not shed, so neither `saw_pressure` nor `saw_wait`
+    // is required; they are reported below for the operator record.
     println!(
         "{}",
         json!({
@@ -440,6 +439,11 @@ impl HttpMcpServer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        // Prefer the worker built alongside this test over the developer's
+        // installed set. See `support::built_workers_dir`.
+        if let Some(dir) = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp")) {
+            command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
+        }
         for (key, value) in args {
             command.arg(key).arg(value);
         }

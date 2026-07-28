@@ -7,6 +7,8 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -50,13 +52,11 @@ async fn stdio_shutdown_on_stdin_eof_exits_parent() {
 
 #[tokio::test]
 async fn stdio_shutdown_after_tool_call_exits_worker_child() {
-    if !debug_worker_binary().is_file() {
-        eprintln!(
-            "skipping worker-child lifecycle check: {} is missing",
-            debug_worker_binary().display()
-        );
+    let Some(worker) = built_worker_binary() else {
+        eprintln!("skipping worker-child lifecycle check: no worker built in this profile");
         return;
-    }
+    };
+    assert!(worker.is_file(), "built worker path must exist: {}", worker.display());
 
     let registry = tempfile::tempdir().expect("temp registry");
     let mut server = StdioServer::start(&fixture_root(), registry.path());
@@ -107,11 +107,13 @@ impl StdioServer {
             .arg(project_root)
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", registry)
-            .env("LEAN_HOST_MCP_WORKERS_DIR", debug_workers_dir())
             .env("RUST_LOG", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(dir) = built_workers_dir() {
+            command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
+        }
         let mut child = command.spawn().expect("spawn lean-host-mcp stdio server");
         let stdin = child.stdin.take().expect("server stdin");
         let stdout = BufReader::new(child.stdout.take().expect("server stdout"));
@@ -282,17 +284,14 @@ fn fixture_root() -> PathBuf {
         .join("fixtures/lean")
 }
 
-fn debug_workers_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate has workspace parent")
-        .parent()
-        .expect("workspace has repository parent")
-        .join("target/debug")
+/// Hardcoding `target/debug` resolved to a stale or missing worker whenever the
+/// suite was built in another profile; derive it from the binary under test.
+fn built_workers_dir() -> Option<PathBuf> {
+    support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp"))
 }
 
-fn debug_worker_binary() -> PathBuf {
-    debug_workers_dir().join("lean-host-mcp-worker")
+fn built_worker_binary() -> Option<PathBuf> {
+    built_workers_dir().map(|dir| dir.join("lean-host-mcp-worker"))
 }
 
 #[cfg(unix)]

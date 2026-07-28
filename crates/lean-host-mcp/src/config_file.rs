@@ -45,27 +45,18 @@ pub struct ConfigFile {
 /// `[runtime]` — worker policy knobs (mirrors `ProjectRuntimeConfig`).
 #[derive(Debug, Default, Deserialize)]
 pub struct RuntimeFileConfig {
-    pub worker_rss_post_job_restart_kib: Option<u64>,
-    pub worker_rss_hard_kill_kib: Option<u64>,
-    pub worker_rss_sample_millis: Option<u64>,
-    pub import_switch_rss_soft_kib: Option<u64>,
-    pub module_cache_rss_guard_kib: Option<u64>,
-    pub module_cache_max_bytes: Option<u64>,
+    pub lean_max_memory_kib: Option<u64>,
     pub request_timeout_millis: Option<u64>,
     pub project_mailbox_capacity: Option<usize>,
     pub worker_restart_limit: Option<usize>,
     pub worker_restart_window_secs: Option<u64>,
 }
 
-/// `[broker]` — project-pool and semantic-admission knobs.
+/// `[broker]` — project-pool knobs.
 #[derive(Debug, Default, Deserialize)]
 pub struct BrokerFileConfig {
     pub max_projects: Option<usize>,
     pub idle_timeout_secs: Option<u64>,
-    pub semantic_permits: Option<usize>,
-    pub semantic_waiters: Option<usize>,
-    pub semantic_admission_timeout_millis: Option<u64>,
-    pub semantic_lock_dir: Option<PathBuf>,
 }
 
 /// `[server]` — transport knobs.
@@ -198,20 +189,18 @@ mod tests {
     #[test]
     fn merge_overlays_local_over_home_per_key() {
         let mut base = toml::from_str::<toml::Value>(
-            "primary_project = \"/home/proj\"\n[runtime]\nworker_rss_post_job_restart_kib = 5\n[broker]\nmax_projects = 8\n",
+            "primary_project = \"/home/proj\"\n[runtime]\nlean_max_memory_kib = 5\n[broker]\nmax_projects = 8\n",
         )
         .unwrap();
-        let overlay = toml::from_str::<toml::Value>(
-            "[runtime]\nworker_rss_post_job_restart_kib = 8\nworker_rss_hard_kill_kib = 16\n",
-        )
-        .unwrap();
+        let overlay =
+            toml::from_str::<toml::Value>("[runtime]\nlean_max_memory_kib = 8\nrequest_timeout_millis = 16\n").unwrap();
         merge_toml(&mut base, overlay);
         let config: ConfigFile = base.try_into().unwrap();
 
         // Local overrode the one runtime key it set...
-        assert_eq!(config.runtime.worker_rss_post_job_restart_kib, Some(8));
+        assert_eq!(config.runtime.lean_max_memory_kib, Some(8));
         // ...added its own...
-        assert_eq!(config.runtime.worker_rss_hard_kill_kib, Some(16));
+        assert_eq!(config.runtime.request_timeout_millis, Some(16));
         // ...and left untouched home keys (runtime sibling + other sections) intact.
         assert_eq!(config.broker.max_projects, Some(8));
         assert_eq!(config.primary_project.as_deref(), Some(Path::new("/home/proj")));
@@ -220,16 +209,17 @@ mod tests {
     #[test]
     fn full_example_parses() {
         let config: ConfigFile = toml::from_str::<toml::Value>(
-            "[runtime]\nworker_rss_post_job_restart_kib = 8388608\nworker_restart_window_secs = 60\n\
-             [broker]\nmax_projects = 4\nsemantic_permits = 1\n\
+            "[runtime]\nlean_max_memory_kib = 8388608\nworker_restart_window_secs = 60\n\
+             [broker]\nmax_projects = 4\nidle_timeout_secs = 600\n\
              [server]\nbind = \"127.0.0.1:8765\"\nhttp_path = \"/mcp\"\n",
         )
         .unwrap()
         .try_into()
         .unwrap();
 
-        assert_eq!(config.runtime.worker_rss_post_job_restart_kib, Some(8_388_608));
+        assert_eq!(config.runtime.lean_max_memory_kib, Some(8_388_608));
         assert_eq!(config.broker.max_projects, Some(4));
+        assert_eq!(config.broker.idle_timeout_secs, Some(600));
         assert_eq!(config.server.bind.as_deref(), Some("127.0.0.1:8765"));
         assert_eq!(config.server.http_path.as_deref(), Some("/mcp"));
     }
@@ -238,7 +228,7 @@ mod tests {
     fn empty_config_is_all_none() {
         let config = ConfigFile::default();
         assert!(config.primary_project.is_none());
-        assert!(config.runtime.worker_rss_post_job_restart_kib.is_none());
+        assert!(config.runtime.lean_max_memory_kib.is_none());
         assert!(config.broker.max_projects.is_none());
         assert!(config.server.bind.is_none());
     }

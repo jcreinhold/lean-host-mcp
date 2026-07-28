@@ -30,8 +30,9 @@ use lean_host_mcp::tools::semantic::{
 use lean_host_mcp::tools::{OutputBudgetOverrides, TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
     BrokerConfig, CoordinateSpace, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker,
-    ProofAttemptResult, Severity,
+    ProjectHint, ProofAttemptResult, Severity,
 };
+use lean_rs_worker_parent::{LeanWorkerDeclarationFilter, LeanWorkerDeclarationNameMatch, LeanWorkerDeclarationSearch};
 
 fn fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").ok().map(PathBuf::from)
@@ -54,10 +55,6 @@ fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
         cwd: root.to_path_buf(),
         max_projects: BrokerConfig::default_max_projects(),
         idle_timeout: BrokerConfig::default_idle_timeout(),
-        semantic_permits: BrokerConfig::default_semantic_permits(),
-        semantic_waiters: BrokerConfig::default_semantic_waiters(),
-        semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-        semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
     });
     ToolContext { broker, config }
 }
@@ -1804,13 +1801,243 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
 
     assert!(proof.runtime().is_some(), "proof_state should include runtime facts");
     assert!(
-        inspect
-            .runtime()
-            .is_some_and(|runtime| runtime.queue_wait_millis > 0 || runtime.admission_wait_millis > 0),
-        "parallel calls should report queue or admission wait metadata"
-    );
-    assert!(
         verify.runtime().is_some(),
         "verify_declaration should include runtime facts"
     );
+
+    // One project means one actor thread running one job at a time, so
+    // concurrent calls against it are serialized by its mailbox. At least one
+    // of the three must therefore observe a nonzero mailbox wait. This asserts
+    // the *shape* of same-project concurrency, not a latency budget — see
+    // `multi_project::concurrent_calls_across_projects_do_not_queue` for the
+    // complementary claim that *different* projects do not serialize.
+    let waits: Vec<u64> = [proof.runtime(), inspect.runtime(), verify.runtime()]
+        .iter()
+        .map(|runtime| runtime.map_or(0, |facts| facts.queue_wait_millis))
+        .collect();
+    assert!(
+        waits.iter().any(|wait| *wait > 0),
+        "concurrent same-project calls must queue behind the project's single actor; queue_wait_millis={waits:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call() {
+    let Some(root) = fixture_root() else {
+        return;
+    };
+    let ctx = open_ctx(&root);
+    let imports = vec!["LeanRsFixture.Handles".to_owned()];
+    let request = || InspectDeclarationRequest {
+        name: "Nat.add_zero".to_owned(),
+        file: None,
+        imports: imports.clone(),
+        project: None,
+        raw_statement: false,
+        fields: InspectDeclarationFields::default(),
+    };
+
+    // First call opens the session and stamps the import's artifact.
+    let first = inspect_declaration(&ctx, request()).await.expect("first inspect");
+    let first_generation = first
+        .runtime()
+        .expect("full verbosity keeps runtime facts")
+        .worker_generation;
+
+    // A second identical call must reuse everything: same session, no recycle.
+    // Asserted first so the recycle below is attributable to the mtime bump
+    // and not to something this workload does on every repeat.
+    let steady = inspect_declaration(&ctx, request()).await.expect("second inspect");
+    let steady_runtime = steady.runtime().expect("full verbosity keeps runtime facts");
+    assert!(
+        steady_runtime.call_restart.is_none(),
+        "a repeat call must not recycle: {:?}",
+        steady_runtime.call_restart
+    );
+    assert_eq!(steady_runtime.worker_generation, first_generation);
+
+    // Now stand in for `lake build`: move the imported module's `.olean`
+    // mtime forward. Forward, not backward, so the artifact stays newer than
+    // its source and Lake still considers the fixture built.
+    let olean = root.join(".lake/build/lib/lean/LeanRsFixture/Handles.olean");
+    let bumped = std::fs::metadata(&olean)
+        .expect("fixture must be built")
+        .modified()
+        .unwrap()
+        + std::time::Duration::from_mins(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&olean)
+        .expect("open the imported olean")
+        .set_modified(bumped)
+        .expect("bump the olean mtime");
+
+    let after = inspect_declaration(&ctx, request()).await.expect("third inspect");
+    let after_runtime = after.runtime().expect("full verbosity keeps runtime facts");
+    assert_eq!(
+        after_runtime.call_restart.as_ref().map(|event| event.cause.as_str()),
+        Some("artifacts_rebuilt"),
+        "a rebuilt import must recycle the worker so the next session re-imports; runtime={after_runtime:?}"
+    );
+    assert!(
+        after_runtime.worker_generation > first_generation,
+        "the recycle must actually advance the worker generation: {} -> {}",
+        first_generation,
+        after_runtime.worker_generation
+    );
+    // The recycle is pre-job, so the answer is still a real one.
+    assert!(matches!(after.status, lean_host_mcp::ResponseStatus::Ok));
+}
+
+/// A rebuild must be caught even when another import profile ran in between.
+///
+/// The child pools sessions, so the profile served two calls ago is still alive
+/// and would be restored without re-importing — from `.olean` files that have
+/// since changed. Before the pool a differing profile always re-imported, so
+/// remembering only the immediately preceding profile was enough; this pins the
+/// property that survived that change.
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn a_rebuild_recycles_even_when_another_profile_ran_in_between() {
+    let Some(root) = fixture_root() else {
+        return;
+    };
+    let ctx = open_ctx(&root);
+    let request = |module: &str| InspectDeclarationRequest {
+        name: "Nat.add_zero".to_owned(),
+        file: None,
+        imports: vec![module.to_owned()],
+        project: None,
+        raw_statement: false,
+        fields: InspectDeclarationFields::default(),
+    };
+    // Profile A stamps its artifact, then profile B takes over as the live one.
+    let first = inspect_declaration(&ctx, request("LeanRsFixture.Handles"))
+        .await
+        .expect("inspect under profile A");
+    let first_generation = first
+        .runtime()
+        .expect("full verbosity keeps runtime facts")
+        .worker_generation;
+    let other = inspect_declaration(&ctx, request("LeanRsFixture.Strings"))
+        .await
+        .expect("inspect under profile B");
+    let other_runtime = other.runtime().expect("full verbosity keeps runtime facts");
+    assert!(
+        other_runtime.call_restart.is_none(),
+        "switching profiles must not recycle on its own: {:?}",
+        other_runtime.call_restart
+    );
+
+    // Stand in for `lake build` on A's import only. Forward, so the artifact
+    // stays newer than its source and Lake still considers the fixture built.
+    let olean = root.join(".lake/build/lib/lean/LeanRsFixture/Handles.olean");
+    let bumped = std::fs::metadata(&olean)
+        .expect("fixture must be built")
+        .modified()
+        .unwrap()
+        + std::time::Duration::from_mins(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&olean)
+        .expect("open the imported olean")
+        .set_modified(bumped)
+        .expect("bump the olean mtime");
+
+    let back = inspect_declaration(&ctx, request("LeanRsFixture.Handles"))
+        .await
+        .expect("inspect back under profile A");
+    let back_runtime = back.runtime().expect("full verbosity keeps runtime facts");
+    assert_eq!(
+        back_runtime.call_restart.as_ref().map(|event| event.cause.as_str()),
+        Some("artifacts_rebuilt"),
+        "returning to a rebuilt profile must recycle rather than reuse the pooled session; runtime={back_runtime:?}"
+    );
+    assert!(
+        back_runtime.worker_generation > first_generation,
+        "the recycle must actually advance the worker generation: {} -> {}",
+        first_generation,
+        back_runtime.worker_generation
+    );
+    assert!(matches!(back.status, lean_host_mcp::ResponseStatus::Ok));
+
+    // And it must not recycle again: the fresh child imported A at the new
+    // stamp, so the very next call has nothing left to invalidate.
+    let settled = inspect_declaration(&ctx, request("LeanRsFixture.Handles"))
+        .await
+        .expect("inspect after the recycle");
+    let settled_runtime = settled.runtime().expect("full verbosity keeps runtime facts");
+    assert!(
+        settled_runtime.call_restart.is_none(),
+        "one rebuild must cost exactly one recycle: {:?}",
+        settled_runtime.call_restart
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn batched_declaration_searches_answer_in_request_order() {
+    let Some(root) = fixture_root() else {
+        return;
+    };
+    let ctx = open_ctx(&root);
+
+    // Three fragments, no one of which is a substring of another, each matching
+    // a distinct fixture declaration. `search_for_proof` re-pairs the batch's
+    // results to their labels *positionally*, so order is the contract: with
+    // these inputs any permutation — a swap or a rotation — fails, which no
+    // weaker assertion (counts, non-emptiness, a set of names) can detect.
+    let fragments = ["stringIdentity", "levelSucc", "exprBVar"];
+    let requests: Vec<_> = fragments
+        .iter()
+        .map(|fragment| LeanWorkerDeclarationSearch {
+            name_fragment: Some((*fragment).to_owned()),
+            name_match: LeanWorkerDeclarationNameMatch::Contains,
+            kind: None,
+            required_constants: Vec::new(),
+            conclusion_head: None,
+            scope_biases: Vec::new(),
+            limit: 8,
+            filter: LeanWorkerDeclarationFilter {
+                include_private: false,
+                include_generated: false,
+                include_internal: false,
+            },
+            include_source: false,
+        })
+        .collect();
+
+    let imports = vec![
+        "Init".to_owned(),
+        "LeanRsFixture.Strings".to_owned(),
+        "LeanRsFixture.Handles".to_owned(),
+    ];
+    let call = ctx
+        .broker
+        .search_declarations(ProjectHint::from_request(None), imports.clone(), imports, requests)
+        .await
+        .expect("batched declaration search should complete");
+
+    assert_eq!(
+        call.value.len(),
+        fragments.len(),
+        "the batch must answer every request exactly once"
+    );
+    for (fragment, result) in fragments.iter().zip(&call.value) {
+        let names: Vec<&str> = result.declarations.iter().map(|row| row.name.as_str()).collect();
+        assert!(
+            !names.is_empty(),
+            "fragment {fragment} must match at least one fixture declaration, or the ordering \
+             assertion below is vacuous"
+        );
+        // Case-insensitively: the worker's `Contains` match is, so `levelSucc`
+        // legitimately answers with `Lean.mkLevelSucc`. Folding case keeps the
+        // three fragments pairwise distinguishable, which is all the oracle needs.
+        let needle = fragment.to_lowercase();
+        assert!(
+            names.iter().all(|name| name.to_lowercase().contains(&needle)),
+            "result for {fragment} answers a different request: {names:?}"
+        );
+    }
 }

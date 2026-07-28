@@ -35,12 +35,27 @@ name = "module_query_roundtrip"
 harness = false
 name = "multi_project_dispatch"
 
+[[bench]]
+harness = false
+name = "search_for_proof"
+
+[[bench]]
+harness = false
+name = "import_switch"
+
+[[bench]]
+harness = false
+name = "cache_hit"
+
+[[bench]]
+harness = false
+name = "ilean_reference_scan"
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
-fs4 = "1.1"
 lru = "0.18"
 parking_lot = "0.12"
 regex = "1"

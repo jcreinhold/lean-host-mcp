@@ -9,6 +9,120 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **One import per session instead of one per call.** The root cause of the server's memory growth was upstream: the
+  worker child rebuilt its host session on every `OpenHostSession`, so every tool call ran a full `importModules`, and
+  under `loadExts := true` those imported regions are never reclaimable. Child RSS therefore grew with the *number of
+  calls*, not with the workload — measured at ~1.18 GiB per import, 2.9 GiB across eleven repeat opens. lean-rs now
+  reuses a session whose `(project_root, mode, imports, import_profile)` match. Warm `search_for_proof` on the fixture
+  fell from 1.41 s to 1.26 s (−10.3%, p = 0.01) on top of the batching win that preceded it.
+- **One Lean heap budget replaces four resident-memory thresholds.** `runtime.lean_max_memory_kib` (default 8 GiB,
+  `LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB`) is enforced inside the child by `lean_internal_set_max_memory`, so an elaboration
+  that exhausts it fails as ordinary Lean-domain data inside the `ok` payload and the worker keeps serving. Removed:
+  `runtime.worker_rss_post_job_restart_kib`, `runtime.worker_rss_hard_kill_kib`, `runtime.worker_rss_sample_millis`,
+  `runtime.import_switch_rss_soft_kib`, the `invalid RSS config` startup check, and the forced recycle every 64
+  requests. All four measured resident memory, which counts the shared, clean, mmapped `.olean` pages every
+  Mathlib-scale worker maps at startup — so they fired on healthy workers while doing nothing about the growth above.
+  Dropping the hard-kill watchdog also removes the supervisor's polling read loop, which forked `/bin/ps` on macOS every
+  250 ms during an in-flight call. RSS is still sampled once per call for `runtime.rss_kib`; no policy reads it.
+  `[runtime]` goes from 10 knobs to 5.
+- `scripts/rss_threshold_sweep.py` is now `scripts/memory_stability.py`: it replays a workload `--repeats` times against
+  **one** server and reports whether the worker generation advances, rather than sweeping thresholds that no longer
+  exist.
+- **Worker cycling is bounded by import count.** Session reuse removes growth with call *count*, but not with import
+  *count*: an environment imported with `loadExts := true` is never reclaimed, so a child that keeps importing keeps
+  growing. Measured by alternating two import profiles against one server: about +1 GiB per switch, monotone, with
+  per-call latency degrading from 0.4 s to 5 s and the OS delivering a `SIGKILL` before call 180. Both worker builders
+  now set `max_imports`, the count of the thing that actually accumulates — no `ps` fork, no byte threshold that would
+  fire immediately on Mathlib and never on a small project. A workload that repeats one import profile never trips it (a
+  reused session is not an import); one that alternates cycles about every other call and stays at 1.65 GiB. The
+  supervisor's own all-causes restart backstop is raised to match, because its default of 16 per minute counted these
+  planned cycles and, once exhausted, refused to spawn any replacement at all.
+- **Switching import profiles no longer costs a re-import, and `max_imports` is now a bound on distinct profiles.** The
+  entry above bounded import growth by cycling the child; it did not stop the child from re-importing on every switch,
+  and each of those imports was the thing being bounded. The reason it dropped the outgoing environment first — to avoid
+  holding two at once — turns out not to buy anything: under `loadExts := true` an import's compacted regions survive
+  the environment that owns them, so dropping reclaims essentially nothing. Measured in fresh processes at a fixed
+  import count, holding N environments live costs 30–50 MB more than holding one and dropping N−1, against 0.8–1.0 GiB
+  per import — 4–6% of a single import. The worker child therefore parks the outgoing session in a bounded pool, and
+  `WORKER_MAX_IMPORTS` goes from 2 to 4. An alternating workload is now the same workload as a repeating one: 200 calls
+  over two profiles perform 2 imports, never recycle the worker, and peak at 1.68 GiB, where before they cycled the
+  child roughly every other call. On `benches/worker_roundtrip.rs` an `inspect_declaration` that switches profiles every
+  iteration runs in 2.17 ms against 2.36 ms for one that does not — the switch is now a key comparison and a round trip,
+  where it used to be ~787 ms of respawn and re-import. A client rotating through more profiles than the pool holds
+  still sees planned `max_imports` cycles.
+- **`artifacts_rebuilt` now catches a rebuild under any profile the child may still hold, not just the last one.** The
+  check previously skipped whenever the incoming import profile differed from the previous call's, on the grounds that a
+  differing profile re-imports anyway. Under pooling it does not: a profile served several calls ago can be restored
+  without importing, and would be served from `.olean` files rebuilt since. The controller now stamps each profile the
+  child may be holding, bounded by the same `WORKER_MAX_IMPORTS` that sizes the child's pool. Cost is unchanged at one
+  `stat` per import per call.
+- **Opening a worker no longer spends an import proving it can.** Both worker builders opened a session during startup
+  purely as validation. This server hands every real call its own imports, so it passed an empty import set to the
+  builder and never reused the session that open produced — one full import, one pooled session slot, and one of
+  `max_imports`, spent on an environment no call could reach, on every project open and on every per-call semantic
+  child. A builder given no imports now opens no session; one given imports still opens eagerly, since then the session
+  it prepares is the one later calls reuse. Deployment validation is unchanged and still runs up front, because
+  `LeanWorkerHostHandleBuilder::check` — which the server calls when it opens a project — opens a session
+  unconditionally.
+
+- **Project-scope `lean_lookup(kind = "references")` parses less instead of remembering more.** Over a 1431-module
+  project (76 MB of `.ilean`), a phase split put ~95% of the cost in the JSON parse, so the reader stopped doing the
+  parsing it was throwing away: every document was parsed **twice**, because the `version` probe that looked like a
+  cheap prefix read actually walked the whole file (Lean's `Json` is an `RBNode`, so `Json.compress` sorts the keys and
+  `version` lands last — byte 116,287 of 116,299 in a sampled file); one shared document type served both entry points,
+  so a reference query materialized and discarded the whole `decls` subtree while a declaration outline discarded the
+  whole `references` subtree; and the reference map was built in full and *then* filtered, at ~400k transient
+  allocations corpus-wide. The version gate now runs after a single parse (with the future-version verdict preserved by
+  a re-probe on the failure path only), `references` and `decls` have independent projections, and matching entries are
+  selected during deserialization so allocation is proportional to hits. Whole-project worst case 427 ms → ~120 ms. The
+  reader still holds no cache and no state between calls.
+- A `files`-restricted reference query now reads only the indices that can contribute, instead of scanning the whole
+  project and filtering afterwards: 271 ms → ~0.5 ms for one file. A path the reader cannot invert with certainty —
+  including Lake's mangled filenames, e.g. module `«kan-lint-style»` indexing as `kan-lint-style.ilean` — falls the
+  whole request back to the full walk, so a narrowed answer is never smaller than an unnarrowed one.
+
+### Added
+
+- `benches/worker_roundtrip.rs` gains an `inspect_declaration_alternating_imports` arm, the direct measurement of what
+  an import switch costs.
+- `benches/ilean_reference_scan.rs` measures a project-scope reference query end to end, with a no-hit arm that
+  separates the scan floor from result construction and a narrowed arm. The previous number on record — "~565 ms" — was
+  a single wall-clock sample from an `#[ignore]`d test on a corpus a third the size.
+- A reused session's environment is a snapshot taken at import, so a `lake build` that rewrites an imported `.olean`
+  would otherwise keep being answered from the pre-build environment. The controller now stamps the newest `.olean`
+  mtime among a session's imports, re-stamps before each reusing call, and recycles the worker when it advances —
+  reported as `artifacts_rebuilt` in `runtime.call_restart`. One `stat` per import per call; the whole-build-tree scan
+  the obvious alternative implies measured 160–190 ms warm over mathlib4's 8408 `.olean` files.
+- `lean_status` reports `broker.lean_max_memory_kib`.
+- `benches/cache_hit.rs` measures what a warm `proof_state` on an unmodified file costs — **57.6 µs**, against 21 ms
+  when a one-comment edit changes the content hash and forces the elaboration. Nothing covered this: the existing
+  `module_query_roundtrip` calls the uncached entry point and measures a full 18–20 ms worker round trip.
+- `benches/import_switch.rs` prices an import-profile switch against one resident project: 4.9 ms steady versus 555 ms
+  alternating.
+
+### Fixed
+
+- The project-scope reference scan no longer blocks a tokio worker thread. It is file I/O and JSON parsing from first
+  byte to last, called straight from an `async fn` with no `spawn_blocking`, so on a large project it stalled the
+  runtime for the duration of the scan.
+- `telemetry.verbosity = full` now actually puts the telemetry block on the wire. The semantic boundary dropped it at
+  `quiet` and then discarded it at `full` too, because `SemanticResponse` had no field to carry it — so the documented
+  knob had no observable effect, and every `runtime_*` column in the `smoke_perf` JSONL harness was silently always
+  null. Worker generation, restart history, RSS, and the full import list are observable again under `full`; `quiet`
+  still omits the key entirely.
+- Integration suites that spawn a server now prefer the worker built alongside them over the developer's *installed*
+  worker under `~/Library/Application Support`. Without the pin a suite silently exercised whatever binary was installed
+  last — which invalidated a worker-memory measurement here, because the installed worker predated the session-reuse fix
+  it was supposed to be testing. `stdio_lifecycle` additionally hardcoded `target/debug`, so it resolved nothing at all
+  under `cargo test --release`.
+- `scripts/memory_stability.py` reported every memory and restart fact as `null`. It read the pre-semantic tool names
+  (`inspect_declaration`, `proof_state`, …), looked for the envelope in `structuredContent` when the server's default
+  carrier is `content` text, addressed the old `runtime`/`freshness` layout rather than `telemetry.runtime`/`trust`, and
+  never asked the server for the telemetry block it was trying to read. A run therefore reported "no restarts" when it
+  had measured nothing at all.
+
 ## [0.7.0] - 2026-07-24
 
 ### Added
@@ -18,8 +132,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   rendering machinery. A proof-stepping trial loop no longer needs a per-step `lean_context` call; boundaries stay
   available as a one-shot navigation call.
 - `retry_tainted_non_positive` (default `false`) on `lean_trial` and `lean_verify` opts into one server-side retry of a
-  non-positive verdict when the worker was recycled mid-call (tainted by the RSS watchdog). With the flag off,
-  behavior is byte-for-byte unchanged: the taint is still reported via `execution_taint` and the existing
+  non-positive verdict when the worker was recycled mid-call (tainted by the RSS watchdog). With the flag off, behavior
+  is byte-for-byte unchanged: the taint is still reported via `execution_taint` and the existing
   relabel-to-`worker_recycled` policy.
 - Batch trial results gain `post_closure_diagnostics`: error-severity entries are moved off `closed` candidates, so a
   `closed` candidate's own diagnostics are error-free and the post-closure consequences (e.g. `no goals` from a
@@ -31,9 +145,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **Breaking:** `lean_context` drops the declaration echo fields from its default response and makes the boundary
-  list and `expected_type` opt-in (`include_boundaries`, `include_expected_type`, both default `false`). The trimmed
-  default response is roughly half the old size; set the flags for the old shape.
+- **Breaking:** `lean_context` drops the declaration echo fields from its default response and makes the boundary list
+  and `expected_type` opt-in (`include_boundaries`, `include_expected_type`, both default `false`). The trimmed default
+  response is roughly half the old size; set the flags for the old shape.
 - Adopted the `lean-rs` 0.5 line (`lean-rs-worker-{child,parent,protocol}` and `lean-toolchain` 0.4 → 0.5) and the
   `lean-semantic-search` 0.5 stack; the supported Lean window is unchanged (`4.26.0 ..= 4.33.0-rc1`).
 - Completeness flags that equal their default are omitted from MCP responses instead of serialized (`verified`,

@@ -41,10 +41,6 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
                 cwd: root.clone(),
                 max_projects: BrokerConfig::default_max_projects(),
                 idle_timeout: BrokerConfig::default_idle_timeout(),
-                semantic_permits: BrokerConfig::default_semantic_permits(),
-                semantic_waiters: BrokerConfig::default_semantic_waiters(),
-                semantic_admission_timeout: BrokerConfig::default_semantic_admission_timeout(),
-                semantic_lock_dir: BrokerConfig::default_semantic_lock_dir(),
             });
             let ctx = ToolContext {
                 broker,

@@ -25,36 +25,27 @@ Discovery at startup:
 
 When both exist they **merge per key**: the home file sets baseline values and the local file overrides only the keys it
 sets. A missing file is fine; a malformed file is logged and ignored. The same startup validation applies whatever the
-source (RSS ordering, non-zero pool guards).
+source (non-zero guards on every budget and pool size).
 
 ## Configuration reference
 
 Every knob, with the environment variable — and, for the transport knobs, the CLI flag — that overrides it. Precedence
 per knob is **CLI flag > env var > file > built-in default**, so an env var still overrides the file and existing
-`LEAN_HOST_MCP_*` setups keep working unchanged. RSS thresholds are in KiB and byte caps in bytes; a magnitude in a
-description (e.g. "5 GiB") is for reading, not for setting.
+`LEAN_HOST_MCP_*` setups keep working unchanged. Memory budgets are in KiB and byte caps in bytes; a magnitude in a
+description (e.g. "8 GiB") is for reading, not for setting.
 
 <!-- BEGIN GENERATED: do not edit by hand. Regenerate from `config_schema::render_reference_table`; the `operations_md_reference_table_is_in_sync` test fails when this block drifts. -->
 
 | Key | Type | Default | Override | Description |
 | --- | --- | --- | --- | --- |
 | `primary_project` | path | unset | `--lake-root / LEAN_HOST_MCP_PROJECT` | Default Lake project for calls that omit an explicit project= argument. Lowest-priority fallback, after the flag/env and the nearest lakefile above the working directory. |
-| `runtime.worker_rss_post_job_restart_kib` | integer (KiB) | `5242880` | `LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB` | Post-job soft restart ceiling: after a call finishes, the worker is recycled if its resident memory is at or above this. Raise toward the hard-kill ceiling to recycle less often. Default 5 GiB. |
-| `runtime.worker_rss_hard_kill_kib` | integer (KiB) | `16777216` | `LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB` | In-flight hard-kill ceiling: a call whose worker crosses this is killed mid-call so a runaway tactic cannot exhaust the machine. Must be at least the post-job ceiling. Default 16 GiB. |
-| `runtime.worker_rss_sample_millis` | integer (ms) | `250` | `LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS` | How often the supervisor samples worker resident memory for the in-flight hard-kill watchdog. |
-| `runtime.import_switch_rss_soft_kib` | integer (KiB) | `2097152` | `LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB` | Soft restart ceiling applied when a call needs a different import set than the live worker holds. Must not exceed the post-job ceiling. Default 2 GiB. |
-| `runtime.module_cache_rss_guard_kib` | integer (KiB) | `2097152` | `LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB` | Resident-memory ceiling above which the per-worker module-query cache stops growing. Default 2 GiB. |
-| `runtime.module_cache_max_bytes` | integer (bytes) | `33554432` | `LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES` | Maximum size of the per-worker module-query result cache, in bytes. Default 32 MiB. |
+| `runtime.lean_max_memory_kib` | integer (KiB) | `8388608` | `LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB` | Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. An elaboration that crosses it fails as an ordinary Lean error inside the tool result, so the worker is not killed and other calls are unaffected. This replaced four resident-memory thresholds, which measured shared mmapped .olean pages and so fired on healthy workers. Default 8 GiB. |
 | `runtime.request_timeout_millis` | integer (ms) | `120000` | `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS` | Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose lean_verify/lean_context work legitimately runs longer; lower it to bound a single heavy file query. Default 120 s. |
-| `runtime.project_mailbox_capacity` | integer | `8` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls may queue for one project's worker before new calls are shed with a retryable busy status. |
+| `runtime.project_mailbox_capacity` | integer | `16` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls may queue for one project's worker before new calls are shed with a retryable busy status. This is the server's only admission mechanism; it applies per project, so distinct projects never contend for one budget. |
 | `runtime.worker_restart_limit` | integer | `3` | `LEAN_HOST_MCP_WORKER_RESTART_LIMIT` | How many worker restarts are tolerated within the restart window before the project is marked unhealthy. |
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
 | `broker.max_projects` | integer | `4` | `LEAN_HOST_MCP_MAX_PROJECTS` | How many distinct Lake projects stay open at once; on overflow the least-recently-used project's worker is evicted. |
 | `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes. |
-| `broker.semantic_permits` | integer | `1` | `LEAN_HOST_MCP_SEMANTIC_PERMITS` | How many semantic (elaborating) calls run concurrently across all projects and parallel server processes sharing the semantic lock directory. |
-| `broker.semantic_waiters` | integer | `16` | `LEAN_HOST_MCP_SEMANTIC_WAITERS` | How many semantic calls may queue for a permit before new ones are shed with a retryable semantic_admission_full status. |
-| `broker.semantic_admission_timeout_millis` | integer (ms) | `60000` | `LEAN_HOST_MCP_SEMANTIC_ADMISSION_TIMEOUT_MILLIS` | How long a semantic call waits for a permit before giving up with a retryable semantic_admission_timeout status. Default 60 seconds. |
-| `broker.semantic_lock_dir` | path | unset | `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR` | Directory for OS-visible cross-process semantic admission locks. Unset uses the per-user cache directory. Parallel servers sharing a directory must agree on broker.semantic_permits. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
 | `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
 | `server.response_carrier` | string (text, structured, both) | `"text"` | `LEAN_HOST_MCP_RESPONSE_CARRIER` | Which field of the tool result carries the semantic response. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text. |
@@ -66,29 +57,84 @@ description (e.g. "5 GiB") is for reading, not for setting.
 <!-- END GENERATED -->
 
 `output.max_field_bytes` and `output.max_total_bytes` bound model-facing payloads before they leave the worker. Tight
-caps are useful for smoke tests and for very large proof states, but they can also make proof-step batches partial:
-once the total proof-action budget is exhausted the current candidate reports `budget_exceeded` and later candidates
-report `not_attempted`. Retry the promising snippet alone, or raise `LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES`, when the
-response summary shows nonzero `budget_exceeded`, `not_attempted`, or `output_truncated` counts.
+caps are useful for smoke tests and for very large proof states, but they can also make proof-step batches partial: once
+the total proof-action budget is exhausted the current candidate reports `budget_exceeded` and later candidates report
+`not_attempted`. Retry the promising snippet alone, or raise `LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES`, when the response
+summary shows nonzero `budget_exceeded`, `not_attempted`, or `output_truncated` counts.
 
-The three RSS ceilings must satisfy `import_switch <= post_job <= hard_kill`; the server **refuses to start** with a
-clear `invalid RSS config: …` message otherwise (an inverted order makes the cheaper planned cycle unreachable — e.g.
-`post_job` above `hard_kill` means every overrun escalates straight to an in-flight hard kill). To recycle less often
-under memory pressure, raise `post_job` toward (but below) `hard_kill` — e.g.
-`LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB=8388608` for an 8 GiB post-job ceiling.
+### Rebuilt artifacts
 
-`broker.semantic_permits` is enforced across all `lean-host-mcp` processes sharing `broker.semantic_lock_dir`, not just
-inside one server process. The default lock namespace lives under the current user's cache directory at
-`lean-host-mcp/semantic-admission`; set `LEAN_HOST_MCP_SEMANTIC_LOCK_DIR` only when you need an explicit namespace.
-Permit files are visible as `permit-000.lock`, `permit-001.lock`, and so on, with best-effort holder metadata. Parallel
-servers are serialized only when they share the same lock directory. Servers that share a lock directory must also agree
-on `broker.semantic_permits`; a process that requests a different count while another permit is active is rejected with
-`semantic_admission_config`. Stop existing servers or choose a fresh lock directory before changing the limit.
+A worker session's Lean environment is a **snapshot taken at import**. The child reuses a session whose imports match
+the request, so `.olean` files written after that import are invisible to it — a `lake build` in another terminal would
+otherwise keep being answered from the pre-build environment. (Before the worker child learned to reuse sessions it
+re-imported on every call, and that accident is what used to hide this.)
 
-The admission boundary covers every path that may open, spawn, restart, or run a Lean worker. Cheap metadata paths use
-the Lake files directly and do not acquire a semantic permit: degraded `needs_build` responses, invalid-request
-responses, and project-scope `.ilean` reference reads can report project identity without opening a worker. File-scope
-reference lookup and all declaration/proof operations still acquire a permit before the project can open.
+The server therefore stamps the newest modification time among the *imported modules'* own `.olean` files when it opens
+a session, re-stamps before each call that would reuse it, and recycles the worker when the stamp has advanced. The
+recycle happens before the job runs, so the call is answered by a fresh worker and the result is sound; it appears as an
+`artifacts_rebuilt` entry in `runtime.call_restart` and one `info` log line. The cost is one `stat` per import per call.
+
+Two limits worth stating. Only the modules a call names in its import set are watched, not their full transitive closure
+— nearly the same set in practice, because Lake's traces include each dependency's hash, so rebuilding a dependency
+rebuilds the `.olean` of everything importing it. And the check compares mtimes, so a build that leaves every imported
+artifact byte- and time-identical is correctly treated as no change.
+
+### Memory
+
+`runtime.lean_max_memory_kib` is the only memory *knob*, and it bounds the wrong-quantity problem out of existence.
+Earlier releases carried four *resident*-memory thresholds — an import-switch soft cycle, a post-job recycle, an
+in-flight hard kill, and a forced recycle every 64 requests. Resident memory counts the shared, clean, mmapped `.olean`
+pages a Mathlib-scale worker maps at startup, so those thresholds fired on healthy workers while doing nothing about the
+process that was genuinely growing. One cause of that growth — the worker child re-importing on every call — is fixed at
+the source: a call whose imports match the live session reuses it, so nothing accumulates as long as a client keeps
+asking about the same imports.
+
+What remains is a ceiling on the Lean **heap**, enforced inside Lean by `lean_internal_set_max_memory` rather than by
+watching the process from outside. Crossing it is an ordinary elaboration failure inside the tool result: the worker
+keeps running, concurrent calls are unaffected, and the response says which declaration was too expensive. Raise it if a
+legitimately heavy module reports memory exhaustion; lower it to make a runaway tactic fail sooner.
+
+### Import cycling
+
+Importing is the one thing that still accumulates. A Lean environment imported with `loadExts := true` cannot be
+reclaimed, so every import a child performs is retained until that child exits — measured on the bundled fixture at
+roughly **+1 GiB per import**, reaching 11.2 GiB and an OS `SIGKILL` before call 180 when nothing bounded it.
+
+The worker child therefore keeps a small pool of imported sessions rather than dropping the outgoing one when the
+imports change. Returning to a profile it still holds is a key comparison, not an import: an alternating workload
+imports once per **distinct** profile instead of once per switch. Holding an environment alive rather than dropping it
+costs 30–50 MB, against the 0.8–1.0 GiB the import that produced it costs, because the regions outlive the environment
+either way.
+
+The server cycles a worker after a small number of imports, which — the pool being the same size — is also the number of
+distinct import profiles one child may hold. This is not tunable and needs no attention in normal use. A client working
+one proof loop repeats one import profile and never triggers it, because a reused session is not an import; a client
+that alternates among a handful of profiles does not trigger it either, because a pooled session is not an import. A
+client that rotates through more profiles than the pool holds sees a `max_imports` entry in `runtime.call_restart`,
+logged at `debug`. Those cycles are planned — they do not count toward `runtime.worker_restart_limit`, and the call that
+triggers one still answers normally. If you see `max_imports` dominating your logs, the fix is on the client side: draw
+related calls from a smaller set of `imports` lists rather than varying it per call.
+
+## Concurrency and admission
+
+There is no process-wide or cross-process admission gate. Each resident project owns one worker child and one dedicated
+thread that runs a single job at a time, so a project's work is serialized by construction;
+`runtime.project_mailbox_capacity` bounds how many calls may wait for that thread before further calls are shed with a
+retryable `mailbox_full` status. Server-wide concurrency is therefore `broker.max_projects` workers, one in-flight call
+each — calls against *different* projects run at the same time and never queue behind one another. Parallel
+`lean-host-mcp` processes are likewise independent; if a machine cannot hold that many workers, lower
+`broker.max_projects`.
+
+Cheap metadata paths never open a worker at all: degraded `needs_build` responses, invalid-request responses, and
+project-scope `.ilean` reference reads answer from the Lake files directly. A repeat module query on an unmodified file
+is answered from the per-project result cache and likewise never enters the mailbox, so a warm call does not queue
+behind in-flight Lean work.
+
+**Semantic search costs a second child, briefly.** `search_for_proof`'s semantic ranking runs in its own worker child,
+separate from the one serving elaboration. It is spawned for the call and released when the call ends, so two children
+are alive only for the duration of a semantic search and the steady-state footprint stays at one worker per resident
+project. Keeping that child resident between calls was tried and measured *slower*; the note on
+`open_semantic_capability` in `src/project.rs` records why.
 
 ## Observing worker recycles
 
@@ -100,15 +146,21 @@ Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `r
 
 - `warn` — abnormal/crash causes: `rss_hard_limit_exceeded`, `child_abort`, `child_exit`, `session_missing`,
   `worker_internal`, `timeout`, `cancelled` (and `restart limit exceeded; marking project unhealthy`).
-- `info` — memory-pressure cycles: `rss_post_job`, `rss_import_switch` (the frequency to watch when tuning the budget),
-  plus `opened project` / `idle reaper evicted projects` lifecycle lines.
-- `debug` — pure hygiene (`max_requests`, `max_imports`, `idle`, `explicit`), per-call tool entry, project resolution,
-  the `job` span, and a `post-job rss check` showing live RSS vs the `post_job` ceiling.
+- `info` — `artifacts_rebuilt` (a `.olean` among the imports of a session the child may still hold was rewritten, so the
+  child was recycled), memory-pressure cycles (`rss_post_job`), plus `opened project` / `idle reaper evicted projects`
+  lifecycle lines.
+- `debug` — pure hygiene (`max_imports`, `max_requests`, `idle`, `explicit`), per-call tool entry, project resolution,
+  and the `job` span.
+
+The server no longer configures any resident-memory threshold, so in practice you see the abnormal causes above,
+`explicit`, `artifacts_rebuilt`, and `max_imports` (see "Import cycling"). `rss_post_job` / `rss_hard_limit_exceeded`
+and `max_requests` stay in the vocabulary because the supervisor still reports them if a future policy asks for them;
+seeing one today means the worker was configured somewhere other than here.
 
 Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for the per-call detail. Example at default level:
 
 ```text
-INFO worker recycled (memory pressure) cause=rss_post_job rss_kib=Some(7340032) limit_kib=Some(5242880) restarts_total=4
+INFO worker recycled (imports rebuilt on disk) cause=artifacts_rebuilt worker_generation=2 planned=true restarts_total=1
 ```
 
 The same data reaches the MCP client in `response.runtime`: the per-call cause in `call_restart`, the most recent in
@@ -119,8 +171,8 @@ when no recycle has happened).
 
 The idle reaper (`LEAN_HOST_MCP_IDLE_TIMEOUT_SECS`) governs resident per-project controllers, not the parent server
 process. A stdio server exits when its transport closes: it serves until the client closes the server's stdin. It also
-watches the process that launched it and exits if that parent PID disappears or changes without a clean MCP shutdown.
-An HTTP server is separate: it exits on Ctrl-C, SIGTERM, or ordinary process shutdown. Both transport exit paths call
+watches the process that launched it and exits if that parent PID disappears or changes without a clean MCP shutdown. An
+HTTP server is separate: it exits on Ctrl-C, SIGTERM, or ordinary process shutdown. Both transport exit paths call
 `ProjectBroker::shutdown_all`, which closes resident projects before the process returns.
 
 Project shutdown is bounded by the worker layer. The host stops accepting new project work, queued messages receive
@@ -149,8 +201,8 @@ lean-host-mcp doctor processes --cleanup-stale-records
 ```
 
 Cleanup removes records whose PID is no longer alive. It does not kill live processes and does not infer ownership from
-an executable name, command substring, or port number. Do not use broad process-name cleanup; identify the exact PID from
-the registry or from `ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
+an executable name, command substring, or port number. Do not use broad process-name cleanup; identify the exact PID
+from the registry or from `ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
 
 ## Runtime-error contract
 
@@ -164,11 +216,11 @@ JSON-RPC errors:
   "errors": [
     {
       "code": "runtime_unavailable",
-      "message": "semantic_admission_timeout",
+      "message": "mailbox_full",
       "severity": "error",
       "retryable": true,
       "details": {
-        "reason": "semantic_admission_timeout",
+        "reason": "mailbox_full",
         "project_root": "/abs/path",
         "session_id": "uuid",
         "worker_generation": 3,
@@ -176,7 +228,7 @@ JSON-RPC errors:
         "restart_cause": null,
         "rss_kib": 2097152,
         "limit_kib": null,
-        "retry_after_millis": 60000,
+        "retry_after_millis": null,
         "restarts_in_window": 1,
         "window_millis": 60000
       }
@@ -213,8 +265,9 @@ Which failures land where:
 
 - **Lean-domain failures** — parse errors, elaboration diagnostics, kernel rejection, meta timeout — are part of `data`.
   A failed proof is a successful tool call.
-- **Retryable runtime failures** — admission pressure, mailbox pressure (`busy`), worker death, session loss, RSS
-  hard-kill — are `errors` with `code: "runtime_unavailable"` and `retryable: true`.
+- **Retryable runtime failures** — mailbox pressure (`busy`), project-pool pressure, worker death, session loss — are
+  `errors` with `code: "runtime_unavailable"` and `retryable: true`. Exhausting the Lean heap budget is *not* one of
+  these: it is a Lean-domain failure, reported in `data` like any other elaboration error.
 - **MCP errors** are reserved for I/O and config failures, internal-invariant violations, and unusable Lake projects.
 
 ## Prompt-stack verification through MCP
@@ -233,9 +286,9 @@ lean-host-mcp --lake-root /path/to/kan-proofs --bind 127.0.0.1:8765
 
 The checker does not start or manage the server. Use a built Lake project, and rebuild/install workers after upgrading
 the host so the server and worker protocol stay in step. The MCP backend calls `lean_verify` with sorry rejection and
-axiom reporting, using `lean_trial(kind = "command")` only for declarations that verification cannot row-report, such
-as definitions whose axiom set must still be checked. `--changed REF --backend mcp` preserves the checker's
-file-level changed-prompt selection and uses MCP verification for the selected prompts.
+axiom reporting, using `lean_trial(kind = "command")` only for declarations that verification cannot row-report, such as
+definitions whose axiom set must still be checked. `--changed REF --backend mcp` preserves the checker's file-level
+changed-prompt selection and uses MCP verification for the selected prompts.
 
 Fallback is explicit:
 
@@ -253,10 +306,10 @@ With fallback, the checker reports the fallback and uses the Lake backend for th
 ### Internal runtime facts
 
 The operation layer still computes freshness/import and runtime facts before semantic response adaptation. Runtime facts
-include worker generation, whether a call observed or performed a restart, retry count, admission wait, controller queue
-wait, RSS when available, import profile, profile-switch count, and restart history. These remain telemetry and are
-omitted at the default quiet verbosity. Proof-relevant artifact facts are public under `trust.artifacts` and survive the
-quiet telemetry gate: source snapshots (`source` / `file` / `edit_fresh`), build artifacts (`olean` or `ilean` with
+include worker generation, whether a call observed or performed a restart, retry count, controller queue wait, RSS when
+available, import profile, profile-switch count, and restart history. These remain telemetry and are omitted at the
+default quiet verbosity. Proof-relevant artifact facts are public under `trust.artifacts` and survive the quiet
+telemetry gate: source snapshots (`source` / `file` / `edit_fresh`), build artifacts (`olean` or `ilean` with
 `build_fresh`, `stale_build`, or `missing_build`), and worker/toolchain availability facts.
 
 ## Capability shims and module queries
@@ -342,9 +395,8 @@ stdio MCP server, calls `tools/list`, runs representative tool calls, and emits 
 response bytes, 32 KiB / 64 KiB budget flags, status, warning count, observable project-session changes, and process RSS
 when the platform exposes it. For `lean_context(kind = "proof_position")`, rows also include the worker module-cache
 status, worker-reported output bytes, phase timings, and optional worker cache size facts. The budget constants are
-test-only guardrails:
-ordinary model-facing responses should aim for 16–32 KiB, with 64 KiB as the default hard ceiling. Production truncation
-is still tool-specific policy.
+test-only guardrails: ordinary model-facing responses should aim for 16–32 KiB, with 64 KiB as the default hard ceiling.
+Production truncation is still tool-specific policy.
 
 ```sh
 cargo build -p lean-host-mcp

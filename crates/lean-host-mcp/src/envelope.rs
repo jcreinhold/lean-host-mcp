@@ -113,7 +113,6 @@ pub struct RuntimeFacts {
     pub worker_generation: u64,
     pub worker_restarted: bool,
     pub retry_count: u32,
-    pub admission_wait_millis: u64,
     pub queue_wait_millis: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_restart: Option<RuntimeRestartEvent>,
@@ -329,7 +328,6 @@ mod tests {
             worker_generation: 4,
             worker_restarted: false,
             retry_count: 0,
-            admission_wait_millis: 0,
             queue_wait_millis: 0,
             call_restart: None,
             last_restart: Some(RuntimeRestartEvent {

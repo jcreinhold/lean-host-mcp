@@ -128,13 +128,15 @@ single client surveys several projects. A call that omits it resolves the projec
 2. Walk upward from the server's working directory for `lakefile.{toml,lean}`
 3. `primary_project` in the config file (`./lean-host-mcp.toml` or `~/.config/lean-host-mcp/config.toml`)
 
-All tunable knobs (worker memory ceilings, pool sizing, transport) can also be set in that config file instead of env
-vars. Run `lean-host-mcp config init` to write a documented starter with every option at its default, then edit it. See
+All tunable knobs (the worker's Lean heap budget, pool sizing, transport) can also be set in that config file instead
+of env vars. Run `lean-host-mcp config init` to write a documented starter with every option at its default, then edit it. See
 [Configuration file](docs/operations.md#configuration-file) for discovery and precedence, and
 [Configuration reference](docs/operations.md#configuration-reference) for the full per-knob table.
-`broker.semantic_permits` is a per-user cross-process admission limit by default; parallel servers that share the same
-semantic lock directory queue worker-opening semantic calls until a permit is free. Metadata-only degraded responses and
-project-scope `.ilean` reference reads do not open workers and do not consume permits.
+Concurrency is `broker.max_projects` resident workers, one in-flight call each: a project's calls are serialized by its
+own actor thread, but calls against different projects run at the same time. `runtime.project_mailbox_capacity` bounds
+how many calls may wait for one project before further ones are shed with a retryable `busy` status. Metadata-only
+degraded responses, project-scope `.ilean` reference reads, and warm module-query cache hits do not open or queue on a
+worker.
 
 ## Response Shape
 
@@ -167,7 +169,7 @@ Artifact facts use stable tokens: `artifact` is `source`, `olean`, `ilean`, or `
 telemetry never removes these trust facts.
 
 The split that matters: **Lean-domain failures** (parse errors, elaboration diagnostics, kernel rejection, meta timeout)
-ride inside `data` — a failed proof is still a successful call. **Recoverable runtime failures** (admission or mailbox
+ride inside `data` — a failed proof is still a successful call. **Recoverable runtime failures** (mailbox or project-pool
 pressure, worker death, session loss) appear in `errors` with a retryable flag and structured details. **MCP errors**
 are reserved for I/O/config failures and unusable Lake projects. By default the semantic response rides as JSON text in
 `content`; `server.response_carrier` (`structured` / `both`) can place it in `structuredContent` instead. Tools

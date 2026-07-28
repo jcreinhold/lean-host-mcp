@@ -30,25 +30,58 @@ use lean_semantic_search_runtime::SemanticSearchRuntimeBuild;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::admission::SemanticPermit;
 use crate::cache::ModuleQueryCache;
 use crate::config_file::RuntimeFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
-use crate::lake_meta::LakeProjectMeta;
+use crate::lake_meta::{self, LakeProjectMeta};
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
 
-/// LRU capacity for exact bounded module query results.
-const MODULE_QUERY_CACHE_CAPACITY: usize = 256;
-const WORKER_REQUEST_RESTARTS: u64 = 64;
-const PROJECT_MAILBOX_CAPACITY: usize = 8;
-const WORKER_RSS_POST_JOB_RESTART_KIB: u64 = 5 * 1024 * 1024;
-const WORKER_RSS_HARD_KILL_KIB: u64 = 16 * 1024 * 1024;
-const WORKER_RSS_SAMPLE_MILLIS: u64 = 250;
-const IMPORT_SWITCH_RSS_SOFT_KIB: u64 = 2 * 1024 * 1024;
-const MODULE_CACHE_RSS_GUARD_KIB: u64 = 2 * 1024 * 1024;
-const MODULE_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// LRU capacity for exact bounded module-query results, applied to the single
+/// and batch caches separately.
+///
+/// This bounds memory outright rather than approximately. Every cached value is
+/// a worker reply already truncated to the 64 KiB `total_bytes` budget the tools
+/// send (`DEFAULT_TOTAL_BYTES` in `tools/`), so one project holds at most
+/// `2 × 64 × 64 KiB = 8 MiB` and the default four-project pool at most 32 MiB —
+/// no byte-accounting LRU required, which is the machinery this design avoids.
+///
+/// 64 rather than the former 256 because the working set is small and concrete:
+/// an agent iterates on a handful of files, and each file contributes one entry
+/// per distinct query shape. 256 sized the cache for a workload nobody has;
+/// what it actually bought was a 4× larger worst case.
+const MODULE_QUERY_CACHE_CAPACITY: usize = 64;
+/// Lean *heap* ceiling for a worker child, enforced inside the child by
+/// `lean_internal_set_max_memory`.
+///
+/// This replaced four RSS thresholds — an import-switch soft cycle, a post-job
+/// recycle, a 16 GiB in-flight hard kill, and a forced recycle every 64
+/// requests. All four existed to contain a child whose RSS grew with the
+/// *number of tool calls*, because every session open re-ran `importModules`
+/// and those regions were never reclaimable. The worker child now reuses a
+/// matching session, so the growth they contained is gone, and what is left is
+/// one runaway elaboration — which is a heap problem, not an RSS one.
+///
+/// RSS was the wrong quantity to measure regardless. It counts shared, clean,
+/// mmapped `.olean` pages that the kernel can drop at will: a Mathlib child
+/// reads multiple GiB of RSS while its actual footprint is a fraction of that,
+/// so an RSS ceiling fires on healthy workers and says nothing about the
+/// unhealthy ones. Lean's own heap accounting is the quantity that
+/// distinguishes them.
+///
+/// Overrun surfaces as a `LeanWorkerElabFailure` inside the `ok` payload —
+/// the Lean-domain-failure contract — rather than as a kill, a result taint, or
+/// a restart. 8 GiB because a single elaboration that legitimately needs more
+/// than that is a Lean-side problem an agent cannot act on either way.
+const LEAN_MAX_MEMORY_KIB: u64 = 8 * 1024 * 1024;
+/// Depth of one project's job queue, and the only admission mechanism in the
+/// server. The actor thread runs one job at a time, so this bounds how many
+/// callers may be waiting on a single worker before the project sheds load
+/// retryably rather than queueing without limit. Sized to the process-wide
+/// waiter bound the deleted semantic-admission semaphore used to enforce, now
+/// applied per project — different projects no longer contend for one budget.
+const PROJECT_MAILBOX_CAPACITY: usize = 16;
 /// Per-request worker deadline. Covers one tool call end to end (live rows,
 /// diagnostics, terminal response); on expiry the worker is recycled and the
 /// call returns a retryable runtime error. Replaces the worker-parent's 10-min
@@ -56,9 +89,75 @@ const MODULE_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// `find_references` at project scope) appear to hang. Raise it for unusually
 /// heavy modules whose `verify`/`proof_state` legitimately runs longer.
 const REQUEST_TIMEOUT_MILLIS: u64 = 120 * 1000;
+/// How many *imports* one worker child may run before the supervisor cycles it,
+/// and — the same number, structurally — how many imported environments that
+/// child pools.
+///
+/// This is the **entire** memory policy for import residue.
+/// [`LEAN_MAX_MEMORY_KIB`] bounds the Lean *heap*; an import's compacted regions
+/// are mmapped outside that heap, so it does not see them. Nothing else does
+/// either.
+///
+/// Session reuse removed growth with call count, but not with import count: a
+/// Lean environment imported with `loadExts := true` cannot be reclaimed
+/// (`Environment.freeRegions` is unsound there), so every import a child
+/// performs is retained for the life of that child even after its session is
+/// dropped. Measured on `fixtures/lean` by alternating two import profiles
+/// against one server (`scripts/memory_stability.py`): child RSS rose from
+/// 1.26 GiB to 11.2 GiB over ~10 switches, per-call latency degraded from 0.4 s
+/// to 5 s, and the OS killed the child with `SIGKILL` at 178 calls.
+///
+/// So the bound belongs on imports. A workload that repeats one import profile
+/// — the proof loop this server exists to serve — never trips it, because a
+/// reused session is not an import and does not count
+/// (`Response::HostSessionReused` leaves `imports_since_restart` untouched).
+///
+/// Since the child pools sessions rather than dropping the outgoing one, a
+/// workload that *switches* profiles doesn't trip it either, as long as it
+/// cycles among at most this many: returning to a pooled profile is a key
+/// compare, not an import. That makes this a bound on **distinct** profiles per
+/// child generation, which is why it can afford to be larger than the `2` that
+/// bounded switches.
+///
+/// `4` from the three-arm measurement in `lean-rs`'s `long_session_memory`
+/// example (`pooled-distinct`), fresh process per arm, `.olean`-backed RSS at
+/// the end:
+///
+/// | distinct | imports | live envs | peak RSS |
+/// |----------|---------|-----------|----------|
+/// | 2, dropped   | 2  | 1 | 1.650 GB |
+/// | 2, pooled    | 2  | 2 | 1.679 GB |
+/// | 2, alternating | 8 | 1 | 8.824 GB |
+/// | 4, dropped   | 4  | 1 | 4.043 GB |
+/// | 4, pooled    | 4  | 4 | 4.190 GB |
+/// | 4, alternating | 16 | 1 | ~7.9 GB |
+///
+/// Holding an environment alive instead of dropping it costs 30–50 MB against
+/// the 0.8–1.0 GiB the import that produced it costs — 4–6%, because the
+/// regions outlive the environment either way. So the pool is nearly free and
+/// the *imports* are what to count: four distinct profiles cost ~4.2 GiB
+/// pooled versus ~7.9 GiB and four times the imports without.
+///
+/// This is deliberately *not* an RSS threshold. RSS counts shared, clean,
+/// mmapped `.olean` pages, so any byte-valued limit either fires immediately on
+/// a Mathlib-scale project or never fires on a small one; the import count is
+/// the quantity that actually leaks, and reading it costs no `ps` fork.
+const WORKER_MAX_IMPORTS: u64 = 4;
 const MAX_JOB_RETRIES: u32 = 1;
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_mins(1);
+/// Backstop on *every* worker cycle in one [`RESTART_WINDOW`], planned or not.
+///
+/// The supervisor's own limit, distinct from [`MAX_RESTARTS_PER_WINDOW`], which
+/// this actor applies to abnormal causes only. The supervisor cannot make that
+/// distinction, so its default of 16 counts [`WORKER_MAX_IMPORTS`] cycles —
+/// and exhausting it is terminal: the supervisor refuses to spawn a
+/// replacement and every later call fails with "shutdown is in progress". A
+/// workload that alternates import profiles reached that state after 16 calls
+/// and never recovered. Sized far above any legitimate cycle rate so that only
+/// a genuine spawn loop can reach it; the discriminating breaker is this
+/// actor's own.
+const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 
 /// Runtime policy for one private project actor.
 ///
@@ -67,12 +166,7 @@ const RESTART_WINDOW: Duration = Duration::from_mins(1);
 /// rereading process environment during project open.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectRuntimeConfig {
-    worker_rss_post_job_restart_kib: u64,
-    worker_rss_hard_kill_kib: u64,
-    worker_rss_sample_millis: u64,
-    import_switch_rss_soft_kib: u64,
-    module_cache_rss_guard_kib: u64,
-    module_cache_max_bytes: u64,
+    lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
     max_restarts_per_window: usize,
@@ -82,12 +176,7 @@ pub struct ProjectRuntimeConfig {
 impl Default for ProjectRuntimeConfig {
     fn default() -> Self {
         Self {
-            worker_rss_post_job_restart_kib: WORKER_RSS_POST_JOB_RESTART_KIB,
-            worker_rss_hard_kill_kib: WORKER_RSS_HARD_KILL_KIB,
-            worker_rss_sample_millis: WORKER_RSS_SAMPLE_MILLIS,
-            import_switch_rss_soft_kib: IMPORT_SWITCH_RSS_SOFT_KIB,
-            module_cache_rss_guard_kib: MODULE_CACHE_RSS_GUARD_KIB,
-            module_cache_max_bytes: MODULE_CACHE_MAX_BYTES,
+            lean_max_memory_kib: LEAN_MAX_MEMORY_KIB,
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
             max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
@@ -113,17 +202,11 @@ impl ProjectRuntimeConfig {
     /// # Errors
     ///
     /// [`ServerError::Internal`] when an env var is malformed, or a resolved
-    /// value (from env or file) is zero where zero is unsafe, or the RSS
-    /// ceilings violate `import_switch <= post_job <= hard_kill`.
+    /// value (from env or file) is zero where zero is unsafe.
     pub fn from_env_with_file(file: &RuntimeFileConfig) -> Result<Self> {
         parse_runtime_config(
             RuntimeEnv {
-                worker_rss_post_job_restart_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB")?,
-                worker_rss_hard_kill_kib: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB")?,
-                worker_rss_sample_millis: runtime_env_var("LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS")?,
-                import_switch_rss_soft_kib: runtime_env_var("LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB")?,
-                module_cache_rss_guard_kib: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB")?,
-                module_cache_max_bytes: runtime_env_var("LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES")?,
+                lean_max_memory_kib: runtime_env_var("LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB")?,
                 request_timeout_millis: runtime_env_var("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS")?,
                 project_mailbox_capacity: runtime_env_var("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY")?,
                 worker_restart_limit: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_LIMIT")?,
@@ -133,34 +216,11 @@ impl ProjectRuntimeConfig {
         )
     }
 
+    /// The Lean heap ceiling applied to each worker child; see
+    /// [`LEAN_MAX_MEMORY_KIB`].
     #[must_use]
-    pub const fn worker_rss_post_job_restart_kib(&self) -> u64 {
-        self.worker_rss_post_job_restart_kib
-    }
-
-    #[must_use]
-    pub const fn worker_rss_hard_kill_kib(&self) -> u64 {
-        self.worker_rss_hard_kill_kib
-    }
-
-    #[must_use]
-    pub const fn worker_rss_sample_millis(&self) -> u64 {
-        self.worker_rss_sample_millis
-    }
-
-    #[must_use]
-    pub const fn import_switch_rss_soft_kib(&self) -> u64 {
-        self.import_switch_rss_soft_kib
-    }
-
-    #[must_use]
-    pub const fn module_cache_rss_guard_kib(&self) -> u64 {
-        self.module_cache_rss_guard_kib
-    }
-
-    #[must_use]
-    pub const fn module_cache_max_bytes(&self) -> u64 {
-        self.module_cache_max_bytes
+    pub const fn lean_max_memory_kib(&self) -> u64 {
+        self.lean_max_memory_kib
     }
 
     #[must_use]
@@ -186,12 +246,7 @@ impl ProjectRuntimeConfig {
 
 #[derive(Debug, Default)]
 struct RuntimeEnv {
-    worker_rss_post_job_restart_kib: Option<String>,
-    worker_rss_hard_kill_kib: Option<String>,
-    worker_rss_sample_millis: Option<String>,
-    import_switch_rss_soft_kib: Option<String>,
-    module_cache_rss_guard_kib: Option<String>,
-    module_cache_max_bytes: Option<String>,
+    lean_max_memory_kib: Option<String>,
     request_timeout_millis: Option<String>,
     project_mailbox_capacity: Option<String>,
     worker_restart_limit: Option<String>,
@@ -201,41 +256,11 @@ struct RuntimeEnv {
 fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig) -> Result<ProjectRuntimeConfig> {
     let defaults = ProjectRuntimeConfig::default();
     let config = ProjectRuntimeConfig {
-        worker_rss_post_job_restart_kib: parse_nonzero_u64(
-            "LEAN_HOST_MCP_WORKER_RSS_POST_JOB_RESTART_KIB",
-            env.worker_rss_post_job_restart_kib.as_deref(),
-            file.worker_rss_post_job_restart_kib,
-            defaults.worker_rss_post_job_restart_kib,
-        )?,
-        worker_rss_hard_kill_kib: parse_nonzero_u64(
-            "LEAN_HOST_MCP_WORKER_RSS_HARD_KILL_KIB",
-            env.worker_rss_hard_kill_kib.as_deref(),
-            file.worker_rss_hard_kill_kib,
-            defaults.worker_rss_hard_kill_kib,
-        )?,
-        worker_rss_sample_millis: parse_nonzero_u64(
-            "LEAN_HOST_MCP_WORKER_RSS_SAMPLE_MILLIS",
-            env.worker_rss_sample_millis.as_deref(),
-            file.worker_rss_sample_millis,
-            defaults.worker_rss_sample_millis,
-        )?,
-        import_switch_rss_soft_kib: parse_nonzero_u64(
-            "LEAN_HOST_MCP_IMPORT_SWITCH_RSS_SOFT_KIB",
-            env.import_switch_rss_soft_kib.as_deref(),
-            file.import_switch_rss_soft_kib,
-            defaults.import_switch_rss_soft_kib,
-        )?,
-        module_cache_rss_guard_kib: parse_nonzero_u64(
-            "LEAN_HOST_MCP_MODULE_CACHE_RSS_GUARD_KIB",
-            env.module_cache_rss_guard_kib.as_deref(),
-            file.module_cache_rss_guard_kib,
-            defaults.module_cache_rss_guard_kib,
-        )?,
-        module_cache_max_bytes: parse_nonzero_u64(
-            "LEAN_HOST_MCP_MODULE_CACHE_MAX_BYTES",
-            env.module_cache_max_bytes.as_deref(),
-            file.module_cache_max_bytes,
-            defaults.module_cache_max_bytes,
+        lean_max_memory_kib: parse_nonzero_u64(
+            "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
+            env.lean_max_memory_kib.as_deref(),
+            file.lean_max_memory_kib,
+            defaults.lean_max_memory_kib,
         )?,
         request_timeout_millis: parse_nonzero_u64(
             "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
@@ -262,33 +287,7 @@ fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig) -> Result<Pro
             defaults.restart_window.as_secs(),
         )?),
     };
-    validate_rss_ordering(&config)?;
     Ok(config)
-}
-
-/// The three RSS ceilings escalate: a worker cycles cleanly before an
-/// import-profile switch (`import_switch`), again after a job that grew past the
-/// post-job budget (`post_job`), and is killed in-flight only at the hard limit
-/// (`hard_kill`). If a tuned value inverts that order the cheaper cycle can
-/// never fire — e.g. `post_job > hard_kill` means the planned post-job recycle
-/// is unreachable and every overrun escalates straight to a hard kill. Reject it
-/// at startup with the offending values, rather than degrade silently.
-fn validate_rss_ordering(config: &ProjectRuntimeConfig) -> Result<()> {
-    if config.import_switch_rss_soft_kib > config.worker_rss_post_job_restart_kib {
-        return Err(ServerError::Internal(format!(
-            "invalid RSS config: import_switch={} KiB exceeds post_job={} KiB \
-             (need import_switch <= post_job <= hard_kill)",
-            config.import_switch_rss_soft_kib, config.worker_rss_post_job_restart_kib,
-        )));
-    }
-    if config.worker_rss_post_job_restart_kib > config.worker_rss_hard_kill_kib {
-        return Err(ServerError::Internal(format!(
-            "invalid RSS config: post_job={} KiB exceeds hard_kill={} KiB \
-             (need import_switch <= post_job <= hard_kill)",
-            config.worker_rss_post_job_restart_kib, config.worker_rss_hard_kill_kib,
-        )));
-    }
-    Ok(())
 }
 
 fn runtime_env_var(name: &str) -> Result<Option<String>> {
@@ -346,11 +345,9 @@ struct JobMeta {
     import_fingerprint: String,
     _created_at: Instant,
     queued_at: Instant,
-    admission_wait_millis: u64,
     _correlation_id: uuid::Uuid,
     retry_policy: RetryPolicy,
     _active_job: ActiveJobGuard,
-    _semantic_permit: SemanticPermit,
 }
 
 enum ProjectMessage {
@@ -374,10 +371,12 @@ enum ProjectMessage {
         request: LeanWorkerDeclarationInspectionRequest,
         reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationInspectionResult>>>,
     },
+    /// Several searches against **one** session; see
+    /// [`LeanProject::search_declarations`].
     DeclarationSearch {
         meta: JobMeta,
-        request: LeanWorkerDeclarationSearch,
-        reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationSearchResult>>>,
+        requests: Vec<LeanWorkerDeclarationSearch>,
+        reply: oneshot::Sender<Result<ProjectCall<Vec<LeanWorkerDeclarationSearchResult>>>>,
     },
     ProofAttempt {
         meta: JobMeta,
@@ -450,9 +449,10 @@ impl ProjectMessage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RestartCause {
-    #[expect(dead_code, reason = "stable wire cause reserved for future non-RSS profile cycling")]
-    ImportProfileSwitch,
-    RssImportSwitch,
+    /// A `.olean` among the live session's imports was rebuilt on disk. The
+    /// session's environment is a snapshot taken at import, so it must be
+    /// dropped or the call answers from a stale Lean environment.
+    ArtifactsRebuilt,
     RssPostJob,
     RssHardLimit,
     MaxRequests,
@@ -470,8 +470,7 @@ enum RestartCause {
 impl RestartCause {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::ImportProfileSwitch => "import_profile_switch",
-            Self::RssImportSwitch => "rss_import_switch",
+            Self::ArtifactsRebuilt => "artifacts_rebuilt",
             Self::RssPostJob => "rss_post_job",
             Self::RssHardLimit => "rss_hard_limit_exceeded",
             Self::MaxRequests => "max_requests",
@@ -567,7 +566,8 @@ fn log_restart(event: &RuntimeRestartEvent, restarts_total: u64) {
         | "worker_internal"
         | "timeout"
         | "cancelled" => emit!(warn, "worker recycled (abnormal)"),
-        "rss_post_job" | "rss_import_switch" => emit!(info, "worker recycled (memory pressure)"),
+        "rss_post_job" => emit!(info, "worker recycled (memory pressure)"),
+        "artifacts_rebuilt" => emit!(info, "worker recycled (imports rebuilt on disk)"),
         _ => emit!(debug, "worker recycled (hygiene)"),
     }
 }
@@ -603,7 +603,6 @@ impl RuntimeSnapshot {
             worker_generation: self.worker_generation,
             worker_restarted: false,
             retry_count: 0,
-            admission_wait_millis: 0,
             queue_wait_millis: 0,
             call_restart: None,
             last_restart: self.last_restart.clone(),
@@ -706,25 +705,18 @@ impl LeanProject {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// Returns `ServerError` when mailbox enqueue, actor reply, or
     /// worker execution fails.
     pub(crate) async fn process_module_query(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
         source: String,
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
             source,
             query,
             options,
@@ -737,13 +729,11 @@ impl LeanProject {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// Returns `ServerError` when mailbox enqueue, actor reply, or
     /// worker execution fails.
     pub(crate) async fn process_module_query_batch(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
         source: String,
         selectors: Vec<LeanWorkerModuleQuerySelector>,
         budgets: LeanWorkerOutputBudgets,
@@ -751,12 +741,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQueryBatch {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
             source,
             selectors,
             budgets,
@@ -770,51 +755,53 @@ impl LeanProject {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// Returns `ServerError` when mailbox enqueue, actor reply, or
     /// worker execution fails.
     pub(crate) async fn inspect_declaration(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
         request: LeanWorkerDeclarationInspectionRequest,
     ) -> Result<ProjectCall<LeanWorkerDeclarationInspectionResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationInspection {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
             request,
             reply,
         };
         self.enqueue(message, rx).await
     }
 
-    /// Run bounded declaration search through this project's serialized worker actor.
+    /// Run a group of bounded declaration searches through this project's
+    /// serialized worker actor, against one session.
+    ///
+    /// The unit is a group rather than a single search because its one caller
+    /// — `search_for_proof` — always has several: it derives up to six queries
+    /// from a single goal and needs all of them to rank. Issued one at a time
+    /// those were N mailbox hops and, worse, N session opens, and every open
+    /// re-runs `importModules` over the whole closure. Results come back in
+    /// request order.
+    ///
+    /// Worth the widened signature: `benches/search_for_proof.rs` on the
+    /// fixture went from **2.71 s to 1.41 s** per warm call — the six session
+    /// opens were about half of the most expensive tool in the surface, and the
+    /// saving scales with the import closure, so a Mathlib-scale project gains
+    /// more than this fixture does.
     ///
     /// # Errors
     ///
-    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
-    /// worker execution fails.
+    /// Returns `ServerError` when mailbox enqueue, actor reply, or worker
+    /// execution fails. A failure of any single search fails the group: they
+    /// share a session, so a worker fault that kills one has already invalidated
+    /// the rest.
     pub(crate) async fn search_declarations(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
-        request: LeanWorkerDeclarationSearch,
-    ) -> Result<ProjectCall<LeanWorkerDeclarationSearchResult>> {
+        requests: Vec<LeanWorkerDeclarationSearch>,
+    ) -> Result<ProjectCall<Vec<LeanWorkerDeclarationSearchResult>>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationSearch {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
-            request,
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            requests,
             reply,
         };
         self.enqueue(message, rx).await
@@ -829,18 +816,11 @@ impl LeanProject {
     pub(crate) async fn semantic_proof_search(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
         request: SemanticProofSearchRequest,
     ) -> Result<ProjectCall<SemanticProofSearchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::SemanticProofSearch {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
             request,
             reply,
         };
@@ -851,24 +831,17 @@ impl LeanProject {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// Returns `ServerError` when mailbox enqueue, actor reply, or
     /// worker execution fails.
     pub(crate) async fn attempt_proof(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
         request: LeanWorkerProofAttemptRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<ProjectCall<LeanWorkerProofAttemptResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ProofAttempt {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
             request,
             options,
             reply,
@@ -880,24 +853,17 @@ impl LeanProject {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// Returns `ServerError` when mailbox enqueue, actor reply, or
     /// worker execution fails.
     pub(crate) async fn verify_declaration(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
         request: LeanWorkerDeclarationVerificationRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerification {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
             request,
             options,
             reply,
@@ -910,24 +876,17 @@ impl LeanProject {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError` when admission, mailbox enqueue, actor reply, or
+    /// Returns `ServerError` when mailbox enqueue, actor reply, or
     /// worker execution fails.
     pub(crate) async fn verify_declaration_batch(
         &self,
         imports: Vec<String>,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
         request: LeanWorkerDeclarationVerificationBatchRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationBatchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerificationBatch {
-            meta: self.job_meta(
-                imports,
-                RetryPolicy::RetryOnceReadOnly,
-                semantic_permit,
-                admission_wait_millis,
-            ),
+            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
             request,
             options,
             reply,
@@ -935,13 +894,7 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
-    fn job_meta(
-        &self,
-        imports: Vec<String>,
-        retry_policy: RetryPolicy,
-        semantic_permit: SemanticPermit,
-        admission_wait_millis: u64,
-    ) -> JobMeta {
+    fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy) -> JobMeta {
         let created_at = Instant::now();
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
         JobMeta {
@@ -949,13 +902,11 @@ impl LeanProject {
             imports,
             _created_at: created_at,
             queued_at: Instant::now(),
-            admission_wait_millis,
             _correlation_id: uuid::Uuid::new_v4(),
             retry_policy,
             _active_job: ActiveJobGuard {
                 active_jobs: Arc::clone(&self.active_jobs),
             },
-            _semantic_permit: semantic_permit,
         }
     }
 
@@ -1100,12 +1051,11 @@ struct ActorConfig {
     session_id: String,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     healthy: Arc<AtomicBool>,
-    worker_rss_post_job_restart_kib: u64,
-    worker_rss_hard_kill_kib: u64,
-    worker_rss_sample_millis: u64,
-    import_switch_rss_soft_kib: u64,
-    module_cache_rss_guard_kib: u64,
-    module_cache_max_bytes: u64,
+    /// Where a module this project imports could have its `.olean` built.
+    /// Resolved once at open: the package set is a function of
+    /// `lake-manifest.json`, and a manifest change evicts the project outright.
+    artifact_roots: Vec<PathBuf>,
+    lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
     max_restarts_per_window: usize,
@@ -1201,12 +1151,8 @@ impl ActorConfig {
             session_id,
             runtime,
             healthy,
-            worker_rss_post_job_restart_kib: runtime_config.worker_rss_post_job_restart_kib(),
-            worker_rss_hard_kill_kib: runtime_config.worker_rss_hard_kill_kib(),
-            worker_rss_sample_millis: runtime_config.worker_rss_sample_millis(),
-            import_switch_rss_soft_kib: runtime_config.import_switch_rss_soft_kib(),
-            module_cache_rss_guard_kib: runtime_config.module_cache_rss_guard_kib(),
-            module_cache_max_bytes: runtime_config.module_cache_max_bytes(),
+            artifact_roots: lake_meta::artifact_roots(&meta.canonical_root),
+            lean_max_memory_kib: runtime_config.lean_max_memory_kib(),
             request_timeout_millis: runtime_config.request_timeout_millis(),
             mailbox_capacity: runtime_config.mailbox_capacity(),
             max_restarts_per_window: runtime_config.max_restarts_per_window(),
@@ -1217,12 +1163,30 @@ impl ActorConfig {
     }
 }
 
+/// One import profile the child may be holding, and the build state it was
+/// holding it at.
+struct ImportProfileStamp {
+    fingerprint: String,
+    /// Newest `.olean` mtime among that profile's imports, sampled when it was
+    /// last served. `None` for an unbuilt project, where there is no mtime to
+    /// compare against.
+    artifact_stamp: Option<std::time::SystemTime>,
+}
+
 struct ProjectActorState {
     config: ActorConfig,
     handle: LeanWorkerHostHandle,
     worker_generation_base: u64,
     last_restart: Option<RuntimeRestartEvent>,
-    last_import_fingerprint: Option<String>,
+    /// The import profiles the live worker child may still be holding, MRU at
+    /// the back, bounded by [`WORKER_MAX_IMPORTS`] so it mirrors the child's own
+    /// session pool.
+    ///
+    /// A *list* because the child pools sessions: it holds several imported
+    /// environments at once, so "the profile the live session was opened with"
+    /// is no longer a single value, and a stamp recorded for one profile stays
+    /// relevant while another is served.
+    imports_seen: Vec<ImportProfileStamp>,
     profile_switch_count: u64,
     last_rss_kib: Option<u64>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
@@ -1266,9 +1230,18 @@ impl ProjectActorState {
                 });
                 let _ = reply.send(result);
             }
-            ProjectMessage::DeclarationSearch { meta, request, reply } => {
+            ProjectMessage::DeclarationSearch { meta, requests, reply } => {
+                // One session for the whole group. `search_declarations_with_imports`
+                // opens and drops a session per call, and every open re-imports,
+                // so the per-search cost here is a worker round trip rather than
+                // an import. The session borrows `&mut handle` and dies inside
+                // the closure, so nothing escapes the actor's stack frame.
                 let result = self.run_job(meta, |handle, imports| {
-                    handle.search_declarations_with_imports(imports, &request, None, None)
+                    let mut session = handle.open_session_with_imports(imports, None, None)?;
+                    requests
+                        .iter()
+                        .map(|request| session.search_declarations(request, None, None))
+                        .collect()
                 });
                 let _ = reply.send(result);
             }
@@ -1328,7 +1301,8 @@ impl ProjectActorState {
         .entered();
         let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
         let generation_before = self.observed_generation();
-        let mut call_restart = self.cycle_before_import_switch_if_needed(&meta)?;
+        self.note_import_profile_switch(&meta);
+        let mut call_restart: Option<RuntimeRestartEvent> = self.cycle_if_imports_rebuilt(&meta)?;
         let mut lifecycle_baseline = self.handle.lifecycle_snapshot();
 
         let max_retries = meta.retry_policy.retries();
@@ -1339,11 +1313,9 @@ impl ProjectActorState {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
                     }
-                    self.last_import_fingerprint = Some(meta.import_fingerprint.clone());
+                    // Sampled for `RuntimeFacts.rss_kib`, which is reporting
+                    // only: no threshold reads it, and nothing restarts on it.
                     self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
-                    if let Some(event) = self.cycle_after_post_job_rss_if_needed(&meta)? {
-                        call_restart = Some(event);
-                    }
                     let runtime =
                         self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
                     tracing::debug!(
@@ -1454,7 +1426,6 @@ impl ProjectActorState {
                 }
                 Err(err) => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
-                    self.last_import_fingerprint = Some(meta.import_fingerprint.clone());
                     return Err(map_worker_err(err));
                 }
             }
@@ -1487,13 +1458,33 @@ impl ProjectActorState {
         result.map(|value| ProjectCall::new(value, runtime))
     }
 
+    /// Spawn the semantic-search child for one call. The child is dropped when
+    /// the caller's `LeanWorkerCapability` goes out of scope.
+    ///
+    /// **Keeping it resident between calls has now been measured twice, and
+    /// rejected twice for different reasons.**
+    ///
+    /// The first measurement — 2.71 s per-call spawn versus 3.30 s resident on
+    /// `benches/search_for_proof.rs`, a 15–22% regression — was taken against a
+    /// worker child that re-imported on every `open_session_with_imports`.
+    /// Residency saved the process spawn while letting one child accumulate
+    /// every call's unreclaimable import, and the accumulation cost more. That
+    /// reason is now obsolete: a session whose imports match the live one is
+    /// reused.
+    ///
+    /// So it was re-implemented — resident on the actor state, evicted by
+    /// import fingerprint — and re-measured on the same bench: **1.35 s
+    /// per-call spawn versus 1.49 s resident** (p = 0.11, confidence intervals
+    /// overlapping). No significant improvement, with the point estimate again
+    /// slightly worse, so the simpler per-call spawn stands. The spawn it would
+    /// save is smaller than `benches/worker_cold_spawn.rs`'s 845 ms suggests:
+    /// that figure is the *main* worker's cold spawn plus a first inspect, and
+    /// the semantic child imports a different, smaller set.
+    ///
+    /// Revisit only with a workload where the semantic child's spawn is a
+    /// measured majority of the call — and revert again unless the bench moves.
     fn open_semantic_capability(&self, meta: &JobMeta) -> Result<lean_rs_worker_parent::LeanWorkerCapability> {
-        let runtime = lean_semantic_search_runtime::build_cached(SemanticSearchRuntimeBuild {
-            cache_root: semantic_runtime_cache_root()?,
-            toolchain_label: self.config.toolchain_label.clone(),
-            lean_sysroot: self.config.lean_sysroot.clone(),
-        })
-        .map_err(|err| {
+        let runtime = semantic_runtime(&self.config.toolchain_label, &self.config.lean_sysroot).map_err(|err| {
             self.worker_unavailable_for(
                 meta,
                 format!("semantic runtime build failed for this toolchain: {err}"),
@@ -1522,62 +1513,132 @@ impl ProjectActorState {
             })
     }
 
-    fn cycle_before_import_switch_if_needed(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
-        let Some(previous_import_fingerprint) = self.last_import_fingerprint.as_deref() else {
+    /// Drop the live session when a `.olean` it imported has been rebuilt.
+    ///
+    /// A worker session's environment is a snapshot taken at import: the child
+    /// reuses a session whose imports match, so `.olean` files written after
+    /// that import are invisible to it. Before the child learned to reuse,
+    /// every call re-imported, and that accident is what kept a mid-session
+    /// `lake build` from being served stale answers. This restores the property
+    /// deliberately, at k `stat` calls per job rather than a full import.
+    ///
+    /// Checked against the stamp recorded for *this* import profile, whichever
+    /// profile ran in between. Until the child pooled sessions, a differing
+    /// profile always re-imported, so only the immediately preceding profile
+    /// could be stale and one remembered stamp sufficed. A pooled child parks
+    /// the old environment instead, so a profile served three calls ago can be
+    /// restored without importing — and would be served from `.olean` files
+    /// rebuilt since. Recycling before the job means the job then runs on a
+    /// fresh worker, which is why `artifacts_rebuilt` is not an execution taint.
+    ///
+    /// The stamp is read just before the session opens, not after, so a build
+    /// that lands inside that window is attributed to the new session and the
+    /// following call sees no advance. Closing it would cost a second stat pass
+    /// per job to catch a race measured in milliseconds against a `lake build`
+    /// measured in seconds; the artifact facts in `trust` still report the
+    /// staleness for the modules a call actually touches.
+    fn cycle_if_imports_rebuilt(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
+        let stamp = lake_meta::import_artifact_stamp(&self.config.artifact_roots, &meta.imports);
+        // Recorded unconditionally: this is the stamp of the artifacts the
+        // session about to serve the job will have imported, whether that
+        // session is a pooled one, the live one, or the replacement opened
+        // below.
+        let previous = self.note_import_profile(&meta.import_fingerprint, stamp);
+        let (Some(previous), Some(current)) = (previous, stamp) else {
             return Ok(None);
         };
-        if previous_import_fingerprint == meta.import_fingerprint {
+        if current <= previous {
             return Ok(None);
         }
-        self.profile_switch_count = self.profile_switch_count.saturating_add(1);
-        let Some(current_kib) = self.handle.rss_kib() else {
-            return Ok(None);
-        };
-        self.last_rss_kib = Some(current_kib);
-        if current_kib < self.config.import_switch_rss_soft_kib {
-            return Ok(None);
-        }
-        let limit_kib = self.config.import_switch_rss_soft_kib;
-        let reason = format!("rss_import_switch current_kib={current_kib} limit_kib={limit_kib}");
-        self.record_restart_or_stop(RestartCause::RssImportSwitch, &reason)
+        let reason = format!("artifacts_rebuilt imports={} newest_olean_advanced", meta.imports.len());
+        self.record_restart_or_stop(RestartCause::ArtifactsRebuilt, &reason)
             .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         self.handle.cycle().map_err(map_worker_err)?;
-        self.last_rss_kib = self.handle.rss_kib().or(Some(current_kib));
+        self.forget_pooled_import_profiles();
         let event = restart_event(
-            RestartCause::RssImportSwitch,
+            RestartCause::ArtifactsRebuilt,
             reason,
             self.observed_generation(),
-            Some(current_kib),
-            Some(limit_kib),
+            self.last_rss_kib,
+            None,
         );
         self.record_restart(event.clone());
         Ok(Some(event))
     }
 
-    fn cycle_after_post_job_rss_if_needed(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
-        let Some(current_kib) = self.handle.rss_kib() else {
-            return Ok(None);
-        };
-        self.last_rss_kib = Some(current_kib);
-        let limit_kib = self.config.worker_rss_post_job_restart_kib;
-        tracing::debug!(rss_kib = current_kib, limit_kib, "post-job rss check");
-        if current_kib < limit_kib {
-            return Ok(None);
+    /// The profile the most recent job ran with, or `None` before the first job.
+    ///
+    /// Reported as the `import_profile` runtime fact and used to count switches.
+    /// Both want "most recent", which is the back of the MRU list.
+    fn current_import_profile(&self) -> Option<&str> {
+        self.imports_seen.last().map(|held| held.fingerprint.as_str())
+    }
+
+    /// Record that `fingerprint` is now the most recently served profile,
+    /// carrying `stamp`, and return the stamp the child last held it at.
+    ///
+    /// `None` covers both "the child cannot be holding this profile" and "it
+    /// held it over an unbuilt project", deliberately: neither gives an mtime
+    /// to compare the incoming one against, so the caller treats them alike.
+    fn note_import_profile(
+        &mut self,
+        fingerprint: &str,
+        stamp: Option<std::time::SystemTime>,
+    ) -> Option<std::time::SystemTime> {
+        if let Some(index) = self
+            .imports_seen
+            .iter()
+            .position(|held| held.fingerprint == fingerprint)
+        {
+            let mut held = self.imports_seen.remove(index);
+            let previous = held.artifact_stamp;
+            held.artifact_stamp = stamp;
+            self.imports_seen.push(held);
+            return previous;
         }
-        let reason = format!("rss_post_job current_kib={current_kib} limit_kib={limit_kib}");
-        self.record_restart_or_stop(RestartCause::RssPostJob, &reason)
-            .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
-        self.handle.cycle().map_err(map_worker_err)?;
-        self.last_rss_kib = self.handle.rss_kib().or(Some(current_kib));
-        let event = restart_event(
-            RestartCause::RssPostJob,
-            reason,
-            self.observed_generation(),
-            Some(current_kib),
-            Some(limit_kib),
-        );
-        self.record_restart(event.clone());
-        Ok(Some(event))
+        // Bounded by the same constant the child sizes its session pool from,
+        // so the parent's picture of what the child holds cannot outgrow it.
+        while self.imports_seen.len() >= usize::try_from(WORKER_MAX_IMPORTS).unwrap_or(usize::MAX) {
+            self.imports_seen.remove(0);
+        }
+        self.imports_seen.push(ImportProfileStamp {
+            fingerprint: fingerprint.to_owned(),
+            artifact_stamp: stamp,
+        });
+        None
+    }
+
+    /// Forget every pooled profile except the one the current job is serving.
+    ///
+    /// Called after the child is replaced: the new child holds nothing its
+    /// predecessor held, so every remembered stamp but one describes an
+    /// environment that no longer exists. The exception is the current job's
+    /// profile, which the caller records before the replacement and the job
+    /// then re-imports into the fresh child — dropping it too would blind the
+    /// *next* call to a rebuild that lands right after this one.
+    fn forget_pooled_import_profiles(&mut self) {
+        if let Some(current) = self.imports_seen.pop() {
+            self.imports_seen.clear();
+            self.imports_seen.push(current);
+        }
+    }
+
+    /// Count a change of import profile for telemetry.
+    ///
+    /// This used to also cycle the worker when RSS was above a soft ceiling, on
+    /// the theory that an import switch would otherwise hold two imported
+    /// environments at once. It now does — the child pools them deliberately,
+    /// at a measured 30–50 MB per extra live environment against the ~1 GiB an
+    /// import costs. What bounds the count is [`WORKER_MAX_IMPORTS`]; what
+    /// bounds the heap is [`LEAN_MAX_MEMORY_KIB`]. Neither is a process-level
+    /// RSS reading, which mostly measured mmapped `.olean` pages.
+    fn note_import_profile_switch(&mut self, meta: &JobMeta) {
+        let switched = self
+            .current_import_profile()
+            .is_some_and(|previous| previous != meta.import_fingerprint);
+        if switched {
+            self.profile_switch_count = self.profile_switch_count.saturating_add(1);
+        }
     }
 
     fn rebuild_after_worker_death(
@@ -1592,6 +1653,7 @@ impl ProjectActorState {
         let (handle, _) = open_worker(&self.config, false)?;
         self.handle = handle;
         self.worker_generation_base = next_generation;
+        self.forget_pooled_import_profiles();
         self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
         let event = restart_event(cause, reason, self.observed_generation(), self.last_rss_kib, None);
         self.record_restart(event.clone());
@@ -1617,6 +1679,9 @@ impl ProjectActorState {
             self.record_restart_or_stop(cause, &reason)
                 .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         }
+        // The supervisor replaced the child under us — most often on its own
+        // `max_imports` policy, which is exactly the pooled-profile ceiling.
+        self.forget_pooled_import_profiles();
         self.last_rss_kib = after.last_rss_kib.or(self.last_rss_kib);
         let event = restart_event(cause, reason, self.observed_generation(), self.last_rss_kib, None);
         self.record_restart(event.clone());
@@ -1674,13 +1739,12 @@ impl ProjectActorState {
                 worker_generation: self.observed_generation(),
                 worker_restarted: false,
                 retry_count: MAX_JOB_RETRIES,
-                admission_wait_millis: 0,
                 queue_wait_millis: 0,
                 call_restart: None,
                 last_restart: Some(event),
                 rss_kib: self.last_rss_kib,
                 worker_lanes: 1,
-                import_profile: self.last_import_fingerprint.clone(),
+                import_profile: self.current_import_profile().map(str::to_owned),
                 profile_switch_count: self.profile_switch_count,
                 restarts_total: self.restart_stats.total,
                 restarts_by_cause: self.restart_stats.by_cause.clone(),
@@ -1715,7 +1779,6 @@ impl ProjectActorState {
             worker_generation: generation,
             worker_restarted: call_restart.is_some() || generation > generation_before,
             retry_count,
-            admission_wait_millis: meta.admission_wait_millis,
             queue_wait_millis,
             call_restart,
             last_restart: self.last_restart.clone(),
@@ -1823,7 +1886,7 @@ fn actor_main(
         handle,
         worker_generation_base: 1,
         last_restart: None,
-        last_import_fingerprint: None,
+        imports_seen: Vec::new(),
         profile_switch_count: 0,
         last_rss_kib: None,
         runtime: Arc::clone(&config.runtime),
@@ -1864,14 +1927,6 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
     if preflight {
         let report = builder.check();
         if let Some(first) = report.first_error() {
-            if bootstrap_failure_is_hard_rss(&first.code().to_string(), first.message()) {
-                return Err(bootstrap_hard_rss_unavailable(
-                    config,
-                    first.message().to_owned(),
-                    parse_keyed_u64(first.message(), "current_kib"),
-                    parse_keyed_u64(first.message(), "limit_kib").or(Some(config.worker_rss_hard_kill_kib)),
-                ));
-            }
             return Err(ServerError::BadProject(format!(
                 "{}: {}",
                 first.code(),
@@ -1879,25 +1934,10 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
             )));
         }
     }
-    let handle = match builder.open() {
-        Ok(handle) => handle,
-        Err(LeanWorkerError::RssHardLimitExceeded {
-            operation,
-            current_kib,
-            limit_kib,
-            ..
-        }) => {
-            return Err(bootstrap_hard_rss_unavailable(
-                config,
-                format!(
-                    "rss_hard_limit_exceeded operation={operation} current_kib={current_kib} limit_kib={limit_kib}"
-                ),
-                Some(current_kib),
-                Some(limit_kib),
-            ));
-        }
-        Err(err) => return Err(map_worker_err(err)),
-    };
+    // No `RssHardLimitExceeded` arm: this server no longer sets
+    // `rss_hard_limit`, so the supervisor cannot produce one. See
+    // `LEAN_MAX_MEMORY_KIB`.
+    let handle = builder.open().map_err(map_worker_err)?;
     let runtime_toolchain = handle
         .runtime_metadata()
         .lean_version
@@ -1905,84 +1945,19 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
     Ok((handle, runtime_toolchain))
 }
 
-fn bootstrap_failure_is_hard_rss(code: &str, message: &str) -> bool {
-    let lower = message.to_lowercase();
-    code.contains("rss")
-        || lower.contains("hard rss limit")
-        || lower.contains("rss_hard_limit")
-        || lower.contains("rss_hard_limit_exceeded")
-        || lower.contains("rss hard limit")
-}
-
-fn bootstrap_hard_rss_unavailable(
-    config: &ActorConfig,
-    reason: String,
-    current_kib: Option<u64>,
-    limit_kib: Option<u64>,
-) -> ServerError {
-    config.healthy.store(false, Ordering::Release);
-    let generation = config.runtime.lock().worker_generation;
-    let event = restart_event(
-        RestartCause::RssHardLimit,
-        reason.clone(),
-        generation,
-        current_kib,
-        limit_kib,
-    );
-    // First-spawn worker tripped the hard RSS limit before serving a call: a
-    // single terminal recycle. Emit the same log line a live recycle would, so
-    // the cause is visible on stderr even when the project never opens.
-    let restarts_total = 1;
-    log_restart(&event, restarts_total);
-    let by_cause = BTreeMap::from([(RestartCause::RssHardLimit.as_str().to_owned(), restarts_total)]);
-    let runtime = RuntimeFacts {
-        worker_generation: generation,
-        worker_restarted: true,
-        retry_count: 0,
-        admission_wait_millis: 0,
-        queue_wait_millis: 0,
-        call_restart: Some(event.clone()),
-        last_restart: Some(event.clone()),
-        rss_kib: current_kib,
-        worker_lanes: 1,
-        import_profile: None,
-        profile_switch_count: 0,
-        restarts_total,
-        restarts_by_cause: by_cause.clone(),
-    };
-    *config.runtime.lock() = RuntimeSnapshot {
-        worker_generation: generation,
-        last_restart: Some(event),
-        rss_kib: current_kib,
-        import_profile: None,
-        profile_switch_count: 0,
-        restarts_total,
-        restarts_by_cause: by_cause,
-    };
-    ServerError::worker_unavailable(WorkerUnavailable {
-        retryable: false,
-        worker_restarted: true,
-        project_root: config.lake_root.to_string_lossy().into_owned(),
-        project_hash: config.manifest_hash.clone(),
-        imports: Vec::new(),
-        session_id: config.session_id.clone(),
-        lean_toolchain: config.toolchain_label.clone(),
-        worker_generation: generation,
-        reason,
-        restart_cause: Some(RestartCause::RssHardLimit.as_str().to_owned()),
-        rss_kib: current_kib,
-        limit_kib,
-        retry_after_millis: None,
-        restarts_in_window: None,
-        window_millis: None,
-        runtime,
-        toolchain_advisories: config.toolchain_advisories.clone(),
-    })
-}
-
 fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
-    let restart_policy = LeanWorkerRestartPolicy::default().max_requests(WORKER_REQUEST_RESTARTS);
-    let module_cache_limits = module_cache_limits(config);
+    // One policy restart, on the one quantity that accumulates without bound:
+    // imports. `disabled()`'s own doc warns that a long-running host wants
+    // `memory_bounded`, "because fresh imports retain Lean process-global state
+    // until the child exits" — session reuse made that true per *import* rather
+    // than per *call*, which is what [`WORKER_MAX_IMPORTS`] bounds. No
+    // `max_rss_kib`, no `max_requests`, no `rss_hard_limit`. The Lean heap is
+    // bounded separately by [`LEAN_MAX_MEMORY_KIB`]; the crash-loop breaker
+    // (`MAX_RESTARTS_PER_WINDOW`) and the request deadline are this actor's own.
+    let restart_policy = LeanWorkerRestartPolicy::default()
+        .max_imports(WORKER_MAX_IMPORTS)
+        .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW);
+    let module_cache_limits = module_cache_limits();
     LeanWorkerHostHandleBuilder::shims_only(&config.lake_root, std::iter::empty::<String>())
         .worker_child(LeanWorkerChild::for_toolchain(
             config.worker_path.clone(),
@@ -1991,10 +1966,7 @@ fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
         .startup_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_millis(config.request_timeout_millis))
         .restart_policy(restart_policy)
-        .rss_hard_limit(
-            config.worker_rss_hard_kill_kib,
-            Duration::from_millis(config.worker_rss_sample_millis),
-        )
+        .lean_max_memory_kib(config.lean_max_memory_kib)
         .module_cache_limits(module_cache_limits)
 }
 
@@ -2002,7 +1974,10 @@ fn semantic_capability_builder(
     config: &ActorConfig,
     built: &lean_toolchain::LeanBuiltCapability,
 ) -> Result<LeanWorkerCapabilityBuilder> {
-    let restart_policy = LeanWorkerRestartPolicy::default().max_requests(WORKER_REQUEST_RESTARTS);
+    // See `worker_builder`: bounded by import count, one Lean heap ceiling.
+    let restart_policy = LeanWorkerRestartPolicy::default()
+        .max_imports(WORKER_MAX_IMPORTS)
+        .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW);
     let builder = LeanWorkerCapabilityBuilder::from_built_capability(built, std::iter::empty::<String>())
         .map_err(map_worker_err)?
         .import_workspace_root(config.lake_root.clone())
@@ -2013,14 +1988,61 @@ fn semantic_capability_builder(
         .startup_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_millis(config.request_timeout_millis))
         .restart_policy(restart_policy)
-        .rss_hard_limit(
-            config.worker_rss_hard_kill_kib,
-            Duration::from_millis(config.worker_rss_sample_millis),
-        )
-        .module_cache_limits(module_cache_limits(config))
+        .lean_max_memory_kib(config.lean_max_memory_kib)
+        .module_cache_limits(module_cache_limits())
         .json_command_export(lean_semantic_search_capability::DECLARATION_FEATURES_EXPORT)
         .json_command_export(lean_semantic_search_capability::PROOF_GOAL_FEATURES_EXPORT);
     Ok(builder)
+}
+
+/// Built semantic-search runtimes, one per `(toolchain label, Lean sysroot)`.
+///
+/// `lean_semantic_search_runtime::build_cached` is cached *on disk*, not in
+/// process: every call re-materializes the source package, takes a filesystem
+/// build lock, and runs a Lake build to conclude there is nothing to do.
+/// Measured warm on this machine at **5.5 ms**, paid on the project's actor
+/// thread — where it blocks the worker — on every semantic call. The result is
+/// a pure function of the key, so it is computed once per process instead.
+///
+/// Process-wide rather than per project because that is the true scope: two
+/// projects pinned to the same toolchain build the identical runtime into the
+/// identical cache directory, and today they each pay for it.
+///
+/// The build itself runs *outside* the lock. Holding it would serialize every
+/// project behind one Lake invocation; upstream's own filesystem lock already
+/// makes a concurrent duplicate build safe, and the loser simply overwrites an
+/// equal value.
+static SEMANTIC_RUNTIMES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<(String, PathBuf), lean_semantic_search_runtime::SemanticSearchRuntime>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Memoized [`lean_semantic_search_runtime::build_cached`]; see
+/// [`SEMANTIC_RUNTIMES`]. Failures are never cached — a build that failed
+/// because a toolchain was mid-install must be retried, not remembered.
+///
+/// The error is a rendered message rather than a [`ServerError`] so the caller
+/// keeps deciding what a failure means; it wraps this in the same structured
+/// `worker_unavailable` it always did.
+fn semantic_runtime(
+    toolchain_label: &str,
+    lean_sysroot: &Path,
+) -> std::result::Result<lean_semantic_search_runtime::SemanticSearchRuntime, String> {
+    let key = (toolchain_label.to_owned(), lean_sysroot.to_path_buf());
+    // Bound the guard to a statement so the lock is released before the build
+    // below, rather than living to the end of an `if let`.
+    let cached = SEMANTIC_RUNTIMES.lock().get(&key).cloned();
+    if let Some(runtime) = cached {
+        return Ok(runtime);
+    }
+    let cache_root = semantic_runtime_cache_root().map_err(|err| err.to_string())?;
+    let runtime = lean_semantic_search_runtime::build_cached(SemanticSearchRuntimeBuild {
+        cache_root,
+        toolchain_label: toolchain_label.to_owned(),
+        lean_sysroot: lean_sysroot.to_path_buf(),
+    })
+    .map_err(|err| err.to_string())?;
+    SEMANTIC_RUNTIMES.lock().insert(key, runtime.clone());
+    Ok(runtime)
 }
 
 fn semantic_runtime_cache_root() -> Result<PathBuf> {
@@ -2029,10 +2051,20 @@ fn semantic_runtime_cache_root() -> Result<PathBuf> {
     Ok(cache_dir.join("lean-host-mcp").join("semantic-runtimes"))
 }
 
-fn module_cache_limits(config: &ActorConfig) -> LeanWorkerModuleCacheLimits {
-    LeanWorkerModuleCacheLimits::default()
-        .rss_guard_kib(config.module_cache_rss_guard_kib)
-        .max_bytes(config.module_cache_max_bytes)
+/// Worker-side module snapshot cache limits.
+///
+/// The RSS guard is pinned to an unreachable ceiling, i.e. off. It is not a
+/// knob because no finite value behaves sensibly: the worker clears the *whole*
+/// snapshot cache at the top of every module-query batch whenever its RSS is at
+/// or above the guard, and RSS counts the shared, clean, reclaimable `.olean`
+/// pages Lean mmaps. Those alone put any Mathlib-scale worker past both our old
+/// 2 GiB setting and the worker's own 3 GiB default, so the guard fired on
+/// import-set size rather than on cache growth and wiped the cache on every
+/// single query — making the snapshot cache unreachable in exactly the projects
+/// that need it. Cache size is bounded by the worker's entry/TTL/byte limits,
+/// which are the bounds that actually track the cache.
+fn module_cache_limits() -> LeanWorkerModuleCacheLimits {
+    LeanWorkerModuleCacheLimits::default().rss_guard_kib(0)
 }
 
 fn actor_thread_name(canonical_root: &Path) -> String {
@@ -2107,16 +2139,6 @@ fn millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn parse_keyed_u64(text: &str, key: &str) -> Option<u64> {
-    let prefix = format!("{key}=");
-    let start = text.find(&prefix)?.checked_add(prefix.len())?;
-    let digits = text[start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits.parse().ok()
-}
-
 /// Resolve a knob through `env > file > default` and reject a zero result
 /// whatever its source. `env` is the raw env-var string (parsed here); `file`
 /// is the already-typed config-file value; `default` is the built-in constant.
@@ -2152,16 +2174,10 @@ mod tests {
 
     #[test]
     fn runtime_config_parses_runtime_policy_without_env_reads() {
-        // Distinct values that also satisfy the RSS ordering invariant
-        // (import_switch <= post_job <= hard_kill); see validate_rss_ordering.
+        // Distinct values so a field routed to the wrong knob is visible.
         let config = parse_runtime_config(
             RuntimeEnv {
-                worker_rss_post_job_restart_kib: Some("5".to_owned()),
-                worker_rss_hard_kill_kib: Some("7".to_owned()),
-                worker_rss_sample_millis: Some("11".to_owned()),
-                import_switch_rss_soft_kib: Some("3".to_owned()),
-                module_cache_rss_guard_kib: Some("17".to_owned()),
-                module_cache_max_bytes: Some("19".to_owned()),
+                lean_max_memory_kib: Some("5".to_owned()),
                 request_timeout_millis: Some("37".to_owned()),
                 project_mailbox_capacity: Some("23".to_owned()),
                 worker_restart_limit: Some("29".to_owned()),
@@ -2171,12 +2187,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.worker_rss_post_job_restart_kib(), 5);
-        assert_eq!(config.worker_rss_hard_kill_kib(), 7);
-        assert_eq!(config.worker_rss_sample_millis(), 11);
-        assert_eq!(config.import_switch_rss_soft_kib(), 3);
-        assert_eq!(config.module_cache_rss_guard_kib(), 17);
-        assert_eq!(config.module_cache_max_bytes(), 19);
+        assert_eq!(config.lean_max_memory_kib(), 5);
         assert_eq!(config.request_timeout_millis(), 37);
         assert_eq!(config.mailbox_capacity(), 23);
         assert_eq!(config.max_restarts_per_window(), 29);
@@ -2226,98 +2237,43 @@ mod tests {
     }
 
     #[test]
-    fn rss_config_rejects_post_job_above_hard_kill() {
-        let err = parse_runtime_config(
-            RuntimeEnv {
-                // 20 GiB post-job ceiling above the 16 GiB default hard kill: the
-                // planned post-job cycle could never fire before the hard kill.
-                worker_rss_post_job_restart_kib: Some("20971520".to_owned()),
-                ..RuntimeEnv::default()
-            },
-            &RuntimeFileConfig::default(),
-        )
-        .unwrap_err();
-        let ServerError::Internal(message) = err else {
-            panic!("expected Internal config error");
-        };
-        assert!(message.contains("invalid RSS config"), "message: {message}");
-        assert!(message.contains("hard_kill"), "message: {message}");
-    }
-
-    #[test]
-    fn rss_config_rejects_import_switch_above_post_job() {
-        let err = parse_runtime_config(
-            RuntimeEnv {
-                // Import-switch soft limit above the 5 GiB default post-job ceiling.
-                import_switch_rss_soft_kib: Some("6291456".to_owned()),
-                ..RuntimeEnv::default()
-            },
-            &RuntimeFileConfig::default(),
-        )
-        .unwrap_err();
-        let ServerError::Internal(message) = err else {
-            panic!("expected Internal config error");
-        };
-        assert!(message.contains("invalid RSS config"), "message: {message}");
-        assert!(message.contains("import_switch"), "message: {message}");
-    }
-
-    #[test]
-    fn rss_config_accepts_raising_post_job_to_8gib() {
-        // The motivating case: 8 GiB post-job ceiling, below the 16 GiB hard
-        // kill and above the 2 GiB import-switch soft limit.
-        let config = parse_runtime_config(
-            RuntimeEnv {
-                worker_rss_post_job_restart_kib: Some("8388608".to_owned()),
-                ..RuntimeEnv::default()
-            },
-            &RuntimeFileConfig::default(),
-        )
-        .unwrap();
-        assert_eq!(config.worker_rss_post_job_restart_kib(), 8_388_608);
-    }
-
-    #[test]
     fn runtime_config_precedence_env_over_file_over_default() {
         let file = RuntimeFileConfig {
-            worker_rss_post_job_restart_kib: Some(8_388_608),
+            lean_max_memory_kib: Some(8_388_608),
             ..RuntimeFileConfig::default()
         };
         // Env unset -> file value is used.
         let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
-        assert_eq!(config.worker_rss_post_job_restart_kib(), 8_388_608);
-        // Env set -> env wins over the file (6 GiB, still a valid ordering).
+        assert_eq!(config.lean_max_memory_kib(), 8_388_608);
+        // Env set -> env wins over the file.
         let env = RuntimeEnv {
-            worker_rss_post_job_restart_kib: Some("6291456".to_owned()),
+            lean_max_memory_kib: Some("6291456".to_owned()),
             ..RuntimeEnv::default()
         };
         let config = parse_runtime_config(env, &file).unwrap();
-        assert_eq!(config.worker_rss_post_job_restart_kib(), 6_291_456);
+        assert_eq!(config.lean_max_memory_kib(), 6_291_456);
         // Neither -> built-in default.
         let config = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default()).unwrap();
-        assert_eq!(
-            config.worker_rss_post_job_restart_kib(),
-            WORKER_RSS_POST_JOB_RESTART_KIB
-        );
+        assert_eq!(config.lean_max_memory_kib(), LEAN_MAX_MEMORY_KIB);
     }
 
     #[test]
-    fn runtime_config_rejects_zero_and_bad_ordering_from_file() {
+    fn runtime_config_rejects_zero_from_file() {
+        // Zero is rejected wherever it comes from: an unbounded Lean heap is a
+        // different posture from a large one, and reaching it by typing `0`
+        // into a config file is never deliberate.
         let zero = RuntimeFileConfig {
-            worker_rss_sample_millis: Some(0),
+            lean_max_memory_kib: Some(0),
             ..RuntimeFileConfig::default()
         };
-        assert!(parse_runtime_config(RuntimeEnv::default(), &zero).is_err());
-
-        let inverted = RuntimeFileConfig {
-            worker_rss_post_job_restart_kib: Some(20_971_520), // above 16 GiB default hard kill
-            ..RuntimeFileConfig::default()
-        };
-        let err = parse_runtime_config(RuntimeEnv::default(), &inverted).unwrap_err();
+        let err = parse_runtime_config(RuntimeEnv::default(), &zero).unwrap_err();
         let ServerError::Internal(message) = err else {
             panic!("expected Internal config error");
         };
-        assert!(message.contains("invalid RSS config"), "message: {message}");
+        assert!(
+            message.contains("LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB"),
+            "message: {message}"
+        );
     }
 
     #[test]
@@ -2367,12 +2323,8 @@ mod tests {
             session_id: "session-test".to_owned(),
             runtime,
             healthy: Arc::new(AtomicBool::new(true)),
-            worker_rss_post_job_restart_kib: WORKER_RSS_POST_JOB_RESTART_KIB,
-            worker_rss_hard_kill_kib: WORKER_RSS_HARD_KILL_KIB,
-            worker_rss_sample_millis: WORKER_RSS_SAMPLE_MILLIS,
-            import_switch_rss_soft_kib: IMPORT_SWITCH_RSS_SOFT_KIB,
-            module_cache_rss_guard_kib: MODULE_CACHE_RSS_GUARD_KIB,
-            module_cache_max_bytes: MODULE_CACHE_MAX_BYTES,
+            artifact_roots: Vec::new(),
+            lean_max_memory_kib: LEAN_MAX_MEMORY_KIB,
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
             max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
@@ -2395,61 +2347,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_hard_rss_failure_is_structured_runtime_unavailable() {
-        let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
-            worker_generation: 1,
-            last_restart: None,
-            rss_kib: None,
-            import_profile: None,
-            profile_switch_count: 0,
-            restarts_total: 0,
-            restarts_by_cause: BTreeMap::new(),
-        }));
-        let config = ActorConfig {
-            lake_root: PathBuf::from("/tmp/lean-host-mcp-bootstrap-rss-test"),
-            manifest_hash: "sha256-test".to_owned(),
-            toolchain_label: "leanprover/lean4:test".to_owned(),
-            worker_path: PathBuf::from("/tmp/worker"),
-            lean_sysroot: PathBuf::from("/tmp/lean"),
-            session_id: "session-test".to_owned(),
-            runtime: Arc::clone(&runtime),
-            healthy: Arc::new(AtomicBool::new(true)),
-            worker_rss_post_job_restart_kib: WORKER_RSS_POST_JOB_RESTART_KIB,
-            worker_rss_hard_kill_kib: 64,
-            worker_rss_sample_millis: WORKER_RSS_SAMPLE_MILLIS,
-            import_switch_rss_soft_kib: IMPORT_SWITCH_RSS_SOFT_KIB,
-            module_cache_rss_guard_kib: MODULE_CACHE_RSS_GUARD_KIB,
-            module_cache_max_bytes: MODULE_CACHE_MAX_BYTES,
-            request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
-            mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
-            max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
-            restart_window: RESTART_WINDOW,
-            toolchain_advisories: Vec::new(),
-        };
-
-        let err = bootstrap_hard_rss_unavailable(
-            &config,
-            "rss_hard_limit_exceeded operation=startup current_kib=128 limit_kib=64".to_owned(),
-            Some(128),
-            Some(64),
-        );
-
-        let ServerError::WorkerUnavailable(info) = err else {
-            panic!("expected WorkerUnavailable");
-        };
-        assert!(!info.retryable);
-        assert_eq!(info.restart_cause.as_deref(), Some("rss_hard_limit_exceeded"));
-        assert_eq!(info.rss_kib, Some(128));
-        assert_eq!(info.limit_kib, Some(64));
-        assert_eq!(
-            info.runtime.last_restart.as_ref().map(|event| event.cause.as_str()),
-            Some("rss_hard_limit_exceeded")
-        );
-    }
-
-    #[test]
     fn planned_restart_causes_do_not_consume_abnormal_restart_budget() {
-        assert!(!RestartCause::RssImportSwitch.counts_toward_restart_limit());
         assert!(!RestartCause::RssPostJob.counts_toward_restart_limit());
         assert!(!RestartCause::MaxRequests.counts_toward_restart_limit());
         assert!(!RestartCause::MaxImports.counts_toward_restart_limit());

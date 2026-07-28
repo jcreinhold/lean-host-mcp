@@ -24,8 +24,7 @@ as the semantic-lookup companion. `declaration.rs` backs `inspect_declaration`; 
 and `find_references`; `source_input.rs` is the shared source-reading helper. `proof_state` depends on an optional
 bounded shim and returns `{ "status": "unsupported" }` cleanly when the loaded dylib lacks it. Lean-domain failures
 (parse, elaboration, kernel rejection, meta timeout) are part of the `ok` payload; missing imports become an envelope
-warning. `src/index.rs` is a legacy SQLite declaration index kept for internal tests only—the MCP tools call bounded
-worker queries instead, never the index.
+warning.
 
 ## Common commands
 
@@ -140,6 +139,29 @@ state-machine arm + `do_*` method to coordinate.
 - Hold a `LeanWorkerSession<'_>` across an `.await` (it borrows from `&mut LeanWorkerHostHandle`).
 - Wrap `LeanWorkerHostHandle` in `Arc`/`Mutex` and share it between tokio tasks.
 - Add a `Request` enum back. The closure-channel shape is deliberately the simpler form.
+- Restart, recycle, or refuse a call on **resident** memory. RSS counts the shared, clean, mmapped `.olean` pages every
+  Mathlib-scale worker maps at startup, so any RSS threshold fires on healthy workers. Four of them used to live here;
+  they existed to contain a child that re-imported on every call, which is now fixed upstream (a session whose imports
+  match the live one is reused, so retained import state no longer scales with call count). What replaced them is
+  `LEAN_MAX_MEMORY_KIB`, a Lean **heap** ceiling enforced inside the child, whose overrun is ordinary Lean-domain data
+  in the `ok` payload. RSS is sampled once per call for the `rss_kib` fact and read by no policy.
+- Add `max_requests` or an RSS ceiling to either worker builder. The **one** policy restart both builders set is
+  `max_imports(WORKER_MAX_IMPORTS)`, because imports are the one thing a child accumulates without bound: an environment
+  imported with `loadExts := true` is never reclaimed, so retained state scales with *import* count even though session
+  reuse removed the scaling with *call* count. Measured by alternating two import profiles against one server: +1 GiB
+  per import, 11.2 GiB and a `SIGKILL` before call 180 with no bound; 1.65 GiB and no aborts with it. A workload that
+  repeats one import profile never trips it, because a reused session is not an import. `SUPERVISOR_RESTART_INTENSITY`
+  raises the supervisor's own all-causes backstop above that planned cycle rate — its default of 16/min is terminal when
+  exhausted. The crash-loop breaker (`MAX_RESTARTS_PER_WINDOW`, abnormal causes only) and the per-request deadline are
+  this actor's own and stay.
+- Drop the outgoing session when the imports change. Since the residue is unreclaimable either way, the child *pools*
+  imported sessions — capacity `LEAN_RS_WORKER_SESSION_POOL_CAPACITY`, which the supervisor derives from `max_imports`,
+  so the parent cycles the child exactly where the pool would start evicting. A profile the pool still holds is restored
+  by key comparison, not by importing, at a measured 30–50 MB per extra live environment against 0.8–1.0 GiB per import.
+  `WORKER_MAX_IMPORTS` is therefore a bound on *distinct* profiles per child, which is why it is 4 rather than 2, and an
+  alternating workload is now the same workload as a repeating one (`smoke_perf.rs`: 200 alternating calls, 0 restarts,
+  1.68 GiB). The parent mirrors the pool in `ProjectActorState::imports_seen` so `cycle_if_imports_rebuilt` can still
+  catch a `.olean` rebuilt under a profile that another profile ran in between.
 
 Lean-domain failures cross the worker boundary as `Serialize + Deserialize` data (`LeanWorkerElabFailure`,
 `LeanWorkerMetaResult<T>`, etc.); the projection from worker types to MCP types is pure Rust data shuffling, with no
@@ -162,16 +184,24 @@ crates/
       projections.rs    worker-type -> MCP-wire projection helpers
       cache.rs          ModuleQueryCache: bounded module-query result cache
       envelope.rs       Response<T> = { status, result, freshness, telemetry?, warnings, next_actions }
-      config_file.rs    on-disk [server]/[telemetry]/[output] config -> ToolConfig
+      config_file.rs    on-disk [runtime]/[broker]/[server]/[telemetry]/[output] config
+      config_schema.rs  SCHEMA_FIELDS: `config init` output + the generated docs/operations.md table
       error.rs          ServerError
       lake_meta.rs      LakeProjectMeta + lakefile discovery
-      index.rs          legacy SQLite DeclarationIndex (internal tests only)
+      diagnosis.rs      execution-taint classification for verdicts computed under duress
+      trust.rs          public `trust` block: project identity + artifact freshness facts
+      ilean.rs          `.ilean` reference reads for project-scope find_references
+      semantic_search.rs  in-call ranking over declaration rows
+      smoke.rs          shared harness bits for the black-box integration tests
       tools/
         mod.rs          ToolContext + shared tool plumbing
+        semantic.rs     public facade: the five `lean_*` tools and their `kind` dispatch
         declaration.rs  inspect_declaration
+        declaration_inventory.rs  module/file declaration outlines
         proof_search.rs search_for_proof
         proof_action.rs try_proof_step / verify_declaration
         position.rs     proof_state / find_references
+        changed_coverage.rs  git-diff-scoped verification targets
         source_input.rs shared source-reading helper
   lean-host-mcp-worker/         # worker child binary (only crate that links libleanshared)
     build.rs            emits rpath; honors LEAN_HOST_MCP_TARGET_TOOLCHAIN
