@@ -522,9 +522,9 @@ fn version_key(s: &str) -> Option<(u32, u32, u32, u8, u32)> {
 /// dominates a lower one (major ≫ minor ≫ patch ≫ rc/release split ≫ rc
 /// number). This is what makes "nearest" behave: a pin a whole major above the
 /// head is closest to the head (largest scalar), not to whichever lower version
-/// happens to share a digit, and `4.30.0-rc1` is closest to its own release
-/// `4.30.0` (one rc step, weight ~10³) rather than to `4.29.1` (a patch away,
-/// weight ~10⁶). The weights assume the realistic ranges of a Lean version
+/// happens to share a digit, and `4.31.0-rc1` is closest to its own release
+/// `4.31.0` (one rc step, weight ~10³) rather than to `4.30.0` (a minor away,
+/// weight ~10⁹). The weights assume the realistic ranges of a Lean version
 /// (each field < 1000); see the supported-window table.
 fn version_scalar((major, minor, patch, rc_flag, rc_num): (u32, u32, u32, u8, u32)) -> u64 {
     // Saturating throughout (workspace denies unchecked arithmetic); the
@@ -894,25 +894,37 @@ mod tests {
     }
 
     #[test]
-    fn window_verdict_flags_in_between_rc_with_nearest_release() {
-        // A release candidate of an already-supported release (e.g. `4.30.0-rc1`
-        // when `4.30.0` ships) is out of window, and its genuinely-nearest
-        // supported version is that release — not the window floor.
+    fn window_verdict_flags_in_between_patch_with_nearest_release() {
+        // A patch above an interior supported release (e.g. `4.31.1` when the
+        // window holds `4.31.0`) is out of window, and its genuinely-nearest
+        // supported version is that release — not the window floor or head.
+        //
+        // The witness is a patch gap rather than an rc of a supported release
+        // because the current window pairs every interior numbered release
+        // with its rc (`4.31.0-rc1`, `4.32.0-rc1` are supported entries), so
+        // no rc witness exists; the patch gap pins the same nearest-scan.
         let (floor, _) = window_bounds();
         let release = lean_toolchain::SUPPORTED_TOOLCHAINS
             .iter()
             .filter_map(|t| t.versions.first().copied())
-            // A `X.Y.Z` release (no `-rc`) other than the floor, so the rc we
-            // synthesize is genuinely between two supported versions.
+            // A `X.Y.Z` release (no `-rc`) other than the floor, so the patch
+            // we synthesize is genuinely between two supported versions.
             .find(|v| !v.contains("-rc") && *v != floor)
             .expect("the supported window should contain a non-floor numbered release");
-        let rc = format!("{release}-rc1");
-        // Guard: the synthesized rc must not itself be a supported entry.
-        assert!(
-            lean_toolchain::supported_for(&rc).is_none(),
-            "{rc} unexpectedly supported"
+        let mut parts = release.split('.');
+        let (major, minor, patch) = (
+            parts.next().expect("numbered release has a major"),
+            parts.next().expect("numbered release has a minor"),
+            parts.next().expect("numbered release has a patch"),
         );
-        match ToolchainId::parse(&format!("v{rc}")).unwrap().window_verdict() {
+        let next_patch = patch.parse::<u32>().expect("numbered release patch is a number") + 1;
+        let gap = format!("{major}.{minor}.{next_patch}");
+        // Guard: the synthesized patch must not itself be a supported entry.
+        assert!(
+            lean_toolchain::supported_for(&gap).is_none(),
+            "{gap} unexpectedly supported"
+        );
+        match ToolchainId::parse(&format!("v{gap}")).unwrap().window_verdict() {
             WindowVerdict::OutOfWindow { nearest, .. } => assert_eq!(nearest, release),
             other @ (WindowVerdict::Supported | WindowVerdict::Unknown) => {
                 panic!("expected OutOfWindow, got {other:?}")

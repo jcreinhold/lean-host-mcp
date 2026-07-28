@@ -996,13 +996,15 @@ mod tests {
         fake_worker(root.path(), "v4.23.0", "d");
         // Supported + passing smoke → kept.
         fake_worker(root.path(), "v4.30.0", "d");
-        // Supported but smoke FAILED → pruned (loads but crashes).
-        let failed_dir = root.path().join("v4.29.0");
+        // Supported but smoke FAILED → pruned (loads but crashes). Must be an
+        // in-window toolchain — an out-of-window id would be pruned regardless,
+        // which would let a smoke-failure regression pass silently.
+        let failed_dir = root.path().join("v4.31.0");
         std::fs::create_dir_all(&failed_dir).expect("mkdir");
         std::fs::write(failed_dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
         WorkerSidecar::record(
             &failed_dir,
-            &ToolchainId::parse("v4.29.0").expect("parse"),
+            &ToolchainId::parse("v4.31.0").expect("parse"),
             "d".to_owned(),
             crate::smoke::SmokeOutcome::Failed {
                 detail: "signal: 11 (SIGSEGV)".to_owned(),
@@ -1012,7 +1014,7 @@ mod tests {
 
         prune_in(root.path()).expect("prune");
         assert!(!root.path().join("v4.23.0").exists(), "out-of-window pruned");
-        assert!(!root.path().join("v4.29.0").exists(), "smoke-failed pruned");
+        assert!(!root.path().join("v4.31.0").exists(), "smoke-failed pruned");
         assert!(root.path().join("v4.30.0").exists(), "servable worker kept");
     }
 
