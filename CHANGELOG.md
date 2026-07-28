@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-28
+
 ### Fixed
 
 - **The Lean heap ceiling aborted workers before the residue budget could recycle them.** `runtime.lean_max_memory_kib`
@@ -53,6 +55,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **The supported Lean window floor is now 4.30.0; workers for 4.27.0–4.29.1 are unservable.** lean-rs 0.6.1 dropped
+  those toolchains: their `libleanshared` does not export the `collectAxioms` symbol the mandatory host shim
+  references, so the window claimed support the runtime never had. A project pinned to a dropped toolchain is now
+  rejected at open with the out-of-window verdict, and `install-worker --prune` removes workers already installed for
+  one. Pulled in through the existing `"0.6"` lean-rs requirements; no API change.
 - **`scripts/memory_stability.py` reports import residue, the quantity the recycle policy actually reads.** It reported
   RSS only, which is an observation and not a policy input, so the harness could not show whether a long-lived server
   was approaching a recycle. New `peak_import_residue_mib` / `final_import_residue_mib` / `import_residue_budget_mib`
@@ -458,7 +465,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.5.0...v0.5.1
