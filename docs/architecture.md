@@ -74,33 +74,43 @@ therefore `broker.max_projects` workers, one in-flight job each. Degraded respon
 cache hit is answered from the project handle without entering the mailbox. A full project queue is a structured
 retryable infrastructure error rather than unbounded memory growth.
 
-Worker memory is bounded inside Lean and by import count, not by watching the process. Each child runs under
-`runtime.lean_max_memory_kib`, a Lean *heap* ceiling enforced by `lean_internal_set_max_memory`, so an elaboration that
-exhausts it fails as ordinary Lean-domain data while the worker keeps serving. Nothing restarts on resident memory: RSS
-counts the shared, clean, mmapped `.olean` pages every Mathlib-scale worker maps at startup, which made the four
-thresholds this replaced fire on healthy workers. RSS is still sampled once per call for the `rss_kib` runtime fact; no
-policy reads it.
+Worker memory is bounded by retained import bytes, not by watching the process. Above that sits
+`runtime.lean_max_memory_kib`, a Lean *heap* ceiling enforced by `lean_internal_set_max_memory` — a backstop rather than
+a second policy, because crossing it aborts the child: Lean's allocator signals the overrun with a C++ exception that
+cannot unwind through the Rust frame at the shim boundary. Its default is therefore derived from the residue budget
+(doubled) rather than fixed, so the clean recycle always fires first. Nothing restarts on resident memory: RSS counts
+the shared, clean, mmapped `.olean` pages every Mathlib-scale worker maps at startup, which made the four thresholds
+this replaced fire on healthy workers. RSS is still sampled once per call for the `rss_kib` runtime fact; no policy
+reads it.
 
 What accumulates instead is *imports*. A session whose imports match the live one is reused, so a child's retained state
 no longer scales with call count — but an environment imported with `loadExts := true` is never reclaimed, so it still
-scales with the number of imports a child has performed. Measured against the bundled fixture by alternating two
-profiles: about +1 GiB per import, reaching 11.2 GiB and an OS `SIGKILL` before call 180. The one policy restart both
-worker builders set therefore bounds that quantity directly — `max_imports`, a count, cheap to read and independent of
-how large any one project's `.olean` set happens to be.
+scales with what a child has imported. The unit is bytes, not imports: `.olean` compacted regions are position-dependent
+and each `importModules` gets a fresh `ImportState`, so only the first import in a process is memory-mapped and every
+later one re-materializes its whole closure — including already-mapped modules — as private dirty pages. Measured
+against real per-file headers at Mathlib scale, that is 10–18 MB for the first import and 2.0–4.5 GB for each one after
+it, and five *near-identical* profiles cost more (16.0 GiB) than five unrelated ones (9.6 GiB) because overlap is what
+gets re-copied. The policy restart both worker builders set therefore bounds the residue in the unit the child itself
+reports — `max_import_residue_bytes`, accumulated from `LeanWorkerImportStats::non_memory_mapped_region_bytes`, which
+predicts physical footprint growth with slope 1.09 and R² 0.96. A `max_imports` backstop sits underneath it, high enough
+never to fire except when a child reports zero-valued import statistics.
 
 Because the residue is unreclaimable either way, the child *keeps* the outgoing environment instead of dropping it when
-the imports change, in a session pool sized to the same `max_imports`. Returning to a profile it still holds costs a key
-comparison rather than an import, at a measured 30–50 MB per extra live environment against the 0.8–1.0 GiB an import
-costs. So the bound is really on **distinct** profiles per child: a workload that repeats one profile never trips it,
-and neither does one alternating among as many as the pool holds. Cycles that do fire are planned, appear as
-`max_imports` in `call_restart`, and do not consume the abnormal-restart budget. Fatal child exits are reported by the
-worker layer; the host maps those structured outcomes once into MCP runtime facts and retries selected read-only
-semantic jobs once. Responses carry runtime facts (`worker_generation`, `worker_restarted`, `retry_count`,
-`queue_wait_millis`, `call_restart`, `last_restart`) so clients can distinguish Lean-domain results from infrastructure
-recovery and lifecycle history. The server reports these facts and the client decides policy; the single exception is
-opt-in: `retry_tainted_non_positive` on trial/verify requests asks the server to apply one specific policy itself —
-re-issuing a non-positive verdict once when the runtime was recycled mid-call — and the retry is still surfaced through
-the same `retry_count` fact rather than hidden.
+the imports change, in a session pool whose capacity is now an independent knob rather than a mirror of the restart
+bound. Returning to a profile it still holds costs a key comparison rather than an import, at a measured ~70 MiB per
+extra live environment against the 2.0–4.5 GB an import costs. A workload that repeats one profile never trips the
+bound, and neither does one alternating among as many profiles as the pool holds; a sweep across more distinct profiles
+than the budget covers recycles, which is physics rather than policy. Cycles that do fire are planned, appear as
+`import_residue` in `call_restart`, and do not consume the abnormal-restart budget — and when the project actor finds
+itself idle above 60% of the budget it takes the same cycle early as `import_residue_idle`, re-importing the most recent
+profile so the spawn and the import both land between calls. Fatal child exits are reported by the worker layer; the
+host maps those structured outcomes once into MCP runtime facts and retries selected read-only semantic jobs once.
+Responses carry runtime facts (`worker_generation`, `worker_restarted`, `retry_count`, `queue_wait_millis`,
+`call_restart`, `last_restart`) so clients can distinguish Lean-domain results from infrastructure recovery and
+lifecycle history. The server reports these facts and the client decides policy; the single exception is opt-in:
+`retry_tainted_non_positive` on trial/verify requests asks the server to apply one specific policy itself — re-issuing a
+non-positive verdict once when the runtime was recycled mid-call — and the retry is still surfaced through the same
+`retry_count` fact rather than hidden.
 
 Each semantic tool opens a worker session with imports derived from the source header or explicit request. The worker
 child answers a matching open from its live session, or from one it has pooled, rather than importing again — so a
@@ -114,7 +124,7 @@ proof snippets, and sorry policy failures are structured tool data. Recoverable 
 with `code: "runtime_unavailable"`. MCP errors are reserved for I/O/config failures, internal invariants, and unusable
 Lake projects.
 
-The core capabilities the worker exercises across that boundary are the `lean_rs_host_*` symbols (28 mandatory, 6
+The core capabilities the worker exercises across that boundary are the `lean_rs_host_*` symbols (34 mandatory, 13
 optional) that ship inside `lean-rs-host` as a vendored Lake package. The semantic proof-search lane uses the same
 zero-consumer-setup shape through the package-owned `lean-semantic-search-runtime` crate. `lean-host-mcp` chooses the
 host cache root and toolchain/sysroot, but the runtime crate owns the `LeanSemanticSearch` source payload, provenance,

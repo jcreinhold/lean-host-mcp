@@ -50,6 +50,8 @@ pub struct RuntimeFileConfig {
     pub project_mailbox_capacity: Option<usize>,
     pub worker_restart_limit: Option<usize>,
     pub worker_restart_window_secs: Option<u64>,
+    pub worker_import_residue_budget_mib: Option<u64>,
+    pub worker_session_pool_capacity: Option<usize>,
 }
 
 /// `[broker]` — project-pool knobs.

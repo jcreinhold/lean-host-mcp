@@ -9,8 +9,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Lean heap ceiling aborted workers before the residue budget could recycle them.** `runtime.lean_max_memory_kib`
+  was a fixed 8 GiB, below the 9 GiB floor under the residue budget, so at Mathlib scale the ceiling always fired first
+  — and it does not fire gracefully. Its documented behaviour, "overrun surfaces as an ordinary Lean error in the `ok`
+  payload", is false in this embedding: Lean's allocator signals the overrun by throwing a C++ exception, which cannot
+  unwind through the Rust frame at the shim FFI boundary, so the child aborts with exit status 134 and
+  `fatal runtime error: Rust cannot catch foreign exceptions, aborting`. Observed on a three-file kan-proofs sweep:
+  files one and two answered, file three aborted the child mid-import at 1.7 GiB of residue against a budget that could
+  never be reached. The ceiling's default is now derived — twice the residue budget, because the gap has to cover what
+  the heap counts and the budget does not, which that abort put at 4.4-6.3 GiB — so the clean recycle is always strictly
+  ahead of the abort, and raising the budget carries the ceiling with it. Setting `runtime.lean_max_memory_kib` at or
+  below the budget explicitly is now warned about at startup. The same sweep now completes with zero restarts.
+- **The residue budget could exceed the machine it was sizing for.** Its 9 GiB floor was unconditional, so on any host
+  under about 12 GiB the budget was larger than total RAM and the child grew until the OS killed it — the exact failure
+  the bound exists to prevent. The derived default is now also capped at what is left after one in-flight import, which
+  makes the existing below-floor startup warning reachable on the machines it was written for.
+- **A child abort carried no record of why.** `LeanWorkerRestartReason::ChildAbort` kept only the operation name, and
+  the child's stderr is drained once at reap and retained nowhere else, so a supervisor-absorbed abort — the path behind
+  the read-only verify/proof-state degraded verdict — reported `child_abort operation=…` and nothing more. It now
+  carries the exit status and the child's message, which is what identified the heap-ceiling abort above.
+- **A pooled Lean environment could kill the worker mid-request.** Upstream, `Environment.extensions` is sized once at
+  import and can never grow afterwards, so an environment held across a later import that registers an environment
+  extension — which is what every `initialize` block and every `register_simp_attr` does — is permanently short.
+  Elaborating any `namespace`, `section`, or `open … in` against it panics inside Lean once per out-of-range slot, and
+  the child dies mid-query; the tool call comes back as a degraded batch. Session pooling made this reachable. lean-rs
+  now stamps each imported environment with an extension-registration epoch and drops any held environment whose stamp
+  no longer matches, in the worker child and in `SessionPool` alike. Requires the patched lean-rs; no wire protocol
+  change, no config change, and an import that registers nothing is unaffected. A related fix keeps a staleness eviction
+  from permanently disabling the worker's reuse hint, which would otherwise have made every later session open count
+  against `max_imports` even when it was a pool hit.
+
+- **A worker restart the server could not classify was recorded as planned.** `worker_internal` — the bucket for a
+  restart whose cause this build does not recognise, including any cycling policy a future lean-rs adds — did not count
+  toward `runtime.worker_restart_limit`, so a child cycling repeatedly for an unknown reason never tripped the
+  crash-loop breaker. `diagnosis` already treated the same cause as disrupting a verdict, so the two disagreed. It now
+  counts.
+- **A child abort reported as a restart reason was misclassified.** `LeanWorkerRestartReason::ChildAbort` had no arm in
+  the cause mapping and fell through to `worker_internal`, which (see above) was then treated as planned and
+  non-abnormal. It now maps to `child_abort`, matching how the same event is classified when it arrives as a worker
+  error instead of a restart reason.
+
 ### Changed
 
+- **`scripts/memory_stability.py` reports import residue, the quantity the recycle policy actually reads.** It reported
+  RSS only, which is an observation and not a policy input, so the harness could not show whether a long-lived server
+  was approaching a recycle. New `peak_import_residue_mib` / `final_import_residue_mib` / `import_residue_budget_mib`
+  summary fields, and a kan-proofs workload (`scripts/memory_stability.kanproofs.json`) alongside the fixture one.
+  Measured over 60 calls on a Mathlib-scale project: 60/60 `ok`, generation unmoved, 0 restarts, residue flat at 1786
+  MiB against a 9216 MiB budget.
+- **The worker recycle bound is denominated in bytes, not in imports.** `WORKER_MAX_IMPORTS = 4` was the server's only
+  reclamation mechanism, and it counted the wrong thing: an import's unreclaimable residue is its *whole closure*
+  (`.olean` compacted regions are position-dependent, so only the first import in a process is memory-mapped and every
+  later one re-copies even already-mapped modules privately). Measured against real per-file headers at Mathlib scale,
+  the first import costs 10–18 MB and each later one 2.0–4.5 GB — so the same count of four imports costs 9.6 GiB on one
+  workload and 16.0 GiB on another. The server now accumulates the bytes the child reports and recycles on
+  `runtime.worker_import_residue_budget_mib`, defaulting to a quarter of system RAM split across `broker.max_projects`
+  and clamped to 9–12 GiB. A `max_imports = 32` backstop remains underneath, reachable only when a child reports
+  zero-valued import statistics. New restart cause `import_residue`; planned, so it does not count toward
+  `runtime.worker_restart_limit` and does not taint a verdict.
+- **The session pool is sized independently of the recycle bound.** New `runtime.worker_session_pool_capacity` (default
+  8) sets how many imported environments one child keeps warm. It was previously tied to the recycle bound, which meant
+  the child's LRU eviction never ran and a `changed_coverage` sweep over more than four files re-imported on every step.
+  A held environment costs about 70 MiB against 2.0–4.5 GB for the import it saves.
+- **Residue cycles are taken while the project is idle where possible.** Above 60% of the budget the project actor waits
+  for its next call with a short timeout instead of blocking indefinitely; on a quiet tick it recycles the worker and
+  re-imports the most recently served profile, so both the spawn and the import land between calls rather than inside
+  one. Reported as the `import_residue_idle` restart cause. The `import_residue_idle : import_residue` ratio is the
+  operational signal: idle dominating means the cost is off the critical path, reactive dominating means the budget is
+  too low for how continuously the workload runs. Contexts without a tokio runtime keep the plain blocking receive.
+- **`runtime.import_residue_bytes` and `runtime.import_residue_limit_bytes`** now ride the telemetry block, so the
+  quantity the policy acts on is observable rather than inferred.
 - **One import per session instead of one per call.** The root cause of the server's memory growth was upstream: the
   worker child rebuilt its host session on every `OpenHostSession`, so every tool call ran a full `importModules`, and
   under `loadExts := true` those imported regions are never reclaimable. Child RSS therefore grew with the *number of
@@ -30,34 +100,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `scripts/rss_threshold_sweep.py` is now `scripts/memory_stability.py`: it replays a workload `--repeats` times against
   **one** server and reports whether the worker generation advances, rather than sweeping thresholds that no longer
   exist.
-- **Worker cycling is bounded by import count.** Session reuse removes growth with call *count*, but not with import
-  *count*: an environment imported with `loadExts := true` is never reclaimed, so a child that keeps importing keeps
-  growing. Measured by alternating two import profiles against one server: about +1 GiB per switch, monotone, with
-  per-call latency degrading from 0.4 s to 5 s and the OS delivering a `SIGKILL` before call 180. Both worker builders
-  now set `max_imports`, the count of the thing that actually accumulates — no `ps` fork, no byte threshold that would
-  fire immediately on Mathlib and never on a small project. A workload that repeats one import profile never trips it (a
-  reused session is not an import); one that alternates cycles about every other call and stays at 1.65 GiB. The
-  supervisor's own all-causes restart backstop is raised to match, because its default of 16 per minute counted these
-  planned cycles and, once exhausted, refused to spawn any replacement at all.
-- **Switching import profiles no longer costs a re-import, and `max_imports` is now a bound on distinct profiles.** The
-  entry above bounded import growth by cycling the child; it did not stop the child from re-importing on every switch,
-  and each of those imports was the thing being bounded. The reason it dropped the outgoing environment first — to avoid
-  holding two at once — turns out not to buy anything: under `loadExts := true` an import's compacted regions survive
-  the environment that owns them, so dropping reclaims essentially nothing. Measured in fresh processes at a fixed
-  import count, holding N environments live costs 30–50 MB more than holding one and dropping N−1, against 0.8–1.0 GiB
-  per import — 4–6% of a single import. The worker child therefore parks the outgoing session in a bounded pool, and
-  `WORKER_MAX_IMPORTS` goes from 2 to 4. An alternating workload is now the same workload as a repeating one: 200 calls
-  over two profiles perform 2 imports, never recycle the worker, and peak at 1.68 GiB, where before they cycled the
-  child roughly every other call. On `benches/worker_roundtrip.rs` an `inspect_declaration` that switches profiles every
-  iteration runs in 2.17 ms against 2.36 ms for one that does not — the switch is now a key comparison and a round trip,
-  where it used to be ~787 ms of respawn and re-import. A client rotating through more profiles than the pool holds
-  still sees planned `max_imports` cycles.
+- **Worker cycling is bounded, and switching import profiles no longer costs a re-import.** Session reuse removes growth
+  with call *count*, but not with import *count*: an environment imported with `loadExts := true` is never reclaimed, so
+  a child that keeps importing keeps growing — unbounded, that ended in an OS `SIGKILL` before call 180. Dropping the
+  outgoing environment before importing the next one does not help, because under `loadExts := true` an import's
+  compacted regions survive the environment that owns them. The worker child therefore parks the outgoing session in a
+  bounded pool and the parent cycles the child on a budget (see the byte-denominated bound above, which replaced this
+  entry's original import *count*). An alternating workload became the same workload as a repeating one: 200 calls over
+  two profiles perform 2 imports and never recycle the worker, where before they cycled roughly every other call. On
+  `benches/worker_roundtrip.rs` an `inspect_declaration` that switches profiles every iteration runs in 2.17 ms against
+  2.36 ms for one that does not — the switch is now a key comparison and a round trip, where it used to be ~787 ms of
+  respawn and re-import. The supervisor's own all-causes restart backstop is raised to clear the planned cycle rate,
+  because its default of 16 per minute counted these planned cycles and, once exhausted, refused to spawn any
+  replacement at all.
 - **`artifacts_rebuilt` now catches a rebuild under any profile the child may still hold, not just the last one.** The
   check previously skipped whenever the incoming import profile differed from the previous call's, on the grounds that a
   differing profile re-imports anyway. Under pooling it does not: a profile served several calls ago can be restored
   without importing, and would be served from `.olean` files rebuilt since. The controller now stamps each profile the
-  child may be holding, bounded by the same `WORKER_MAX_IMPORTS` that sizes the child's pool. Cost is unchanged at one
-  `stat` per import per call.
+  child may be holding, bounded by the same `runtime.worker_session_pool_capacity` that sizes the child's pool. Cost is
+  unchanged at one `stat` per import per call.
 - **Opening a worker no longer spends an import proving it can.** Both worker builders opened a session during startup
   purely as validation. This server hands every real call its own imports, so it passed an empty import set to the
   builder and never reused the session that open produced — one full import, one pooled session slot, and one of
@@ -66,7 +127,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   it prepares is the one later calls reuse. Deployment validation is unchanged and still runs up front, because
   `LeanWorkerHostHandleBuilder::check` — which the server calls when it opens a project — opens a session
   unconditionally.
-
 - **Project-scope `lean_lookup(kind = "references")` parses less instead of remembering more.** Over a 1431-module
   project (76 MB of `.ilean`), a phase split put ~95% of the cost in the JSON parse, so the reader stopped doing the
   parsing it was throwing away: every document was parsed **twice**, because the `version` probe that looked like a

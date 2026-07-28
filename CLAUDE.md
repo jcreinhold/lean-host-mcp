@@ -73,7 +73,7 @@ matching `target/release/`), then `<dir>/<toolchain>/lean-host-mcp-worker`.
 E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY` (defaults `lean_rs_fixture` /
 `LeanRsFixture`).
 
-Running the server requires any Lake project whose requested imports have built `.olean` files. The 28 mandatory + 6
+Running the server requires any Lake project whose requested imports have built `.olean` files. The 34 mandatory + 13
 optional `lean_rs_host_*` symbols come from the vendored shim Lake package inside `lean-rs-host`
 (`crates/lean-rs-host/shims/lean-rs-host-shims/`), which the host builds once per toolchain and loads without building
 the consumer's `:shared` facet—consumers don't declare or link it. Each project's `lean-toolchain` pin selects the
@@ -143,25 +143,45 @@ state-machine arm + `do_*` method to coordinate.
   Mathlib-scale worker maps at startup, so any RSS threshold fires on healthy workers. Four of them used to live here;
   they existed to contain a child that re-imported on every call, which is now fixed upstream (a session whose imports
   match the live one is reused, so retained import state no longer scales with call count). What replaced them is
-  `LEAN_MAX_MEMORY_KIB`, a Lean **heap** ceiling enforced inside the child, whose overrun is ordinary Lean-domain data
-  in the `ok` payload. RSS is sampled once per call for the `rss_kib` fact and read by no policy.
-- Add `max_requests` or an RSS ceiling to either worker builder. The **one** policy restart both builders set is
-  `max_imports(WORKER_MAX_IMPORTS)`, because imports are the one thing a child accumulates without bound: an environment
-  imported with `loadExts := true` is never reclaimed, so retained state scales with *import* count even though session
-  reuse removed the scaling with *call* count. Measured by alternating two import profiles against one server: +1 GiB
-  per import, 11.2 GiB and a `SIGKILL` before call 180 with no bound; 1.65 GiB and no aborts with it. A workload that
-  repeats one import profile never trips it, because a reused session is not an import. `SUPERVISOR_RESTART_INTENSITY`
-  raises the supervisor's own all-causes backstop above that planned cycle rate — its default of 16/min is terminal when
-  exhausted. The crash-loop breaker (`MAX_RESTARTS_PER_WINDOW`, abnormal causes only) and the per-request deadline are
-  this actor's own and stay.
-- Drop the outgoing session when the imports change. Since the residue is unreclaimable either way, the child *pools*
-  imported sessions — capacity `LEAN_RS_WORKER_SESSION_POOL_CAPACITY`, which the supervisor derives from `max_imports`,
-  so the parent cycles the child exactly where the pool would start evicting. A profile the pool still holds is restored
-  by key comparison, not by importing, at a measured 30–50 MB per extra live environment against 0.8–1.0 GiB per import.
-  `WORKER_MAX_IMPORTS` is therefore a bound on *distinct* profiles per child, which is why it is 4 rather than 2, and an
-  alternating workload is now the same workload as a repeating one (`smoke_perf.rs`: 200 alternating calls, 0 restarts,
-  1.68 GiB). The parent mirrors the pool in `ProjectActorState::imports_seen` so `cycle_if_imports_rebuilt` can still
-  catch a `.olean` rebuilt under a profile that another profile ran in between.
+  `runtime.lean_max_memory_kib`, a Lean **heap** ceiling enforced inside the child. RSS is sampled once per call for the
+  `rss_kib` fact and read by no policy.
+- Give that heap ceiling a fixed value, and do not believe the old claim that its overrun is ordinary Lean-domain data
+  in the `ok` payload — it is not, and the difference is a dead child. Lean's allocator throws a C++ exception, which
+  cannot unwind through the Rust frame at the shim FFI boundary: `fatal runtime error: Rust cannot catch foreign
+  exceptions, aborting`, exit status 134. (Lean's *monadic* check point does raise a catchable error, but
+  `importModules` never reaches it.) So the ceiling must sit above everything healthy work reaches, and healthy work
+  reaches the residue budget by construction. A fixed 8 GiB under a 9 GiB budget floor meant the abort always preempted
+  the clean recycle and the residue policy was unreachable at Mathlib scale — a three-file kan-proofs sweep aborted the
+  child on file three. `lean_max_memory_kib_for` derives it as twice the budget, so the order is structural.
+- Add `max_requests`, an RSS ceiling, or an import *count* ceiling to either worker builder. The **one** policy restart
+  both builders set is `max_import_residue_bytes`, because imports are the one thing a child accumulates without bound:
+  an environment imported with `loadExts := true` is never reclaimed, so retained state scales with what a child has
+  imported even though session reuse removed the scaling with *call* count. It is denominated in bytes because a count
+  is the wrong unit — measured on real per-file headers at Mathlib scale, the same *four* imports cost 9.6 GiB on one
+  workload and 16.0 GiB on another, and only the first import in a process is memory-mapped (10–18 MB; every later one
+  re-materializes its whole closure at 2.0–4.5 GB, overlap included). The parent accumulates
+  `LeanWorkerImportStats::non_memory_mapped_region_bytes`, which predicts Δ`phys_footprint` with slope 1.09 / R² 0.96;
+  `compacted_region_bytes`, extension entries, and module count all fail the ≥0.9 bar. `WORKER_MAX_IMPORTS_BACKSTOP`
+  (32) stays only as the guard against a child that reports zero-valued import stats — that path advances
+  `import_stats_unusable`. `SUPERVISOR_RESTART_INTENSITY` raises the supervisor's own all-causes backstop above the
+  planned cycle rate — its default of 16/min is terminal when exhausted. The crash-loop breaker
+  (`MAX_RESTARTS_PER_WINDOW`, abnormal causes only) and the per-request deadline are this actor's own and stay.
+- Drop the outgoing session when the imports change, or re-couple the pool to the restart bound. Since the residue is
+  unreclaimable either way, the child *pools* imported sessions — capacity `LEAN_RS_WORKER_SESSION_POOL_CAPACITY`, set
+  from the first-class `LeanWorkerConfig::session_pool_capacity` (`WORKER_SESSION_POOL_CAPACITY = 8`). It used to be
+  derived from `max_imports`, which made the child's LRU eviction dead code: the parent cycled the child exactly where
+  the pool would have started evicting. A profile the pool still holds is restored by key comparison, not by importing,
+  at a measured ~70 MiB per extra live environment against 2.0–4.5 GB per import. (The pool can also evict below
+  capacity, when an import registers a Lean environment extension and leaves a held environment permanently
+  short-`extensions`; that direction only frees slots.) The residue budget and the pool capacity are now independent:
+  the budget bounds bytes per child generation, the capacity bounds how many warm profiles a generation holds, and
+  `reuse_hint_capacity` plus `ProjectActorState::imports_seen` both track the *capacity* — the latter so
+  `cycle_if_imports_rebuilt` still catches a `.olean` rebuilt under a profile that another profile ran in between.
+- Take the residue cycle on the request path when it can be taken off it. Above 60% of the budget the actor's receive
+  loop waits with a `QUIESCENCE_GRACE` timeout instead of `blocking_recv`, and on a quiet tick it cycles and re-imports
+  the most recent profile (`RestartCause::ImportResidueIdle`). The `import_residue_idle : import_residue` ratio is this
+  design's KPI. Under the soft budget, or with no tokio handle (sync tests), the timeout is not armed and the loop is
+  the plain blocking receive it always was.
 
 Lean-domain failures cross the worker boundary as `Serialize + Deserialize` data (`LeanWorkerElabFailure`,
 `LeanWorkerMetaResult<T>`, etc.); the projection from worker types to MCP types is pure Rust data shuffling, with no

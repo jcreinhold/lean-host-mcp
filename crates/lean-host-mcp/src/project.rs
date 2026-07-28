@@ -52,29 +52,69 @@ use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
 /// per distinct query shape. 256 sized the cache for a workload nobody has;
 /// what it actually bought was a 4× larger worst case.
 const MODULE_QUERY_CACHE_CAPACITY: usize = 64;
+/// Room the sizing rules leave for the one import that may be in flight.
+///
+/// `q_max = 4.51 GB`, the largest single-import residue measured over
+/// kan-proofs, rounded up: a budget with less than this left over on the machine
+/// cannot afford the import that would fill it.
+const WORKER_IMPORT_HEADROOM_BYTES: u64 = 4608 * 1024 * 1024;
+/// Least gap [`lean_max_memory_kib_for`] leaves between the residue budget and
+/// the heap ceiling, whatever the budget.
+///
+/// 8 GiB against a measured 4.4–6.3 GiB offset. The margin is deliberate: the
+/// offset comes from one project's imports, and being too low aborts a healthy
+/// child while being too high only defers to the OS.
+const WORKER_HEAP_HEADROOM_FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Lean *heap* ceiling for a worker child, enforced inside the child by
-/// `lean_internal_set_max_memory`.
+/// `lean_internal_set_max_memory` — derived from the residue budget rather than
+/// fixed, because the two are not independent.
 ///
-/// This replaced four RSS thresholds — an import-switch soft cycle, a post-job
-/// recycle, a 16 GiB in-flight hard kill, and a forced recycle every 64
-/// requests. All four existed to contain a child whose RSS grew with the
-/// *number of tool calls*, because every session open re-ran `importModules`
-/// and those regions were never reclaimable. The worker child now reuses a
-/// matching session, so the growth they contained is gone, and what is left is
-/// one runaway elaboration — which is a heap problem, not an RSS one.
+/// **This is a suicide switch, not a graceful limit.** It was documented as
+/// surfacing a Lean-domain failure inside the `ok` payload; that is false in
+/// this embedding, and measurably so. Lean's allocator signals the overrun by
+/// throwing a C++ exception, which unwinds into the Rust frame at the shim FFI
+/// boundary and gets `fatal runtime error: Rust cannot catch foreign
+/// exceptions, aborting` — exit status 134, the whole child. Lean's *monadic*
+/// check point (`Core.checkMaxMemory`) does raise a catchable error, but only
+/// where Lean code reaches it; `importModules` never does. Observed on a
+/// three-file kan-proofs sweep at the old fixed 8 GiB: files 1 and 2 answered,
+/// file 3 aborted the child mid-import.
 ///
-/// RSS was the wrong quantity to measure regardless. It counts shared, clean,
-/// mmapped `.olean` pages that the kernel can drop at will: a Mathlib child
-/// reads multiple GiB of RSS while its actual footprint is a fraction of that,
-/// so an RSS ceiling fires on healthy workers and says nothing about the
-/// unhealthy ones. Lean's own heap accounting is the quantity that
-/// distinguishes them.
+/// Which is why the value cannot be a constant. Crossing this ceiling kills the
+/// child, so it must sit above everything healthy work reaches — and healthy
+/// work reaches the residue budget by construction, because that is the point at
+/// which the supervisor recycles cleanly. A fixed 8 GiB sat *below* the 9 GiB
+/// budget floor, so at Mathlib scale the suicide switch always preempted the
+/// clean recycle and the entire residue policy was unreachable. Deriving it
+/// keeps the order structural: budget first, abort only if something is wrong.
 ///
-/// Overrun surfaces as a `LeanWorkerElabFailure` inside the `ok` payload —
-/// the Lean-domain-failure contract — rather than as a kill, a result taint, or
-/// a restart. 8 GiB because a single elaboration that legitimately needs more
-/// than that is a Lean-side problem an agent cannot act on either way.
-const LEAN_MAX_MEMORY_KIB: u64 = 8 * 1024 * 1024;
+/// The gap has to cover what the *heap* counts and the budget does not, and both
+/// terms below are needed because that quantity is neither constant nor
+/// proportional. In the observed abort the heap crossed 8 GiB while residue was
+/// between 1.71 and 3.62 GiB, so the offset — the elaborator's own heap, the
+/// first import's non-residue allocation, and the transient peak inside
+/// `importModules` — was 4.4–6.3 GiB. That offset tracks the *project*, not the
+/// budget, so a purely proportional gap is too small at a low budget; and it is
+/// measured on one project, so a purely fixed gap would be too small for a
+/// heavier one. Take whichever binds:
+///
+/// - [`WORKER_HEAP_HEADROOM_FLOOR_BYTES`] covers the offset outright, which is
+///   what a budget below it needs.
+/// - Doubling covers a project whose offset scales past that floor, which is
+///   what a budget above it needs.
+///
+/// The error is also asymmetric, so both terms err high. Too low aborts healthy
+/// work — the bug this fixes. Too high means the OS reaps the child instead,
+/// which for a *child* process is nearly the same outcome, minus the thrash. The
+/// one thing this really asserts is that the clean recycle wins.
+const fn lean_max_memory_kib_for(import_residue_budget_bytes: u64) -> u64 {
+    let headroom = if import_residue_budget_bytes > WORKER_HEAP_HEADROOM_FLOOR_BYTES {
+        import_residue_budget_bytes
+    } else {
+        WORKER_HEAP_HEADROOM_FLOOR_BYTES
+    };
+    import_residue_budget_bytes.saturating_add(headroom) / 1024
+}
 /// Depth of one project's job queue, and the only admission mechanism in the
 /// server. The actor thread runs one job at a time, so this bounds how many
 /// callers may be waiting on a single worker before the project sheds load
@@ -89,60 +129,133 @@ const PROJECT_MAILBOX_CAPACITY: usize = 16;
 /// `find_references` at project scope) appear to hang. Raise it for unusually
 /// heavy modules whose `verify`/`proof_state` legitimately runs longer.
 const REQUEST_TIMEOUT_MILLIS: u64 = 120 * 1000;
-/// How many *imports* one worker child may run before the supervisor cycles it,
-/// and — the same number, structurally — how many imported environments that
-/// child pools.
+/// How many bytes of unreclaimable import residue one worker child may retain
+/// before the supervisor cycles it — the ceiling on the RAM-derived default.
 ///
-/// This is the **entire** memory policy for import residue.
-/// [`LEAN_MAX_MEMORY_KIB`] bounds the Lean *heap*; an import's compacted regions
-/// are mmapped outside that heap, so it does not see them. Nothing else does
-/// either.
+/// This is the **entire** memory policy for import residue, and the *only* one
+/// that recycles cleanly. [`lean_max_memory_kib_for`] derives a heap ceiling
+/// above it, but crossing that ceiling aborts the child, so it is a backstop
+/// against a residue-accounting bug rather than a second policy.
+///
+/// The two are not independent, and believing they were is what put the ceiling
+/// below the budget. Only the *first* `importModules` in a process maps its
+/// compacted regions; every later one re-materialises them as private copies,
+/// which are ordinary heap allocations the ceiling does see. So the same bytes
+/// this counts are most of what accumulates against the heap ceiling.
 ///
 /// Session reuse removed growth with call count, but not with import count: a
 /// Lean environment imported with `loadExts := true` cannot be reclaimed
 /// (`Environment.freeRegions` is unsound there), so every import a child
 /// performs is retained for the life of that child even after its session is
-/// dropped. Measured on `fixtures/lean` by alternating two import profiles
-/// against one server (`scripts/memory_stability.py`): child RSS rose from
-/// 1.26 GiB to 11.2 GiB over ~10 switches, per-call latency degraded from 0.4 s
-/// to 5 s, and the OS killed the child with `SIGKILL` at 178 calls.
+/// dropped. What this bound counts is those retained bytes directly — the
+/// `non_memory_mapped_region_bytes` Lean attributes to each import, summed over
+/// the child's generation.
 ///
-/// So the bound belongs on imports. A workload that repeats one import profile
-/// — the proof loop this server exists to serve — never trips it, because a
-/// reused session is not an import and does not count
-/// (`Response::HostSessionReused` leaves `imports_since_restart` untouched).
+/// **Why bytes and not a count.** This was `WORKER_MAX_IMPORTS = 4` until the
+/// unit was measured. On `~/Code/kan-proofs` with real per-file import headers,
+/// four imports cost 9.60 GiB of process `phys_footprint` on one sample of
+/// profiles and 16.00 GiB on another — the same count, 1.7× the memory, on the
+/// same machine and the same project. An import ranges from tens of megabytes to
+/// several gigabytes depending on its closure, so a count that is right for one
+/// project is wrong for the next by two orders of magnitude.
 ///
-/// Since the child pools sessions rather than dropping the outgoing one, a
-/// workload that *switches* profiles doesn't trip it either, as long as it
-/// cycles among at most this many: returning to a pooled profile is a key
-/// compare, not an import. That makes this a bound on **distinct** profiles per
-/// child generation, which is why it can afford to be larger than the `2` that
-/// bounded switches.
+/// **What this buys, and what it does not.** It buys scale-independence, which
+/// depends on no measurement: `4` recycles a 50 MB/import project after 200 MB
+/// for nothing, and a 2 GB/import project after 8 GB whether or not the machine
+/// cares. It does **not** buy fewer restarts at Mathlib scale. Residue there is
+/// ~2–4.5 GB per import — the profile's whole closure, because `.olean`
+/// compacted regions are position-dependent and only the *first* `importModules`
+/// in a process maps them at their preferred addresses; every later import
+/// re-materialises even shared modules as private copies. Against the floor
+/// below that is three or four imports per generation, which is roughly where
+/// the count already sat. Restarts at that scale are physics: *k* files means
+/// ~*k* imports, and residue that cannot be reclaimed must be recycled every
+/// `budget / residue-per-import` imports whatever any policy says. What Part 3's
+/// idle cycling changes is *when* that cost lands, not how often.
 ///
-/// `4` from the three-arm measurement in `lean-rs`'s `long_session_memory`
-/// example (`pooled-distinct`), fresh process per arm, `.olean`-backed RSS at
-/// the end:
+/// A workload that repeats one import profile — the proof loop this server
+/// exists to serve — never trips it, because a reused session is not an import
+/// and charges nothing (`Response::HostSessionReused` leaves the accumulator
+/// untouched). Nor does one cycling among at most
+/// [`WORKER_SESSION_POOL_CAPACITY`] profiles: returning to a pooled profile is a
+/// key comparison.
 ///
-/// | distinct | imports | live envs | peak RSS |
-/// |----------|---------|-----------|----------|
-/// | 2, dropped   | 2  | 1 | 1.650 GB |
-/// | 2, pooled    | 2  | 2 | 1.679 GB |
-/// | 2, alternating | 8 | 1 | 8.824 GB |
-/// | 4, dropped   | 4  | 1 | 4.043 GB |
-/// | 4, pooled    | 4  | 4 | 4.190 GB |
-/// | 4, alternating | 16 | 1 | ~7.9 GB |
+/// This is deliberately *not* an RSS threshold, and the reason is stronger than
+/// it used to be. RSS counts shared, clean, mmapped `.olean` pages, so an
+/// RSS-valued limit fires immediately on a Mathlib-scale project. Worse, it is
+/// anti-correlated: across twelve real imports ΔRSS/Δfootprint was 5.8 on the
+/// first and **0.00** after — RSS *fell* while retained memory grew by 2.3–5.4
+/// GB, because the OS evicts exactly the clean pages RSS was counting. The
+/// quantity here is Lean's own attribution of what it could not map, read off a
+/// value the child already computes, needing no `ps` fork.
+const WORKER_IMPORT_RESIDUE_CEILING_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+/// The floor under the derived residue budget, and the load-bearing half of it.
 ///
-/// Holding an environment alive instead of dropping it costs 30–50 MB against
-/// the 0.8–1.0 GiB the import that produced it costs — 4–6%, because the
-/// regions outlive the environment either way. So the pool is nearly free and
-/// the *imports* are what to count: four distinct profiles cost ~4.2 GiB
-/// pooled versus ~7.9 GiB and four times the imports without.
+/// Below one import's residue the policy degenerates to "cycle before every
+/// import", which is strictly worse than the count bound it replaces. `2 × q_max`
+/// where `q_max = 4.51 GB` is the largest single-import residue measured over
+/// kan-proofs, so a generation always fits at least two imports and the session
+/// pool has something to do.
+const WORKER_IMPORT_RESIDUE_FLOOR_BYTES: u64 = 9 * 1024 * 1024 * 1024;
+/// The budget a machine too small for the floor gets instead.
 ///
-/// This is deliberately *not* an RSS threshold. RSS counts shared, clean,
-/// mmapped `.olean` pages, so any byte-valued limit either fires immediately on
-/// a Mathlib-scale project or never fires on a small one; the import count is
-/// the quantity that actually leaks, and reading it costs no `ps` fork.
-const WORKER_MAX_IMPORTS: u64 = 4;
+/// Degenerate on purpose — one import per generation — because a single import
+/// can never restart before itself: the accumulator only advances on completed
+/// imports and the bound is tested before the request. So this is "recycle after
+/// every import", which is well defined, safe, and the most such a machine can
+/// be given. Nonzero so the MiB round-trip through `[runtime]` stays nonzero.
+const WORKER_IMPORT_RESIDUE_MIN_BYTES: u64 = 1024 * 1024;
+/// Reciprocal of the share of system RAM all resident projects' residue budgets
+/// may claim, before division by `BrokerConfig::max_projects`.
+///
+/// A quarter: residue is the part of a child that cannot be reclaimed, not its
+/// whole footprint, and the OS needs the rest.
+const WORKER_IMPORT_RESIDUE_RAM_DIVISOR: u64 = 4;
+/// Assumed system RAM when the platform will not report it.
+const WORKER_ASSUMED_SYSTEM_RAM_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+/// Percentage of the residue budget at which an *idle* child is cycled.
+///
+/// The hard bound stops a request; this one fires between requests, where the
+/// ~730 ms respawn costs the client nothing.
+const WORKER_IMPORT_RESIDUE_SOFT_PERCENT: u64 = 60;
+/// Pure backstop on imports per child, behind the byte budget.
+///
+/// The one thing between a residue-accounting bug and the 11.2 GiB `SIGKILL`
+/// this subsystem exists to prevent, and it costs one integer compare. Set far
+/// above any legitimate generation so that in normal operation the byte bound is
+/// always what fires and this only speaks when residue is being reported as
+/// zero. [`LeanWorkerStats::import_stats_unusable`] says which happened.
+const WORKER_MAX_IMPORTS_BACKSTOP: u64 = 32;
+/// How many imported environments one worker child pools.
+///
+/// No longer the same number as the restart bound, and their being equal was a
+/// bug: it made the child's LRU eviction unreachable, because the parent cycled
+/// the child at exactly the point the pool would have begun evicting. They price
+/// different things. A held environment costs ~70 MiB — 8,396,800 KiB holding
+/// five against 8,110,080 KiB dropping each, measured on kan-proofs — while the
+/// import it saves costs 2.0–4.5 GB. Holding is 1.6–3.5% of importing, so
+/// capacity should track the workload's working set of distinct profiles, not
+/// the memory bound.
+///
+/// `8` because [`crate::tools::changed_coverage`] loops per changed file with no
+/// cap and median PR diffs run 3–12 files; at 4, any 5-file diff thrashes the
+/// pool inside one tool call. Eight costs ~560 MiB held against 8 GB or more of
+/// re-imports avoided.
+const WORKER_SESSION_POOL_CAPACITY: usize = 8;
+/// How long the actor waits for another call before treating the project as
+/// quiescent and cycling an over-budget child.
+///
+/// Only armed when the child is already over its soft residue budget; under it
+/// the actor blocks on its mailbox with no timer at all. Two seconds is short
+/// enough that a pause between proof steps is usually enough, and long enough
+/// that a burst of calls is never interrupted mid-flight.
+const QUIESCENCE_GRACE: Duration = Duration::from_secs(2);
+/// How recently a profile must have been served for an idle cycle to re-import
+/// it into the fresh child.
+///
+/// A minute of silence is not evidence the caller is coming back to the same
+/// file, and a wrong guess costs a full import.
+const PREWARM_RECENCY: Duration = Duration::from_mins(1);
 const MAX_JOB_RETRIES: u32 = 1;
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_mins(1);
@@ -171,18 +284,95 @@ pub struct ProjectRuntimeConfig {
     mailbox_capacity: usize,
     max_restarts_per_window: usize,
     restart_window: Duration,
+    import_residue_budget_bytes: u64,
+    session_pool_capacity: usize,
 }
 
 impl Default for ProjectRuntimeConfig {
     fn default() -> Self {
+        let import_residue_budget_bytes = default_import_residue_budget_bytes(crate::broker::DEFAULT_MAX_PROJECTS);
         Self {
-            lean_max_memory_kib: LEAN_MAX_MEMORY_KIB,
+            lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
             max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
             restart_window: RESTART_WINDOW,
+            import_residue_budget_bytes,
+            session_pool_capacity: WORKER_SESSION_POOL_CAPACITY,
         }
     }
+}
+
+/// The residue budget one project actor gets when nothing overrides it.
+///
+/// Derived rather than constant because the quantity it bounds is a share of the
+/// machine: each resident project owns one child, up to `max_projects` of them
+/// are resident at once, and residue is the part of a child that cannot be
+/// handed back. The floor is what actually decides the value on any machine
+/// smaller than about 150 GiB, which is deliberate — see
+/// [`WORKER_IMPORT_RESIDUE_FLOOR_BYTES`]. Sizing below one import's residue
+/// would be strictly worse than the count bound this replaces, so the fraction
+/// is allowed to lose.
+fn default_import_residue_budget_bytes(max_projects: usize) -> u64 {
+    import_residue_budget_for(
+        system_ram_bytes().unwrap_or(WORKER_ASSUMED_SYSTEM_RAM_BYTES),
+        max_projects,
+    )
+}
+
+/// The policy half of [`default_import_residue_budget_bytes`], split out from
+/// the one platform read so the sizing rules can be tested on machines that do
+/// not exist.
+fn import_residue_budget_for(ram: u64, max_projects: usize) -> u64 {
+    let per_project = ram
+        .checked_div(WORKER_IMPORT_RESIDUE_RAM_DIVISOR)
+        .and_then(|share| share.checked_div(max_projects.max(1) as u64))
+        .unwrap_or(WORKER_IMPORT_RESIDUE_FLOOR_BYTES);
+    // The floor is unconditional, and on any machine under ~12 GiB it exceeds
+    // the whole machine — a budget the child cannot reach before the OS kills it
+    // is not a budget, and the `SIGKILL` it fails to prevent is the exact
+    // failure this subsystem exists for. Cap it at what is left after the one
+    // import that may be in flight when the bound is tested. On an
+    // undersized machine the result lands below the floor, which is honest:
+    // that is what `actor_main`'s below-floor warning is there to say.
+    let affordable = ram
+        .saturating_sub(WORKER_IMPORT_HEADROOM_BYTES)
+        .max(WORKER_IMPORT_RESIDUE_MIN_BYTES);
+    per_project
+        .clamp(WORKER_IMPORT_RESIDUE_FLOOR_BYTES, WORKER_IMPORT_RESIDUE_CEILING_BYTES)
+        .min(affordable)
+}
+
+/// Total physical RAM, or `None` where the platform will not say.
+///
+/// Read once at startup and never again: the number does not change, and this is
+/// a sizing input rather than a live signal. Deliberately not a dependency — one
+/// `sysctl` and one `/proc` read are the whole implementation.
+#[cfg(target_os = "macos")]
+fn system_ram_bytes() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn system_ram_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn system_ram_bytes() -> Option<u64> {
+    None
 }
 
 impl ProjectRuntimeConfig {
@@ -211,13 +401,57 @@ impl ProjectRuntimeConfig {
                 project_mailbox_capacity: runtime_env_var("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY")?,
                 worker_restart_limit: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_LIMIT")?,
                 worker_restart_window_secs: runtime_env_var("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS")?,
+                worker_import_residue_budget_mib: runtime_env_var("LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB")?,
+                worker_session_pool_capacity: runtime_env_var("LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY")?,
             },
             file,
         )
     }
 
+    /// Unreclaimable import residue one worker child may retain before the
+    /// supervisor cycles it; see [`WORKER_IMPORT_RESIDUE_CEILING_BYTES`].
+    #[must_use]
+    pub const fn import_residue_budget_bytes(&self) -> u64 {
+        self.import_residue_budget_bytes
+    }
+
+    /// Override the residue budget on an already-resolved config.
+    ///
+    /// The one knob an embedder that bypasses [`Self::from_env`] still has to
+    /// be able to set: every other default is a policy constant that holds on
+    /// any machine, while this one is a share of the host's RAM and the default
+    /// can only guess at how many projects will actually be resident. Also how
+    /// a test forces the residue path to fire without a Mathlib-scale import.
+    ///
+    /// Moves the Lean heap ceiling with it, for the reason
+    /// [`lean_max_memory_kib_for`] gives: a ceiling below the budget aborts the
+    /// child where the budget would have recycled it cleanly. Callers do not get
+    /// to hold the two independently, because there is no correct way to.
+    #[must_use]
+    pub const fn with_import_residue_budget_bytes(mut self, bytes: u64) -> Self {
+        self.import_residue_budget_bytes = bytes;
+        self.lean_max_memory_kib = lean_max_memory_kib_for(bytes);
+        self
+    }
+
+    /// The residue at which an *idle* child is cycled proactively, so the
+    /// respawn lands between requests rather than inside one.
+    #[must_use]
+    pub const fn import_residue_soft_bytes(&self) -> u64 {
+        self.import_residue_budget_bytes
+            .saturating_div(100)
+            .saturating_mul(WORKER_IMPORT_RESIDUE_SOFT_PERCENT)
+    }
+
+    /// How many imported environments one worker child pools; see
+    /// [`WORKER_SESSION_POOL_CAPACITY`].
+    #[must_use]
+    pub const fn session_pool_capacity(&self) -> usize {
+        self.session_pool_capacity
+    }
+
     /// The Lean heap ceiling applied to each worker child; see
-    /// [`LEAN_MAX_MEMORY_KIB`].
+    /// [`lean_max_memory_kib_for`].
     #[must_use]
     pub const fn lean_max_memory_kib(&self) -> u64 {
         self.lean_max_memory_kib
@@ -251,17 +485,33 @@ struct RuntimeEnv {
     project_mailbox_capacity: Option<String>,
     worker_restart_limit: Option<String>,
     worker_restart_window_secs: Option<String>,
+    worker_import_residue_budget_mib: Option<String>,
+    worker_session_pool_capacity: Option<String>,
 }
 
 fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig) -> Result<ProjectRuntimeConfig> {
     let defaults = ProjectRuntimeConfig::default();
+    // Resolved before the heap ceiling, which defaults to a function of it:
+    // an operator who raises the budget must get a ceiling that still sits
+    // above it, or they have rebuilt the inversion `lean_max_memory_kib_for`
+    // exists to prevent.
+    // Configured in MiB because the value is gigabytes: a byte count here
+    // would be a wall of zeros to get wrong.
+    let import_residue_budget_bytes = parse_nonzero_u64(
+        "LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB",
+        env.worker_import_residue_budget_mib.as_deref(),
+        file.worker_import_residue_budget_mib,
+        defaults.import_residue_budget_bytes / (1024 * 1024),
+    )?
+    .saturating_mul(1024 * 1024);
     let config = ProjectRuntimeConfig {
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),
             file.lean_max_memory_kib,
-            defaults.lean_max_memory_kib,
+            lean_max_memory_kib_for(import_residue_budget_bytes),
         )?,
+        import_residue_budget_bytes,
         request_timeout_millis: parse_nonzero_u64(
             "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
             env.request_timeout_millis.as_deref(),
@@ -286,6 +536,12 @@ fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig) -> Result<Pro
             file.worker_restart_window_secs,
             defaults.restart_window.as_secs(),
         )?),
+        session_pool_capacity: parse_nonzero_usize(
+            "LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY",
+            env.worker_session_pool_capacity.as_deref(),
+            file.worker_session_pool_capacity,
+            defaults.session_pool_capacity,
+        )?,
     };
     Ok(config)
 }
@@ -457,6 +713,14 @@ enum RestartCause {
     RssHardLimit,
     MaxRequests,
     MaxImports,
+    /// Imports retained the configured budget of unreclaimable bytes, and the
+    /// child was cycled before the next one on the request path.
+    ImportResidue,
+    /// The same budget crossed its soft threshold while the mailbox was empty,
+    /// so the cycle ran between requests instead of inside one. The ratio of
+    /// this cause to [`Self::ImportResidue`] is how much of the recycle cost the
+    /// idle path actually moved off the critical path.
+    ImportResidueIdle,
     Idle,
     Timeout,
     Cancelled,
@@ -475,6 +739,8 @@ impl RestartCause {
             Self::RssHardLimit => "rss_hard_limit_exceeded",
             Self::MaxRequests => "max_requests",
             Self::MaxImports => "max_imports",
+            Self::ImportResidue => "import_residue",
+            Self::ImportResidueIdle => "import_residue_idle",
             Self::Idle => "idle",
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
@@ -495,6 +761,13 @@ impl RestartCause {
                 | Self::ChildAbort
                 | Self::SessionMissing
                 | Self::RssHardLimit
+                // Not a planned cycle: this is the bucket for a restart whose
+                // cause this build cannot name — an upstream policy added after
+                // it shipped, or a replacement the supervisor reported with no
+                // reason at all. `diagnosis::execution_taint` already treats it
+                // as disrupting; a crash-loop breaker that excused the one cause
+                // it understands least would be exactly backwards.
+                | Self::WorkerInternal
         )
     }
 
@@ -568,6 +841,10 @@ fn log_restart(event: &RuntimeRestartEvent, restarts_total: u64) {
         | "cancelled" => emit!(warn, "worker recycled (abnormal)"),
         "rss_post_job" => emit!(info, "worker recycled (memory pressure)"),
         "artifacts_rebuilt" => emit!(info, "worker recycled (imports rebuilt on disk)"),
+        // Reactive at `info`, proactive at `debug` (via the fallthrough): the
+        // ratio between them is the tuning signal, and it is the *reactive*
+        // half — the cycle a call had to wait for — that an operator acts on.
+        "import_residue" => emit!(info, "worker recycled (import residue budget)"),
         _ => emit!(debug, "worker recycled (hygiene)"),
     }
 }
@@ -577,11 +854,13 @@ fn restart_cause_from_worker(reason: &LeanWorkerRestartReason) -> RestartCause {
         "explicit" => RestartCause::Explicit,
         "max_requests" => RestartCause::MaxRequests,
         "max_imports" => RestartCause::MaxImports,
+        "import_residue" => RestartCause::ImportResidue,
         "rss_ceiling" => RestartCause::RssPostJob,
         "rss_hard_limit" => RestartCause::RssHardLimit,
         "idle" => RestartCause::Idle,
         "cancelled" => RestartCause::Cancelled,
         "timeout" => RestartCause::Timeout,
+        "child_abort" => RestartCause::ChildAbort,
         _ => RestartCause::WorkerInternal,
     }
 }
@@ -595,6 +874,8 @@ struct RuntimeSnapshot {
     profile_switch_count: u64,
     restarts_total: u64,
     restarts_by_cause: BTreeMap<String, u64>,
+    import_residue_bytes: Option<u64>,
+    import_residue_limit_bytes: Option<u64>,
 }
 
 impl RuntimeSnapshot {
@@ -612,6 +893,8 @@ impl RuntimeSnapshot {
             profile_switch_count: self.profile_switch_count,
             restarts_total: self.restarts_total,
             restarts_by_cause: self.restarts_by_cause.clone(),
+            import_residue_bytes: self.import_residue_bytes,
+            import_residue_limit_bytes: self.import_residue_limit_bytes,
         }
     }
 }
@@ -659,6 +942,8 @@ impl LeanProject {
             profile_switch_count: 0,
             restarts_total: 0,
             restarts_by_cause: BTreeMap::new(),
+            import_residue_bytes: None,
+            import_residue_limit_bytes: None,
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let healthy = Arc::new(AtomicBool::new(true));
@@ -1060,6 +1345,17 @@ struct ActorConfig {
     mailbox_capacity: usize,
     max_restarts_per_window: usize,
     restart_window: Duration,
+    import_residue_budget_bytes: u64,
+    import_residue_soft_bytes: u64,
+    session_pool_capacity: usize,
+    /// The tokio runtime the actor may borrow to wait on its mailbox with a
+    /// timeout, captured where [`LeanProject::open`] runs inside one.
+    ///
+    /// `None` in a synchronous test context, which degrades to the mailbox-empty
+    /// check alone — the same degradation the broker's reaper already accepts.
+    /// The handle is used *only* to wrap the receive; no Lean session ever
+    /// crosses it.
+    tokio_handle: Option<tokio::runtime::Handle>,
     /// Open-time toolchain advisories (unknown pin, missing sidecar, no smoke
     /// record). The actor carries them so a `runtime_unavailable` it produces
     /// after worker death still flags a suspect worker. Mirrors
@@ -1157,6 +1453,10 @@ impl ActorConfig {
             mailbox_capacity: runtime_config.mailbox_capacity(),
             max_restarts_per_window: runtime_config.max_restarts_per_window(),
             restart_window: runtime_config.restart_window(),
+            import_residue_budget_bytes: runtime_config.import_residue_budget_bytes(),
+            import_residue_soft_bytes: runtime_config.import_residue_soft_bytes(),
+            session_pool_capacity: runtime_config.session_pool_capacity(),
+            tokio_handle: tokio::runtime::Handle::try_current().ok(),
             toolchain_advisories: open_warnings.clone(),
         };
         Ok((config, open_warnings))
@@ -1167,10 +1467,18 @@ impl ActorConfig {
 /// holding it at.
 struct ImportProfileStamp {
     fingerprint: String,
+    /// The profile's imports, kept so a pre-warm after an idle cycle can reopen
+    /// it. The fingerprint is `imports.join("\n")` and could be split back, but
+    /// that makes the pre-warm depend on the fingerprint's spelling; this list is
+    /// what the child was actually asked for.
+    imports: Vec<String>,
     /// Newest `.olean` mtime among that profile's imports, sampled when it was
     /// last served. `None` for an unbuilt project, where there is no mtime to
     /// compare against.
     artifact_stamp: Option<std::time::SystemTime>,
+    /// When this profile was last served, so an idle cycle only pre-warms a
+    /// profile a returning caller is plausibly still working in.
+    last_served: Instant,
 }
 
 struct ProjectActorState {
@@ -1192,10 +1500,22 @@ struct ProjectActorState {
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     abnormal_restart_times: VecDeque<Instant>,
     restart_stats: RestartStats,
+    /// Whether this quiet period has already taken its idle cycle.
+    ///
+    /// One is all a quiet period can profitably take. The pre-warm that follows
+    /// a cycle re-imports, which puts the fresh child's residue back above zero
+    /// and, under a budget small enough, straight back over the soft threshold —
+    /// so without this the actor would cycle, pre-warm, and cycle again every
+    /// grace interval, discarding each pre-warm with nothing served in between.
+    /// Cleared by the next served call, which is what makes the *next* cycle
+    /// worth something.
+    cycled_while_idle: bool,
 }
 
 impl ProjectActorState {
     fn handle_message(&mut self, message: ProjectMessage) {
+        // A call was served, so the next quiet period earns a fresh idle cycle.
+        self.cycled_while_idle = false;
         match message {
             ProjectMessage::ModuleQuery {
                 meta,
@@ -1543,7 +1863,7 @@ impl ProjectActorState {
         // session about to serve the job will have imported, whether that
         // session is a pooled one, the live one, or the replacement opened
         // below.
-        let previous = self.note_import_profile(&meta.import_fingerprint, stamp);
+        let previous = self.note_import_profile(&meta.import_fingerprint, &meta.imports, stamp);
         let (Some(previous), Some(current)) = (previous, stamp) else {
             return Ok(None);
         };
@@ -1583,6 +1903,7 @@ impl ProjectActorState {
     fn note_import_profile(
         &mut self,
         fingerprint: &str,
+        imports: &[String],
         stamp: Option<std::time::SystemTime>,
     ) -> Option<std::time::SystemTime> {
         if let Some(index) = self
@@ -1593,19 +1914,166 @@ impl ProjectActorState {
             let mut held = self.imports_seen.remove(index);
             let previous = held.artifact_stamp;
             held.artifact_stamp = stamp;
+            held.last_served = Instant::now();
             self.imports_seen.push(held);
             return previous;
         }
-        // Bounded by the same constant the child sizes its session pool from,
-        // so the parent's picture of what the child holds cannot outgrow it.
-        while self.imports_seen.len() >= usize::try_from(WORKER_MAX_IMPORTS).unwrap_or(usize::MAX) {
+        // Bounded by the child's own session-pool capacity, so the parent's
+        // picture of what the child holds cannot outgrow what it can hold.
+        while self.imports_seen.len() >= self.config.session_pool_capacity {
             self.imports_seen.remove(0);
         }
         self.imports_seen.push(ImportProfileStamp {
             fingerprint: fingerprint.to_owned(),
+            imports: imports.to_vec(),
             artifact_stamp: stamp,
+            last_served: Instant::now(),
         });
         None
+    }
+
+    /// Cycle the child now, between requests, if imports have retained more than
+    /// the soft share of the residue budget.
+    ///
+    /// The recycle itself is not avoidable — residue is unreclaimable, so a
+    /// child that has imported enough must be replaced eventually — but *when*
+    /// it lands is. Run reactively it costs the next caller a ~730 ms respawn on
+    /// top of their import; run here it costs nobody anything, because every
+    /// reply has already been sent and the mailbox is empty.
+    ///
+    /// A cheap recycle is also newly worth taking. `.olean` compacted regions
+    /// are position-dependent, so the *first* import in a fresh process maps
+    /// them at their preferred addresses and retains almost nothing — 0.29 GB of
+    /// footprint for a 2.2 GB closure, against 2–4.5 GB for the same import
+    /// performed later in a process. A fresh child is not merely emptier, its
+    /// next import is far cheaper.
+    ///
+    /// Having cycled, it re-imports the most recently served profile into the
+    /// fresh child, so the next caller does not pay for the emptiness this
+    /// created. Bounded by recency: a profile nobody has touched in
+    /// [`PREWARM_RECENCY`] is a guess, and a wrong guess costs a real import.
+    /// The bounded wait to arm before the next receive, or `None` to block.
+    ///
+    /// `None` is the normal answer and costs nothing: under the soft budget
+    /// there is no cycle to schedule, so the actor blocks on its mailbox with no
+    /// timer and no extra wakeups. It is also the answer in a synchronous test
+    /// context, where there is no runtime to borrow — the mailbox-empty check in
+    /// the loop still fires, so idle cycling degrades rather than disappearing.
+    fn idle_grace(&self) -> Option<(&tokio::runtime::Handle, Duration)> {
+        let handle = self.config.tokio_handle.as_ref()?;
+        self.over_soft_budget().map(|_residue| (handle, QUIESCENCE_GRACE))
+    }
+
+    /// The generation's retained residue, if it is worth cycling for.
+    ///
+    /// Two conditions, not one. The threshold is the obvious half. The other is
+    /// that the generation has actually retained something: a child that has
+    /// imported nothing has nothing a cycle could reclaim, so replacing it is
+    /// pure cost — and with a soft budget of zero (a budget small enough that
+    /// 60% of it rounds to nothing) the threshold alone would be satisfied by
+    /// every freshly spawned child, cycling forever and importing never.
+    fn over_soft_budget(&self) -> Option<u64> {
+        if self.cycled_while_idle {
+            return None;
+        }
+        let residue = self.handle.lifecycle_snapshot().import_residue_bytes;
+        (residue > 0 && residue >= self.config.import_residue_soft_bytes).then_some(residue)
+    }
+
+    /// Cycle over the soft budget, having *demonstrated* that the project is
+    /// quiet: the mailbox stayed empty for a whole [`QUIESCENCE_GRACE`]. That is
+    /// what earns the pre-warm, which is a multi-second import at Mathlib scale
+    /// and would land on the next caller's latency if taken mid-burst.
+    fn cycle_on_quiescence(&mut self) {
+        self.cycle_over_soft_budget(true);
+    }
+
+    /// Cycle over the soft budget with nothing more than an empty mailbox to go
+    /// on. Used only where no tokio handle is available to arm the quiescence
+    /// timer — a synchronous embedder or test — so idle cycling degrades to
+    /// moving the respawn off the request path rather than disappearing. No
+    /// pre-warm: an empty mailbox one instant after a reply is not evidence of a
+    /// pause, and a wrong guess costs a real import.
+    fn cycle_after_reply(&mut self) {
+        self.cycle_over_soft_budget(false);
+    }
+
+    fn cycle_over_soft_budget(&mut self, quiesced: bool) {
+        let Some(residue) = self.over_soft_budget() else {
+            return;
+        };
+        // Captured before the cycle, because the cycle invalidates every
+        // remembered profile and this is the one worth paying to get back.
+        let prewarm = quiesced
+            .then(|| {
+                self.imports_seen
+                    .last()
+                    .filter(|held| held.last_served.elapsed() <= PREWARM_RECENCY)
+                    .map(|held| (held.fingerprint.clone(), held.imports.clone()))
+            })
+            .flatten();
+        let reason = format!(
+            "import_residue_idle residue_mib={} soft_mib={} limit_mib={}",
+            residue / (1024 * 1024),
+            self.config.import_residue_soft_bytes / (1024 * 1024),
+            self.config.import_residue_budget_bytes / (1024 * 1024),
+        );
+        if let Err(err) = self.handle.cycle() {
+            // Nothing is owed to a caller here — there is no call in flight —
+            // and the reactive bound still stands, so a failed idle cycle is a
+            // missed optimisation rather than an error to propagate.
+            tracing::debug!(error = %err, "idle worker cycle failed; the reactive residue bound still applies");
+            return;
+        }
+        // A full clear, not `forget_pooled_import_profiles`: that one preserves
+        // the profile of the job currently being served, and there is no such
+        // job here. The fresh child holds nothing.
+        self.imports_seen.clear();
+        // From here the cycle has happened, so this quiet period is spent
+        // whether or not the pre-warm below succeeds.
+        self.cycled_while_idle = true;
+        let event = restart_event(
+            RestartCause::ImportResidueIdle,
+            reason,
+            self.observed_generation(),
+            self.last_rss_kib,
+            None,
+        );
+        self.record_restart(event.clone());
+        self.publish_runtime(&RuntimeFacts {
+            worker_generation: event.worker_generation,
+            worker_restarted: true,
+            retry_count: 0,
+            queue_wait_millis: 0,
+            call_restart: None,
+            last_restart: Some(event),
+            rss_kib: self.last_rss_kib,
+            worker_lanes: 1,
+            import_profile: None,
+            profile_switch_count: self.profile_switch_count,
+            restarts_total: self.restart_stats.total,
+            restarts_by_cause: self.restart_stats.by_cause.clone(),
+            import_residue_bytes: Some(self.handle.lifecycle_snapshot().import_residue_bytes),
+            import_residue_limit_bytes: Some(self.config.import_residue_budget_bytes),
+        });
+
+        // The cycle relocated the respawn; this relocates the import, which at
+        // Mathlib scale is the expensive half by an order of magnitude.
+        let Some((fingerprint, imports)) = prewarm else { return };
+        match self.handle.open_session_with_imports(imports.clone(), None, None) {
+            Ok(_session) => {
+                // Record it the same way a served job would, so the *next* call
+                // on this profile compares artifact stamps against the import
+                // that actually happened rather than treating it as unseen.
+                let stamp = lake_meta::import_artifact_stamp(&self.config.artifact_roots, &imports);
+                let _previous = self.note_import_profile(&fingerprint, &imports, stamp);
+            }
+            Err(err) => {
+                // Same posture as a failed cycle: nobody is waiting, and the
+                // next real call imports this itself.
+                tracing::debug!(error = %err, "idle pre-warm failed; the next call will import normally");
+            }
+        }
     }
 
     /// Forget every pooled profile except the one the current job is serving.
@@ -1629,9 +2097,10 @@ impl ProjectActorState {
     /// the theory that an import switch would otherwise hold two imported
     /// environments at once. It now does — the child pools them deliberately,
     /// at a measured 30–50 MB per extra live environment against the ~1 GiB an
-    /// import costs. What bounds the count is [`WORKER_MAX_IMPORTS`]; what
-    /// bounds the heap is [`LEAN_MAX_MEMORY_KIB`]. Neither is a process-level
-    /// RSS reading, which mostly measured mmapped `.olean` pages.
+    /// import costs. What bounds retained bytes is
+    /// [`WORKER_IMPORT_RESIDUE_CEILING_BYTES`]; what backstops the heap above it
+    /// is [`lean_max_memory_kib_for`]. Neither is a process-level RSS reading,
+    /// which mostly measured mmapped `.olean` pages.
     fn note_import_profile_switch(&mut self, meta: &JobMeta) {
         let switched = self
             .current_import_profile()
@@ -1748,6 +2217,8 @@ impl ProjectActorState {
                 profile_switch_count: self.profile_switch_count,
                 restarts_total: self.restart_stats.total,
                 restarts_by_cause: self.restart_stats.by_cause.clone(),
+                import_residue_bytes: Some(self.handle.lifecycle_snapshot().import_residue_bytes),
+                import_residue_limit_bytes: self.config.import_residue_budget_bytes.into(),
             });
             return Err(RestartLimitExceeded {
                 message,
@@ -1788,6 +2259,8 @@ impl ProjectActorState {
             profile_switch_count: self.profile_switch_count,
             restarts_total: self.restart_stats.total,
             restarts_by_cause: self.restart_stats.by_cause.clone(),
+            import_residue_bytes: Some(snapshot.import_residue_bytes),
+            import_residue_limit_bytes: snapshot.import_residue_limit_bytes,
         }
     }
 
@@ -1800,6 +2273,8 @@ impl ProjectActorState {
             profile_switch_count: runtime.profile_switch_count,
             restarts_total: runtime.restarts_total,
             restarts_by_cause: runtime.restarts_by_cause.clone(),
+            import_residue_bytes: runtime.import_residue_bytes,
+            import_residue_limit_bytes: runtime.import_residue_limit_bytes,
         };
     }
 
@@ -1892,19 +2367,74 @@ fn actor_main(
         runtime: Arc::clone(&config.runtime),
         abnormal_restart_times: VecDeque::new(),
         restart_stats: RestartStats::default(),
+        cycled_while_idle: false,
     };
+
+    // Once per project, at open. Below the floor the budget can be smaller than
+    // a single import's residue, at which point the policy degenerates into
+    // recycling the child before nearly every import — strictly worse than the
+    // count bound it replaced, and not something the response envelope makes
+    // obvious, since each of those cycles is individually well-formed.
+    if config.import_residue_budget_bytes < WORKER_IMPORT_RESIDUE_FLOOR_BYTES {
+        tracing::warn!(
+            budget_mib = config.import_residue_budget_bytes / (1024 * 1024),
+            floor_mib = WORKER_IMPORT_RESIDUE_FLOOR_BYTES / (1024 * 1024),
+            "import residue budget is below the floor one Mathlib-scale import needs; \
+             raise runtime.worker_import_residue_budget_mib if workers recycle constantly"
+        );
+    }
+    // Only reachable when an operator sets `runtime.lean_max_memory_kib`
+    // explicitly — the derived default cannot invert. Worth a warning rather
+    // than a clamp because it is their machine and their call, but it is almost
+    // never what they meant: below the budget the ceiling always fires first,
+    // and it fires as a child abort rather than a clean recycle.
+    if config.lean_max_memory_kib.saturating_mul(1024) <= config.import_residue_budget_bytes {
+        tracing::warn!(
+            lean_max_memory_mib = config.lean_max_memory_kib / 1024,
+            budget_mib = config.import_residue_budget_bytes / (1024 * 1024),
+            "Lean heap ceiling is at or below the import residue budget, so it will abort the \
+             child before the budget can recycle it cleanly; raise runtime.lean_max_memory_kib \
+             above the budget or leave it unset to track it"
+        );
+    }
 
     let (tx, mut rx) = mpsc::channel::<ProjectMessage>(config.mailbox_capacity);
     if init_reply.send(Ok((runtime_toolchain, tx))).is_err() {
         return;
     }
 
-    while let Some(message) = rx.blocking_recv() {
+    // Every reply is sent inside `handle_message` before it returns, so by the
+    // time control reaches the bottom of this loop the client already has its
+    // answer. That is what makes an idle cycle free: it happens after the work
+    // it would otherwise have delayed.
+    loop {
+        let message = match state.idle_grace() {
+            None => rx.blocking_recv(),
+            // Over the soft budget: wait a bounded moment for the next call
+            // instead of forever, so a genuine pause becomes a chance to
+            // recycle. `block_on` wraps the *receive* only — no Lean session
+            // exists at this point, let alone crosses it.
+            Some((handle, grace)) => match handle.block_on(async { tokio::time::timeout(grace, rx.recv()).await }) {
+                Ok(message) => message,
+                Err(_elapsed) => {
+                    state.cycle_on_quiescence();
+                    continue;
+                }
+            },
+        };
+        let Some(message) = message else { break };
         if !config.healthy.load(Ordering::Acquire) {
             message.reject(&state, "project_shutting_down");
             continue;
         }
         state.handle_message(message);
+        // Only where `idle_grace` can never arm. With a runtime available the
+        // quiescence tick above does this job two seconds later and pre-warms as
+        // well, so cycling here would spend the generation on the strictly worse
+        // of the two paths.
+        if config.tokio_handle.is_none() && rx.is_empty() {
+            state.cycle_after_reply();
+        }
     }
 
     match state.handle.shutdown() {
@@ -1936,7 +2466,7 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
     }
     // No `RssHardLimitExceeded` arm: this server no longer sets
     // `rss_hard_limit`, so the supervisor cannot produce one. See
-    // `LEAN_MAX_MEMORY_KIB`.
+    // `lean_max_memory_kib_for`.
     let handle = builder.open().map_err(map_worker_err)?;
     let runtime_toolchain = handle
         .runtime_metadata()
@@ -1945,18 +2475,29 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
     Ok((handle, runtime_toolchain))
 }
 
+/// One policy restart, on the one quantity that accumulates without bound: the
+/// bytes an import retains and the child cannot give back.
+///
+/// `disabled()`'s own doc warns that a long-running host wants
+/// `memory_bounded`, "because fresh imports retain Lean process-global state
+/// until the child exits" — session reuse made that true per *import* rather
+/// than per *call*, and [`WORKER_IMPORT_RESIDUE_CEILING_BYTES`] explains why the
+/// bound is denominated in the bytes those imports retain rather than in their
+/// number. [`WORKER_MAX_IMPORTS_BACKSTOP`] rides behind it as the guard against
+/// a child that reports no residue at all.
+///
+/// Still no `max_rss_kib`, no `max_requests`, no `rss_hard_limit`. The Lean heap
+/// is backstopped above this by [`lean_max_memory_kib_for`]; the crash-loop breaker
+/// ([`MAX_RESTARTS_PER_WINDOW`]) and the request deadline are this actor's own.
+fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
+    LeanWorkerRestartPolicy::default()
+        .max_import_residue_bytes(config.import_residue_budget_bytes)
+        .max_imports(WORKER_MAX_IMPORTS_BACKSTOP)
+        .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW)
+}
+
 fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
-    // One policy restart, on the one quantity that accumulates without bound:
-    // imports. `disabled()`'s own doc warns that a long-running host wants
-    // `memory_bounded`, "because fresh imports retain Lean process-global state
-    // until the child exits" — session reuse made that true per *import* rather
-    // than per *call*, which is what [`WORKER_MAX_IMPORTS`] bounds. No
-    // `max_rss_kib`, no `max_requests`, no `rss_hard_limit`. The Lean heap is
-    // bounded separately by [`LEAN_MAX_MEMORY_KIB`]; the crash-loop breaker
-    // (`MAX_RESTARTS_PER_WINDOW`) and the request deadline are this actor's own.
-    let restart_policy = LeanWorkerRestartPolicy::default()
-        .max_imports(WORKER_MAX_IMPORTS)
-        .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW);
+    let restart_policy = residue_restart_policy(config);
     let module_cache_limits = module_cache_limits();
     LeanWorkerHostHandleBuilder::shims_only(&config.lake_root, std::iter::empty::<String>())
         .worker_child(LeanWorkerChild::for_toolchain(
@@ -1966,6 +2507,7 @@ fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
         .startup_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_millis(config.request_timeout_millis))
         .restart_policy(restart_policy)
+        .session_pool_capacity(config.session_pool_capacity)
         .lean_max_memory_kib(config.lean_max_memory_kib)
         .module_cache_limits(module_cache_limits)
 }
@@ -1974,10 +2516,9 @@ fn semantic_capability_builder(
     config: &ActorConfig,
     built: &lean_toolchain::LeanBuiltCapability,
 ) -> Result<LeanWorkerCapabilityBuilder> {
-    // See `worker_builder`: bounded by import count, one Lean heap ceiling.
-    let restart_policy = LeanWorkerRestartPolicy::default()
-        .max_imports(WORKER_MAX_IMPORTS)
-        .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW);
+    // See `residue_restart_policy`: bounded by retained bytes, one Lean heap
+    // ceiling.
+    let restart_policy = residue_restart_policy(config);
     let builder = LeanWorkerCapabilityBuilder::from_built_capability(built, std::iter::empty::<String>())
         .map_err(map_worker_err)?
         .import_workspace_root(config.lake_root.clone())
@@ -1988,6 +2529,7 @@ fn semantic_capability_builder(
         .startup_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_millis(config.request_timeout_millis))
         .restart_policy(restart_policy)
+        .session_pool_capacity(config.session_pool_capacity)
         .lean_max_memory_kib(config.lean_max_memory_kib)
         .module_cache_limits(module_cache_limits())
         .json_command_export(lean_semantic_search_capability::DECLARATION_FEATURES_EXPORT)
@@ -2100,6 +2642,14 @@ fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
         LeanWorkerRestartReason::Explicit => RestartCause::Explicit.as_str().to_owned(),
         LeanWorkerRestartReason::MaxRequests { limit } => format!("max_requests limit={limit}"),
         LeanWorkerRestartReason::MaxImports { limit } => format!("max_imports limit={limit}"),
+        LeanWorkerRestartReason::ImportResidue {
+            residue_bytes,
+            limit_bytes,
+        } => format!(
+            "import_residue residue_mib={} limit_mib={}",
+            residue_bytes / (1024 * 1024),
+            limit_bytes / (1024 * 1024)
+        ),
         LeanWorkerRestartReason::RssCeiling {
             current_kib, limit_kib, ..
         } => {
@@ -2121,13 +2671,33 @@ fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
             )
         }
         LeanWorkerRestartReason::Cancelled { operation } => format!("cancelled operation={operation}"),
-        LeanWorkerRestartReason::ChildAbort { operation } => format!("child_abort operation={operation}"),
+        // The child's stderr is drained once, at exit, and retained nowhere
+        // else. Dropping it here would leave `child_abort operation=…` as the
+        // whole record of a fatal child — enough to know something died, not
+        // enough to tell a Lean out-of-memory panic from a segfault.
+        LeanWorkerRestartReason::ChildAbort {
+            operation,
+            status,
+            diagnostics,
+        } => {
+            let detail = diagnostics.trim();
+            if detail.is_empty() {
+                format!("child_abort operation={operation} status={status}")
+            } else {
+                format!("child_abort operation={operation} status={status}: {detail}")
+            }
+        }
         LeanWorkerRestartReason::RequestTimeout { operation, duration } => {
             format!(
                 "timeout operation={operation} duration_millis={}",
                 millis_u64(*duration)
             )
         }
+        // `LeanWorkerRestartReason` is `#[non_exhaustive]`: a cycling policy
+        // added upstream must surface as an unnamed cause rather than fail to
+        // build here. `restart_cause_from_worker` maps the same case to
+        // `WorkerInternal`, so the two agree.
+        other => format!("worker_internal reason={}", other.stable_cause()),
     }
 }
 
@@ -2182,6 +2752,8 @@ mod tests {
                 project_mailbox_capacity: Some("23".to_owned()),
                 worker_restart_limit: Some("29".to_owned()),
                 worker_restart_window_secs: Some("31".to_owned()),
+                worker_import_residue_budget_mib: Some("41".to_owned()),
+                worker_session_pool_capacity: Some("43".to_owned()),
             },
             &RuntimeFileConfig::default(),
         )
@@ -2192,6 +2764,59 @@ mod tests {
         assert_eq!(config.mailbox_capacity(), 23);
         assert_eq!(config.max_restarts_per_window(), 29);
         assert_eq!(config.restart_window(), Duration::from_secs(31));
+        assert_eq!(config.import_residue_budget_bytes(), 41 * 1024 * 1024);
+        assert_eq!(config.session_pool_capacity(), 43);
+    }
+
+    #[test]
+    fn the_residue_budget_defaults_within_its_documented_clamp() {
+        // Derived from system RAM, so the assertion is on the clamp rather than
+        // a literal: the floor is what decides it on any ordinary machine, and
+        // dropping below it would degenerate the policy into recycling before
+        // every import.
+        let budget = ProjectRuntimeConfig::default().import_residue_budget_bytes();
+        assert!(
+            (WORKER_IMPORT_RESIDUE_FLOOR_BYTES..=WORKER_IMPORT_RESIDUE_CEILING_BYTES).contains(&budget),
+            "derived residue budget {budget} escaped its clamp"
+        );
+        assert!(
+            ProjectRuntimeConfig::default().import_residue_soft_bytes() < budget,
+            "the idle threshold must fire before the reactive one, or it never fires at all"
+        );
+    }
+
+    #[test]
+    fn pool_capacity_and_the_residue_budget_are_independent_knobs() {
+        // The bug this replaced: one constant serving as both the restart bound
+        // and the pool capacity made the child's eviction path unreachable.
+        let env = RuntimeEnv {
+            worker_session_pool_capacity: Some("2".to_owned()),
+            ..RuntimeEnv::default()
+        };
+        let config = parse_runtime_config(env, &RuntimeFileConfig::default()).unwrap();
+        assert_eq!(config.session_pool_capacity(), 2);
+        assert_eq!(
+            config.import_residue_budget_bytes(),
+            ProjectRuntimeConfig::default().import_residue_budget_bytes(),
+            "setting capacity must not move the memory bound"
+        );
+    }
+
+    #[test]
+    fn the_residue_budget_resolves_env_over_file_over_default() {
+        let file = RuntimeFileConfig {
+            worker_import_residue_budget_mib: Some(4_096),
+            ..RuntimeFileConfig::default()
+        };
+        let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+        assert_eq!(config.import_residue_budget_bytes(), 4_096 * 1024 * 1024);
+
+        let env = RuntimeEnv {
+            worker_import_residue_budget_mib: Some("2048".to_owned()),
+            ..RuntimeEnv::default()
+        };
+        let config = parse_runtime_config(env, &file).unwrap();
+        assert_eq!(config.import_residue_budget_bytes(), 2_048 * 1024 * 1024);
     }
 
     #[test]
@@ -2254,7 +2879,86 @@ mod tests {
         assert_eq!(config.lean_max_memory_kib(), 6_291_456);
         // Neither -> built-in default.
         let config = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default()).unwrap();
-        assert_eq!(config.lean_max_memory_kib(), LEAN_MAX_MEMORY_KIB);
+        assert_eq!(
+            config.lean_max_memory_kib(),
+            lean_max_memory_kib_for(config.import_residue_budget_bytes())
+        );
+    }
+
+    /// The invariant the derivation exists for: crossing the heap ceiling aborts
+    /// the child, so it must never sit at or below the point the supervisor
+    /// recycles cleanly. A fixed 8 GiB ceiling under a 9 GiB budget floor made
+    /// every Mathlib-scale recycle an abort and the residue policy unreachable —
+    /// observed on a three-file kan-proofs sweep before this was derived.
+    #[test]
+    fn the_heap_ceiling_stays_above_every_residue_budget_the_resolver_can_produce() {
+        // A raised budget must carry the ceiling with it, or the operator who
+        // raised it has silently recreated the inversion.
+        for budget_mib in [512_u64, 9216, 12288, 65536] {
+            let file = RuntimeFileConfig {
+                worker_import_residue_budget_mib: Some(budget_mib),
+                ..RuntimeFileConfig::default()
+            };
+            let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+            assert_eq!(config.import_residue_budget_bytes(), budget_mib * 1024 * 1024);
+            assert!(
+                config.lean_max_memory_kib().saturating_mul(1024) > config.import_residue_budget_bytes(),
+                "ceiling {} KiB is not above budget {budget_mib} MiB",
+                config.lean_max_memory_kib()
+            );
+        }
+        // And the embedder-facing setter is not a way around it.
+        let config = ProjectRuntimeConfig::default().with_import_residue_budget_bytes(40 * 1024 * 1024 * 1024);
+        assert!(config.lean_max_memory_kib().saturating_mul(1024) > config.import_residue_budget_bytes());
+    }
+
+    /// "Above the budget" is not sufficient on its own. The heap counts several
+    /// gigabytes the budget never sees — the elaborator's heap, the first
+    /// import's non-residue allocation, the transient peak inside
+    /// `importModules` — and that offset tracks the project, not the budget. A
+    /// gap that is merely proportional vanishes at a low budget and puts the
+    /// abort back in front of the recycle.
+    #[test]
+    fn the_gap_above_the_budget_never_falls_below_what_the_heap_counts_and_the_budget_does_not() {
+        let gib = 1024 * 1024 * 1024;
+        for budget in [1_u64, gib, 4 * gib, 9 * gib, 40 * gib] {
+            let gap = lean_max_memory_kib_for(budget).saturating_mul(1024) - budget;
+            // Minus one KiB: the ceiling is expressed in KiB, so a budget that
+            // is not KiB-aligned loses its remainder to truncation.
+            assert!(
+                gap >= WORKER_HEAP_HEADROOM_FLOOR_BYTES - 1024,
+                "budget {budget} leaves only {gap} bytes of heap headroom"
+            );
+        }
+        // Above the floor the proportional term takes over, so a project heavy
+        // enough to need a large budget gets a proportionally larger gap.
+        assert_eq!(
+            lean_max_memory_kib_for(40 * gib).saturating_mul(1024),
+            80 * gib,
+            "past the floor the gap must scale with the budget"
+        );
+    }
+
+    /// The floor is unconditional and larger than several common machines. A
+    /// budget the child cannot reach before the OS kills it is not a budget, so
+    /// the machine gets the last word.
+    #[test]
+    fn a_machine_too_small_for_the_floor_gets_a_budget_it_can_actually_reach() {
+        let gib = 1024 * 1024 * 1024;
+        // Roomy: the floor decides, exactly as documented.
+        assert_eq!(
+            import_residue_budget_for(64 * gib, 4),
+            WORKER_IMPORT_RESIDUE_FLOOR_BYTES
+        );
+        // Undersized: the floor would exceed the machine, so the machine wins
+        // and `actor_main`'s below-floor warning becomes reachable.
+        let small = import_residue_budget_for(8 * gib, 4);
+        assert!(small < WORKER_IMPORT_RESIDUE_FLOOR_BYTES, "{small}");
+        assert_eq!(small, 8 * gib - WORKER_IMPORT_HEADROOM_BYTES);
+        // Absurd: never zero, because zero fails the nonzero MiB round-trip and
+        // would take the server down rather than degrade it.
+        assert_eq!(import_residue_budget_for(gib, 4), WORKER_IMPORT_RESIDUE_MIN_BYTES);
+        assert!(import_residue_budget_for(0, 4) > 0);
     }
 
     #[test]
@@ -2313,6 +3017,8 @@ mod tests {
             profile_switch_count: 0,
             restarts_total: 0,
             restarts_by_cause: BTreeMap::new(),
+            import_residue_bytes: None,
+            import_residue_limit_bytes: None,
         }));
         let config = ActorConfig {
             lake_root: tmp.path().join("consumer"),
@@ -2324,11 +3030,15 @@ mod tests {
             runtime,
             healthy: Arc::new(AtomicBool::new(true)),
             artifact_roots: Vec::new(),
-            lean_max_memory_kib: LEAN_MAX_MEMORY_KIB,
+            lean_max_memory_kib: ProjectRuntimeConfig::default().lean_max_memory_kib(),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
             max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
             restart_window: RESTART_WINDOW,
+            import_residue_budget_bytes: ProjectRuntimeConfig::default().import_residue_budget_bytes(),
+            import_residue_soft_bytes: ProjectRuntimeConfig::default().import_residue_soft_bytes(),
+            session_pool_capacity: WORKER_SESSION_POOL_CAPACITY,
+            tokio_handle: None,
             toolchain_advisories: Vec::new(),
         };
 
@@ -2351,6 +3061,8 @@ mod tests {
         assert!(!RestartCause::RssPostJob.counts_toward_restart_limit());
         assert!(!RestartCause::MaxRequests.counts_toward_restart_limit());
         assert!(!RestartCause::MaxImports.counts_toward_restart_limit());
+        assert!(!RestartCause::ImportResidue.counts_toward_restart_limit());
+        assert!(!RestartCause::ImportResidueIdle.counts_toward_restart_limit());
         assert!(!RestartCause::Idle.counts_toward_restart_limit());
 
         assert!(RestartCause::ChildExit.counts_toward_restart_limit());
@@ -2393,6 +3105,60 @@ mod tests {
             })
             .as_str(),
             "timeout"
+        );
+        assert_eq!(
+            restart_cause_from_worker(&LeanWorkerRestartReason::ImportResidue {
+                residue_bytes: 2,
+                limit_bytes: 1,
+            })
+            .as_str(),
+            "import_residue"
+        );
+    }
+
+    /// The reason string is the only place the two figures an operator needs —
+    /// what was retained and what the limit was — reach the response, which is
+    /// why they are not duplicated onto `RuntimeRestartEvent`.
+    #[test]
+    fn the_residue_reason_text_names_both_figures() {
+        let text = restart_reason_text(&LeanWorkerRestartReason::ImportResidue {
+            residue_bytes: 9 * 1024 * 1024 * 1024,
+            limit_bytes: 12 * 1024 * 1024 * 1024,
+        });
+        assert_eq!(text, "import_residue residue_mib=9216 limit_mib=12288");
+    }
+
+    /// `LeanWorkerRestartReason` is `#[non_exhaustive]` and its `stable_cause`
+    /// set is open, so a lean-rs upgrade can hand this build a cause it has
+    /// never heard of. It lands on `worker_internal`, which must be treated as
+    /// abnormal: `diagnosis::execution_taint` already counts it as disrupting,
+    /// and a crash-loop breaker that excused the one cause it understands least
+    /// would be exactly backwards. Every cause this build *does* know is
+    /// classified precisely, so nothing routine reaches that bucket.
+    #[test]
+    fn an_unclassified_restart_is_abnormal_and_nothing_routine_reaches_it() {
+        assert!(RestartCause::WorkerInternal.counts_toward_restart_limit());
+        assert_eq!(
+            restart_cause_from_worker(&LeanWorkerRestartReason::ChildAbort {
+                operation: "test",
+                status: String::from("signal: 6 (SIGABRT)"),
+                diagnostics: String::new(),
+            })
+            .as_str(),
+            "child_abort",
+            "a child abort is a named cause, not an unclassified one"
+        );
+        assert_eq!(
+            restart_cause_from_worker(&LeanWorkerRestartReason::Explicit).as_str(),
+            "explicit"
+        );
+        assert_eq!(
+            restart_cause_from_worker(&LeanWorkerRestartReason::Idle {
+                idle_for: Duration::from_millis(2),
+                limit: Duration::from_millis(1),
+            })
+            .as_str(),
+            "idle"
         );
     }
 }

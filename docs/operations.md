@@ -35,15 +35,16 @@ per knob is **CLI flag > env var > file > built-in default**, so an env var stil
 description (e.g. "8 GiB") is for reading, not for setting.
 
 <!-- BEGIN GENERATED: do not edit by hand. Regenerate from `config_schema::render_reference_table`; the `operations_md_reference_table_is_in_sync` test fails when this block drifts. -->
-
 | Key | Type | Default | Override | Description |
 | --- | --- | --- | --- | --- |
 | `primary_project` | path | unset | `--lake-root / LEAN_HOST_MCP_PROJECT` | Default Lake project for calls that omit an explicit project= argument. Lowest-priority fallback, after the flag/env and the nearest lakefile above the working directory. |
-| `runtime.lean_max_memory_kib` | integer (KiB) | `8388608` | `LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB` | Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. An elaboration that crosses it fails as an ordinary Lean error inside the tool result, so the worker is not killed and other calls are unaffected. This replaced four resident-memory thresholds, which measured shared mmapped .olean pages and so fired on healthy workers. Default 8 GiB. |
+| `runtime.lean_max_memory_kib` | integer (KiB) | unset | `LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB` | Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. Crossing it kills the child: Lean's allocator signals the overrun with a C++ exception, which cannot unwind through the Rust frame at the shim boundary and aborts the process. Commented out because the default tracks runtime.worker_import_residue_budget_mib doubled, which keeps the clean recycle strictly ahead of the abort by more than the 4.4-6.3 GiB the heap counts and the budget does not — a fixed value below the budget makes the abort fire first and the residue policy unreachable. Set it only to raise the backstop; lowering it below the budget is warned about at startup. |
 | `runtime.request_timeout_millis` | integer (ms) | `120000` | `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS` | Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose lean_verify/lean_context work legitimately runs longer; lower it to bound a single heavy file query. Default 120 s. |
 | `runtime.project_mailbox_capacity` | integer | `16` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls may queue for one project's worker before new calls are shed with a retryable busy status. This is the server's only admission mechanism; it applies per project, so distinct projects never contend for one budget. |
 | `runtime.worker_restart_limit` | integer | `3` | `LEAN_HOST_MCP_WORKER_RESTART_LIMIT` | How many worker restarts are tolerated within the restart window before the project is marked unhealthy. |
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
+| `runtime.worker_import_residue_budget_mib` | integer (MiB) | unset | `LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB` | How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects) and clamped to [9216, 12288]; set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it. |
+| `runtime.worker_session_pool_capacity` | integer | `8` | `LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY` | How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8. |
 | `broker.max_projects` | integer | `4` | `LEAN_HOST_MCP_MAX_PROJECTS` | How many distinct Lake projects stay open at once; on overflow the least-recently-used project's worker is evicted. |
 | `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
@@ -53,7 +54,6 @@ description (e.g. "8 GiB") is for reading, not for setting.
 | `output.max_field_bytes` | integer (bytes) | unset | `LEAN_HOST_MCP_OUTPUT_MAX_FIELD_BYTES` | Override the per-field output byte cap for all tools. Unset keeps each tool's built-in default (8 KiB for inspection, 4 KiB for proof actions). Clamped to 256 bytes to 64 KiB. |
 | `output.max_total_bytes` | integer (bytes) | unset | `LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES` | Override the total output byte cap for all tools. Unset keeps the built-in 64 KiB default. Clamped to 1 KiB to 64 KiB. |
 | `output.heartbeat_limit` | integer (heartbeats) | unset | `LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT` | Default elaboration heartbeat budget for lean_trial proof_step and lean_verify target groups. Unset uses the worker default. Bounds runaway tactics. |
-
 <!-- END GENERATED -->
 
 `output.max_field_bytes` and `output.max_total_bytes` bound model-facing payloads before they leave the worker. Tight
@@ -97,23 +97,64 @@ legitimately heavy module reports memory exhaustion; lower it to make a runaway 
 ### Import cycling
 
 Importing is the one thing that still accumulates. A Lean environment imported with `loadExts := true` cannot be
-reclaimed, so every import a child performs is retained until that child exits — measured on the bundled fixture at
-roughly **+1 GiB per import**, reaching 11.2 GiB and an OS `SIGKILL` before call 180 when nothing bounded it.
+reclaimed, so every import a child performs is retained until that child exits. The size of that residue is **the
+imported closure, not the delta**: `.olean` compacted regions are position-dependent, so only the *first* import in a
+fresh process gets them memory-mapped, and every later import re-materializes even already-mapped modules as private
+copies. Measured against real per-file headers from a Mathlib-scale project, the first import in a child costs 10–18 MB
+and each later one costs **2.0–4.5 GB** — with the profiles that overlap most costing the *most*, because the shared
+modules are exactly the ones re-copied.
 
-The worker child therefore keeps a small pool of imported sessions rather than dropping the outgoing one when the
-imports change. Returning to a profile it still holds is a key comparison, not an import: an alternating workload
-imports once per **distinct** profile instead of once per switch. Holding an environment alive rather than dropping it
-costs 30–50 MB, against the 0.8–1.0 GiB the import that produced it costs, because the regions outlive the environment
-either way.
+The worker child therefore keeps a pool of imported sessions rather than dropping the outgoing one when the imports
+change. Returning to a profile it still holds is a key comparison, not an import: an alternating workload imports once
+per **distinct** profile instead of once per switch. Holding an environment alive rather than dropping it costs about 70
+MiB — 2–4% of the import it saves — because the regions outlive the environment either way. That is what
+`runtime.worker_session_pool_capacity` buys, and why its default is 8: a changed-file sweep touches one profile per
+file, and a pool smaller than the batch re-imports on every step.
 
-The server cycles a worker after a small number of imports, which — the pool being the same size — is also the number of
-distinct import profiles one child may hold. This is not tunable and needs no attention in normal use. A client working
-one proof loop repeats one import profile and never triggers it, because a reused session is not an import; a client
-that alternates among a handful of profiles does not trigger it either, because a pooled session is not an import. A
-client that rotates through more profiles than the pool holds sees a `max_imports` entry in `runtime.call_restart`,
-logged at `debug`. Those cycles are planned — they do not count toward `runtime.worker_restart_limit`, and the call that
-triggers one still answers normally. If you see `max_imports` dominating your logs, the fix is on the client side: draw
-related calls from a smaller set of `imports` lists rather than varying it per call.
+`runtime.worker_import_residue_budget_mib` bounds the rest. The child reports the unreclaimable bytes each import
+retained; the server sums them over the child's lifetime and recycles it when the total crosses the budget. The default
+is derived from the machine — a quarter of system RAM split across `broker.max_projects`, clamped to 9–12 GiB — because
+the same *count* of imports costs 9.6 GiB on one workload and 16.0 GiB on another. There is a `max_imports = 32`
+backstop underneath, which exists only to catch a child that reports zero-valued import statistics; it should never
+fire.
+
+What this means per workload:
+
+- **A proof loop on one file never recycles.** A call whose imports match the live session reuses it, and a reuse is not
+  an import, so the total does not move however long the loop runs.
+- **Alternating among up to `worker_session_pool_capacity` profiles never recycles either**, for the same reason: a
+  pooled session is restored by key comparison.
+- **A sweep across many files recycles once every `budget / residue-per-import` files** — roughly every 3 files at
+  Mathlib scale, more on a smaller project. This is unavoidable, not a misconfiguration: *k* distinct profiles means *k*
+  imports, and if an import cannot be reclaimed then the process must eventually exit. The recycle itself is cheap; the
+  re-import after it is not, which is why the server tries to do both while you are idle.
+
+Cycles appear in `runtime.restarts_by_cause` under two names. `import_residue` is a reactive cycle, taken on the call
+that would have crossed the budget. `import_residue_idle` is the same cycle taken proactively during a lull, at 60% of
+the budget, followed by a re-import of the most recent profile — so the next call finds a fresh child that is already
+warm. **The ratio between them is the diagnostic**: `import_residue_idle` dominating means the cost is landing between
+your calls, which is the intended state. `import_residue` dominating means the workload never pauses long enough, and
+raising the budget is the lever. Both are planned — neither counts toward `runtime.worker_restart_limit`, neither taints
+a verdict, and the call that triggers a reactive one still answers normally.
+
+The one thing that will *not* help is varying your `imports` lists less: four of the five tools derive imports from the
+file's own header, so the client has no such choice.
+
+`runtime.lean_max_memory_kib` sits above all of this as a backstop, and its default is derived from the residue budget
+for a reason worth stating: **crossing it kills the child.** Lean's allocator signals a heap-ceiling overrun by throwing
+a C++ exception, which cannot unwind through the Rust frame at the shim boundary, so the process aborts with exit status
+134 — it is not the recoverable Lean error a heartbeat or `maxRecDepth` overrun produces. A ceiling *below* the residue
+budget therefore preempts every clean recycle with an abort: a three-file Mathlib-scale sweep under a fixed 8 GiB
+ceiling answered two files and aborted the child on the third, at 1.7 GiB of residue against a 9 GiB budget that could
+never fire. The default is now twice the budget — the gap has to cover what the heap counts and the budget does not,
+measured at 4.4–6.3 GiB in that abort — so the recycle always wins. Raise it if you want a looser backstop; setting it
+below the budget is warned about at startup and is almost never what you want.
+
+> Earlier releases of this document reported +1 GiB per import and an 11.2 GiB `SIGKILL`. Those figures were resident
+> memory, measured on a fixture whose import sets shared ~99% of their closure. RSS counts clean mapped `.olean` pages
+> that cost nothing to reclaim, and under pressure it *falls* while the unreclaimable total keeps growing — it is
+> anti-correlated with the quantity that matters, not merely inflated. The figures above are physical footprint (macOS
+> `phys_footprint`, Linux `Private_Dirty`) on real project headers.
 
 ## Concurrency and admission
 
@@ -147,15 +188,17 @@ Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `r
 - `warn` — abnormal/crash causes: `rss_hard_limit_exceeded`, `child_abort`, `child_exit`, `session_missing`,
   `worker_internal`, `timeout`, `cancelled` (and `restart limit exceeded; marking project unhealthy`).
 - `info` — `artifacts_rebuilt` (a `.olean` among the imports of a session the child may still hold was rewritten, so the
-  child was recycled), memory-pressure cycles (`rss_post_job`), plus `opened project` / `idle reaper evicted projects`
-  lifecycle lines.
-- `debug` — pure hygiene (`max_imports`, `max_requests`, `idle`, `explicit`), per-call tool entry, project resolution,
-  and the `job` span.
+  child was recycled), `import_residue` (the reactive half of the residue budget — the cycle a call had to wait for, and
+  the frequency an operator tunes against), memory-pressure cycles (`rss_post_job`), plus `opened project` / `idle
+  reaper evicted projects` lifecycle lines.
+- `debug` — pure hygiene (`import_residue_idle`, `max_imports`, `max_requests`, `idle`, `explicit`), per-call tool
+  entry, project resolution, and the `job` span.
 
 The server no longer configures any resident-memory threshold, so in practice you see the abnormal causes above,
-`explicit`, `artifacts_rebuilt`, and `max_imports` (see "Import cycling"). `rss_post_job` / `rss_hard_limit_exceeded`
-and `max_requests` stay in the vocabulary because the supervisor still reports them if a future policy asks for them;
-seeing one today means the worker was configured somewhere other than here.
+`explicit`, `artifacts_rebuilt`, and the two residue causes (see "Import cycling"). `max_imports` should not appear at
+all — it is a backstop for a child that reports no import statistics. `rss_post_job` / `rss_hard_limit_exceeded` and
+`max_requests` stay in the vocabulary because the supervisor still reports them if a future policy asks for them; seeing
+one today means the worker was configured somewhere other than here.
 
 Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for the per-call detail. Example at default level:
 
@@ -165,7 +208,9 @@ INFO worker recycled (imports rebuilt on disk) cause=artifacts_rebuilt worker_ge
 
 The same data reaches the MCP client in `response.runtime`: the per-call cause in `call_restart`, the most recent in
 `last_restart`, and the lifetime frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause` (omitted
-when no recycle has happened).
+when no recycle has happened). `import_residue_bytes` and `import_residue_limit_bytes` report the quantity the recycle
+policy actually reads, so how close a child is to its next cycle is observable rather than inferred. The two figures a
+cycle happened *on* are in the restart event's `reason` string.
 
 ## Process lifetime
 
@@ -410,3 +455,25 @@ LEAN_HOST_MCP_SMOKE_PROJECT=/path/to/your/lake/project \
 
 The harness deliberately does not claim speedups. Keep its JSONL output with any performance change so later comparisons
 use the same workload, byte accounting, and cold/warm worker behaviour.
+
+### Memory stability
+
+`scripts/memory_stability.py` answers the orthogonal question: does a long-lived server grow with *call count*? It
+replays a workload JSON `--repeats` times against one server and reports `peak_import_residue_mib`,
+`final_import_residue_mib`, `final_worker_generation`, and `call_restart_count` per run. Residue is monotone within a
+generation, so `peak == final` with the generation unmoved is the flat-growth result.
+
+```sh
+uv run scripts/memory_stability.py \
+  --project-root /path/to/lake/project \
+  --workload scripts/memory_stability.kanproofs.json \
+  --server-bin target/release/lean-host-mcp \
+  --workers-dir target/release \
+  --repeats 15
+```
+
+Measured on a Mathlib-scale project (kan-proofs, four tools against one file, 15 repeats — 60 calls): **60/60 `ok`,
+generation 1 throughout, 0 restarts, residue 1786 MiB peak and final against a 9216 MiB budget, RSS 5.46 GB.** That is
+the claim the design rests on, on real data rather than the fixture: a workload that repeats one import profile charges
+nothing, because a reused session is not an import. Compare with the recycle behaviour of a *changed-file* sweep, which
+imports once per file and is bounded instead by the residue budget (`tests/kanproofs_eval.rs`).

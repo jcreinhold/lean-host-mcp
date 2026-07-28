@@ -6,10 +6,10 @@
 ## Why this exists
 
 Project-scope reference lookup, now exposed as `lean_lookup(kind = "references")`, used to re-elaborate every `.lean`
-module in the worker (~3 s/file → ~27 min on a ~500-module project). `lake build` already writes the answer to disk:
-one **`.ilean`** file per module under
-`<project>/.lake/build/lib/lean/`, the LSP reference index. It records, per name, the definition site and every usage
-site *within that module's source*, so "find references to `N`" is a disk read plus a JSON parse, no Lean runtime.
+module in the worker (~3 s/file → ~27 min on a ~500-module project). `lake build` already writes the answer to disk: one
+**`.ilean`** file per module under `<project>/.lake/build/lib/lean/`, the LSP reference index. It records, per name, the
+definition site and every usage site *within that module's source*, so "find references to `N`" is a disk read plus a
+JSON parse, no Lean runtime.
 
 ## What it costs
 
@@ -38,10 +38,10 @@ is file I/O and parsing from first byte to last and must not hold a tokio worker
 ## Where the reader lives
 
 It is a private module in `lean-host-mcp` (`src/ilean.rs`), not a separate `lean-rs` crate and not a worker capability.
-The references lookup mode is its sole consumer, so a published crate would be a premature boundary; and `.ilean` is pure
-data, so routing it through the worker would needlessly drag the `libleanshared` link concern into something that reads
-JSON off disk. The reader stays pure Rust + `serde_json` (already dependencies), adding no new dependency and no Lean
-linkage, and so preserves the parent ⊥ `libleanshared` invariant. The volatile on-disk format is sealed behind the
+The references lookup mode is its sole consumer, so a published crate would be a premature boundary; and `.ilean` is
+pure data, so routing it through the worker would needlessly drag the `libleanshared` link concern into something that
+reads JSON off disk. The reader stays pure Rust + `serde_json` (already dependencies), adding no new dependency and no
+Lean linkage, and so preserves the parent ⊥ `libleanshared` invariant. The volatile on-disk format is sealed behind the
 version gate below.
 
 ## The narrow interface
@@ -56,8 +56,8 @@ pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> Modul
   narrowing is the reader's own business, and callers never learn how a source path maps to an index path. When a path
   cannot be inverted with certainty (a dotted component, a non-`.lean` extension, a path outside the root, or a computed
   index that does not exist — the last of which covers Lake's filename mangling, e.g. module `«kan-lint-style»` indexing
-  as `kan-lint-style.ilean`) the whole request falls back to the full walk, so a narrowed answer is never smaller than an
-  unnarrowed one.
+  as `kan-lint-style.ilean`) the whole request falls back to the full walk, so a narrowed answer is never smaller than
+  an unnarrowed one.
 - `ReferenceIndex { status, references, modules_scanned, modules_skipped, stale_sources }` — reports as **data**, never
   warns. `status` is `NotBuilt` (no `.lake/build/lib/lean`) or `Present`. A malformed/unreadable/unsupported single file
   is counted in `modules_skipped`, never fatal. `stale_sources` flags contributing modules whose `.lean` is newer than

@@ -30,7 +30,7 @@ use lean_host_mcp::tools::semantic::{
 use lean_host_mcp::tools::{OutputBudgetOverrides, TelemetryVerbosity, ToolConfig, ToolContext};
 use lean_host_mcp::{
     BrokerConfig, CoordinateSpace, DeclarationInspectionResult, DeclarationVerificationResult, ProjectBroker,
-    ProjectHint, ProofAttemptResult, Severity,
+    ProjectHint, ProjectRuntimeConfig, ProofAttemptResult, Severity,
 };
 use lean_rs_worker_parent::{LeanWorkerDeclarationFilter, LeanWorkerDeclarationNameMatch, LeanWorkerDeclarationSearch};
 
@@ -46,6 +46,29 @@ fn open_ctx(root: &Path) -> ToolContext {
             ..ToolConfig::default()
         },
     )
+}
+
+/// A context whose project actor runs under an explicit residue budget, so a
+/// test can reach the residue paths without a Mathlib-scale import. Everything
+/// else is the shipped default.
+fn open_ctx_with_residue_budget(root: &Path, budget_bytes: u64) -> ToolContext {
+    let broker = ProjectBroker::new_with_runtime_config(
+        BrokerConfig {
+            config_default: None,
+            env_default: Some(root.to_path_buf()),
+            cwd: root.to_path_buf(),
+            max_projects: BrokerConfig::default_max_projects(),
+            idle_timeout: BrokerConfig::default_idle_timeout(),
+        },
+        ProjectRuntimeConfig::default().with_import_residue_budget_bytes(budget_bytes),
+    );
+    ToolContext {
+        broker,
+        config: ToolConfig {
+            verbosity: TelemetryVerbosity::Full,
+            ..ToolConfig::default()
+        },
+    }
 }
 
 fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
@@ -1888,6 +1911,95 @@ async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call()
     );
     // The recycle is pre-job, so the answer is still a real one.
     assert!(matches!(after.status, lean_host_mcp::ResponseStatus::Ok));
+}
+
+/// The proactive half of the residue policy: when a project falls quiet above
+/// the soft budget, the actor cycles the child *between* calls rather than
+/// inside the one that would have crossed the hard budget.
+///
+/// Forced with a one-byte budget so the fixture, whose imports are orders of
+/// magnitude smaller than a Mathlib-scale profile, still crosses it — the
+/// quantity under test is the actor's timing, not the child's arithmetic, which
+/// `lean-rs-worker-parent`'s own suite pins against known byte counts.
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn an_idle_project_over_its_soft_budget_cycles_between_calls() {
+    let Some(root) = fixture_root() else {
+        return;
+    };
+    let ctx = open_ctx_with_residue_budget(&root, 1);
+    let request = || InspectDeclarationRequest {
+        name: "Nat.add_zero".to_owned(),
+        file: None,
+        imports: vec!["LeanRsFixture.Handles".to_owned()],
+        project: None,
+        raw_statement: false,
+        fields: InspectDeclarationFields::default(),
+    };
+
+    let first = inspect_declaration(&ctx, request()).await.expect("first inspect");
+    assert!(matches!(first.status, lean_host_mcp::ResponseStatus::Ok));
+
+    // Longer than the actor's quiescence grace, so the receive times out and the
+    // idle path runs. Nothing is in flight, so this is wall time, not a race.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let second = inspect_declaration(&ctx, request()).await.expect("second inspect");
+    let runtime = second.runtime().expect("full verbosity keeps runtime facts");
+    assert!(
+        runtime.restarts_by_cause.contains_key("import_residue_idle"),
+        "a quiet project over its soft budget must cycle proactively; causes={:?}",
+        runtime.restarts_by_cause
+    );
+    assert!(
+        runtime.call_restart.is_none(),
+        "an idle cycle happens between calls, so it must never be attributed to one: {:?}",
+        runtime.call_restart
+    );
+    // The pre-warm re-imported the profile this call asks for, so the call is
+    // answered by a child that is both fresh and already warm.
+    assert!(matches!(second.status, lean_host_mcp::ResponseStatus::Ok));
+}
+
+/// The control for the test above: under the shipped budget the fixture never
+/// approaches the soft threshold, so no residue cycle of either kind fires and
+/// the idle path costs nothing — not a wakeup, not a respawn.
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn a_project_under_its_soft_budget_never_cycles_for_residue() {
+    let Some(root) = fixture_root() else {
+        return;
+    };
+    let ctx = open_ctx(&root);
+    let request = || InspectDeclarationRequest {
+        name: "Nat.add_zero".to_owned(),
+        file: None,
+        imports: vec!["LeanRsFixture.Handles".to_owned()],
+        project: None,
+        raw_statement: false,
+        fields: InspectDeclarationFields::default(),
+    };
+
+    let first = inspect_declaration(&ctx, request()).await.expect("first inspect");
+    let first_generation = first
+        .runtime()
+        .expect("full verbosity keeps runtime facts")
+        .worker_generation;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let second = inspect_declaration(&ctx, request()).await.expect("second inspect");
+    let runtime = second.runtime().expect("full verbosity keeps runtime facts");
+    assert_eq!(
+        runtime.worker_generation, first_generation,
+        "an idle project under its budget must not be cycled at all"
+    );
+    for cause in ["import_residue", "import_residue_idle"] {
+        assert!(
+            !runtime.restarts_by_cause.contains_key(cause),
+            "{cause} must not fire under the shipped budget; causes={:?}",
+            runtime.restarts_by_cause
+        );
+    }
 }
 
 /// A rebuild must be caught even when another import profile ran in between.

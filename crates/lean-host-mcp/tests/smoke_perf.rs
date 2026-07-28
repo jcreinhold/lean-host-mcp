@@ -280,14 +280,15 @@ async fn replay_for_stability(label: &str, calls: &[ToolCall], target: usize) ->
 /// child learned to reuse a matching session, the child re-imported on every
 /// call and a forced recycle every 64 requests contained the growth — so this
 /// fails at call 64 against that build, which is exactly the regression it
-/// exists to catch. It is also the arm that must stay free of the
-/// `WORKER_MAX_IMPORTS` cycle: a reused session is not an import.
+/// exists to catch. It is also the arm that must stay free of the residue
+/// cycle: a reused session is not an import, so the running total never moves.
 ///
 /// **One profile, deliberately.** The mixed `fixture_calls()` workload rotates
-/// five import profiles — one more than `WORKER_MAX_IMPORTS`, so it cannot fit
-/// in the child's session pool and every full rotation does cycle. Two
-/// profiles, which do fit, are the subject of the
-/// `alternating_import_profiles_*` test below.
+/// about half a dozen import profiles, which now fit inside
+/// `WORKER_SESSION_POOL_CAPACITY` — so it imports once per profile and then
+/// stops. Isolating a single profile keeps this arm sensitive to a *reuse*
+/// regression specifically, which a pooled workload would mask. Two profiles
+/// are the subject of the `alternating_import_profiles_*` test below.
 ///
 /// Ignored because it needs a built Lake fixture and takes minutes; it is the
 /// in-repo counterpart to `scripts/memory_stability.py` for a foreign project.
@@ -330,24 +331,27 @@ async fn repeated_calls_on_one_import_profile_never_recycle_the_worker() {
 ///
 /// That equivalence is the point. A Lean environment imported with
 /// `loadExts := true` is never reclaimed, so a child that re-imports on every
-/// switch grows without bound — measured at about +1 GiB per switch, reaching
-/// 11.2 GiB and a `SIGKILL` from the OS before call 180. `WORKER_MAX_IMPORTS`
-/// bounded that by cycling the child, and this test used to assert *which*
-/// cause fired, because a cycle every other call was the price of switching.
+/// switch grows without bound — measured on this fixture at about +1 GiB of RSS
+/// per switch, reaching 11.2 GiB and a `SIGKILL` from the OS before call 180.
+/// An import *count* ceiling bounded that by cycling the child, and this test
+/// used to assert *which* cause fired, because a cycle every other call was the
+/// price of switching.
 ///
 /// The child now pools imported sessions instead of dropping the outgoing one,
 /// so returning to a profile it already holds is a key compare rather than an
-/// import. Two profiles are inside `WORKER_MAX_IMPORTS`, so this workload
-/// performs two imports in total and never reaches the bound — making it the
-/// same assertion as
+/// import. Two profiles are far inside `WORKER_SESSION_POOL_CAPACITY`, so this
+/// workload performs two imports in total; two fixture imports are also orders
+/// of magnitude below the residue budget, so neither bound is approached —
+/// making this the same assertion as
 /// [`repeated_calls_on_one_import_profile_never_recycle_the_worker`], which is
 /// exactly the claim: **under pooling, switching profiles and repeating one are
 /// the same workload.**
 ///
-/// The RSS ceiling stays as the CI backstop. Two live environments measured
-/// 1.68 GiB against 1.65 GiB for one live plus one dropped — the pool costs
-/// ~30 MB per extra environment — while the pre-pool alternating build passed
-/// 4 GiB before call 30.
+/// The RSS ceiling stays as the CI backstop, and only as that: RSS counts clean
+/// mapped `.olean` pages and falls under pressure while the unreclaimable total
+/// grows, which is why no policy reads it. Two live environments measured
+/// 1.68 GiB against 1.65 GiB for one live plus one dropped, while the pre-pool
+/// alternating build passed 4 GiB before call 30.
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; long-running worker-stability check"]
 async fn alternating_import_profiles_reuse_pooled_sessions_and_never_recycle() {

@@ -1,0 +1,47 @@
+{
+  "calls": [
+    {
+      "label": "inspect_rat_den_dvd",
+      "tool": "lean_lookup",
+      "arguments": {
+        "kind": "declaration",
+        "name": "Rat.exists_intCast_eq_intCast_mul_of_den_dvd",
+        "file": "${PROJECT_ROOT}/KanProofs/Data/Rat/Lemmas.lean"
+      }
+    },
+    {
+      "label": "proof_state_rat_den_dvd",
+      "tool": "lean_context",
+      "arguments": {
+        "kind": "proof_position",
+        "file": "${PROJECT_ROOT}/KanProofs/Data/Rat/Lemmas.lean",
+        "declaration": "Rat.exists_intCast_eq_intCast_mul_of_den_dvd"
+      }
+    },
+    {
+      "label": "verify_rat_den_dvd",
+      "tool": "lean_verify",
+      "arguments": {
+        "targets": [
+          {
+            "kind": "explicit",
+            "file": "${PROJECT_ROOT}/KanProofs/Data/Rat/Lemmas.lean",
+            "declarations": ["Rat.exists_intCast_eq_intCast_mul_of_den_dvd"]
+          }
+        ],
+        "report_axioms": true
+      }
+    },
+    {
+      "label": "references_rat_den_dvd",
+      "tool": "lean_lookup",
+      "arguments": {
+        "kind": "references",
+        "scope": "file",
+        "name": "Rat.exists_intCast_eq_intCast_mul_of_den_dvd",
+        "file": "${PROJECT_ROOT}/KanProofs/Data/Rat/Lemmas.lean",
+        "limit": 10
+      }
+    }
+  ]
+}

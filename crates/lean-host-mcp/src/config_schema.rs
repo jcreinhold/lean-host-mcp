@@ -53,10 +53,10 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
     FieldDoc {
         key: "runtime.lean_max_memory_kib",
         ty: "integer (KiB)",
-        value: "8388608",
-        commented: false,
+        value: "18874368",
+        commented: true,
         overrides: "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
-        description: "Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. An elaboration that crosses it fails as an ordinary Lean error inside the tool result, so the worker is not killed and other calls are unaffected. This replaced four resident-memory thresholds, which measured shared mmapped .olean pages and so fired on healthy workers. Default 8 GiB.",
+        description: "Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. Crossing it kills the child: Lean's allocator signals the overrun with a C++ exception, which cannot unwind through the Rust frame at the shim boundary and aborts the process. Commented out because the default tracks runtime.worker_import_residue_budget_mib doubled, which keeps the clean recycle strictly ahead of the abort by more than the 4.4-6.3 GiB the heap counts and the budget does not — a fixed value below the budget makes the abort fire first and the residue policy unreachable. Set it only to raise the backstop; lowering it below the budget is warned about at startup.",
     },
     FieldDoc {
         key: "runtime.request_timeout_millis",
@@ -89,6 +89,22 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         commented: false,
         overrides: "LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS",
         description: "Rolling window, in seconds, over which worker_restart_limit is counted.",
+    },
+    FieldDoc {
+        key: "runtime.worker_import_residue_budget_mib",
+        ty: "integer (MiB)",
+        value: "9216",
+        commented: true,
+        overrides: "LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB",
+        description: "How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects) and clamped to [9216, 12288]; set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it.",
+    },
+    FieldDoc {
+        key: "runtime.worker_session_pool_capacity",
+        ty: "integer",
+        value: "8",
+        commented: false,
+        overrides: "LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY",
+        description: "How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8.",
     },
     // ---- [broker] — project pool ---------------------------------------
     FieldDoc {
@@ -305,13 +321,34 @@ mod tests {
         let config: ConfigFile = toml::from_str(&render_default_toml()).unwrap();
         let rt = ProjectRuntimeConfig::default();
 
-        assert_eq!(config.runtime.lean_max_memory_kib, Some(rt.lean_max_memory_kib()));
+        // Commented out for the same reason as the residue budget below: it is
+        // derived from that budget, so it inherits the RAM dependence. What the
+        // catalogue can pin is the ordering the derivation exists to guarantee.
+        assert_eq!(config.runtime.lean_max_memory_kib, None);
+        assert!(
+            rt.lean_max_memory_kib().saturating_mul(1024) > rt.import_residue_budget_bytes(),
+            "the heap ceiling must stay above the residue budget, or the abort preempts the clean recycle"
+        );
         assert_eq!(config.runtime.request_timeout_millis, Some(rt.request_timeout_millis()));
         assert_eq!(config.runtime.project_mailbox_capacity, Some(rt.mailbox_capacity()));
         assert_eq!(config.runtime.worker_restart_limit, Some(rt.max_restarts_per_window()));
         assert_eq!(
             config.runtime.worker_restart_window_secs,
             Some(rt.restart_window().as_secs())
+        );
+        // Commented out in the generated file on purpose: its default is derived
+        // from system RAM, so no literal in this catalogue could match it on
+        // every machine. Absence is what "derive it" means, and the derived
+        // value is asserted to stay within the documented clamp instead.
+        assert_eq!(config.runtime.worker_import_residue_budget_mib, None);
+        let derived_mib = rt.import_residue_budget_bytes() / (1024 * 1024);
+        assert!(
+            (9216..=12288).contains(&derived_mib),
+            "derived residue budget {derived_mib} MiB escaped the clamp this catalogue documents"
+        );
+        assert_eq!(
+            config.runtime.worker_session_pool_capacity,
+            Some(rt.session_pool_capacity())
         );
 
         assert_eq!(config.broker.max_projects, Some(broker::DEFAULT_MAX_PROJECTS));

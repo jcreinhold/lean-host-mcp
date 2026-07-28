@@ -8,10 +8,13 @@ long-lived server grows or recycles with *call count*: watch
 `final_worker_generation` (it should stay at the value the first call reported)
 and `call_restart_count` (it should stay 0) across increasing `--repeats`.
 
-It replaces a sweep over four resident-memory thresholds, which no longer exist
-— worker memory is now bounded inside Lean by `runtime.lean_max_memory_kib`, and
-nothing restarts on RSS. RSS is still reported, as an observation rather than a
-policy input.
+It replaces a sweep over four resident-memory thresholds, which no longer exist.
+Worker memory is bounded by retained import bytes
+(`runtime.worker_import_residue_budget_mib`), reported here as
+`peak_import_residue_mib`; `runtime.lean_max_memory_kib` is a backstop above that
+whose overrun aborts the child rather than raising an error, which is why its
+default is derived from the budget. Nothing restarts on RSS. RSS is still
+reported, as an observation rather than a policy input.
 
 It intentionally knows nothing about any particular repository. Put
 workspace-specific declarations and file paths in the workload JSON file.
@@ -407,6 +410,8 @@ def call_record(
         "retry_count": runtime.get("retry_count"),
         "queue_wait_millis": runtime.get("queue_wait_millis"),
         "runtime_rss_kib": runtime.get("rss_kib"),
+        "import_residue_bytes": runtime.get("import_residue_bytes"),
+        "import_residue_limit_bytes": runtime.get("import_residue_limit_bytes"),
         "worker_lanes": runtime.get("worker_lanes"),
         "profile_switch_count": runtime.get("profile_switch_count"),
         "call_restart_cause": call_restart.get("cause"),
@@ -444,6 +449,9 @@ def summarize(
     retry_total = 0
     max_retry = 0
     max_queue_wait = 0
+    peak_residue = 0
+    final_residue = None
+    residue_budget = None
 
     for record in records:
         status = str(record.get("status"))
@@ -456,6 +464,13 @@ def summarize(
         restart_rss = record.get("call_restart_rss_kib")
         if isinstance(restart_rss, int):
             peak_call_restart_rss = max(peak_call_restart_rss, restart_rss)
+        residue = record.get("import_residue_bytes")
+        if isinstance(residue, int):
+            peak_residue = max(peak_residue, residue)
+            final_residue = residue
+        residue_limit = record.get("import_residue_limit_bytes")
+        if isinstance(residue_limit, int):
+            residue_budget = residue_limit
         generation = record.get("worker_generation")
         if isinstance(generation, int):
             max_generation = max(max_generation, generation)
@@ -491,6 +506,12 @@ def summarize(
         "peak_runtime_rss_kib": peak_runtime_rss,
         "peak_call_restart_rss_kib": peak_call_restart_rss,
         "peak_observed_worker_rss_kib": max(peak_runtime_rss, peak_call_restart_rss),
+        # The quantity the recycle policy actually reads. RSS above is an
+        # observation; this is the input. A workload that repeats one import
+        # profile must leave it flat, because a reused session is not an import.
+        "peak_import_residue_mib": peak_residue // (1024 * 1024),
+        "final_import_residue_mib": (final_residue // (1024 * 1024)) if isinstance(final_residue, int) else None,
+        "import_residue_budget_mib": (residue_budget // (1024 * 1024)) if isinstance(residue_budget, int) else None,
         "max_worker_generation": max_generation,
         "final_worker_generation": final_generation,
         "worker_restarted_true_count": worker_restarted_true,

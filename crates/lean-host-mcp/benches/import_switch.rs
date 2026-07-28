@@ -12,11 +12,19 @@
 //!
 //! - `steady` repeats one import set. The worker child reuses its live session,
 //!   so this is the floor: query cost with no import.
-//! - `alternating` flips between two disjoint-enough sets every call, forcing a
-//!   re-import on each. The ratio to `steady` is the price of a switch.
+//! - `alternating` flips between two sets every call. Both fit in the child's
+//!   session pool, so each flip is a key comparison against a parked session
+//!   rather than an import — the ratio to `steady` is what pooling reduced a
+//!   switch *to*.
+//! - `rotating` cycles through one more profile than the pool holds, so the
+//!   least-recently-used entry is evicted before every return and each call
+//!   pays a real import. The ratio between `rotating` and `alternating` is the
+//!   price of overflowing the pool, which is what sizes
+//!   `WORKER_SESSION_POOL_CAPACITY`.
 //!
-//! Both use `inspect_declaration` on a core name resolvable under either set,
-//! so the *answer* is identical in both arms and only the environment differs.
+//! All three use `inspect_declaration` on a core name resolvable under every
+//! set, so the *answer* is identical in every arm and only the environment
+//! differs.
 //!
 //! Gated on `LEAN_HOST_MCP_BENCH_FIXTURE` (same shape as the e2e env var): a
 //! no-op when unset, so `cargo bench` still runs in CI.
@@ -36,6 +44,27 @@ use tokio::runtime::Runtime;
 /// Resolvable under either import set below, so the two arms differ only in the
 /// environment the worker holds, never in the work the query does.
 const SHARED_DECLARATION: &str = "Nat.add_zero";
+
+/// One more than `lean_host_mcp`'s `WORKER_SESSION_POOL_CAPACITY`. Kept as a
+/// literal rather than imported: the constant is private, and a bench that
+/// silently followed a capacity change would stop measuring overflow the moment
+/// the capacity moved. If this stops being capacity + 1, the `rotating` arm is
+/// measuring pool hits and must be fixed, not re-baselined.
+const POOL_OVERFLOW_PROFILES: usize = 9;
+
+/// Distinct single-module import sets, all of which resolve
+/// [`SHARED_DECLARATION`] out of core.
+const OVERFLOW_MODULES: [&str; POOL_OVERFLOW_PROFILES] = [
+    "LeanRsFixture.Handles",
+    "LeanRsFixture.Strings",
+    "LeanRsFixture.Scalars",
+    "LeanRsFixture.Containers",
+    "LeanRsFixture.Effects",
+    "LeanRsFixture.Evidence",
+    "LeanRsFixture.Meta",
+    "LeanRsFixture.SourceRanges",
+    "LeanRsFixture.ScanForms",
+];
 
 fn fixture_root() -> Option<PathBuf> {
     std::env::var("LEAN_HOST_MCP_BENCH_FIXTURE")
@@ -86,11 +115,22 @@ fn bench_import_switch(c: &mut Criterion) {
 
     let profile_a = vec!["LeanRsFixture.Handles".to_owned()];
     let profile_b = vec!["LeanRsFixture.Strings".to_owned(), "LeanRsFixture.Scalars".to_owned()];
+    // One more profile than the pool holds: with `POOL_OVERFLOW_PROFILES`
+    // distinct keys in rotation, the entry a call returns to is always the one
+    // the previous overflow evicted, so every call imports.
+    let rotation: Vec<Vec<String>> = OVERFLOW_MODULES
+        .iter()
+        .map(|module| vec![(*module).to_owned()])
+        .collect();
+    assert_eq!(rotation.len(), POOL_OVERFLOW_PROFILES);
 
-    // Open the project and pay both cold imports once, outside the measurement.
+    // Open the project and pay every cold import once, outside the measurement.
     rt.block_on(async {
         inspect(&ctx, profile_a.clone()).await;
         inspect(&ctx, profile_b.clone()).await;
+        for imports in &rotation {
+            inspect(&ctx, imports.clone()).await;
+        }
     });
 
     let mut group = c.benchmark_group("import_switch");
@@ -114,6 +154,15 @@ fn bench_import_switch(c: &mut Criterion) {
             } else {
                 profile_b.clone()
             };
+            rt.block_on(inspect(&ctx, imports));
+        });
+    });
+
+    group.bench_function("rotating", |b| {
+        let next = Cell::new(0_usize);
+        b.iter(|| {
+            let index = next.replace(next.get().wrapping_add(1) % POOL_OVERFLOW_PROFILES);
+            let imports = rotation.get(index).expect("rotation index stays in range").clone();
             rt.block_on(inspect(&ctx, imports));
         });
     });

@@ -193,8 +193,12 @@ pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 /// recycle, not a real result.
 ///
 /// Returns the `call_restart` event for a job-disrupting cause; `None`
-/// otherwise. `max_requests` / `max_imports` / `idle` / `explicit` are excluded:
-/// they are planned hygiene cycles, not duress.
+/// otherwise. `max_requests` / `max_imports` / `import_residue` /
+/// `import_residue_idle` / `idle` / `explicit` are excluded: they are planned
+/// hygiene cycles, not duress. A residue cycle in particular runs *before* the
+/// import that would have crossed the budget, so the call it precedes runs in a
+/// fresh child under no pressure at all — the opposite of the RSS causes below,
+/// which fire only once pressure is already being felt.
 ///
 /// `rss_post_job` *is* job-disrupting even though it fires after the job
 /// returned `Ok`: crossing the post-job RSS budget means the job elaborated
@@ -244,7 +248,8 @@ pub(crate) fn execution_taint_text(event: &RuntimeRestartEvent) -> (String, Stri
         "the worker was recycled or restarted during this call ({cause}){rss}; any non-positive outcome here — a \
          rejection, `not_found`, a failed tactic, or empty goals — may be a casualty of the recycle rather than a real \
          result, and is not trustworthy. Retry; if it persists, the module is too heavy for the worker's memory budget \
-         (raise LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB or verify with `lake build` / `lake env lean`).",
+         (raise LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB, which carries the Lean heap ceiling up with it, or \
+         verify with `lake build` / `lake env lean`).",
         cause = event.cause,
     );
     let next_action = "retry; if it persists, verify with `lake build <module>` or `lake env lean <file>`".to_owned();
@@ -364,7 +369,14 @@ mod tests {
             );
         }
         // Planned hygiene cycles do not: the cycle was routine.
-        for cause in ["max_requests", "max_imports", "idle", "explicit"] {
+        for cause in [
+            "max_requests",
+            "max_imports",
+            "import_residue",
+            "import_residue_idle",
+            "idle",
+            "explicit",
+        ] {
             assert!(
                 execution_taint(&facts_with_restart(cause)).is_none(),
                 "{cause} should not taint the verdict"

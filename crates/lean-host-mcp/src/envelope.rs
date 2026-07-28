@@ -131,6 +131,18 @@ pub struct RuntimeFacts {
     /// Omitted when no recycle has happened.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub restarts_by_cause: BTreeMap<String, u64>,
+    /// Unreclaimable bytes this worker generation has retained through imports,
+    /// and the budget at which it will be recycled.
+    ///
+    /// The live position between the two is the only thing that makes the
+    /// budget knob tunable: `restarts_by_cause` says how often a recycle
+    /// happened, this says how close the current child is to the next one.
+    /// Deliberately not duplicated onto [`RuntimeRestartEvent`] — its `reason`
+    /// already names both figures for a cycle that has already happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_residue_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_residue_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -344,6 +356,8 @@ mod tests {
             profile_switch_count: 1,
             restarts_total: 1,
             restarts_by_cause: BTreeMap::from([("rss_post_job".to_owned(), 1)]),
+            import_residue_bytes: None,
+            import_residue_limit_bytes: None,
         };
 
         let json = serde_json::to_value(facts).unwrap();

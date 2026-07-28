@@ -21,9 +21,22 @@ whole pipeline without uploading by running the workflow via `workflow_dispatch`
 
 ## 1. Pre-flight gate
 
-Run `scripts/prerelease.sh` from a clean tree (no uncommitted changes). It must pass end to end. Use `--quick` only for
-iteration, never for the actual release gate — the full run is what asserts the parent ⊥ libleanshared link invariant
-and dependency hygiene (cargo-deny).
+**First, assert the workspace has no local-path patch.** A `[patch.crates-io]` block in the root `Cargo.toml` points
+lean-rs at a sibling checkout while an upstream fix is unreleased. It is invisible to `prerelease.sh` — which is
+correct, because development needs it — but a release built through it is a release against sources nobody can fetch.
+
+```sh
+! rg -q '^\[patch\.crates-io\]' Cargo.toml   # must succeed (block absent)
+```
+
+If it is present: publish the lean-rs side first, remove the block, `cargo update -p lean-rs-worker-parent` (and its
+siblings) to the published versions, rerun `lean-host-mcp install-worker`, and start this checklist over.
+`cargo publish` would eventually reject the path dependencies, but only after the version bump and CHANGELOG edits are
+already made.
+
+Then run `scripts/prerelease.sh` from a clean tree (no uncommitted changes). It must pass end to end. Use `--quick` only
+for iteration, never for the actual release gate — the full run is what asserts the parent ⊥ libleanshared link
+invariant and dependency hygiene (cargo-deny).
 
 Then validate packaging without uploading:
 
