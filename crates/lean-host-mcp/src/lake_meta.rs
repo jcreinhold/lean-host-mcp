@@ -627,7 +627,7 @@ mod tests {
     fn write_project(root: &Path) {
         fs::create_dir_all(root).unwrap();
         fs::write(root.join("lakefile.lean"), "package proj\nlean_lib Proj\n").unwrap();
-        fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.33.0-rc1\n").unwrap();
+        fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.33.0-rc2\n").unwrap();
         fs::write(root.join("lake-manifest.json"), "{\"packages\": []}\n").unwrap();
         fs::write(root.join("Proj.lean"), "-- umbrella\n").unwrap();
     }
