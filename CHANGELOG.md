@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **The e2e suite raced itself under the default parallel test runner.** The two rebuild tests move the fixture's
+  `Handles.olean` mtime forward to stand in for `lake build`, while the two residue-budget tests assert across
+  multi-second sleeps that the worker serving that same import never recycles — one test's bump landed inside
+  another's stability window and both failed with `artifacts_rebuilt` recycles that neither caused. The four tests
+  now share a `serial_test` key (`handles_olean`) that confines the exclusion to exactly them; the rest of the
+  suite still runs in parallel.
+
 ## [0.9.0] - 2026-08-04
 
 ### Changed

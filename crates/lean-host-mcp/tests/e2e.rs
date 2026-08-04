@@ -8,12 +8,25 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::significant_drop_tightening,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    // The rebuild tests move an mtime with `SystemTime + Duration`; overflow
+    // is not a meaningful failure mode for a test clock bump.
+    clippy::arithmetic_side_effects
 )]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+// Four tests below share one mutable file: the fixture's `Handles.olean`,
+// whose mtime the rebuild tests bump to stand in for `lake build`, while the
+// residue-budget tests assert across multi-second sleeps that the worker
+// serving that same import never recycles. Under the default parallel test
+// runner one test's bump lands inside another's stability window and the
+// assertions fail with `artifacts_rebuilt`; the named serial key confines
+// the exclusion to exactly these four, leaving the rest of the suite
+// parallel.
+use serial_test::serial;
 
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
 use lean_host_mcp::tools::position::{
@@ -1846,6 +1859,7 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+#[serial(handles_olean)]
 async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call() {
     let Some(root) = fixture_root() else {
         return;
@@ -1923,6 +1937,7 @@ async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call()
 /// `lean-rs-worker-parent`'s own suite pins against known byte counts.
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+#[serial(handles_olean)]
 async fn an_idle_project_over_its_soft_budget_cycles_between_calls() {
     let Some(root) = fixture_root() else {
         return;
@@ -1966,6 +1981,7 @@ async fn an_idle_project_over_its_soft_budget_cycles_between_calls() {
 /// the idle path costs nothing — not a wakeup, not a respawn.
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+#[serial(handles_olean)]
 async fn a_project_under_its_soft_budget_never_cycles_for_residue() {
     let Some(root) = fixture_root() else {
         return;
@@ -2011,6 +2027,7 @@ async fn a_project_under_its_soft_budget_never_cycles_for_residue() {
 /// property that survived that change.
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+#[serial(handles_olean)]
 async fn a_rebuild_recycles_even_when_another_profile_ran_in_between() {
     let Some(root) = fixture_root() else {
         return;
