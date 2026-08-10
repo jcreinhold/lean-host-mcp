@@ -49,12 +49,12 @@ jobs:
           echo "LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---${toolchain##*:}" >> "$GITHUB_ENV"
       - name: fmt
         run: cargo fmt --all -- --check
-      # clippy --workspace is link-safe (no final link happens) per CLAUDE.md.
+      # clippy --workspace is link-safe (no final link happens) per AGENTS.md.
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       # Build and test PER-MEMBER, never workspace-wide: a `--all-targets`
       # workspace build unifies the lean-rs-sys feature set across the parent and
-      # worker, silently re-linking libleanshared into the parent (CLAUDE.md
+      # worker, silently re-linking libleanshared into the parent (AGENTS.md
       # "Always build per-member"). That also makes the parent's own test binary
       # unrunnable — it would reference @rpath/libleanshared.dylib with no rpath.
       - name: build (parent)

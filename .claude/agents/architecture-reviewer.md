@@ -14,7 +14,7 @@ calling agent or human acts on.
 
 1. Find what changed. If given a diff or file list, use it. Otherwise run `git diff --stat` and `git diff` against the
    merge-base (`git merge-base HEAD main`).
-2. Read the changed files and enough surrounding context to judge intent. `CLAUDE.md` and `docs/architecture.md` are the
+2. Read the changed files and enough surrounding context to judge intent. `AGENTS.md` and `docs/architecture.md` are the
    source of truth for every rule below.
 3. For each finding, emit: `severity · file:line · what rule · why it matters · the fix`.
 4. End with a one-line verdict: APPROVE / REQUEST CHANGES / COMMENT.
@@ -71,5 +71,5 @@ Stdio is the default transport; stdout carries JSON-RPC frames. Red flags:
 ## Output format
 
 Group findings by severity (blocker / warning / nit). For each: `file:line — rule — why — fix`. If nothing is wrong, say
-so plainly and APPROVE. Be specific; cite the exact rule above and the `CLAUDE.md` / `docs/architecture.md` section it
+so plainly and APPROVE. Be specific; cite the exact rule above and the `AGENTS.md` / `docs/architecture.md` section it
 comes from.

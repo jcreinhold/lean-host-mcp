@@ -4,7 +4,7 @@
 # This is the local mirror of `.github/workflows/ci.yml`'s `check` job
 # (fmt, clippy, build, test) PLUS the invariants CI does not enforce but
 # the repo already configures: the parent-binary link-set assertion
-# (CLAUDE.md "Multi-toolchain dispatch"), taplo/mdwright format checks
+# (AGENTS.md "Multi-toolchain dispatch"), taplo/mdwright format checks
 # (taplo.toml / .mdwright.toml / npx prettier), cargo-deny (deny.toml), and cargo-shear.
 # Passing locally is the fast feedback loop before a release tag.
 #
@@ -111,14 +111,14 @@ skip_gate() {
 run_gate "cargo fmt --all -- --check" \
 	cargo fmt --all -- --check
 
-# clippy --workspace is link-safe (no linking happens) per CLAUDE.md.
+# clippy --workspace is link-safe (no linking happens) per AGENTS.md.
 run_gate "cargo clippy --workspace --all-targets -- -D warnings" \
 	cargo clippy --workspace --all-targets -- -D warnings
 
 # Build and test PER-MEMBER, never workspace-wide. A `--workspace` /
 # `--all-targets` build unifies the `lean-rs-sys` feature set across the
 # parent and worker crates, silently re-linking `libleanshared` into the
-# parent (CLAUDE.md "Always build per-member"). That both violates the
+# parent (AGENTS.md "Always build per-member"). That both violates the
 # parent ⊥ libleanshared invariant and makes the parent's own test binary
 # unrunnable — it references `@rpath/libleanshared.dylib` with no rpath to
 # find it. Scoping to `-p` keeps the parent on `lean-rs-sys` metadata-only,
@@ -149,13 +149,13 @@ gate_link_invariant() {
 	case "$(uname -s)" in
 	Darwin)
 		if otool -L "$bin" | grep -q libleanshared; then
-			log_err "$bin links libleanshared — the parent must stay free of it (CLAUDE.md)."
+			log_err "$bin links libleanshared — the parent must stay free of it (AGENTS.md)."
 			return 1
 		fi
 		;;
 	Linux)
 		if ldd "$bin" 2>/dev/null | grep -q libleanshared; then
-			log_err "$bin links libleanshared — the parent must stay free of it (CLAUDE.md)."
+			log_err "$bin links libleanshared — the parent must stay free of it (AGENTS.md)."
 			return 1
 		fi
 		;;

@@ -33,8 +33,8 @@ case "$file" in
 	command -v npx >/dev/null 2>&1 && npx --yes prettier --write "$file" >/dev/null 2>&1 || true
 	;;
 *.md)
-	# Format all Markdown — no carveouts. CLAUDE.md/AGENTS.md (a symlink to
-	# CLAUDE.md) and docs under .claude/ are formatted like any other file.
+	# Format all Markdown — no carveouts. AGENTS.md/CLAUDE.md and docs under
+	# .claude/ are formatted like any other file.
 	command -v mdwright >/dev/null 2>&1 && mdwright fmt "$file" >/dev/null 2>&1 || true
 	;;
 esac

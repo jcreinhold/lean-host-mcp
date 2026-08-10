@@ -100,7 +100,7 @@ floor. If upstream didn't move it, leave it alone.
 
 Mirror CI's order (`.github/workflows/ci.yml`). **Always build per-member, never `--workspace`** — a workspace build
 unifies the `lean-rs-sys` feature set and silently re-links `libleanshared` into the parent, breaking the whole
-multi-toolchain story (CLAUDE.md "Always build per-member").
+multi-toolchain story (AGENTS.md "Always build per-member").
 
 ```sh
 # Lint gate first — CI runs clippy as -D warnings (clippy --workspace is safe; it doesn't link).
@@ -122,7 +122,7 @@ cargo test -p lean-host-mcp --all-targets
 
 To exercise the new toolchain end to end, build a worker for it and point the parent at the built worker. The parent
 resolves workers from `~/.local/share/lean-host-mcp/workers/<id>/`; during development shortcut that with
-`LEAN_HOST_MCP_WORKERS_DIR` (CLAUDE.md "Running from a development checkout"):
+`LEAN_HOST_MCP_WORKERS_DIR` (AGENTS.md "Running from a development checkout"):
 
 ```sh
 # Build the worker for the new toolchain (its build.rs bakes the matching lib/lean rpath):
@@ -150,7 +150,7 @@ tagging (`--quick` skips cargo-deny for iteration).
 - **README "Versions" section** is the single source of truth for the version matrix: it names the package version, the
   `lean-rs-worker-*` / `lean-rs` line, the supported window, and the head the server is built and tested against. Bring
   all of those in line with the bump.
-- Grep for the *old head* to catch other prose and example mentions: `grep -rIn 'v<old-head>' README.md docs/ CLAUDE.md`
+- Grep for the *old head* to catch other prose and example mentions: `grep -rIn 'v<old-head>' README.md docs/ AGENTS.md`
   (the JSON `lean_toolchain` examples in `README.md`, `docs/operations.md`, and `docs/tool-catalog.md` should track the
   head; `docs/ilean-reference-index.md`'s *"Verified … schema (Lean vX.Y.Z)"* note records the toolchain a schema was
   validated against — only move it if you re-verified under the new head).
@@ -159,7 +159,7 @@ tagging (`--quick` skips cargo-deny for iteration).
 
 ### 7. Commit
 
-Branch first if you're on `main`. Commit message in the repo's style, e.g.
+Commit message in the repo's style, e.g.
 `Move to lean-semantic-search 0.4 (lean-rs 0.3); widen window to vX.Y.Z` (mirror recent log entries). Summarize in the
 body: the new head toolchain, the two upstream lines, any Rust-floor change, and the test result.
 
@@ -172,7 +172,7 @@ shim to reach for in this repo.
 | --- | --- | --- |
 | `BadProject`: *"lean-toolchain pins …, outside the lean-rs supported window …"* when opening a project or on `install-worker` | The depended-on `lean-toolchain` crate's window doesn't include that pin yet | Bump the `lean-toolchain` / `lean-rs-*` deps to a line whose `SUPPORTED_TOOLCHAINS` covers it (step 2). Do **not** try to widen the window by editing this repo — it's read from the crate. |
 | `cargo deny check` reports duplicate `lean-rs` (or `lean-toolchain`) versions | The worker stack and lean-semantic-search ended up on different lean-rs lines | Reconcile both families onto the same line (step 2); `cargo update` to refresh `Cargo.lock`. |
-| Parent binary links `libleanshared` (link-set assertion fails) | Built with `cargo build --workspace`, which unified the `lean-rs-sys` features into the parent | Rebuild per-member: `cargo build -p lean-host-mcp` / `-p lean-host-mcp-worker` (CLAUDE.md "Always build per-member"). |
+| Parent binary links `libleanshared` (link-set assertion fails) | Built with `cargo build --workspace`, which unified the `lean-rs-sys` features into the parent | Rebuild per-member: `cargo build -p lean-host-mcp` / `-p lean-host-mcp-worker` (AGENTS.md "Always build per-member"). |
 | `libleanshared.{dylib,so}: cannot open` at worker startup | The worker was built for a different toolchain than is installed, so its rpath points at an absent prefix | Rebuild the worker with `LEAN_HOST_MCP_TARGET_TOOLCHAIN=vX.Y.Z` for the installed toolchain, or `install-worker --toolchain vX.Y.Z`. |
 | A test golden / cache-key assertion fails only after the bump | The worker substrate version moved, or a hardcoded head literal is stale | If the diff is the intended additive change, refresh the golden; align the `server.rs` / `broker.rs` / `declaration_inventory.rs` head literals with the fixture pin (step 3). |
 | A Rust test fails only on the new toolchain | Likely an upstream behavior change | Reproduce minimally; if it's an upstream regression, raise it with the lean-rs / lean-semantic-search maintainers rather than pinning around it here. |

@@ -63,7 +63,7 @@ links at the bottom. The tag message must match the version.
 ## 4. Version matrix check
 
 Confirm the supported `lean-rs` / Lean toolchain pairing in the **README** (the single source of truth) is current for
-this release. Bumping the toolchain is a `lean-rs` change first, then a version bump here — see CLAUDE.md "Version
+this release. Bumping the toolchain is a `lean-rs` change first, then a version bump here — see AGENTS.md "Version
 matrix".
 
 ## 5. Tag and push (triggers the irreversible publish)

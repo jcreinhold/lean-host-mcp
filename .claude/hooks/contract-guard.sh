@@ -6,12 +6,12 @@
 # print guidance to stderr and exit 2 so the text is returned to Claude to
 # act on. We never undo anything.
 #
-#   1. stdout is the MCP transport (CLAUDE.md / main.rs). Stdio is the
+#   1. stdout is the MCP transport (AGENTS.md / main.rs). Stdio is the
 #      default transport and stdout carries JSON-RPC frames; diagnostics go
 #      to stderr via `tracing`. A `println!`/`print!` in library/worker
 #      code corrupts the protocol stream. The repo has ZERO such calls in
 #      src today — keep it that way.
-#   2. The parent never links libleanshared (CLAUDE.md "Multi-toolchain
+#   2. The parent never links libleanshared (AGENTS.md "Multi-toolchain
 #      dispatch"). Only crates/lean-host-mcp-worker may depend on the
 #      Lean-runtime crates. Adding lean-rs / lean-rs-host / lean-rs-sys /
 #      lean-rs-worker-child to the PARENT manifest silently re-links the
@@ -42,7 +42,7 @@ case "$file" in
 */crates/*/src/cli/*) : ;;
 */crates/*/src/*.rs)
 	if grep -Eq '\b(println!|print!)[[:space:]]*\(' "$file"; then
-		msgs+=("• $file uses println!/print!. stdout is reserved for the stdio MCP transport's JSON-RPC frames (CLAUDE.md; src/main.rs). Route diagnostics to stderr via tracing; never print to stdout from src/. (The install-worker CLI under src/cli/ is the only allowed exception.)")
+		msgs+=("• $file uses println!/print!. stdout is reserved for the stdio MCP transport's JSON-RPC frames (AGENTS.md; src/main.rs). Route diagnostics to stderr via tracing; never print to stdout from src/. (The install-worker CLI under src/cli/ is the only allowed exception.)")
 	fi
 	;;
 esac
@@ -51,7 +51,7 @@ esac
 case "$file" in
 */crates/lean-host-mcp/Cargo.toml)
 	if grep -Eq '^[[:space:]]*(lean-rs-host|lean-rs-sys|lean-rs-worker-child|lean-rs)([[:space:]]|=|\.|")' "$file"; then
-		msgs+=("• $file (the PARENT manifest) gained a Lean-runtime dependency. Per CLAUDE.md only crates/lean-host-mcp-worker may link libleanshared; the parent must stay free of it. Keep lean-rs / lean-rs-host / lean-rs-sys / lean-rs-worker-child in the worker crate. Verify with: ! otool -L target/release/lean-host-mcp | grep -q libleanshared (macOS) / ! ldd … (Linux). Build per-member with -p, never --workspace.")
+		msgs+=("• $file (the PARENT manifest) gained a Lean-runtime dependency. Per AGENTS.md only crates/lean-host-mcp-worker may link libleanshared; the parent must stay free of it. Keep lean-rs / lean-rs-host / lean-rs-sys / lean-rs-worker-child in the worker crate. Verify with: ! otool -L target/release/lean-host-mcp | grep -q libleanshared (macOS) / ! ldd … (Linux). Build per-member with -p, never --workspace.")
 	fi
 	;;
 esac
