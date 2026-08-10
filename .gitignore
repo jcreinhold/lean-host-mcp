@@ -14,3 +14,4 @@ __pycache__/
 
 # Claude Code local runtime artifacts
 .claude/scheduled_tasks.lock
+.pi/sessions/
