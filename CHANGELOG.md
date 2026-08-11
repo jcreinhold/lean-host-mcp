@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Widened the toolchain window head to Lean 4.34.0-rc1.** The `lean-rs` / `lean-semantic-search` 0.7 line is
+  unchanged; upstream lean-rs 0.7.2 added 4.34.0-rc1 to `SUPPORTED_TOOLCHAINS` (new `lean.h` digest confined to TSan
+  instrumentation — byte-identical ABI probe, all 88 required symbols resolve), so the supported window is
+  `4.30.0 ..= 4.34.0-rc1`. The fixture pin, the worker the server is built and tested against, and the head-toolchain
+  literals in the test suite all move to v4.34.0-rc1. The Rust floor is unchanged at 1.91.
+
 ## [0.9.1] - 2026-08-10
 
 ### Fixed

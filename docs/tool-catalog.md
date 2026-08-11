@@ -36,7 +36,7 @@ All public tools return the semantic response baseline:
   "trust": {
     "project_root": "/abs/project",
     "session_id": "metadata-only-or-worker-session",
-    "lean_toolchain": "leanprover/lean4:v4.33.0-rc2",
+    "lean_toolchain": "leanprover/lean4:v4.34.0-rc1",
     "artifacts": [
       {
         "artifact": "ilean",
