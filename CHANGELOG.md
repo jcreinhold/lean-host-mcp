@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-11
+
 ### Changed
 
 - **Widened the toolchain window head to Lean 4.34.0-rc1.** The `lean-rs` / `lean-semantic-search` 0.7 line is
@@ -494,7 +496,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.7.0...v0.8.0
