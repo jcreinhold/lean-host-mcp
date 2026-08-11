@@ -404,6 +404,10 @@ struct MappedCoverage {
 }
 
 fn map_changed_file(changed: &ChangedFile, declarations: &[DeclarationInventoryRow]) -> MappedCoverage {
+    let declarations = declarations
+        .iter()
+        .filter(|row| !row.name.starts_with("_private."))
+        .collect::<Vec<_>>();
     if changed.whole_file {
         return MappedCoverage {
             known: declarations
@@ -430,7 +434,7 @@ fn map_changed_file(changed: &ChangedFile, declarations: &[DeclarationInventoryR
     let mut unknown = Vec::new();
     for hunk in &changed.hunks {
         let mut matched = false;
-        for row in declarations {
+        for row in &declarations {
             if let Some(reason) = overlap_reason(*hunk, row) {
                 matched = true;
                 known_by_decl
@@ -582,5 +586,19 @@ deleted file mode 100644
         assert_eq!(mapped.known.len(), 2);
         assert!(mapped.unknown.is_empty());
         assert!(mapped.known.iter().all(|decl| decl.reason == "whole_file_changed"));
+    }
+
+    #[test]
+    fn changed_coverage_excludes_generated_private_aliases() {
+        let mapped = map_changed_file(
+            &ChangedFile {
+                path: "Demo.lean".to_owned(),
+                hunks: Vec::new(),
+                whole_file: true,
+            },
+            &[row("Demo.public"), row("_private.Demo.0.Demo.public")],
+        );
+        assert_eq!(mapped.known.len(), 1);
+        assert_eq!(mapped.known[0].declaration, "Demo.public");
     }
 }

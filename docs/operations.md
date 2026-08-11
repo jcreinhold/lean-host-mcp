@@ -317,29 +317,26 @@ Which failures land where:
 
 ## Prompt-stack verification through MCP
 
-The `check_stack.py` checker used by the KanProofs formalization prompt stacks keeps its Lake/checkdecls backend as the
-default. It can also verify through the semantic MCP surface when you start a loopback HTTP server yourself:
+The KanProofs `stacks orchestrate` verifier uses the semantic MCP surface by default when a loopback HTTP server is
+available:
 
 ```sh
 lean-host-mcp --lake-root /path/to/kan-proofs --bind 127.0.0.1:8765
 
-/path/to/check_stack.py /path/to/prompt-workspace \
-  --verify \
-  --backend mcp \
-  --mcp-url http://127.0.0.1:8765/mcp
+cd /path/to/kan-proofs
+uv run stacks orchestrate verify /path/to/prompt-workspace --commit <commit>
 ```
 
-The checker does not start or manage the server. Use a built Lake project, and rebuild/install workers after upgrading
-the host so the server and worker protocol stay in step. The MCP backend calls `lean_verify` with sorry rejection and
-axiom reporting, using `lean_trial(kind = "command")` only for declarations that verification cannot row-report, such as
-definitions whose axiom set must still be checked. `--changed REF --backend mcp` preserves the checker's file-level
-changed-prompt selection and uses MCP verification for the selected prompts.
+The verifier does not start or manage the server. Installed workers record their wire-protocol version; compatible
+package upgrades need no rebuild. An incompatible worker returns a non-retryable `runtime_unavailable` issue whose
+`next_action` and `details.recovery_command` are exactly `lean-host-mcp install-worker --auto`. The verifier calls
+`lean_verify` with sorry rejection, axiom reporting, source-digest validation, and the server-side tainted-result retry.
 
-Fallback is explicit:
+When the server is temporarily unavailable, KanProofs falls back to only the named modules and probes under its Lake
+build lock. The standalone `stacks check --verify` compatibility surface still makes fallback explicit:
 
 ```sh
-/path/to/check_stack.py /path/to/prompt-workspace \
-  --verify \
+uv run stacks check /path/to/prompt-workspace --verify \
   --backend mcp \
   --mcp-url http://127.0.0.1:8765/mcp \
   --fallback lake
@@ -355,7 +352,8 @@ include worker generation, whether a call observed or performed a restart, retry
 available, import profile, profile-switch count, and restart history. These remain telemetry and are omitted at the
 default quiet verbosity. Proof-relevant artifact facts are public under `trust.artifacts` and survive the quiet
 telemetry gate: source snapshots (`source` / `file` / `edit_fresh`), build artifacts (`olean` or `ilean` with
-`build_fresh`, `stale_build`, or `missing_build`), and worker/toolchain availability facts.
+`build_fresh`, `stale_build`, or `missing_build`), and worker/toolchain availability facts. Each source fact includes
+`content_sha256`, the digest of the exact bytes elaborated for that call.
 
 ## Capability shims and module queries
 
@@ -390,29 +388,26 @@ The detection is "was this binary built from a checkout that still has the worke
 binary was built). Either way the worker needs a Rust toolchain on `PATH` and the matching Lean toolchain installed via
 elan; the freshly built worker is smoke-tested before it is recorded as usable.
 
-### Keeping workers in step with the host
+### Keeping workers compatible with the host
 
-The worker and the parent share the workspace version and are protocol/ABI-coupled in lockstep: a worker built by a
-different `lean-host-mcp` may speak a different worker protocol. **After upgrading `lean-host-mcp`, rebuild your
-workers** — otherwise a skewed worker can fail at call time rather than with a clear message.
-
-The provenance sidecar records the building host version, so the tools can tell a worker is stale without running it:
+The provenance sidecar records the worker wire-protocol version independently of the package version:
 
 - `install-worker --auto` (the default) scans `~/.elan/toolchains` and (re)builds any worker that is **missing or
-  stale** — host-version skew, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that are
+  stale** — protocol mismatch, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that are
   current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current workers
   too (e.g. to re-run the smoke test or replace a corrupted binary).
 - `install-worker --toolchain <id>` builds one worker, always overwriting.
-- `install-worker --list` prints every installed worker; the `host` column reads `current` (built by the running host),
-  `stale` (a different, version-locked host — rebuild), or `unknown` (sidecar predates the field).
+- `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
+  `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
 - `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are
   rebuildable artifacts, so this only deletes from the install root and never touches source. Use it for disk hygiene or
   to force a clean rebuild after a `lean-rs` ABI change.
 - `install-worker --prune` removes only *unservable* workers — those outside the supported window or with a recorded
-  smoke-test failure. Servable-but-stale workers (header drift, host skew) are kept; rebuild those with `--auto`.
+  smoke-test failure. Other stale workers are kept; rebuild those with `--auto`.
 
-At runtime, a project served by a host-skewed worker still opens but every response carries a warning naming the worker
-and host versions and the rebuild command; header drift and smoke failure remain hard refusals.
+At runtime, package-version skew is silent when the protocol matches. A recorded protocol mismatch is a non-retryable
+`runtime_unavailable` response with `lean-host-mcp install-worker --auto` as the exact recovery command. Header drift or
+smoke failure is also a hard refusal with an actionable reinstall command.
 
 ## Build, test, lint
 

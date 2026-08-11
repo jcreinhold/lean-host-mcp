@@ -710,7 +710,7 @@ pub async fn command_trial(ctx: &ToolContext, req: CommandTrialRequest) -> Resul
             (
                 format!("{}\n\n{commands}\n", input.source),
                 input.imports,
-                ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved),
+                ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved, input.hash),
                 label,
             )
         }
@@ -764,7 +764,7 @@ pub async fn file_diagnostics(
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
-    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved);
+    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved, input.hash);
     let file_label = input.resolved.to_string_lossy().into_owned();
     let imports = input.imports.clone();
     let selectors = vec![LeanWorkerModuleQuerySelector::Diagnostics {
@@ -1452,7 +1452,7 @@ async fn run_module_query(
     source: &QueryFile,
     query: LeanWorkerModuleQuery,
 ) -> Result<QueryRun> {
-    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &source.resolved);
+    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &source.resolved, source.hash);
     let call = ctx
         .broker
         .process_cached_module_query(
@@ -1483,7 +1483,7 @@ async fn run_module_query_batch(
     selectors: Vec<LeanWorkerModuleQuerySelector>,
     budgets: LeanWorkerOutputBudgets,
 ) -> Result<BatchRun> {
-    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &source.resolved);
+    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &source.resolved, source.hash);
     let file_label = source.resolved.to_string_lossy().into_owned();
     let call = ctx
         .broker

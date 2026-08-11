@@ -131,7 +131,7 @@ async fn worker_declarations(
     limit: usize,
 ) -> Result<Response<DeclarationInventoryResult>> {
     let input = read_query_file(root, path)?;
-    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved);
+    let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved, input.hash);
     let module = module_hint.or_else(|| module_name_for_file(root, &input.resolved));
     let file_label = input.resolved.to_string_lossy().into_owned();
     let selectors = vec![LeanWorkerModuleQuerySelector::DeclarationOutline {

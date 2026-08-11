@@ -52,6 +52,9 @@ pub struct ArtifactTrust {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
+    /// SHA-256 of the exact source bytes used for this semantic call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
 }
 
 impl ArtifactTrust {
@@ -64,6 +67,7 @@ impl ArtifactTrust {
             module: None,
             detail: None,
             next_action: None,
+            content_sha256: None,
         }
     }
 
@@ -91,9 +95,43 @@ impl ArtifactTrust {
         self
     }
 
-    pub fn source_file_edit_fresh(root: &Path, path: &Path) -> Self {
+    #[must_use]
+    pub fn content_sha256(mut self, digest: [u8; 32]) -> Self {
+        fn hex_digit(nibble: u8) -> char {
+            match nibble {
+                0 => '0',
+                1 => '1',
+                2 => '2',
+                3 => '3',
+                4 => '4',
+                5 => '5',
+                6 => '6',
+                7 => '7',
+                8 => '8',
+                9 => '9',
+                10 => 'a',
+                11 => 'b',
+                12 => 'c',
+                13 => 'd',
+                14 => 'e',
+                15 => 'f',
+                _ => '?',
+            }
+        }
+
+        let encoded = digest.iter().fold(String::with_capacity(64), |mut output, byte| {
+            output.push(hex_digit(*byte >> 4));
+            output.push(hex_digit(*byte & 0x0f));
+            output
+        });
+        self.content_sha256 = Some(encoded);
+        self
+    }
+
+    pub fn source_file_edit_fresh(root: &Path, path: &Path, digest: [u8; 32]) -> Self {
         Self::new(ArtifactKind::Source, TrustScope::File, TrustStatus::EditFresh)
             .path(display_path(root, path))
+            .content_sha256(digest)
             .detail("source snapshot was read from disk for this call")
     }
 
@@ -249,10 +287,22 @@ mod tests {
 
     #[test]
     fn trust_deduplication_preserves_first_occurrence_order() {
-        let source = ArtifactTrust::source_file_edit_fresh(Path::new("/tmp/project"), Path::new("/tmp/project/A.lean"));
+        let source =
+            ArtifactTrust::source_file_edit_fresh(Path::new("/tmp/project"), Path::new("/tmp/project/A.lean"), [7; 32]);
         let ilean = ArtifactTrust::ilean_project_build_fresh();
         let deduped = dedupe_artifacts([source.clone(), ilean.clone(), source.clone()]);
         assert_eq!(deduped, vec![source, ilean]);
+    }
+
+    #[test]
+    fn source_fact_serializes_the_snapshot_digest() {
+        let fact = ArtifactTrust::source_file_edit_fresh(
+            Path::new("/tmp/project"),
+            Path::new("/tmp/project/A.lean"),
+            [0xab; 32],
+        );
+        let expected = "ab".repeat(32);
+        assert_eq!(fact.content_sha256.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

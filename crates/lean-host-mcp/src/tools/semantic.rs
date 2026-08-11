@@ -870,6 +870,22 @@ pub(crate) fn from_worker_unavailable(info: &WorkerUnavailable) -> SemanticRespo
     from_runtime_response(old)
 }
 
+pub(crate) fn from_incompatible_worker(message: &str, recovery_command: &str) -> SemanticResponse<Value> {
+    SemanticResponse {
+        data: None,
+        errors: vec![SemanticIssue {
+            code: "runtime_unavailable".to_owned(),
+            message: message.to_owned(),
+            severity: Some("error".to_owned()),
+            next_action: Some(recovery_command.to_owned()),
+            retryable: Some(false),
+            details: Some(json!({ "recovery_command": recovery_command })),
+        }],
+        trust: SemanticTrust::unknown(),
+        telemetry: None,
+    }
+}
+
 fn from_tool_response<T>(mut response: Response<T>, verbosity: TelemetryVerbosity) -> Result<SemanticResponse<Value>>
 where
     T: Serialize + JsonSchema,

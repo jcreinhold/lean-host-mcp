@@ -6,11 +6,10 @@
 //!
 //! - `--toolchain <id>`: build for one toolchain (always overwrites).
 //! - no flag / `--auto`: scan `~/.elan/toolchains/leanprover--lean4---*`
-//!   and build for any that are missing or stale (host-version skew, header
+//!   and build for any that are missing or stale (protocol mismatch, header
 //!   drift, failed/absent smoke); `--force` rebuilds current ones too.
 //! - `--list`: print a table of currently-installed workers, including a
-//!   `host` column that flags workers built by a different (version-locked)
-//!   `lean-host-mcp` than the one running.
+//!   `protocol` column that reports wire compatibility.
 //! - `--clean [--toolchain <id>]`: remove all installed workers, or just one.
 //! - `--prune`: remove only unservable workers (outside the supported window,
 //!   or with a failed smoke test), keeping servable-but-stale ones.
@@ -191,27 +190,20 @@ fn run_list() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|t| t.elan_dir().ok())
             .and_then(|dir| hash_lean_header(&dir).ok());
-        // One sidecar load feeds both the `build` (header-drift) and `runtime`
-        // (smoke) columns. No sidecar means no provenance at all, so both are
-        // `unknown`/`untested` — the same labels their per-state helpers use.
+        // One sidecar load feeds build, runtime, and protocol compatibility.
         let sidecar = WorkerSidecar::load(&id_path);
         let header = sidecar
             .as_ref()
             .map_or("unknown", |s| s.header_status(current.as_deref()));
         let smoke = sidecar.as_ref().map_or("untested", WorkerSidecar::smoke_status);
-        // Host-version provenance: `current` if built by this host, `stale` if
-        // by a different (version-locked) host — the skew that silently served
-        // an ABI-mismatched worker before this column existed.
-        let host = sidecar
-            .as_ref()
-            .map_or("unknown", |s| s.host_status(env!("CARGO_PKG_VERSION")));
+        let protocol = sidecar.as_ref().map_or("unknown", WorkerSidecar::protocol_status);
         rows.push(ListRow {
             id: id.to_owned(),
             path: bin,
             support,
             header,
             smoke,
-            host,
+            protocol,
             size: meta.len(),
             mtime,
             sha,
@@ -222,14 +214,14 @@ fn run_list() -> anyhow::Result<()> {
 
     println!(
         "{:<28}  {:<14}  {:<9}  {:<9}  {:<9}  {:>10}  {:<24}  sha256",
-        "toolchain", "support", "build", "runtime", "host", "size", "built"
+        "toolchain", "support", "build", "runtime", "protocol", "size", "built"
     );
     for row in &rows {
         let mtime = humantime::format_rfc3339_seconds_or_fallback(row.mtime);
         let size = format_mib(row.size);
         println!(
             "{:<28}  {:<14}  {:<9}  {:<9}  {:<9}  {:>10}  {:<24}  {}",
-            row.id, row.support, row.header, row.smoke, row.host, size, mtime, row.sha
+            row.id, row.support, row.header, row.smoke, row.protocol, size, mtime, row.sha
         );
     }
     Ok(())
@@ -245,7 +237,7 @@ struct ListRow {
     support: &'static str,
     header: &'static str,
     smoke: &'static str,
-    host: &'static str,
+    protocol: &'static str,
     size: u64,
     mtime: SystemTime,
     sha: String,
@@ -348,11 +340,11 @@ fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
         None => return Freshness::Stale("no smoke record"),
         Some(_) => {}
     }
-    // Worker and host are version-locked; a different builder version may speak
-    // a different worker protocol. `""` means the sidecar predates the field.
-    let built = sidecar.host_version();
-    if !built.is_empty() && built != env!("CARGO_PKG_VERSION") {
-        return Freshness::Stale("host-version skew");
+    if sidecar
+        .protocol_version()
+        .is_some_and(|version| version != lean_rs_worker_protocol::protocol::PROTOCOL_VERSION)
+    {
+        return Freshness::Stale("protocol mismatch");
     }
     Freshness::Current
 }
@@ -1048,19 +1040,17 @@ mod tests {
     }
 
     #[test]
-    fn freshness_stale_on_host_version_skew() {
-        // Absent-from-elan id so header drift is skipped and the *host skew* is
-        // the reason; a passing smoke rules out the smoke-stale path too.
+    fn freshness_stale_on_protocol_mismatch() {
         let root = tempfile::tempdir().expect("tmp root");
         let dir = root.path().join("v4.99.99");
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
-        let skewed = r#"{"toolchain":"v4.99.99","header_digest":"d","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","digest_supported_at_build":true,"smoke":{"result":"passed"}}"#;
+        let skewed = r#"{"toolchain":"v4.99.99","header_digest":"d","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","worker_protocol_version":999,"digest_supported_at_build":true,"smoke":{"result":"passed"}}"#;
         std::fs::write(dir.join("worker.json"), skewed).expect("sidecar");
         let id = ToolchainId::parse("v4.99.99").expect("parse");
         assert!(matches!(
             worker_freshness_in(root.path(), &id),
-            Freshness::Stale("host-version skew")
+            Freshness::Stale("protocol mismatch")
         ));
     }
 }

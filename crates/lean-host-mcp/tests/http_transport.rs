@@ -5,6 +5,7 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStderr, Command};
@@ -316,7 +318,10 @@ async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
     // mailbox — the server's only admission mechanism.
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_str())],
-        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
+        &[
+            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
+            ("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full"),
+        ],
     )
     .await;
     let mut sessions = Vec::new();
@@ -408,6 +413,60 @@ async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
     assert!(response.http_status.is_success());
     assert!(response.json.get("error").is_none());
 
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires built Lean fixture and worker binary"]
+async fn streamable_http_five_clients_serialize_source_consistent_results() {
+    let root = fixture_root();
+    let root_s = root.to_string_lossy().into_owned();
+    let expected =
+        sha256_hex(&std::fs::read(root.join("LeanRsFixture/ProofActions.lean")).expect("read fixture source"));
+    let server = HttpMcpServer::start_with_env(
+        &[("--lake-root", root_s.as_str())],
+        &[
+            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
+            ("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full"),
+        ],
+    )
+    .await;
+    let mut tasks = Vec::new();
+    for _ in 0..5 {
+        let mut session = server.new_session().await;
+        tasks.push(tokio::spawn(async move {
+            session
+                .request(
+                    "tools/call",
+                    json!({
+                        "name": "lean_status",
+                        "arguments": {
+                            "kind": "file_diagnostics",
+                            "file": "LeanRsFixture/ProofActions.lean"
+                        }
+                    }),
+                )
+                .await
+        }));
+    }
+
+    let mut waits = Vec::new();
+    for task in tasks {
+        let response = task.await.expect("HTTP task join").expect("HTTP tool response");
+        assert!(response.http_status.is_success(), "response: {response:?}");
+        assert!(response.json.get("error").is_none(), "response: {:?}", response.json);
+        assert_eq!(
+            source_content_digest(&response.json, "LeanRsFixture/ProofActions.lean"),
+            Some(expected.as_str()),
+            "every client must receive trust for the same source bytes: {:?}",
+            response.json
+        );
+        waits.push(success_runtime_u64(&response.json, "queue_wait_millis").unwrap_or_default());
+    }
+    assert!(
+        waits.iter().any(|wait| *wait > 0),
+        "five same-project clients must observe the single actor queue: {waits:?}"
+    );
     server.shutdown().await;
 }
 
@@ -775,6 +834,36 @@ fn runtime_u64(response: &Value, field: &str) -> Option<u64> {
         .pointer("/result/structuredContent/errors/0/details")
         .and_then(|runtime| runtime.get(field))
         .and_then(Value::as_u64)
+}
+
+fn success_runtime_u64(response: &Value, field: &str) -> Option<u64> {
+    response
+        .pointer("/result/structuredContent/telemetry/runtime")
+        .and_then(|runtime| runtime.get(field))
+        .and_then(Value::as_u64)
+}
+
+fn source_content_digest<'a>(response: &'a Value, path: &str) -> Option<&'a str> {
+    response
+        .pointer("/result/structuredContent/trust/artifacts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|artifact| {
+            artifact.get("artifact").and_then(Value::as_str) == Some("source")
+                && artifact.get("path").and_then(Value::as_str) == Some(path)
+                && artifact.get("status").and_then(Value::as_str) == Some("edit_fresh")
+        })
+        .and_then(|artifact| artifact.get("content_sha256"))
+        .and_then(Value::as_str)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().fold(String::with_capacity(64), |mut output, byte| {
+        write!(&mut output, "{byte:02x}").expect("writing to a String is infallible");
+        output
+    })
 }
 
 fn semantic_error_code(response: &Value) -> Option<String> {

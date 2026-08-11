@@ -90,6 +90,9 @@ pub enum ServerError {
     #[error("lake project not usable: {0}")]
     BadProject(String),
 
+    #[error("incompatible Lean worker: {message}")]
+    IncompatibleWorker { message: String, recovery_command: String },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -134,6 +137,7 @@ impl From<ServerError> for McpError {
             other @ (ServerError::Lean(_)
             | ServerError::SessionGone
             | ServerError::BadProject(_)
+            | ServerError::IncompatibleWorker { .. }
             | ServerError::Io(_)
             | ServerError::Internal(_)) => Self::internal_error(other.to_string(), None),
         }

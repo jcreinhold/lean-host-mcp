@@ -256,7 +256,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
-    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved);
+    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved, input.hash);
     let file_label = input.resolved.to_string_lossy().into_owned();
     let budgets = proof_action_budgets(&ctx.config.output);
     let candidates = proof_candidates(&req);
@@ -460,7 +460,7 @@ pub async fn verify_declaration(
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
-    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved);
+    let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved, input.hash);
     let file_label = input.resolved.to_string_lossy().into_owned();
     let budgets = proof_action_budgets(&ctx.config.output);
     if req.declaration.trim().is_empty() {
@@ -1038,7 +1038,7 @@ fn prepare_verify_group(root: &Path, group: VerifyGroup) -> Result<PreparedVerif
                 source: input.source,
                 imports: input.imports,
                 file_label,
-                source_fact: Some(ArtifactTrust::source_file_edit_fresh(root, &input.resolved)),
+                source_fact: Some(ArtifactTrust::source_file_edit_fresh(root, &input.resolved, input.hash)),
                 targets: group.targets,
             })
         }

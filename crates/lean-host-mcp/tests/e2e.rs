@@ -14,9 +14,12 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use sha2::{Digest, Sha256};
 
 // Four tests below share one mutable file: the fixture's `Handles.olean`,
 // whose mtime the rebuild tests bump to stand in for `lake build`, while the
@@ -129,6 +132,14 @@ fn run_git(root: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().fold(String::with_capacity(64), |mut output, byte| {
+        write!(&mut output, "{byte:02x}").expect("writing to a String is infallible");
+        output
+    })
 }
 
 fn semantic_request(kind: &str, args: serde_json::Value) -> SemanticToolRequest {
@@ -1257,10 +1268,10 @@ async fn lean_verify_changed_targets_and_changed_coverage_report_gaps() {
             1,
         )
         .replacen("  trivial", "  exact True.intro", 1);
-    fs::write(&proof_actions, edited).expect("write proof actions edit");
+    fs::write(&proof_actions, &edited).expect("write proof actions edit");
     fs::write(
         work.join("LeanRsFixture/NewChanged.lean"),
-        "namespace LeanRsFixture.NewChanged\n\ntheorem fresh : True := by\n  trivial\n\nend LeanRsFixture.NewChanged\n",
+        "namespace LeanRsFixture.NewChanged\n\nprivate theorem helper : True := by\n  trivial\n\ntheorem fresh : True := helper\n\nend LeanRsFixture.NewChanged\n",
     )
     .expect("write untracked file");
     fs::remove_file(work.join("LeanRsFixture/Strings.lean")).expect("delete lean file");
@@ -1296,6 +1307,7 @@ async fn lean_verify_changed_targets_and_changed_coverage_report_gaps() {
                 && artifact.scope == lean_host_mcp::TrustScope::File
                 && artifact.status == lean_host_mcp::TrustStatus::EditFresh
                 && artifact.path.as_deref() == Some("LeanRsFixture/ProofActions.lean")
+                && artifact.content_sha256.as_deref() == Some(sha256_hex(edited.as_bytes()).as_str())
         }),
         "changed coverage should report source edit-fresh trust for mapped files: {:?}",
         coverage.trust.artifacts
@@ -1314,6 +1326,12 @@ async fn lean_verify_changed_targets_and_changed_coverage_report_gaps() {
             .iter()
             .any(|row| row["declaration"].as_str() == Some("LeanRsFixture.NewChanged.fresh")),
         "untracked file should select all declarations: {known:?}"
+    );
+    assert!(
+        known.iter().all(|row| !row["declaration"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("_private."))),
+        "changed coverage must not select generated private aliases: {known:?}"
     );
     assert!(
         coverage_data

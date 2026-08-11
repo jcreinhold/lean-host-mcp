@@ -1409,6 +1409,20 @@ impl ActorConfig {
                      provides (header drift); rebuild it: {install_cmd}"
                 )));
             }
+            Readiness::Incompatible {
+                toolchain,
+                worker_protocol,
+                host_protocol,
+                install_cmd: _,
+            } => {
+                return Err(ServerError::IncompatibleWorker {
+                    message: format!(
+                        "worker for {toolchain} uses protocol {worker_protocol}, but this host requires \
+                         protocol {host_protocol}"
+                    ),
+                    recovery_command: "lean-host-mcp install-worker --auto".to_owned(),
+                });
+            }
             Readiness::Unusable {
                 toolchain,
                 detail,

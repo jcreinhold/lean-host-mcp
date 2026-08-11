@@ -126,6 +126,10 @@ impl LeanHostService {
         let response = match result {
             Ok(response) => response,
             Err(ServerError::WorkerUnavailable(info)) => tools::semantic::from_worker_unavailable(&info),
+            Err(ServerError::IncompatibleWorker {
+                message,
+                recovery_command,
+            }) => tools::semantic::from_incompatible_worker(&message, &recovery_command),
             Err(err) => return Err(McpError::from(err)),
         };
         Ok(carry(&response, self.ctx.config.carrier))
@@ -229,6 +233,33 @@ mod tests {
         assert_eq!(
             json.pointer("/errors/1/message").and_then(serde_json::Value::as_str),
             Some("worker for v4.30.0 has no runtime smoke record")
+        );
+    }
+
+    #[test]
+    fn incompatible_worker_is_nonretryable_with_exact_recovery_command() {
+        let response = tools::semantic::from_incompatible_worker(
+            "worker protocol 1 is incompatible with host protocol 2",
+            "lean-host-mcp install-worker --auto",
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json.pointer("/errors/0/code").and_then(serde_json::Value::as_str),
+            Some("runtime_unavailable")
+        );
+        assert_eq!(
+            json.pointer("/errors/0/retryable").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/errors/0/next_action")
+                .and_then(serde_json::Value::as_str),
+            Some("lean-host-mcp install-worker --auto")
+        );
+        assert_eq!(
+            json.pointer("/errors/0/details/recovery_command")
+                .and_then(serde_json::Value::as_str),
+            Some("lean-host-mcp install-worker --auto")
         );
     }
 

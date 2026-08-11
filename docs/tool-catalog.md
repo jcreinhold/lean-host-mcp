@@ -588,7 +588,8 @@ The response is a compact batch:
 `worker_recycled`, or `unsupported`. `requested` counts expanded targets before host-side caps; `truncated` is true when
 declaration inventory or verification output was capped. `file_all` and source-backed `module_all` use the current
 source snapshot and report the same project-relative file paths in rows. If a module has no source file, `module_all`
-may use the `.ilean` declaration inventory, with typed artifact freshness facts in `trust`.
+may use the `.ilean` declaration inventory, with typed artifact freshness facts in `trust`. Every source-backed trust
+fact includes `content_sha256`, the SHA-256 of the exact bytes used by the call.
 
 `detail` defaults to `"compact"`, which keeps the row-level declaration name, file, status, reason, diagnostics,
 sorry/admit facts, axiom facts, and trustworthiness flags, but omits repeated target-span and ambiguous-candidate span
@@ -606,7 +607,8 @@ unset. At most one retry per batch; it is surfaced through `runtime.retry_count`
 source-fresh declaration spans and verifies only known declarations. Coverage is conservative: comment or whitespace
 hunks outside any declaration, unavailable/truncated declaration inventory, deleted files, and renames are reported
 under `coverage` instead of being silently dropped. If coverage is unknown, verify the whole file or rebuild and retry;
-the server will not trust stale `.ilean` rows as authoritative for editable changed source.
+the server will not trust stale `.ilean` rows as authoritative for editable changed source. Generated `_private.*`
+aliases are excluded from changed-target expansion; callers may still request such a declaration explicitly.
 
 ## `lean_lookup`
 
