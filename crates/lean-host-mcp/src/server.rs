@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::broker::ProjectBroker;
@@ -96,13 +96,16 @@ impl LeanHostService {
 }
 
 #[tool_handler]
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "rmcp's #[tool_handler] macro emits `async fn list_tools` with no `.await` over the RPITIT ServerHandler trait; the async-ness is macro-generated and not ours to remove"
+)]
 impl ServerHandler for LeanHostService {
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo` is `#[non_exhaustive]` from rmcp; struct literal
         // syntax (even with `..default`) is forbidden across crates. Build
         // via Default + field mutation.
         let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::LATEST;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
@@ -147,11 +150,11 @@ where
     let value = match serde_json::to_value(response) {
         Ok(value) => value,
         Err(err) => {
-            return CallToolResult::error(vec![Content::text(format!("failed to serialize response: {err}"))]);
+            return CallToolResult::error(vec![ContentBlock::text(format!("failed to serialize response: {err}"))]);
         }
     };
     match carrier {
-        ResponseCarrier::Text => CallToolResult::success(vec![Content::text(value.to_string())]),
+        ResponseCarrier::Text => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
         ResponseCarrier::Both => CallToolResult::structured(value),
         ResponseCarrier::Structured => {
             let mut result = CallToolResult::structured(value);

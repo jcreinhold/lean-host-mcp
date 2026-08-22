@@ -59,7 +59,7 @@ dirs = "6"
 lru = "0.18"
 parking_lot = "0.12"
 regex = "1"
-rmcp = { version = "1.8", features = [
+rmcp = { version = "3", features = [
   "macros",
   "schemars",
   "server",
@@ -95,7 +95,7 @@ lean-toolchain.workspace = true
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 reqwest = { version = "0.13", default-features = false }
-serial_test = "3"
+serial_test = "4"
 tokio = { version = "1", features = ["process"] }
 
 [lints]
