@@ -289,7 +289,7 @@ mod tests {
             "trust": {
                 "project_root": "/tmp/project",
                 "session_id": "session",
-                "lean_toolchain": "leanprover/lean4:v4.34.0-rc1"
+                "lean_toolchain": "leanprover/lean4:v4.34.0-rc2"
             }
         });
 

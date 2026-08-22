@@ -9,6 +9,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Widened the toolchain window head to Lean 4.34.0-rc2 and added 4.33.1 to the window.** The `lean-rs` /
+  `lean-semantic-search` 0.7 line is unchanged (already at lean-rs 0.7.3 / lean-semantic-search 0.7.2): lean-rs 0.7.3's
+  `SUPPORTED_TOOLCHAINS` adds 4.33.1 (new `lean.h` digest backporting the 4.34.0-rc1 TSan instrumentation —
+  byte-identical ABI probe) and 4.34.0-rc2 (new digest implementing the sticky-rc fix — no struct declaration changes,
+  byte-identical probe against rc1), so the supported window is `4.30.0 ..= 4.34.0-rc2`. The fixture pin, the worker
+  the server is built and tested against, and the head-toolchain literals in the test suite all move to v4.34.0-rc2.
+  The Rust floor is unchanged at 1.94.
+- **Upgraded rmcp from 1.8 to 3.1.4.** Tracks the MCP 2025-11-25 spec alignment: `Content` is renamed to
+  `ContentBlock`, version negotiation now runs through rmcp's `supported_protocol_versions()` (the explicit
+  `ProtocolVersion::LATEST` pin in `get_info` was dropped as redundant), and `CallToolResult` gained a `resultType`
+  field that rmcp omits for legacy sessions. Newer clients may now negotiate protocol 2025-11-25, under which the
+  Streamable HTTP transport enforces the `MCP-Protocol-Version` header. The Rust floor moved from 1.91 to 1.94 (which
+  also matches the lean-rs 0.7.3 floor).
+
 ## [0.10.0] - 2026-08-11
 
 ### Changed

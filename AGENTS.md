@@ -71,6 +71,15 @@ matching `target/release/`), then `<dir>/<toolchain>/lean-host-mcp-worker`.
 E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY` (defaults `lean_rs_fixture` /
 `LeanRsFixture`).
 
+When exercising a non-default toolchain locally (e2e, or a worker built by hand rather than via `install-worker`),
+export `LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---<id>` for the *whole* build-and-test invocation, the
+way CI does. The `lean-toolchain` crate's build script bakes the discovered toolchain's `lean.h` digest into every
+binary it is linked into — parent test binaries included — and the semantic-capability preflight compares that baked
+digest against the per-toolchain capability manifest. Building with only `LEAN_HOST_MCP_TARGET_TOOLCHAIN` set updates
+the worker's rpath but leaves the bindings (and the parent's baked digest) on whatever `lean --print-prefix` resolves
+to, so a worker built that way for a non-default toolchain fails bootstrap with
+`lean_rs.loader.unsupported_toolchain_fingerprint`.
+
 Running the server requires any Lake project whose requested imports have built `.olean` files. The 34 mandatory + 13
 optional `lean_rs_host_*` symbols come from the vendored shim Lake package inside `lean-rs-host`
 (`crates/lean-rs-host/shims/lean-rs-host-shims/`), which the host builds once per toolchain and loads without building
