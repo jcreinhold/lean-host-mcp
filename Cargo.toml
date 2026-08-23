@@ -17,14 +17,14 @@ version = "0.11.0"
 # here (members reference them via `.workspace = true`) removes per-crate drift;
 # `deny.toml` enforces the no-duplicate-version invariant across the full graph.
 [workspace.dependencies]
-lean-rs-worker-child = { version = "0.7", path = "../lean-rs/crates/lean-rs-worker-child" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
-lean-rs-worker-parent = { version = "0.7", path = "../lean-rs/crates/lean-rs-worker-parent" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
-lean-rs-worker-protocol = { version = "0.7", path = "../lean-rs/crates/lean-rs-worker-protocol" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
-lean-semantic-search-capability = { version = "0.7", path = "../lean-semantic-search/crates/capability" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
-lean-semantic-search-contract = { version = "0.7", path = "../lean-semantic-search/crates/contract" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
-lean-semantic-search-retrieval = { version = "0.7", path = "../lean-semantic-search/crates/retrieval" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
-lean-semantic-search-runtime = { version = "0.7", path = "../lean-semantic-search/crates/runtime" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
-lean-toolchain = { version = "0.7", path = "../lean-rs/crates/lean-toolchain" } # TODO(cpu_millis-path-deps): revert to crates.io once the lean-rs-worker-parent cpu_millis release lands
+lean-rs-worker-child = "0.8"
+lean-rs-worker-parent = "0.8"
+lean-rs-worker-protocol = "0.8"
+lean-semantic-search-capability = "0.7"
+lean-semantic-search-contract = "0.7"
+lean-semantic-search-retrieval = "0.7"
+lean-semantic-search-runtime = "0.7"
+lean-toolchain = "0.8"
 
 [workspace.lints.rust]
 future-incompatible = "warn"
