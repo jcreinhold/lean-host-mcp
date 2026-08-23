@@ -23,7 +23,9 @@ Every call is read-only. The server reads files, elaborates in memory, and never
 - `lean_lookup`: semantic discovery. Use it for declarations, declaration inventory, proof search, reference search, and
   changed-declaration coverage.
 - `lean_verify`: verification gates. Use it when a declaration or changed set must be checked with `sorry` policy and
-  optional axiom reporting.
+  optional axiom reporting. When the MCP request carries `_meta.progressToken`, the server emits a start notification, a
+  heartbeat every 15 seconds, and a completion notification on `notifications/progress`; clients that omit the token
+  keep the same single-response behavior.
 
 ## Response Shape
 

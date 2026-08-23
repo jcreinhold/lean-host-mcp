@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Added progress notifications for long `lean_verify` calls.** Requests carrying an MCP `_meta.progressToken` now
+  receive start, 15-second heartbeat, and completion events on `notifications/progress`; requests without a token and
+  the final verification response are unchanged.
+
 ## [0.11.0] - 2026-08-22
 
 ### Changed
@@ -17,15 +23,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `lean-semantic-search` 0.7 line is unchanged (already at lean-rs 0.7.3 / lean-semantic-search 0.7.2): lean-rs 0.7.3's
   `SUPPORTED_TOOLCHAINS` adds 4.33.1 (new `lean.h` digest backporting the 4.34.0-rc1 TSan instrumentation —
   byte-identical ABI probe) and 4.34.0-rc2 (new digest implementing the sticky-rc fix — no struct declaration changes,
-  byte-identical probe against rc1), so the supported window is `4.30.0 ..= 4.34.0-rc2`. The fixture pin, the worker
-  the server is built and tested against, and the head-toolchain literals in the test suite all move to v4.34.0-rc2.
-  The Rust floor is unchanged at 1.94.
-- **Upgraded rmcp from 1.8 to 3.1.4.** Tracks the MCP 2025-11-25 spec alignment: `Content` is renamed to
-  `ContentBlock`, version negotiation now runs through rmcp's `supported_protocol_versions()` (the explicit
-  `ProtocolVersion::LATEST` pin in `get_info` was dropped as redundant), and `CallToolResult` gained a `resultType`
-  field that rmcp omits for legacy sessions. Newer clients may now negotiate protocol 2025-11-25, under which the
-  Streamable HTTP transport enforces the `MCP-Protocol-Version` header. The Rust floor moved from 1.91 to 1.94 (which
-  also matches the lean-rs 0.7.3 floor).
+  byte-identical probe against rc1), so the supported window is `4.30.0 ..= 4.34.0-rc2`. The fixture pin, the worker the
+  server is built and tested against, and the head-toolchain literals in the test suite all move to v4.34.0-rc2. The
+  Rust floor is unchanged at 1.94.
+- **Upgraded rmcp from 1.8 to 3.1.4.** Tracks the MCP 2025-11-25 spec alignment: `Content` is renamed to `ContentBlock`,
+  version negotiation now runs through rmcp's `supported_protocol_versions()` (the explicit `ProtocolVersion::LATEST`
+  pin in `get_info` was dropped as redundant), and `CallToolResult` gained a `resultType` field that rmcp omits for
+  legacy sessions. Newer clients may now negotiate protocol 2025-11-25, under which the Streamable HTTP transport
+  enforces the `MCP-Protocol-Version` header. The Rust floor moved from 1.91 to 1.94 (which also matches the lean-rs
+  0.7.3 floor).
 
 ## [0.10.0] - 2026-08-11
 
@@ -43,10 +49,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **The e2e suite raced itself under the default parallel test runner.** The two rebuild tests move the fixture's
   `Handles.olean` mtime forward to stand in for `lake build`, while the two residue-budget tests assert across
-  multi-second sleeps that the worker serving that same import never recycles — one test's bump landed inside
-  another's stability window and both failed with `artifacts_rebuilt` recycles that neither caused. The four tests
-  now share a `serial_test` key (`handles_olean`) that confines the exclusion to exactly them; the rest of the
-  suite still runs in parallel.
+  multi-second sleeps that the worker serving that same import never recycles — one test's bump landed inside another's
+  stability window and both failed with `artifacts_rebuilt` recycles that neither caused. The four tests now share a
+  `serial_test` key (`handles_olean`) that confines the exclusion to exactly them; the rest of the suite still runs in
+  parallel.
 
 ## [0.9.0] - 2026-08-04
 
@@ -105,10 +111,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - **The supported Lean window floor is now 4.30.0; workers for 4.27.0–4.29.1 are unservable.** lean-rs 0.6.1 dropped
-  those toolchains: their `libleanshared` does not export the `collectAxioms` symbol the mandatory host shim
-  references, so the window claimed support the runtime never had. A project pinned to a dropped toolchain is now
-  rejected at open with the out-of-window verdict, and `install-worker --prune` removes workers already installed for
-  one. Pulled in through the existing `"0.6"` lean-rs requirements; no API change.
+  those toolchains: their `libleanshared` does not export the `collectAxioms` symbol the mandatory host shim references,
+  so the window claimed support the runtime never had. A project pinned to a dropped toolchain is now rejected at open
+  with the out-of-window verdict, and `install-worker --prune` removes workers already installed for one. Pulled in
+  through the existing `"0.6"` lean-rs requirements; no API change.
 - **`scripts/memory_stability.py` reports import residue, the quantity the recycle policy actually reads.** It reported
   RSS only, which is an observation and not a policy input, so the harness could not show whether a long-lived server
   was approaching a recycle. New `peak_import_residue_mib` / `final_import_residue_mib` / `import_residue_budget_mib`

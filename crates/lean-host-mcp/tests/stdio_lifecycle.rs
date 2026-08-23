@@ -90,6 +90,55 @@ async fn stdio_shutdown_after_tool_call_exits_worker_child() {
     }
 }
 
+#[tokio::test]
+async fn stdio_lean_verify_reports_progress() {
+    let registry = tempfile::tempdir().expect("temp registry");
+    let mut server = StdioServer::start(&fixture_root(), registry.path());
+    server.initialize().await;
+
+    let (response, notifications) = server
+        .request_with_notifications(
+            "tools/call",
+            json!({
+                "name": "lean_verify",
+                "arguments": {
+                    "targets": [{
+                        "kind": "bogus_group",
+                        "file": "LeanRsFixture/ProofActions.lean"
+                    }]
+                },
+                "_meta": { "progressToken": "verify-progress" }
+            }),
+        )
+        .await;
+
+    assert!(response.get("error").is_none(), "MCP request failed: {response:?}");
+    let progress = notifications
+        .iter()
+        .filter(|message| message.get("method").and_then(Value::as_str) == Some("notifications/progress"))
+        .collect::<Vec<_>>();
+    assert_eq!(progress.len(), 2, "expected start and finish progress: {progress:?}");
+    let [start, finish] = progress.as_slice() else {
+        panic!("expected exactly two progress notifications: {progress:?}");
+    };
+    assert!(progress.iter().all(|message| {
+        message.pointer("/params/progressToken").and_then(Value::as_str) == Some("verify-progress")
+    }));
+    assert_eq!(
+        start.pointer("/params/message").and_then(Value::as_str),
+        Some("Preparing Lean declaration verification")
+    );
+    assert!(
+        finish
+            .pointer("/params/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.starts_with("Lean declaration verification finished")),
+        "finish notification should name the completed operation: {finish:?}"
+    );
+
+    server.close_stdin_and_wait().await;
+}
+
 struct StdioServer {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -152,6 +201,10 @@ impl StdioServer {
     }
 
     async fn request_allow_error(&mut self, method: &str, params: Value) -> Value {
+        self.request_with_notifications(method, params).await.0
+    }
+
+    async fn request_with_notifications(&mut self, method: &str, params: Value) -> (Value, Vec<Value>) {
         let id = self.next_id;
         self.next_id = self.next_id.checked_add(1).expect("request id overflow");
         let message = json!({
@@ -161,11 +214,13 @@ impl StdioServer {
             "params": params
         });
         self.write_message(&message).await;
+        let mut notifications = Vec::new();
         loop {
             let response = self.read_response().await;
             if response.get("id").and_then(Value::as_u64) == Some(id) {
-                return response;
+                return (response, notifications);
             }
+            notifications.push(response);
         }
     }
 

@@ -9,16 +9,84 @@
 //! schema validators), so we drop it and place the serialized envelope per the
 //! configured [`ResponseCarrier`].
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::broker::ProjectBroker;
 use crate::error::ServerError;
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
+
+const VERIFY_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
+
+async fn with_verify_progress<T>(context: &RequestContext<RoleServer>, operation: impl Future<Output = T>) -> T {
+    let Some(progress_token) = context.meta.get_progress_token() else {
+        return operation.await;
+    };
+
+    let peer = context.peer.clone();
+    let started = Instant::now();
+    let mut progress = 0.0;
+    if let Err(error) = peer
+        .notify_progress(
+            ProgressNotificationParam::new(progress_token.clone(), progress)
+                .with_message("Preparing Lean declaration verification"),
+        )
+        .await
+    {
+        tracing::debug!(?error, "could not send lean_verify start progress");
+    }
+
+    tokio::pin!(operation);
+    let mut ticker = tokio::time::interval(VERIFY_PROGRESS_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            result = &mut operation => {
+                progress += 1.0;
+                let elapsed = started.elapsed().as_secs_f64();
+                if let Err(error) = peer
+                    .notify_progress(
+                        ProgressNotificationParam::new(progress_token, progress)
+                            .with_total(progress)
+                            .with_message(format!(
+                                "Lean declaration verification finished ({elapsed:.1}s elapsed)"
+                            )),
+                    )
+                    .await
+                {
+                    tracing::debug!(?error, "could not send lean_verify finish progress");
+                }
+                return result;
+            }
+            _ = ticker.tick() => {
+                progress += 1.0;
+                let elapsed = started.elapsed().as_secs();
+                if let Err(error) = peer
+                    .notify_progress(
+                        ProgressNotificationParam::new(progress_token.clone(), progress)
+                            .with_message(format!(
+                                "Lean declaration verification still running ({elapsed}s elapsed)"
+                            )),
+                    )
+                    .await
+                {
+                    tracing::debug!(?error, "could not send lean_verify heartbeat progress");
+                }
+            }
+        }
+    }
+}
 
 // Deliberately not `use crate::error::Result;` here: the `#[tool_handler]`
 // macro emits bare `Result<...>` references that must resolve to the std
@@ -69,9 +137,16 @@ impl LeanHostService {
     async fn lean_verify(
         &self,
         Parameters(req): Parameters<tools::proof_action::LeanVerifyToolRequest>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_verify", "tool call");
-        self.respond_semantic(tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await)
+        self.respond_semantic(
+            Box::pin(with_verify_progress(
+                &context,
+                tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()),
+            ))
+            .await,
+        )
     }
 
     #[tool(

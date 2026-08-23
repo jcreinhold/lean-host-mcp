@@ -215,7 +215,9 @@ operation modules:
   explicit imports or after a current file source snapshot. Info messages become rendered output; warnings and errors
   stay in diagnostics.
 - `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, module-wide, or changed
-  declaration target groups under the requested sorry/axiom policy. Policy failures are normal results.
+  declaration target groups under the requested sorry/axiom policy. Policy failures are normal results. Its MCP handler
+  wraps the operation with token-gated progress notifications, including 15-second heartbeats, so transport visibility
+  remains observational and does not enter the verification or worker layers.
 - `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
   project declarations can resolve. Rendered fields are capped before crossing the worker boundary.
 - `lean_lookup(kind = "declarations")` lists declarations for a file or module. Source files use the edit-fresh worker
