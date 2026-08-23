@@ -9,11 +9,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-23
+
 ### Added
 
 - **Added progress notifications for long `lean_verify` calls.** Requests carrying an MCP `_meta.progressToken` now
   receive start, 15-second heartbeat, and completion events on `notifications/progress`; requests without a token and
   the final verification response are unchanged.
+- **Added per-call worker timing to every tool response.** The telemetry `runtime` block gains `call_elapsed_millis`
+  (worker-call wallclock, queue wait excluded, including any recycle and retries the call triggered) alongside the
+  existing `queue_wait_millis`, and `call_cpu_millis` (the worker child process's own CPU delta around the call,
+  contention-immune, generation-guarded so a mid-call recycle reports `null` rather than a bogus figure). CPU sampling
+  comes from `lean-rs-worker-parent` 0.8's `cumulative_cpu_millis`: Linux reads `/proc/<pid>/stat`, macOS uses
+  `proc_pidinfo` scaled by `mach_timebase_info`.
+- **Added a slow-elaboration warning.** When `call_cpu_millis` exceeds `output.slow_call_warning_millis` (default
+  10000 ms, env `LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS`), every tool response carries a warning issue naming
+  the CPU figure and recommending refactoring — split the declaration, add explicit type annotations to cut typeclass
+  search, or extract intermediate lemmas. Keying on CPU rather than wallclock keeps machine contention from triggering
+  it; when wallclock is more than twice the CPU figure the warning attributes the wait to contention instead. The
+  warning is emitted in the response funnel, so it survives the default `telemetry.verbosity = quiet` drop.
+
+### Changed
+
+- **The lean-rs dependency line advances to 0.8** (`lean-rs-worker-parent` / `-child` / `-protocol` / `lean-toolchain`
+  0.8.0, `lean-semantic-search` 0.7.3). The supported Lean window is unchanged: `4.30.0 ..= 4.34.0-rc2`.
 
 ## [0.11.0] - 2026-08-22
 
@@ -520,7 +539,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.9.0...v0.9.1

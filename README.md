@@ -190,8 +190,8 @@ Two proof-agent details are worth calling out:
 
 ## Versions
 
-`lean-host-mcp` 0.11.0 builds on `lean-rs-worker-parent` / `-child` 0.7, which transitively pin `lean-rs` /
-`lean-rs-host` 0.7 (0.7.3). It supports the Lean window `4.30.0 ..= 4.34.0-rc2` and is built and tested against the head of that
+`lean-host-mcp` 0.12.0 builds on `lean-rs-worker-parent` / `-child` 0.8, which transitively pin `lean-rs` /
+`lean-rs-host` 0.8 (0.8.0). It supports the Lean window `4.30.0 ..= 4.34.0-rc2` and is built and tested against the head of that
 window, Lean **4.34.0-rc2**.
 
 A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long
