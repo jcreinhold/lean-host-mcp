@@ -105,11 +105,29 @@ pub struct OutputBudgetOverrides {
 ///
 /// They decide where the envelope rides, how much telemetry it carries, and the
 /// output byte/heartbeat budgets that were once per-call request arguments.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ToolConfig {
     pub carrier: ResponseCarrier,
     pub verbosity: TelemetryVerbosity,
     pub output: OutputBudgetOverrides,
+    /// Worker-call CPU milliseconds above which every response carries a
+    /// slow-call refactoring warning. Default
+    /// [`DEFAULT_SLOW_CALL_WARNING_MILLIS`].
+    pub slow_call_warning_millis: u64,
+}
+
+/// Default [`ToolConfig::slow_call_warning_millis`]: ten seconds of worker CPU.
+pub const DEFAULT_SLOW_CALL_WARNING_MILLIS: u64 = 10_000;
+
+impl Default for ToolConfig {
+    fn default() -> Self {
+        Self {
+            carrier: ResponseCarrier::default(),
+            verbosity: TelemetryVerbosity::default(),
+            output: OutputBudgetOverrides::default(),
+            slow_call_warning_millis: DEFAULT_SLOW_CALL_WARNING_MILLIS,
+        }
+    }
 }
 
 /// Shared state every tool handler reads.

@@ -93,6 +93,7 @@ pub struct OutputFileConfig {
     pub max_field_bytes: Option<u32>,
     pub max_total_bytes: Option<u32>,
     pub heartbeat_limit: Option<u64>,
+    pub slow_call_warning_millis: Option<u64>,
 }
 
 impl ConfigFile {

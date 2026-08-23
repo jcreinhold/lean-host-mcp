@@ -182,6 +182,14 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         overrides: "LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT",
         description: "Default elaboration heartbeat budget for lean_trial proof_step and lean_verify target groups. Unset uses the worker default. Bounds runaway tactics.",
     },
+    FieldDoc {
+        key: "output.slow_call_warning_millis",
+        ty: "integer (ms)",
+        value: "10000",
+        commented: false,
+        overrides: "LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS",
+        description: "Worker-call CPU time above which every tool response carries a warning naming the elapsed milliseconds and recommending refactoring (splitting the declaration, explicit type annotations, extracted lemmas). Keys on call_cpu_millis, not wallclock, so machine contention never triggers it. Default 10 s.",
+    },
 ];
 
 /// Split a dotted key into `(table, leaf)`. A top-level key (no `.`) returns an
@@ -353,6 +361,10 @@ mod tests {
 
         assert_eq!(config.broker.max_projects, Some(broker::DEFAULT_MAX_PROJECTS));
         assert_eq!(config.broker.idle_timeout_secs, Some(broker::DEFAULT_IDLE_TIMEOUT_SECS));
+        assert_eq!(
+            config.output.slow_call_warning_millis,
+            Some(crate::tools::DEFAULT_SLOW_CALL_WARNING_MILLIS)
+        );
     }
 
     /// Reduce a Markdown table to a grid of trimmed cells, normalising the

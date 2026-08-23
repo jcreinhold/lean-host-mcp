@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use crate::broker::{BrokerConfigSnapshot, ProjectHint};
 use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure, Telemetry};
 use crate::error::{Result, ServerError, WorkerUnavailable};
-use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolContext};
+use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolConfig, ToolContext};
 use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus, dedupe_artifacts};
 
 use super::changed_coverage::{self, ChangedCoverageRequest};
@@ -612,7 +612,7 @@ pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(position::proof_state(ctx, request).await?, ctx.config.verbosity)
+            from_tool_response(position::proof_state(ctx, request).await?, ctx.config)
         }
         Some(kind) => Ok(invalid_kind("lean_context", kind, &["proof_position"])),
         None => Ok(missing_kind("lean_context", &["proof_position"])),
@@ -632,14 +632,14 @@ pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<S
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(proof_action::try_proof_step(ctx, request).await?, ctx.config.verbosity)
+            from_tool_response(proof_action::try_proof_step(ctx, request).await?, ctx.config)
         }
         Some("command") => {
             let request = match decode::<CommandTrialRequest>(req, semantic_example("lean_trial", "command")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(position::command_trial(ctx, request).await?, ctx.config.verbosity)
+            from_tool_response(position::command_trial(ctx, request).await?, ctx.config)
         }
         Some(kind) => Ok(invalid_kind("lean_trial", kind, &["proof_step", "command"])),
         None => Ok(missing_kind("lean_trial", &["proof_step", "command"])),
@@ -701,7 +701,7 @@ pub async fn lean_verify_raw(ctx: &ToolContext, value: Value) -> Result<Semantic
 /// Returns infrastructure failures only; per-declaration Lean failures remain
 /// structured semantic data.
 pub async fn lean_verify_targets(ctx: &ToolContext, request: LeanVerifyRequest) -> Result<SemanticResponse<Value>> {
-    from_tool_response(proof_action::verify_targets(ctx, request).await?, ctx.config.verbosity)
+    from_tool_response(proof_action::verify_targets(ctx, request).await?, ctx.config)
 }
 
 /// Semantic lookup and discovery.
@@ -721,10 +721,7 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(
-                declaration::inspect_declaration(ctx, request).await?,
-                ctx.config.verbosity,
-            )
+            from_tool_response(declaration::inspect_declaration(ctx, request).await?, ctx.config)
         }
         Some("declarations") => {
             let request =
@@ -734,7 +731,7 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 };
             from_tool_response(
                 declaration_inventory::declaration_inventory(ctx, request).await?,
-                ctx.config.verbosity,
+                ctx.config,
             )
         }
         Some("changed_coverage") => {
@@ -743,27 +740,21 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                     Ok(request) => request,
                     Err(response) => return Ok(*response),
                 };
-            from_tool_response(
-                changed_coverage::changed_coverage(ctx, request).await?,
-                ctx.config.verbosity,
-            )
+            from_tool_response(changed_coverage::changed_coverage(ctx, request).await?, ctx.config)
         }
         Some("proof_search") => {
             let request = match decode::<SearchForProofRequest>(req, semantic_example("lean_lookup", "proof_search")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(
-                proof_search::search_for_proof(ctx, request).await?,
-                ctx.config.verbosity,
-            )
+            from_tool_response(proof_search::search_for_proof(ctx, request).await?, ctx.config)
         }
         Some("references") => {
             let request = match decode::<FindReferencesRequest>(req, semantic_example("lean_lookup", "references")) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(position::find_references(ctx, request).await?, ctx.config.verbosity)
+            from_tool_response(position::find_references(ctx, request).await?, ctx.config)
         }
         Some(kind) => Ok(invalid_kind(
             "lean_lookup",
@@ -855,7 +846,7 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                     Ok(request) => request,
                     Err(response) => return Ok(*response),
                 };
-            from_tool_response(position::file_diagnostics(ctx, request).await?, ctx.config.verbosity)
+            from_tool_response(position::file_diagnostics(ctx, request).await?, ctx.config)
         }
         other => Ok(invalid_kind("lean_status", other, &["project", "file_diagnostics"])),
     }
@@ -886,12 +877,51 @@ pub(crate) fn from_incompatible_worker(message: &str, recovery_command: &str) ->
     }
 }
 
-fn from_tool_response<T>(mut response: Response<T>, verbosity: TelemetryVerbosity) -> Result<SemanticResponse<Value>>
+/// The wallclock/CPU ratio at or above which a slow call is attributed to
+/// machine contention rather than elaboration cost, and the warning says so
+/// instead of recommending a refactor.
+const CONTENTION_WALLCLOCK_CPU_RATIO: u64 = 2;
+
+/// The per-call slow-elaboration warning, keyed on worker CPU so machine
+/// contention can never trigger it. Wallclock rides along as context: a large
+/// wallclock/CPU gap means the call was starved, not expensive, and says so
+/// instead of recommending a refactor.
+fn slow_call_warning(runtime: Option<&crate::envelope::RuntimeFacts>, threshold_millis: u64) -> Option<String> {
+    let runtime = runtime?;
+    let cpu_millis = runtime.call_cpu_millis?;
+    if cpu_millis <= threshold_millis {
+        return None;
+    }
+    let contention = if runtime.call_elapsed_millis >= cpu_millis.saturating_mul(CONTENTION_WALLCLOCK_CPU_RATIO) {
+        format!(
+            " Wallclock was {} ms — over twice the CPU time, so machine contention (not elaboration cost) is the larger factor here.",
+            runtime.call_elapsed_millis
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "This call consumed {cpu_millis} ms of worker CPU (slow-call threshold {threshold_millis} ms, tune via output.slow_call_warning_millis). \
+         Declarations this expensive to elaborate usually benefit from refactoring: split the declaration, add explicit type annotations to cut \
+         typeclass search, or extract intermediate lemmas.{contention}"
+    ))
+}
+
+fn from_tool_response<T>(mut response: Response<T>, config: ToolConfig) -> Result<SemanticResponse<Value>>
 where
     T: Serialize + JsonSchema,
 {
     response.drain_advisories();
-    if !verbosity.is_full() {
+    if let Some(warning) = slow_call_warning(
+        response
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.runtime.as_ref()),
+        config.slow_call_warning_millis,
+    ) {
+        response.warnings.push(warning);
+    }
+    if !config.verbosity.is_full() {
         response.drop_telemetry();
     }
     let data = response
@@ -1065,7 +1095,7 @@ fn telemetry_verbosity_name(verbosity: TelemetryVerbosity) -> &'static str {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::broker::{BrokerConfig, ProjectBroker};
@@ -1094,6 +1124,59 @@ mod tests {
     }
 
     #[test]
+    fn slow_call_warning_keys_on_cpu_and_rides_quiet_responses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let runtime = |cpu: Option<u64>, wall: u64| RuntimeFacts {
+            call_elapsed_millis: wall,
+            call_cpu_millis: cpu,
+            ..RuntimeFacts::default()
+        };
+        let config = ToolConfig::default();
+        let build =
+            |runtime: RuntimeFacts| Response::ok(json!({"probe": true}), freshness(&root)).with_runtime(runtime);
+
+        // Under threshold: no warning.
+        let response = from_tool_response(build(runtime(Some(9_000), 9_500)), config).unwrap();
+        assert!(
+            response
+                .errors
+                .iter()
+                .all(|issue| !issue.message.contains("worker CPU"))
+        );
+
+        // Over threshold CPU: warning survives the quiet telemetry drop and
+        // names the CPU figure plus the tuning knob.
+        let response = from_tool_response(build(runtime(Some(12_345), 13_000)), config).unwrap();
+        let warning = response
+            .errors
+            .iter()
+            .find(|issue| issue.message.contains("worker CPU"))
+            .unwrap_or_else(|| panic!("slow-call warning must be present at quiet verbosity"));
+        assert!(warning.message.contains("12345 ms"));
+        assert!(warning.message.contains("output.slow_call_warning_millis"));
+        assert!(!warning.message.contains("contention"));
+
+        // Wallclock ≫ CPU: the warning says contention, not refactor.
+        let response = from_tool_response(build(runtime(Some(12_345), 30_000)), config).unwrap();
+        let warning = response
+            .errors
+            .iter()
+            .find(|issue| issue.message.contains("worker CPU"))
+            .unwrap_or_else(|| panic!("slow-call warning must be present"));
+        assert!(warning.message.contains("contention"));
+
+        // No CPU sample (platform unsupported or mid-call recycle): silent.
+        let response = from_tool_response(build(runtime(None, 60_000)), config).unwrap();
+        assert!(
+            response
+                .errors
+                .iter()
+                .all(|issue| !issue.message.contains("worker CPU"))
+        );
+    }
+
+    #[test]
     fn telemetry_verbosity_full_is_what_puts_the_runtime_block_on_the_wire() {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
@@ -1103,13 +1186,27 @@ mod tests {
         };
         let build = || Response::ok(json!({"probe": true}), freshness(&root)).with_runtime(runtime.clone());
 
-        let quiet = from_tool_response(build(), TelemetryVerbosity::Quiet).unwrap();
+        let quiet = from_tool_response(
+            build(),
+            ToolConfig {
+                verbosity: TelemetryVerbosity::Quiet,
+                ..ToolConfig::default()
+            },
+        )
+        .unwrap();
         assert!(
             quiet.telemetry.is_none(),
             "the default verbosity must not ship operational telemetry to the model"
         );
 
-        let full = from_tool_response(build(), TelemetryVerbosity::Full).unwrap();
+        let full = from_tool_response(
+            build(),
+            ToolConfig {
+                verbosity: TelemetryVerbosity::Full,
+                ..ToolConfig::default()
+            },
+        )
+        .unwrap();
         let telemetry = full.telemetry.unwrap();
         assert_eq!(
             telemetry.runtime.map(|facts| facts.worker_generation),
@@ -1121,9 +1218,29 @@ mod tests {
         // Serialization, not just the struct: the field is `skip_serializing_if
         // = "Option::is_none"`, so a quiet response must have no `telemetry`
         // key at all rather than an explicit null.
-        let quiet_json = serde_json::to_value(from_tool_response(build(), TelemetryVerbosity::Quiet).unwrap()).unwrap();
+        let quiet_json = serde_json::to_value(
+            from_tool_response(
+                build(),
+                ToolConfig {
+                    verbosity: TelemetryVerbosity::Quiet,
+                    ..ToolConfig::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(quiet_json.get("telemetry").is_none(), "quiet: {quiet_json}");
-        let full_json = serde_json::to_value(from_tool_response(build(), TelemetryVerbosity::Full).unwrap()).unwrap();
+        let full_json = serde_json::to_value(
+            from_tool_response(
+                build(),
+                ToolConfig {
+                    verbosity: TelemetryVerbosity::Full,
+                    ..ToolConfig::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(
             full_json.pointer("/telemetry/runtime/worker_generation").is_some(),
             "full: {full_json}"
@@ -1180,7 +1297,14 @@ mod tests {
         let response = Response::ok(serde_json::json!({"status": "ok"}), freshness(tmp.path()))
             .with_trust_artifact(ArtifactTrust::ilean_project_missing_build());
 
-        let semantic = from_tool_response(response, TelemetryVerbosity::Quiet).unwrap();
+        let semantic = from_tool_response(
+            response,
+            ToolConfig {
+                verbosity: TelemetryVerbosity::Quiet,
+                ..ToolConfig::default()
+            },
+        )
+        .unwrap();
         let json = serde_json::to_value(&semantic).unwrap();
 
         assert!(json.get("telemetry").is_none());

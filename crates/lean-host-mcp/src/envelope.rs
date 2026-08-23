@@ -113,7 +113,21 @@ pub struct RuntimeFacts {
     pub worker_generation: u64,
     pub worker_restarted: bool,
     pub retry_count: u32,
+    /// Milliseconds the call spent queued on the project actor before the
+    /// worker started it.
     pub queue_wait_millis: u64,
+    /// Wallclock milliseconds of the worker call itself, queue wait excluded.
+    /// Includes any recycle/re-import the call triggered and any retries, so it
+    /// is the full worker-side cost the caller paid for this call.
+    pub call_elapsed_millis: u64,
+    /// Worker-child CPU milliseconds (user + system) consumed by this call, a
+    /// delta around the job. Contention-immune, unlike `call_elapsed_millis`;
+    /// `None` when the platform provided no usable sample (or the child was
+    /// recycled mid-call, invalidating the baseline). Sampling granularity is
+    /// 10 ms on Linux and nanosecond-precise on macOS; other Unix falls back to
+    /// one-second `ps` sampling, where sub-second calls may read as 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_cpu_millis: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_restart: Option<RuntimeRestartEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -341,6 +355,8 @@ mod tests {
             worker_restarted: false,
             retry_count: 0,
             queue_wait_millis: 0,
+            call_elapsed_millis: 0,
+            call_cpu_millis: None,
             call_restart: None,
             last_restart: Some(RuntimeRestartEvent {
                 cause: "rss_post_job".to_owned(),

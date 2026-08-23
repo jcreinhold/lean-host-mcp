@@ -314,10 +314,14 @@ fn resolve_tool_config(file: &ConfigFile) -> anyhow::Result<ToolConfig> {
         max_total_bytes: tool_env_int("LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES")?.or(file.output.max_total_bytes),
         heartbeat_limit: tool_env_int("LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT")?.or(file.output.heartbeat_limit),
     };
+    let slow_call_warning_millis = tool_env_int::<u64>("LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS")?
+        .or(file.output.slow_call_warning_millis)
+        .unwrap_or(lean_host_mcp::tools::DEFAULT_SLOW_CALL_WARNING_MILLIS);
     Ok(ToolConfig {
         carrier,
         verbosity,
         output,
+        slow_call_warning_millis,
     })
 }
 

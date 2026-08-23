@@ -69,6 +69,19 @@ is not an MCP transport error. Infrastructure failures that the client can retry
 restart-loop exhaustion, appear in `errors` with structured details. Warnings and next actions from the underlying
 implementation are also carried as warning issues in `errors`.
 
+### Call timing and the slow-call warning
+
+Every call's telemetry `runtime` block carries three timing facts: `queue_wait_millis` (admission delay before the
+worker started the call), `call_elapsed_millis` (worker-call wallclock, queue wait excluded, including any recycle and
+retries the call triggered), and `call_cpu_millis` (the worker child process's own CPU delta around the call — sampled
+at 10 ms granularity on Linux, nanosecond precision on macOS — omitted
+when the platform cannot sample it or a mid-call recycle invalidated the baseline). Under the default
+`telemetry.verbosity = quiet` the telemetry block is dropped, but the actionable signal is not: when
+`call_cpu_millis` exceeds `output.slow_call_warning_millis` (default 10000), the response carries a warning issue
+naming the CPU figure and recommending refactoring (split the declaration, add explicit type annotations, extract
+intermediate lemmas). Keying on CPU rather than wallclock keeps machine contention from ever triggering it; when
+wallclock is more than twice the CPU figure the warning says so instead.
+
 Omission convention: completeness flags named `*_truncated` (plus `RenderedText.truncated`, `partial`, and advisory
 containers such as `post_closure_diagnostics`, `entry_goals`, and `locals`) are omitted from the JSON when they carry
 their empty/default value (`false` or empty); an absent flag means complete/untruncated. The examples below show

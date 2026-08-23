@@ -596,6 +596,31 @@ impl Drop for ActiveJobGuard {
     }
 }
 
+/// How a `run_job` retry loop ended. Carrying this out of the loop keeps the
+/// loop's arms to control flow only — the caller computes timing and restart
+/// facts at one finalization point instead of at every exit.
+enum JobExit<R> {
+    /// The job produced a value.
+    Done(R),
+    /// The worker could not produce a value; the fields are the arguments
+    /// [`ProjectActorState::worker_unavailable_for`] needs.
+    Unavailable {
+        reason: String,
+        retryable: bool,
+        worker_restarted: bool,
+        cause: Option<RestartCause>,
+        limit_kib: Option<u64>,
+    },
+}
+
+/// A worker-child CPU sample pinned to the child generation it came from, so a
+/// mid-call recycle (new child, counter reset to zero) yields `None` from
+/// [`ProjectActorState::cpu_delta_since`] instead of a bogus delta.
+struct CpuSampleBaseline {
+    worker_generation: u64,
+    cpu_millis: u64,
+}
+
 struct JobMeta {
     imports: Vec<String>,
     import_fingerprint: String,
@@ -885,6 +910,8 @@ impl RuntimeSnapshot {
             worker_restarted: false,
             retry_count: 0,
             queue_wait_millis: 0,
+            call_elapsed_millis: 0,
+            call_cpu_millis: None,
             call_restart: None,
             last_restart: self.last_restart.clone(),
             rss_kib: self.rss_kib,
@@ -1636,12 +1663,18 @@ impl ProjectActorState {
         let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
         let generation_before = self.observed_generation();
         self.note_import_profile_switch(&meta);
+        let job_started = Instant::now();
+        let cpu_baseline = self.cpu_baseline();
         let mut call_restart: Option<RuntimeRestartEvent> = self.cycle_if_imports_rebuilt(&meta)?;
         let mut lifecycle_baseline = self.handle.lifecycle_snapshot();
 
         let max_retries = meta.retry_policy.retries();
         let mut retry_count = 0_u32;
-        loop {
+        // The loop owns only control flow: run, classify, maybe retry. Every
+        // exit funnels into the single finalization below, which is the one
+        // place timing/restart facts are computed — threading them through six
+        // exits complects measurement with the retry state machine.
+        let exit = loop {
             match job(&mut self.handle, meta.imports.clone()) {
                 Ok(value) => {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
@@ -1650,16 +1683,7 @@ impl ProjectActorState {
                     // Sampled for `RuntimeFacts.rss_kib`, which is reporting
                     // only: no threshold reads it, and nothing restarts on it.
                     self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
-                    let runtime =
-                        self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
-                    tracing::debug!(
-                        retry_count,
-                        rss_kib = ?runtime.rss_kib,
-                        worker_generation = runtime.worker_generation,
-                        "job complete"
-                    );
-                    self.publish_runtime(&runtime);
-                    return Ok(ProjectCall::new(value, runtime));
+                    break JobExit::Done(value);
                 }
                 Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
@@ -1673,20 +1697,13 @@ impl ProjectActorState {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
                     }
-                    let reason = format!("worker_died_after_retry: {err}");
-                    let generation = self.observed_generation();
-                    let runtime =
-                        self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
-                    self.publish_runtime(&runtime);
-                    return Err(self.worker_unavailable_for(
-                        &meta,
-                        reason,
-                        true,
-                        generation > generation_before,
-                        Some(worker_death_cause(&err)),
-                        None,
-                        None,
-                    ));
+                    break JobExit::Unavailable {
+                        reason: format!("worker_died_after_retry: {err}"),
+                        retryable: true,
+                        worker_restarted: self.observed_generation() > generation_before,
+                        cause: Some(worker_death_cause(&err)),
+                        limit_kib: None,
+                    };
                 }
                 Err(err) if worker_error_is_session_missing(&err) && retry_count < max_retries => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
@@ -1702,19 +1719,13 @@ impl ProjectActorState {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
                     }
-                    let generation = self.observed_generation();
-                    let runtime =
-                        self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
-                    self.publish_runtime(&runtime);
-                    return Err(self.worker_unavailable_for(
-                        &meta,
-                        format!("session_missing: {err}"),
-                        true,
-                        generation > generation_before,
-                        Some(RestartCause::SessionMissing),
-                        None,
-                        None,
-                    ));
+                    break JobExit::Unavailable {
+                        reason: format!("session_missing: {err}"),
+                        retryable: true,
+                        worker_restarted: self.observed_generation() > generation_before,
+                        cause: Some(RestartCause::SessionMissing),
+                        limit_kib: None,
+                    };
                 }
                 Err(LeanWorkerError::RssHardLimitExceeded {
                     operation,
@@ -1725,44 +1736,66 @@ impl ProjectActorState {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
                     }
-                    let runtime =
-                        self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
-                    self.publish_runtime(&runtime);
-                    return Err(self.worker_unavailable_for(
-                        &meta,
-                        format!(
+                    break JobExit::Unavailable {
+                        reason: format!(
                             "rss_hard_limit_exceeded operation={operation} current_kib={current_kib} limit_kib={limit_kib}"
                         ),
-                        false,
-                        true,
-                        Some(RestartCause::RssHardLimit),
-                        Some(limit_kib),
-                        None,
-                    ));
+                        retryable: false,
+                        worker_restarted: true,
+                        cause: Some(RestartCause::RssHardLimit),
+                        limit_kib: Some(limit_kib),
+                    };
                 }
                 Err(err) if matches!(err, LeanWorkerError::Timeout { .. }) => {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
                     }
-                    let generation = self.observed_generation();
-                    let runtime =
-                        self.runtime_facts(&meta, generation_before, retry_count, queue_wait_millis, call_restart);
-                    self.publish_runtime(&runtime);
-                    return Err(self.worker_unavailable_for(
-                        &meta,
-                        format!("timeout: {err}"),
-                        true,
-                        generation > generation_before,
-                        Some(RestartCause::Timeout),
-                        None,
-                        None,
-                    ));
+                    break JobExit::Unavailable {
+                        reason: format!("timeout: {err}"),
+                        retryable: true,
+                        worker_restarted: self.observed_generation() > generation_before,
+                        cause: Some(RestartCause::Timeout),
+                        limit_kib: None,
+                    };
                 }
                 Err(err) => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     return Err(map_worker_err(err));
                 }
             }
+        };
+
+        // The one finalization point: elapsed/CPU are sampled after the loop,
+        // and the facts are built and published exactly once per call.
+        let call_elapsed_millis = millis_u64(job_started.elapsed());
+        let call_cpu_millis = self.cpu_delta_since(cpu_baseline);
+        let runtime = self.runtime_facts(
+            &meta,
+            generation_before,
+            retry_count,
+            queue_wait_millis,
+            call_elapsed_millis,
+            call_cpu_millis,
+            call_restart,
+        );
+        self.publish_runtime(&runtime);
+        match exit {
+            JobExit::Done(value) => {
+                tracing::debug!(
+                    retry_count,
+                    rss_kib = ?runtime.rss_kib,
+                    worker_generation = runtime.worker_generation,
+                    "job complete"
+                );
+                Ok(ProjectCall::new(value, runtime))
+            }
+            JobExit::Unavailable {
+                reason,
+                retryable,
+                worker_restarted,
+                cause,
+                limit_kib,
+            } => Err(self.worker_unavailable_for(&meta, reason, retryable, worker_restarted, cause, limit_kib, None)),
         }
     }
 
@@ -1780,14 +1813,28 @@ impl ProjectActorState {
         .entered();
         let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
         let generation_before = self.observed_generation();
+        let job_started = Instant::now();
         let mut capability = self.open_semantic_capability(&meta)?;
+        // The semantic search runs in this separate capability child, so the
+        // CPU delta samples it rather than the main worker handle.
+        let cpu_baseline = capability.cumulative_cpu_millis();
         let result = {
             let mut session = capability
                 .open_session_with_imports(meta.imports.clone(), None, None)
                 .map_err(map_worker_err)?;
             crate::semantic_search::run_semantic_proof_search(&mut session, request)
         };
-        let runtime = self.runtime_facts(&meta, generation_before, 0, queue_wait_millis, None);
+        let call_cpu_millis =
+            cpu_baseline.and_then(|start| capability.cumulative_cpu_millis().map(|end| end.saturating_sub(start)));
+        let runtime = self.runtime_facts(
+            &meta,
+            generation_before,
+            0,
+            queue_wait_millis,
+            millis_u64(job_started.elapsed()),
+            call_cpu_millis,
+            None,
+        );
         self.publish_runtime(&runtime);
         result.map(|value| ProjectCall::new(value, runtime))
     }
@@ -2059,6 +2106,8 @@ impl ProjectActorState {
             worker_restarted: true,
             retry_count: 0,
             queue_wait_millis: 0,
+            call_elapsed_millis: 0,
+            call_cpu_millis: None,
             call_restart: None,
             last_restart: Some(event),
             rss_kib: self.last_rss_kib,
@@ -2182,6 +2231,31 @@ impl ProjectActorState {
         self.last_restart = Some(event);
     }
 
+    /// CPU milliseconds the current child has consumed since `baseline`, which
+    /// is a sample taken by the same child generation. A mid-call recycle
+    /// invalidates the baseline (the new child starts at zero), yielding `None`
+    /// rather than a bogus delta.
+    fn cpu_delta_since(&mut self, baseline: Option<CpuSampleBaseline>) -> Option<u64> {
+        let baseline = baseline?;
+        if baseline.worker_generation == self.observed_generation() {
+            self.handle
+                .cumulative_cpu_millis()
+                .map(|end| end.saturating_sub(baseline.cpu_millis))
+        } else {
+            None
+        }
+    }
+
+    /// Capture a CPU baseline for [`Self::cpu_delta_since`]: the child CPU
+    /// sample plus the generation it belongs to.
+    fn cpu_baseline(&mut self) -> Option<CpuSampleBaseline> {
+        let worker_generation = self.observed_generation();
+        self.handle.cumulative_cpu_millis().map(|cpu_millis| CpuSampleBaseline {
+            worker_generation,
+            cpu_millis,
+        })
+    }
+
     fn record_restart_or_stop(
         &mut self,
         cause: RestartCause,
@@ -2223,6 +2297,8 @@ impl ProjectActorState {
                 worker_restarted: false,
                 retry_count: MAX_JOB_RETRIES,
                 queue_wait_millis: 0,
+                call_elapsed_millis: 0,
+                call_cpu_millis: None,
                 call_restart: None,
                 last_restart: Some(event),
                 rss_kib: self.last_rss_kib,
@@ -2256,6 +2332,8 @@ impl ProjectActorState {
         generation_before: u64,
         retry_count: u32,
         queue_wait_millis: u64,
+        call_elapsed_millis: u64,
+        call_cpu_millis: Option<u64>,
         call_restart: Option<RuntimeRestartEvent>,
     ) -> RuntimeFacts {
         let generation = self.observed_generation();
@@ -2265,6 +2343,8 @@ impl ProjectActorState {
             worker_restarted: call_restart.is_some() || generation > generation_before,
             retry_count,
             queue_wait_millis,
+            call_elapsed_millis,
+            call_cpu_millis,
             call_restart,
             last_restart: self.last_restart.clone(),
             rss_kib: snapshot.last_rss_kib.or(self.last_rss_kib),

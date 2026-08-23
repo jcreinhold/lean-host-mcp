@@ -106,8 +106,11 @@ itself idle above 60% of the budget it takes the same cycle early as `import_res
 profile so the spawn and the import both land between calls. Fatal child exits are reported by the worker layer; the
 host maps those structured outcomes once into MCP runtime facts and retries selected read-only semantic jobs once.
 Responses carry runtime facts (`worker_generation`, `worker_restarted`, `retry_count`, `queue_wait_millis`,
-`call_restart`, `last_restart`) so clients can distinguish Lean-domain results from infrastructure recovery and
-lifecycle history. The server reports these facts and the client decides policy; the single exception is opt-in:
+`call_elapsed_millis`, `call_cpu_millis`, `call_restart`, `last_restart`) so clients can distinguish Lean-domain
+results from infrastructure recovery and lifecycle history. The two timing fields bracket the call:
+`queue_wait_millis` covers admission delay, `call_elapsed_millis` the worker-call wallclock (queue excluded),
+and `call_cpu_millis` the worker child's own CPU delta — contention-immune, and the figure the
+`output.slow_call_warning_millis` (default 10 s) per-call refactoring warning keys on. The server reports these facts and the client decides policy; the single exception is opt-in:
 `retry_tainted_non_positive` on trial/verify requests asks the server to apply one specific policy itself — re-issuing a
 non-positive verdict once when the runtime was recycled mid-call — and the retry is still surfaced through the same
 `retry_count` fact rather than hidden.
