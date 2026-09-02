@@ -96,7 +96,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "9216",
         commented: true,
         overrides: "LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB",
-        description: "How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects) and clamped to [9216, 12288]; set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it.",
+        description: "How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects), clamped to [9216, 12288], and capped at one child's share of RAM after the import in flight (RAM / max_projects − 4608); set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it.",
     },
     FieldDoc {
         key: "runtime.worker_session_pool_capacity",
@@ -345,14 +345,20 @@ mod tests {
             Some(rt.restart_window().as_secs())
         );
         // Commented out in the generated file on purpose: its default is derived
-        // from system RAM, so no literal in this catalogue could match it on
-        // every machine. Absence is what "derive it" means, and the derived
-        // value is asserted to stay within the documented clamp instead.
+        // from system RAM and the pool size, so no literal in this catalogue
+        // could match it on every machine. Absence is what "derive it" means;
+        // the derived value is asserted to stay at or below the documented
+        // ceiling (the floor gives way to one child's share of the machine) and
+        // to be the derivation for the catalogue's own default pool size.
         assert_eq!(config.runtime.worker_import_residue_budget_mib, None);
         let derived_mib = rt.import_residue_budget_bytes() / (1024 * 1024);
         assert!(
-            (9216..=12288).contains(&derived_mib),
-            "derived residue budget {derived_mib} MiB escaped the clamp this catalogue documents"
+            (1..=12288).contains(&derived_mib),
+            "derived residue budget {derived_mib} MiB escaped the bounds this catalogue documents"
+        );
+        assert_eq!(
+            rt.import_residue_budget_bytes(),
+            ProjectRuntimeConfig::default_for_projects(broker::DEFAULT_MAX_PROJECTS).import_residue_budget_bytes()
         );
         assert_eq!(
             config.runtime.worker_session_pool_capacity,

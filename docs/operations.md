@@ -43,7 +43,7 @@ description (e.g. "8 GiB") is for reading, not for setting.
 | `runtime.project_mailbox_capacity` | integer | `16` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls may queue for one project's worker before new calls are shed with a retryable busy status. This is the server's only admission mechanism; it applies per project, so distinct projects never contend for one budget. |
 | `runtime.worker_restart_limit` | integer | `3` | `LEAN_HOST_MCP_WORKER_RESTART_LIMIT` | How many worker restarts are tolerated within the restart window before the project is marked unhealthy. |
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
-| `runtime.worker_import_residue_budget_mib` | integer (MiB) | unset | `LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB` | How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects) and clamped to [9216, 12288]; set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it. |
+| `runtime.worker_import_residue_budget_mib` | integer (MiB) | unset | `LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB` | How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects), clamped to [9216, 12288], and capped at one child's share of RAM after the import in flight (RAM / max_projects − 4608); set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it. |
 | `runtime.worker_session_pool_capacity` | integer | `8` | `LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY` | How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8. |
 | `broker.max_projects` | integer | `4` | `LEAN_HOST_MCP_MAX_PROJECTS` | How many distinct Lake projects stay open at once; on overflow the least-recently-used project's worker is evicted. |
 | `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes. |
@@ -114,10 +114,19 @@ file, and a pool smaller than the batch re-imports on every step.
 
 `runtime.worker_import_residue_budget_mib` bounds the rest. The child reports the unreclaimable bytes each import
 retained; the server sums them over the child's lifetime and recycles it when the total crosses the budget. The default
-is derived from the machine — a quarter of system RAM split across `broker.max_projects`, clamped to 9–12 GiB — because
-the same *count* of imports costs 9.6 GiB on one workload and 16.0 GiB on another. There is a `max_imports = 32`
-backstop underneath, which exists only to catch a child that reports zero-valued import statistics; it should never
-fire.
+is derived from the machine — a quarter of system RAM split across `broker.max_projects`, clamped to 9–12 GiB, and never
+more than one child's share of RAM after the import that may be in flight, `RAM / max_projects − 4.5 GiB` — because the
+same *count* of imports costs 9.6 GiB on one workload and 16.0 GiB on another. There is a `max_imports = 32` backstop
+underneath, which exists only to catch a child that reports zero-valued import statistics; it should never fire.
+
+Size the pool before the budget. Each resident child can hold its residue budget, one import in flight (up to 4.5 GiB),
+and the heap gap the ceiling allows above the budget (the larger of the budget and 8 GiB) before a recycle wins, so the
+machine must fit `max_projects × (budget + 4.5 GiB + max(budget, 8 GiB))` beside everything else it runs. On a 24 GiB
+machine that is one project with an explicit `worker_import_residue_budget_mib = 4096` and
+`lean_max_memory_kib = 14680064`; the derived default there is the 9 GiB floor with an 18 GiB ceiling, which fits only
+while nothing else runs. The child inherits the daemon's environment, so `LEAN_RS_NUM_THREADS` set on the server process
+bounds the worker's Lean task threads; the default is every core, and each concurrent elaboration task holds its own
+working set.
 
 What this means per workload:
 

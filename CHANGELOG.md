@@ -9,6 +9,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- The default import residue budget is sized for the configured `broker.max_projects`, not the compiled-in default of
+  four, and never exceeds one child's share of the machine after the import in flight (`RAM / max_projects − 4.5 GiB`).
+  On a 24 GiB machine with four projects the old derivation handed every child the 9 GiB floor — 36 GiB of residue with
+  an 18 GiB heap ceiling each — and the machine paged until it hung; the new one hands each 1.5 GiB and says so in the
+  below-floor warning. Sizing policy only: residue accounting, the derived heap ceiling, and the absence of any
+  resident-size policy are unchanged.
+- `ProjectRuntimeConfig::from_env_with_file` takes the pool size, `ProjectRuntimeConfig::default_for_projects` exposes
+  the derivation, and startup logs the derived residue budget.
+
+### Fixed
+
+- `docs/operations.md` and the config catalogue described the default budget as always within 9–12 GiB. They now state
+  the machine cap, the per-child worst case the pool must fit, and that the worker child inherits `LEAN_RS_NUM_THREADS`
+  from the daemon environment.
+
 ## [0.12.0] - 2026-08-23
 
 ### Added

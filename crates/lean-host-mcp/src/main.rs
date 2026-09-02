@@ -171,7 +171,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let env_default = args.lake_root;
     let config_default = file.primary_project.clone();
     let (max_projects, idle_timeout) = BrokerConfig::pool_from_env_with_file(&file.broker)?;
-    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime)?;
+    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_projects.get())?;
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -184,6 +184,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_projects = %max_projects,
         idle_timeout_secs = idle_timeout.as_secs(),
         lean_max_memory_kib = runtime_config.lean_max_memory_kib(),
+        import_residue_budget_mib = runtime_config.import_residue_budget_bytes() / (1024 * 1024),
         project_mailbox_capacity = runtime_config.mailbox_capacity(),
         transport = transport,
         bind = bind_display.as_deref(),

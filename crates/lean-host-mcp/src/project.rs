@@ -290,7 +290,22 @@ pub struct ProjectRuntimeConfig {
 
 impl Default for ProjectRuntimeConfig {
     fn default() -> Self {
-        let import_residue_budget_bytes = default_import_residue_budget_bytes(crate::broker::DEFAULT_MAX_PROJECTS);
+        Self::default_for_projects(crate::broker::DEFAULT_MAX_PROJECTS)
+    }
+}
+
+impl ProjectRuntimeConfig {
+    /// Defaults for a broker that keeps up to `max_projects` worker children
+    /// resident.
+    ///
+    /// The residue budget and the heap ceiling derived from it are per child,
+    /// but every child draws on the same RAM, so they are sized from one
+    /// child's share of the machine. Deriving them from the compiled-in pool
+    /// size while the operator had configured another was the bug this
+    /// replaces: four children each sized as if alone.
+    #[must_use]
+    pub fn default_for_projects(max_projects: usize) -> Self {
+        let import_residue_budget_bytes = default_import_residue_budget_bytes(max_projects);
         Self {
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
@@ -324,18 +339,24 @@ fn default_import_residue_budget_bytes(max_projects: usize) -> u64 {
 /// the one platform read so the sizing rules can be tested on machines that do
 /// not exist.
 fn import_residue_budget_for(ram: u64, max_projects: usize) -> u64 {
+    let projects = max_projects.max(1) as u64;
     let per_project = ram
         .checked_div(WORKER_IMPORT_RESIDUE_RAM_DIVISOR)
-        .and_then(|share| share.checked_div(max_projects.max(1) as u64))
+        .and_then(|share| share.checked_div(projects))
         .unwrap_or(WORKER_IMPORT_RESIDUE_FLOOR_BYTES);
     // The floor is unconditional, and on any machine under ~12 GiB it exceeds
     // the whole machine — a budget the child cannot reach before the OS kills it
     // is not a budget, and the `SIGKILL` it fails to prevent is the exact
-    // failure this subsystem exists for. Cap it at what is left after the one
-    // import that may be in flight when the bound is tested. On an
-    // undersized machine the result lands below the floor, which is honest:
-    // that is what `actor_main`'s below-floor warning is there to say.
+    // failure this subsystem exists for. Cap it at one child's share of the
+    // machine, less the one import that may be in flight when the bound is
+    // tested: the budget is per child, but every resident child draws on the
+    // same RAM, and a pool of four does not make the machine four times
+    // larger. On an undersized machine — or a roomy one asked to keep too many
+    // projects — the result lands below the floor, which is honest: that is
+    // what `actor_main`'s below-floor warning is there to say.
     let affordable = ram
+        .checked_div(projects)
+        .unwrap_or(0)
         .saturating_sub(WORKER_IMPORT_HEADROOM_BYTES)
         .max(WORKER_IMPORT_RESIDUE_MIN_BYTES);
     per_project
@@ -383,17 +404,22 @@ impl ProjectRuntimeConfig {
     /// [`ServerError::Internal`] when a runtime env var is malformed, zero
     /// where zero is unsafe.
     pub fn from_env() -> Result<Self> {
-        Self::from_env_with_file(&RuntimeFileConfig::default())
+        Self::from_env_with_file(&RuntimeFileConfig::default(), crate::broker::DEFAULT_MAX_PROJECTS)
     }
 
     /// Resolve the runtime policy with a config-file section as the layer
     /// beneath env vars: each knob is `env var > file > built-in default`.
     ///
+    /// `max_projects` is the broker's configured pool size. The residue budget
+    /// and the heap ceiling derived from it are per child, so their defaults
+    /// are one child's share of the machine, not the share a pool of
+    /// [`crate::broker::DEFAULT_MAX_PROJECTS`] would get.
+    ///
     /// # Errors
     ///
     /// [`ServerError::Internal`] when an env var is malformed, or a resolved
     /// value (from env or file) is zero where zero is unsafe.
-    pub fn from_env_with_file(file: &RuntimeFileConfig) -> Result<Self> {
+    pub fn from_env_with_file(file: &RuntimeFileConfig, max_projects: usize) -> Result<Self> {
         parse_runtime_config(
             RuntimeEnv {
                 lean_max_memory_kib: runtime_env_var("LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB")?,
@@ -405,6 +431,7 @@ impl ProjectRuntimeConfig {
                 worker_session_pool_capacity: runtime_env_var("LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY")?,
             },
             file,
+            max_projects,
         )
     }
 
@@ -489,8 +516,12 @@ struct RuntimeEnv {
     worker_session_pool_capacity: Option<String>,
 }
 
-fn parse_runtime_config(env: RuntimeEnv, file: &RuntimeFileConfig) -> Result<ProjectRuntimeConfig> {
-    let defaults = ProjectRuntimeConfig::default();
+fn parse_runtime_config(
+    env: RuntimeEnv,
+    file: &RuntimeFileConfig,
+    max_projects: usize,
+) -> Result<ProjectRuntimeConfig> {
+    let defaults = ProjectRuntimeConfig::default_for_projects(max_projects);
     // Resolved before the heap ceiling, which defaults to a function of it:
     // an operator who raises the budget must get a ceiling that still sits
     // above it, or they have rebuilt the inversion `lean_max_memory_kib_for`
@@ -2474,7 +2505,8 @@ fn actor_main(
             budget_mib = config.import_residue_budget_bytes / (1024 * 1024),
             floor_mib = WORKER_IMPORT_RESIDUE_FLOOR_BYTES / (1024 * 1024),
             "import residue budget is below the floor one Mathlib-scale import needs; \
-             raise runtime.worker_import_residue_budget_mib if workers recycle constantly"
+             raise runtime.worker_import_residue_budget_mib or lower broker.max_projects \
+             if workers recycle constantly"
         );
     }
     // Only reachable when an operator sets `runtime.lean_max_memory_kib`
@@ -2850,6 +2882,7 @@ mod tests {
                 worker_session_pool_capacity: Some("43".to_owned()),
             },
             &RuntimeFileConfig::default(),
+            crate::broker::DEFAULT_MAX_PROJECTS,
         )
         .unwrap();
 
@@ -2863,15 +2896,20 @@ mod tests {
     }
 
     #[test]
-    fn the_residue_budget_defaults_within_its_documented_clamp() {
-        // Derived from system RAM, so the assertion is on the clamp rather than
-        // a literal: the floor is what decides it on any ordinary machine, and
-        // dropping below it would degenerate the policy into recycling before
-        // every import.
+    fn the_residue_budget_defaults_to_one_childs_share_of_this_machine() {
+        // Derived from system RAM and the pool size, so the assertion is on the
+        // derivation and its bounds rather than a literal: the ceiling is
+        // absolute, and the floor gives way to what one child's share of the
+        // machine can actually hold.
+        let ram = system_ram_bytes().unwrap_or(WORKER_ASSUMED_SYSTEM_RAM_BYTES);
         let budget = ProjectRuntimeConfig::default().import_residue_budget_bytes();
+        assert_eq!(
+            budget,
+            import_residue_budget_for(ram, crate::broker::DEFAULT_MAX_PROJECTS)
+        );
         assert!(
-            (WORKER_IMPORT_RESIDUE_FLOOR_BYTES..=WORKER_IMPORT_RESIDUE_CEILING_BYTES).contains(&budget),
-            "derived residue budget {budget} escaped its clamp"
+            (WORKER_IMPORT_RESIDUE_MIN_BYTES..=WORKER_IMPORT_RESIDUE_CEILING_BYTES).contains(&budget),
+            "derived residue budget {budget} escaped its bounds"
         );
         assert!(
             ProjectRuntimeConfig::default().import_residue_soft_bytes() < budget,
@@ -2887,7 +2925,8 @@ mod tests {
             worker_session_pool_capacity: Some("2".to_owned()),
             ..RuntimeEnv::default()
         };
-        let config = parse_runtime_config(env, &RuntimeFileConfig::default()).unwrap();
+        let config =
+            parse_runtime_config(env, &RuntimeFileConfig::default(), crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
         assert_eq!(config.session_pool_capacity(), 2);
         assert_eq!(
             config.import_residue_budget_bytes(),
@@ -2902,14 +2941,14 @@ mod tests {
             worker_import_residue_budget_mib: Some(4_096),
             ..RuntimeFileConfig::default()
         };
-        let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+        let config = parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
         assert_eq!(config.import_residue_budget_bytes(), 4_096 * 1024 * 1024);
 
         let env = RuntimeEnv {
             worker_import_residue_budget_mib: Some("2048".to_owned()),
             ..RuntimeEnv::default()
         };
-        let config = parse_runtime_config(env, &file).unwrap();
+        let config = parse_runtime_config(env, &file, crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
         assert_eq!(config.import_residue_budget_bytes(), 2_048 * 1024 * 1024);
     }
 
@@ -2920,17 +2959,22 @@ mod tests {
             ..RuntimeFileConfig::default()
         };
         // Env unset -> file value is used.
-        let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+        let config = parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
         assert_eq!(config.request_timeout_millis(), 45_000);
         // Env set -> env wins over the file.
         let env = RuntimeEnv {
             request_timeout_millis: Some("90000".to_owned()),
             ..RuntimeEnv::default()
         };
-        let config = parse_runtime_config(env, &file).unwrap();
+        let config = parse_runtime_config(env, &file, crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
         assert_eq!(config.request_timeout_millis(), 90_000);
         // Neither -> built-in default (120 s).
-        let config = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default()).unwrap();
+        let config = parse_runtime_config(
+            RuntimeEnv::default(),
+            &RuntimeFileConfig::default(),
+            crate::broker::DEFAULT_MAX_PROJECTS,
+        )
+        .unwrap();
         assert_eq!(config.request_timeout_millis(), REQUEST_TIMEOUT_MILLIS);
     }
 
@@ -2944,6 +2988,7 @@ mod tests {
                 ..RuntimeEnv::default()
             },
             &RuntimeFileConfig::default(),
+            crate::broker::DEFAULT_MAX_PROJECTS,
         )
         .unwrap_err();
         let ServerError::Internal(message) = err else {
@@ -2962,17 +3007,22 @@ mod tests {
             ..RuntimeFileConfig::default()
         };
         // Env unset -> file value is used.
-        let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+        let config = parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
         assert_eq!(config.lean_max_memory_kib(), 8_388_608);
         // Env set -> env wins over the file.
         let env = RuntimeEnv {
             lean_max_memory_kib: Some("6291456".to_owned()),
             ..RuntimeEnv::default()
         };
-        let config = parse_runtime_config(env, &file).unwrap();
+        let config = parse_runtime_config(env, &file, crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
         assert_eq!(config.lean_max_memory_kib(), 6_291_456);
         // Neither -> built-in default.
-        let config = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default()).unwrap();
+        let config = parse_runtime_config(
+            RuntimeEnv::default(),
+            &RuntimeFileConfig::default(),
+            crate::broker::DEFAULT_MAX_PROJECTS,
+        )
+        .unwrap();
         assert_eq!(
             config.lean_max_memory_kib(),
             lean_max_memory_kib_for(config.import_residue_budget_bytes())
@@ -2993,7 +3043,8 @@ mod tests {
                 worker_import_residue_budget_mib: Some(budget_mib),
                 ..RuntimeFileConfig::default()
             };
-            let config = parse_runtime_config(RuntimeEnv::default(), &file).unwrap();
+            let config =
+                parse_runtime_config(RuntimeEnv::default(), &file, crate::broker::DEFAULT_MAX_PROJECTS).unwrap();
             assert_eq!(config.import_residue_budget_bytes(), budget_mib * 1024 * 1024);
             assert!(
                 config.lean_max_memory_kib().saturating_mul(1024) > config.import_residue_budget_bytes(),
@@ -3046,13 +3097,51 @@ mod tests {
         );
         // Undersized: the floor would exceed the machine, so the machine wins
         // and `actor_main`'s below-floor warning becomes reachable.
-        let small = import_residue_budget_for(8 * gib, 4);
+        let small = import_residue_budget_for(8 * gib, 1);
         assert!(small < WORKER_IMPORT_RESIDUE_FLOOR_BYTES, "{small}");
         assert_eq!(small, 8 * gib - WORKER_IMPORT_HEADROOM_BYTES);
+        // Undersized and crowded: four children on 8 GiB have 2 GiB each, less
+        // than one import in flight, so each gets the degenerate minimum.
+        assert_eq!(import_residue_budget_for(8 * gib, 4), WORKER_IMPORT_RESIDUE_MIN_BYTES);
         // Absurd: never zero, because zero fails the nonzero MiB round-trip and
         // would take the server down rather than degrade it.
         assert_eq!(import_residue_budget_for(gib, 4), WORKER_IMPORT_RESIDUE_MIN_BYTES);
         assert!(import_residue_budget_for(0, 4) > 0);
+    }
+
+    /// The budget is per child but the RAM is shared, so the pool size has to
+    /// enter the derivation before the floor does. 24 GiB is the machine that
+    /// crashed twice under four resident workers each sized as if alone.
+    #[test]
+    fn the_pool_size_divides_the_machine_before_the_floor_applies() {
+        let gib = 1024 * 1024 * 1024;
+        // One resident child: 24 − 4.5 GiB is left for it, so the floor is affordable.
+        assert_eq!(
+            import_residue_budget_for(24 * gib, 1),
+            WORKER_IMPORT_RESIDUE_FLOOR_BYTES
+        );
+        // Two: 12 GiB each, 7.5 GiB of residue once the import in flight is paid for.
+        assert_eq!(
+            import_residue_budget_for(24 * gib, 2),
+            12 * gib - WORKER_IMPORT_HEADROOM_BYTES
+        );
+        // Four: 6 GiB each, 1.5 GiB of residue. The old derivation handed each
+        // the 9 GiB floor, 36 GiB of residue with 18 GiB heap ceilings on a
+        // 24 GiB machine.
+        assert_eq!(
+            import_residue_budget_for(24 * gib, 4),
+            6 * gib - WORKER_IMPORT_HEADROOM_BYTES
+        );
+        // The configured pool size, not the compiled-in default, sizes the defaults.
+        let ram = system_ram_bytes().unwrap_or(WORKER_ASSUMED_SYSTEM_RAM_BYTES);
+        assert_eq!(
+            ProjectRuntimeConfig::default_for_projects(1).import_residue_budget_bytes(),
+            import_residue_budget_for(ram, 1)
+        );
+        let one = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default(), 1).unwrap();
+        let four = parse_runtime_config(RuntimeEnv::default(), &RuntimeFileConfig::default(), 4).unwrap();
+        assert!(one.import_residue_budget_bytes() >= four.import_residue_budget_bytes());
+        assert!(one.lean_max_memory_kib() >= four.lean_max_memory_kib());
     }
 
     #[test]
@@ -3064,7 +3153,7 @@ mod tests {
             lean_max_memory_kib: Some(0),
             ..RuntimeFileConfig::default()
         };
-        let err = parse_runtime_config(RuntimeEnv::default(), &zero).unwrap_err();
+        let err = parse_runtime_config(RuntimeEnv::default(), &zero, crate::broker::DEFAULT_MAX_PROJECTS).unwrap_err();
         let ServerError::Internal(message) = err else {
             panic!("expected Internal config error");
         };
