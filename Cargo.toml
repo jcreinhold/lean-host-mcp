@@ -17,14 +17,14 @@ version = "0.12.0"
 # here (members reference them via `.workspace = true`) removes per-crate drift;
 # `deny.toml` enforces the no-duplicate-version invariant across the full graph.
 [workspace.dependencies]
-lean-rs-worker-child = "0.8"
-lean-rs-worker-parent = "0.8"
-lean-rs-worker-protocol = "0.8"
+lean-rs-worker-child = "0.9"
+lean-rs-worker-parent = "0.9"
+lean-rs-worker-protocol = "0.9"
 lean-semantic-search-capability = "0.7"
 lean-semantic-search-contract = "0.7"
 lean-semantic-search-retrieval = "0.7"
 lean-semantic-search-runtime = "0.7"
-lean-toolchain = "0.8"
+lean-toolchain = "0.9"
 
 [workspace.lints.rust]
 future-incompatible = "warn"
