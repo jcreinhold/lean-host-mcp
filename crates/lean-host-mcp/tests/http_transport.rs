@@ -113,7 +113,7 @@ async fn streamable_http_initialize_and_tools_list() {
             .pointer("/properties/kind/enum")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(5),
+        Some(4),
         "lean_lookup top-level kind property should summarize every lookup mode: {lookup_schema:?}"
     );
     assert!(

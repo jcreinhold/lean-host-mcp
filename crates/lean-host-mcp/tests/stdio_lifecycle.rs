@@ -126,13 +126,13 @@ async fn stdio_lean_verify_reports_progress() {
     }));
     assert_eq!(
         start.pointer("/params/message").and_then(Value::as_str),
-        Some("Preparing Lean declaration verification")
+        Some("Preparing lean_verify")
     );
     assert!(
         finish
             .pointer("/params/message")
             .and_then(Value::as_str)
-            .is_some_and(|message| message.starts_with("Lean declaration verification finished")),
+            .is_some_and(|message| message.starts_with("lean_verify finished")),
         "finish notification should name the completed operation: {finish:?}"
     );
 
