@@ -20,12 +20,14 @@ Every call is read-only. The server reads files, elaborates in memory, and never
   diagnostics before choosing a tactic.
 - `lean_trial`: non-mutating probes. Use `proof_step` to try tactics and `command` for `#check`, `#eval`, or
   `#print axioms`.
-- `lean_lookup`: semantic discovery. Use it for declarations, declaration inventory, proof search, reference search, and
-  changed-declaration coverage.
-- `lean_verify`: verification gates. Use it when a declaration or changed set must be checked with `sorry` policy and
-  optional axiom reporting. When the MCP request carries `_meta.progressToken`, the server emits a start notification, a
-  heartbeat every 15 seconds, and a completion notification on `notifications/progress`; clients that omit the token
-  keep the same single-response behavior.
+- `lean_lookup`: semantic discovery. Use it for declarations, declaration inventory, proof search, and reference search.
+- `lean_verify`: verification gates. Use it when a declaration, file, or module must be checked with `sorry` policy and
+  optional axiom reporting.
+
+When an MCP request carries `_meta.progressToken`, every tool emits a start notification, a heartbeat every 15 seconds,
+and a completion notification on `notifications/progress`. Clients such as Claude Code extend their per-call deadline
+only while progress arrives, so a cold import or a large file's elaboration is not abandoned at the client while the
+worker keeps computing. Clients that omit the token keep the same single-response behavior.
 
 ## Response Shape
 
@@ -209,25 +211,25 @@ The old user-facing phrase `verify_declaration` maps to `lean_verify` with one e
 }
 ```
 
-### Verify Changed Declarations
+### Request Synonyms
 
-```json
-{
-  "name": "lean_verify",
-  "arguments": {
-    "targets": [
-      {
-        "kind": "changed",
-        "base": "HEAD",
-        "files": ["LeanRsFixture/ProofActions.lean"],
-        "include_untracked": true
-      }
-    ],
-    "allow_sorry": false,
-    "report_axioms": true
-  }
-}
-```
+Requests are decoded forgivingly. The recurring synonyms agents write are mapped onto the canonical schema before typed
+decoding, so the first call succeeds; the canonical shapes below remain the documented ones, and responses never use
+the synonyms.
+
+- Modes: `lean_lookup` `signature`/`print`/`decl` → `declaration`; `inventory`/`outline` → `declarations`; `lean_trial`
+  `tactic`/`step` → `proof_step`, `snippet`/`eval`/`check` → `command`; `lean_context` `goal`/`state` →
+  `proof_position`; `lean_status` `health`/`capabilities` → `project`, `diagnostics` → `file_diagnostics`.
+- Fields: `lean_lookup(kind="declarations")` accepts a bare `file`/`path` or `module` in place of `target`;
+  `lean_lookup(kind="declaration")` accepts `declaration` for `name` and `value`/`type`/`docs` as field names;
+  `lean_trial(kind="command")` accepts `command`, `code`, or a line array for `commands`; `lean_trial(kind="proof_step")`
+  accepts `tactic` for `snippet` and `candidates` for `snippets`; a `proof_position` given as a string is the entry goal
+  (`"start"`) or an `after_text` match, and as an integer an `index`.
+- `lean_verify` accepts one group at top level (`file` with `declarations`, `file` alone, or `module` alone), a singular
+  `target`, string groups (`"Proofs/A.lean"`, `"Proofs.A"`), and the group kinds `file` → `file_all`, `module` →
+  `module_all`, `declarations` → `explicit`.
+- A `kind` that names another tool's job (`search`, `file`, `verify`, …) is still rejected, with the error naming the
+  tool and mode to call instead.
 
 ## Proof Workflow
 
@@ -549,13 +551,7 @@ Mixed target groups:
       ]
     },
     { "kind": "file_all", "file": "LeanRsFixture/ProofAgent.lean" },
-    { "kind": "module_all", "module": "LeanRsFixture.ProofActions" },
-    {
-      "kind": "changed",
-      "base": "HEAD",
-      "files": ["LeanRsFixture/ProofActions.lean"],
-      "include_untracked": true
-    }
+    { "kind": "module_all", "module": "LeanRsFixture.ProofActions" }
   ],
   "allow_sorry": false,
   "report_axioms": false,
@@ -616,14 +612,11 @@ server re-issues that batch once. `verified` rows are never retried — verifica
 tainted and non-positive, the rows are relabeled to `worker_recycled` with the usual warning, exactly as with the flag
 unset. At most one retry per batch; it is surfaced through `runtime.retry_count`.
 
-`changed` runs non-interactive git commands under the project root:
-`git diff --unified=0 --no-ext-diff --find-renames <base> -- '*.lean'`, plus
-`git ls-files --others --exclude-standard -- '*.lean'` when `include_untracked` is true. It maps changed hunks to
-source-fresh declaration spans and verifies only known declarations. Coverage is conservative: comment or whitespace
-hunks outside any declaration, unavailable/truncated declaration inventory, deleted files, and renames are reported
-under `coverage` instead of being silently dropped. If coverage is unknown, verify the whole file or rebuild and retry;
-the server will not trust stale `.ilean` rows as authoritative for editable changed source. Generated `_private.*`
-aliases are excluded from changed-target expansion; callers may still request such a declaration explicitly.
+A `not_found` row for an explicit target carries, in `facts.candidates` (with `"detail": "full"`) and in a response
+warning, the file's declarations whose short name matches the requested one across namespaces and case — the usual
+cause is a namespace or capitalization slip, and the warning names the intended declaration so the next call can use
+it. Mapping a git diff to declarations is the caller's job; the stacks verifier does it from `git diff` and passes
+explicit groups.
 
 ## `lean_lookup`
 
@@ -674,24 +667,6 @@ Index rows know the declaration range and name/selection range but not the decla
 `body_span` are omitted. If neither source nor index is available, the result status is `missing_build` or `not_found`,
 never an empty successful list. `limit` defaults to 200 and is capped at 1000; truncation keeps a deterministic prefix
 and sets `truncated: true`.
-
-### `kind: "changed_coverage"`
-
-Reports how git hunks map to source-fresh declarations without verifying them. The request fields match the
-`lean_verify` changed target:
-
-```json
-{
-  "kind": "changed_coverage",
-  "base": "HEAD",
-  "files": ["LeanRsFixture/ProofActions.lean"],
-  "include_untracked": true
-}
-```
-
-The result has `known` changed declarations and the same `coverage` block that `lean_verify` returns. Source-backed
-coverage rows carry `source` / `file` / `edit_fresh` trust facts for the mapped files, so a gate can tell the mapping
-was computed from the current source snapshot. Unknown rows are actionable coverage gaps, not failures to be ignored.
 
 ### `kind: "proof_search"`
 

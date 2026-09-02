@@ -16,9 +16,9 @@ Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups d
 
 - **`lean_context`** — proof context. Initial mode: `proof_position`.
 - **`lean_trial`** — non-mutating experiments. Modes: `proof_step` and `command`.
-- **`lean_verify`** — declaration verification for explicit, file-wide, module-wide, or changed target groups.
-- **`lean_lookup`** — declaration inspection, declaration inventory, changed-diff coverage, proof search, and
-  references. Initial modes: `declaration`, `declarations`, `changed_coverage`, `proof_search`, and `references`.
+- **`lean_verify`** — declaration verification for explicit, file-wide, or module-wide target groups.
+- **`lean_lookup`** — declaration inspection, declaration inventory, proof search, and references. Modes:
+  `declaration`, `declarations`, `proof_search`, and `references`.
 - **`lean_status`** — project/toolchain/config status and current-source file diagnostics. Modes: `project` and
   `file_diagnostics`.
 

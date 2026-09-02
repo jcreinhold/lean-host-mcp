@@ -8,7 +8,7 @@
 // worker-actor channel without extra lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
@@ -36,9 +36,6 @@ use crate::error::{Result, ServerError};
 use crate::projections::{
     DeclarationVerificationFacts, DeclarationVerificationResult, ElabFailure, ProofAttemptEnvelope, ProofAttemptResult,
     project_declaration_verification, project_proof_attempt,
-};
-use crate::tools::changed_coverage::{
-    ChangedCoverageReport, ChangedCoverageRequest, ChangedCoverageResult, ChangedDeclaration, compute_changed_coverage,
 };
 use crate::tools::position::{ProofPositionSelector, worker_proof_position};
 use crate::tools::source_input::{read_query_file, resolve_path, source_path_for_module};
@@ -191,32 +188,15 @@ impl From<VerifyDeclarationRequest> for LeanVerifyRequest {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LeanVerifyTargetGroup {
-    Explicit {
-        file: PathBuf,
-        declarations: Vec<String>,
-    },
-    FileAll {
-        file: PathBuf,
-    },
-    ModuleAll {
-        module: String,
-    },
-    Changed {
-        #[serde(default)]
-        base: Option<String>,
-        #[serde(default)]
-        files: Vec<PathBuf>,
-        #[serde(default)]
-        include_untracked: bool,
-    },
+    Explicit { file: PathBuf, declarations: Vec<String> },
+    FileAll { file: PathBuf },
+    ModuleAll { module: String },
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct LeanVerifyResult {
     pub summary: LeanVerifySummary,
     pub results: Vec<LeanVerifyRow>,
-    #[serde(skip_serializing_if = "ChangedCoverageReport::is_empty")]
-    pub coverage: ChangedCoverageReport,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -225,7 +205,6 @@ pub struct LeanVerifySummary {
     pub verified: usize,
     pub failed: usize,
     pub needs_build: usize,
-    pub unknown_coverage: usize,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
@@ -561,18 +540,27 @@ pub async fn verify_declaration(
     // Honest diagnostics: route the verdict's resolution health (needs_build
     // vs genuine ambiguity) through the shared renderer, and flag when the
     // axiom walk could not run.
-    let (cause, candidates, axiom_warning) = match response.result_ref() {
+    let (cause, candidates, similar, axiom_warning) = match response.result_ref() {
         Some(result) => (
             verification_incomplete_cause(result),
             verification_ambiguous_candidates(result),
+            verification_not_found_similar(result),
             axiom_unavailable_warning(result, req.report_axioms),
         ),
-        None => (None, Vec::new(), None),
+        None => (None, Vec::new(), Vec::new(), None),
     };
     if let Some(cause) = cause {
         response = warn_needs_build(response, &cause);
     }
     response = crate::diagnosis::warn_ambiguous(response, &candidates);
+    if !similar.is_empty() {
+        let suggestion = NotFoundSuggestion {
+            declaration: req.declaration.clone(),
+            file: req.file.to_string_lossy().into_owned(),
+            similar,
+        };
+        response = warn_not_found_suggestions(response, std::slice::from_ref(&suggestion));
+    }
     if let Some(warning) = axiom_warning {
         response = response.warn(warning);
     }
@@ -658,30 +646,6 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                     }
                 }
             }
-            LeanVerifyTargetGroup::Changed {
-                base,
-                files,
-                include_untracked,
-            } => {
-                let coverage = compute_changed_coverage(
-                    ctx,
-                    hint.clone(),
-                    &meta.canonical_root,
-                    ChangedCoverageRequest {
-                        base: base.clone(),
-                        files: files.clone(),
-                        include_untracked: *include_untracked,
-                        project: req.project.clone(),
-                    },
-                )
-                .await?;
-                expansion.absorb_changed_coverage(&coverage);
-                if let Some(result) = coverage.result_ref() {
-                    expansion.coverage.extend(result.coverage.clone());
-                    expansion.truncated |= result.coverage.truncated;
-                    expansion.push_changed_group(group_index, &result.known);
-                }
-            }
         }
     }
 
@@ -695,6 +659,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
     let mut last_identity = None;
     let mut build_causes = Vec::new();
     let mut ambiguous = Vec::new();
+    let mut not_found_suggestions = Vec::new();
     let mut axiom_warnings = Vec::new();
     let mut recycled = None;
 
@@ -784,12 +749,13 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
         }
         build_causes.extend(projected.build_causes);
         ambiguous.extend(projected.ambiguous);
+        not_found_suggestions.extend(projected.not_found_suggestions);
         axiom_warnings.extend(projected.axiom_warnings);
         rows.extend(projected.rows);
     }
 
     rows.sort_by_key(|row| order_by_id.get(&row.id).copied().unwrap_or(usize::MAX));
-    let summary = summarize_rows(requested, expansion.truncated, expansion.coverage.unknown.len(), &rows);
+    let summary = summarize_rows(requested, expansion.truncated, &rows);
     let (freshness, runtime) = match last_identity {
         Some(identity) => identity,
         None => {
@@ -797,16 +763,9 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
             (base.freshness, base.runtime)
         }
     };
-    let mut response = Response::ok(
-        LeanVerifyResult {
-            summary,
-            results: rows,
-            coverage: expansion.coverage,
-        },
-        freshness,
-    )
-    .with_runtime(runtime)
-    .with_trust_artifacts(expansion.trust_artifacts.into_vec());
+    let mut response = Response::ok(LeanVerifyResult { summary, results: rows }, freshness)
+        .with_runtime(runtime)
+        .with_trust_artifacts(expansion.trust_artifacts.into_vec());
     response.warnings.extend(expansion.warnings);
     response.next_actions.extend(expansion.next_actions);
     if req.targets.is_empty() {
@@ -821,6 +780,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
         response = warn_needs_build(response, &cause);
     }
     response = crate::diagnosis::warn_ambiguous(response, &ambiguous);
+    response = warn_not_found_suggestions(response, &not_found_suggestions);
     for warning in axiom_warnings {
         if !response.warnings.contains(&warning) {
             response.warnings.push(warning);
@@ -861,7 +821,6 @@ struct VerifyExpansion {
     requested: usize,
     next_order: usize,
     truncated: bool,
-    coverage: ChangedCoverageReport,
     trust_artifacts: ArtifactTrustDeduper,
     warnings: Vec<String>,
     next_actions: Vec<String>,
@@ -894,7 +853,6 @@ impl VerifyExpansion {
             requested: 0,
             next_order: 0,
             truncated: false,
-            coverage: ChangedCoverageReport::default(),
             trust_artifacts: ArtifactTrustDeduper::default(),
             warnings: Vec::new(),
             next_actions: Vec::new(),
@@ -920,19 +878,6 @@ impl VerifyExpansion {
             source,
             declarations.iter().map(|row| (row.name.as_str(), None)),
         );
-    }
-
-    fn push_changed_group(&mut self, group_index: usize, declarations: &[ChangedDeclaration]) {
-        let mut by_file = BTreeMap::<String, Vec<(&str, Option<String>)>>::new();
-        for declaration in declarations {
-            by_file
-                .entry(declaration.file.clone())
-                .or_default()
-                .push((declaration.declaration.as_str(), Some(declaration.reason.clone())));
-        }
-        for (file, declarations) in by_file {
-            self.push_declarations(group_index, VerifySource::File(PathBuf::from(file)), declarations);
-        }
     }
 
     fn push_declarations<'a, I>(&mut self, group_index: usize, source: VerifySource, declarations: I)
@@ -985,12 +930,6 @@ impl VerifyExpansion {
         &mut self,
         response: &Response<crate::tools::declaration_inventory::DeclarationInventoryResult>,
     ) {
-        self.trust_artifacts.extend(response.trust_artifacts.iter().cloned());
-        self.warnings.extend(response.warnings.clone());
-        self.next_actions.extend(response.next_actions.clone());
-    }
-
-    fn absorb_changed_coverage(&mut self, response: &Response<ChangedCoverageResult>) {
         self.trust_artifacts.extend(response.trust_artifacts.iter().cloned());
         self.warnings.extend(response.warnings.clone());
         self.next_actions.extend(response.next_actions.clone());
@@ -1070,8 +1009,40 @@ struct ProjectedBatchRows {
     rows: Vec<LeanVerifyRow>,
     build_causes: Vec<IncompleteCause>,
     ambiguous: Vec<crate::diagnosis::CompetingDecl>,
+    not_found_suggestions: Vec<NotFoundSuggestion>,
     axiom_warnings: Vec<String>,
     recycled: bool,
+}
+
+/// A `not_found` verdict together with the file's declarations whose short
+/// name matches the requested one across namespaces and case, as attached by
+/// the worker. Rendered as a warning so the caller can retry with the intended
+/// name instead of listing the file.
+struct NotFoundSuggestion {
+    declaration: String,
+    file: String,
+    similar: Vec<String>,
+}
+
+fn warn_not_found_suggestions<T>(mut response: Response<T>, suggestions: &[NotFoundSuggestion]) -> Response<T>
+where
+    T: Serialize + JsonSchema,
+{
+    for suggestion in suggestions {
+        response = response.warn(format!(
+            "`{}` was not found in {}; declarations there with a similar name: {}",
+            suggestion.declaration,
+            suggestion.file,
+            suggestion.similar.join(", ")
+        ));
+    }
+    if !suggestions.is_empty() {
+        response = response.hint(
+            "Verify one of the similar names, or list the file with lean_lookup kind=\"declarations\" to find the \
+             intended declaration.",
+        );
+    }
+    response
 }
 
 fn project_batch_rows(
@@ -1116,6 +1087,7 @@ fn project_batch_rows(
                     .collect(),
                 build_causes: Vec::new(),
                 ambiguous: Vec::new(),
+                not_found_suggestions: Vec::new(),
                 axiom_warnings: Vec::new(),
                 recycled: false,
             }
@@ -1136,6 +1108,7 @@ fn project_batch_rows(
                 .collect(),
             build_causes: Vec::new(),
             ambiguous: Vec::new(),
+            not_found_suggestions: Vec::new(),
             axiom_warnings: Vec::new(),
             recycled: false,
         },
@@ -1155,6 +1128,7 @@ fn project_batch_rows(
                 .collect(),
             build_causes: Vec::new(),
             ambiguous: Vec::new(),
+            not_found_suggestions: Vec::new(),
             axiom_warnings: Vec::new(),
             recycled: false,
         },
@@ -1174,6 +1148,7 @@ fn project_batch_verdict_rows(
         rows: Vec::with_capacity(rows.len()),
         build_causes: Vec::new(),
         ambiguous: Vec::new(),
+        not_found_suggestions: Vec::new(),
         axiom_warnings: Vec::new(),
         recycled: false,
     };
@@ -1204,6 +1179,14 @@ fn project_batch_verdict_rows(
             out.build_causes.push(cause);
         }
         out.ambiguous.extend(verification_ambiguous_candidates(&projected));
+        let similar = verification_not_found_similar(&projected);
+        if !similar.is_empty() {
+            out.not_found_suggestions.push(NotFoundSuggestion {
+                declaration: target.declaration.clone(),
+                file: target.file.clone(),
+                similar,
+            });
+        }
         if let Some(warning) = axiom_unavailable_warning(&projected, report_axioms) {
             out.axiom_warnings.push(warning);
         }
@@ -1294,12 +1277,7 @@ fn needs_build_row(target: VerifyTarget) -> LeanVerifyRow {
     }
 }
 
-fn summarize_rows(
-    requested: usize,
-    truncated: bool,
-    unknown_coverage: usize,
-    rows: &[LeanVerifyRow],
-) -> LeanVerifySummary {
+fn summarize_rows(requested: usize, truncated: bool, rows: &[LeanVerifyRow]) -> LeanVerifySummary {
     let verified = rows.iter().filter(|row| row.verification_status == "verified").count();
     let needs_build = rows
         .iter()
@@ -1310,7 +1288,6 @@ fn summarize_rows(
         verified,
         failed: rows.len().saturating_sub(verified).saturating_sub(needs_build),
         needs_build,
-        unknown_coverage,
         truncated,
     }
 }
@@ -1502,6 +1479,29 @@ fn verification_ambiguous_candidates(result: &DeclarationVerificationResult) -> 
             name: c.declaration_name.clone(),
             namespace: (!c.namespace_name.is_empty()).then(|| c.namespace_name.clone()),
         })
+        .collect()
+}
+
+/// Similar declarations the worker attached to a `not_found` verdict: the
+/// file's declarations whose short name matches the requested one across
+/// namespaces and case. Empty for every other status, and for workers that
+/// predate the suggestion.
+fn verification_not_found_similar(result: &DeclarationVerificationResult) -> Vec<String> {
+    let DeclarationVerificationResult::Ok {
+        verification_status,
+        facts,
+        ..
+    } = result
+    else {
+        return Vec::new();
+    };
+    if verification_status != "not_found" {
+        return Vec::new();
+    }
+    facts
+        .candidates
+        .iter()
+        .map(|candidate| candidate.declaration_name.clone())
         .collect()
 }
 
@@ -1908,12 +1908,11 @@ mod tests {
             },
         ];
 
-        let summary = summarize_rows(4, true, 2, &rows);
+        let summary = summarize_rows(4, true, &rows);
         assert_eq!(summary.requested, 4);
         assert_eq!(summary.verified, 1);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.needs_build, 1);
-        assert_eq!(summary.unknown_coverage, 2);
         assert!(summary.truncated);
     }
 

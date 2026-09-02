@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Every tool emits token-gated progress notifications (start, 15-second heartbeats, completion), not only
+  `lean_verify`, so clients that extend their deadline on progress no longer abandon a cold import or a long
+  elaboration in `lean_trial`, `lean_context`, `lean_lookup`, or `lean_status`.
+- Request synonyms: recurring mode and field spellings (`signature`, `tactic`, `command`, a bare `file` for
+  `lean_lookup(kind="declarations")`, a top-level or singular `lean_verify` target, string target groups, and more) are
+  normalized onto the canonical schema before decoding. A mode that names another tool's job, such as `search`, is
+  rejected with an error naming the tool and mode to call instead.
+- `lean_verify` `not_found` rows carry the file's declarations with a similar short name in `facts.candidates` and a
+  response warning, so a namespace or capitalization slip is corrected on the next call instead of a file listing.
+
 ### Changed
 
 - The default import residue budget is sized for the configured `broker.max_projects`, not the compiled-in default of
@@ -19,6 +31,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   resident-size policy are unchanged.
 - `ProjectRuntimeConfig::from_env_with_file` takes the pool size, `ProjectRuntimeConfig::default_for_projects` exposes
   the derivation, and startup logs the derived residue budget.
+
+### Removed
+
+- `lean_lookup(kind="changed_coverage")` and the `lean_verify` `changed` target group, with the `coverage` result
+  field and the `unknown_coverage` summary field. No consumer used them; mapping a diff to declarations is the caller's
+  job.
 
 ### Fixed
 

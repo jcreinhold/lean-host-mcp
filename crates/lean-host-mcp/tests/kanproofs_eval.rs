@@ -220,11 +220,11 @@ async fn kanproofs_unbuilt_import_degrades_to_build_warning() {
 /// What a changed-file sweep actually costs on a Mathlib-scale project, and
 /// whether the residue policy behaves as designed while paying it.
 ///
-/// This is the workload the byte-denominated bound exists for:
-/// `changed_coverage` loops `declaration_inventory` once per changed file, and
-/// on this project 96% of files carry a unique ordered import header — so *N*
-/// files means *N* distinct import profiles and *N* imports, each retaining its
-/// whole closure. The sweep here calls the same inventory path directly rather
+/// This is the workload the byte-denominated bound exists for: a changed-file
+/// sweep, as the stacks verifier runs it, calls `declaration_inventory` once
+/// per changed file, and on this project 96% of files carry a unique ordered
+/// import header — so *N* files means *N* distinct import profiles and *N*
+/// imports, each retaining its whole closure. The sweep here calls the same inventory path directly rather
 /// than through a git diff, so it needs no working-tree changes in the project
 /// under test.
 ///

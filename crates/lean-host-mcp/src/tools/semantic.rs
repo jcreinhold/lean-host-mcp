@@ -19,12 +19,12 @@ use crate::error::{Result, ServerError, WorkerUnavailable};
 use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolConfig, ToolContext};
 use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus, dedupe_artifacts};
 
-use super::changed_coverage::{self, ChangedCoverageRequest};
 use super::declaration::{self, InspectDeclarationRequest};
 use super::declaration_inventory::{self, DeclarationInventoryRequest};
 use super::position::{self, CommandTrialRequest, FileDiagnosticsRequest, FindReferencesRequest, ProofStateRequest};
 use super::proof_action::{self, LeanVerifyRequest, TryProofStepRequest};
 use super::proof_search::{self, SearchForProofRequest};
+use super::request_aliases::{canonical_kind, cross_tool_hint, normalize_args, normalize_verify_request};
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SemanticToolRequest {
@@ -309,20 +309,6 @@ fn lean_lookup_schema() -> Schema {
             }),
             json!({
                 "type": "object",
-                "description": "Map git hunks to declarations without verifying them.",
-                "required": ["kind"],
-                "properties": {
-                    "kind": { "const": "changed_coverage" },
-                    "base": { "type": ["string", "null"], "default": "HEAD" },
-                    "files": { "type": "array", "items": { "type": "string" } },
-                    "include_untracked": { "type": "boolean", "default": false },
-                    "project": { "type": ["string", "null"] }
-                },
-                "additionalProperties": false,
-                "examples": [semantic_example("lean_lookup", "changed_coverage").unwrap_or(Value::Null)]
-            }),
-            json!({
-                "type": "object",
                 "description": "Retrieve proof-search candidates from a file/declaration position or explicit goal text.",
                 "required": ["kind"],
                 "properties": {
@@ -434,12 +420,6 @@ fn semantic_example(tool: &str, kind: &str) -> Option<Value> {
             "kind": "declarations",
             "target": { "kind": "module", "module": "LeanRsFixture.ProofAgent" },
             "limit": 200
-        })),
-        ("lean_lookup", "changed_coverage") => Some(json!({
-            "kind": "changed_coverage",
-            "base": "HEAD",
-            "files": ["LeanRsFixture/ProofActions.lean"],
-            "include_untracked": true
         })),
         ("lean_lookup", "proof_search") => Some(json!({
             "kind": "proof_search",
@@ -606,9 +586,10 @@ impl StatusInclude {
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    match req.kind() {
+    let kind = req.kind().map(|kind| canonical_kind("lean_context", kind).to_owned());
+    match kind.as_deref() {
         Some("proof_position") => {
-            let request = match decode::<ProofStateRequest>(req, semantic_example("lean_context", "proof_position")) {
+            let request = match decode_kind::<ProofStateRequest>("lean_context", "proof_position", req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -626,16 +607,17 @@ pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    match req.kind() {
+    let kind = req.kind().map(|kind| canonical_kind("lean_trial", kind).to_owned());
+    match kind.as_deref() {
         Some("proof_step") => {
-            let request = match decode::<TryProofStepRequest>(req, semantic_example("lean_trial", "proof_step")) {
+            let request = match decode_kind::<TryProofStepRequest>("lean_trial", "proof_step", req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
             from_tool_response(proof_action::try_proof_step(ctx, request).await?, ctx.config)
         }
         Some("command") => {
-            let request = match decode::<CommandTrialRequest>(req, semantic_example("lean_trial", "command")) {
+            let request = match decode_kind::<CommandTrialRequest>("lean_trial", "command", req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -653,16 +635,11 @@ pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<S
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    match req.kind() {
-        None => {
-            let request = match decode::<LeanVerifyRequest>(req, semantic_example("lean_verify", "targets")) {
-                Ok(request) => request,
-                Err(response) => return Ok(*response),
-            };
-            lean_verify_targets(ctx, request).await
-        }
-        Some(kind) => Ok(invalid_kind("lean_verify", kind, &[])),
+    let mut value: Map<String, Value> = req.args.into_iter().collect();
+    if let Some(kind) = req.kind {
+        value.insert("kind".to_owned(), Value::String(kind));
     }
+    lean_verify_raw(ctx, Value::Object(value)).await
 }
 
 /// Declaration-verification entry point for the public MCP handler.
@@ -675,7 +652,8 @@ pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 ///
 /// Returns infrastructure failures only; malformed requests are structured
 /// semantic data.
-pub async fn lean_verify_raw(ctx: &ToolContext, value: Value) -> Result<SemanticResponse<Value>> {
+pub async fn lean_verify_raw(ctx: &ToolContext, mut value: Value) -> Result<SemanticResponse<Value>> {
+    normalize_verify_request(&mut value);
     if let Some(kind) = value
         .get("kind")
         .and_then(Value::as_str)
@@ -714,43 +692,34 @@ pub async fn lean_verify_targets(ctx: &ToolContext, request: LeanVerifyRequest) 
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    match req.kind() {
+    let kind = req.kind().map(|kind| canonical_kind("lean_lookup", kind).to_owned());
+    match kind.as_deref() {
         Some("declaration") => {
-            let request = match decode::<InspectDeclarationRequest>(req, semantic_example("lean_lookup", "declaration"))
-            {
+            let request = match decode_kind::<InspectDeclarationRequest>("lean_lookup", "declaration", req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
             from_tool_response(declaration::inspect_declaration(ctx, request).await?, ctx.config)
         }
         Some("declarations") => {
-            let request =
-                match decode::<DeclarationInventoryRequest>(req, semantic_example("lean_lookup", "declarations")) {
-                    Ok(request) => request,
-                    Err(response) => return Ok(*response),
-                };
+            let request = match decode_kind::<DeclarationInventoryRequest>("lean_lookup", "declarations", req) {
+                Ok(request) => request,
+                Err(response) => return Ok(*response),
+            };
             from_tool_response(
                 declaration_inventory::declaration_inventory(ctx, request).await?,
                 ctx.config,
             )
         }
-        Some("changed_coverage") => {
-            let request =
-                match decode::<ChangedCoverageRequest>(req, semantic_example("lean_lookup", "changed_coverage")) {
-                    Ok(request) => request,
-                    Err(response) => return Ok(*response),
-                };
-            from_tool_response(changed_coverage::changed_coverage(ctx, request).await?, ctx.config)
-        }
         Some("proof_search") => {
-            let request = match decode::<SearchForProofRequest>(req, semantic_example("lean_lookup", "proof_search")) {
+            let request = match decode_kind::<SearchForProofRequest>("lean_lookup", "proof_search", req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
             from_tool_response(proof_search::search_for_proof(ctx, request).await?, ctx.config)
         }
         Some("references") => {
-            let request = match decode::<FindReferencesRequest>(req, semantic_example("lean_lookup", "references")) {
+            let request = match decode_kind::<FindReferencesRequest>("lean_lookup", "references", req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -759,23 +728,11 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
         Some(kind) => Ok(invalid_kind(
             "lean_lookup",
             kind,
-            &[
-                "declaration",
-                "declarations",
-                "changed_coverage",
-                "proof_search",
-                "references",
-            ],
+            &["declaration", "declarations", "proof_search", "references"],
         )),
         None => Ok(missing_kind(
             "lean_lookup",
-            &[
-                "declaration",
-                "declarations",
-                "changed_coverage",
-                "proof_search",
-                "references",
-            ],
+            &["declaration", "declarations", "proof_search", "references"],
         )),
     }
 }
@@ -787,10 +744,10 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 /// Returns Lake-project resolution failures. Invalid semantic modes are
 /// returned as structured semantic errors.
 pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    let kind = req.kind().unwrap_or("project").to_owned();
+    let kind = canonical_kind("lean_status", req.kind().unwrap_or("project")).to_owned();
     match kind.as_str() {
         "project" => {
-            let request = match decode::<StatusRequest>(req, semantic_example("lean_status", "project")) {
+            let request = match decode_kind::<StatusRequest>("lean_status", "project", req) {
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
@@ -841,11 +798,10 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
             })
         }
         "file_diagnostics" => {
-            let request =
-                match decode::<FileDiagnosticsRequest>(req, semantic_example("lean_status", "file_diagnostics")) {
-                    Ok(request) => request,
-                    Err(response) => return Ok(*response),
-                };
+            let request = match decode_kind::<FileDiagnosticsRequest>("lean_status", "file_diagnostics", req) {
+                Ok(request) => request,
+                Err(response) => return Ok(*response),
+            };
             from_tool_response(position::file_diagnostics(ctx, request).await?, ctx.config)
         }
         other => Ok(invalid_kind("lean_status", other, &["project", "file_diagnostics"])),
@@ -1010,12 +966,19 @@ fn semantic_issues(
     out
 }
 
-fn decode<T>(req: SemanticToolRequest, example: Option<Value>) -> std::result::Result<T, Box<SemanticResponse<Value>>>
+/// Decode one mode's typed request after mapping the recurring field synonyms
+/// onto the canonical names (see [`super::request_aliases`]).
+fn decode_kind<T>(
+    tool: &str,
+    kind: &str,
+    req: SemanticToolRequest,
+) -> std::result::Result<T, Box<SemanticResponse<Value>>>
 where
     T: DeserializeOwned,
 {
-    let value = Value::Object(req.args.into_iter().collect());
-    decode_value(value, example)
+    let mut args: Map<String, Value> = req.args.into_iter().collect();
+    normalize_args(tool, kind, &mut args);
+    decode_value(Value::Object(args), semantic_example(tool, kind))
 }
 
 fn decode_value<T>(value: Value, example: Option<Value>) -> std::result::Result<T, Box<SemanticResponse<Value>>>
@@ -1058,11 +1021,15 @@ fn missing_kind(tool: &str, allowed: &[&str]) -> SemanticResponse<Value> {
 }
 
 fn invalid_kind(tool: &str, kind: &str, allowed: &[&str]) -> SemanticResponse<Value> {
-    let message = if allowed.is_empty() {
+    let mut message = if allowed.is_empty() {
         format!("{tool} does not support kind `{kind}`; omit `kind` for this tool")
     } else {
         format!("{tool} does not support kind `{kind}`; allowed: {}", allowed.join(", "))
     };
+    if let Some(hint) = cross_tool_hint(tool, kind) {
+        message.push(' ');
+        message.push_str(hint);
+    }
     SemanticResponse {
         data: None,
         errors: vec![SemanticIssue {

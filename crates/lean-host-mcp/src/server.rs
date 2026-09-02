@@ -25,9 +25,17 @@ use crate::broker::ProjectBroker;
 use crate::error::ServerError;
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
-const VERIFY_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 
-async fn with_verify_progress<T>(context: &RequestContext<RoleServer>, operation: impl Future<Output = T>) -> T {
+/// Run one tool call while heartbeating `notifications/progress` to the client.
+///
+/// Every worker-backed tool can legitimately run longer than a client's idle
+/// timeout: a cold import, a large file's elaboration, a proof-step batch.
+/// Clients such as Claude Code extend their per-call deadline only while
+/// progress notifications keep arriving, so the heartbeat is what keeps a slow
+/// but healthy call from being abandoned at the client while the worker keeps
+/// computing. Silent when the client sent no progress token.
+async fn with_progress<T>(context: &RequestContext<RoleServer>, tool: &str, operation: impl Future<Output = T>) -> T {
     let Some(progress_token) = context.meta.get_progress_token() else {
         return operation.await;
     };
@@ -37,16 +45,15 @@ async fn with_verify_progress<T>(context: &RequestContext<RoleServer>, operation
     let mut progress = 0.0;
     if let Err(error) = peer
         .notify_progress(
-            ProgressNotificationParam::new(progress_token.clone(), progress)
-                .with_message("Preparing Lean declaration verification"),
+            ProgressNotificationParam::new(progress_token.clone(), progress).with_message(format!("Preparing {tool}")),
         )
         .await
     {
-        tracing::debug!(?error, "could not send lean_verify start progress");
+        tracing::debug!(?error, tool, "could not send start progress");
     }
 
     tokio::pin!(operation);
-    let mut ticker = tokio::time::interval(VERIFY_PROGRESS_INTERVAL);
+    let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
 
@@ -59,13 +66,11 @@ async fn with_verify_progress<T>(context: &RequestContext<RoleServer>, operation
                     .notify_progress(
                         ProgressNotificationParam::new(progress_token, progress)
                             .with_total(progress)
-                            .with_message(format!(
-                                "Lean declaration verification finished ({elapsed:.1}s elapsed)"
-                            )),
+                            .with_message(format!("{tool} finished ({elapsed:.1}s elapsed)")),
                     )
                     .await
                 {
-                    tracing::debug!(?error, "could not send lean_verify finish progress");
+                    tracing::debug!(?error, tool, "could not send finish progress");
                 }
                 return result;
             }
@@ -75,13 +80,11 @@ async fn with_verify_progress<T>(context: &RequestContext<RoleServer>, operation
                 if let Err(error) = peer
                     .notify_progress(
                         ProgressNotificationParam::new(progress_token.clone(), progress)
-                            .with_message(format!(
-                                "Lean declaration verification still running ({elapsed}s elapsed)"
-                            )),
+                            .with_message(format!("{tool} still running ({elapsed}s elapsed)")),
                     )
                     .await
                 {
-                    tracing::debug!(?error, "could not send lean_verify heartbeat progress");
+                    tracing::debug!(?error, tool, "could not send heartbeat progress");
                 }
             }
         }
@@ -119,21 +122,37 @@ impl LeanHostService {
     async fn lean_context(
         &self,
         Parameters(req): Parameters<tools::semantic::LeanContextToolRequest>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_context", "tool call");
-        self.respond_semantic(tools::semantic::lean_context(&self.ctx, req.into_inner()).await)
+        self.respond_semantic(
+            Box::pin(with_progress(
+                &context,
+                "lean_context",
+                tools::semantic::lean_context(&self.ctx, req.into_inner()),
+            ))
+            .await,
+        )
     }
 
     #[tool(description = "Non-mutating Lean experiments. Kinds: proof_step, command.")]
     async fn lean_trial(
         &self,
         Parameters(req): Parameters<tools::semantic::LeanTrialToolRequest>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_trial", "tool call");
-        self.respond_semantic(tools::semantic::lean_trial(&self.ctx, req.into_inner()).await)
+        self.respond_semantic(
+            Box::pin(with_progress(
+                &context,
+                "lean_trial",
+                tools::semantic::lean_trial(&self.ctx, req.into_inner()),
+            ))
+            .await,
+        )
     }
 
-    #[tool(description = "Verify Lean declarations from explicit, file_all, module_all, or changed target groups.")]
+    #[tool(description = "Verify Lean declarations from explicit, file_all, or module_all target groups.")]
     async fn lean_verify(
         &self,
         Parameters(req): Parameters<tools::proof_action::LeanVerifyToolRequest>,
@@ -141,32 +160,47 @@ impl LeanHostService {
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_verify", "tool call");
         self.respond_semantic(
-            Box::pin(with_verify_progress(
+            Box::pin(with_progress(
                 &context,
+                "lean_verify",
                 tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()),
             ))
             .await,
         )
     }
 
-    #[tool(
-        description = "Semantic lookup. Kinds: declaration, declarations, changed_coverage, proof_search, references."
-    )]
+    #[tool(description = "Semantic lookup. Kinds: declaration, declarations, proof_search, references.")]
     async fn lean_lookup(
         &self,
         Parameters(req): Parameters<tools::semantic::LeanLookupToolRequest>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_lookup", "tool call");
-        self.respond_semantic(tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await)
+        self.respond_semantic(
+            Box::pin(with_progress(
+                &context,
+                "lean_lookup",
+                tools::semantic::lean_lookup(&self.ctx, req.into_inner()),
+            ))
+            .await,
+        )
     }
 
     #[tool(description = "Project/toolchain status and source diagnostics. Kinds: project, file_diagnostics.")]
     async fn lean_status(
         &self,
         Parameters(req): Parameters<tools::semantic::LeanStatusToolRequest>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         tracing::debug!(tool = "lean_status", "tool call");
-        self.respond_semantic(tools::semantic::lean_status(&self.ctx, req.into_inner()).await)
+        self.respond_semantic(
+            Box::pin(with_progress(
+                &context,
+                "lean_status",
+                tools::semantic::lean_status(&self.ctx, req.into_inner()),
+            ))
+            .await,
+        )
     }
 }
 

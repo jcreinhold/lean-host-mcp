@@ -217,17 +217,15 @@ operation modules:
 - `lean_trial(kind = "command")` runs bounded Lean command text such as `#check` or `#print axioms`, either under
   explicit imports or after a current file source snapshot. Info messages become rendered output; warnings and errors
   stay in diagnostics.
-- `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, module-wide, or changed
-  declaration target groups under the requested sorry/axiom policy. Policy failures are normal results. Its MCP handler
-  wraps the operation with token-gated progress notifications, including 15-second heartbeats, so transport visibility
-  remains observational and does not enter the verification or worker layers.
+- `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, or module-wide declaration
+  target groups under the requested sorry/axiom policy. Policy failures are normal results. All MCP handlers
+  wrap the operation with token-gated progress notifications, including 15-second heartbeats, so transport visibility
+  remains observational and does not enter the job or worker layers.
 - `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
   project declarations can resolve. Rendered fields are capped before crossing the worker boundary.
 - `lean_lookup(kind = "declarations")` lists declarations for a file or module. Source files use the edit-fresh worker
   declaration-outline selector; module requests fall back to the existing `.ilean` reader only when the source file is
   unavailable, reporting build-fresh or stale build artifact facts.
-- `lean_lookup(kind = "changed_coverage")` maps git hunks to source-fresh declaration spans without verifying them,
-  preserving unknown, deleted, and renamed coverage gaps.
 - `lean_lookup(kind = "proof_search")` builds a small target profile from proof context or explicit goal/type text, then
   tries a private source-backed `lean-semantic-search` lane before falling back to bounded lean-rs declaration search.
 - `lean_lookup(kind = "references")` runs semantic reference lookup for a fully-qualified name in file or bounded

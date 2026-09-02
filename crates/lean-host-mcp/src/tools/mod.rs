@@ -17,12 +17,12 @@
 
 use std::sync::Arc;
 
-pub(crate) mod changed_coverage;
 pub mod declaration;
 pub mod declaration_inventory;
 pub mod position;
 pub mod proof_action;
 pub mod proof_search;
+pub mod request_aliases;
 pub mod semantic;
 pub(crate) mod source_input;
 
