@@ -292,7 +292,7 @@ JSON-RPC errors:
   "trust": {
     "project_root": "/abs/path",
     "session_id": "uuid",
-    "lean_toolchain": "leanprover/lean4:v4.35.0-rc2",
+    "lean_toolchain": "leanprover/lean4:v4.35.0-rc3",
     "artifacts": [
       {
         "artifact": "worker",

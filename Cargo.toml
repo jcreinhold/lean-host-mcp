@@ -8,7 +8,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jcreinhold/lean-host-mcp"
 rust-version = "1.94"
-version = "0.14.0"
+version = "0.14.1"
 
 # Single version knob for the semver-fragile, version-coupled crate families.
 # The lean-rs stack is 0.x (adjacent minor lines are incompatible) and the
@@ -17,14 +17,14 @@ version = "0.14.0"
 # here (members reference them via `.workspace = true`) removes per-crate drift;
 # `deny.toml` enforces the no-duplicate-version invariant across the full graph.
 [workspace.dependencies]
-lean-rs-worker-child = "0.9.1"
-lean-rs-worker-parent = "0.9.1"
-lean-rs-worker-protocol = "0.9.1"
-lean-semantic-search-capability = "0.7.5"
-lean-semantic-search-contract = "0.7.5"
-lean-semantic-search-retrieval = "0.7.5"
-lean-semantic-search-runtime = "0.7.5"
-lean-toolchain = "0.9.1"
+lean-rs-worker-child = "0.9.2"
+lean-rs-worker-parent = "0.9.2"
+lean-rs-worker-protocol = "0.9.2"
+lean-semantic-search-capability = "0.7.6"
+lean-semantic-search-contract = "0.7.6"
+lean-semantic-search-retrieval = "0.7.6"
+lean-semantic-search-runtime = "0.7.6"
+lean-toolchain = "0.9.2"
 
 [workspace.lints.rust]
 future-incompatible = "warn"

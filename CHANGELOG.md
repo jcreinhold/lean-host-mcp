@@ -9,6 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-25
+
+### Changed
+
+- **Widened the toolchain window head to Lean 4.35.0-rc3 and added 4.34.1 to the window.** The requirements rise to
+  lean-rs 0.9.2 and lean-semantic-search 0.7.6 on the unchanged 0.9 / 0.7 lines, because `lean-toolchain` 0.9.1's
+  build script rejects the 4.34.1 and 4.35.0-rc3 `lean.h`. Both ship new digests carrying a refcount-helper patch with
+  no struct declaration changes. The supported window is now `4.30.0 ..= 4.35.0-rc3`. The fixture pin, the worker the
+  server is built and tested against, and the head-toolchain literals in the test suite and docs all move to
+  v4.35.0-rc3. The Rust floor is unchanged at 1.94.
+
 ### Fixed
 
 - **API docs no longer link to private items.** Thirteen rustdoc warnings (links to crate-private items and one link
@@ -597,7 +608,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.11.0...v0.12.0

@@ -81,6 +81,20 @@ require_cmd cargo "install via https://rustup.rs"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 
+# Build against the fixture's pinned toolchain, as ci.yml does. Without this,
+# lean-rs-sys discovers whatever `lean --print-prefix` resolves to from the
+# repo root (elan's default), so the debug worker the stdio lifecycle test
+# spawns links a different libleanshared than the fixture's .oleans need.
+# An explicit LEAN_SYSROOT still wins.
+if [[ -z "${LEAN_SYSROOT:-}" ]]; then
+	fixture_toolchain="$(cat fixtures/lean/lean-toolchain)"
+	export LEAN_SYSROOT="$HOME/.elan/toolchains/leanprover--lean4---${fixture_toolchain##*:}"
+	if [[ ! -d "$LEAN_SYSROOT" ]]; then
+		log_err "fixture toolchain $fixture_toolchain is not installed (elan toolchain install $fixture_toolchain)"
+		exit 2
+	fi
+fi
+
 # -- gate runner ------------------------------------------------------------
 
 declare -a PASSED=() FAILED=() SKIPPED=()
