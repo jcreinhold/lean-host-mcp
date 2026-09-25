@@ -1074,7 +1074,7 @@ mod tests {
         let dir = root.join("status");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("lakefile.lean"), "package status\nlean_lib Status\n").unwrap();
-        std::fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.34.0-rc2\n").unwrap();
+        std::fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0-rc2\n").unwrap();
         std::fs::write(dir.join("lake-manifest.json"), "{}\n").unwrap();
         dir.canonicalize().unwrap()
     }
@@ -1085,7 +1085,7 @@ mod tests {
             project_hash: "hash".to_owned(),
             imports: vec!["Init".to_owned()],
             session_id: "test-session".to_owned(),
-            lean_toolchain: "leanprover/lean4:v4.34.0-rc2".to_owned(),
+            lean_toolchain: "leanprover/lean4:v4.35.0-rc2".to_owned(),
             toolchain_advisories: Vec::new(),
         }
     }

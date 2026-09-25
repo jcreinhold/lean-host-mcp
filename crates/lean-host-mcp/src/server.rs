@@ -398,7 +398,7 @@ mod tests {
             "trust": {
                 "project_root": "/tmp/project",
                 "session_id": "session",
-                "lean_toolchain": "leanprover/lean4:v4.34.0-rc2"
+                "lean_toolchain": "leanprover/lean4:v4.35.0-rc2"
             }
         });
 

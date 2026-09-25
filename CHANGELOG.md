@@ -9,6 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Widened the toolchain window head to Lean 4.35.0-rc2 and added 4.34.0 and 4.35.0-rc1 to the window.** The
+  `lean-rs` / `lean-semantic-search` line is unchanged at 0.9 / 0.7, but the requirements rise to lean-rs 0.9.1 and
+  lean-semantic-search 0.7.5, because `lean-toolchain` 0.9.0's build script rejects the 4.35 `lean.h`. lean-rs 0.9.1's
+  `SUPPORTED_TOOLCHAINS` adds 4.34.0 (byte-identical header to 4.34.0-rc2), 4.35.0-rc1, and 4.35.0-rc2 (new digests,
+  no struct declaration changes). It also fixes scalar-array element sizes for arrays that 4.35 marks as linear. The
+  supported window is now `4.30.0 ..= 4.35.0-rc2`. The fixture pin, the worker the server is built and tested against,
+  and the head-toolchain literals in the test suite and docs all move to v4.35.0-rc2. The Rust floor is unchanged at
+  1.94.
+
 ## [0.13.0] - 2026-09-02
 
 ### Added
