@@ -24,13 +24,14 @@
 //!
 //! What the semantic adapter reads is kept to proof-relevant content. Operational
 //! telemetry is gated behind [`TelemetryVerbosity`](crate::tools::TelemetryVerbosity):
-//! in the default `quiet` mode the `runtime` block is omitted unless it carries
-//! an actionable signal (a worker restart — see [`RuntimeFacts::is_actionable`]),
-//! and `freshness` drops `project_hash` (the Lake-manifest SHA-256) and the full
-//! `imports` list. In `full` mode every field is emitted: `runtime` with its
-//! lifecycle/pressure counters, and `freshness` with all five fields, so a
-//! client can branch on `(project_root, project_hash)` to detect dependency
-//! changes between calls.
+//! in the default `quiet` mode the whole `telemetry` block — `project_hash` (the
+//! Lake-manifest SHA-256), the full `imports` list, and the worker `runtime`
+//! facts — is dropped, leaving `freshness` with its three identity fields. The
+//! one actionable signal a worker restart carries already reaches the agent as
+//! a top-level `warning`. In `full` mode the `telemetry` block is emitted too:
+//! `runtime` with its lifecycle/pressure counters, plus `project_hash` and
+//! `imports`, so a client can branch on `(project_root, project_hash)` to detect
+//! dependency changes between calls.
 //!
 //! Three volatile decisions hide behind one shape: what freshness means, how
 //! warning text is rendered, and how worker failure becomes structured data.
@@ -46,8 +47,8 @@ use crate::trust::ArtifactTrust;
 
 /// The project freshness snapshot a producer builds.
 ///
-/// Built by [`crate::project`]'s `freshness` and
-/// [`crate::error::WorkerUnavailable::freshness`]. Not serialized directly:
+/// Built by the project controller's `freshness` and by
+/// `WorkerUnavailable::freshness`. Not serialized directly:
 /// [`Response::ok`] splits it into the always-emitted [`FreshnessIdentity`] and
 /// the verbosity-gated [`Telemetry`] block.
 #[derive(Debug, Clone)]

@@ -113,7 +113,7 @@ impl ToolchainId {
     /// release, e.g. `v4.31.0-rc1 < v4.31.0`), then non-numbered pins
     /// (`nightly-*`) after, ordered by their string (dates sort naturally).
     ///
-    /// Reuses [`version_key`] so the ordering matches the supported-window
+    /// Reuses `version_key` so the ordering matches the supported-window
     /// logic. Callers (`install-worker` listing/scan) `.cmp()` these keys
     /// instead of comparing the raw strings, whose lexical order wrongly puts
     /// `v4.31.0-rc1` *after* `v4.31.0` (the release is a prefix of the rc).

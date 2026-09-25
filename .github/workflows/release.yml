@@ -97,6 +97,15 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # rustdoc per member: a broken or private intra-doc link ships to docs.rs
+      # as dead text, so fail on it here.
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc -p lean-host-mcp --no-deps
+          cargo doc -p lean-host-mcp-worker --no-deps
+
       # Build and test PER-MEMBER, never workspace-wide: a `--all-targets`
       # workspace build unifies the lean-rs-sys feature set across the parent and
       # worker, silently re-linking libleanshared into the parent.

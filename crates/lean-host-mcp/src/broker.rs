@@ -22,7 +22,7 @@
 //!
 //! **Manifest invalidation.** Every cache hit compares the project's
 //! `lake-manifest.json` hash and treats a mismatch as a miss: the project is
-//! shut down and re-spawned. The hash comes from [`ProjectBroker::meta`], which
+//! shut down and re-spawned. The hash comes from `ProjectBroker::meta`, which
 //! rebuilds a project's [`LakeProjectMeta`] only when the files it derives from
 //! have changed, so the steady-state cost is five `stat` calls per tool call
 //! rather than a lakefile parse and a manifest hash.

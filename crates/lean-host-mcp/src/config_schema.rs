@@ -1,6 +1,6 @@
 //! The one catalogue of every configuration knob.
 //!
-//! A knob is defined once, here, as a [`FieldDoc`] row in [`SCHEMA_FIELDS`]:
+//! A knob is defined once, here, as a `FieldDoc` row in `SCHEMA_FIELDS`:
 //! its TOML key, type, default, the env var / CLI flag that overrides it, and
 //! a one-line description. Two renderers consume that catalogue —
 //! [`render_default_toml`] writes the documented starter file `config init`

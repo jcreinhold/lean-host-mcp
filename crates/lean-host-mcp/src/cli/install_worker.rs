@@ -17,7 +17,7 @@
 //! The worker is always compiled locally per toolchain (its `build.rs` bakes an
 //! absolute rpath, so binaries don't travel), with `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>`
 //! set so the right rpath is baked in. Where the worker *source* comes from is
-//! decided once, internally, by [`resolve_worker_source`]: a local checkout
+//! decided once, internally, by `resolve_worker_source`: a local checkout
 //! (`cargo build -p lean-host-mcp-worker`) when this binary was built from one,
 //! otherwise the published crate (`cargo install lean-host-mcp-worker`). Callers
 //! of `install-worker` never choose; `--source-dir` is the override for the rare

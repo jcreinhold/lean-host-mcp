@@ -2,14 +2,14 @@
 # scripts/prerelease.sh — run every pre-release gate locally.
 #
 # This is the local mirror of `.github/workflows/ci.yml`'s `check` job
-# (fmt, clippy, build, test) PLUS the invariants CI does not enforce but
+# (fmt, clippy, rustdoc, build, test) PLUS the invariants CI does not enforce but
 # the repo already configures: the parent-binary link-set assertion
 # (AGENTS.md "Multi-toolchain dispatch"), taplo/mdwright format checks
 # (taplo.toml / .mdwright.toml / npx prettier), cargo-deny (deny.toml), and cargo-shear.
 # Passing locally is the fast feedback loop before a release tag.
 #
 # Unlike its sibling repos, CI here does NOT set RUSTFLAGS=-D warnings
-# globally — only clippy is `-D warnings`. We stay faithful to that.
+# globally — only clippy and rustdoc are `-D warnings`. We stay faithful to that.
 #
 # All gates are attempted even if an earlier one fails; the run ends with
 # a pass/fail/skip summary and a non-zero exit if anything failed. Optional
@@ -114,6 +114,13 @@ run_gate "cargo fmt --all -- --check" \
 # clippy --workspace is link-safe (no linking happens) per AGENTS.md.
 run_gate "cargo clippy --workspace --all-targets -- -D warnings" \
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# rustdoc per member: a broken or private intra-doc link is a warning docs.rs
+# renders as dead text, so it fails here instead of shipping.
+run_gate "cargo doc -p lean-host-mcp --no-deps (-D warnings)" \
+	env RUSTDOCFLAGS="-D warnings" cargo doc -p lean-host-mcp --no-deps
+run_gate "cargo doc -p lean-host-mcp-worker --no-deps (-D warnings)" \
+	env RUSTDOCFLAGS="-D warnings" cargo doc -p lean-host-mcp-worker --no-deps
 
 # Build and test PER-MEMBER, never workspace-wide. A `--workspace` /
 # `--all-targets` build unifies the `lean-rs-sys` feature set across the

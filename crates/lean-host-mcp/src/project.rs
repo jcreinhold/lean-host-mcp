@@ -436,7 +436,8 @@ impl ProjectRuntimeConfig {
     }
 
     /// Unreclaimable import residue one worker child may retain before the
-    /// supervisor cycles it; see [`WORKER_IMPORT_RESIDUE_CEILING_BYTES`].
+    /// supervisor cycles it. The derived default is a share of host RAM,
+    /// clamped to at most 12 GiB.
     #[must_use]
     pub const fn import_residue_budget_bytes(&self) -> u64 {
         self.import_residue_budget_bytes
@@ -450,10 +451,10 @@ impl ProjectRuntimeConfig {
     /// can only guess at how many projects will actually be resident. Also how
     /// a test forces the residue path to fire without a Mathlib-scale import.
     ///
-    /// Moves the Lean heap ceiling with it, for the reason
-    /// [`lean_max_memory_kib_for`] gives: a ceiling below the budget aborts the
-    /// child where the budget would have recycled it cleanly. Callers do not get
-    /// to hold the two independently, because there is no correct way to.
+    /// Moves the Lean heap ceiling with it (see [`Self::lean_max_memory_kib`]):
+    /// a ceiling below the budget aborts the child where the budget would have
+    /// recycled it cleanly. Callers do not get to hold the two independently,
+    /// because there is no correct way to.
     #[must_use]
     pub const fn with_import_residue_budget_bytes(mut self, bytes: u64) -> Self {
         self.import_residue_budget_bytes = bytes;
@@ -470,15 +471,18 @@ impl ProjectRuntimeConfig {
             .saturating_mul(WORKER_IMPORT_RESIDUE_SOFT_PERCENT)
     }
 
-    /// How many imported environments one worker child pools; see
-    /// [`WORKER_SESSION_POOL_CAPACITY`].
+    /// How many imported environments one worker child pools (default 8). A
+    /// held environment costs tens of MiB while re-importing one costs
+    /// gigabytes, so a small pool pays for itself.
     #[must_use]
     pub const fn session_pool_capacity(&self) -> usize {
         self.session_pool_capacity
     }
 
-    /// The Lean heap ceiling applied to each worker child; see
-    /// [`lean_max_memory_kib_for`].
+    /// The Lean heap ceiling applied to each worker child, in KiB: the import
+    /// residue budget plus headroom equal to the larger of the budget and
+    /// 8 GiB. Kept above the budget so an over-budget child is recycled cleanly
+    /// by the supervisor instead of aborted by Lean.
     #[must_use]
     pub const fn lean_max_memory_kib(&self) -> u64 {
         self.lean_max_memory_kib

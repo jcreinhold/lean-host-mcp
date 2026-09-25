@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **API docs no longer link to private items.** Thirteen rustdoc warnings (links to crate-private items and one link
+  to a method that does not exist) rendered as dead text on docs.rs. The public `ProjectRuntimeConfig` accessor docs now state
+  the memory and pool policy directly instead of pointing at private constants, and the envelope module doc now
+  describes the `quiet` telemetry gate accurately. CI and `scripts/prerelease.sh` now build both crates' docs with
+  `-D warnings`.
+
 ## [0.14.0] - 2026-09-25
 
 ### Changed
@@ -280,7 +288,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   an import switch costs.
 - `benches/ilean_reference_scan.rs` measures a project-scope reference query end to end, with a no-hit arm that
   separates the scan floor from result construction and a narrowed arm. The previous number on record — "~565 ms" — was
-  a single wall-clock sample from an `#[ignore]`d test on a corpus a third the size.
+  a single wall-clock sample from an `#[ignore]` test on a corpus a third the size.
 - A reused session's environment is a snapshot taken at import, so a `lake build` that rewrites an imported `.olean`
   would otherwise keep being answered from the pre-build environment. The controller now stamps the newest `.olean`
   mtime among a session's imports, re-stamps before each reusing call, and recycles the worker when it advances —

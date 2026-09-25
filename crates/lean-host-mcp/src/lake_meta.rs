@@ -65,7 +65,7 @@ impl LakeProjectMeta {
     ///
     /// Returns [`ServerError::BadProject`] when the path does not
     /// canonicalise, neither lakefile variant is present, both parsers reject
-    /// the file, or [`fingerprint_lake_project`] cannot read the manifest.
+    /// the file, or the Lake manifest cannot be read.
     pub fn from_explicit(root: &Path) -> Result<Self> {
         let canonical_root = root
             .canonicalize()
