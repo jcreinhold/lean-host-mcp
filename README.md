@@ -148,7 +148,7 @@ for runtime failures and warnings; `trust` is the small project/session identity
   "trust": {
     "project_root": "/abs/path",
     "session_id": "uuid-or-metadata-only",
-    "lean_toolchain": "leanprover/lean4:v4.35.0-rc3",
+    "lean_toolchain": "leanprover/lean4:v4.35.0",
     "artifacts": [
       {
         "artifact": "source",
@@ -191,8 +191,8 @@ Two proof-agent details are worth calling out:
 ## Versions
 
 `lean-host-mcp` 0.14.1 builds on `lean-rs-worker-parent` / `-child` 0.9, which transitively pin `lean-rs` /
-`lean-rs-host` 0.9 (0.9.2). It supports the Lean window `4.30.0 ..= 4.35.0-rc3` and is built and tested against the head
-of that window, Lean **4.35.0-rc3**.
+`lean-rs-host` 0.9 (0.9.4). It supports the Lean window `4.30.0 ..= 4.35.0` and is built and tested against the head
+of that window, Lean **4.35.0**.
 
 A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long
 as it falls inside the supported window. The window is read directly from `lean-toolchain::SUPPORTED_TOOLCHAINS` (itself

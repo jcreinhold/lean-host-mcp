@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Widened the toolchain window head to Lean 4.35.0.** The requirements rise to lean-rs 0.9.4 and lean-semantic-search
+  0.7.7 on the unchanged 0.9 / 0.7 lines. The final 4.35.0 ships a `lean.h` byte-identical to 4.35.0-rc3 and 4.35.0-rc4,
+  so both join the existing window entry and no bindings change. The supported window is now `4.30.0 ..= 4.35.0`. The
+  fixture pin, the worker the server is built and tested against, and the head-toolchain literals in the test suite and
+  docs all move to v4.35.0. The Rust floor is unchanged at 1.94.
+
 ## [0.14.1] - 2026-09-25
 
 ### Changed
