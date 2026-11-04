@@ -2241,10 +2241,10 @@ impl ProjectActorState {
             self.config.import_residue_budget_bytes / (1024 * 1024),
         );
         if let Err(err) = self.handle.cycle() {
-            // Nothing is owed to a caller here — there is no call in flight —
-            // and the reactive bound still stands, so a failed idle cycle is a
-            // missed optimisation rather than an error to propagate.
-            tracing::debug!(error = %err, "idle worker cycle failed; the reactive residue bound still applies");
+            // There is no caller to reply to here. The supervisor retains any
+            // failed replacement whose exit is unconfirmed; its historical old
+            // exit cannot acknowledge shutdown or release this actor's slot.
+            tracing::debug!(error = %err, "idle worker cycle failed; replacement remains supervised through shutdown");
             return;
         }
         // A full clear, not `forget_pooled_import_profiles`: that one preserves

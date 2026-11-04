@@ -75,6 +75,11 @@ resources have been freed. The token and broker instance identity are process-lo
 priority policy, preemption, or persistence. See the [tool catalog](tool-catalog.md#worker-activity-and-admission-leases)
 for the public contract.
 
+The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's
+exit cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps
+the project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains
+uncertain.
+
 ## Project And Worker Boundary
 
 `ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction, manifest

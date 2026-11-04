@@ -34,7 +34,7 @@
 //! **Admission.** Each project owns a serialized worker thread with a bounded
 //! mailbox. Capacity reservations count resident, opening, and retiring workers
 //! until confirmed exit. Ordinary concurrency is [`BrokerConfig::max_projects`]
-//! workers × one in-flight job each. An explicit [`Self::runtime_control`] lease
+//! workers × one in-flight job each. An explicit [`ProjectBroker::runtime_control`] lease
 //! can atomically pause idle-pool admission for a cooperating external caller;
 //! it preserves warm caches unless the caller requests retirement.
 
