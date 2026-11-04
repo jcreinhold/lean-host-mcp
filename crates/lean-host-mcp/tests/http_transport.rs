@@ -20,9 +20,10 @@ use tokio::process::{Child, ChildStderr, Command};
 
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const EXPECTED_TOOLS: [&str; 5] = [
+const EXPECTED_TOOLS: [&str; 6] = [
     "lean_context",
     "lean_lookup",
+    "lean_runtime",
     "lean_status",
     "lean_trial",
     "lean_verify",
@@ -723,6 +724,145 @@ fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.to_str().expect("UTF-8 test path").replace('\'', "'\\''"))
 }
 
+#[tokio::test]
+async fn streamable_http_runtime_lease_is_immediate_and_owned_across_connections() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
+    std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
+    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    let root_s = root.path().to_string_lossy();
+    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
+    let mut owner = TaskHttpClient::new(&server.url);
+    let acquired = owner.control(json!({"action": "acquire"})).await;
+    assert_eq!(acquired["status"], "acquired");
+    assert_eq!(acquired["pool"]["workers_stopped"], true);
+    let token = acquired["lease_id"].as_str().unwrap().to_owned();
+    drop(owner);
+    let mut reconnected = TaskHttpClient::new(&server.url);
+    let status = reconnected.control(json!({"action": "status"})).await;
+    assert_eq!(status["pool"]["admission_paused"], true);
+    assert!(status.get("lease_id").is_none());
+    assert_eq!(status["pool"]["instance_id"], acquired["pool"]["instance_id"]);
+    let invalid = reconnected
+        .control(json!({"action": "release", "lease_id": "wrong"}))
+        .await;
+    assert_eq!(invalid["status"], "invalid_lease");
+    let mut legacy = server.new_session().await;
+    let denied = legacy.request("tools/call", json!({"name": "lean_trial", "arguments": {"kind": "command", "imports": ["Init"], "commands": "#check Nat"}})).await.unwrap();
+    assert_eq!(
+        runtime_error_reason(&denied.json).as_deref(),
+        Some("worker_pool_leased"),
+        "{}",
+        denied.json
+    );
+    assert!(denied.json.pointer("/result/taskId").is_none());
+    let metadata = legacy
+        .request(
+            "tools/call",
+            json!({"name": "lean_status", "arguments": {"kind": "project"}}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        metadata
+            .json
+            .pointer("/result/structuredContent/data/worker_opened")
+            .is_some_and(|opened| opened == false)
+    );
+    let renewed = reconnected
+        .control(json!({"action": "renew", "lease_id": token, "lease_seconds": 60}))
+        .await;
+    assert_eq!(renewed["status"], "ok");
+    assert!(renewed["pool"]["lease_remaining_millis"].as_u64().unwrap() > 30_000);
+    let released = reconnected
+        .control(json!({"action": "release", "lease_id": token}))
+        .await;
+    assert_eq!(released["status"], "ok");
+    assert_eq!(released["pool"]["admission_paused"], false);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires built Lean fixture and worker binary"]
+async fn streamable_http_runtime_lease_preserves_warm_workers_and_retires_only_idle_work() {
+    let root = fixture_root();
+    let root_s = root.to_string_lossy();
+    let server = HttpMcpServer::start_with_env(
+        &[("--lake-root", root_s.as_ref())],
+        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
+    )
+    .await;
+    let mut client = TaskHttpClient::new(&server.url);
+    let warm = client.command("#eval (1 : Nat)").await;
+    assert_eq!(
+        client.terminal(&warm, Duration::from_secs(30)).await["result"]["status"],
+        "completed"
+    );
+    let acquired = client.acquire_idle(false).await;
+    assert_eq!(acquired["pool"]["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(acquired["pool"]["occupied_slots"], 1);
+    assert_eq!(acquired["retirement_requested"], 0);
+    let generation = acquired["pool"]["projects"][0]["runtime"]["worker_generation"].clone();
+    let token = acquired["lease_id"].as_str().unwrap().to_owned();
+    client.control(json!({"action": "release", "lease_id": token})).await;
+    let repeat = client.command("#eval (2 : Nat)").await;
+    assert_eq!(
+        client.terminal(&repeat, Duration::from_secs(10)).await["result"]["status"],
+        "completed"
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let started = scratch.path().join("started");
+    let finished = scratch.path().join("finished");
+    let running = client
+        .command(&sentinel_command(&started, Some((&finished, 4_000))))
+        .await;
+    wait_for_sentinel(&started, Duration::from_secs(10)).await;
+    let busy = client.control(json!({"action": "acquire", "retire_idle": true})).await;
+    assert_eq!(busy["status"], "busy");
+    assert!(busy.get("lease_id").is_none());
+    assert_eq!(busy["pool"]["projects"][0]["idle"], false);
+    assert!(busy["pool"]["projects"][0]["outstanding_jobs"].as_u64().unwrap() >= 1);
+    assert_eq!(busy["pool"]["projects"][0]["runtime"]["worker_generation"], generation);
+    assert_eq!(
+        client.terminal(&running, Duration::from_secs(10)).await["result"]["status"],
+        "completed"
+    );
+    assert!(finished.exists(), "claiming must not cancel existing work");
+    let retired = client.acquire_idle(true).await;
+    assert_eq!(retired["retirement_requested"], 1);
+    assert!(retired["pool"]["projects"].as_array().unwrap().is_empty());
+    let token = retired["lease_id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client.control(json!({"action": "status"})).await;
+            assert_eq!(status["pool"]["admission_paused"], true);
+            if status["pool"]["workers_stopped"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("retired child must confirm exit");
+    let blocked = client.command("#eval (3 : Nat)").await;
+    let blocked = client.terminal(&blocked, Duration::from_secs(10)).await;
+    assert_eq!(
+        runtime_error_reason(&json!({"result": blocked["result"]["result"]})).as_deref(),
+        Some("worker_pool_leased")
+    );
+    let still_stopped = client.control(json!({"action": "status"})).await;
+    assert_eq!(still_stopped["pool"]["workers_stopped"], true);
+    client.control(json!({"action": "release", "lease_id": token})).await;
+    let healthy = scratch.path().join("healthy");
+    let next = client.command(&sentinel_command(&healthy, None)).await;
+    assert_eq!(
+        client.terminal(&next, Duration::from_secs(10)).await["result"]["status"],
+        "completed"
+    );
+    assert!(healthy.exists());
+    server.shutdown().await;
+}
+
 struct TaskHttpClient {
     client: reqwest::Client,
     url: String,
@@ -730,6 +870,37 @@ struct TaskHttpClient {
 }
 
 impl TaskHttpClient {
+    async fn control(&mut self, arguments: Value) -> Value {
+        let response = self
+            .request("tools/call", json!({"name": "lean_runtime", "arguments": arguments}))
+            .await;
+        assert!(
+            response.pointer("/result/taskId").is_none(),
+            "control must remain synchronous: {response}"
+        );
+        response
+            .pointer("/result/structuredContent")
+            .expect("structured control response")
+            .clone()
+    }
+
+    async fn acquire_idle(&mut self, retire_idle: bool) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let result = self
+                    .control(json!({"action": "acquire", "retire_idle": retire_idle}))
+                    .await;
+                if result["status"] == "acquired" {
+                    return result;
+                }
+                assert_eq!(result["status"], "busy");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("finished worker must become claimable")
+    }
+
     fn new(url: &str) -> Self {
         Self {
             client: reqwest::Client::builder()

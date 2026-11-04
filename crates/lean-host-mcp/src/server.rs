@@ -26,7 +26,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_router};
 
-use crate::broker::ProjectBroker;
+use crate::broker::{ProjectBroker, RuntimeControlRequest};
 use crate::cancellation::with_cancellation;
 use crate::error::ServerError;
 use crate::tasks::RequestTasks;
@@ -127,6 +127,19 @@ impl LeanHostService {
 #[tool_router]
 impl LeanHostService {
     #[tool(
+        description = "Observe worker activity or atomically lease the idle worker pool. Actions: status, acquire, renew, release. Leases keep warm caches unless retire_idle is explicitly true; renew before expiry while relying on the pause."
+    )]
+    async fn lean_runtime(
+        &self,
+        Parameters(request): Parameters<RuntimeControlRequest>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        Ok(carry(
+            &self.ctx.broker.runtime_control(&request),
+            self.ctx.config.carrier,
+        ))
+    }
+
+    #[tool(
         description = "Lean proof or term context. Use kind=\"proof_position\" for proof state at a declaration position."
     )]
     async fn lean_context(
@@ -220,7 +233,9 @@ impl ServerHandler for LeanHostService {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if context.client_capabilities().is_some_and(|caps| caps.supports_tasks()) {
+        // Coordination is immediate and must return its lease token directly,
+        // even for clients that negotiate asynchronous Lean job handles.
+        if request.name != "lean_runtime" && context.client_capabilities().is_some_and(|caps| caps.supports_tasks()) {
             // Parse before acceptance. Task calls use no request-scoped peer or
             // cancellation token, so disconnecting cannot abandon their result.
             let call = TaskCall::parse(&request)?;

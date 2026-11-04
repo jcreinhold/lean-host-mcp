@@ -26,6 +26,7 @@ crates/lean-host-mcp/src/
   transport_http.rs private axum/rmcp Streamable HTTP entry
   server.rs         LeanHostService tool registration
   broker.rs         ProjectBroker: LRU pool, idle eviction, per-call routing
+  broker/control.rs process-local worker activity snapshots and expiring admission leases
   project.rs        LeanProject serialized controller for one Lake project
   tools/            semantic.rs facade; declaration/proof_search/proof_action/position internals
   projections.rs    stable MCP projections from lean-rs worker types
@@ -61,6 +62,18 @@ opening a Lean session; in-flight cancellation uses the worker layer's token and
 Cancellation remains bounded by supervisor observation and deadlines, rather than being an instantaneous stop. The
 owning operation waits for its terminal cleanup instead of treating a cancellation acknowledgement as termination.
 Dropping a caller's future also signals cancellation without freeing the worker's capacity early.
+
+`lean_runtime` is an additional synchronous operational tool, separate from the five semantic job families. Its idle-pool
+lease shares the broker registry mutex with both resident project borrowing and startup-lock acquisition. A claim is
+refused while any caller holds a project, any startup lock is retained, or any actor-owned message remains active.
+Background recycling and prewarming acquire actor activity under that same lock; old controllers cannot start it after
+eviction. Pool activity counts survive registry removal and remain held through cleanup. Once claimed, new worker
+admission is refused until release or monotonic expiry. Idle reaping also pauses, preserving
+warm caches unless the acquirer explicitly requests retirement. Retirement only closes idle actors' mailboxes; the
+existing worker permits still wait for confirmed shutdown. Snapshots and shutdown requests alone do not establish that
+resources have been freed. The token and broker instance identity are process-local, with no cross-process scheduling,
+priority policy, preemption, or persistence. See the [tool catalog](tool-catalog.md#worker-activity-and-admission-leases)
+for the public contract.
 
 ## Project And Worker Boundary
 

@@ -622,13 +622,15 @@ impl RetryPolicy {
     }
 }
 
-struct ActiveJobGuard {
+pub(crate) struct ActiveJobGuard {
     active_jobs: Arc<AtomicUsize>,
+    pool_active_jobs: Arc<AtomicUsize>,
 }
 
 impl Drop for ActiveJobGuard {
     fn drop(&mut self) {
         self.active_jobs.fetch_sub(1, Ordering::AcqRel);
+        self.pool_active_jobs.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -982,6 +984,7 @@ pub(crate) struct LeanProject {
     open_warnings: Vec<String>,
     actor_tx: Mutex<Option<mpsc::Sender<ProjectMessage>>>,
     active_jobs: Arc<AtomicUsize>,
+    pool_active_jobs: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     module_queries: ModuleQueryCache,
@@ -1022,6 +1025,7 @@ impl LeanProject {
         meta: LakeProjectMeta,
         runtime_config: ProjectRuntimeConfig,
         slot: OwnedSemaphorePermit,
+        maintenance: crate::broker::MaintenanceAccess,
     ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
@@ -1036,14 +1040,16 @@ impl LeanProject {
             import_residue_limit_bytes: None,
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
+        let pool_active_jobs = maintenance.activity_counter();
         let healthy = Arc::new(AtomicBool::new(true));
-        let (config, open_warnings) = ActorConfig::from_meta(
+        let (mut config, open_warnings) = ActorConfig::from_meta(
             &meta,
             session_id.clone(),
             Arc::clone(&runtime),
             Arc::clone(&healthy),
             runtime_config,
         )?;
+        config.maintenance = maintenance;
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
@@ -1075,6 +1081,7 @@ impl LeanProject {
             open_warnings,
             actor_tx: Mutex::new(Some(actor_tx)),
             active_jobs,
+            pool_active_jobs,
             healthy,
             runtime,
             module_queries: ModuleQueryCache::with_capacity(cache_cap),
@@ -1277,6 +1284,7 @@ impl LeanProject {
     fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy) -> JobMeta {
         let created_at = Instant::now();
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
+        self.pool_active_jobs.fetch_add(1, Ordering::AcqRel);
         JobMeta {
             import_fingerprint: import_fingerprint(&imports),
             imports,
@@ -1286,6 +1294,7 @@ impl LeanProject {
             retry_policy,
             _active_job: ActiveJobGuard {
                 active_jobs: Arc::clone(&self.active_jobs),
+                pool_active_jobs: Arc::clone(&self.pool_active_jobs),
             },
             cancellation: CallCancellation::current(),
         }
@@ -1386,7 +1395,23 @@ impl LeanProject {
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        self.active_jobs.load(Ordering::Acquire) == 0
+        self.outstanding_jobs() == 0
+    }
+
+    pub(crate) fn outstanding_jobs(&self) -> usize {
+        self.active_jobs.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_maintenance(&self, session_id: &str) -> Option<ActiveJobGuard> {
+        if self.session_id != session_id || !self.is_healthy() {
+            return None;
+        }
+        self.active_jobs.fetch_add(1, Ordering::AcqRel);
+        self.pool_active_jobs.fetch_add(1, Ordering::AcqRel);
+        Some(ActiveJobGuard {
+            active_jobs: Arc::clone(&self.active_jobs),
+            pool_active_jobs: Arc::clone(&self.pool_active_jobs),
+        })
     }
 
     fn unavailable(&self, reason: impl Into<String>, retryable: bool, worker_restarted: bool) -> ServerError {
@@ -1431,6 +1456,7 @@ impl Drop for LeanProject {
 
 #[derive(Clone)]
 struct ActorConfig {
+    maintenance: crate::broker::MaintenanceAccess,
     lake_root: PathBuf,
     manifest_hash: String,
     toolchain_label: String,
@@ -1553,6 +1579,7 @@ impl ActorConfig {
             "resolved ready worker binary"
         );
         let config = Self {
+            maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: meta.canonical_root.clone(),
             manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
@@ -1926,14 +1953,28 @@ impl ProjectActorState {
         // The semantic search runs in this separate capability child, so the
         // CPU delta samples it rather than the main worker handle.
         let cpu_baseline = capability.cumulative_cpu_millis();
-        let result = {
+        let result = (|| {
             let mut session = capability
                 .open_session_with_imports(meta.imports.clone(), Some(meta.cancellation.worker()), None)
                 .map_err(map_worker_err)?;
             crate::semantic_search::run_semantic_proof_search(&mut session, request, meta.cancellation.worker())
-        };
+        })();
         let call_cpu_millis =
             cpu_baseline.and_then(|start| capability.cumulative_cpu_millis().map(|end| end.saturating_sub(start)));
+        // A pool lease must not advertise confirmed exit after an unobserved
+        // companion shutdown. Retain the project's slot if its child is uncertain.
+        if let Err(error) = capability.shutdown() {
+            self.config.startup_uncertain.store(true, Ordering::Release);
+            return Err(self.worker_unavailable_for(
+                &meta,
+                format!("semantic capability shutdown uncertain: {error}"),
+                false,
+                false,
+                None,
+                None,
+                None,
+            ));
+        }
         let runtime = self.runtime_facts(
             &meta,
             generation_before,
@@ -1987,6 +2028,9 @@ impl ProjectActorState {
         semantic_capability_builder(&self.config, &runtime.built)?
             .open()
             .map_err(|err| {
+                if startup_outcome_uncertain(&err) {
+                    self.config.startup_uncertain.store(true, Ordering::Release);
+                }
                 self.worker_unavailable_for(
                     meta,
                     format!(
@@ -2169,6 +2213,15 @@ impl ProjectActorState {
 
     fn cycle_over_soft_budget(&mut self, quiesced: bool) {
         let Some(residue) = self.over_soft_budget() else {
+            return;
+        };
+        // Idle recycling and prewarming can start a child and elaborate Lean.
+        // They participate in the same atomic admission/retirement boundary.
+        let Some(_activity) = self
+            .config
+            .maintenance
+            .try_begin(&self.config.lake_root, &self.config.session_id)
+        else {
             return;
         };
         // Captured before the cycle, because the cycle invalidates every
@@ -3314,6 +3367,7 @@ mod tests {
             import_residue_limit_bytes: None,
         }));
         let config = ActorConfig {
+            maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: tmp.path().join("consumer"),
             manifest_hash: "sha256-test".to_owned(),
             toolchain_label: "leanprover/lean4:test".to_owned(),
@@ -3468,6 +3522,7 @@ mod tests {
     fn cancelled_queued_messages_keep_their_cancellation_and_release_activity_on_drop() {
         let cancellation = CallCancellation::default();
         let active = Arc::new(AtomicUsize::new(1));
+        let pool_active = Arc::new(AtomicUsize::new(1));
         let (reply, _receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
             meta: JobMeta {
@@ -3479,6 +3534,7 @@ mod tests {
                 retry_policy: RetryPolicy::RetryOnceReadOnly,
                 _active_job: ActiveJobGuard {
                     active_jobs: Arc::clone(&active),
+                    pool_active_jobs: Arc::clone(&pool_active),
                 },
                 cancellation: cancellation.clone(),
             },
@@ -3491,6 +3547,7 @@ mod tests {
         assert!(message.meta().cancellation.is_cancelled());
         drop(message);
         assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(pool_active.load(Ordering::Acquire), 0);
     }
     #[test]
     fn startup_capacity_requires_no_spawn_or_confirmed_exit_evidence() {

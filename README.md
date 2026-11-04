@@ -22,8 +22,9 @@ Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups d
 - **`lean_status`** — project/toolchain/config status and current-source file diagnostics. Modes: `project` and
   `file_diagnostics`.
 
-Every call is non-mutating: the server reads source and elaborates in memory, and never touches your files. The typical
-workflow and the request/result schema for each tool are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
+The semantic calls read source and elaborate in memory. The separate `lean_runtime` tool observes worker activity or
+obtains an expiring lease on an idle worker pool, keeping warm caches unless retirement is explicitly requested. No
+tool writes source. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
 
 ## Quick start
 

@@ -31,14 +31,12 @@
 //! worker spawn or command execution. Concurrent misses for the same
 //! canonical root are coalesced so only one project controller is opened.
 //!
-//! **Admission.** There is no broker-level gate. The resource that needs
-//! protecting is one worker child's serialized request stream, and that is
-//! already structural: each project owns a dedicated OS thread that runs one
-//! job at a time, fed by a bounded mailbox that sheds retryably when full. A
-//! process-wide semaphore on top of that would protect nothing the actor does
-//! not, while serializing calls to *different* projects that share no worker.
-//! Concurrency is therefore [`BrokerConfig::max_projects`] workers × one
-//! in-flight job each.
+//! **Admission.** Each project owns a serialized worker thread with a bounded
+//! mailbox. Capacity reservations count resident, opening, and retiring workers
+//! until confirmed exit. Ordinary concurrency is [`BrokerConfig::max_projects`]
+//! workers × one in-flight job each. An explicit [`Self::runtime_control`] lease
+//! can atomically pause idle-pool admission for a cooperating external caller;
+//! it preserves warm caches unless the caller requests retirement.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -67,6 +65,12 @@ use crate::error::{Result, ServerError};
 use crate::lake_meta::{LakeProjectMeta, ProjectInputStamp};
 use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
+
+mod control;
+pub(crate) use control::MaintenanceAccess;
+pub use control::{
+    RuntimeAction, RuntimeControlRequest, RuntimeControlResult, RuntimeControlStatus, WorkerActivity, WorkerPoolStatus,
+};
 
 /// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
 pub const DEFAULT_MAX_PROJECTS: usize = 4;
@@ -216,6 +220,7 @@ impl ProjectHint {
 }
 
 struct BrokerInner {
+    control: control::ControlState,
     registry: LruCache<PathBuf, Arc<LeanProject>>,
     last_used: HashMap<PathBuf, Instant>,
     opening_locks: HashMap<PathBuf, Weak<AsyncMutex<()>>>,
@@ -278,6 +283,7 @@ impl ProjectBroker {
     pub fn new_with_runtime_config(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<Self> {
         let broker = Arc::new(Self {
             inner: Arc::new(Mutex::new(BrokerInner {
+                control: control::ControlState::default(),
                 registry: LruCache::new(config.max_projects),
                 last_used: HashMap::new(),
                 opening_locks: HashMap::new(),
@@ -761,14 +767,14 @@ impl ProjectBroker {
     /// Look up or open the project for `root`. Mutex is released around
     /// the slow path so concurrent calls for different roots parallelize.
     async fn acquire(&self, root: PathBuf) -> Result<Arc<LeanProject>> {
-        let epoch = self.inner.lock().shutdown_epoch;
         if CallCancellation::current().is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
         // Fast path: registry hit + matching manifest hash.
-        let cached = {
+        let (epoch, cached) = {
             let mut inner = self.inner.lock();
-            inner.registry.get(&root).cloned()
+            Self::check_runtime_admission(&mut inner, &root)?;
+            (inner.shutdown_epoch, inner.registry.get(&root).cloned())
         };
         if let Some(project) = cached {
             let current_hash = self.meta(&root)?.manifest_hash;
@@ -798,7 +804,7 @@ impl ProjectBroker {
             drop(project);
         }
 
-        let open_lock = self.opening_lock(&root);
+        let open_lock = self.opening_lock(&root)?;
         let cancellation = CallCancellation::current();
         let open_guard = tokio::select! {
             guard = Arc::clone(&open_lock).lock_owned() => guard,
@@ -847,12 +853,13 @@ impl ProjectBroker {
         }
         let runtime_config = self.runtime_config.clone();
         let inner = Arc::clone(&self.inner);
+        let maintenance = MaintenanceAccess::new(&self.inner);
         let root = root.clone();
         let opened = tokio::task::spawn_blocking(move || {
             // Hold same-root serialization through registration even when the
             // async caller disappears while blocking startup is still running.
             let _open_guard = open_guard;
-            let opened = LeanProject::open(meta, runtime_config, slot)?;
+            let opened = LeanProject::open(meta, runtime_config, slot, maintenance)?;
             let mut registry = inner.lock();
             if registry.shutdown_epoch != epoch {
                 drop(registry);
@@ -877,15 +884,30 @@ impl ProjectBroker {
         opened
     }
 
-    fn opening_lock(&self, root: &Path) -> Arc<AsyncMutex<()>> {
+    fn opening_lock(&self, root: &Path) -> Result<Arc<AsyncMutex<()>>> {
         let mut inner = self.inner.lock();
+        // Claim acquisition uses this same mutex. A cold caller must either
+        // retain its opening lock before the claim, or observe the held lease.
+        Self::check_runtime_admission(&mut inner, root)?;
         inner.opening_locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = inner.opening_locks.get(root).and_then(Weak::upgrade) {
-            return lock;
+            return Ok(lock);
         }
         let lock = Arc::new(AsyncMutex::new(()));
         inner.opening_locks.insert(root.to_path_buf(), Arc::downgrade(&lock));
-        lock
+        drop(inner);
+        Ok(lock)
+    }
+
+    fn check_runtime_admission(inner: &mut BrokerInner, root: &Path) -> Result<()> {
+        if let Some(remaining) = inner.control.remaining(Instant::now()) {
+            let mut error = Self::pool_unavailable(root, "worker_pool_leased", true);
+            if let ServerError::WorkerUnavailable(info) = &mut error {
+                info.retry_after_millis = Some(remaining);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn reserve_worker_slot(&self, root: &Path) -> Result<OwnedSemaphorePermit> {
@@ -963,6 +985,11 @@ impl ProjectBroker {
         let now = Instant::now();
         let evicted: Vec<Arc<LeanProject>> = {
             let mut inner = self.inner.lock();
+            // A maintenance caller explicitly chose to keep warm caches.
+            // Ordinary idle eviction resumes when its lease ends.
+            if inner.control.remaining(now).is_some() {
+                return;
+            }
             let expired: Vec<PathBuf> = inner
                 .last_used
                 .iter()
@@ -1338,15 +1365,15 @@ mod tests {
     async fn opening_locks_survive_shutdown_and_a_disappearing_caller() {
         let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None, None));
         let root = PathBuf::from("/project");
-        let original = broker.opening_lock(&root);
+        let original = broker.opening_lock(&root).unwrap();
         let waiting = Arc::clone(&original);
         broker.shutdown_all();
         drop(original);
-        let successor = broker.opening_lock(&root);
+        let successor = broker.opening_lock(&root).unwrap();
         assert!(Arc::ptr_eq(&waiting, &successor));
         drop(waiting);
         drop(successor);
-        let _other = broker.opening_lock(Path::new("/other"));
+        let _other = broker.opening_lock(Path::new("/other")).unwrap();
         assert!(!broker.inner.lock().opening_locks.contains_key(&root));
     }
     #[tokio::test]
@@ -1377,7 +1404,7 @@ mod tests {
     async fn cancelled_same_project_waiter_does_not_wait_for_startup_or_take_capacity() {
         let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None, None));
         let root = PathBuf::from("/blocked-startup");
-        let held = broker.opening_lock(&root).lock_owned().await;
+        let held = broker.opening_lock(&root).unwrap().lock_owned().await;
         let request = tokio_util::sync::CancellationToken::new();
         let cancel = request.clone();
         let result = tokio::time::timeout(

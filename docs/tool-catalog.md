@@ -5,12 +5,16 @@
 is intentionally small: it gives an agent proof context, safe experiments, verification, semantic lookup, and cheap
 status without exposing raw Lean worker primitives.
 
+The separate operational tool `lean_runtime` observes worker activity and coordinates an idle worker pool. It does not
+evaluate Lean or establish any proof or source-freshness claim.
+
 ```text
 lean_context -> lean_lookup -> lean_trial -> lean_verify
                          \-> lean_status
 ```
 
-Every call is read-only. The server reads files, elaborates in memory, and never writes source.
+The semantic tools read files and elaborate in memory. No tool writes source. `lean_runtime` may pause admission or
+explicitly retire idle workers as described below.
 
 ## Tool Roles
 
@@ -49,6 +53,50 @@ A cancellation acknowledgement records intent. A queued operation is skipped, wh
 finish its cleanup before normal cancellation becomes terminal. Supervisor observation and deadlines bound worker
 cancellation; it is not instantaneous. Completed task status means the tool returned a result, which may contain Lean
 errors or a negative verification verdict. It does not itself establish successful verification.
+
+## Worker Activity And Admission Leases
+
+`lean_runtime` is always synchronous, including for task-aware clients. It has four actions:
+
+| Action | Fields | Behavior |
+| --- | --- | --- |
+| `status` (default) | none | Observe resident workers, startup callers, occupied slots, and admission state. |
+| `acquire` | optional `lease_seconds`, `retire_idle` | Atomically pause admission if no worker request or startup is admitted. |
+| `renew` | `lease_id`, optional `lease_seconds` | Extend the caller's unexpired lease. |
+| `release` | `lease_id` | Release that lease and resume ordinary admission. |
+
+Lease lifetimes default to 30 seconds and must be between 1 and 300 seconds. Keep the returned `lease_id` private;
+status never reveals it. Another connection can renew or release the lease with its token. An expired token cannot
+affect a later lease. Leases expire after client failure and do not survive a server restart; `pool.instance_id`
+identifies this broker lifetime. Renew well before expiry while depending on the pause, and stop relying on it if renewal
+fails. Losing a response can lose the token; in that case wait for expiry rather than assuming ownership.
+
+Acquire returns `acquired`, `busy` (a request or startup already admitted), or `leased` (another lease holds admission).
+It never cancels existing work or waits for capacity. While held, new worker-backed calls return the retryable semantic
+reason `worker_pool_leased`; cheap project status and runtime coordination remain available. The ordinary worker queue
+and parallelism are unchanged outside a lease. There is no priority or fairness guarantee between competing acquirers.
+
+An ordinary status snapshot is advisory: another request can start immediately after it. Only a successful, unexpired
+owned lease closes that race. The admission check and lease acquisition share the registry lock. Admitted callers count
+as active before enqueue, and queued/running messages remain active through cancellation cleanup. An opening caller
+retains startup ownership even if its HTTP connection disappears.
+Background recycling and prewarming use the same admission boundary and count as active work. The pool-level
+`outstanding_jobs` count also retains work owned by a controller that has been removed from the resident registry.
+
+By default acquire keeps workers and their warm caches, including across idle-reaper ticks. For a caller that actually
+needs their memory, explicitly set `retire_idle: true` on acquire. `retirement_requested` counts shutdown requests;
+it does not acknowledge child exit. Wait for `pool.workers_stopped: true`, under the same live lease, before relying on
+released worker capacity. An occupied slot may represent a starting, resident, retiring, or uncertain worker; uncertain
+shutdown continues to count and must not be treated as freed memory. Poll no faster than once per second while waiting,
+and renew the lease if needed.
+
+The lease covers only this server's worker admission. It does not reserve RAM, stop other programs, coordinate another
+server process, bind results to a source revision, or replace a caller's build/output locks. The caller chooses when to
+claim and whether retirement is worth losing warm caches.
+
+For example, obtain a memory handoff with `{"action":"acquire","retire_idle":true,"lease_seconds":30}`, retain its
+token, observe confirmed exit, renew during the external operation, and release in cleanup. If acquire is busy, continue
+independent work or wait for the existing owner; do not kill the active worker.
 
 ## Response Shape
 
