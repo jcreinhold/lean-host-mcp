@@ -324,23 +324,72 @@ fn fingerprint_lake_project(lake_root: &Path) -> Result<String> {
 /// [`artifact_roots`] and the `.ilean` reader must agree on where Lake writes.
 pub(crate) const BUILD_LIB_REL: &str = ".lake/build/lib/lean";
 
-/// Every directory a module this project imports could have its `.olean` built
-/// into: the project's own build tree, then one per Lake package.
+/// Project and dependency artifact roots in the worker's search precedence.
 ///
-/// Computed once per project rather than per call — the package set is a
-/// function of `lake-manifest.json`, and a manifest change already rebuilds the
-/// whole [`LakeProjectMeta`] and evicts the project. An unbuilt or missing
-/// `.lake/packages` simply contributes nothing.
+/// Mirrors `lean-rs-host` 0.9.4's `LakeProject::olean_search_paths` and
+/// `manifest_package_root` without linking the Lean runtime into this parent.
+/// Keep this contract aligned when updating that dependency: project first,
+/// then manifest order, with `packagesDir`, path `dir`, and Git `subDir`
+/// respected. Unbuilt paths remain in the list so later builds are observed.
+/// Missing or malformed manifests still retain inherited `LEAN_PATH` entries.
+/// Process-owned shim and toolchain roots are treated as immutable runtime
+/// inputs; these roots describe the mutable project/package/environment paths.
 pub(crate) fn artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
+    let mut roots = manifest_artifact_roots(lake_root);
+    if let Ok(lean_path) = std::env::var("LEAN_PATH") {
+        // lean-rs-worker-parent does not override the child cwd. Its relative
+        // LEAN_PATH entries therefore resolve against our inherited cwd too.
+        let worker_cwd = std::env::current_dir().unwrap_or_default();
+        append_lean_path(&mut roots, &worker_cwd, &lean_path);
+    }
+    roots
+}
+
+/// Lean's `System.SearchPath.parse` splits on the platform separator without
+/// shell quoting or filtering empty entries. `worker_cwd` is injected so tests
+/// can resolve relative paths without changing the process environment or cwd.
+fn append_lean_path(roots: &mut Vec<PathBuf>, worker_cwd: &Path, lean_path: &str) {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    roots.extend(lean_path.split(separator).map(|path| worker_cwd.join(path)));
+}
+
+fn manifest_artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![lake_root.join(BUILD_LIB_REL)];
-    let Ok(entries) = std::fs::read_dir(lake_root.join(".lake/packages")) else {
+    let Ok(bytes) = std::fs::read(lake_root.join("lake-manifest.json")) else {
         return roots;
     };
-    for entry in entries.flatten() {
-        let candidate = entry.path().join(BUILD_LIB_REL);
-        if candidate.is_dir() {
-            roots.push(candidate);
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return roots;
+    };
+    let packages_dir = manifest
+        .get("packagesDir")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(".lake/packages");
+    let Some(packages) = manifest.get("packages").and_then(serde_json::Value::as_array) else {
+        return roots;
+    };
+    for package in packages {
+        let Some(name) = package.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let name = name
+            .trim()
+            .trim_matches('`')
+            .trim_matches('«')
+            .trim_matches('»')
+            .trim_matches('"')
+            .trim();
+        if package.get("type").and_then(serde_json::Value::as_str) == Some("path")
+            && let Some(dir) = package.get("dir").and_then(serde_json::Value::as_str)
+        {
+            roots.push(lake_root.join(dir).join(BUILD_LIB_REL));
+            continue;
         }
+        let mut package_root = lake_root.join(packages_dir).join(name);
+        if let Some(sub_dir) = package.get("subDir").and_then(serde_json::Value::as_str) {
+            package_root.push(sub_dir);
+        }
+        roots.push(package_root.join(BUILD_LIB_REL));
     }
     roots
 }
@@ -378,25 +427,254 @@ mod tests {
 
     use super::*;
 
+    // Manifest tests are independent of the test process's inherited LEAN_PATH.
+    fn artifact_roots(root: &Path) -> Vec<PathBuf> {
+        manifest_artifact_roots(root)
+    }
+
     #[test]
-    fn artifact_roots_put_the_project_first_and_include_built_packages() {
+    fn inherited_lean_path_is_watched_without_a_manifest_and_keeps_entry_order() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        fs::create_dir_all(root.join(BUILD_LIB_REL)).unwrap();
-        fs::create_dir_all(root.join(".lake/packages/batteries").join(BUILD_LIB_REL)).unwrap();
-        // A package directory that was never built contributes no root: a
-        // non-directory candidate must not become a path we stat per call.
-        fs::create_dir_all(root.join(".lake/packages/unbuilt")).unwrap();
-
-        let roots = artifact_roots(root);
-
-        assert_eq!(
-            roots.first(),
-            Some(&root.join(BUILD_LIB_REL)),
-            "the project's own tree must be probed first; it is the developer-loop hit"
+        let mut roots = manifest_artifact_roots(root);
+        let absolute = root.join("absolute");
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        append_lean_path(
+            &mut roots,
+            root,
+            &format!("relative{separator}{}{separator}", absolute.display()),
         );
-        assert!(roots.contains(&root.join(".lake/packages/batteries").join(BUILD_LIB_REL)));
-        assert_eq!(roots.len(), 2, "unbuilt packages must not contribute roots: {roots:?}");
+        assert_eq!(
+            roots,
+            vec![
+                root.join(BUILD_LIB_REL),
+                root.join("relative"),
+                absolute,
+                root.to_path_buf()
+            ]
+        );
+        let imports = ["EnvModule".to_owned()];
+        let artifact = root.join("relative/EnvModule.olean");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"first").unwrap();
+        let before = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
+        fs::write(artifact, b"rebuilt artifact").unwrap();
+        assert_ne!(
+            Some(before),
+            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
+        );
+    }
+
+    #[test]
+    fn project_and_manifest_packages_take_precedence_over_lean_path_shadows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"packages":[
+            {"name":"dep","type":"path","dir":"dep"}
+        ]}"#,
+        )
+        .unwrap();
+        let project = root.join(BUILD_LIB_REL).join("Shared.olean");
+        let package = root.join("dep").join(BUILD_LIB_REL).join("Shared.olean");
+        let env = root.join("env/Shared.olean");
+        for artifact in [&project, &package, &env] {
+            fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+            fs::write(artifact, b"initial").unwrap();
+        }
+        let mut roots = manifest_artifact_roots(root);
+        append_lean_path(&mut roots, root, "env");
+        assert_eq!(roots.last(), Some(&root.join("env")));
+        let imports = ["Shared".to_owned()];
+        let project_stamp = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
+        fs::write(&env, b"environment rebuilt").unwrap();
+        fs::write(&package, b"package rebuilt").unwrap();
+        assert_eq!(
+            Some(project_stamp.clone()),
+            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
+        );
+        fs::remove_file(project).unwrap();
+        let package_stamp = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
+        assert_ne!(project_stamp, package_stamp);
+        fs::write(env, b"environment rebuilt again").unwrap();
+        assert_eq!(
+            Some(package_stamp),
+            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
+        );
+    }
+
+    #[test]
+    fn artifact_roots_follow_manifest_order_without_scanning_or_filtering_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"packages":[
+            {"name":"z-first","type":"git"}, {"name":"a-second","type":"git"}
+        ]}"#,
+        )
+        .unwrap();
+        // A checkout absent from the manifest must not affect resolution.
+        fs::create_dir_all(root.join(".lake/packages/unlisted").join(BUILD_LIB_REL)).unwrap();
+        assert_eq!(
+            artifact_roots(root),
+            vec![
+                root.join(BUILD_LIB_REL),
+                root.join(".lake/packages/z-first").join(BUILD_LIB_REL),
+                root.join(".lake/packages/a-second").join(BUILD_LIB_REL)
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_roots_resolve_custom_packages_dir_and_normalize_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"packagesDir":"vendor","packages":[
+            {"name":" «doc-gen4» ","type":"git"}, {"name":"`batteries`","type":"git"}
+        ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_roots(root),
+            vec![
+                root.join(BUILD_LIB_REL),
+                root.join("vendor/doc-gen4").join(BUILD_LIB_REL),
+                root.join("vendor/batteries").join(BUILD_LIB_REL)
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_roots_resolve_relative_and_absolute_path_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let external = root.join("external");
+        fs::write(
+            root.join("lake-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "packagesDir": "vendor", "packages": [
+                    {"name":"sibling","type":"path","dir":"../sibling", "subDir":"ignored"},
+                    {"name":"external","type":"path","dir":external},
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_roots(root),
+            vec![
+                root.join(BUILD_LIB_REL),
+                root.join("../sibling").join(BUILD_LIB_REL),
+                external.join(BUILD_LIB_REL)
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_roots_resolve_git_package_subdirectories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"packagesDir":"vendor","packages":[
+            {"name":"«multi-package»","type":"git","subDir":"crates/lean"}
+        ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_roots(root),
+            vec![
+                root.join(BUILD_LIB_REL),
+                root.join("vendor/multi-package/crates/lean").join(BUILD_LIB_REL)
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_roots_match_worker_fallback_for_malformed_manifest_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("lake-manifest.json"), b"{malformed").unwrap();
+        assert_eq!(artifact_roots(root), vec![root.join(BUILD_LIB_REL)]);
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"packages":[
+            {"type":"git"}, "invalid", {"name":"fallback","type":"path"}
+        ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_roots(root),
+            vec![
+                root.join(BUILD_LIB_REL),
+                root.join(".lake/packages/fallback").join(BUILD_LIB_REL)
+            ]
+        );
+    }
+
+    #[test]
+    fn new_package_build_changes_import_stamp_without_changing_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"packages":[
+            {"name":"dep","type":"path","dir":"local-dep"}
+        ]}"#,
+        )
+        .unwrap();
+        let roots = artifact_roots(root);
+        let imports = ["Demo.A".to_owned()];
+        let before = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
+        let artifact = root.join("local-dep").join(BUILD_LIB_REL).join("Demo/A.olean");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(artifact, b"built").unwrap();
+        assert_eq!(
+            artifact_roots(root),
+            roots,
+            "building must not change search precedence"
+        );
+        assert_ne!(
+            Some(before),
+            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
+        );
+    }
+
+    #[test]
+    fn import_stamps_only_watch_first_resolved_package_in_manifest_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"packages":[
+            {"name":"first","type":"path","dir":"first"},
+            {"name":"second","type":"path","dir":"second"}
+        ]}"#,
+        )
+        .unwrap();
+        let first = root.join("first").join(BUILD_LIB_REL).join("Shared.olean");
+        let second = root.join("second").join(BUILD_LIB_REL).join("Shared.olean");
+        for artifact in [&first, &second] {
+            fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+            fs::write(artifact, b"initial").unwrap();
+        }
+        let roots = artifact_roots(root);
+        let imports = ["Shared".to_owned()];
+        let before = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
+        fs::write(&second, b"shadowed change").unwrap();
+        assert_eq!(
+            Some(before.clone()),
+            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
+        );
+        fs::remove_file(first).unwrap();
+        assert_ne!(
+            Some(before),
+            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
+        );
     }
 
     #[test]

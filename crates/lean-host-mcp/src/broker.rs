@@ -854,16 +854,21 @@ impl ProjectBroker {
             let _open_guard = open_guard;
             let opened = LeanProject::open(meta, runtime_config, slot)?;
             let mut registry = inner.lock();
-            if cancellation.is_cancelled() || registry.shutdown_epoch != epoch {
-                let reason = if cancellation.is_cancelled() { "request_cancelled" } else { "project_shutting_down" };
+            if registry.shutdown_epoch != epoch {
                 drop(registry);
                 opened.shutdown();
-                return Err(Self::pool_unavailable(&root, reason, false));
+                return Err(Self::pool_unavailable(&root, "project_shutting_down", false));
             }
             registry.registry.put(root.clone(), Arc::clone(&opened));
             registry.last_used.insert(root.clone(), Instant::now());
             drop(registry);
             tracing::info!(project = %root.display(), toolchain = %opened.toolchain(), "opened project; worker spawned");
+            if cancellation.is_cancelled() {
+                // Startup already completed. Keep its idle worker warm so a
+                // surviving coalesced caller can reuse it without waiting for
+                // retirement or receiving a false pool-full rejection.
+                return Err(Self::pool_unavailable(&root, "request_cancelled", false));
+            }
             Ok(opened)
         })
         .await
@@ -1078,9 +1083,8 @@ pub struct BrokerConfigSnapshot {
     pub idle_timeout_secs: u64,
     pub request_timeout_millis: u64,
     /// The Lean heap ceiling each worker child runs under. Reported because it
-    /// is the one memory bound a caller can hit: crossing it surfaces as an
-    /// ordinary elaboration failure, and knowing the number is what turns that
-    /// failure into "raise the budget" rather than "the tool is broken".
+    /// is the worker's allocator backstop: exceeding it can abort the child.
+    /// This is not a process-footprint or machine-wide memory ceiling.
     pub lean_max_memory_kib: u64,
 }
 

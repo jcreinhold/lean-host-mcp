@@ -470,6 +470,372 @@ async fn streamable_http_five_clients_serialize_source_consistent_results() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn streamable_http_task_results_survive_new_client() {
+    let root = tempfile::tempdir().expect("metadata project");
+    std::fs::write(root.path().join("lakefile.lean"), "package lifecycle\n").unwrap();
+    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
+    let root_s = root.path().to_string_lossy();
+    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
+    let mut legacy = server.new_session().await;
+    let arguments = json!({"name": "lean_verify", "arguments": {"targets": []}});
+    let synchronous = legacy.request("tools/call", arguments.clone()).await.unwrap();
+    assert!(synchronous.json.pointer("/result/taskId").is_none());
+    assert!(synchronous.json.pointer("/result/structuredContent").is_some());
+
+    let mut original = TaskHttpClient::new(&server.url);
+    let accepted = original.request("tools/call", arguments).await;
+    let task_id = task_id(&accepted).to_owned();
+    assert_eq!(
+        accepted.pointer("/result/resultType").and_then(Value::as_str),
+        Some("task")
+    );
+    let immediate = original.request("tasks/get", json!({"taskId": task_id})).await;
+    assert_eq!(
+        immediate.pointer("/result/taskId").and_then(Value::as_str),
+        Some(task_id.as_str())
+    );
+    drop(original);
+    // A different HTTP client, with no session id or initialized connection,
+    // must retrieve the same server-owned task and its unchanged tool payload.
+    let mut reconnected = TaskHttpClient::new(&server.url);
+    let terminal = reconnected.terminal(&task_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        terminal.pointer("/result/status").and_then(Value::as_str),
+        Some("completed")
+    );
+    let mut retained = terminal.pointer("/result/result").unwrap().clone();
+    let mut synchronous = synchronous.json.get("result").unwrap().clone();
+    // The current protocol adds its result discriminator; tool content and
+    // semantic metadata must otherwise be identical to the legacy response.
+    retained.as_object_mut().unwrap().remove("resultType");
+    synchronous.as_object_mut().unwrap().remove("resultType");
+    assert_eq!(retained, synchronous);
+    let status = reconnected
+        .request(
+            "tools/call",
+            json!({"name": "lean_status", "arguments": {"kind": "project"}}),
+        )
+        .await;
+    assert!(
+        status.pointer("/result/taskId").is_none(),
+        "cheap metadata remains synchronous: {status}"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires built Lean fixture and worker binary"]
+async fn streamable_http_queued_task_cancellation_skips_lean() {
+    let scratch = tempfile::tempdir().expect("test-owned sentinels");
+    let running = scratch.path().join("running");
+    let finished = scratch.path().join("finished");
+    let forbidden = scratch.path().join("cancelled-job-started");
+    let root = fixture_root();
+    let root_s = root.to_string_lossy();
+    let server = HttpMcpServer::start_with_env(
+        &[("--lake-root", root_s.as_ref())],
+        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
+    )
+    .await;
+    let mut client = TaskHttpClient::new(&server.url);
+    let blocker = client
+        .command(&sentinel_command(&running, Some((&finished, 4_000))))
+        .await;
+    wait_for_sentinel(&running, Duration::from_secs(30)).await;
+    let queued = client.command(&sentinel_command(&forbidden, None)).await;
+    assert!(!finished.exists(), "second request must be accepted while Lean is busy");
+    let ack = client.request("tasks/cancel", json!({"taskId": queued})).await;
+    assert_eq!(
+        ack.pointer("/result/resultType").and_then(Value::as_str),
+        Some("complete")
+    );
+    let cancelled = client.terminal(&queued, Duration::from_secs(10)).await;
+    assert_eq!(
+        cancelled.pointer("/result/status").and_then(Value::as_str),
+        Some("cancelled")
+    );
+    let blocker = client.terminal(&blocker, Duration::from_secs(10)).await;
+    assert_eq!(
+        blocker.pointer("/result/status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(
+        finished.exists(),
+        "blocking Lean command must finish normally: {blocker}"
+    );
+    assert!(!forbidden.exists(), "cancelled waiting command must never enter Lean");
+    let follow_up = scratch.path().join("healthy-follow-up");
+    let healthy = client.command(&sentinel_command(&follow_up, None)).await;
+    let result = client.terminal(&healthy, Duration::from_secs(10)).await;
+    assert_eq!(
+        result.pointer("/result/status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(
+        follow_up.exists(),
+        "same worker must remain usable after queued cancellation: {result}"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires built Lean fixture and worker binary"]
+async fn streamable_http_running_task_cancellation_stops_worker_and_drains() {
+    let scratch = tempfile::tempdir().expect("test-owned sentinels");
+    let started = scratch.path().join("started");
+    let forbidden = scratch.path().join("ran-after-cancellation");
+    let root = fixture_root();
+    let root_s = root.to_string_lossy();
+    let server = HttpMcpServer::start_with_env(
+        &[("--lake-root", root_s.as_ref())],
+        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
+    )
+    .await;
+    let mut client = TaskHttpClient::new(&server.url);
+    let task = client
+        .command(&sentinel_command(&started, Some((&forbidden, 4_000))))
+        .await;
+    wait_for_sentinel(&started, Duration::from_secs(30)).await;
+    assert!(
+        !forbidden.exists(),
+        "cancellation must be requested before Lean finishes"
+    );
+    client.request("tasks/cancel", json!({"taskId": task})).await;
+    // The cancellation must settle before the uncancelled computation's sleep
+    // would end; merely forgetting its HTTP request cannot pass this check.
+    let cancelled = client.terminal(&task, Duration::from_secs(2)).await;
+    assert_eq!(
+        cancelled.pointer("/result/status").and_then(Value::as_str),
+        Some("cancelled")
+    );
+    let healthy = scratch.path().join("healthy-follow-up");
+    let follow_up = client.command(&sentinel_command(&healthy, None)).await;
+    let response = client.terminal(&follow_up, Duration::from_secs(10)).await;
+    assert_eq!(
+        response.pointer("/result/status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(
+        healthy.exists(),
+        "worker must accept work after cancellation drains: {response}"
+    );
+    // Catch detached Lean execution that survives a prematurely terminal task.
+    tokio::time::sleep(Duration::from_millis(4_250)).await;
+    assert!(
+        !forbidden.exists(),
+        "cancelled worker computation continued in the background"
+    );
+    server.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires built Lean fixture and worker binary"]
+async fn streamable_http_cancelled_startup_preserves_coalesced_worker_at_capacity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = tempfile::Builder::new()
+        .prefix("lean-startup-'wrapper-")
+        .tempdir()
+        .expect("test-owned delayed worker");
+    let worker = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp"))
+        .expect("build the real worker alongside the parent before running this test")
+        .join("lean-host-mcp-worker")
+        .canonicalize()
+        .expect("exact real worker path");
+    let starts = scratch.path().join("worker-starts");
+    let release = scratch.path().join("release-startup");
+    let wrapper = scratch.path().join("lean-host-mcp-worker");
+    // Delay the actual worker handshake, not a Lean command. The first caller
+    // must therefore still own the same-project opening lock when cancelled.
+    // Bound the wrapper wait so an assertion failure cannot leave a child stuck.
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nremaining=500\nwhile [ ! -f {} ]; do\n  remaining=$((remaining - 1))\n  [ \"$remaining\" -gt 0 ] || exit 75\n  sleep 0.01\ndone\nexec {} \"$@\"\n",
+        shell_quote_path(&starts),
+        shell_quote_path(&release),
+        shell_quote_path(&worker),
+    );
+    std::fs::write(&wrapper, script).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = fixture_root();
+    let root_s = root.to_string_lossy();
+    let wrapper_dir = scratch.path().to_str().expect("UTF-8 test path");
+    let server = HttpMcpServer::start_with_env(
+        &[("--lake-root", root_s.as_ref())],
+        &[
+            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
+            ("LEAN_HOST_MCP_WORKERS_DIR", wrapper_dir),
+        ],
+    )
+    .await;
+    let mut opener = TaskHttpClient::new(&server.url);
+    let forbidden = scratch.path().join("cancelled-opener-entered-lean");
+    let opening = opener.command(&sentinel_command(&forbidden, None)).await;
+    wait_for_sentinel(&starts, Duration::from_secs(30)).await;
+    let mut waiter = TaskHttpClient::new(&server.url);
+    let healthy = scratch.path().join("surviving-waiter-entered-lean");
+    let waiting = waiter.command(&sentinel_command(&healthy, None)).await;
+    let status = waiter.request("tasks/get", json!({"taskId": waiting})).await;
+    assert_eq!(
+        status.pointer("/result/status").and_then(Value::as_str),
+        Some("working")
+    );
+    assert!(!healthy.exists(), "same-project request must wait for startup");
+    opener.request("tasks/cancel", json!({"taskId": opening})).await;
+    assert_eq!(
+        std::fs::read_to_string(&starts).unwrap().lines().count(),
+        1,
+        "only one worker may start while the capacity-one startup is held"
+    );
+    std::fs::write(&release, "continue").unwrap();
+    let cancelled = opener.terminal(&opening, Duration::from_secs(30)).await;
+    assert_eq!(
+        cancelled.pointer("/result/status").and_then(Value::as_str),
+        Some("cancelled"),
+        "opening caller must observe its own cancellation: {cancelled}"
+    );
+    let completed = waiter.terminal(&waiting, Duration::from_secs(30)).await;
+    assert_eq!(
+        completed.pointer("/result/status").and_then(Value::as_str),
+        Some("completed"),
+        "surviving caller must reuse the new worker rather than report a busy pool: {completed}"
+    );
+    assert!(
+        healthy.exists(),
+        "surviving caller must actually execute Lean: {completed}"
+    );
+    assert!(
+        !forbidden.exists(),
+        "cancelled opener must not execute its Lean command"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&starts).unwrap().lines().count(),
+        1,
+        "startup must use one retained child, with no temporary preflight or replacement child"
+    );
+    server.shutdown().await;
+}
+
+#[cfg(unix)]
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_str().expect("UTF-8 test path").replace('\'', "'\\''"))
+}
+
+struct TaskHttpClient {
+    client: reqwest::Client,
+    url: String,
+    next_id: u64,
+}
+
+impl TaskHttpClient {
+    fn new(url: &str) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(35))
+                .build()
+                .unwrap(),
+            url: url.to_owned(),
+            next_id: 1,
+        }
+    }
+
+    async fn request(&mut self, method: &str, mut params: Value) -> Value {
+        use rmcp::model::{ClientCapabilities, Implementation, ProtocolVersion, RequestMetaObject};
+        let meta = RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2026_07_28,
+            Implementation::new("lean-host-lifecycle-test", "1"),
+            ClientCapabilities::builder().enable_tasks().build(),
+        );
+        params["_meta"] = serde_json::to_value(meta).unwrap();
+        let name = if method == "tools/call" {
+            params.get("name")
+        } else {
+            params.get("taskId")
+        }
+        .and_then(Value::as_str)
+        .expect("named tool or task request")
+        .to_owned();
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).unwrap();
+        let response = self
+            .client
+            .post(&self.url)
+            .header("Accept", ACCEPT_BOTH)
+            .header("Content-Type", "application/json")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", method)
+            .header("Mcp-Name", name)
+            .body(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string())
+            .send()
+            .await
+            .expect("task HTTP request");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await.expect("task HTTP body");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(status.is_success(), "HTTP task request failed: {status}: {body}");
+        let response = parse_response_body(&headers, &bytes).expect("task HTTP JSON response");
+        assert!(response.get("error").is_none(), "task JSON-RPC error: {response}");
+        assert_eq!(response.get("id").and_then(Value::as_u64), Some(id));
+        response
+    }
+
+    async fn command(&mut self, commands: &str) -> String {
+        let response = self.request("tools/call", json!({"name": "lean_trial", "arguments": {"kind": "command", "imports": ["Init"], "commands": commands}})).await;
+        task_id(&response).to_owned()
+    }
+
+    async fn terminal(&mut self, task_id: &str, timeout: Duration) -> Value {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let response = self.request("tasks/get", json!({"taskId": task_id})).await;
+                if matches!(
+                    response.pointer("/result/status").and_then(Value::as_str),
+                    Some("completed" | "failed" | "cancelled")
+                ) {
+                    return response;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("task must reach a terminal state within its test deadline")
+    }
+}
+
+fn task_id(response: &Value) -> &str {
+    response
+        .pointer("/result/taskId")
+        .and_then(Value::as_str)
+        .expect("task handle over HTTP")
+}
+
+fn sentinel_command(started: &Path, completion: Option<(&Path, u32)>) -> String {
+    let started = serde_json::to_string(started.to_str().expect("UTF-8 test path")).unwrap();
+    let mut command = format!("#eval do\n  IO.FS.writeFile {started} \"started\"\n");
+    if let Some((finished, sleep_ms)) = completion {
+        let finished = serde_json::to_string(finished.to_str().expect("UTF-8 test path")).unwrap();
+        writeln!(
+            &mut command,
+            "  IO.sleep {sleep_ms}\n  IO.FS.writeFile {finished} \"finished\""
+        )
+        .unwrap();
+    }
+    command
+}
+
+async fn wait_for_sentinel(path: &Path, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Lean command must reach its test-owned start sentinel");
+}
+
 #[derive(Debug)]
 struct HttpMcpServer {
     child: Child,
@@ -488,6 +854,7 @@ impl HttpMcpServer {
         let config_dir = tempfile::tempdir().expect("temp config dir").keep();
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command
+            .kill_on_drop(true)
             .arg("--bind")
             .arg(bind.to_string())
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)

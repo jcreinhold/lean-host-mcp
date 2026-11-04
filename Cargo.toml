@@ -1,6 +1,12 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["vendor/lean-rs-worker-parent"]
 resolver = "3"
+
+# Temporary upstream correctness fix, retained locally until a release includes
+# bounded cancellation observation and startup cleanup. See vendor provenance.
+[patch.crates-io]
+lean-rs-worker-parent = { path = "vendor/lean-rs-worker-parent" }
 
 [workspace.package]
 authors = ["Jacob Reinhold"]

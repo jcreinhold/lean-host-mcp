@@ -1095,8 +1095,6 @@ dependencies = [
 [[package]]
 name = "lean-rs-worker-parent"
 version = "0.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ad91857487596a02b1cf63846b9553047b09ef9409876f8dace5f85b720b8c3"
 dependencies = [
  "lean-rs-worker-protocol",
  "lean-toolchain",

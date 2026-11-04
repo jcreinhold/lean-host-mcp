@@ -2291,7 +2291,7 @@ impl ProjectActorState {
         self.record_restart_or_stop(cause, &reason)
             .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         let next_generation = self.observed_generation().saturating_add(1);
-        let (handle, _) = open_worker(&self.config, false)?;
+        let (handle, _) = open_worker(&self.config)?;
         self.handle = handle;
         self.worker_generation_base = next_generation;
         self.forget_pooled_import_profiles();
@@ -2560,7 +2560,7 @@ fn actor_main(
     config: ActorConfig,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>>,
 ) -> bool {
-    let (handle, runtime_toolchain) = match open_worker(&config, true) {
+    let (handle, runtime_toolchain) = match open_worker(&config) {
         Ok(value) => value,
         Err(err) => {
             let _ = init_reply.send(Err(err));
@@ -2670,18 +2670,11 @@ fn actor_main(
     }
 }
 
-fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostHandle, String)> {
+fn open_worker(config: &ActorConfig) -> Result<(LeanWorkerHostHandle, String)> {
+    // `open` performs static validation and retains the one resulting worker.
+    // `check` would spawn a second preflight child and discard its shutdown
+    // result, which cannot establish safe capacity accounting.
     let builder = worker_builder(config);
-    if preflight {
-        let report = builder.check();
-        if let Some(first) = report.first_error() {
-            return Err(ServerError::BadProject(format!(
-                "{}: {}",
-                first.code(),
-                first.message()
-            )));
-        }
-    }
     // No `RssHardLimitExceeded` arm: this server no longer sets
     // `rss_hard_limit`, so the supervisor cannot produce one. See
     // `lean_max_memory_kib_for`.

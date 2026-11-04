@@ -70,15 +70,16 @@ the request, so `.olean` files written after that import are invisible to it —
 otherwise keep being answered from the pre-build environment. (Before the worker child learned to reuse sessions it
 re-imported on every call, and that accident is what used to hide this.)
 
-The server therefore stamps the newest modification time among the *imported modules'* own `.olean` files when it opens
-a session, re-stamps before each call that would reuse it, and recycles the worker when the stamp has advanced. The
-recycle happens before the job runs, so the call is answered by a fresh worker and the result is sound; it appears as an
-`artifacts_rebuilt` entry in `runtime.call_restart` and one `info` log line. The cost is one `stat` per import per call.
+The server records individual imported `.olean` metadata, including resolved path, size, modification time, and Unix
+file identity/change time. It follows manifest package order, custom `packagesDir`, path dependencies, Git `subDir`, and
+inherited `LEAN_PATH`. Rebuilt, removed, replaced, or newly available artifacts invalidate affected cached queries and
+pooled sessions. The worker is recycled before reuse; `artifacts_rebuilt` records that transition. Unrelated artifacts
+do not invalidate a warm query.
 
-Two limits worth stating. Only the modules a call names in its import set are watched, not their full transitive closure
-— nearly the same set in practice, because Lake's traces include each dependency's hash, so rebuilding a dependency
-rebuilds the `.olean` of everything importing it. And the check compares mtimes, so a build that leaves every imported
-artifact byte- and time-identical is correctly treated as no change.
+Only named imports are watched rather than their full transitive closure: normal Lake dependency propagation must
+update the corresponding imported artifacts. Bundled shims and installed toolchain contents remain trusted fixed runtime
+inputs. Concurrent builds are not an atomic execution snapshot; changed artifacts prevent result-cache insertion.
+Callers requiring an exact source/build revision must coordinate those inputs.
 
 ### Memory
 
