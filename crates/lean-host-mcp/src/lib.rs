@@ -24,6 +24,7 @@
 
 pub mod broker;
 mod cache;
+mod cancellation;
 pub mod cli;
 pub mod config_file;
 pub mod config_schema;
@@ -37,6 +38,7 @@ pub mod projections;
 mod semantic_search;
 pub mod server;
 mod smoke;
+mod tasks;
 pub mod toolchain;
 pub mod tools;
 pub mod trust;

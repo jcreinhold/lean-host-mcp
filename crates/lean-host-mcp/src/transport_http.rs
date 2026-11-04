@@ -41,8 +41,9 @@ pub(crate) async fn serve(
 
     let cancellation = CancellationToken::new();
     let http_config = StreamableHttpServerConfig::default().with_cancellation_token(cancellation.child_token());
+    let handler = LeanHostService::new(broker, tool_config);
     let service = StreamableHttpService::new(
-        move || Ok(LeanHostService::new(Arc::clone(&broker), tool_config)),
+        move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
         http_config,
     );

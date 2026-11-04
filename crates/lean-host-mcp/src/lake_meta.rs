@@ -345,45 +345,6 @@ pub(crate) fn artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// Newest modification time among the built `.olean` files of `modules`, or
-/// `None` when none of them resolves to one.
-///
-/// This is the cheap, precise half of "did the environment these imports
-/// describe change on disk": at most one `stat` per module per root, with the
-/// project's own tree first so the common developer loop hits immediately. The
-/// obvious alternative — the newest mtime anywhere under `.lake/build/lib` —
-/// was measured at 160–190 ms warm and 1.5 s cold over mathlib4's 8408
-/// `.olean` files, which is not a per-call cost worth paying.
-///
-/// It watches only the *named* imports, not their transitive closure. That is
-/// nearly the same set in practice: Lake's traces include each dependency's
-/// hash, so rebuilding a dependency rebuilds the `.olean` of everything that
-/// imports it. The gap is a dependency built alone and never propagated, where
-/// the importing module's own artifact is genuinely still the one last built.
-///
-/// `None` is returned for an unbuilt project rather than an error: nothing to
-/// watch is not a failure, and a caller comparing two `None`s correctly
-/// concludes nothing changed.
-pub(crate) fn import_artifact_stamp(roots: &[PathBuf], modules: &[String]) -> Option<std::time::SystemTime> {
-    let mut newest: Option<std::time::SystemTime> = None;
-    for module in modules {
-        let relative: PathBuf = module.split('.').collect::<PathBuf>().with_extension("olean");
-        for root in roots {
-            let Ok(metadata) = std::fs::metadata(root.join(&relative)) else {
-                continue;
-            };
-            if let Ok(modified) = metadata.modified() {
-                newest = Some(newest.map_or(modified, |current| current.max(modified)));
-            }
-            // First root that has this module wins: a module lives in exactly
-            // one package's build tree, so later roots cannot hold a different
-            // artifact for the same name.
-            break;
-        }
-    }
-    newest
-}
-
 /// Sanitise a directory name into a Lake package identifier.
 fn default_package_from_dir_name(name: &str) -> String {
     name.replace('-', "_")
@@ -417,27 +378,6 @@ mod tests {
 
     use super::*;
 
-    /// Stamp `path` with an explicit mtime. Used instead of sleeping: the
-    /// contract is "newest mtime across the import set", and a real `lake
-    /// build` advances it by far more than a test can afford to wait for.
-    fn set_mtime(path: &Path, when: std::time::SystemTime) {
-        fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(when)
-            .unwrap();
-    }
-
-    /// Write `<root>/<BUILD_LIB_REL>/<module path>.olean`, creating parents.
-    fn write_olean(root: &Path, module: &str, body: &str) -> PathBuf {
-        let relative: PathBuf = module.split('.').collect::<PathBuf>().with_extension("olean");
-        let path = root.join(BUILD_LIB_REL).join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, body).unwrap();
-        path
-    }
-
     #[test]
     fn artifact_roots_put_the_project_first_and_include_built_packages() {
         let tmp = tempfile::tempdir().unwrap();
@@ -462,66 +402,9 @@ mod tests {
     #[test]
     fn artifact_roots_survive_a_project_with_no_lake_directory_at_all() {
         let tmp = tempfile::tempdir().unwrap();
-        // An unbuilt project still yields its own (nonexistent) build dir, so
-        // `import_artifact_stamp` has something to probe and answers `None`
-        // rather than the caller having to special-case an empty root list.
+        // An unbuilt project still yields its own nonexistent build directory.
         let roots = artifact_roots(tmp.path());
         assert_eq!(roots, vec![tmp.path().join(BUILD_LIB_REL)]);
-        assert_eq!(
-            import_artifact_stamp(&roots, &["Demo.A".to_owned()]),
-            None,
-            "an unbuilt project has nothing to watch"
-        );
-    }
-
-    #[test]
-    fn the_import_stamp_advances_when_an_imported_olean_is_rewritten() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        write_olean(root, "Demo.A", "first");
-        write_olean(root, "Demo.B", "first");
-        let roots = artifact_roots(root);
-        let modules = vec!["Demo.A".to_owned(), "Demo.B".to_owned()];
-
-        let before = import_artifact_stamp(&roots, &modules).expect("both modules are built");
-
-        // Rewrite one of the two with a strictly later mtime.
-        let later = before + std::time::Duration::from_mins(1);
-        let rebuilt = write_olean(root, "Demo.B", "second");
-        set_mtime(&rebuilt, later);
-
-        let after = import_artifact_stamp(&roots, &modules).expect("both modules are still built");
-        assert!(
-            after > before,
-            "rebuilding an imported module must advance the stamp; {before:?} -> {after:?}"
-        );
-
-        // A module the call does not import is invisible, however new it is:
-        // otherwise every unrelated `lake build` would cycle the worker.
-        let unrelated = write_olean(root, "Demo.C", "brand new");
-        set_mtime(&unrelated, later + std::time::Duration::from_mins(1));
-        assert_eq!(
-            import_artifact_stamp(&roots, &modules),
-            Some(after),
-            "a module outside the import set must not move the stamp"
-        );
-    }
-
-    #[test]
-    fn an_unbuilt_module_in_the_import_set_is_skipped_not_fatal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        write_olean(root, "Demo.A", "built");
-        let roots = artifact_roots(root);
-
-        let built_only = import_artifact_stamp(&roots, &["Demo.A".to_owned()]);
-        let with_missing = import_artifact_stamp(&roots, &["Demo.A".to_owned(), "Demo.NeverBuilt".to_owned()]);
-
-        assert!(built_only.is_some());
-        assert_eq!(
-            with_missing, built_only,
-            "an unbuilt import contributes nothing rather than sinking the stamp"
-        );
     }
 
     #[test]

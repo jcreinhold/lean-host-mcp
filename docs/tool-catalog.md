@@ -29,6 +29,22 @@ and a completion notification on `notifications/progress`. Clients such as Claud
 only while progress arrives, so a cold import or a large file's elaboration is not abandoned at the client while the
 worker keeps computing. Clients that omit the token keep the same single-response behavior.
 
+Clients declaring the `io.modelcontextprotocol/tasks` extension may receive a standard task handle from `tools/call`.
+Use `tasks/get` with its `taskId` to retrieve status and the eventual original tool result; use `tasks/cancel` to request
+cancellation. Cheap project status remains synchronous. Existing clients keep synchronous tool responses. The HTTP
+server shares task records across client sessions, so reconnecting clients can retrieve their existing handles.
+
+The server retains at most 128 active or completed task records, with completed results available for ten minutes.
+When that registry is full, calls use the ordinary synchronous path. Follow the suggested polling interval; task push
+notifications and in-task input are not used. Retention survives client disconnects, not a server restart. A task ID
+identifies one request, not a deduplication key: resubmitting `tools/call` creates another request. Callers remain
+responsible for binding requests to the source revision they require.
+
+A cancellation acknowledgement records intent. A queued operation is skipped, while a running worker operation must
+finish its cleanup before normal cancellation becomes terminal. Supervisor observation and deadlines bound worker
+cancellation; it is not instantaneous. Completed task status means the tool returned a result, which may contain Lean
+errors or a negative verification verdict. It does not itself establish successful verification.
+
 ## Response Shape
 
 All public tools return the semantic response baseline:

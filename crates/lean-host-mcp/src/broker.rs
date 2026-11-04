@@ -57,8 +57,10 @@ use lean_rs_worker_parent::{
 use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::cache::{ModuleQueryBatchKey, ModuleQueryKey};
+use crate::cancellation::CallCancellation;
 use crate::config_file::BrokerFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
@@ -216,7 +218,8 @@ impl ProjectHint {
 struct BrokerInner {
     registry: LruCache<PathBuf, Arc<LeanProject>>,
     last_used: HashMap<PathBuf, Instant>,
-    opening_locks: HashMap<PathBuf, Arc<AsyncMutex<()>>>,
+    opening_locks: HashMap<PathBuf, Weak<AsyncMutex<()>>>,
+    shutdown_epoch: u64,
     /// Last-built [`LakeProjectMeta`] per canonical root, with the stamp of the
     /// files it came from. Purely a cost cache: [`ProjectBroker::meta`] revalidates
     /// against disk on every lookup, so an entry is never served stale. Sized to
@@ -241,9 +244,10 @@ pub(crate) struct CachedBrokerCall<T> {
 }
 
 pub struct ProjectBroker {
-    inner: Mutex<BrokerInner>,
+    inner: Arc<Mutex<BrokerInner>>,
     config: BrokerConfig,
     runtime_config: ProjectRuntimeConfig,
+    worker_slots: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for ProjectBroker {
@@ -273,13 +277,15 @@ impl ProjectBroker {
     #[must_use]
     pub fn new_with_runtime_config(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<Self> {
         let broker = Arc::new(Self {
-            inner: Mutex::new(BrokerInner {
+            inner: Arc::new(Mutex::new(BrokerInner {
                 registry: LruCache::new(config.max_projects),
                 last_used: HashMap::new(),
                 opening_locks: HashMap::new(),
+                shutdown_epoch: 0,
                 meta_cache: LruCache::new(config.max_projects),
-            }),
+            })),
             runtime_config,
+            worker_slots: Arc::new(Semaphore::new(config.max_projects.get())),
             config,
         });
         broker.spawn_reaper();
@@ -447,12 +453,28 @@ impl ProjectBroker {
         // A query this build cannot key is run uncached rather than filed under
         // a shared key; see `ModuleQueryKey`.
         let key = ModuleQueryKey::from_query(&query);
+        let context = crate::cache::ModuleQueryContext::capture(
+            project.canonical_root(),
+            &session_imports,
+            &freshness_imports,
+            &options,
+            project.runtime_facts().worker_generation,
+        );
         // The lookup is a plain in-process map probe on the project handle: a
         // hit answers without ever entering the actor's mailbox, so a warm
         // repeat of an unmodified file never queues behind in-flight Lean work.
         if let Some(value) = key
             .as_ref()
-            .and_then(|key| project.module_query_cache().get(&path, content_hash, key))
+            .zip(context.as_ref())
+            .and_then(|(key, context)| project.module_query_cache().get(&path, content_hash, context, key))
+            .filter(|_| {
+                context.as_ref().is_some_and(|context| {
+                    context
+                        .after_processing(project.canonical_root(), project.runtime_facts().worker_generation)
+                        .as_ref()
+                        == Some(context)
+                })
+            })
         {
             return Ok(CachedBrokerCall {
                 value,
@@ -465,10 +487,12 @@ impl ProjectBroker {
             .process_module_query(session_imports, source, query, options)
             .await?;
         let (value, runtime) = call.into_parts();
-        if let Some(key) = key {
+        if let Some((key, context)) = key.zip(
+            context.and_then(|context| context.after_processing(project.canonical_root(), runtime.worker_generation)),
+        ) {
             project
                 .module_query_cache()
-                .insert(path, content_hash, key, value.clone());
+                .insert(path, content_hash, context, key, value.clone());
         }
         Ok(CachedBrokerCall {
             value,
@@ -517,11 +541,31 @@ impl ProjectBroker {
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
         let project = self.project_for(hint).await?;
         let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
+        let context = crate::cache::ModuleQueryContext::capture(
+            project.canonical_root(),
+            &session_imports,
+            &freshness_imports,
+            &options,
+            project.runtime_facts().worker_generation,
+        );
         // As in `process_cached_module_query`: a hit bypasses the mailbox, and
         // an unkeyable batch runs uncached.
         if let Some(value) = key
             .as_ref()
-            .and_then(|key| project.module_query_cache().get_batch(&path, content_hash, key))
+            .zip(context.as_ref())
+            .and_then(|(key, context)| {
+                project
+                    .module_query_cache()
+                    .get_batch(&path, content_hash, context, key)
+            })
+            .filter(|_| {
+                context.as_ref().is_some_and(|context| {
+                    context
+                        .after_processing(project.canonical_root(), project.runtime_facts().worker_generation)
+                        .as_ref()
+                        == Some(context)
+                })
+            })
         {
             return Ok(CachedBrokerCall {
                 value,
@@ -534,10 +578,12 @@ impl ProjectBroker {
             .process_module_query_batch(session_imports, source, selectors, budgets, options)
             .await?;
         let (value, runtime) = call.into_parts();
-        if let Some(key) = key {
+        if let Some((key, context)) = key.zip(
+            context.and_then(|context| context.after_processing(project.canonical_root(), runtime.worker_generation)),
+        ) {
             project
                 .module_query_cache()
-                .insert_batch(path, content_hash, key, value.clone());
+                .insert_batch(path, content_hash, context, key, value.clone());
         }
         Ok(CachedBrokerCall {
             value,
@@ -715,6 +761,10 @@ impl ProjectBroker {
     /// Look up or open the project for `root`. Mutex is released around
     /// the slow path so concurrent calls for different roots parallelize.
     async fn acquire(&self, root: PathBuf) -> Result<Arc<LeanProject>> {
+        let epoch = self.inner.lock().shutdown_epoch;
+        if CallCancellation::current().is_cancelled() {
+            return Err(Self::pool_unavailable(&root, "request_cancelled", false));
+        }
         // Fast path: registry hit + matching manifest hash.
         let cached = {
             let mut inner = self.inner.lock();
@@ -748,16 +798,17 @@ impl ProjectBroker {
             drop(project);
         }
 
-        let open_lock = {
-            let mut inner = self.inner.lock();
-            Arc::clone(
-                inner
-                    .opening_locks
-                    .entry(root.clone())
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-            )
+        let open_lock = self.opening_lock(&root);
+        let cancellation = CallCancellation::current();
+        let open_guard = tokio::select! {
+            guard = Arc::clone(&open_lock).lock_owned() => guard,
+            () = cancellation.cancelled() => {
+                return Err(Self::pool_unavailable(&root, "request_cancelled", false));
+            }
         };
-        let _open_guard = open_lock.lock().await;
+        if cancellation.is_cancelled() {
+            return Err(Self::pool_unavailable(&root, "request_cancelled", false));
+        }
 
         let cached_after_wait = {
             let mut inner = self.inner.lock();
@@ -766,7 +817,6 @@ impl ProjectBroker {
         if let Some(project) = cached_after_wait {
             let current_hash = self.meta(&root)?.manifest_hash;
             if project.manifest_hash() == current_hash && project.is_healthy() {
-                self.inner.lock().opening_locks.remove(&root);
                 self.inner.lock().last_used.insert(root, Instant::now());
                 return Ok(project);
             }
@@ -780,91 +830,122 @@ impl ProjectBroker {
             }
         }
 
-        // Slow path: open without holding the registry lock.
-        let meta_root = root.clone();
-        let meta = match tokio::task::spawn_blocking(move || LakeProjectMeta::from_explicit(&meta_root)).await {
-            Ok(Ok(meta)) => meta,
-            Ok(Err(err)) => {
-                self.inner.lock().opening_locks.remove(&root);
-                return Err(err);
-            }
-            Err(err) => {
-                self.inner.lock().opening_locks.remove(&root);
-                return Err(ServerError::Internal(format!("project metadata task failed: {err}")));
-            }
-        };
-        let runtime_config = self.runtime_config.clone();
-        let opened = match tokio::task::spawn_blocking(move || LeanProject::open(meta, runtime_config)).await {
-            Ok(Ok(project)) => project,
-            Ok(Err(err)) => {
-                self.inner.lock().opening_locks.remove(&root);
-                tracing::warn!(project = %root.display(), error = %err, "project open failed");
-                return Err(err);
-            }
-            Err(err) => {
-                self.inner.lock().opening_locks.remove(&root);
-                return Err(ServerError::Internal(format!("project open task failed: {err}")));
-            }
-        };
-        tracing::info!(project = %root.display(), toolchain = %opened.toolchain(), "opened project; worker spawned");
-
-        // Reacquire, race-resolve, insert with possible eviction.
-        let mut inner = self.inner.lock();
-        let (project, victim) = if let Some(existing) = inner.registry.get(&root).cloned() {
-            // Someone else won the race. Use theirs; our `opened` will
-            // shut down when the local `Arc` drops.
-            inner.last_used.insert(root.clone(), Instant::now());
-            (existing, Some(opened))
-        } else {
-            let victim = if inner.registry.len() >= inner.registry.cap().get() {
-                pop_idle_lru(&mut inner.registry)
-            } else {
-                None
-            };
-            if victim.is_none() && inner.registry.len() >= inner.registry.cap().get() {
-                inner.opening_locks.remove(&root);
-                drop(inner);
-                opened.shutdown();
-                tracing::warn!(
-                    project = %root.display(),
-                    "project pool full and every entry is active; rejecting (retryable)"
-                );
-                return Err(ServerError::worker_unavailable(crate::error::WorkerUnavailable {
-                    retryable: true,
-                    worker_restarted: false,
-                    project_root: root.to_string_lossy().into_owned(),
-                    project_hash: String::new(),
-                    imports: Vec::new(),
-                    session_id: String::new(),
-                    lean_toolchain: String::new(),
-                    worker_generation: 0,
-                    reason: "project_pool_busy_all_entries_active".to_owned(),
-                    restart_cause: None,
-                    rss_kib: None,
-                    limit_kib: None,
-                    retry_after_millis: None,
-                    restarts_in_window: None,
-                    window_millis: None,
-                    runtime: crate::envelope::RuntimeFacts::default(),
-                    // Pool exhaustion is not toolchain-provenance related, and the
-                    // rejected project never opened, so there are no advisories.
-                    toolchain_advisories: Vec::new(),
-                }));
-            }
-            if let Some((ref evicted_path, _)) = victim {
-                inner.last_used.remove(evicted_path);
-            }
-            inner.registry.put(root.clone(), Arc::clone(&opened));
-            inner.last_used.insert(root.clone(), Instant::now());
-            (opened, victim.map(|(_, v)| v))
-        };
-        inner.opening_locks.remove(&root);
-        drop(inner);
-        if let Some(v) = victim {
-            tracing::debug!(evicted = %v.canonical_root().display(), "evicted LRU project to make room");
-            v.shutdown();
+        // Reserve before startup, and keep the permit on the actor thread until
+        // structured shutdown completes. Opening and retiring workers count too.
+        let slot = self.reserve_worker_slot(&root).await?;
+        let cancellation = CallCancellation::current();
+        let mut on_drop = cancellation.cancel_on_drop();
+        if cancellation.is_cancelled() {
+            return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
-        Ok(project)
+        let meta_root = root.clone();
+        let meta = tokio::task::spawn_blocking(move || LakeProjectMeta::from_explicit(&meta_root))
+            .await
+            .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
+        if cancellation.is_cancelled() {
+            return Err(Self::pool_unavailable(&root, "request_cancelled", false));
+        }
+        let runtime_config = self.runtime_config.clone();
+        let inner = Arc::clone(&self.inner);
+        let root = root.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            // Hold same-root serialization through registration even when the
+            // async caller disappears while blocking startup is still running.
+            let _open_guard = open_guard;
+            let opened = LeanProject::open(meta, runtime_config, slot)?;
+            let mut registry = inner.lock();
+            if cancellation.is_cancelled() || registry.shutdown_epoch != epoch {
+                let reason = if cancellation.is_cancelled() { "request_cancelled" } else { "project_shutting_down" };
+                drop(registry);
+                opened.shutdown();
+                return Err(Self::pool_unavailable(&root, reason, false));
+            }
+            registry.registry.put(root.clone(), Arc::clone(&opened));
+            registry.last_used.insert(root.clone(), Instant::now());
+            drop(registry);
+            tracing::info!(project = %root.display(), toolchain = %opened.toolchain(), "opened project; worker spawned");
+            Ok(opened)
+        })
+        .await
+        .map_err(|err| ServerError::Internal(format!("project open task failed: {err}")))?;
+        on_drop.disarm();
+        opened
+    }
+
+    fn opening_lock(&self, root: &Path) -> Arc<AsyncMutex<()>> {
+        let mut inner = self.inner.lock();
+        inner.opening_locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = inner.opening_locks.get(root).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        inner.opening_locks.insert(root.to_path_buf(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn reserve_worker_slot(&self, root: &Path) -> Result<OwnedSemaphorePermit> {
+        if CallCancellation::current().is_cancelled() {
+            return Err(Self::pool_unavailable(root, "request_cancelled", false));
+        }
+        if let Ok(slot) = Arc::clone(&self.worker_slots).try_acquire_owned() {
+            return Ok(slot);
+        }
+        let victim = {
+            let mut inner = self.inner.lock();
+            let victim = pop_idle_lru(&mut inner.registry);
+            if let Some((path, _)) = &victim {
+                inner.last_used.remove(path);
+            }
+            victim
+        };
+        let Some((path, project)) = victim else {
+            return Err(Self::pool_unavailable(
+                root,
+                "project_pool_busy_all_entries_active",
+                true,
+            ));
+        };
+        tracing::debug!(evicted = %path.display(), "retiring idle LRU project before replacement startup");
+        project.shutdown();
+        self.wait_for_worker_slot(root).await
+    }
+
+    async fn wait_for_worker_slot(&self, root: &Path) -> Result<OwnedSemaphorePermit> {
+        let cancellation = CallCancellation::current();
+        let limit = Duration::from_millis(self.request_timeout_millis());
+        tokio::select! {
+            slot = tokio::time::timeout(limit, Arc::clone(&self.worker_slots).acquire_owned()) => {
+                match slot {
+                    Ok(slot) => slot.map_err(|err| ServerError::Internal(format!("worker capacity closed: {err}"))),
+                    Err(_) => Err(Self::pool_unavailable(root, "worker_retirement_timeout", false)),
+                }
+            }
+            () = cancellation.cancelled() => {
+                Err(Self::pool_unavailable(root, "request_cancelled", false))
+            }
+        }
+    }
+
+    fn pool_unavailable(root: &Path, reason: &str, retryable: bool) -> ServerError {
+        ServerError::worker_unavailable(crate::error::WorkerUnavailable {
+            retryable,
+            worker_restarted: false,
+            project_root: root.to_string_lossy().into_owned(),
+            project_hash: String::new(),
+            imports: Vec::new(),
+            session_id: String::new(),
+            lean_toolchain: String::new(),
+            worker_generation: 0,
+            reason: reason.to_owned(),
+            restart_cause: None,
+            rss_kib: None,
+            limit_kib: None,
+            retry_after_millis: None,
+            restarts_in_window: None,
+            window_millis: None,
+            runtime: crate::envelope::RuntimeFacts::default(),
+            toolchain_advisories: Vec::new(),
+        })
     }
 
     /// Evict every entry whose `last_used` timestamp is older than
@@ -886,7 +967,7 @@ impl ProjectBroker {
             let mut out: Vec<Arc<LeanProject>> = Vec::with_capacity(expired.len());
             for p in &expired {
                 if let Some(proj) = inner.registry.peek(p)
-                    && !proj.is_idle()
+                    && (!proj.is_idle() || Arc::strong_count(proj) != 1)
                 {
                     continue;
                 }
@@ -919,6 +1000,7 @@ impl ProjectBroker {
     pub fn shutdown_all(&self) {
         let projects: Vec<Arc<LeanProject>> = {
             let mut inner = self.inner.lock();
+            inner.shutdown_epoch = inner.shutdown_epoch.wrapping_add(1);
             let paths: Vec<PathBuf> = inner.registry.iter().map(|(path, _)| path.clone()).collect();
             let mut projects = Vec::with_capacity(paths.len());
             for path in paths {
@@ -927,7 +1009,7 @@ impl ProjectBroker {
                 }
                 inner.last_used.remove(&path);
             }
-            inner.opening_locks.clear();
+            inner.opening_locks.retain(|_, lock| lock.strong_count() > 0);
             projects
         };
         if !projects.is_empty() {
@@ -976,7 +1058,7 @@ fn pop_idle_lru(registry: &mut LruCache<PathBuf, Arc<LeanProject>>) -> Option<(P
     let key = registry
         .iter()
         .rev()
-        .find_map(|(path, project)| project.is_idle().then(|| path.clone()))?;
+        .find_map(|(path, project)| (project.is_idle() && Arc::strong_count(project) == 1).then(|| path.clone()))?;
     let project = registry.pop(&key)?;
     Some((key, project))
 }
@@ -1201,5 +1283,117 @@ mod tests {
             ..BrokerFileConfig::default()
         };
         assert!(parse_pool_config(None, None, &file).is_err());
+    }
+    #[tokio::test]
+    async fn concurrent_startups_reserve_capacity_before_opening_and_hold_it_through_retirement() {
+        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        config.max_projects = NonZeroUsize::MIN;
+        let broker = ProjectBroker::new(config);
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut calls = Vec::new();
+        for index in 0..8 {
+            let broker = Arc::clone(&broker);
+            let barrier = Arc::clone(&barrier);
+            let release = Arc::clone(&release);
+            let active = Arc::clone(&active);
+            calls.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let root = PathBuf::from(format!("/project-{index}"));
+                if let Ok(slot) = broker.reserve_worker_slot(&root).await {
+                    active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    release.notified().await;
+                    drop(slot);
+                    true
+                } else {
+                    false
+                }
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.iter().filter(|call| call.is_finished()).count() < 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 1);
+        broker.shutdown_all();
+        assert!(broker.reserve_worker_slot(Path::new("/later")).await.is_err());
+        release.notify_one();
+        let mut opened = 0;
+        for call in calls {
+            opened += usize::from(call.await.unwrap());
+        }
+        assert_eq!(opened, 1);
+        assert!(broker.reserve_worker_slot(Path::new("/later")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn opening_locks_survive_shutdown_and_a_disappearing_caller() {
+        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None, None));
+        let root = PathBuf::from("/project");
+        let original = broker.opening_lock(&root);
+        let waiting = Arc::clone(&original);
+        broker.shutdown_all();
+        drop(original);
+        let successor = broker.opening_lock(&root);
+        assert!(Arc::ptr_eq(&waiting, &successor));
+        drop(waiting);
+        drop(successor);
+        let _other = broker.opening_lock(Path::new("/other"));
+        assert!(!broker.inner.lock().opening_locks.contains_key(&root));
+    }
+    #[tokio::test]
+    async fn cancelling_capacity_wait_keeps_the_retiring_workers_slot_reserved() {
+        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        config.max_projects = NonZeroUsize::MIN;
+        let broker = ProjectBroker::new(config);
+        let retiring = broker.reserve_worker_slot(Path::new("/first")).await.unwrap();
+        let request = tokio_util::sync::CancellationToken::new();
+        let cancelled = request.clone();
+        let result = crate::cancellation::with_cancellation(&request, async {
+            cancelled.cancel();
+            broker.wait_for_worker_slot(Path::new("/next")).await
+        })
+        .await;
+        let reason = match &result {
+            Err(ServerError::WorkerUnavailable(info)) => info.reason.clone(),
+            _ => panic!("cancelled capacity wait must not acquire a slot"),
+        };
+        drop(result);
+        assert_eq!(reason, "request_cancelled");
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        drop(retiring);
+        assert_eq!(broker.worker_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_same_project_waiter_does_not_wait_for_startup_or_take_capacity() {
+        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None, None));
+        let root = PathBuf::from("/blocked-startup");
+        let held = broker.opening_lock(&root).lock_owned().await;
+        let request = tokio_util::sync::CancellationToken::new();
+        let cancel = request.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::cancellation::with_cancellation(&request, async {
+                cancel.cancel();
+                broker.acquire(root).await
+            }),
+        )
+        .await
+        .unwrap();
+        let reason = match result {
+            Err(ServerError::WorkerUnavailable(info)) => info.reason,
+            _ => panic!("cancelled opening wait must return before startup completes"),
+        };
+        assert_eq!(reason, "request_cancelled");
+        assert_eq!(
+            broker.worker_slots.available_permits(),
+            broker.config.max_projects.get()
+        );
+        drop(held);
     }
 }

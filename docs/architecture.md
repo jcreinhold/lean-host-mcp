@@ -56,6 +56,12 @@ Runtime pressure is not a transport error. Mailbox pressure, project-pool pressu
 restart recovery continue to surface through the semantic response `errors` channel with structured runtime metadata.
 HTTP status codes are reserved for transport/protocol failures such as invalid headers or bad HTTP paths.
 
+Request cancellation reaches the project queue and the worker supervisor. Cancelled queued jobs are skipped before
+opening a Lean session; in-flight cancellation uses the worker layer's token and may recycle that project's worker.
+Cancellation remains bounded by supervisor observation and deadlines, rather than being an instantaneous stop. The
+owning operation waits for its terminal cleanup instead of treating a cancellation acknowledgement as termination.
+Dropping a caller's future also signals cancellation without freeing the worker's capacity early.
+
 ## Project And Worker Boundary
 
 `ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction, manifest
@@ -66,10 +72,13 @@ a time in FIFO order and tracks host presentation facts such as the current work
 and the last import profile. A bounded project queue turns overload into a retryable `busy` failure instead of unbounded
 memory growth. The parent binary never links `libleanshared`; the per-toolchain worker child does.
 
-There is no broker-level admission gate above that. The resource worth protecting is one worker child's serialized
-request stream, and the actor thread plus its bounded mailbox already enforce exactly that; a process-wide semaphore
-would add nothing the actor does not while serializing calls to different projects that share no worker. Concurrency is
-therefore `broker.max_projects` workers, one in-flight job each. Degraded responses and pure `.ilean` reads use
+The broker reserves capacity before opening a worker. Opening, resident and retiring project workers all count against
+`broker.max_projects`; a slot is released only after confirmed shutdown. An uncertain shutdown keeps its slot unavailable
+until server restart. Same-project startup is coalesced even when a caller disconnects. Idle LRU workers may be replaced
+when capacity is full, while a worker borrowed by a caller or processing queued work cannot be evicted. Capacity counts
+project runtimes rather than memory bytes. It does not cover the transient semantic-search companion child described
+below or external Lean processes. Different projects can still run
+concurrently, with one in-flight job per project. Degraded responses and pure `.ilean` reads use
 `project_identity_without_worker` so they can fill semantic trust identity without spawning, and a warm module-query
 cache hit is answered from the project handle without entering the mailbox. A full project queue is a structured
 retryable infrastructure error rather than unbounded memory growth.

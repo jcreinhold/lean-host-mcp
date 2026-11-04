@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use lean_rs_worker_parent::{LeanWorkerJsonCommand, LeanWorkerSession};
+use lean_rs_worker_parent::{LeanWorkerCancellationToken, LeanWorkerJsonCommand, LeanWorkerSession};
 use lean_semantic_search_contract::{
     CAPABILITY_SCHEMA_VERSION, CommandResponse, DECLARATION_FEATURE_COMMAND_VERSION, DeclarationFeatureRow, Diagnostic,
     DiagnosticSeverity, ModuleSpec, PROOF_GOAL_FEATURE_COMMAND_VERSION, ProofGoalFeatureRequest, ProofGoalFeatureRow,
@@ -65,6 +65,7 @@ struct DeclarationFeatureCommandRequest {
 pub(crate) fn run_semantic_proof_search(
     session: &mut LeanWorkerSession<'_>,
     request: &SemanticProofSearchRequest,
+    cancellation: &LeanWorkerCancellationToken,
 ) -> Result<SemanticProofSearchResult> {
     let goal_command = LeanWorkerJsonCommand::<ProofGoalFeatureRequest, ProofGoalResponse>::new(
         lean_semantic_search_capability::PROOF_GOAL_FEATURES_EXPORT,
@@ -74,7 +75,7 @@ pub(crate) fn run_semantic_proof_search(
     );
 
     let goal_response = session
-        .run_json_command(&goal_command, &request.goal, None, None)
+        .run_json_command(&goal_command, &request.goal, Some(cancellation), None)
         .map_err(crate::error::map_worker_err)?;
     validate_response(
         &goal_response,
@@ -95,7 +96,7 @@ pub(crate) fn run_semantic_proof_search(
         declaration_ids: Vec::new(),
     };
     let declaration_response = session
-        .run_json_command(&declaration_command, &declaration_request, None, None)
+        .run_json_command(&declaration_command, &declaration_request, Some(cancellation), None)
         .map_err(crate::error::map_worker_err)?;
     validate_response(
         &declaration_response,

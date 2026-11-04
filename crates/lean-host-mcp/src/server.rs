@@ -7,22 +7,29 @@
 //! `Json` wrapper makes rmcp advertise a deep `outputSchema` that no Anthropic
 //! API client forwards to the model (it costs only wire bytes and breaks strict
 //! schema validators), so we drop it and place the serialized envelope per the
-//! configured [`ResponseCarrier`].
+//! configured [`ResponseCarrier`]. Clients negotiating the MCP Tasks extension
+//! receive process-local task handles. Clone a service across transport sessions
+//! to retain those handles and their results after a client reconnects.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock, CreateTaskResult,
+    GetTaskParams, GetTaskResult, Implementation, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    ServerCapabilities, ServerInfo, Tool, UpdateTaskParams,
 };
 use rmcp::service::RequestContext;
-use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_router};
 
 use crate::broker::ProjectBroker;
+use crate::cancellation::with_cancellation;
 use crate::error::ServerError;
+use crate::tasks::RequestTasks;
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
@@ -36,6 +43,14 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 /// but healthy call from being abandoned at the client while the worker keeps
 /// computing. Silent when the client sent no progress token.
 async fn with_progress<T>(context: &RequestContext<RoleServer>, tool: &str, operation: impl Future<Output = T>) -> T {
+    with_cancellation(&context.ct, progress_while_waiting(context, tool, operation)).await
+}
+
+async fn progress_while_waiting<T>(
+    context: &RequestContext<RoleServer>,
+    tool: &str,
+    operation: impl Future<Output = T>,
+) -> T {
     let Some(progress_token) = context.meta.get_progress_token() else {
         return operation.await;
     };
@@ -91,17 +106,11 @@ async fn with_progress<T>(context: &RequestContext<RoleServer>, tool: &str, oper
     }
 }
 
-// Deliberately not `use crate::error::Result;` here: the `#[tool_handler]`
-// macro emits bare `Result<...>` references that must resolve to the std
-// `Result`. `crate::error::Result` appears only via fully-qualified paths.
-
 #[derive(Debug, Clone)]
 pub struct LeanHostService {
     ctx: ToolContext,
-    // Read by the `#[tool_handler]`-generated `call_tool` dispatcher; the
-    // reference is invisible to dead-code analysis.
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+    tasks: RequestTasks,
 }
 
 impl LeanHostService {
@@ -110,6 +119,7 @@ impl LeanHostService {
         Self {
             ctx,
             tool_router: Self::tool_router(),
+            tasks: RequestTasks::default(),
         }
     }
 }
@@ -204,18 +214,75 @@ impl LeanHostService {
     }
 }
 
-#[tool_handler]
-#[allow(
-    clippy::unused_async_trait_impl,
-    reason = "rmcp's #[tool_handler] macro emits `async fn list_tools` with no `.await` over the RPITIT ServerHandler trait; the async-ness is macro-generated and not ours to remove"
-)]
 impl ServerHandler for LeanHostService {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        if context.client_capabilities().is_some_and(|caps| caps.supports_tasks()) {
+            // Parse before acceptance. Task calls use no request-scoped peer or
+            // cancellation token, so disconnecting cannot abandon their result.
+            let call = TaskCall::parse(&request)?;
+            if !call.is_cheap_metadata() {
+                let service = self.clone();
+                if let Some(task) = self
+                    .tasks
+                    .spawn(&request.name, move || async move { service.run_task(call).await })
+                {
+                    return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+                }
+            }
+        }
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListToolsResult::with_all_items(self.tool_router.list_all())))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+
+    fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
+        std::future::ready(self.tasks.get(&request.task_id).map(GetTaskResult::new))
+    }
+
+    fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        // These tools never ask for in-task input. Unknown/already answered
+        // input keys are ignored, as required by the Tasks extension.
+        std::future::ready(self.tasks.get(&request.task_id).map(|_| ()))
+    }
+
+    fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::ready(self.tasks.cancel(&request.task_id))
+    }
+
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo` is `#[non_exhaustive]` from rmcp; struct literal
         // syntax (even with `..default`) is forbidden across crates. Build
         // via Default + field mutation.
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder().enable_tools().enable_tasks().build();
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
         info.instructions = Some(
@@ -223,7 +290,9 @@ impl ServerHandler for LeanHostService {
              Tools expose five semantic Lean job families: context, trial, \
              verification, lookup, and status. Context, trial, lookup, and \
              status select a mode with `kind`; verification takes explicit \
-             target groups."
+             target groups. Clients advertising io.modelcontextprotocol/tasks \
+             may receive task handles; results remain available for ten minutes \
+             after completion while this server process lives."
                 .to_owned(),
         );
         info
@@ -231,6 +300,17 @@ impl ServerHandler for LeanHostService {
 }
 
 impl LeanHostService {
+    async fn run_task(&self, call: TaskCall) -> Result<CallToolResult, McpError> {
+        let result = match call {
+            TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
+            TaskCall::Trial(req) => tools::semantic::lean_trial(&self.ctx, req.into_inner()).await,
+            TaskCall::Verify(req) => tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await,
+            TaskCall::Lookup(req) => tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await,
+            TaskCall::Status(req) => tools::semantic::lean_status(&self.ctx, req.into_inner()).await,
+        };
+        self.respond_semantic(result)
+    }
+
     fn respond_semantic(
         &self,
         result: crate::error::Result<tools::semantic::SemanticResponse<serde_json::Value>>,
@@ -245,6 +325,36 @@ impl LeanHostService {
             Err(err) => return Err(McpError::from(err)),
         };
         Ok(carry(&response, self.ctx.config.carrier))
+    }
+}
+
+enum TaskCall {
+    Context(tools::semantic::LeanContextToolRequest),
+    Trial(tools::semantic::LeanTrialToolRequest),
+    Verify(tools::proof_action::LeanVerifyToolRequest),
+    Lookup(tools::semantic::LeanLookupToolRequest),
+    Status(tools::semantic::LeanStatusToolRequest),
+}
+
+impl TaskCall {
+    fn is_cheap_metadata(&self) -> bool {
+        matches!(self, Self::Status(req) if tools::request_aliases::canonical_kind(
+            "lean_status",
+            req.0.kind.as_deref().map(str::trim).filter(|kind| !kind.is_empty()).unwrap_or("project"),
+        ) == "project")
+    }
+
+    fn parse(request: &CallToolRequestParams) -> Result<Self, McpError> {
+        let args = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+        let result = match request.name.as_ref() {
+            "lean_context" => serde_json::from_value(args).map(Self::Context),
+            "lean_trial" => serde_json::from_value(args).map(Self::Trial),
+            "lean_verify" => serde_json::from_value(args).map(Self::Verify),
+            "lean_lookup" => serde_json::from_value(args).map(Self::Lookup),
+            "lean_status" => serde_json::from_value(args).map(Self::Status),
+            _ => return Err(McpError::invalid_params("tool not found", None)),
+        };
+        result.map_err(|error| McpError::invalid_params(error.to_string(), None))
     }
 }
 
@@ -279,6 +389,92 @@ mod tests {
     use super::*;
     use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
     use crate::error::{ServerError, WorkerUnavailable};
+    use rmcp::ServiceExt;
+    use rmcp::model::{ClientCapabilities, NumberOrString, TaskPayload, TaskStatus};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn task_negotiation_preserves_sync_payload_and_service_clone_results() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lakefile.lean"), "package status\nlean_lib Status\n").unwrap();
+        std::fs::write(dir.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        std::fs::write(dir.path().join("lake-manifest.json"), "{}\n").unwrap();
+        let broker = ProjectBroker::new(crate::broker::BrokerConfig {
+            config_default: Some(dir.path().to_path_buf()),
+            env_default: None,
+            cwd: dir.path().to_path_buf(),
+            max_projects: crate::broker::BrokerConfig::default_max_projects(),
+            idle_timeout: Duration::ZERO,
+        });
+        let service = LeanHostService::new(broker, ToolConfig::default());
+        // Establish an in-memory legacy peer without enabling rmcp's client
+        // feature, opening a socket, or starting a Lean worker.
+        let (server_io, mut client_io) = tokio::io::duplex(65_536);
+        client_io.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let running = service.clone().serve(server_io).await.unwrap();
+        let context = RequestContext::new(NumberOrString::Number(2), running.peer().clone());
+        let request = CallToolRequestParams::new("lean_verify")
+            .with_arguments(serde_json::from_value(serde_json::json!({"targets": []})).unwrap());
+        let synchronous = service.call_tool(request.clone(), context.clone()).await.unwrap();
+        let CallToolResponse::Complete(synchronous) = synchronous else {
+            unreachable!("legacy client must receive a synchronous result")
+        };
+        let mut task_context = context.clone();
+        task_context
+            .meta
+            .set_client_capabilities(ClientCapabilities::builder().enable_tasks().build());
+        let accepted = service.call_tool(request, task_context).await.unwrap();
+        let CallToolResponse::Task(accepted) = accepted else {
+            unreachable!("negotiated client should receive a task handle")
+        };
+        let clone = service.clone();
+        let task_id = accepted.task.task_id;
+        assert!(
+            clone
+                .get_task(GetTaskParams::new(&task_id), context.clone())
+                .await
+                .is_ok()
+        );
+        drop(service);
+        let final_task = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let task = clone
+                    .get_task(GetTaskParams::new(&task_id), context.clone())
+                    .await
+                    .unwrap()
+                    .task;
+                if task.status().is_terminal() {
+                    break task;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(final_task.status(), TaskStatus::Completed);
+        let TaskPayload::Completed { result } = final_task.payload else {
+            unreachable!("task result must be retained")
+        };
+        assert_eq!(
+            serde_json::Value::Object(result),
+            serde_json::to_value(synchronous).unwrap()
+        );
+        clone
+            .cancel_task(CancelTaskParams::new(&task_id), context.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            clone
+                .get_task(GetTaskParams::new(&task_id), context)
+                .await
+                .unwrap()
+                .task
+                .status(),
+            TaskStatus::Completed
+        );
+        running.cancel().await.unwrap();
+        drop(client_io);
+    }
 
     #[test]
     fn worker_unavailable_is_a_structured_tool_response() {

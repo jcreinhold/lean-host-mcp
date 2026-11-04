@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lean_rs_worker_parent::{
-    LeanWorkerCapabilityBuilder, LeanWorkerChild, LeanWorkerDeclarationInspectionRequest,
+    LeanWorkerCancellationToken, LeanWorkerCapabilityBuilder, LeanWorkerChild, LeanWorkerDeclarationInspectionRequest,
     LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationSearch, LeanWorkerDeclarationSearchResult,
     LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
     LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions,
@@ -28,9 +28,10 @@ use lean_rs_worker_parent::{
 };
 use lean_semantic_search_runtime::SemanticSearchRuntimeBuild;
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use crate::cache::ModuleQueryCache;
+use crate::cancellation::CallCancellation;
 use crate::config_file::RuntimeFileConfig;
 use crate::envelope::{Freshness, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
@@ -664,6 +665,7 @@ struct JobMeta {
     _correlation_id: uuid::Uuid,
     retry_policy: RetryPolicy,
     _active_job: ActiveJobGuard,
+    cancellation: CallCancellation,
 }
 
 enum ProjectMessage {
@@ -720,7 +722,7 @@ enum ProjectMessage {
 }
 
 impl ProjectMessage {
-    fn imports(&self) -> &[String] {
+    fn meta(&self) -> &JobMeta {
         match self {
             Self::ModuleQuery { meta, .. }
             | Self::ModuleQueryBatch { meta, .. }
@@ -729,8 +731,12 @@ impl ProjectMessage {
             | Self::ProofAttempt { meta, .. }
             | Self::DeclarationVerification { meta, .. }
             | Self::DeclarationVerificationBatch { meta, .. }
-            | Self::SemanticProofSearch { meta, .. } => &meta.imports,
+            | Self::SemanticProofSearch { meta, .. } => meta,
         }
+    }
+
+    fn imports(&self) -> &[String] {
+        &self.meta().imports
     }
 
     fn reject(self, state: &ProjectActorState, reason: &'static str) {
@@ -981,6 +987,24 @@ pub(crate) struct LeanProject {
     module_queries: ModuleQueryCache,
 }
 
+/// Keep uncertain shutdowns counted rather than starting a replacement beside
+/// a possibly live child. Unwinding also retains capacity until server restart.
+struct WorkerSlot(Option<OwnedSemaphorePermit>);
+
+impl WorkerSlot {
+    fn release(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0.take() {
+            slot.forget();
+        }
+    }
+}
+
 impl std::fmt::Debug for LeanProject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LeanProject")
@@ -994,7 +1018,11 @@ impl std::fmt::Debug for LeanProject {
 }
 
 impl LeanProject {
-    pub(crate) fn open(meta: LakeProjectMeta, runtime_config: ProjectRuntimeConfig) -> Result<Arc<Self>> {
+    pub(crate) fn open(
+        meta: LakeProjectMeta,
+        runtime_config: ProjectRuntimeConfig,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
             worker_generation: 1,
@@ -1023,7 +1051,12 @@ impl LeanProject {
         thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                actor_main(config, init_tx);
+                // The permit outlives the handle's structured shutdown, including
+                // failed startup and unwinding. Registry eviction alone frees nothing.
+                let slot = WorkerSlot(Some(slot));
+                if actor_main(config, init_tx) {
+                    slot.release();
+                }
             })
             .map_err(|e| ServerError::Internal(format!("spawn project actor thread: {e}")))?;
 
@@ -1254,6 +1287,7 @@ impl LeanProject {
             _active_job: ActiveJobGuard {
                 active_jobs: Arc::clone(&self.active_jobs),
             },
+            cancellation: CallCancellation::current(),
         }
     }
 
@@ -1265,6 +1299,11 @@ impl LeanProject {
     where
         T: Send + 'static,
     {
+        let cancellation = message.meta().cancellation.clone();
+        let mut on_drop = cancellation.cancel_on_drop();
+        if cancellation.is_cancelled() {
+            return Err(self.unavailable("request_cancelled", false, false));
+        }
         let project_info = self.worker_error_context(message.imports());
         let tx = self
             .actor_tx
@@ -1293,13 +1332,15 @@ impl LeanProject {
             }
         }
 
-        match reply_rx.await {
+        let result = match reply_rx.await {
             Ok(result) => result,
             Err(_) => {
                 self.shutdown();
                 Err(self.unavailable("mailbox_closed_before_reply", true, false))
             }
-        }
+        };
+        on_drop.disarm();
+        result
     }
 
     pub(crate) fn manifest_hash(&self) -> &str {
@@ -1398,10 +1439,7 @@ struct ActorConfig {
     session_id: String,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     healthy: Arc<AtomicBool>,
-    /// Where a module this project imports could have its `.olean` built.
-    /// Resolved once at open: the package set is a function of
-    /// `lake-manifest.json`, and a manifest change evicts the project outright.
-    artifact_roots: Vec<PathBuf>,
+    startup_uncertain: Arc<AtomicBool>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -1523,7 +1561,7 @@ impl ActorConfig {
             session_id,
             runtime,
             healthy,
-            artifact_roots: lake_meta::artifact_roots(&meta.canonical_root),
+            startup_uncertain: Arc::new(AtomicBool::new(false)),
             lean_max_memory_kib: runtime_config.lean_max_memory_kib(),
             request_timeout_millis: runtime_config.request_timeout_millis(),
             mailbox_capacity: runtime_config.mailbox_capacity(),
@@ -1548,10 +1586,9 @@ struct ImportProfileStamp {
     /// that makes the pre-warm depend on the fingerprint's spelling; this list is
     /// what the child was actually asked for.
     imports: Vec<String>,
-    /// Newest `.olean` mtime among that profile's imports, sampled when it was
-    /// last served. `None` for an unbuilt project, where there is no mtime to
-    /// compare against.
-    artifact_stamp: Option<std::time::SystemTime>,
+    /// Exact per-import artifact metadata when last served. `None` means an
+    /// artifact could not be inspected, so a pooled session cannot be trusted.
+    artifact_stamp: Option<crate::cache::ImportArtifactStamp>,
     /// When this profile was last served, so an idle cycle only pre-warms a
     /// profile a returning caller is plausibly still working in.
     last_served: Instant,
@@ -1600,8 +1637,15 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
-                let result = self.run_job(meta, |handle, imports| {
-                    handle.process_module_query_with_imports(imports, &source, &query, &options, None, None)
+                let result = self.run_job(meta, |handle, imports, cancellation| {
+                    handle.process_module_query_with_imports(
+                        imports,
+                        &source,
+                        &query,
+                        &options,
+                        Some(cancellation),
+                        None,
+                    )
                 });
                 let _ = reply.send(result);
             }
@@ -1613,16 +1657,22 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
-                let result = self.run_job(meta, |handle, imports| {
+                let result = self.run_job(meta, |handle, imports, cancellation| {
                     handle.process_module_query_batch_with_imports(
-                        imports, &source, &selectors, &budgets, &options, None, None,
+                        imports,
+                        &source,
+                        &selectors,
+                        &budgets,
+                        &options,
+                        Some(cancellation),
+                        None,
                     )
                 });
                 let _ = reply.send(result);
             }
             ProjectMessage::DeclarationInspection { meta, request, reply } => {
-                let result = self.run_job(meta, |handle, imports| {
-                    handle.inspect_declaration_with_imports(imports, &request, None, None)
+                let result = self.run_job(meta, |handle, imports, cancellation| {
+                    handle.inspect_declaration_with_imports(imports, &request, Some(cancellation), None)
                 });
                 let _ = reply.send(result);
             }
@@ -1632,11 +1682,11 @@ impl ProjectActorState {
                 // so the per-search cost here is a worker round trip rather than
                 // an import. The session borrows `&mut handle` and dies inside
                 // the closure, so nothing escapes the actor's stack frame.
-                let result = self.run_job(meta, |handle, imports| {
-                    let mut session = handle.open_session_with_imports(imports, None, None)?;
+                let result = self.run_job(meta, |handle, imports, cancellation| {
+                    let mut session = handle.open_session_with_imports(imports, Some(cancellation), None)?;
                     requests
                         .iter()
-                        .map(|request| session.search_declarations(request, None, None))
+                        .map(|request| session.search_declarations(request, Some(cancellation), None))
                         .collect()
                 });
                 let _ = reply.send(result);
@@ -1647,8 +1697,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
-                let result = self.run_job(meta, |handle, imports| {
-                    handle.attempt_proof_with_imports(imports, &request, &options, None, None)
+                let result = self.run_job(meta, |handle, imports, cancellation| {
+                    handle.attempt_proof_with_imports(imports, &request, &options, Some(cancellation), None)
                 });
                 let _ = reply.send(result);
             }
@@ -1658,8 +1708,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
-                let result = self.run_job(meta, |handle, imports| {
-                    handle.verify_declaration_with_imports(imports, &request, &options, None, None)
+                let result = self.run_job(meta, |handle, imports, cancellation| {
+                    handle.verify_declaration_with_imports(imports, &request, &options, Some(cancellation), None)
                 });
                 let _ = reply.send(result);
             }
@@ -1669,8 +1719,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
-                let result = self.run_job(meta, |handle, imports| {
-                    handle.verify_declaration_batch_with_imports(imports, &request, &options, None, None)
+                let result = self.run_job(meta, |handle, imports, cancellation| {
+                    handle.verify_declaration_batch_with_imports(imports, &request, &options, Some(cancellation), None)
                 });
                 let _ = reply.send(result);
             }
@@ -1684,8 +1734,15 @@ impl ProjectActorState {
     fn run_job<R>(
         &mut self,
         meta: JobMeta,
-        job: impl Fn(&mut LeanWorkerHostHandle, Vec<String>) -> std::result::Result<R, LeanWorkerError>,
+        job: impl Fn(
+            &mut LeanWorkerHostHandle,
+            Vec<String>,
+            &LeanWorkerCancellationToken,
+        ) -> std::result::Result<R, LeanWorkerError>,
     ) -> Result<ProjectCall<R>> {
+        if meta.cancellation.is_cancelled() {
+            return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
+        }
         // Runs on the project's dedicated actor thread (no async), so an entered
         // span is correct and ties every nested worker/recycle log to this call.
         let _span = tracing::debug_span!(
@@ -1710,7 +1767,10 @@ impl ProjectActorState {
         // place timing/restart facts are computed — threading them through six
         // exits complects measurement with the retry state machine.
         let exit = loop {
-            match job(&mut self.handle, meta.imports.clone()) {
+            if meta.cancellation.is_cancelled() {
+                return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
+            }
+            match job(&mut self.handle, meta.imports.clone(), meta.cancellation.worker()) {
                 Ok(value) => {
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
@@ -1719,6 +1779,16 @@ impl ProjectActorState {
                     // only: no threshold reads it, and nothing restarts on it.
                     self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
                     break JobExit::Done(value);
+                }
+                Err(_err) if meta.cancellation.is_cancelled() => {
+                    call_restart = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
+                    break JobExit::Unavailable {
+                        reason: "request_cancelled".to_owned(),
+                        retryable: false,
+                        worker_restarted: self.observed_generation() > generation_before,
+                        cause: Some(RestartCause::Cancelled),
+                        limit_kib: None,
+                    };
                 }
                 Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
@@ -1839,6 +1909,9 @@ impl ProjectActorState {
         meta: JobMeta,
         request: &SemanticProofSearchRequest,
     ) -> Result<ProjectCall<SemanticProofSearchResult>> {
+        if meta.cancellation.is_cancelled() {
+            return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
+        }
         let _span = tracing::debug_span!(
             "semantic_job",
             session_id = %self.config.session_id,
@@ -1855,9 +1928,9 @@ impl ProjectActorState {
         let cpu_baseline = capability.cumulative_cpu_millis();
         let result = {
             let mut session = capability
-                .open_session_with_imports(meta.imports.clone(), None, None)
+                .open_session_with_imports(meta.imports.clone(), Some(meta.cancellation.worker()), None)
                 .map_err(map_worker_err)?;
-            crate::semantic_search::run_semantic_proof_search(&mut session, request)
+            crate::semantic_search::run_semantic_proof_search(&mut session, request, meta.cancellation.worker())
         };
         let call_cpu_millis =
             cpu_baseline.and_then(|start| capability.cumulative_cpu_millis().map(|end| end.saturating_sub(start)));
@@ -1947,26 +2020,27 @@ impl ProjectActorState {
     /// rebuilt since. Recycling before the job means the job then runs on a
     /// fresh worker, which is why `artifacts_rebuilt` is not an execution taint.
     ///
-    /// The stamp is read just before the session opens, not after, so a build
-    /// that lands inside that window is attributed to the new session and the
-    /// following call sees no advance. Closing it would cost a second stat pass
-    /// per job to catch a race measured in milliseconds against a `lake build`
-    /// measured in seconds; the artifact facts in `trust` still report the
-    /// staleness for the modules a call actually touches.
+    /// Stamps track each named import, including removal and backdated
+    /// replacement, rather than only the newest mtime. Lake must propagate a
+    /// changed transitive dependency to these named imports. A build concurrent
+    /// with execution is not an atomic snapshot; the broker refuses to cache
+    /// such a result, and the following job compares against this pre-job stamp.
     fn cycle_if_imports_rebuilt(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
-        let stamp = lake_meta::import_artifact_stamp(&self.config.artifact_roots, &meta.imports);
+        let stamp = crate::cache::ImportArtifactStamp::capture(
+            &lake_meta::artifact_roots(&self.config.lake_root),
+            &meta.imports,
+        );
         // Recorded unconditionally: this is the stamp of the artifacts the
         // session about to serve the job will have imported, whether that
         // session is a pooled one, the live one, or the replacement opened
         // below.
-        let previous = self.note_import_profile(&meta.import_fingerprint, &meta.imports, stamp);
-        let (Some(previous), Some(current)) = (previous, stamp) else {
-            return Ok(None);
-        };
-        if current <= previous {
+        if !self.note_import_profile(&meta.import_fingerprint, &meta.imports, stamp) {
             return Ok(None);
         }
-        let reason = format!("artifacts_rebuilt imports={} newest_olean_advanced", meta.imports.len());
+        let reason = format!(
+            "artifacts_rebuilt imports={} named_olean_metadata_changed",
+            meta.imports.len()
+        );
         self.record_restart_or_stop(RestartCause::ArtifactsRebuilt, &reason)
             .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         self.handle.cycle().map_err(map_worker_err)?;
@@ -1991,28 +2065,27 @@ impl ProjectActorState {
     }
 
     /// Record that `fingerprint` is now the most recently served profile,
-    /// carrying `stamp`, and return the stamp the child last held it at.
+    /// carrying `stamp`, and report whether an existing session must be cycled.
     ///
-    /// `None` covers both "the child cannot be holding this profile" and "it
-    /// held it over an unbuilt project", deliberately: neither gives an mtime
-    /// to compare the incoming one against, so the caller treats them alike.
+    /// A new profile has no session to invalidate. A failed artifact inspection
+    /// always invalidates a previously held session.
     fn note_import_profile(
         &mut self,
         fingerprint: &str,
         imports: &[String],
-        stamp: Option<std::time::SystemTime>,
-    ) -> Option<std::time::SystemTime> {
+        stamp: Option<crate::cache::ImportArtifactStamp>,
+    ) -> bool {
         if let Some(index) = self
             .imports_seen
             .iter()
             .position(|held| held.fingerprint == fingerprint)
         {
             let mut held = self.imports_seen.remove(index);
-            let previous = held.artifact_stamp;
+            let changed = stamp.is_none() || held.artifact_stamp != stamp;
             held.artifact_stamp = stamp;
             held.last_served = Instant::now();
             self.imports_seen.push(held);
-            return previous;
+            return changed;
         }
         // Bounded by the child's own session-pool capacity, so the parent's
         // picture of what the child holds cannot outgrow what it can hold.
@@ -2025,7 +2098,7 @@ impl ProjectActorState {
             artifact_stamp: stamp,
             last_served: Instant::now(),
         });
-        None
+        false
     }
 
     /// Cycle the child now, between requests, if imports have retained more than
@@ -2158,13 +2231,14 @@ impl ProjectActorState {
         // The cycle relocated the respawn; this relocates the import, which at
         // Mathlib scale is the expensive half by an order of magnitude.
         let Some((fingerprint, imports)) = prewarm else { return };
+        let stamp =
+            crate::cache::ImportArtifactStamp::capture(&lake_meta::artifact_roots(&self.config.lake_root), &imports);
         match self.handle.open_session_with_imports(imports.clone(), None, None) {
             Ok(_session) => {
                 // Record it the same way a served job would, so the *next* call
                 // on this profile compares artifact stamps against the import
                 // that actually happened rather than treating it as unseen.
-                let stamp = lake_meta::import_artifact_stamp(&self.config.artifact_roots, &imports);
-                let _previous = self.note_import_profile(&fingerprint, &imports, stamp);
+                let _changed = self.note_import_profile(&fingerprint, &imports, stamp);
             }
             Err(err) => {
                 // Same posture as a failed cycle: nobody is waiting, and the
@@ -2440,7 +2514,15 @@ impl ProjectActorState {
     }
 
     fn shutdown_unavailable(&self, meta: &JobMeta, reason: &'static str) -> ServerError {
-        self.worker_unavailable_for(meta, reason.to_owned(), true, false, None, None, None)
+        self.worker_unavailable_for(
+            meta,
+            reason.to_owned(),
+            reason != "request_cancelled",
+            false,
+            None,
+            None,
+            None,
+        )
     }
 
     fn restart_limit_error(&self, imports: &[String], limit: RestartLimitExceeded) -> ServerError {
@@ -2477,12 +2559,12 @@ struct RestartLimitExceeded {
 fn actor_main(
     config: ActorConfig,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>>,
-) {
+) -> bool {
     let (handle, runtime_toolchain) = match open_worker(&config, true) {
         Ok(value) => value,
         Err(err) => {
             let _ = init_reply.send(Err(err));
-            return;
+            return !config.startup_uncertain.load(Ordering::Acquire);
         }
     };
     let mut state = ProjectActorState {
@@ -2529,9 +2611,9 @@ fn actor_main(
     }
 
     let (tx, mut rx) = mpsc::channel::<ProjectMessage>(config.mailbox_capacity);
-    if init_reply.send(Ok((runtime_toolchain, tx))).is_err() {
-        return;
-    }
+    // If the opener disappeared, dropping the returned sender closes rx and
+    // still takes the same acknowledged worker shutdown path below.
+    let _ = init_reply.send(Ok((runtime_toolchain, tx)));
 
     // Every reply is sent inside `handle_message` before it returns, so by the
     // time control reaches the bottom of this loop the client already has its
@@ -2557,6 +2639,10 @@ fn actor_main(
             message.reject(&state, "project_shutting_down");
             continue;
         }
+        if message.meta().cancellation.is_cancelled() {
+            message.reject(&state, "request_cancelled");
+            continue;
+        }
         state.handle_message(message);
         // Only where `idle_grace` can never arm. With a runtime available the
         // quiescence tick above does this job two seconds later and pre-warms as
@@ -2575,9 +2661,11 @@ fn actor_main(
                 wait_millis = millis_u64(report.wait_elapsed),
                 "project worker shutdown complete"
             );
+            !state.config.startup_uncertain.load(Ordering::Acquire)
         }
         Err(err) => {
-            tracing::warn!(error = %err, "project worker shutdown failed");
+            tracing::error!(error = %err, "project worker shutdown uncertain; retaining worker capacity");
+            false
         }
     }
 }
@@ -2597,12 +2685,37 @@ fn open_worker(config: &ActorConfig, preflight: bool) -> Result<(LeanWorkerHostH
     // No `RssHardLimitExceeded` arm: this server no longer sets
     // `rss_hard_limit`, so the supervisor cannot produce one. See
     // `lean_max_memory_kib_for`.
-    let handle = builder.open().map_err(map_worker_err)?;
+    let handle = builder.open().map_err(|error| {
+        if startup_outcome_uncertain(&error) {
+            config.startup_uncertain.store(true, Ordering::Release);
+            config.healthy.store(false, Ordering::Release);
+            tracing::error!(error = %error, "worker startup has no confirmed child exit; retaining capacity");
+        }
+        map_worker_err(error)
+    })?;
     let runtime_toolchain = handle
         .runtime_metadata()
         .lean_version
         .unwrap_or_else(|| config.toolchain_label.clone());
     Ok((handle, runtime_toolchain))
+}
+
+/// Only errors proving no spawn or an observed child exit release startup
+/// capacity. In particular, handshake/setup/protocol failures can follow spawn.
+fn startup_outcome_uncertain(error: &LeanWorkerError) -> bool {
+    !matches!(
+        error,
+        LeanWorkerError::Spawn { .. }
+            | LeanWorkerError::WorkerChildUnresolved { .. }
+            | LeanWorkerError::WorkerChildNotExecutable { .. }
+            | LeanWorkerError::Bootstrap { .. }
+            | LeanWorkerError::ChildExited { .. }
+            | LeanWorkerError::ChildPanicOrAbort { .. }
+            | LeanWorkerError::Timeout {
+                operation: "startup",
+                ..
+            }
+    )
 }
 
 /// One policy restart, on the one quantity that accumulates without bound: the
@@ -3216,7 +3329,7 @@ mod tests {
             session_id: "session-test".to_owned(),
             runtime,
             healthy: Arc::new(AtomicBool::new(true)),
-            artifact_roots: Vec::new(),
+            startup_uncertain: Arc::new(AtomicBool::new(false)),
             lean_max_memory_kib: ProjectRuntimeConfig::default().lean_max_memory_kib(),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -3347,5 +3460,59 @@ mod tests {
             .as_str(),
             "idle"
         );
+    }
+    #[test]
+    fn worker_capacity_is_released_only_after_confirmed_shutdown() {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        WorkerSlot(Some(Arc::clone(&capacity).try_acquire_owned().unwrap())).release();
+        assert_eq!(capacity.available_permits(), 1);
+        let uncertain = WorkerSlot(Some(Arc::clone(&capacity).try_acquire_owned().unwrap()));
+        drop(uncertain);
+        assert_eq!(capacity.available_permits(), 0);
+    }
+
+    #[test]
+    fn cancelled_queued_messages_keep_their_cancellation_and_release_activity_on_drop() {
+        let cancellation = CallCancellation::default();
+        let active = Arc::new(AtomicUsize::new(1));
+        let (reply, _receive) = oneshot::channel();
+        let message = ProjectMessage::ModuleQuery {
+            meta: JobMeta {
+                imports: vec!["Init".to_owned()],
+                import_fingerprint: "Init".to_owned(),
+                _created_at: Instant::now(),
+                queued_at: Instant::now(),
+                _correlation_id: uuid::Uuid::new_v4(),
+                retry_policy: RetryPolicy::RetryOnceReadOnly,
+                _active_job: ActiveJobGuard {
+                    active_jobs: Arc::clone(&active),
+                },
+                cancellation: cancellation.clone(),
+            },
+            source: String::new(),
+            query: LeanWorkerModuleQuery::Diagnostics,
+            options: LeanWorkerElabOptions::default(),
+            reply,
+        };
+        cancellation.cancel();
+        assert!(message.meta().cancellation.is_cancelled());
+        drop(message);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn startup_capacity_requires_no_spawn_or_confirmed_exit_evidence() {
+        assert!(!startup_outcome_uncertain(&LeanWorkerError::Spawn {
+            executable: PathBuf::from("missing-worker"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }));
+        assert!(startup_outcome_uncertain(&LeanWorkerError::Handshake {
+            message: "reader disconnected".to_owned()
+        }));
+        assert!(startup_outcome_uncertain(&LeanWorkerError::Protocol {
+            message: "configuration write failed".to_owned()
+        }));
+        assert!(startup_outcome_uncertain(&LeanWorkerError::Setup {
+            message: "child stdout unavailable".to_owned()
+        }));
     }
 }
