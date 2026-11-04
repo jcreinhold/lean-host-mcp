@@ -33,6 +33,11 @@ Clients declaring the `io.modelcontextprotocol/tasks` extension may receive a st
 Use `tasks/get` with its `taskId` to retrieve status and the eventual original tool result; use `tasks/cancel` to request
 cancellation. Cheap project status remains synchronous. Existing clients keep synchronous tool responses. The HTTP
 server shares task records across client sessions, so reconnecting clients can retrieve their existing handles.
+A task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
+
+Closing an HTTP connection alone does not request cancellation. A synchronous request may continue until completion or
+its worker deadline, even when its response stream is lost. Synchronous clients should send MCP
+`notifications/cancelled` with the original request ID when they intend to stop work.
 
 The server retains at most 128 active or completed task records, with completed results available for ten minutes.
 When that registry is full, calls use the ordinary synchronous path. Follow the suggested polling interval; task push
