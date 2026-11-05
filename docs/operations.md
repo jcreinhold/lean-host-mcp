@@ -246,17 +246,22 @@ startup parent PID, and process group. Inspect records with:
 lean-host-mcp doctor processes
 ```
 
+The stdio parent watcher uses the kernel's parent PID rather than `ps`, and only confirmed parent death or reparenting
+ends the session. Observation failures never trigger shutdown.
+
 The output lists only host-written records: PID, liveness, executable-match status when the platform exposes it,
 transport, bind/path, working directory, startup/current parent PID, process group, stale-stdio-client status, and
-direct child PIDs. It does not scan for process names. If a live stdio server is reparented, the output suggests an
-exact PID command such as `kill -TERM <pid>` for the recorded server PID. Clean records left behind by abruptly killed
+direct child PIDs. Liveness is `true`, `false` (kernel-confirmed absence), or `unknown`; `liveness_error` identifies
+permission denial or another observation failure. Missing process metadata and child lists remain unknown, not evidence
+of absence. It does not scan for process names. Only a confirmed live stdio server with a matching executable and a
+confirmed parent change receives an exact PID suggestion such as `kill -TERM <pid>` for the recorded server PID. Clean records left behind by abruptly killed
 servers with:
 
 ```sh
 lean-host-mcp doctor processes --cleanup-stale-records
 ```
 
-Cleanup removes records whose PID is no longer alive. It does not kill live processes and does not infer ownership from
+Cleanup removes records only after kernel-confirmed PID absence is rechecked; unknown observations preserve records. It does not kill live processes and does not infer ownership from
 an executable name, command substring, or port number. Do not use broad process-name cleanup; identify the exact PID
 from the registry or from `ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
 

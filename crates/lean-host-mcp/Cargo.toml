@@ -92,6 +92,9 @@ lean-semantic-search-runtime.workspace = true
 # see the link-set assertion in AGENTS.md.
 lean-toolchain.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 reqwest = { version = "0.13", default-features = false }

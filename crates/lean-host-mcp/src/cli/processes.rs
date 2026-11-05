@@ -18,7 +18,7 @@ const REGISTRY_ENV: &str = "LEAN_HOST_MCP_PROCESS_REGISTRY_DIR";
 
 #[derive(Debug, Args)]
 pub struct DoctorProcessesArgs {
-    /// Remove registry records whose PID is no longer alive.
+    /// Remove registry records whose PID is confirmed absent.
     #[arg(long)]
     pub cleanup_stale_records: bool,
 }
@@ -90,12 +90,12 @@ struct ProcessRecord {
 struct ListedRecord {
     path: PathBuf,
     record: ProcessRecord,
-    alive: bool,
+    liveness: ProcessLiveness,
     executable_match: Option<bool>,
     current_parent_pid: Option<u32>,
     current_process_group_id: Option<u32>,
-    parent_alive_at_start: Option<bool>,
-    child_pids: Vec<u32>,
+    parent_liveness_at_start: Option<ProcessLiveness>,
+    child_pids: Option<Vec<u32>>,
 }
 
 /// List registered server records and optionally remove stale records.
@@ -108,9 +108,10 @@ pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
     let records = list_records()?;
     for listed in &records {
         println!(
-            "pid={} alive={} executable_match={} transport={} bind={} http_path={} cwd={} started_unix_millis={} parent_pid_at_start={} current_parent_pid={} parent_alive_at_start={} process_group_id={} current_process_group_id={} stale_client={} record={}",
+            "pid={} alive={} liveness_error={} executable_match={} transport={} bind={} http_path={} cwd={} started_unix_millis={} parent_pid_at_start={} current_parent_pid={} parent_alive_at_start={} process_group_id={} current_process_group_id={} stale_client={} record={}",
             listed.record.pid,
-            listed.alive,
+            listed.liveness.display(),
+            listed.liveness.error_label(),
             display_match(listed.executable_match),
             listed.record.transport,
             listed.record.bind.as_deref().unwrap_or("-"),
@@ -119,29 +120,26 @@ pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
             listed.record.started_unix_millis,
             display_u32(listed.record.parent_pid_at_start),
             display_u32(listed.current_parent_pid),
-            display_bool(listed.parent_alive_at_start),
+            listed
+                .parent_liveness_at_start
+                .map_or("unknown", ProcessLiveness::display),
             display_u32(listed.record.process_group_id),
             display_u32(listed.current_process_group_id),
             stale_stdio_client(listed),
             listed.path.display(),
         );
-        if !listed.child_pids.is_empty() {
-            println!("  child_pids={}", join_u32(&listed.child_pids));
+        match &listed.child_pids {
+            Some(pids) => println!("  child_pids={}", join_u32(pids)),
+            None => println!("  child_pids=unknown"),
         }
-        if !listed.alive {
+        if listed.liveness == ProcessLiveness::Dead {
             println!("  stale_record_cleanup=lean-host-mcp doctor processes --cleanup-stale-records");
         } else if stale_stdio_client(listed) {
             println!("  exact_terminate=kill -TERM {}", listed.record.pid);
         }
     }
     if args.cleanup_stale_records {
-        for listed in records {
-            if listed.alive {
-                continue;
-            }
-            fs::remove_file(&listed.path).with_context(|| format!("remove stale record {}", listed.path.display()))?;
-            eprintln!("removed stale process record {}", listed.path.display());
-        }
+        cleanup_stale_records(&records, process_liveness)?;
     }
     Ok(())
 }
@@ -161,22 +159,23 @@ fn list_records() -> Result<Vec<ListedRecord>> {
         let bytes = fs::read(&path).with_context(|| format!("read process record {}", path.display()))?;
         let record: ProcessRecord =
             serde_json::from_slice(&bytes).with_context(|| format!("parse process record {}", path.display()))?;
-        let alive = process_alive(record.pid);
-        let executable_match = alive
+        let liveness = process_liveness(record.pid);
+        let observable = liveness != ProcessLiveness::Dead;
+        let executable_match = observable
             .then(|| executable_matches(record.pid, &record.executable))
             .flatten();
-        let current_parent_pid = alive.then(|| parent_pid(record.pid)).flatten();
-        let current_process_group_id = alive.then(|| process_group_id(record.pid)).flatten();
-        let parent_alive_at_start = record.parent_pid_at_start.map(process_alive);
-        let child_pids = if alive { child_pids(record.pid) } else { Vec::new() };
+        let current_parent_pid = observable.then(|| parent_pid(record.pid)).flatten();
+        let current_process_group_id = observable.then(|| process_group_id(record.pid)).flatten();
+        let parent_liveness_at_start = record.parent_pid_at_start.map(process_liveness);
+        let child_pids = observable.then(|| child_pids(record.pid)).flatten();
         out.push(ListedRecord {
             path,
             record,
-            alive,
+            liveness,
             executable_match,
             current_parent_pid,
             current_process_group_id,
-            parent_alive_at_start,
+            parent_liveness_at_start,
             child_pids,
         });
     }
@@ -206,49 +205,114 @@ fn display_match(value: Option<bool>) -> &'static str {
     }
 }
 
-fn display_bool(value: Option<bool>) -> &'static str {
-    match value {
-        Some(true) => "yes",
-        Some(false) => "no",
-        None => "unknown",
-    }
-}
-
 fn display_u32(value: Option<u32>) -> String {
     value.map_or_else(|| "-".to_owned(), |pid| pid.to_string())
 }
 
 fn stale_stdio_client(listed: &ListedRecord) -> bool {
-    listed.alive
+    listed.liveness == ProcessLiveness::Alive
+        && listed.executable_match == Some(true)
         && listed.record.transport == "stdio"
         && listed
             .record
             .parent_pid_at_start
-            .is_some_and(|recorded| recorded > 1 && Some(recorded) != listed.current_parent_pid)
+            .is_some_and(|recorded| recorded > 1 && parent_changed(recorded, listed.current_parent_pid))
 }
 
 fn join_u32(values: &[u32]) -> String {
     values.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
 }
 
+/// A failed observation is not evidence of death, including sandbox denials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown(io::ErrorKind),
+}
+
+impl ProcessLiveness {
+    fn display(self) -> &'static str {
+        match self {
+            Self::Alive => "true",
+            Self::Dead => "false",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    fn error_label(self) -> &'static str {
+        match self {
+            Self::Alive | Self::Dead => "-",
+            Self::Unknown(io::ErrorKind::PermissionDenied) => "permission_denied",
+            Self::Unknown(io::ErrorKind::InvalidInput) => "invalid_pid",
+            Self::Unknown(io::ErrorKind::Unsupported) => "unsupported",
+            Self::Unknown(_) => "observation_failed",
+        }
+    }
+}
+
 #[cfg(unix)]
-pub fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+pub fn process_liveness(pid: u32) -> ProcessLiveness {
+    let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) else {
+        return ProcessLiveness::Unknown(io::ErrorKind::InvalidInput);
+    };
+    // Signal zero is a kernel existence probe, not a signal. Unlike a shell's
+    // exit status, errno distinguishes ESRCH from permissions/observer failure.
+    let observed = classify_liveness(rustix::process::test_kill_process(pid));
+    // A sandbox may deny signal permission while still allowing a process-group
+    // lookup. A successful kernel query proves presence without needing ps or
+    // network access to the recorded endpoint. A second failure proves nothing.
+    corroborate_liveness(observed, || rustix::process::getpgid(Some(pid)).is_ok())
+}
+
+#[cfg(unix)]
+fn corroborate_liveness(observed: ProcessLiveness, present: impl FnOnce() -> bool) -> ProcessLiveness {
+    if matches!(observed, ProcessLiveness::Unknown(_)) && present() {
+        ProcessLiveness::Alive
+    } else {
+        observed
+    }
+}
+
+#[cfg(unix)]
+fn classify_liveness(result: rustix::io::Result<()>) -> ProcessLiveness {
+    match result {
+        Ok(()) => ProcessLiveness::Alive,
+        Err(rustix::io::Errno::SRCH) => ProcessLiveness::Dead,
+        Err(error) => ProcessLiveness::Unknown(io::Error::from(error).kind()),
+    }
 }
 
 #[cfg(not(unix))]
-pub fn process_alive(_pid: u32) -> bool {
-    false
+pub fn process_liveness(_pid: u32) -> ProcessLiveness {
+    ProcessLiveness::Unknown(io::ErrorKind::Unsupported)
+}
+
+fn parent_changed(recorded: u32, current: Option<u32>) -> bool {
+    current.is_some_and(|current| current != recorded)
+}
+
+/// End a stdio session only on confirmed parent death or reparenting.
+pub fn parent_lost(recorded: u32, current: Option<u32>, liveness: ProcessLiveness) -> bool {
+    liveness == ProcessLiveness::Dead || parent_changed(recorded, current)
+}
+
+fn cleanup_stale_records(records: &[ListedRecord], observe: impl Fn(u32) -> ProcessLiveness) -> Result<()> {
+    for listed in records {
+        // Recheck before mutation; uncertainty (or a reused live PID) preserves
+        // the record even when the initial observation confirmed absence.
+        if listed.liveness != ProcessLiveness::Dead || observe(listed.record.pid) != ProcessLiveness::Dead {
+            continue;
+        }
+        fs::remove_file(&listed.path).with_context(|| format!("remove stale record {}", listed.path.display()))?;
+        eprintln!("removed stale process record {}", listed.path.display());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
 pub fn current_parent_pid() -> Option<u32> {
-    parent_pid(std::process::id())
+    rustix::process::getppid().map(|pid| pid.as_raw_pid() as u32)
 }
 
 #[cfg(not(unix))]
@@ -258,7 +322,7 @@ pub fn current_parent_pid() -> Option<u32> {
 
 #[cfg(unix)]
 fn current_process_group_id() -> Option<u32> {
-    process_group_id(std::process::id())
+    Some(rustix::process::getpgrp().as_raw_pid() as u32)
 }
 
 #[cfg(not(unix))]
@@ -304,7 +368,10 @@ fn parent_pid(_pid: u32) -> Option<u32> {
 
 #[cfg(unix)]
 fn process_group_id(pid: u32) -> Option<u32> {
-    ps_single_u32(pid, "pgid=")
+    let pid = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw)?;
+    rustix::process::getpgid(Some(pid))
+        .ok()
+        .map(|pid| pid.as_raw_pid() as u32)
 }
 
 #[cfg(not(unix))]
@@ -325,31 +392,32 @@ fn ps_single_u32(pid: u32, field: &str) -> Option<u32> {
 }
 
 #[cfg(unix)]
-fn child_pids(parent: u32) -> Vec<u32> {
+fn child_pids(parent: u32) -> Option<Vec<u32>> {
     let output = std::process::Command::new("ps").args(["-axo", "pid=,ppid="]).output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
+    let output = output.ok()?;
     if !output.status.success() {
-        return Vec::new();
+        return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let ppid = fields.next()?.parse::<u32>().ok()?;
-            (ppid == parent).then_some(pid)
-        })
-        .collect()
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse::<u32>().ok()?;
+                let ppid = fields.next()?.parse::<u32>().ok()?;
+                (ppid == parent).then_some(pid)
+            })
+            .collect(),
+    )
 }
 
 #[cfg(not(unix))]
-fn child_pids(_parent: u32) -> Vec<u32> {
-    Vec::new()
+fn child_pids(_parent: u32) -> Option<Vec<u32>> {
+    None
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -360,9 +428,8 @@ mod tests {
         assert_eq!(display_match(Some(true)), "yes");
     }
 
-    #[test]
-    fn doctor_stale_stdio_client_requires_exact_parent_change() {
-        let listed = ListedRecord {
+    fn sample_record() -> ListedRecord {
+        ListedRecord {
             path: PathBuf::from("record.json"),
             record: ProcessRecord {
                 pid: 100,
@@ -375,13 +442,18 @@ mod tests {
                 bind: None,
                 http_path: None,
             },
-            alive: true,
+            liveness: ProcessLiveness::Alive,
             executable_match: Some(true),
             current_parent_pid: Some(1),
             current_process_group_id: Some(25),
-            parent_alive_at_start: Some(false),
-            child_pids: vec![101],
-        };
+            parent_liveness_at_start: Some(ProcessLiveness::Dead),
+            child_pids: Some(vec![101]),
+        }
+    }
+
+    #[test]
+    fn doctor_stale_stdio_client_requires_exact_parent_change() {
+        let listed = sample_record();
         assert!(stale_stdio_client(&listed));
 
         let mut current = listed;
@@ -391,5 +463,92 @@ mod tests {
         current.record.transport = "http".to_owned();
         current.current_parent_pid = Some(1);
         assert!(!stale_stdio_client(&current));
+    }
+
+    #[test]
+    fn doctor_never_recommends_termination_from_unknown_observations() {
+        let mut listed = sample_record();
+        listed.current_parent_pid = None;
+        assert!(!stale_stdio_client(&listed));
+        listed.current_parent_pid = Some(1);
+        listed.liveness = ProcessLiveness::Unknown(io::ErrorKind::PermissionDenied);
+        assert!(!stale_stdio_client(&listed));
+        listed.liveness = ProcessLiveness::Alive;
+        listed.executable_match = None;
+        assert!(!stale_stdio_client(&listed));
+        listed.executable_match = Some(false);
+        assert!(!stale_stdio_client(&listed));
+    }
+
+    #[test]
+    fn parent_loss_requires_confirmed_absence_or_reparenting() {
+        let unknown = ProcessLiveness::Unknown(io::ErrorKind::PermissionDenied);
+        assert!(!parent_lost(50, None, unknown));
+        assert!(!parent_lost(50, Some(50), unknown));
+        assert!(!parent_lost(50, None, ProcessLiveness::Alive));
+        assert!(parent_lost(50, Some(1), unknown));
+        assert!(parent_lost(50, None, ProcessLiveness::Dead));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn liveness_distinguishes_absence_from_denial_and_other_errors() {
+        use rustix::io::Errno;
+        assert_eq!(classify_liveness(Ok(())), ProcessLiveness::Alive);
+        assert_eq!(classify_liveness(Err(Errno::SRCH)), ProcessLiveness::Dead);
+        for error in [Errno::PERM, Errno::ACCESS] {
+            let state = classify_liveness(Err(error));
+            assert_eq!(state, ProcessLiveness::Unknown(io::ErrorKind::PermissionDenied));
+            assert_eq!(state.display(), "unknown");
+            assert_eq!(state.error_label(), "permission_denied");
+        }
+        assert!(matches!(classify_liveness(Err(Errno::IO)), ProcessLiveness::Unknown(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_kernel_observation_can_confirm_presence_but_not_absence() {
+        let denied = ProcessLiveness::Unknown(io::ErrorKind::PermissionDenied);
+        assert_eq!(corroborate_liveness(denied, || true), ProcessLiveness::Alive);
+        assert_eq!(corroborate_liveness(denied, || false), denied);
+        assert_eq!(
+            corroborate_liveness(ProcessLiveness::Dead, || true),
+            ProcessLiveness::Dead
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn liveness_uses_the_kernel_and_rejects_non_process_pids() {
+        assert_eq!(process_liveness(std::process::id()), ProcessLiveness::Alive);
+        for pid in [0, u32::MAX] {
+            assert_eq!(
+                process_liveness(pid),
+                ProcessLiveness::Unknown(io::ErrorKind::InvalidInput)
+            );
+        }
+        assert!(current_parent_pid().is_some());
+        assert!(current_process_group_id().is_some());
+    }
+
+    #[test]
+    fn cleanup_preserves_unknown_and_rechecks_before_removing() {
+        let dir = tempfile::tempdir().expect("temp registry");
+        let mut listed = sample_record();
+        listed.path = dir.path().join("100.json");
+        fs::write(&listed.path, b"record").expect("write record");
+        let unknown = ProcessLiveness::Unknown(io::ErrorKind::PermissionDenied);
+        for initial in [ProcessLiveness::Alive, unknown] {
+            listed.liveness = initial;
+            cleanup_stale_records(std::slice::from_ref(&listed), |_| ProcessLiveness::Dead).expect("cleanup");
+            assert!(listed.path.exists());
+        }
+        listed.liveness = ProcessLiveness::Dead;
+        for rechecked in [ProcessLiveness::Alive, unknown] {
+            cleanup_stale_records(std::slice::from_ref(&listed), |_| rechecked).expect("cleanup");
+            assert!(listed.path.exists());
+        }
+        cleanup_stale_records(std::slice::from_ref(&listed), |_| ProcessLiveness::Dead).expect("cleanup");
+        assert!(!listed.path.exists());
     }
 }

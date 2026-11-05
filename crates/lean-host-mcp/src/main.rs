@@ -283,7 +283,11 @@ async fn wait_for_parent_loss(parent_pid: Option<u32>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
-        if !processes::process_alive(parent_pid) || processes::current_parent_pid() != Some(parent_pid) {
+        if processes::parent_lost(
+            parent_pid,
+            processes::current_parent_pid(),
+            processes::process_liveness(parent_pid),
+        ) {
             return;
         }
     }
