@@ -340,15 +340,22 @@ fn executable_matches(pid: u32, expected: &Path) -> Option<bool> {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn executable_matches(pid: u32, expected: &Path) -> Option<bool> {
     let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
+        .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let command = String::from_utf8_lossy(&output.stdout);
-    let actual = command.split_whitespace().next()?;
-    Some(Path::new(actual) == expected)
+    executable_path_matches(String::from_utf8_lossy(&output.stdout).trim(), expected)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn executable_path_matches(command: &str, expected: &Path) -> Option<bool> {
+    // macOS can expose only argv[0] (e.g. `lean-host-mcp`) for PATH launches.
+    // A relative label cannot identify the executable and is not a mismatch.
+    // `comm` excludes arguments and preserves spaces within an absolute path.
+    let actual = Path::new(command);
+    actual.is_absolute().then_some(actual == expected)
 }
 
 #[cfg(not(unix))]
@@ -463,6 +470,20 @@ mod tests {
         current.record.transport = "http".to_owned();
         current.current_parent_pid = Some(1);
         assert!(!stale_stdio_client(&current));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn relative_executable_labels_are_unknown_and_spaces_are_preserved() {
+        let expected = Path::new("/Applications/Lean Tools/lean-host-mcp");
+        assert_eq!(executable_path_matches("lean-host-mcp", expected), None);
+        assert_eq!(executable_path_matches("./lean-host-mcp", expected), None);
+        assert_eq!(executable_path_matches("", expected), None);
+        assert_eq!(
+            executable_path_matches("/Applications/Lean Tools/lean-host-mcp", expected),
+            Some(true)
+        );
+        assert_eq!(executable_path_matches("/other/lean-host-mcp", expected), Some(false));
     }
 
     #[test]
