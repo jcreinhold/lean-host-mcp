@@ -145,6 +145,10 @@ pub enum LeanVerifyDetail {
 pub struct LeanVerifyToolRequest(Value);
 
 impl LeanVerifyToolRequest {
+    pub(crate) fn as_value(&self) -> &Value {
+        &self.0
+    }
+
     pub fn into_inner(self) -> Value {
         self.0
     }

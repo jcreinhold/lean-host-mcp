@@ -317,6 +317,33 @@ impl ProjectRuntimeConfig {
             session_pool_capacity: WORKER_SESSION_POOL_CAPACITY,
         }
     }
+
+    /// Configuration advisories belong to broker startup, not every worker reopen.
+    pub(crate) fn log_advisories(&self) {
+        if self.import_residue_budget_bytes < WORKER_IMPORT_RESIDUE_FLOOR_BYTES {
+            tracing::warn!(
+                budget_mib = self.import_residue_budget_bytes / (1024 * 1024),
+                sizing_baseline_mib = WORKER_IMPORT_RESIDUE_FLOOR_BYTES / (1024 * 1024),
+                "configured import residue budget is below the two-import Mathlib sizing baseline; \
+             this is not a per-import minimum or an observed failure. Smaller budgets may recycle more often; \
+             tune runtime.worker_import_residue_budget_mib only if measured recycle frequency warrants it"
+            );
+        }
+        // Only reachable when an operator sets `runtime.lean_max_memory_kib`
+        // explicitly — the derived default cannot invert. Worth a warning rather
+        // than a clamp because it is their machine and their call, but it is almost
+        // never what they meant: below the budget the ceiling always fires first,
+        // and it fires as a child abort rather than a clean recycle.
+        if self.lean_max_memory_kib.saturating_mul(1024) <= self.import_residue_budget_bytes {
+            tracing::warn!(
+                lean_max_memory_mib = self.lean_max_memory_kib / 1024,
+                budget_mib = self.import_residue_budget_bytes / (1024 * 1024),
+                "Lean heap ceiling is at or below the import residue budget, so it will abort the \
+             child before the budget can recycle it cleanly; raise runtime.lean_max_memory_kib \
+             above the budget or leave it unset to track it"
+            );
+        }
+    }
 }
 
 /// The residue budget one project actor gets when nothing overrides it.
@@ -2656,35 +2683,6 @@ fn actor_main(
         cycled_while_idle: false,
     };
 
-    // Once per project, at open. Below the floor the budget can be smaller than
-    // a single import's residue, at which point the policy degenerates into
-    // recycling the child before nearly every import — strictly worse than the
-    // count bound it replaced, and not something the response envelope makes
-    // obvious, since each of those cycles is individually well-formed.
-    if config.import_residue_budget_bytes < WORKER_IMPORT_RESIDUE_FLOOR_BYTES {
-        tracing::warn!(
-            budget_mib = config.import_residue_budget_bytes / (1024 * 1024),
-            floor_mib = WORKER_IMPORT_RESIDUE_FLOOR_BYTES / (1024 * 1024),
-            "import residue budget is below the floor one Mathlib-scale import needs; \
-             raise runtime.worker_import_residue_budget_mib or lower broker.max_projects \
-             if workers recycle constantly"
-        );
-    }
-    // Only reachable when an operator sets `runtime.lean_max_memory_kib`
-    // explicitly — the derived default cannot invert. Worth a warning rather
-    // than a clamp because it is their machine and their call, but it is almost
-    // never what they meant: below the budget the ceiling always fires first,
-    // and it fires as a child abort rather than a clean recycle.
-    if config.lean_max_memory_kib.saturating_mul(1024) <= config.import_residue_budget_bytes {
-        tracing::warn!(
-            lean_max_memory_mib = config.lean_max_memory_kib / 1024,
-            budget_mib = config.import_residue_budget_bytes / (1024 * 1024),
-            "Lean heap ceiling is at or below the import residue budget, so it will abort the \
-             child before the budget can recycle it cleanly; raise runtime.lean_max_memory_kib \
-             above the budget or leave it unset to track it"
-        );
-    }
-
     let (tx, mut rx) = mpsc::channel::<ProjectMessage>(config.mailbox_capacity);
     // If the opener disappeared, dropping the returned sender closes rx and
     // still takes the same acknowledged worker shutdown path below.
@@ -3052,6 +3050,30 @@ fn parse_nonzero_usize(name: &str, env: Option<&str>, file: Option<usize>, defau
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_advisory_is_a_startup_configuration_fact_not_a_per_import_minimum() {
+        let (_guard, buffer) = crate::request_log::tests::capture_with_filter("lean_host_mcp=warn");
+        let config = ProjectRuntimeConfig::default().with_import_residue_budget_bytes(4 * 1024 * 1024 * 1024);
+        let broker = crate::broker::ProjectBroker::new_with_runtime_config(
+            crate::broker::BrokerConfig {
+                config_default: None,
+                env_default: None,
+                cwd: std::path::PathBuf::from("."),
+                max_projects: crate::broker::BrokerConfig::default_max_projects(),
+                idle_timeout: Duration::ZERO,
+            },
+            config,
+        );
+        for _ in 0..3 {
+            let _ = broker.runtime_control(&crate::broker::RuntimeControlRequest::default());
+        }
+        let output = buffer.text();
+        assert_eq!(output.matches("two-import Mathlib sizing baseline").count(), 1);
+        assert!(output.contains("not a per-import minimum or an observed failure"));
+        assert!(output.contains("budget_mib=4096 sizing_baseline_mib=9216"));
+        assert!(!output.contains("lower broker.max_projects"));
+    }
 
     #[test]
     fn runtime_config_parses_runtime_policy_without_env_reads() {

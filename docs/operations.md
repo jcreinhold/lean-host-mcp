@@ -193,6 +193,40 @@ are alive only for the duration of a semantic search and the steady-state footpr
 project. Keeping that child resident between calls was tried and measured *slower*; the note on
 `open_semantic_capability` in `src/project.rs` records why.
 
+## Request activity in the terminal
+
+Default INFO logging summarizes each actual semantic execution with a server-generated `request` number, tool,
+canonical kind and bounded project basename. The received line means preparation or queueing has begun, not that a
+worker has already started. The matching response line includes elapsed time (including queue wait), a fixed outcome
+label, an allowlisted `result_status` when present (such as `not_found` or `unsupported`), tool issue counts, and
+diagnostic or verification counts when available. `completed` means a response is ready,
+not that a theorem was proved; inspect `failed`, `diagnostic_errors`, and the actual client response for the verdict.
+
+```text
+INFO Lean request received (preparing or waiting for worker) request=42 tool="lean_verify" kind="verification" project=proofs
+INFO Lean response ready request=42 tool="lean_verify" kind="verification" project=proofs elapsed_ms=1532 outcome="completed" tool_errors=0 tool_warnings=0 verified=3 failed=1 needs_build=0
+```
+
+Synchronous calls, negotiated MCP tasks and retained `lean_request` submissions share this boundary. Retrying the same
+retained ID or polling its result does not log a second execution. Routine `lean_runtime` status and result polling
+remain quiet. If a future disappears before it returns, a warning explicitly says worker completion is not confirmed;
+that log is not a receipt proving that an executing worker stopped.
+
+These summaries do not print command/tactic text, theorem names, imports, diagnostics, response bodies, caller-supplied
+request IDs or full project paths. Project labels are bounded and terminal-safe; kind/outcome labels are allowlisted.
+Existing detailed debug/runtime logs are separate, and may contain paths or diagnostic details.
+
+The default filter, also used for `RUST_LOG=info`, is `info,rmcp=warn`: routine SDK session creation, initialization and
+stream closure are hidden, but SDK WARN/ERROR remain visible. To investigate transport details explicitly, use
+`RUST_LOG=info,rmcp=debug`. Other explicit `RUST_LOG` directives retain their usual meaning. Logs go to stderr, never the
+stdio protocol stream.
+
+The low import-residue-budget advisory is emitted once when the broker is constructed, not every time a project worker
+reopens. Its 9216 MiB comparison is a Mathlib-oriented sizing baseline for retaining two large imports, not a required
+minimum for every import or evidence of a failure. An explicitly configured smaller budget can be intentional; evaluate
+actual recycle frequency before changing it. Lowering the project count does not change an explicitly fixed budget.
+The heap-ceiling warning and real runtime error/recycle logs remain intact; no memory policy changes with logging.
+
 ## Observing worker recycles
 
 Every recycle is logged to **stderr** (stdout stays clean for the stdio transport) and tallied into each tool response's
@@ -207,8 +241,8 @@ Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `r
   child was recycled), `import_residue` (the reactive half of the residue budget — the cycle a call had to wait for, and
   the frequency an operator tunes against), memory-pressure cycles (`rss_post_job`), plus `opened project` / `idle
   reaper evicted projects` lifecycle lines.
-- `debug` — pure hygiene (`import_residue_idle`, `max_imports`, `max_requests`, `idle`, `explicit`), per-call tool
-  entry, project resolution, and the `job` span.
+- `debug` — pure hygiene (`import_residue_idle`, `max_imports`, `max_requests`, `idle`, `explicit`), detailed
+  project resolution, and the `job` span.
 
 The server no longer configures any resident-memory threshold, so in practice you see the abnormal causes above,
 `explicit`, `artifacts_rebuilt`, and the two residue causes (see "Import cycling"). `max_imports` should not appear at
@@ -216,7 +250,7 @@ all — it is a backstop for a child that reports no import statistics. `rss_pos
 `max_requests` stay in the vocabulary because the supervisor still reports them if a future policy asks for them; seeing
 one today means the worker was configured somewhere other than here.
 
-Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for the per-call detail. Example at default level:
+Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for internal runtime detail. Example at default level:
 
 ```text
 INFO worker recycled (imports rebuilt on disk) cause=artifacts_rebuilt worker_generation=2 planned=true restarts_total=1

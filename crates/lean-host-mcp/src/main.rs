@@ -140,8 +140,16 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     reason = "try_init's failure means a subscriber is already installed; we'd continue without ours either way"
 )]
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = logging_filter(std::env::var("RUST_LOG").ok().as_deref());
     let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+}
+
+fn logging_filter(directives: Option<&str>) -> EnvFilter {
+    const DEFAULT: &str = "info,rmcp=warn";
+    match directives.map(str::trim) {
+        None | Some("info") => EnvFilter::new(DEFAULT),
+        Some(value) => EnvFilter::try_new(value).unwrap_or_else(|_| EnvFilter::new(DEFAULT)),
+    }
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -404,6 +412,49 @@ fn validate_http_path(path: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn logging_defaults_quiet_rmcp_info_but_keep_warnings_and_verbose_opt_in() {
+        use std::io::Write;
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("log buffer poisoned"))?
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (setting, verbose) in [(None, false), (Some("info"), false), (Some("info,rmcp=debug"), true)] {
+            let buffer = Buffer::default();
+            let writer = buffer.clone();
+            let subscriber = fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_env_filter(logging_filter(setting))
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "rmcp::service", "session noise");
+                tracing::debug!(target: "rmcp::service", "verbose detail");
+                tracing::warn!(target: "rmcp::service", "transport warning");
+                tracing::error!(target: "rmcp::service", "transport error");
+                tracing::info!(target: "lean_host_mcp::request_log", "request summary");
+            });
+            let output = String::from_utf8(buffer.0.lock().expect("buffer").clone()).expect("utf8");
+            assert_eq!(output.contains("session noise"), verbose);
+            assert_eq!(output.contains("verbose detail"), verbose);
+            assert!(output.contains("transport warning"));
+            assert!(output.contains("transport error"));
+            assert!(output.contains("request summary"));
+        }
+    }
 
     #[test]
     fn no_bind_selects_stdio_even_with_lake_root() {

@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use crate::broker::{ProjectBroker, RuntimeControlRequest};
 use crate::cancellation::with_cancellation;
 use crate::error::ServerError;
+use crate::request_log::RequestLog;
 use crate::tasks::{RequestBinding, RequestTasks};
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
@@ -225,15 +226,12 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::semantic::LeanContextToolRequest>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "lean_context", "tool call");
-        self.respond_semantic(
-            Box::pin(with_progress(
-                &context,
-                "lean_context",
-                tools::semantic::lean_context(&self.ctx, req.into_inner()),
-            ))
-            .await,
-        )
+        Box::pin(with_progress(
+            &context,
+            "lean_context",
+            self.run_task(TaskCall::Context(req)),
+        ))
+        .await
     }
 
     #[tool(
@@ -244,15 +242,12 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::semantic::LeanTrialToolRequest>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "lean_trial", "tool call");
-        self.respond_semantic(
-            Box::pin(with_progress(
-                &context,
-                "lean_trial",
-                tools::semantic::lean_trial(&self.ctx, req.into_inner()),
-            ))
-            .await,
-        )
+        Box::pin(with_progress(
+            &context,
+            "lean_trial",
+            self.run_task(TaskCall::Trial(req)),
+        ))
+        .await
     }
 
     #[tool(description = "Verify Lean declarations from explicit, file_all, or module_all target groups.")]
@@ -261,15 +256,12 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::proof_action::LeanVerifyToolRequest>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "lean_verify", "tool call");
-        self.respond_semantic(
-            Box::pin(with_progress(
-                &context,
-                "lean_verify",
-                tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()),
-            ))
-            .await,
-        )
+        Box::pin(with_progress(
+            &context,
+            "lean_verify",
+            self.run_task(TaskCall::Verify(req)),
+        ))
+        .await
     }
 
     #[tool(description = "Semantic lookup. Kinds: declaration, declarations, proof_search, references.")]
@@ -278,15 +270,12 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::semantic::LeanLookupToolRequest>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "lean_lookup", "tool call");
-        self.respond_semantic(
-            Box::pin(with_progress(
-                &context,
-                "lean_lookup",
-                tools::semantic::lean_lookup(&self.ctx, req.into_inner()),
-            ))
-            .await,
-        )
+        Box::pin(with_progress(
+            &context,
+            "lean_lookup",
+            self.run_task(TaskCall::Lookup(req)),
+        ))
+        .await
     }
 
     #[tool(description = "Project/toolchain status and source diagnostics. Kinds: project, file_diagnostics.")]
@@ -295,15 +284,12 @@ impl LeanHostService {
         Parameters(req): Parameters<tools::semantic::LeanStatusToolRequest>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        tracing::debug!(tool = "lean_status", "tool call");
-        self.respond_semantic(
-            Box::pin(with_progress(
-                &context,
-                "lean_status",
-                tools::semantic::lean_status(&self.ctx, req.into_inner()),
-            ))
-            .await,
-        )
+        Box::pin(with_progress(
+            &context,
+            "lean_status",
+            self.run_task(TaskCall::Status(req)),
+        ))
+        .await
     }
 }
 
@@ -402,6 +388,7 @@ impl ServerHandler for LeanHostService {
 
 impl LeanHostService {
     async fn run_task(&self, call: TaskCall) -> Result<CallToolResult, McpError> {
+        let mut log = call.request_log();
         let result = match call {
             TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
             TaskCall::Trial(req) => tools::semantic::lean_trial(&self.ctx, req.into_inner()).await,
@@ -409,6 +396,7 @@ impl LeanHostService {
             TaskCall::Lookup(req) => tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await,
             TaskCall::Status(req) => tools::semantic::lean_status(&self.ctx, req.into_inner()).await,
         };
+        log.finish(&result);
         self.respond_semantic(result)
     }
 
@@ -438,6 +426,28 @@ enum TaskCall {
 }
 
 impl TaskCall {
+    fn request_log(&self) -> RequestLog {
+        match self {
+            Self::Context(req) => Self::semantic_log("lean_context", &req.0),
+            Self::Trial(req) => Self::semantic_log("lean_trial", &req.0),
+            Self::Lookup(req) => Self::semantic_log("lean_lookup", &req.0),
+            Self::Status(req) => Self::semantic_log("lean_status", &req.0),
+            Self::Verify(req) => RequestLog::new(
+                "lean_verify",
+                None,
+                req.as_value().get("project").and_then(serde_json::Value::as_str),
+            ),
+        }
+    }
+
+    fn semantic_log(tool: &'static str, req: &tools::semantic::SemanticToolRequest) -> RequestLog {
+        RequestLog::new(
+            tool,
+            req.kind.as_deref(),
+            req.args.get("project").and_then(serde_json::Value::as_str),
+        )
+    }
+
     fn is_cheap_metadata(&self) -> bool {
         matches!(self, Self::Status(req) if tools::request_aliases::canonical_kind(
             "lean_status",
@@ -514,7 +524,62 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
+    async fn retained_duplicate_submissions_and_polls_log_only_actual_execution() {
+        let (_guard, buffer) = crate::request_log::tests::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let service = LeanHostService::new(
+            ProjectBroker::new(crate::broker::BrokerConfig {
+                config_default: Some(dir.path().to_path_buf()),
+                env_default: None,
+                cwd: dir.path().to_path_buf(),
+                max_projects: crate::broker::BrokerConfig::default_max_projects(),
+                idle_timeout: Duration::ZERO,
+            }),
+            ToolConfig::default(),
+        );
+        let submit = || RetainedRequest {
+            action: RetainedAction::Submit,
+            request_id: Some("SECRET_CLIENT_ID".to_owned()),
+            tool: Some("lean_trial".to_owned()),
+            arguments: Some(
+                serde_json::from_value(serde_json::json!({"kind":"SECRET_KIND","commands":"SECRET_PROOF"})).unwrap(),
+            ),
+        };
+        service.lean_request(Parameters(submit())).await.unwrap();
+        service.lean_request(Parameters(submit())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !service.tasks.get("SECRET_CLIENT_ID").unwrap().status().is_terminal() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            service
+                .lean_request(Parameters(RetainedRequest {
+                    action: RetainedAction::Get,
+                    request_id: Some("SECRET_CLIENT_ID".to_owned()),
+                    tool: None,
+                    arguments: None,
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .lean_runtime(Parameters(RuntimeControlRequest::default()))
+            .await
+            .unwrap();
+        let output = buffer.text();
+        assert_eq!(output.matches("Lean request received").count(), 1);
+        assert_eq!(output.matches("Lean response ready").count(), 1);
+        assert!(output.contains(r#"kind="invalid""#));
+        assert!(output.contains(r#"outcome="tool_error""#));
+        assert!(!output.contains("SECRET"));
+    }
+
+    #[tokio::test]
     async fn task_negotiation_preserves_sync_payload_and_service_clone_results() {
+        let (_guard, buffer) = crate::request_log::tests::capture();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lakefile.lean"), "package status\nlean_lib Status\n").unwrap();
         std::fs::write(dir.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
@@ -605,6 +670,9 @@ mod tests {
                 .status(),
             TaskStatus::Completed
         );
+        let output = buffer.text();
+        assert_eq!(output.matches("Lean request received").count(), 2);
+        assert_eq!(output.matches("Lean response ready").count(), 2);
         running.cancel().await.unwrap();
         drop(client_io);
     }
