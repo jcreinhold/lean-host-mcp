@@ -983,11 +983,32 @@ pub(crate) struct LeanProject {
     /// [`Self::freshness`]; empty for a fully-vouched-for worker.
     open_warnings: Vec<String>,
     actor_tx: Mutex<Option<mpsc::Sender<ProjectMessage>>>,
+    admission_timeout: Duration,
     active_jobs: Arc<AtomicUsize>,
     pool_active_jobs: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     module_queries: ModuleQueryCache,
+}
+
+/// Reserve a bounded mailbox slot without losing FIFO position on a wakeup.
+async fn reserve_mailbox<'a, T>(
+    tx: &'a mpsc::Sender<T>,
+    cancellation: &CallCancellation,
+    limit: Duration,
+) -> std::result::Result<mpsc::Permit<'a, T>, &'static str> {
+    if cancellation.is_cancelled() {
+        return Err("request_cancelled");
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err("request_cancelled"),
+        result = tokio::time::timeout(limit, tx.reserve()) => match result {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err("mailbox_closed"),
+            Err(_) => Err("mailbox_admission_timeout"),
+        },
+    }
 }
 
 /// Keep uncertain shutdowns counted rather than starting a replacement beside
@@ -1042,6 +1063,7 @@ impl LeanProject {
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let pool_active_jobs = maintenance.activity_counter();
         let healthy = Arc::new(AtomicBool::new(true));
+        let admission_timeout = Duration::from_millis(runtime_config.request_timeout_millis());
         let (mut config, open_warnings) = ActorConfig::from_meta(
             &meta,
             session_id.clone(),
@@ -1080,6 +1102,7 @@ impl LeanProject {
             session_id,
             open_warnings,
             actor_tx: Mutex::new(Some(actor_tx)),
+            admission_timeout,
             active_jobs,
             pool_active_jobs,
             healthy,
@@ -1320,22 +1343,21 @@ impl LeanProject {
             .as_ref()
             .cloned()
             .ok_or_else(|| self.unavailable("project actor is stopped", false, false))?;
-        match tx.try_send(message) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                return Err(ServerError::worker_unavailable(WorkerUnavailable {
-                    retryable: true,
-                    worker_restarted: false,
-                    reason: "mailbox_full".to_owned(),
-                    ..project_info
-                }));
+        // Tokio's reservation queue is FIFO. Keep one reservation future alive
+        // while waiting, rather than racing repeated try_send calls. Cancellation
+        // or expiry drops the unsent message and its activity guard.
+        match reserve_mailbox(&tx, &cancellation, self.admission_timeout).await {
+            Ok(permit) => {
+                permit.send(message);
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.shutdown();
+            Err(reason) => {
+                if reason == "mailbox_closed" {
+                    self.shutdown();
+                }
                 return Err(ServerError::worker_unavailable(WorkerUnavailable {
-                    retryable: true,
+                    retryable: reason != "request_cancelled",
                     worker_restarted: false,
-                    reason: "mailbox_closed".to_owned(),
+                    reason: reason.to_owned(),
                     ..project_info
                 }));
             }
@@ -3508,6 +3530,58 @@ mod tests {
             "idle"
         );
     }
+    async fn poll_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mailbox_admission_is_fifo_and_cancellation_removes_only_its_waiter() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(0).await.unwrap();
+        let first_cancel = CallCancellation::default();
+        let middle_cancel = CallCancellation::default();
+        let last_cancel = CallCancellation::default();
+        let first = reserve_mailbox(&tx, &first_cancel, Duration::from_secs(5));
+        let middle = reserve_mailbox(&tx, &middle_cancel, Duration::from_secs(5));
+        let last = reserve_mailbox(&tx, &last_cancel, Duration::from_secs(5));
+        tokio::pin!(first, middle, last);
+        poll_pending(first.as_mut()).await;
+        poll_pending(middle.as_mut()).await;
+        poll_pending(last.as_mut()).await;
+        middle_cancel.cancel();
+        assert_eq!(middle.await.err(), Some("request_cancelled"));
+        assert_eq!(rx.recv().await, Some(0));
+        first.await.unwrap().send(1);
+        poll_pending(last.as_mut()).await;
+        assert_eq!(rx.recv().await, Some(1));
+        last.await.unwrap().send(3);
+        assert_eq!(rx.recv().await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn mailbox_admission_timeout_and_closed_channel_never_enqueue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(0).await.unwrap();
+        let cancellation = CallCancellation::default();
+        assert_eq!(
+            reserve_mailbox(&tx, &cancellation, Duration::from_millis(1))
+                .await
+                .err(),
+            Some("mailbox_admission_timeout")
+        );
+        assert_eq!(rx.recv().await, Some(0));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert_eq!(
+            reserve_mailbox(&tx, &cancellation, Duration::from_secs(1)).await.err(),
+            Some("mailbox_closed")
+        );
+    }
+
     #[test]
     fn worker_capacity_is_released_only_after_confirmed_shutdown() {
         let capacity = Arc::new(tokio::sync::Semaphore::new(1));

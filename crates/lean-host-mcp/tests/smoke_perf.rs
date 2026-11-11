@@ -179,7 +179,7 @@ async fn black_box_pipelined_mailbox_pressure_returns_structured_statuses() {
             assert!(
                 matches!(
                     reason.as_str(),
-                    "mailbox_full" | "mailbox_closed" | "project_pool_busy_all_entries_active"
+                    "mailbox_admission_timeout" | "mailbox_closed" | "project_admission_timeout"
                 ),
                 "runtime pressure should be structured mailbox/pool pressure, got {reason}: {:?}",
                 response.json

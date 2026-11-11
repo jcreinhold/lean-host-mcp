@@ -25,6 +25,7 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_router};
+use sha2::{Digest, Sha256};
 
 use crate::broker::{ProjectBroker, RuntimeControlRequest};
 use crate::cancellation::with_cancellation;
@@ -124,8 +125,70 @@ impl LeanHostService {
     }
 }
 
+/// A plain-tool bridge for clients without the negotiated MCP Tasks extension.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RetainedRequest {
+    action: RetainedAction,
+    /// Existing ID for get/cancel; optional client-chosen ID for retry-safe submit.
+    request_id: Option<String>,
+    /// One of `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup` or `lean_status`.
+    tool: Option<String>,
+    /// The selected semantic tool's ordinary input object.
+    arguments: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum RetainedAction {
+    Submit,
+    Get,
+    Cancel,
+}
+
 #[tool_router]
 impl LeanHostService {
+    #[tool(
+        description = "Submit, retrieve or cancel a retained Lean request without MCP Tasks negotiation. action=submit takes tool and arguments and returns a taskId immediately. Use that ID as request_id for get/cancel. Supply a unique request_id on submit to retry a lost receipt without duplicate work. Records last ten minutes after completion, only in this server process."
+    )]
+    async fn lean_request(&self, Parameters(request): Parameters<RetainedRequest>) -> Result<CallToolResult, McpError> {
+        let task = match request.action {
+            RetainedAction::Submit => {
+                let tool = request
+                    .tool
+                    .ok_or_else(|| McpError::invalid_params("submit requires tool", None))?;
+                let call =
+                    CallToolRequestParams::new(tool.clone()).with_arguments(request.arguments.unwrap_or_default());
+                let parsed = TaskCall::parse(&call)?;
+                let submission: [u8; 32] = Sha256::digest(
+                    serde_json::to_vec(&(&tool, &call.arguments))
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+                )
+                .into();
+                let request_id = request.request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let service = self.clone();
+                let accepted = self.tasks.submit(&tool, request_id, submission, move || async move {
+                    service.run_task(parsed).await
+                })?;
+                self.tasks.get(&accepted.task_id)?
+            }
+            RetainedAction::Get | RetainedAction::Cancel => {
+                if request.tool.is_some() || request.arguments.is_some() {
+                    return Err(McpError::invalid_params("get/cancel accepts only request_id", None));
+                }
+                let request_id = request
+                    .request_id
+                    .ok_or_else(|| McpError::invalid_params("get/cancel requires request_id", None))?;
+                if matches!(request.action, RetainedAction::Cancel) {
+                    self.tasks.cancel(&request_id)?;
+                }
+                self.tasks.get(&request_id)?
+            }
+        };
+        let value = serde_json::to_value(task).map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(carry(&value, self.ctx.config.carrier))
+    }
+
     #[tool(
         description = "Observe worker activity or atomically lease the idle worker pool. Actions: status, acquire, renew, release. Leases keep warm caches unless retire_idle is explicitly true; renew before expiry while relying on the pause."
     )]
@@ -235,7 +298,9 @@ impl ServerHandler for LeanHostService {
     ) -> Result<CallToolResponse, McpError> {
         // Coordination is immediate and must return its lease token directly,
         // even for clients that negotiate asynchronous Lean job handles.
-        if request.name != "lean_runtime" && context.client_capabilities().is_some_and(|caps| caps.supports_tasks()) {
+        if !matches!(request.name.as_ref(), "lean_runtime" | "lean_request")
+            && context.client_capabilities().is_some_and(|caps| caps.supports_tasks())
+        {
             // Parse before acceptance. Task calls use no request-scoped peer or
             // cancellation token, so disconnecting cannot abandon their result.
             let call = TaskCall::parse(&request)?;
@@ -307,7 +372,8 @@ impl ServerHandler for LeanHostService {
              status select a mode with `kind`; verification takes explicit \
              target groups. Clients advertising io.modelcontextprotocol/tasks \
              may receive task handles; results remain available for ten minutes \
-             after completion while this server process lives."
+             after completion while this server process lives. Use lean_request to submit, \
+             retrieve or cancel retained requests without task negotiation."
                 .to_owned(),
         );
         info

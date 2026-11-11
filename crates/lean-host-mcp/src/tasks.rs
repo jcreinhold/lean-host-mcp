@@ -1,4 +1,4 @@
-//! Bounded, process-local request retention for the negotiated MCP Tasks extension.
+//! Bounded, process-local request retention for MCP Tasks and `lean_request`.
 //!
 //! Cancellation signals the tool and waits for its cleanup; no expiry timer aborts
 //! a worker operation. Finished results remain available for ten minutes. This is
@@ -29,6 +29,7 @@ struct Entry {
     cancellation: CancellationToken,
     created: Instant,
     expires: Option<Instant>,
+    submission: Option<[u8; 32]>,
 }
 
 impl RequestTasks {
@@ -39,15 +40,73 @@ impl RequestTasks {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
     {
+        self.spawn_inner(tool, None, operation).ok().flatten()
+    }
+
+    /// An explicitly identified submission never falls back to synchronous work.
+    /// Reusing the same ID and inputs returns the original handle without running
+    /// the operation again. Identity lasts only as long as the retained record.
+    pub(crate) fn submit<F, Fut>(
+        &self,
+        tool: &str,
+        request_id: String,
+        submission: [u8; 32],
+        operation: F,
+    ) -> Result<Task, McpError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
+    {
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || !request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
+        {
+            return Err(McpError::invalid_params(
+                "request_id must contain 1-128 ASCII letters, digits, underscores, hyphens, dots or colons",
+                None,
+            ));
+        }
+        self.spawn_inner(tool, Some((request_id, submission)), operation)?
+            .ok_or_else(|| McpError::internal_error("Request registry full; no work was submitted", None))
+    }
+
+    fn spawn_inner<F, Fut>(
+        &self,
+        tool: &str,
+        identity: Option<(String, [u8; 32])>,
+        operation: F,
+    ) -> Result<Option<Task>, McpError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
+    {
         let cancellation = CancellationToken::new();
         let task = {
             let mut entries = self.0.lock();
             prune(&mut entries, Instant::now());
-            if entries.len() >= MAX_TASKS {
-                return None;
+            if let Some((request_id, submission)) = &identity
+                && let Some(entry) = entries.get(request_id)
+            {
+                return if entry.submission.as_ref() == Some(submission) {
+                    Ok(Some(entry.task.task.clone()))
+                } else {
+                    Err(McpError::invalid_params(
+                        "request_id already belongs to a different submission",
+                        None,
+                    ))
+                };
             }
+            if entries.len() >= MAX_TASKS {
+                return Ok(None);
+            }
+            let (task_id, submission) = identity.map_or_else(
+                || (uuid::Uuid::new_v4().to_string(), None),
+                |(task_id, submission)| (task_id, Some(submission)),
+            );
             let now = current_timestamp();
-            let task = Task::new(uuid::Uuid::new_v4().to_string(), TaskStatus::Working, &now, &now)
+            let task = Task::new(task_id, TaskStatus::Working, &now, &now)
                 .with_status_message(format!("Accepted {tool}"))
                 .with_poll_interval_ms(2_000);
             entries.insert(
@@ -57,6 +116,7 @@ impl RequestTasks {
                     cancellation: cancellation.clone(),
                     created: Instant::now(),
                     expires: None,
+                    submission,
                 },
             );
             task
@@ -77,7 +137,7 @@ impl RequestTasks {
                 prune(&mut entries.lock(), Instant::now());
             }
         });
-        Some(task)
+        Ok(Some(task))
     }
 
     pub(crate) fn get(&self, task_id: &str) -> Result<DetailedTask, McpError> {
@@ -165,6 +225,70 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn identified_retry_returns_original_result_and_rejects_changed_inputs() {
+        let tasks = RequestTasks::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let original = tasks
+            .submit("test", "client-chosen-id".into(), [1; 32], move || async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        let retry = tasks
+            .submit("test", "client-chosen-id".into(), [1; 32], || async {
+                panic!("retry must not execute")
+            })
+            .unwrap();
+        assert_eq!(original.task_id, retry.task_id);
+        let completed = terminal(&tasks, &original.task_id).await;
+        assert_eq!(completed.status(), TaskStatus::Completed);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            tasks
+                .submit("test", "client-chosen-id".into(), [2; 32], || async {
+                    panic!("conflict must not execute")
+                })
+                .is_err()
+        );
+        let retry = tasks
+            .submit("test", "client-chosen-id".into(), [1; 32], || async {
+                panic!("completed retry must not execute")
+            })
+            .unwrap();
+        assert_eq!(retry.status, TaskStatus::Completed);
+        assert_eq!(tasks.get(&retry.task_id).unwrap(), completed);
+    }
+
+    #[tokio::test]
+    async fn identified_capacity_rejection_does_not_execute_or_evict() {
+        let tasks = RequestTasks::default();
+        for index in 0..MAX_TASKS {
+            tasks
+                .submit("test", format!("id-{index}"), [1; 32], || async {
+                    Ok(CallToolResult::success(vec![]))
+                })
+                .unwrap();
+        }
+        assert!(
+            tasks
+                .submit("test", "overflow".into(), [1; 32], || async {
+                    panic!("overflow must not execute")
+                })
+                .is_err()
+        );
+        assert!(
+            tasks
+                .submit("test", "id-0".into(), [1; 32], || async {
+                    panic!("retry must not execute even when full")
+                })
+                .is_ok()
+        );
+        assert!(tasks.get("overflow").is_err());
+        assert_eq!(tasks.0.lock().len(), MAX_TASKS);
     }
 
     #[tokio::test]

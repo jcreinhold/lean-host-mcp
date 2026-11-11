@@ -87,8 +87,9 @@ invalidation, multi-project routing, and coalescing concurrent opens for the sam
 dedicated controller thread; that thread is the sole owner of the `lean-rs-worker-parent` host handle, so "exactly one
 owner of the Lean runtime at a time" is a structural fact rather than a lock discipline. It submits one semantic job at
 a time in FIFO order and tracks host presentation facts such as the current worker generation, the last restart reason,
-and the last import profile. A bounded project queue turns overload into a retryable `busy` failure instead of unbounded
-memory growth. The parent binary never links `libleanshared`; the per-toolchain worker child does.
+and the last import profile. A bounded project mailbox admits further callers in FIFO order; admission waits are
+cancellable and deadline-bounded. Cold-project capacity uses a separate FIFO admission queue, so clients do not race
+retries for idle workers. The parent binary never links `libleanshared`; the per-toolchain worker child does.
 
 The broker reserves capacity before opening a worker. Opening, resident and retiring project workers all count against
 `broker.max_projects`; a slot is released only after confirmed shutdown. An uncertain shutdown keeps its slot unavailable

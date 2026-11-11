@@ -253,6 +253,7 @@ pub struct ProjectBroker {
     config: BrokerConfig,
     runtime_config: ProjectRuntimeConfig,
     worker_slots: Arc<Semaphore>,
+    capacity_admission: AsyncMutex<()>,
 }
 
 impl std::fmt::Debug for ProjectBroker {
@@ -292,6 +293,7 @@ impl ProjectBroker {
             })),
             runtime_config,
             worker_slots: Arc::new(Semaphore::new(config.max_projects.get())),
+            capacity_admission: AsyncMutex::new(()),
             config,
         });
         broker.spawn_reaper();
@@ -767,6 +769,13 @@ impl ProjectBroker {
     /// Look up or open the project for `root`. Mutex is released around
     /// the slow path so concurrent calls for different roots parallelize.
     async fn acquire(&self, root: PathBuf) -> Result<Arc<LeanProject>> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(self.request_timeout_millis()))
+            .ok_or_else(|| ServerError::Internal("admission deadline is out of range".to_owned()))?;
+        self.acquire_until(root, deadline).await
+    }
+
+    async fn acquire_until(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
         if CallCancellation::current().is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
@@ -807,13 +816,18 @@ impl ProjectBroker {
         let open_lock = self.opening_lock(&root)?;
         let cancellation = CallCancellation::current();
         let open_guard = tokio::select! {
-            guard = Arc::clone(&open_lock).lock_owned() => guard,
+            guard = tokio::time::timeout_at(deadline, Arc::clone(&open_lock).lock_owned()) => {
+                guard.map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
+            },
             () = cancellation.cancelled() => {
                 return Err(Self::pool_unavailable(&root, "request_cancelled", false));
             }
         };
         if cancellation.is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Self::pool_unavailable(&root, "project_admission_timeout", true));
         }
 
         let cached_after_wait = {
@@ -838,7 +852,7 @@ impl ProjectBroker {
 
         // Reserve before startup, and keep the permit on the actor thread until
         // structured shutdown completes. Opening and retiring workers count too.
-        let slot = self.reserve_worker_slot(&root).await?;
+        let slot = self.reserve_worker_slot(&root, deadline).await?;
         let cancellation = CallCancellation::current();
         let mut on_drop = cancellation.cancel_on_drop();
         if cancellation.is_cancelled() {
@@ -910,45 +924,77 @@ impl ProjectBroker {
         Ok(())
     }
 
-    async fn reserve_worker_slot(&self, root: &Path) -> Result<OwnedSemaphorePermit> {
-        if CallCancellation::current().is_cancelled() {
+    async fn reserve_worker_slot(&self, root: &Path, deadline: tokio::time::Instant) -> Result<OwnedSemaphorePermit> {
+        let cancellation = CallCancellation::current();
+        if cancellation.is_cancelled() {
             return Err(Self::pool_unavailable(root, "request_cancelled", false));
         }
-        if let Ok(slot) = Arc::clone(&self.worker_slots).try_acquire_owned() {
-            return Ok(slot);
+        let epoch = self.inner.lock().shutdown_epoch;
+        // One FIFO admission queue owns both idle eviction and slot acquisition.
+        // Later cold projects cannot steal a released slot from an earlier waiter.
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(Self::pool_unavailable(root, "request_cancelled", false)),
+            result = tokio::time::timeout_at(deadline, async {
+                let _turn = self.capacity_admission.lock().await;
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Self::pool_unavailable(root, "project_admission_timeout", true));
+                    }
+                    let victim = {
+                        let mut inner = self.inner.lock();
+                        if inner.shutdown_epoch != epoch {
+                            return Err(Self::pool_unavailable(root, "project_shutting_down", false));
+                        }
+                        Self::check_runtime_admission(&mut inner, root)?;
+                        if let Ok(slot) = Arc::clone(&self.worker_slots).try_acquire_owned() {
+                            return Ok(slot);
+                        }
+                        let victim = pop_idle_lru(&mut inner.registry);
+                        if let Some((path, _)) = &victim {
+                            inner.last_used.remove(path);
+                        }
+                        victim
+                    };
+                    if let Some((path, project)) = victim {
+                        tracing::debug!(evicted = %path.display(), "retiring idle LRU project before replacement startup");
+                        project.shutdown();
+                        // Do not retire another worker while this one is stopping.
+                        return self.wait_for_worker_slot(root, epoch).await;
+                    }
+                    // Only the head waiter polls. Resident activity holds Arc and
+                    // job guards; neither it nor uncertain retirement frees capacity.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }) => result.unwrap_or_else(|_| Err(Self::pool_unavailable(root, "project_admission_timeout", true))),
         }
-        let victim = {
-            let mut inner = self.inner.lock();
-            let victim = pop_idle_lru(&mut inner.registry);
-            if let Some((path, _)) = &victim {
-                inner.last_used.remove(path);
-            }
-            victim
-        };
-        let Some((path, project)) = victim else {
-            return Err(Self::pool_unavailable(
-                root,
-                "project_pool_busy_all_entries_active",
-                true,
-            ));
-        };
-        tracing::debug!(evicted = %path.display(), "retiring idle LRU project before replacement startup");
-        project.shutdown();
-        self.wait_for_worker_slot(root).await
     }
 
-    async fn wait_for_worker_slot(&self, root: &Path) -> Result<OwnedSemaphorePermit> {
+    async fn wait_for_worker_slot(&self, root: &Path, epoch: u64) -> Result<OwnedSemaphorePermit> {
         let cancellation = CallCancellation::current();
         let limit = Duration::from_millis(self.request_timeout_millis());
-        tokio::select! {
-            slot = tokio::time::timeout(limit, Arc::clone(&self.worker_slots).acquire_owned()) => {
-                match slot {
-                    Ok(slot) => slot.map_err(|err| ServerError::Internal(format!("worker capacity closed: {err}"))),
-                    Err(_) => Err(Self::pool_unavailable(root, "worker_retirement_timeout", false)),
+        let slot = Arc::clone(&self.worker_slots).acquire_owned();
+        let deadline = tokio::time::sleep(limit);
+        tokio::pin!(slot, deadline);
+        let mut shutdown_check = tokio::time::interval(Duration::from_millis(25));
+        shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(Self::pool_unavailable(root, "request_cancelled", false)),
+                _ = shutdown_check.tick() => {
+                    if self.inner.lock().shutdown_epoch != epoch {
+                        return Err(Self::pool_unavailable(root, "project_shutting_down", false));
+                    }
                 }
-            }
-            () = cancellation.cancelled() => {
-                Err(Self::pool_unavailable(root, "request_cancelled", false))
+                () = &mut deadline => return Err(Self::pool_unavailable(root, "worker_retirement_timeout", false)),
+                slot = &mut slot => {
+                    let slot = slot.map_err(|err| ServerError::Internal(format!("worker capacity closed: {err}")))?;
+                    if self.inner.lock().shutdown_epoch != epoch {
+                        return Err(Self::pool_unavailable(root, "project_shutting_down", false));
+                    }
+                    return Ok(slot);
+                }
             }
         }
     }
@@ -1315,50 +1361,134 @@ mod tests {
         };
         assert!(parse_pool_config(None, None, &file).is_err());
     }
+    fn capacity_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now().checked_add(Duration::from_secs(5)).unwrap()
+    }
+
     #[tokio::test]
-    async fn concurrent_startups_reserve_capacity_before_opening_and_hold_it_through_retirement() {
+    async fn same_root_waiters_share_their_own_end_to_end_admission_budget() {
         let mut config = cfg(PathBuf::from("/unused"), None, None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
-        let barrier = Arc::new(tokio::sync::Barrier::new(8));
-        let release = Arc::new(tokio::sync::Notify::new());
-        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut calls = Vec::new();
-        for index in 0..8 {
-            let broker = Arc::clone(&broker);
-            let barrier = Arc::clone(&barrier);
-            let release = Arc::clone(&release);
-            let active = Arc::clone(&active);
-            calls.push(tokio::spawn(async move {
-                barrier.wait().await;
-                let root = PathBuf::from(format!("/project-{index}"));
-                if let Ok(slot) = broker.reserve_worker_slot(&root).await {
-                    active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    release.notified().await;
-                    drop(slot);
-                    true
-                } else {
-                    false
-                }
-            }));
+        let occupied = broker
+            .reserve_worker_slot(Path::new("/occupied"), capacity_deadline())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(30))
+            .unwrap();
+        let root = PathBuf::from("/same-cold-project");
+        let first = broker.acquire_until(root.clone(), deadline);
+        let second = broker.acquire_until(root.clone(), deadline);
+        let last = broker.acquire_until(root, deadline);
+        tokio::pin!(first, second, last);
+        pending(first.as_mut()).await;
+        pending(second.as_mut()).await;
+        pending(last.as_mut()).await;
+        let results = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(first, second, last) })
+            .await
+            .unwrap();
+        for result in [results.0, results.1, results.2] {
+            assert!(
+                matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "project_admission_timeout")
+            );
+            drop(result);
         }
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while calls.iter().filter(|call| call.is_finished()).count() < 7 {
-                tokio::task::yield_now().await;
-            }
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        assert!(broker.resident_paths().is_empty());
+        drop(occupied);
+    }
+
+    async fn pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut future = future;
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
         })
-        .await
-        .unwrap();
-        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 1);
+        .await;
+    }
+
+    #[tokio::test]
+    async fn capacity_waiters_are_fifo_and_cancelled_waiters_do_not_steal_slots() {
+        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        config.max_projects = NonZeroUsize::MIN;
+        let broker = ProjectBroker::new(config);
+        let occupied = broker
+            .reserve_worker_slot(Path::new("/occupied"), capacity_deadline())
+            .await
+            .unwrap();
+        let first = broker.reserve_worker_slot(Path::new("/first"), capacity_deadline());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = crate::cancellation::with_cancellation(
+            &cancellation,
+            broker.reserve_worker_slot(Path::new("/cancelled"), capacity_deadline()),
+        );
+        let last = broker.reserve_worker_slot(Path::new("/last"), capacity_deadline());
+        tokio::pin!(first, cancelled, last);
+        pending(first.as_mut()).await;
+        pending(cancelled.as_mut()).await;
+        pending(last.as_mut()).await;
+        cancellation.cancel();
+        assert!(
+            matches!(cancelled.await, Err(ServerError::WorkerUnavailable(info)) if info.reason == "request_cancelled")
+        );
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        drop(occupied);
+        let first_slot = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+        pending(last.as_mut()).await;
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        drop(first_slot);
+        let last_slot = tokio::time::timeout(Duration::from_secs(1), last)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        drop(last_slot);
+        assert_eq!(broker.worker_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_waiting_capacity_without_releasing_unconfirmed_workers() {
+        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        config.max_projects = NonZeroUsize::MIN;
+        let broker = ProjectBroker::new(config);
+        let occupied = broker
+            .reserve_worker_slot(Path::new("/occupied"), capacity_deadline())
+            .await
+            .unwrap();
+        let waiting = broker.reserve_worker_slot(Path::new("/waiting"), capacity_deadline());
+        tokio::pin!(waiting);
+        pending(waiting.as_mut()).await;
         broker.shutdown_all();
-        assert!(broker.reserve_worker_slot(Path::new("/later")).await.is_err());
-        release.notify_one();
-        let mut opened = 0;
-        for call in calls {
-            opened += usize::from(call.await.unwrap());
-        }
-        assert_eq!(opened, 1);
-        assert!(broker.reserve_worker_slot(Path::new("/later")).await.is_ok());
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap();
+        assert!(matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "project_shutting_down"));
+        drop(result);
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_retirement_wait_without_unconfirmed_slot_release() {
+        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        config.max_projects = NonZeroUsize::MIN;
+        let broker = ProjectBroker::new(config);
+        let retiring = broker
+            .reserve_worker_slot(Path::new("/retiring"), capacity_deadline())
+            .await
+            .unwrap();
+        let waiting = broker.wait_for_worker_slot(Path::new("/waiting"), 0);
+        tokio::pin!(waiting);
+        pending(waiting.as_mut()).await;
+        broker.shutdown_all();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap();
+        assert!(matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "project_shutting_down"));
+        drop(result);
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        drop(retiring);
+        assert_eq!(broker.worker_slots.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -1381,12 +1511,15 @@ mod tests {
         let mut config = cfg(PathBuf::from("/unused"), None, None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
-        let retiring = broker.reserve_worker_slot(Path::new("/first")).await.unwrap();
+        let retiring = broker
+            .reserve_worker_slot(Path::new("/first"), capacity_deadline())
+            .await
+            .unwrap();
         let request = tokio_util::sync::CancellationToken::new();
         let cancelled = request.clone();
         let result = crate::cancellation::with_cancellation(&request, async {
             cancelled.cancel();
-            broker.wait_for_worker_slot(Path::new("/next")).await
+            broker.wait_for_worker_slot(Path::new("/next"), 0).await
         })
         .await;
         let reason = match &result {

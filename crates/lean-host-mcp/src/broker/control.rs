@@ -558,7 +558,12 @@ mod tests {
     #[tokio::test]
     async fn retirement_acknowledgement_is_not_reported_as_confirmed_exit() -> TestResult {
         let broker = broker();
-        let retiring = broker.reserve_worker_slot(Path::new("/uncertain-retirement")).await?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or("deadline out of range")?;
+        let retiring = broker
+            .reserve_worker_slot(Path::new("/uncertain-retirement"), deadline)
+            .await?;
         let claimed = broker.runtime_control(&RuntimeControlRequest {
             retire_idle: true,
             ..acquire()

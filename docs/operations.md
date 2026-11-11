@@ -39,8 +39,8 @@ description (e.g. "8 GiB") is for reading, not for setting.
 | --- | --- | --- | --- | --- |
 | `primary_project` | path | unset | `--lake-root / LEAN_HOST_MCP_PROJECT` | Default Lake project for calls that omit an explicit project= argument. Lowest-priority fallback, after the flag/env and the nearest lakefile above the working directory. |
 | `runtime.lean_max_memory_kib` | integer (KiB) | unset | `LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB` | Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. Crossing it kills the child: Lean's allocator signals the overrun with a C++ exception, which cannot unwind through the Rust frame at the shim boundary and aborts the process. Commented out because the default tracks runtime.worker_import_residue_budget_mib doubled, which keeps the clean recycle strictly ahead of the abort by more than the 4.4-6.3 GiB the heap counts and the budget does not — a fixed value below the budget makes the abort fire first and the residue policy unreachable. Set it only to raise the backstop; lowering it below the budget is warned about at startup. |
-| `runtime.request_timeout_millis` | integer (ms) | `120000` | `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS` | Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose lean_verify/lean_context work legitimately runs longer; lower it to bound a single heavy file query. Default 120 s. |
-| `runtime.project_mailbox_capacity` | integer | `16` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls may queue for one project's worker before new calls are shed with a retryable busy status. This is the server's only admission mechanism; it applies per project, so distinct projects never contend for one budget. |
+| `runtime.request_timeout_millis` | integer (ms) | `120000` | `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS` | Per-worker-operation deadline, also used separately to bound each admission wait. Execution expiry recycles the worker; admission expiry returns without dispatching that operation. A tool with multiple operations can take longer than this budget. Default 120 s. |
+| `runtime.project_mailbox_capacity` | integer | `16` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | How many calls fit in one project's worker mailbox. Further callers wait in FIFO order for admission, bounded by request_timeout_millis; cancellation removes only that caller. |
 | `runtime.worker_restart_limit` | integer | `3` | `LEAN_HOST_MCP_WORKER_RESTART_LIMIT` | How many worker restarts are tolerated within the restart window before the project is marked unhealthy. |
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
 | `runtime.worker_import_residue_budget_mib` | integer (MiB) | unset | `LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB` | How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects), clamped to [9216, 12288], and capped at one child's share of RAM after the import in flight (RAM / max_projects − 4608); set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it. |
@@ -169,13 +169,18 @@ below the budget is warned about at startup and is almost never what you want.
 
 ## Concurrency and admission
 
-There is no process-wide or cross-process admission gate. Each resident project owns one worker child and one dedicated
-thread that runs a single job at a time, so a project's work is serialized by construction;
-`runtime.project_mailbox_capacity` bounds how many calls may wait for that thread before further calls are shed with a
-retryable `mailbox_full` status. Server-wide concurrency is therefore `broker.max_projects` workers, one in-flight call
-each — calls against *different* projects run at the same time and never queue behind one another. Parallel
-`lean-host-mcp` processes are likewise independent; if a machine cannot hold that many workers, lower
-`broker.max_projects`.
+Each resident project owns one worker child and one dedicated thread that runs a single job at a time.
+`runtime.project_mailbox_capacity` bounds the actor's mailbox. Further callers wait for mailbox admission in FIFO order
+rather than retrying `mailbox_full`. Cold projects also wait in FIFO order for worker capacity; the head waiter retires
+an idle LRU worker when one becomes available. Active workers are never evicted to make room. Different resident
+projects can still execute concurrently. Cancellation removes only its own waiter, and capacity remains reserved until
+worker exit is confirmed.
+
+Each admission wait is bounded by `runtime.request_timeout_millis`, separately from the subsequent worker execution
+budget. Expiry returns `mailbox_admission_timeout` or `project_admission_timeout` without running that queued operation.
+This is not a whole-tool deadline: a tool that submits several worker operations can take longer. Explicit retained
+requests share a 128-record limit; legacy synchronous requests retain their normal transport behavior. Parallel server
+processes remain independent; lower `broker.max_projects` when the machine cannot hold that many workers.
 
 Cheap metadata paths never open a worker at all: degraded `needs_build` responses, invalid-request responses, and
 project-scope `.ilean` reference reads answer from the Lake files directly. A repeat module query on an unmodified file
@@ -277,11 +282,11 @@ JSON-RPC errors:
   "errors": [
     {
       "code": "runtime_unavailable",
-      "message": "mailbox_full",
+      "message": "mailbox_admission_timeout",
       "severity": "error",
       "retryable": true,
       "details": {
-        "reason": "mailbox_full",
+        "reason": "mailbox_admission_timeout",
         "project_root": "/abs/path",
         "session_id": "uuid",
         "worker_generation": 3,

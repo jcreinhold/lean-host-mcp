@@ -64,7 +64,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "120000",
         commented: false,
         overrides: "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
-        description: "Per-request worker deadline covering one tool call end to end. On expiry the worker is recycled and the call returns a retryable runtime error. Raise it for unusually heavy modules whose lean_verify/lean_context work legitimately runs longer; lower it to bound a single heavy file query. Default 120 s.",
+        description: "Per-worker-operation deadline, also used separately to bound each admission wait. Execution expiry recycles the worker; admission expiry returns without dispatching that operation. A tool with multiple operations can take longer than this budget. Default 120 s.",
     },
     FieldDoc {
         key: "runtime.project_mailbox_capacity",
@@ -72,7 +72,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "16",
         commented: false,
         overrides: "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
-        description: "How many calls may queue for one project's worker before new calls are shed with a retryable busy status. This is the server's only admission mechanism; it applies per project, so distinct projects never contend for one budget.",
+        description: "How many calls fit in one project's worker mailbox. Further callers wait in FIFO order for admission, bounded by request_timeout_millis; cancellation removes only that caller.",
     },
     FieldDoc {
         key: "runtime.worker_restart_limit",

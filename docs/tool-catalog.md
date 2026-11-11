@@ -39,14 +39,41 @@ cancellation. Cheap project status remains synchronous. Existing clients keep sy
 server shares task records across client sessions, so reconnecting clients can retrieve their existing handles.
 A task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
 
+Clients without the Tasks extension can use the ordinary `lean_request` tool:
+
+```json
+{"name":"lean_request","arguments":{"action":"submit","request_id":"unique-client-id","tool":"lean_verify","arguments":{"targets":[]}}}
+{"name":"lean_request","arguments":{"action":"get","request_id":"unique-client-id"}}
+{"name":"lean_request","arguments":{"action":"cancel","request_id":"unique-client-id"}}
+```
+
+`submit` accepts any of the five semantic tools and immediately returns task metadata in the configured tool result
+carrier. Use its `taskId` as `request_id` for `get` or `cancel`. `get` returns the same metadata plus `result` on
+`completed`, or a JSON-RPC `error` on `failed`; the retained `result` is the original `CallToolResult`, including its
+content and structured content. `cancel` returns the current record, which may still be `working` during cleanup.
+The bridge remains synchronous even for task-aware clients. It never submits `lean_runtime` or another `lean_request`.
+
+An optional client-chosen `request_id` makes a lost submission receipt retryable: submitting the same ID, tool and
+argument object returns the original record without running again. Changed inputs under that ID are rejected. IDs
+allow 1–128 ASCII letters, digits, underscores, hyphens, dots or colons. Prefer a fresh UUID per logical request and save
+it before submission. Omit the ID to generate one, but a lost generated receipt cannot be recovered by resubmission.
+This deduplication lasts only while the record exists, not after its ten-minute terminal retention or a server restart.
+After an unknown/expired response, reconcile the outcome before deciding whether to submit again.
+
+Busy project mailboxes and cold-project capacity admit waiting callers in FIFO order. An admission wait is bounded by
+the configured worker timeout and can be cancelled; an admission timeout means that queued operation did not run.
+Worker execution has its own budget after admission. A multi-operation tool may already have completed earlier steps.
+
 Closing an HTTP connection alone does not request cancellation. A synchronous request may continue until completion or
 its worker deadline, even when its response stream is lost. Synchronous clients should send MCP
 `notifications/cancelled` with the original request ID when they intend to stop work.
 
 The server retains at most 128 active or completed task records, with completed results available for ten minutes.
-When that registry is full, calls use the ordinary synchronous path. Follow the suggested polling interval; task push
-notifications and in-task input are not used. Retention survives client disconnects, not a server restart. A task ID
-identifies one request, not a deduplication key: resubmitting `tools/call` creates another request. Callers remain
+When that registry is full, negotiated task calls use the ordinary synchronous path; explicit `lean_request` submits
+are rejected without running, so they never silently lose retention. Follow the suggested polling interval; task push
+notifications and in-task input are not used. Retention survives client disconnects, not a server restart. An automatically generated task ID
+identifies one request, not a deduplication key: resubmitting a semantic `tools/call` creates another request. The explicit
+`lean_request` client-chosen ID exception is described above. Callers remain
 responsible for binding requests to the source revision they require.
 
 A cancellation acknowledgement records intent. A queued operation is skipped, while a running worker operation must

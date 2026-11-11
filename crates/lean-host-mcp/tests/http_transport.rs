@@ -20,9 +20,10 @@ use tokio::process::{Child, ChildStderr, Command};
 
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const EXPECTED_TOOLS: [&str; 6] = [
+const EXPECTED_TOOLS: [&str; 7] = [
     "lean_context",
     "lean_lookup",
+    "lean_request",
     "lean_runtime",
     "lean_status",
     "lean_trial",
@@ -371,7 +372,7 @@ async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
                 assert!(
                     matches!(
                         reason.as_str(),
-                        "mailbox_full" | "mailbox_closed" | "project_pool_busy_all_entries_active"
+                        "mailbox_admission_timeout" | "mailbox_closed" | "project_admission_timeout"
                     ),
                     "unexpected runtime_unavailable reason {reason}: {:?}",
                     response.json
@@ -523,6 +524,157 @@ async fn streamable_http_task_results_survive_new_client() {
         status.pointer("/result/taskId").is_none(),
         "cheap metadata remains synchronous: {status}"
     );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_retries() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("lakefile.lean"), "package retained\n").unwrap();
+    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
+    let root_s = root.path().to_string_lossy();
+    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
+    let mut original = server.new_session().await;
+    let submission = json!({"name": "lean_request", "arguments": {
+        "action": "submit", "request_id": "lost-receipt", "tool": "lean_verify", "arguments": {"targets": []}
+    }});
+    let accepted = original.request("tools/call", submission.clone()).await.unwrap();
+    assert_eq!(
+        accepted.json.pointer("/result/structuredContent/taskId"),
+        Some(&json!("lost-receipt"))
+    );
+    // No Tasks negotiation, and the caller may disappear while work continues.
+    drop(original);
+    let mut reconnected = server.new_session().await;
+    let retry = reconnected.request("tools/call", submission).await.unwrap();
+    assert_eq!(
+        retry.json.pointer("/result/structuredContent/taskId"),
+        Some(&json!("lost-receipt"))
+    );
+    let retained = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = reconnected
+                .request(
+                    "tools/call",
+                    json!({"name": "lean_request", "arguments": {
+                        "action": "get", "request_id": "lost-receipt"
+                    }}),
+                )
+                .await
+                .unwrap();
+            let task = response.json.pointer("/result/structuredContent").unwrap().clone();
+            if task["status"] != "working" {
+                break task;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(retained["status"], "completed", "{retained}");
+    assert!(
+        retained.pointer("/result/structuredContent/errors").is_some(),
+        "original invalid-target result retained: {retained}"
+    );
+    let conflicting = reconnected.request("tools/call", json!({"name": "lean_request", "arguments": {
+        "action": "submit", "request_id": "lost-receipt", "tool": "lean_status", "arguments": {"kind": "project"}
+    }})).await.unwrap();
+    assert!(
+        conflicting.json.get("error").is_some(),
+        "changed inputs must not rerun: {conflicting:?}"
+    );
+    let cancelled = reconnected
+        .request(
+            "tools/call",
+            json!({"name": "lean_request", "arguments": {
+                "action": "cancel", "request_id": "lost-receipt"
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled.json.pointer("/result/structuredContent"),
+        Some(&retained),
+        "cancellation cannot erase a finished result"
+    );
+    let mut task_client = TaskHttpClient::new(&server.url);
+    let get = task_client
+        .request(
+            "tools/call",
+            json!({"name": "lean_request", "arguments": {
+                "action": "get", "request_id": "lost-receipt"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        get.pointer("/result/structuredContent"),
+        Some(&retained),
+        "bridge remains synchronous for task-aware clients"
+    );
+    let unknown = reconnected
+        .request(
+            "tools/call",
+            json!({"name": "lean_request", "arguments": {
+                "action": "get", "request_id": "missing"
+            }}),
+        )
+        .await
+        .unwrap();
+    assert!(unknown.json.get("error").is_some());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires built Lean fixture and worker binary"]
+async fn streamable_http_retained_requests_wait_past_full_mailbox_and_cancel() {
+    let scratch = tempfile::tempdir().unwrap();
+    let running = scratch.path().join("running");
+    let finished = scratch.path().join("finished");
+    let cancelled = scratch.path().join("cancelled-must-not-run");
+    let first = scratch.path().join("first");
+    let last = scratch.path().join("last");
+    let root = fixture_root();
+    let root_s = root.to_string_lossy();
+    let server = HttpMcpServer::start_with_env(
+        &[("--lake-root", root_s.as_ref())],
+        &[
+            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
+            ("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY", "1"),
+        ],
+    )
+    .await;
+    let mut client = TaskHttpClient::new(&server.url);
+    let blocker = client
+        .command(&sentinel_command(&running, Some((&finished, 4_000))))
+        .await;
+    wait_for_sentinel(&running, Duration::from_secs(30)).await;
+    let first_id = client.command(&sentinel_command(&first, None)).await;
+    let cancel_id = client.command(&sentinel_command(&cancelled, None)).await;
+    let last_id = client.command(&sentinel_command(&last, None)).await;
+    assert!(!finished.exists());
+    client.request("tasks/cancel", json!({"taskId": cancel_id})).await;
+    let cancel_result = client.terminal(&cancel_id, Duration::from_secs(10)).await;
+    assert_eq!(cancel_result.pointer("/result/status"), Some(&json!("cancelled")));
+    drop(client);
+    let mut reconnected = TaskHttpClient::new(&server.url);
+    for id in [blocker, first_id, last_id] {
+        let result = reconnected.terminal(&id, Duration::from_secs(15)).await;
+        assert_eq!(result.pointer("/result/status"), Some(&json!("completed")), "{result}");
+        assert_eq!(
+            result.pointer("/result/result/isError"),
+            Some(&json!(false)),
+            "{result}"
+        );
+        assert!(
+            result.pointer("/result/result/structuredContent/data/output").is_some(),
+            "{result}"
+        );
+    }
+    assert!(finished.exists());
+    assert!(first.exists());
+    assert!(last.exists());
+    assert!(!cancelled.exists());
     server.shutdown().await;
 }
 

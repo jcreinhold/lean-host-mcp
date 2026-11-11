@@ -24,7 +24,8 @@ Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups d
 
 The semantic calls read source and elaborate in memory. The separate `lean_runtime` tool observes worker activity or
 obtains an expiring lease on an idle worker pool, keeping warm caches unless retirement is explicitly requested. No
-tool writes source. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
+tool writes source. `lean_request` offers retrievable request IDs, retained final results and cancellation to clients
+without MCP Tasks negotiation. Busy projects wait for admission in FIFO order. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
 
 ## Quick start
 
