@@ -78,6 +78,15 @@ pub enum RuntimeControlStatus {
 /// Server-owned outcome plus an observation of its worker pool.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct RuntimeControlResult {
+    /// Binary source identity captured when it was built.
+    pub build: crate::status::BuildIdentity,
+    /// Actual startup-resolved policy, including derived memory limits.
+    pub effective_settings: crate::status::EffectiveSettings,
+    /// Negotiated extensions; absence on older servers means unsupported.
+    pub capabilities: Vec<String>,
+    /// Filled by the service that owns the retained-request registry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_registry: Option<crate::status::RequestRegistryStatus>,
     /// Result of the requested coordination action.
     pub status: RuntimeControlStatus,
     /// Explanation for a refused or invalid operation.
@@ -201,6 +210,11 @@ impl MaintenanceAccess {
 }
 
 impl ProjectBroker {
+    /// Identity shared by status and immutable retained-request bindings.
+    #[must_use]
+    pub fn instance_id(&self) -> String {
+        self.inner.lock().control.instance_id.clone()
+    }
     /// Observe workers or atomically obtain, renew, or release an idle-pool lease.
     ///
     /// A successful acquire fences new worker admission before inspecting or
@@ -286,6 +300,17 @@ impl ProjectBroker {
             token = None;
         }
         RuntimeControlResult {
+            build: crate::status::BuildIdentity::default(),
+            effective_settings: crate::status::EffectiveSettings {
+                broker: crate::status::BrokerSettings {
+                    max_projects: self.config.max_projects.get(),
+                    idle_timeout_secs: self.config.idle_timeout.as_secs(),
+                },
+                runtime: crate::status::RuntimeSettings::from(&self.runtime_config),
+                server: None,
+            },
+            capabilities: vec!["retained_request_binding_v1".to_owned()],
+            request_registry: None,
             status: result,
             detail,
             lease_id: token,

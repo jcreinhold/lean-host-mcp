@@ -544,6 +544,21 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
         accepted.json.pointer("/result/structuredContent/taskId"),
         Some(&json!("lost-receipt"))
     );
+    let binding = accepted
+        .json
+        .pointer("/result/structuredContent/request")
+        .unwrap()
+        .clone();
+    assert_eq!(binding["tool"], "lean_verify");
+    assert_eq!(binding["project"], Value::Null);
+    assert_eq!(
+        binding["submission_sha256"],
+        "27f1aae6bb5bec5f6b58dc30c3bdda13d76fefd07d5e1d1a72f5116c651f5b23"
+    );
+    let mut status_client = TaskHttpClient::new(&server.url);
+    let status = status_client.control(json!({"action":"status"})).await;
+    assert_eq!(binding["server_instance_id"], status["pool"]["instance_id"]);
+    assert_eq!(status["capabilities"], json!(["retained_request_binding_v1"]));
     // No Tasks negotiation, and the caller may disappear while work continues.
     drop(original);
     let mut reconnected = server.new_session().await;
@@ -573,6 +588,7 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
     .await
     .unwrap();
     assert_eq!(retained["status"], "completed", "{retained}");
+    assert_eq!(retained["request"], binding);
     assert!(
         retained.pointer("/result/structuredContent/errors").is_some(),
         "original invalid-target result retained: {retained}"
@@ -622,6 +638,57 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
         .await
         .unwrap();
     assert!(unknown.json.get("error").is_some());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn streamable_http_status_reports_resolved_settings_without_opening_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let server = HttpMcpServer::start_with_env(
+        &[("--lake-root", root.path().to_str().unwrap())],
+        &[
+            ("LEAN_HOST_MCP_MAX_PROJECTS", "2"),
+            ("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS", "91"),
+            ("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS", "12345"),
+            ("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY", "9"),
+            ("LEAN_HOST_MCP_WORKER_RESTART_LIMIT", "7"),
+            ("LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS", "83"),
+            ("LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB", "4096"),
+            ("LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY", "6"),
+        ],
+    )
+    .await;
+    let mut client = TaskHttpClient::new(&server.url);
+    let status = client.control(json!({"action":"status"})).await;
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["build"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        status["build"]["revision"],
+        json!(option_env!("LEAN_HOST_MCP_BUILD_REVISION"))
+    );
+    assert_eq!(
+        status["build"]["dirty"],
+        json!(option_env!("LEAN_HOST_MCP_BUILD_DIRTY").map(|value| value == "true"))
+    );
+    assert_eq!(status["pool"]["occupied_slots"], 0);
+    assert_eq!(status["pool"]["workers_stopped"], true);
+    assert_eq!(
+        status["effective_settings"]["broker"],
+        json!({"max_projects":2,"idle_timeout_secs":91})
+    );
+    let runtime = &status["effective_settings"]["runtime"];
+    assert_eq!(runtime["request_timeout_millis"], 12_345);
+    assert_eq!(runtime["project_mailbox_capacity"], 9);
+    assert_eq!(runtime["worker_restart_limit"], 7);
+    assert_eq!(runtime["worker_restart_window_secs"], 83);
+    assert_eq!(runtime["worker_import_residue_budget_bytes"], 4_294_967_296_u64);
+    assert_eq!(runtime["worker_import_residue_soft_bytes"], 2_576_980_320_u64);
+    assert_eq!(runtime["worker_session_pool_capacity"], 6);
+    assert_eq!(status["effective_settings"]["server"]["response_carrier"], "both");
+    assert_eq!(
+        status["request_registry"],
+        json!({"active":0,"retained_terminal":0,"capacity":128,"terminal_retention_millis":600_000})
+    );
     server.shutdown().await;
 }
 

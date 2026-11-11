@@ -38,6 +38,7 @@ pub mod projections;
 mod semantic_search;
 pub mod server;
 mod smoke;
+pub mod status;
 mod tasks;
 pub mod toolchain;
 pub mod tools;

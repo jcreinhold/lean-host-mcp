@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, DetailedTask, Task, TaskPayload, TaskStatus};
 use rmcp::task_manager::current_timestamp;
+use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::cancellation::with_cancellation;
@@ -29,10 +30,41 @@ struct Entry {
     cancellation: CancellationToken,
     created: Instant,
     expires: Option<Instant>,
-    submission: Option<[u8; 32]>,
+    submission: Option<RequestBinding>,
+}
+
+/// Immutable input identity, captured atomically with explicit submission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct RequestBinding {
+    pub server_instance_id: String,
+    pub tool: String,
+    pub submission_sha256: String,
+    /// Exact supplied project; source/canonical-root validation stays with callers.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RetainedTask {
+    #[serde(flatten)]
+    task: DetailedTask,
+    request: Option<RequestBinding>,
 }
 
 impl RequestTasks {
+    pub(crate) fn status(&self) -> crate::status::RequestRegistryStatus {
+        let mut entries = self.0.lock();
+        prune(&mut entries, Instant::now());
+        let active = entries
+            .values()
+            .filter(|entry| !entry.task.status().is_terminal())
+            .count();
+        crate::status::RequestRegistryStatus {
+            active,
+            retained_terminal: entries.len().saturating_sub(active),
+            capacity: MAX_TASKS,
+            terminal_retention_millis: u64::try_from(RETENTION.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
     /// Register before spawning, so a returned handle is immediately readable.
     /// A full registry declines task mode; the caller can run synchronously.
     pub(crate) fn spawn<F, Fut>(&self, tool: &str, operation: F) -> Option<Task>
@@ -50,7 +82,7 @@ impl RequestTasks {
         &self,
         tool: &str,
         request_id: String,
-        submission: [u8; 32],
+        submission: RequestBinding,
         operation: F,
     ) -> Result<Task, McpError>
     where
@@ -75,7 +107,7 @@ impl RequestTasks {
     fn spawn_inner<F, Fut>(
         &self,
         tool: &str,
-        identity: Option<(String, [u8; 32])>,
+        identity: Option<(String, RequestBinding)>,
         operation: F,
     ) -> Result<Option<Task>, McpError>
     where
@@ -149,6 +181,18 @@ impl RequestTasks {
             .ok_or_else(unknown_task)
     }
 
+    pub(crate) fn get_retained(&self, task_id: &str) -> Result<RetainedTask, McpError> {
+        let mut entries = self.0.lock();
+        prune(&mut entries, Instant::now());
+        entries
+            .get(task_id)
+            .map(|entry| RetainedTask {
+                task: entry.task.clone(),
+                request: entry.submission.clone(),
+            })
+            .ok_or_else(unknown_task)
+    }
+
     pub(crate) fn cancel(&self, task_id: &str) -> Result<(), McpError> {
         let mut entries = self.0.lock();
         prune(&mut entries, Instant::now());
@@ -213,6 +257,15 @@ fn unknown_task() -> McpError {
 mod tests {
     use super::*;
 
+    fn binding(byte: u8) -> RequestBinding {
+        RequestBinding {
+            server_instance_id: "test-instance".to_owned(),
+            tool: "test".to_owned(),
+            submission_sha256: format!("{byte:02x}").repeat(32),
+            project: Some("/test/project".to_owned()),
+        }
+    }
+
     async fn terminal(tasks: &RequestTasks, task_id: &str) -> DetailedTask {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -233,13 +286,13 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = Arc::clone(&calls);
         let original = tasks
-            .submit("test", "client-chosen-id".into(), [1; 32], move || async move {
+            .submit("test", "client-chosen-id".into(), binding(1), move || async move {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
         let retry = tasks
-            .submit("test", "client-chosen-id".into(), [1; 32], || async {
+            .submit("test", "client-chosen-id".into(), binding(1), || async {
                 panic!("retry must not execute")
             })
             .unwrap();
@@ -249,18 +302,24 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             tasks
-                .submit("test", "client-chosen-id".into(), [2; 32], || async {
+                .submit("test", "client-chosen-id".into(), binding(2), || async {
                     panic!("conflict must not execute")
                 })
                 .is_err()
         );
         let retry = tasks
-            .submit("test", "client-chosen-id".into(), [1; 32], || async {
+            .submit("test", "client-chosen-id".into(), binding(1), || async {
                 panic!("completed retry must not execute")
             })
             .unwrap();
         assert_eq!(retry.status, TaskStatus::Completed);
         assert_eq!(tasks.get(&retry.task_id).unwrap(), completed);
+        let retained = tasks.get_retained(&retry.task_id).unwrap();
+        assert_eq!(retained.request, Some(binding(1)));
+        tasks.cancel(&retry.task_id).unwrap();
+        assert_eq!(tasks.get_retained(&retry.task_id).unwrap().request, retained.request);
+        assert_eq!(tasks.status().active, 0);
+        assert_eq!(tasks.status().retained_terminal, 1);
     }
 
     #[tokio::test]
@@ -268,27 +327,66 @@ mod tests {
         let tasks = RequestTasks::default();
         for index in 0..MAX_TASKS {
             tasks
-                .submit("test", format!("id-{index}"), [1; 32], || async {
+                .submit("test", format!("id-{index}"), binding(1), || async {
                     Ok(CallToolResult::success(vec![]))
                 })
                 .unwrap();
         }
         assert!(
             tasks
-                .submit("test", "overflow".into(), [1; 32], || async {
+                .submit("test", "overflow".into(), binding(1), || async {
                     panic!("overflow must not execute")
                 })
                 .is_err()
         );
         assert!(
             tasks
-                .submit("test", "id-0".into(), [1; 32], || async {
+                .submit("test", "id-0".into(), binding(1), || async {
                     panic!("retry must not execute even when full")
                 })
                 .is_ok()
         );
         assert!(tasks.get("overflow").is_err());
         assert_eq!(tasks.0.lock().len(), MAX_TASKS);
+    }
+
+    #[tokio::test]
+    async fn immutable_binding_is_serialized_with_every_retained_state() {
+        let tasks = RequestTasks::default();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let working = tasks
+            .submit("test", "working-fixture".into(), binding(1), || async {
+                finish_rx.await.unwrap();
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        let observe = |id: &str, status: &str| {
+            let value = serde_json::to_value(tasks.get_retained(id).unwrap()).unwrap();
+            assert_eq!(value.get("taskId").and_then(serde_json::Value::as_str), Some(id));
+            assert_eq!(value.get("status").and_then(serde_json::Value::as_str), Some(status));
+            assert_eq!(value.get("request"), Some(&serde_json::to_value(binding(1)).unwrap()));
+            eprintln!("RETAINED_FIXTURE {status} {value}");
+        };
+        observe(&working.task_id, "working");
+        finish_tx.send(()).unwrap();
+        terminal(&tasks, &working.task_id).await;
+        observe(&working.task_id, "completed");
+        let failed = tasks
+            .submit("test", "failed-fixture".into(), binding(1), || async {
+                Err(McpError::invalid_params("test failure", None))
+            })
+            .unwrap();
+        terminal(&tasks, &failed.task_id).await;
+        observe(&failed.task_id, "failed");
+        let cancelled = tasks
+            .submit("test", "cancelled-fixture".into(), binding(1), || async {
+                crate::cancellation::CallCancellation::current().cancelled().await;
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        tasks.cancel(&cancelled.task_id).unwrap();
+        terminal(&tasks, &cancelled.task_id).await;
+        observe(&cancelled.task_id, "cancelled");
     }
 
     #[tokio::test]

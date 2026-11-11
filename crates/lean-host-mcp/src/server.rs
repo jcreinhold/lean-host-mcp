@@ -11,6 +11,7 @@
 //! receive process-local task handles. Clone a service across transport sessions
 //! to retain those handles and their results after a client reconnects.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +31,7 @@ use sha2::{Digest, Sha256};
 use crate::broker::{ProjectBroker, RuntimeControlRequest};
 use crate::cancellation::with_cancellation;
 use crate::error::ServerError;
-use crate::tasks::RequestTasks;
+use crate::tasks::{RequestBinding, RequestTasks};
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
@@ -160,17 +161,31 @@ impl LeanHostService {
                 let call =
                     CallToolRequestParams::new(tool.clone()).with_arguments(request.arguments.unwrap_or_default());
                 let parsed = TaskCall::parse(&call)?;
-                let submission: [u8; 32] = Sha256::digest(
+                let digest = Sha256::digest(
                     serde_json::to_vec(&(&tool, &call.arguments))
                         .map_err(|error| McpError::internal_error(error.to_string(), None))?,
-                )
-                .into();
+                );
+                let mut submission_sha256 = String::with_capacity(64);
+                for byte in &digest {
+                    let _ = write!(submission_sha256, "{byte:02x}");
+                }
+                let submission = RequestBinding {
+                    server_instance_id: self.ctx.broker.instance_id(),
+                    tool: tool.clone(),
+                    submission_sha256,
+                    project: call
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("project"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                };
                 let request_id = request.request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let service = self.clone();
                 let accepted = self.tasks.submit(&tool, request_id, submission, move || async move {
                     service.run_task(parsed).await
                 })?;
-                self.tasks.get(&accepted.task_id)?
+                self.tasks.get_retained(&accepted.task_id)?
             }
             RetainedAction::Get | RetainedAction::Cancel => {
                 if request.tool.is_some() || request.arguments.is_some() {
@@ -182,7 +197,7 @@ impl LeanHostService {
                 if matches!(request.action, RetainedAction::Cancel) {
                     self.tasks.cancel(&request_id)?;
                 }
-                self.tasks.get(&request_id)?
+                self.tasks.get_retained(&request_id)?
             }
         };
         let value = serde_json::to_value(task).map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -196,10 +211,10 @@ impl LeanHostService {
         &self,
         Parameters(request): Parameters<RuntimeControlRequest>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        Ok(carry(
-            &self.ctx.broker.runtime_control(&request),
-            self.ctx.config.carrier,
-        ))
+        let mut result = self.ctx.broker.runtime_control(&request);
+        result.effective_settings.server = Some(self.ctx.config.into());
+        result.request_registry = Some(self.tasks.status());
+        Ok(carry(&result, self.ctx.config.carrier))
     }
 
     #[tool(

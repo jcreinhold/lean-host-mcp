@@ -60,6 +60,16 @@ it before submission. Omit the ID to generate one, but a lost generated receipt 
 This deduplication lasts only while the record exists, not after its ten-minute terminal retention or a server restart.
 After an unknown/expired response, reconcile the outcome before deciding whether to submit again.
 
+Servers advertising `retained_request_binding_v1` in `lean_runtime` status include an immutable `request` alongside
+each plain bridge record: `server_instance_id`, `tool`, `submission_sha256`, and `project`. The instance matches
+`pool.instance_id`. The digest is lowercase SHA-256 of the compact JSON array `[tool, arguments]`, with object keys
+sorted by the server's JSON serializer. `project` is the exact submitted string (or null), not a resolved-root or source
+revision claim. The binding is stored before execution and remains unchanged through completion or cancellation.
+Clients can persist their ID and input binding before submission, then validate every recovered response without
+relying on a separate status call racing a restart. Native Tasks records not created through the bridge have no such
+binding. Source validation and uncertain-outcome rules still apply; failed/cancelled task state alone is not a universal
+certificate that all worker processes are confirmed stopped.
+
 Busy project mailboxes and cold-project capacity admit waiting callers in FIFO order. An admission wait is bounded by
 the configured worker timeout and can be cancelled; an admission timeout means that queued operation did not run.
 Worker execution has its own budget after admission. A multi-operation tool may already have completed earlier steps.
@@ -84,6 +94,17 @@ errors or a negative verification verdict. It does not itself establish successf
 ## Worker Activity And Admission Leases
 
 `lean_runtime` is always synchronous, including for task-aware clients. It has four actions:
+
+Every response includes `build` with package `version`, full Git `revision`, and build-time `dirty` state. Missing Git
+metadata (for example, an exported source archive) is reported as null, never guessed from the runtime checkout.
+`effective_settings` reports resolved broker/runtime values, including derived heap/residue limits, plus server
+presentation and output overrides. Null output overrides mean each tool keeps its own default budget. These are the
+values the running process actually uses, not the current contents of a configuration file. No raw environment or
+credentials are exposed. Transport addresses are not part of the transport-agnostic tool service.
+
+`request_registry` reports active requests, retained terminal records, capacity, and terminal retention time. A zero
+active count does not prove clients have consumed retained results or authorize discarding them in a restart. Settings,
+build identity, registry counts, and capability discovery never open a Lean worker.
 
 | Action | Fields | Behavior |
 | --- | --- | --- |

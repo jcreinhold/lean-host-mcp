@@ -273,7 +273,8 @@ Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are pa
 ## build.rs note
 
 `crates/lean-host-mcp-worker/build.rs` bakes the Lean toolchain's `lib/lean` directory into the worker binary's rpath so
-`libleanshared.{dylib,so}` loads at runtime. The parent crate has **no** `build.rs`; it does not link `libleanshared`.
+`libleanshared.{dylib,so}` loads at runtime. The parent crate's `build.rs` embeds Git revision and dirty state only; it
+emits no linker directives and does not link `libleanshared`.
 Discovery order: `LEAN_HOST_MCP_TARGET_TOOLCHAIN` (resolved as `~/.elan/toolchains/leanprover--lean4---<id>`), then
 `LEAN_SYSROOT`, then `lean --print-prefix`. macOS/Linux only.
 
