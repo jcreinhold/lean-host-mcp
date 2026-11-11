@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/*"]
 exclude = ["vendor/lean-rs-worker-parent"]
+members = ["crates/*"]
 resolver = "3"
 
 # Temporary upstream correctness fix, retained locally until a release includes
@@ -33,16 +33,16 @@ lean-semantic-search-runtime = "0.7.7"
 lean-toolchain = "0.9.4"
 
 [workspace.lints.rust]
-future-incompatible = "warn"
-let-underscore = "warn"
-nonstandard-style = "warn"
+future_incompatible = { level = "warn", priority = -1 }
+let_underscore = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
 redundant_lifetimes = "warn"
-rust-2018-idioms = "warn"
-rust-2024-compatibility = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
 single_use_lifetimes = "warn"
 trivial_casts = "warn"
 unreachable_pub = "warn"
-unsafe-code = "forbid"
+unsafe_code = "forbid"
 unused = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]

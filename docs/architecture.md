@@ -5,8 +5,9 @@
 
 `lean-host-mcp` is a thin MCP server over `lean-rs-worker`. The design thesis is a **declaration-centric** public API:
 agents name a declaration and, when needed, a proof position inside it — never cursor coordinates, source spans, byte
-offsets, or replacement ranges. The host translates those names into bounded, read-only semantic jobs against a
-supervised worker child, and projects the worker's results into one stable semantic response shape.
+offsets, or replacement ranges. The host translates those names into bounded semantic jobs against a supervised worker
+child without applying source edits automatically, then projects the results into one stable semantic response shape.
+Executed Lean code can perform IO with the server user's privileges; the worker is not an OS sandbox.
 
 The model-facing tools are:
 
@@ -39,7 +40,7 @@ crates/lean-host-mcp-worker/src/
 ```
 
 `server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when needed,
-and send one typed read-only semantic job to the project controller.
+and send one typed semantic job to the project controller.
 
 ## Transport Boundary
 
@@ -52,6 +53,13 @@ Stdio remains the default process model: one client launches one server and EOF 
 single Streamable HTTP server for that run. HTTP sessions are independent rmcp sessions, but the cloned
 `LeanHostService` values share one broker, so all sessions still obey the same per-project serialized controller,
 bounded project queue, memory budget, and worker lifecycle presentation.
+
+MCP 2026-07-28 uses the SDK's stateless discovery and per-request capability/version metadata. Legacy clients retain
+initialize/session support. Both paths share the same service and retained-request registry. Protocol guards follow
+[the MCP versioning contract](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning).
+HTTP is native-only: every present `Origin` is rejected with 403, while requests without Origin still require an
+allowed loopback Host. This follows the
+[Streamable HTTP security requirements](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
 
 Runtime pressure is not a transport error. Mailbox pressure, project-pool pressure, worker death, session loss, and
 restart recovery continue to surface through the semantic response `errors` channel with structured runtime metadata.

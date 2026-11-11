@@ -168,6 +168,174 @@ async fn streamable_http_initialize_and_tools_list() {
 }
 
 #[tokio::test]
+async fn native_http_rejects_every_browser_origin_and_foreign_host() {
+    let server = HttpMcpServer::start(&[]).await;
+    let initialize = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+            "clientInfo": { "name": "origin-test", "version": "1" }
+        }
+    });
+    // GET/DELETE and malformed bodies must not bypass origin validation either.
+    for method in [reqwest::Method::POST, reqwest::Method::GET, reqwest::Method::DELETE] {
+        for origins in [
+            vec!["https://attacker.example"],
+            vec!["null"],
+            vec![""],
+            vec!["not an origin"],
+            vec!["http://127.0.0.1"],
+            vec!["https://attacker.example", "null"],
+            vec!["null", "https://attacker.example"],
+        ] {
+            let mut headers = HeaderMap::new();
+            for origin in &origins {
+                headers.append(reqwest::header::ORIGIN, origin.parse().unwrap());
+            }
+            let response = server
+                .client
+                .request(method.clone(), &server.url)
+                .header("Accept", ACCEPT_BOTH)
+                .header("Content-Type", "application/json")
+                .headers(headers)
+                .body(initialize.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::FORBIDDEN,
+                "{method} {origins:?}"
+            );
+        }
+    }
+    let response = server
+        .client
+        .post(&server.url)
+        .header("Accept", ACCEPT_BOTH)
+        .header("Content-Type", "application/json")
+        .header("Host", "attacker.example")
+        .body(initialize.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    // An ordinary native client has no Origin and still negotiates normally.
+    let mut session = server.new_session().await;
+    assert!(
+        session
+            .request("tools/list", json!({}))
+            .await
+            .unwrap()
+            .http_status
+            .is_success()
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn modern_stateless_discovery_calls_and_protocol_guards() {
+    const VERSION: &str = "2026-07-28";
+    let server = HttpMcpServer::start(&[]).await;
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": VERSION,
+        "io.modelcontextprotocol/clientInfo": { "name": "modern-test", "version": "1" },
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let discover = server
+        .modern_request(
+            "server/discover",
+            None,
+            VERSION,
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta}}),
+        )
+        .await;
+    assert!(discover.http_status.is_success(), "{discover:?}");
+    assert!(discover.session_id.is_none());
+    assert_eq!(
+        discover.json.pointer("/result/resultType").and_then(Value::as_str),
+        Some("complete")
+    );
+    assert!(
+        discover
+            .json
+            .pointer("/result/supportedVersions")
+            .and_then(Value::as_array)
+            .unwrap()
+            .contains(&json!(VERSION))
+    );
+    assert!(discover.json.pointer("/result/capabilities/tools").is_some());
+
+    let listed = server
+        .modern_request(
+            "tools/list",
+            None,
+            VERSION,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":meta}}),
+        )
+        .await;
+    assert!(listed.http_status.is_success(), "{listed:?}");
+    assert!(listed.session_id.is_none());
+    assert_eq!(tool_names(&listed.json), expected_tools());
+
+    let call = server
+        .modern_request(
+            "tools/call",
+            Some("lean_context"),
+            VERSION,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"lean_context","arguments":{"kind":"bogus"},"_meta":meta}}),
+        )
+        .await;
+    assert!(call.http_status.is_success(), "{call:?}");
+    assert!(call.session_id.is_none());
+    assert_eq!(
+        call.json.pointer("/result/isError").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(semantic_error_code(&call.json).as_deref(), Some("invalid_kind"));
+
+    let mismatch = server
+        .modern_request(
+            "tools/list",
+            None,
+            VERSION,
+            json!({"jsonrpc":"2.0","id":4,"method":"server/discover","params":{"_meta":meta}}),
+        )
+        .await;
+    assert_eq!(mismatch.http_status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        mismatch.json.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32020)
+    );
+    let mut unsupported_meta = meta.clone();
+    unsupported_meta["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
+    let unsupported = server
+        .modern_request(
+            "server/discover",
+            None,
+            "2099-01-01",
+            json!({"jsonrpc":"2.0","id":5,"method":"server/discover","params":{"_meta":unsupported_meta}}),
+        )
+        .await;
+    assert_eq!(unsupported.http_status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unsupported.json.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32022)
+    );
+    let task = server
+        .modern_request(
+            "tasks/get",
+            Some("unknown-task"),
+            VERSION,
+            json!({"jsonrpc":"2.0","id":6,"method":"tasks/get","params":{"taskId":"unknown-task","_meta":meta}}),
+        )
+        .await;
+    assert_eq!(task.json.pointer("/error/code").and_then(Value::as_i64), Some(-32021));
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn invalid_http_startup_config_exits() {
     for args in [
         vec!["--http-path", "/mcp"],
@@ -225,6 +393,10 @@ async fn lean_verify_invalid_target_group_is_structured_tool_error() {
         response.json.get("error").is_none(),
         "invalid lean_verify target group should not be a JSON-RPC error: {:?}",
         response.json
+    );
+    assert_eq!(
+        response.json.pointer("/result/isError").and_then(Value::as_bool),
+        Some(true)
     );
     assert_eq!(semantic_error_code(&response.json).as_deref(), Some("invalid_request"));
     assert_eq!(
@@ -1277,6 +1449,32 @@ impl HttpMcpServer {
             stderr_task,
             client: reqwest::Client::new(),
             url: format!("http://{bind}/mcp"),
+        }
+    }
+
+    async fn modern_request(&self, method: &str, name: Option<&str>, version: &str, body: Value) -> HttpMcpResponse {
+        let mut request = self
+            .client
+            .post(&self.url)
+            .header("Accept", ACCEPT_BOTH)
+            .header("Content-Type", "application/json")
+            .header("MCP-Protocol-Version", version)
+            .header("Mcp-Method", method)
+            .body(body.to_string());
+        if let Some(name) = name {
+            request = request.header("Mcp-Name", name);
+        }
+        let response = request.send().await.unwrap();
+        let http_status = response.status();
+        let headers = response.headers().clone();
+        let session_id = headers
+            .get("Mcp-Session-Id")
+            .map(|value| value.to_str().unwrap().to_owned());
+        let json = parse_response_body(&headers, &response.bytes().await.unwrap()).unwrap();
+        HttpMcpResponse {
+            http_status,
+            session_id,
+            json,
         }
     }
 

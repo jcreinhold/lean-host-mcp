@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Updated compatible dependencies, including rmcp 3.9 and Tokio 1.54.1, while preserving the Lean/toolchain pairing
+  and vendored worker-parent cancellation fixes. These versions include the fixes for RUSTSEC-2026-0386 and
+  RUSTSEC-2026-0461.
+- Native-only HTTP now rejects every browser `Origin` with HTTP 403 while retaining loopback and Host validation.
+  Added coverage for modern MCP 2026-07-28 stateless discovery, tools, and protocol guards alongside legacy sessions.
+- Invocation/runtime failures now set MCP `isError` without discarding their semantic envelope. Negative Lean proof
+  verdicts remain domain results. Malformed tool arguments have the same error shape with and without Tasks.
+- Replaced deprecated Rust lint names and SDK aliases, made lint-group priorities explicit, and clarified that Lean
+  execution has the server user's privileges rather than an OS sandbox.
+
 ## [0.14.2] - 2026-10-13
 
 ### Changed
@@ -322,7 +334,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `benches/import_switch.rs` prices an import-profile switch against one resident project: 4.9 ms steady versus 555 ms
   alternating.
 
-### Fixed
+### Additional fixes
 
 - The project-scope reference scan no longer blocks a tokio worker thread. It is file I/O and JSON parsing from first
   byte to last, called straight from an `async fn` with no `spawn_blocking`, so on a large project it stalled the

@@ -2,7 +2,7 @@
 
 `lean-host-mcp` exposes five semantic Lean tools. Four tools use a `kind` field to select a mode inside that job family:
 `lean_context`, `lean_trial`, `lean_lookup`, and `lean_status`. `lean_verify` takes target groups directly. The surface
-is intentionally small: it gives an agent proof context, safe experiments, verification, semantic lookup, and cheap
+is intentionally small: it gives an agent proof context, in-memory experiments, verification, semantic lookup, and cheap
 status without exposing raw Lean worker primitives.
 
 The separate operational tool `lean_runtime` observes worker activity and coordinates an idle worker pool. It does not
@@ -13,8 +13,12 @@ lean_context -> lean_lookup -> lean_trial -> lean_verify
                          \-> lean_status
 ```
 
-The semantic tools read files and elaborate in memory. No tool writes source. `lean_runtime` may pause admission or
-explicitly retire idle workers as described below.
+The semantic tools read files and elaborate in memory without applying source edits automatically. Lean commands,
+tactics, and import initializers can perform IO with the server user's privileges; the worker is not an OS sandbox.
+Only use trusted local clients and projects. `lean_runtime` may pause admission or explicitly retire idle workers.
+
+Invocation/runtime failures with no domain data set MCP `isError: true` and retain the semantic `errors` and `trust`
+envelope. Negative proof/check verdicts remain successful tool executions with domain data, not MCP errors.
 
 ## Tool Roles
 
@@ -22,7 +26,7 @@ explicitly retire idle workers as described below.
   permit or when you need file diagnostics.
 - `lean_context`: local proof state at a declaration position. Use it to see goals, locals, expected type, and
   diagnostics before choosing a tactic.
-- `lean_trial`: non-mutating probes. Use `proof_step` to try tactics and `command` for `#check`, `#eval`, or
+- `lean_trial`: in-memory probes. Use `proof_step` to try tactics and `command` for `#check`, `#eval`, or
   `#print axioms`.
 - `lean_lookup`: semantic discovery. Use it for declarations, declaration inventory, proof search, and reference search.
 - `lean_verify`: verification gates. Use it when a declaration, file, or module must be checked with `sorry` policy and
@@ -97,6 +101,8 @@ errors or a negative verification verdict. It does not itself establish successf
 
 Every response includes `build` with package `version`, full Git `revision`, and build-time `dirty` state. Missing Git
 metadata (for example, an exported source archive) is reported as null, never guessed from the runtime checkout.
+A Git revision identifies source, not the resolved dependency graph or binary hash. Build/install with `--locked` for
+reproducible dependency selection, and retain the executable hash when an exact runtime artifact must be pinned.
 `effective_settings` reports resolved broker/runtime values, including derived heap/residue limits, plus server
 presentation and output overrides. Null output overrides mean each tool keeps its own default budget. These are the
 values the running process actually uses, not the current contents of a configuration file. No raw environment or
@@ -599,7 +605,10 @@ from the JSON when empty and appears only on `closed` candidates.
 
 ### `kind: "command"`
 
-Runs bounded Lean command text as a non-mutating trial. Use it for import-context snippets such as `#check` and
+The trial does not apply source edits automatically. It is not an OS sandbox: commands, tactics, and import
+initializers can perform IO with the server user's privileges. Only run trusted Lean code.
+
+Runs bounded Lean command text as an in-memory trial. Use it for import-context snippets such as `#check` and
 `#print axioms`; it is not a replacement for project-wide shell workflows.
 
 Explicit imports:

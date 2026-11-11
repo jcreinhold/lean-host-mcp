@@ -22,7 +22,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock, CreateTaskResult,
     GetTaskParams, GetTaskResult, Implementation, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
-    ServerCapabilities, ServerInfo, Tool, UpdateTaskParams,
+    ServerCapabilities, ServerConfig, Tool, UpdateTaskParams,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_router};
@@ -236,7 +236,9 @@ impl LeanHostService {
         )
     }
 
-    #[tool(description = "Non-mutating Lean experiments. Kinds: proof_step, command.")]
+    #[tool(
+        description = "Lean experiments without automatic source edits. Kinds: proof_step, command. Runs trusted Lean code with server privileges, not in an OS sandbox."
+    )]
     async fn lean_trial(
         &self,
         Parameters(req): Parameters<tools::semantic::LeanTrialToolRequest>,
@@ -318,8 +320,11 @@ impl ServerHandler for LeanHostService {
         {
             // Parse before acceptance. Task calls use no request-scoped peer or
             // cancellation token, so disconnecting cannot abandon their result.
-            let call = TaskCall::parse(&request)?;
-            if !call.is_cheap_metadata() {
+            // Let the router handle parse failures so malformed arguments have
+            // the same tool-error shape with and without task negotiation.
+            if let Ok(call) = TaskCall::parse(&request)
+                && !call.is_cheap_metadata()
+            {
                 let service = self.clone();
                 if let Some(task) = self
                     .tasks
@@ -372,11 +377,11 @@ impl ServerHandler for LeanHostService {
         std::future::ready(self.tasks.cancel(&request.task_id))
     }
 
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]` from rmcp; struct literal
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` is `#[non_exhaustive]` from rmcp; struct literal
         // syntax (even with `..default`) is forbidden across crates. Build
         // via Default + field mutation.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().enable_tasks().build();
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
@@ -420,7 +425,7 @@ impl LeanHostService {
             }) => tools::semantic::from_incompatible_worker(&message, &recovery_command),
             Err(err) => return Err(McpError::from(err)),
         };
-        Ok(carry(&response, self.ctx.config.carrier))
+        Ok(carry_semantic(&response, self.ctx.config.carrier))
     }
 }
 
@@ -452,6 +457,25 @@ impl TaskCall {
         };
         result.map_err(|error| McpError::invalid_params(error.to_string(), None))
     }
+}
+
+/// Invocation/runtime failures remain structured tool results, with the MCP
+/// error flag set. Negative Lean proof/check verdicts still carry domain data
+/// and are successful tool executions, not protocol or invocation failures.
+fn carry_semantic(
+    response: &tools::semantic::SemanticResponse<serde_json::Value>,
+    carrier: ResponseCarrier,
+) -> CallToolResult {
+    let mut result = carry(response, carrier);
+    if response.data.is_none()
+        && response
+            .errors
+            .iter()
+            .any(|issue| issue.severity.as_deref() == Some("error"))
+    {
+        result.is_error = Some(true);
+    }
+    result
 }
 
 /// Serialize the response and place it in the tool result per the carrier:
@@ -519,6 +543,19 @@ mod tests {
         task_context
             .meta
             .set_client_capabilities(ClientCapabilities::builder().enable_tasks().build());
+        let malformed = CallToolRequestParams::new("lean_context")
+            .with_arguments(serde_json::from_value(serde_json::json!({"kind": 7})).unwrap());
+        let sync_error = service.call_tool(malformed.clone(), context.clone()).await.unwrap();
+        let task_error = service.call_tool(malformed, task_context.clone()).await.unwrap();
+        let (CallToolResponse::Complete(sync_error), CallToolResponse::Complete(task_error)) = (sync_error, task_error)
+        else {
+            unreachable!("invalid arguments must be rejected before task acceptance")
+        };
+        assert_eq!(sync_error.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(sync_error).unwrap(),
+            serde_json::to_value(task_error).unwrap()
+        );
         let accepted = service.call_tool(request, task_context).await.unwrap();
         let CallToolResponse::Task(accepted) = accepted else {
             unreachable!("negotiated client should receive a task handle")
@@ -646,6 +683,7 @@ mod tests {
             "worker protocol 1 is incompatible with host protocol 2",
             "lean-host-mcp install-worker --auto",
         );
+        assert_eq!(carry_semantic(&response, ResponseCarrier::Both).is_error, Some(true));
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(
             json.pointer("/errors/0/code").and_then(serde_json::Value::as_str),
@@ -665,6 +703,23 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("lean-host-mcp install-worker --auto")
         );
+    }
+
+    #[test]
+    fn semantic_error_flag_preserves_domain_data_and_all_carriers() {
+        for carrier in [
+            ResponseCarrier::Text,
+            ResponseCarrier::Both,
+            ResponseCarrier::Structured,
+        ] {
+            let mut response = tools::semantic::from_incompatible_worker("unavailable worker", "install worker");
+            assert_eq!(carry_semantic(&response, carrier).is_error, Some(true));
+            response.data = Some(serde_json::json!({"verdict": "rejected"}));
+            assert_ne!(carry_semantic(&response, carrier).is_error, Some(true));
+            response.data = None;
+            response.errors.first_mut().unwrap().severity = Some("warning".to_owned());
+            assert_ne!(carry_semantic(&response, carrier).is_error, Some(true));
+        }
     }
 
     #[test]

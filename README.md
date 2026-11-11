@@ -1,8 +1,12 @@
 # lean-host-mcp
 
-A Model Context Protocol server that gives an AI agent direct, read-only access to a Lean 4 project's elaborator and
-kernel. The agent can read proof context, get ranked lemma suggestions, inspect declarations, test tactics, verify
-declarations, and find semantic references — all without editing a single file.
+A Model Context Protocol server that gives an AI agent direct access to a Lean 4 project's elaborator and kernel.
+The agent can read proof context, get ranked lemma suggestions, inspect declarations, test tactics, verify declarations,
+and find semantic references without applying source edits automatically.
+
+Use only with trusted local clients and projects. Lean commands, tactics, and import initializers can perform IO with
+the server user's privileges. The supervised worker provides crash isolation, not an OS sandbox; a command such as
+`#eval IO.FS.writeFile ...` can write files.
 
 It hosts Lean **in-process**: the elaborator and kernel run inside a supervised worker child and are reached as
 in-process calls, not as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child, and the
@@ -15,7 +19,7 @@ and launches the matching pre-built worker.
 Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups directly:
 
 - **`lean_context`** — proof context. Initial mode: `proof_position`.
-- **`lean_trial`** — non-mutating experiments. Modes: `proof_step` and `command`.
+- **`lean_trial`** — in-memory experiments. Modes: `proof_step` and `command`.
 - **`lean_verify`** — declaration verification for explicit, file-wide, or module-wide target groups.
 - **`lean_lookup`** — declaration inspection, declaration inventory, proof search, and references. Modes:
   `declaration`, `declarations`, `proof_search`, and `references`.
@@ -24,14 +28,15 @@ Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups d
 
 The semantic calls read source and elaborate in memory. The separate `lean_runtime` tool observes worker activity or
 obtains an expiring lease on an idle worker pool, keeping warm caches unless retirement is explicitly requested. No
-tool writes source. `lean_request` offers retrievable request IDs, retained final results and cancellation to clients
-without MCP Tasks negotiation. Busy projects wait for admission in FIFO order. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
+tool applies source edits automatically; executed Lean code can still perform IO. `lean_request` offers retrievable
+request IDs, retained final results and cancellation to clients without MCP Tasks negotiation. Busy projects wait for
+admission in FIFO order. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
 
 ## Quick start
 
 ```sh
 # 1. Install the server.
-cargo install lean-host-mcp
+cargo install lean-host-mcp --locked
 
 # 2. Install a worker binary for each Lean toolchain you use. With no flag,
 #    install-worker scans ~/.elan/toolchains and builds any that are missing or
@@ -103,6 +108,10 @@ by `--bind` or `LEAN_HOST_MCP_BIND`:
 ```sh
 lean-host-mcp serve --lake-root /path/to/your/lake/project --bind 127.0.0.1:8765
 ```
+
+HTTP is for native local clients. Every request carrying an `Origin` header is rejected with HTTP 403; browser access
+is not supported. Host validation remains enabled, and binding is restricted to loopback because the server has no
+built-in authentication or TLS.
 
 The default HTTP route is `/mcp`; override it with `--http-path /some-path` or `LEAN_HOST_MCP_HTTP_PATH`. `--http-path`
 requires `--bind`; it never switches transports by itself. HTTP binds are loopback-only (`127.0.0.1` or `::1`): the

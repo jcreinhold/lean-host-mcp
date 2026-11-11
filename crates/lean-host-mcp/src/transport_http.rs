@@ -40,7 +40,12 @@ pub(crate) async fn serve(
     let local_addr = listener.local_addr().context("read Streamable HTTP listener address")?;
 
     let cancellation = CancellationToken::new();
-    let http_config = StreamableHttpServerConfig::default().with_cancellation_token(cancellation.child_token());
+    // Native clients do not send Origin. No browser origins are trusted: reject
+    // every present Origin, including null, malformed and duplicate values.
+    // Host validation remains enabled independently to block DNS rebinding.
+    let http_config = StreamableHttpServerConfig::default()
+        .enforce_origin_validation()
+        .with_cancellation_token(cancellation.child_token());
     let handler = LeanHostService::new(broker, tool_config);
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
