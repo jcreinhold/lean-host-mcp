@@ -41,6 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Linux process diagnostics tolerate zero or unavailable process-group IDs without panicking. Restricted observers
+  use procfs only as positive presence evidence; a failed observation still never authorizes stale-record cleanup.
 - Worker startup failures and uncertain replacement shutdowns no longer release capacity before child exit is
   confirmed. Cancellation preserves the original request deadline and observes a worker that emits no progress.
 - Unavailable process observations and relative executable labels remain inconclusive rather than being treated as

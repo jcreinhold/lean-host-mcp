@@ -259,10 +259,23 @@ pub fn process_liveness(pid: u32) -> ProcessLiveness {
     // Signal zero is a kernel existence probe, not a signal. Unlike a shell's
     // exit status, errno distinguishes ESRCH from permissions/observer failure.
     let observed = classify_liveness(rustix::process::test_kill_process(pid));
-    // A sandbox may deny signal permission while still allowing a process-group
-    // lookup. A successful kernel query proves presence without needing ps or
-    // network access to the recorded endpoint. A second failure proves nothing.
-    corroborate_liveness(observed, || rustix::process::getpgid(Some(pid)).is_ok())
+    // A sandbox may deny signal permission while still allowing another kernel
+    // observation. Presence corroborates liveness; a failed fallback never
+    // proves absence and does not contact the recorded server endpoint.
+    corroborate_liveness(observed, || kernel_presence(pid))
+}
+
+#[cfg(target_os = "linux")]
+fn kernel_presence(pid: rustix::process::Pid) -> bool {
+    // Linux tasks can have process-group ID zero (e.g. kernel tasks or an
+    // ancestor group outside a PID namespace). rustix's getpgid returns a
+    // nonzero Pid and asserts on zero, so use procfs only as positive evidence.
+    fs::metadata(format!("/proc/{}", pid.as_raw_pid())).is_ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn kernel_presence(pid: rustix::process::Pid) -> bool {
+    rustix::process::getpgid(Some(pid)).is_ok()
 }
 
 #[cfg(unix)]
@@ -320,7 +333,12 @@ pub fn current_parent_pid() -> Option<u32> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn current_process_group_id() -> Option<u32> {
+    process_group_id(std::process::id())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn current_process_group_id() -> Option<u32> {
     Some(rustix::process::getpgrp().as_raw_pid() as u32)
 }
@@ -373,7 +391,22 @@ fn parent_pid(_pid: u32) -> Option<u32> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn process_group_id(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_group_from_stat(&stat)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn process_group_from_stat(stat: &str) -> Option<u32> {
+    // comm (field 2) can itself contain spaces and closing parentheses. The
+    // remaining fields are scalar values, so split after the final close.
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let group = fields.split_whitespace().nth(2)?.parse::<u32>().ok()?;
+    (group > 0).then_some(group)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn process_group_id(pid: u32) -> Option<u32> {
     let pid = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw)?;
     rustix::process::getpgid(Some(pid))
@@ -549,7 +582,25 @@ mod tests {
             );
         }
         assert!(current_parent_pid().is_some());
+        #[cfg(not(target_os = "linux"))]
         assert!(current_process_group_id().is_some());
+        // Linux may expose no visible process group; zero is not a usable ID.
+        #[cfg(target_os = "linux")]
+        assert_ne!(current_process_group_id(), Some(0));
+    }
+
+    #[test]
+    fn linux_process_group_parser_handles_zero_and_parentheses_without_panicking() {
+        assert_eq!(process_group_from_stat("42 (worker) S 7 42 42 0 0"), Some(42));
+        assert_eq!(process_group_from_stat("42 (worker ) name) S 7 23 23 0 0"), Some(23));
+        for stat in [
+            "42 (kernel) S 7 0 0 0 0",
+            "42 (worker) S 7 -1",
+            "missing",
+            "42 (worker) S",
+        ] {
+            assert_eq!(process_group_from_stat(stat), None);
+        }
     }
 
     #[test]

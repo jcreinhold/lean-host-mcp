@@ -44,6 +44,14 @@ fn doctor_keeps_live_record_when_external_process_tools_are_unavailable() {
     let stdout = String::from_utf8(output.stdout).expect("doctor stdout");
     assert!(stdout.contains(&format!("pid={pid} alive=true")), "{stdout}");
     assert!(stdout.contains("current_parent_pid=-"), "{stdout}");
+    // Linux can still identify the executable through procfs without ps.
+    // Either exact confirmation or uncertainty is safe; a mismatch is not.
+    #[cfg(target_os = "linux")]
+    assert!(
+        stdout.contains("executable_match=yes") || stdout.contains("executable_match=unknown"),
+        "{stdout}"
+    );
+    #[cfg(not(target_os = "linux"))]
     assert!(stdout.contains("executable_match=unknown"), "{stdout}");
     assert!(stdout.contains("child_pids=unknown"), "{stdout}");
     assert!(stdout.contains("stale_client=false"), "{stdout}");
