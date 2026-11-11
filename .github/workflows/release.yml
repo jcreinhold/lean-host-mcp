@@ -56,6 +56,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Development may patch an unpublished worker fix, but a release must
+      # resolve the same published sources that downstream users receive.
+      - name: Reject unpublished dependency patches
+        run: |
+          python3 - <<'PYTHON'
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          if manifest.get("patch"):
+              raise SystemExit("Release blocked: publish upstream fixes and remove Cargo.toml patches first")
+          PYTHON
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

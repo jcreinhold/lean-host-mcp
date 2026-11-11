@@ -9,17 +9,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-11
+
+### Added
+
+- Human-readable INFO request/response summaries with generated correlation numbers, tool/kind, bounded project
+  labels, elapsed time, allowlisted outcomes and result counts. Proof content, diagnostics and caller-supplied IDs
+  are excluded; retained polling stays quiet. Default logging suppresses routine SDK session churn but preserves
+  warnings, errors and explicit verbose overrides. Configuration advisories are emitted once per broker startup.
+- Retained `lean_request` submission, retrieval and cancellation for clients without MCP Tasks negotiation.
+  Client-selected request IDs are registered before execution, deduplicated against exact inputs, and bound to the
+  server instance, tool, request digest and project. Terminal results remain available for ten minutes while the
+  server process lives; they are not durable across restarts.
+- MCP Tasks support for reconnectable work and cancellation that remains responsive during silent worker execution.
+  Existing token-gated progress reporting remains available across the semantic tool families.
+- `lean_runtime` status and expiring idle-pool leases for coordinating external work. Status reports the build
+  revision, effective settings, worker activity and retained-request counts. Idle retirement waits for confirmed
+  worker shutdown before capacity is reusable.
+
 ### Changed
 
-- Updated compatible dependencies, including rmcp 3.9 and Tokio 1.54.1, while preserving the Lean/toolchain pairing
-  and vendored worker-parent cancellation fixes. These versions include the fixes for RUSTSEC-2026-0386 and
-  RUSTSEC-2026-0461.
-- Native-only HTTP now rejects every browser `Origin` with HTTP 403 while retaining loopback and Host validation.
-  Added coverage for modern MCP 2026-07-28 stateless discovery, tools, and protocol guards alongside legacy sessions.
-- Invocation/runtime failures now set MCP `isError` without discarding their semantic envelope. Negative Lean proof
-  verdicts remain domain results. Malformed tool arguments have the same error shape with and without Tasks.
-- Replaced deprecated Rust lint names and SDK aliases, made lint-group priorities explicit, and clarified that Lean
-  execution has the server user's privileges rather than an OS sandbox.
+- Busy-project mailboxes and cold-project capacity admission wait in FIFO order within bounded deadlines instead of
+  making clients race for capacity. Same-project opening waits share the admission deadline.
+- Updated compatible dependencies to rmcp 3.9, Tokio 1.54.1 and published lean-rs 0.9.6, including the fixes for
+  RUSTSEC-2026-0386 and RUSTSEC-2026-0461. The Lean toolchain window remains 4.30.0 through 4.35.0.
+- Native-only HTTP rejects every present browser `Origin` with HTTP 403 while retaining loopback binding and Host
+  validation. Modern MCP 2026-07-28 stateless requests and legacy sessions are covered.
+- Invocation and runtime failures set MCP `isError` while preserving the semantic envelope. Negative Lean proof
+  verdicts remain domain results. Malformed tool arguments have the same error shape with and without Tasks
+  negotiation.
+
+### Fixed
+
+- Worker startup failures and uncertain replacement shutdowns no longer release capacity before child exit is
+  confirmed. Cancellation preserves the original request deadline and observes a worker that emits no progress.
+- Unavailable process observations and relative executable labels remain inconclusive rather than being treated as
+  evidence of process death.
+- Deprecated Rust lint names and SDK aliases, explicit lint-group priorities, and release installation guidance
+  using `--locked`.
+
+### Security
+
+- Clarified the trusted-local-client boundary: Lean commands, tactics and import initializers may perform IO with
+  server privileges. The worker is process isolation, not an OS sandbox.
 
 ## [0.14.2] - 2026-10-13
 
@@ -630,7 +662,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.2...v0.15.0
 [0.14.2]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.13.0...v0.14.0
