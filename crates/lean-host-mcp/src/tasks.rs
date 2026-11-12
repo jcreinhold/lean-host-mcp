@@ -224,8 +224,6 @@ impl RequestTasks {
         let task = {
             let mut registry = self.0.lock();
             registry.prune(Instant::now());
-            // Compact only on new admission, never while returning an ack.
-            registry.compact();
             if let Some((id, submission)) = &identity {
                 if let Some(entry) = registry.entries.get(id) {
                     // Origin instance is evidence, not part of retry equality:
@@ -250,6 +248,12 @@ impl RequestTasks {
                     return Err(unknown_request("request_epoch_closed"));
                 }
             }
+            // Qualify identity and epoch BEFORE compaction. Otherwise the new
+            // request that reclaims capacity would invalidate its own observed
+            // epoch. Existing identities return above without being forgotten;
+            // this absent ID was fresh in the still-open epoch under this lock.
+            // Rotation now fences forgotten keys without relaunching any of them.
+            registry.compact();
             if registry.journal_error {
                 return Err(no_start(
                     "request_journal_unavailable",
@@ -991,20 +995,46 @@ mod tests {
                 &binding.submission_sha256,
             )
             .unwrap();
+        // An exact retry of a still-retained acknowledged key is idempotent,
+        // even at capacity; it must not cause its own record to disappear.
+        tasks
+            .submit("test", "id-0".into(), binding.clone(), || async {
+                panic!("acknowledged ID must not replay")
+            })
+            .unwrap();
+        assert_eq!(tasks.status().request_epoch, binding.request_epoch.clone().unwrap());
+        // A fresh submission observed the current epoch before admission. The
+        // compaction it triggers must admit that same request, not return unknown.
+        tasks
+            .submit("test", "new".into(), binding.clone(), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "new").await;
+        assert_ne!(tasks.status().request_epoch, binding.request_epoch.clone().unwrap());
+        assert_eq!(
+            tasks.get_retained("new").unwrap().execution.disposition,
+            Disposition::Stopped
+        );
+        // It retains its original binding and remains retry-safe across rotation.
+        tasks
+            .submit("test", "new".into(), binding.clone(), || async {
+                panic!("accepted old-epoch request must not replay")
+            })
+            .unwrap();
         let error = tasks
             .submit("test", "id-0".into(), binding.clone(), || async {
                 panic!("forgotten ID must not replay")
             })
             .unwrap_err();
         assert_eq!(error.data.unwrap()["execution"]["disposition"], "unknown");
-        assert_ne!(tasks.status().request_epoch, binding.request_epoch.unwrap());
-        // Other original IDs survive the rotation.
+        // Other original IDs survive the rotation; a stale absent ID stays fenced.
         assert!(tasks.get_retained("id-1").is_ok());
-        tasks
-            .submit("test", "new".into(), v2_binding(&tasks), || async {
-                Ok(CallToolResult::success(vec![]))
-            })
-            .unwrap();
+        assert!(
+            tasks
+                .submit("test", "stale".into(), binding, || async { panic!("closed epoch") })
+                .is_err()
+        );
     }
 
     #[tokio::test]
