@@ -30,6 +30,10 @@ pub struct RequestRegistryStatus {
     pub retained_terminal: usize,
     pub capacity: usize,
     pub terminal_retention_millis: u64,
+    pub request_epoch: String,
+    pub durable: bool,
+    pub journal_healthy: bool,
+    pub max_record_bytes: usize,
 }
 
 /// Resolved execution controls, not raw environment or configuration files.

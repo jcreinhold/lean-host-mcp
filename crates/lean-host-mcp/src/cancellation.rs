@@ -1,6 +1,10 @@
 //! Request cancellation shared by async callers and the synchronous worker owner.
 
 use std::future::Future;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use lean_rs_worker_parent::LeanWorkerCancellationToken;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +17,7 @@ tokio::task_local! {
 pub(crate) struct CallCancellation {
     worker: LeanWorkerCancellationToken,
     signal: CancellationToken,
+    uncertain: Arc<AtomicBool>,
 }
 
 impl CallCancellation {
@@ -35,6 +40,12 @@ impl CallCancellation {
 
     pub(crate) async fn cancelled(&self) {
         self.signal.cancelled().await;
+    }
+
+    /// Retain uncertainty even when a tool degrades a failed worker call into
+    /// another successful semantic result. The outer lifecycle must not lose it.
+    pub(crate) fn mark_uncertain(&self) {
+        self.uncertain.store(true, Ordering::Release);
     }
 
     pub(crate) fn cancel_on_drop(&self) -> CancelOnDrop {
@@ -61,12 +72,19 @@ impl Drop for CancelOnDrop {
 
 /// Signal cancellation without dropping the operation that owns terminal cleanup.
 pub(crate) async fn with_cancellation<T>(request: &CancellationToken, operation: impl Future<Output = T>) -> T {
+    with_cancellation_evidence(request, operation).await.0
+}
+
+pub(crate) async fn with_cancellation_evidence<T>(
+    request: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> (T, bool) {
     let cancellation = CallCancellation::default();
     let _on_drop = cancellation.cancel_on_drop();
     if request.is_cancelled() {
         cancellation.cancel();
     }
-    CURRENT
+    let result = CURRENT
         .scope(cancellation.clone(), async {
             tokio::pin!(operation);
             tokio::select! {
@@ -77,7 +95,8 @@ pub(crate) async fn with_cancellation<T>(request: &CancellationToken, operation:
                 }
             }
         })
-        .await
+        .await;
+    (result, cancellation.uncertain.load(Ordering::Acquire))
 }
 
 #[cfg(test)]

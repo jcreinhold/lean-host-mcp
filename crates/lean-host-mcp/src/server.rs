@@ -125,6 +125,17 @@ impl LeanHostService {
             tasks: RequestTasks::default(),
         }
     }
+
+    /// Enable bounded durable evidence for epoch-bound retained requests.
+    /// This never restarts or replays old work. Unfinished dispatched requests
+    /// recovered from a previous broker remain explicitly unknown.
+    ///
+    /// # Errors
+    /// Returns an error if the journal is locked, malformed or inaccessible.
+    pub fn with_request_journal(mut self, path: &std::path::Path) -> std::io::Result<Self> {
+        self.tasks = RequestTasks::open(path)?;
+        Ok(self)
+    }
 }
 
 /// A plain-tool bridge for clients without the negotiated MCP Tasks extension.
@@ -132,6 +143,10 @@ impl LeanHostService {
 #[serde(deny_unknown_fields)]
 struct RetainedRequest {
     action: RetainedAction,
+    /// Admission epoch from `lean_runtime.request_registry`; opt in to v2 replay safety.
+    request_epoch: Option<String>,
+    /// Required with `request_epoch` when acknowledging a consumed result.
+    submission_sha256: Option<String>,
     /// Existing ID for get/cancel; optional client-chosen ID for retry-safe submit.
     request_id: Option<String>,
     /// One of `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup` or `lean_status`.
@@ -146,22 +161,30 @@ enum RetainedAction {
     Submit,
     Get,
     Cancel,
+    Acknowledge,
 }
 
 #[tool_router]
 impl LeanHostService {
     #[tool(
-        description = "Submit, retrieve or cancel a retained Lean request without MCP Tasks negotiation. action=submit takes tool and arguments and returns a taskId immediately. Use that ID as request_id for get/cancel. Supply a unique request_id on submit to retry a lost receipt without duplicate work. Records last ten minutes after completion, only in this server process."
+        description = "Submit, retrieve or cancel a retained Lean request without MCP Tasks negotiation. action=submit takes tool and arguments and returns a taskId immediately. Use that ID as request_id for get/cancel. Supply a unique request_id on submit to retry a lost receipt without duplicate work. Legacy records expire after ten minutes. For v2 use request_epoch from lean_runtime; v2 results remain until acknowledge with request_epoch and submission_sha256. Execution disposition is separate from the proof verdict. Journal durability is reported by lean_runtime; old work is never replayed after restart."
     )]
     async fn lean_request(&self, Parameters(request): Parameters<RetainedRequest>) -> Result<CallToolResult, McpError> {
         let task = match request.action {
             RetainedAction::Submit => {
+                if request.submission_sha256.is_some() {
+                    return Err(McpError::invalid_params(
+                        "submit does not accept submission_sha256",
+                        None,
+                    ));
+                }
                 let tool = request
                     .tool
                     .ok_or_else(|| McpError::invalid_params("submit requires tool", None))?;
                 let call =
                     CallToolRequestParams::new(tool.clone()).with_arguments(request.arguments.unwrap_or_default());
-                let parsed = TaskCall::parse(&call)?;
+                let parsed = TaskCall::parse(&call)
+                    .map_err(|error| crate::tasks::no_start("invalid_submission", &error.message))?;
                 let digest = Sha256::digest(
                     serde_json::to_vec(&(&tool, &call.arguments))
                         .map_err(|error| McpError::internal_error(error.to_string(), None))?,
@@ -172,6 +195,7 @@ impl LeanHostService {
                 }
                 let submission = RequestBinding {
                     server_instance_id: self.ctx.broker.instance_id(),
+                    request_epoch: request.request_epoch,
                     tool: tool.clone(),
                     submission_sha256,
                     project: call
@@ -188,17 +212,39 @@ impl LeanHostService {
                 })?;
                 self.tasks.get_retained(&accepted.task_id)?
             }
-            RetainedAction::Get | RetainedAction::Cancel => {
+            RetainedAction::Get | RetainedAction::Cancel | RetainedAction::Acknowledge => {
                 if request.tool.is_some() || request.arguments.is_some() {
                     return Err(McpError::invalid_params("get/cancel accepts only request_id", None));
                 }
                 let request_id = request
                     .request_id
                     .ok_or_else(|| McpError::invalid_params("get/cancel requires request_id", None))?;
-                if matches!(request.action, RetainedAction::Cancel) {
-                    self.tasks.cancel(&request_id)?;
+                if matches!(request.action, RetainedAction::Acknowledge) {
+                    self.tasks.acknowledge(
+                        &request_id,
+                        request
+                            .request_epoch
+                            .as_deref()
+                            .ok_or_else(|| McpError::invalid_params("acknowledge requires request_epoch", None))?,
+                        request
+                            .submission_sha256
+                            .as_deref()
+                            .ok_or_else(|| McpError::invalid_params("acknowledge requires submission_sha256", None))?,
+                    )?
+                } else {
+                    if request.submission_sha256.is_some() {
+                        return Err(McpError::invalid_params(
+                            "get/cancel does not accept submission_sha256",
+                            None,
+                        ));
+                    }
+                    if matches!(request.action, RetainedAction::Cancel) {
+                        self.tasks
+                            .cancel_scoped(&request_id, request.request_epoch.as_deref())?;
+                    }
+                    self.tasks
+                        .get_retained_scoped(&request_id, request.request_epoch.as_deref())?
                 }
-                self.tasks.get_retained(&request_id)?
             }
         };
         let value = serde_json::to_value(task).map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -215,6 +261,7 @@ impl LeanHostService {
         let mut result = self.ctx.broker.runtime_control(&request);
         result.effective_settings.server = Some(self.ctx.config.into());
         result.request_registry = Some(self.tasks.status());
+        result.capabilities.push("retained_request_lifecycle_v2".to_owned());
         Ok(carry(&result, self.ctx.config.carrier))
     }
 
@@ -539,6 +586,8 @@ mod tests {
         );
         let submit = || RetainedRequest {
             action: RetainedAction::Submit,
+            request_epoch: None,
+            submission_sha256: None,
             request_id: Some("SECRET_CLIENT_ID".to_owned()),
             tool: Some("lean_trial".to_owned()),
             arguments: Some(
@@ -558,6 +607,8 @@ mod tests {
             service
                 .lean_request(Parameters(RetainedRequest {
                     action: RetainedAction::Get,
+                    request_epoch: None,
+                    submission_sha256: None,
                     request_id: Some("SECRET_CLIENT_ID".to_owned()),
                     tool: None,
                     arguments: None,

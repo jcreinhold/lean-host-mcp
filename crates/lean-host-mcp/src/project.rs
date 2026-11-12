@@ -1397,6 +1397,9 @@ impl LeanProject {
                 Err(self.unavailable("mailbox_closed_before_reply", true, false))
             }
         };
+        if result.is_err() {
+            cancellation.mark_uncertain();
+        }
         on_drop.disarm();
         result
     }

@@ -61,8 +61,9 @@ An optional client-chosen `request_id` makes a lost submission receipt retryable
 argument object returns the original record without running again. Changed inputs under that ID are rejected. IDs
 allow 1–128 ASCII letters, digits, underscores, hyphens, dots or colons. Prefer a fresh UUID per logical request and save
 it before submission. Omit the ID to generate one, but a lost generated receipt cannot be recovered by resubmission.
-This deduplication lasts only while the record exists, not after its ten-minute terminal retention or a server restart.
-After an unknown/expired response, reconcile the outcome before deciding whether to submit again.
+Without `request_epoch`, this legacy deduplication lasts only while the record exists, not after its ten-minute
+terminal retention or a server restart. After an unknown/expired response, reconcile the outcome before deciding
+whether to submit again. New clients should use the epoch-bound lifecycle below.
 
 Servers advertising `retained_request_binding_v1` in `lean_runtime` status include an immutable `request` alongside
 each plain bridge record: `server_instance_id`, `tool`, `submission_sha256`, and `project`. The instance matches
@@ -82,10 +83,11 @@ Closing an HTTP connection alone does not request cancellation. A synchronous re
 its worker deadline, even when its response stream is lost. Synchronous clients should send MCP
 `notifications/cancelled` with the original request ID when they intend to stop work.
 
-The server retains at most 128 active or completed task records, with completed results available for ten minutes.
+The server retains at most 128 active, terminal or acknowledged records. Legacy completed results remain available
+for ten minutes; epoch-bound results remain until acknowledged.
 When that registry is full, negotiated task calls use the ordinary synchronous path; explicit `lean_request` submits
 are rejected without running, so they never silently lose retention. Follow the suggested polling interval; task push
-notifications and in-task input are not used. Retention survives client disconnects, not a server restart. An automatically generated task ID
+notifications and in-task input are not used. Legacy retention survives client disconnects, not a server restart. An automatically generated task ID
 identifies one request, not a deduplication key: resubmitting a semantic `tools/call` creates another request. The explicit
 `lean_request` client-chosen ID exception is described above. Callers remain
 responsible for binding requests to the source revision they require.
@@ -94,6 +96,64 @@ A cancellation acknowledgement records intent. A queued operation is skipped, wh
 finish its cleanup before normal cancellation becomes terminal. Supervisor observation and deadlines bound worker
 cancellation; it is not instantaneous. Completed task status means the tool returned a result, which may contain Lean
 errors or a negative verification verdict. It does not itself establish successful verification.
+
+### Epoch-bound retained lifecycle (v2)
+
+Servers advertising `retained_request_lifecycle_v2` report `request_registry.request_epoch` in `lean_runtime`. Save that
+epoch and a fresh client-chosen ID before submitting. Supply `request_epoch` on submit, get and cancel. The immutable
+`request` binding includes the original epoch and original broker instance, even after recovery. A duplicate retained ID
+with exactly the same epoch and input returns its original record, never another execution. A forgotten ID under a
+closed epoch is rejected as `unknown`, never relaunched. This is not a claim that the original operation never ran. An
+epoch may rotate to compact acknowledged records without restarting any warm worker.
+
+Every bridge response adds:
+
+- `execution.disposition`: `pending`, `not_started`, `stopped`, or `unknown`.
+- `execution.reason`: a stable diagnostic code, separate from the Lean verdict.
+- `cancellation_requested`: intent, not evidence of exit.
+- `result_available` and `acknowledged`: whether the original terminal result is still available and consumed.
+
+`not_started` means the whole retained tool invocation could not dispatch and cannot later dispatch. Registry-full,
+invalid-submit and acceptance-journal failures use the same typed no-start data in their JSON-RPC error. A cancellation
+before dispatch is terminal `not_started`. Once invoked, a returned semantic result normally means `stopped`, but
+runtime errors, uncertain actor cleanup and task panic remain conservatively `unknown`. A multi-operation tool can have
+performed earlier steps even when a later step failed. Uncertainty is retained even if the tool degrades a worker
+failure into a fallback result. A negative Lean verdict can be a perfectly valid result of a stopped execution.
+
+Cancellation never overwrites a returned result. If completion races cancellation, clients receive the original result
+and a separate intent flag. Only the execution disposition, not failed/cancelled task status or the presence of a proof
+verdict, can release a caller's execution lifetime.
+
+After validating and durably saving the complete response and atomically updating its own source/build association, the
+client may send:
+
+```json
+{"name":"lean_request","arguments":{"action":"acknowledge","request_id":"saved-id","request_epoch":"saved-epoch","submission_sha256":"digest-from-request-binding"}}
+```
+
+Acknowledgment requires the exact immutable identity and a terminal request. It releases the large payload, not the
+compact deduplication evidence. A terminal `unknown` may be acknowledged only after the client preserves that unresolved
+lifetime in its own durable association; acknowledgment does not change `unknown` to `stopped`, release a source/build
+reader, or authorize replay. This keeps consumed errors from permanently filling the registry. Subsequent gets return
+`acknowledged: true`, `result_available: false` and no `result`/`error`. Repeated acknowledgments are idempotent while
+the record exists. At capacity, the next admission may rotate the epoch and compact acknowledged records; fetch the new
+epoch for genuinely new work, never blindly replay an unresolved old request with a new identity. Active and
+unacknowledged records are not evicted. The record bound is 4 MiB, so a too-large result explicitly loses its verdict
+(`result_available: false`) but retains execution evidence.
+
+Durability is explicit: `request_registry.durable` is true only when a healthy `--request-journal DIR` (or
+`LEAN_HOST_MCP_REQUEST_JOURNAL`) is configured. `journal_healthy: false` disables new retained admission and ack. With
+no journal the v2 lifetime and epoch rules still apply, but evidence is process-local. The directory has one broker
+owner, enforced by an OS file lock, and bounded per-request atomic, synced snapshots. It is not a worker queue.
+Snapshots contain response data and should be treated as private local application data. Only epoch-bound bridge
+requests are journalled, not negotiated MCP Tasks or legacy requests.
+
+On restart the admission epoch is fresh. Completed results are recovered. Accepted records durably known never to have
+reached dispatch intent become `not_started`; dispatch-intent records without a durable terminal outcome become
+`unknown`. Neither is replayed. The current worker supervisor cannot prove the old worker lifetime after arbitrary
+broker death, so a new healthy broker is not an exit witness. Journal recovery deliberately does not kill, adopt or
+relaunch workers, or claim that all old work stopped. Existing uncertain-outcome recovery remains necessary for those
+cases. Disk failure blocks further retained admission rather than silently degrading to non-durable execution.
 
 ## Worker Activity And Admission Leases
 

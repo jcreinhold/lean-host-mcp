@@ -74,6 +74,11 @@ struct ServeArgs {
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
 
+    /// Directory for durable epoch-bound request results. One broker per directory;
+    /// old requests are recovered as evidence, never replayed.
+    #[arg(long, env = "LEAN_HOST_MCP_REQUEST_JOURNAL")]
+    request_journal: Option<PathBuf>,
+
     /// Loopback address for Streamable HTTP, e.g. 127.0.0.1:8765.
     /// If omitted, the server uses stdio.
     #[arg(long, env = "LEAN_HOST_MCP_BIND")]
@@ -211,10 +216,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         runtime_config,
     );
     let _process_record = processes::ServerProcessRecord::register(transport, bind_display.clone(), http_path_log)?;
+    let mut service = LeanHostService::new(Arc::clone(&broker), tool_config);
+    if let Some(path) = args.request_journal {
+        service = service.with_request_journal(&path)?;
+    }
     let result = if let Some(config) = http {
-        transport_http::serve(Arc::clone(&broker), config, tool_config).await
+        transport_http::serve(service, config).await
     } else {
-        serve_stdio(Arc::clone(&broker), tool_config).await
+        serve_stdio(service).await
     };
     broker.shutdown_all();
     result
@@ -238,9 +247,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     clippy::significant_drop_tightening,
     reason = "the rmcp server handle must stay alive across the selected transport-wait and parent-loss futures"
 )]
-async fn serve_stdio(broker: Arc<ProjectBroker>, tool_config: ToolConfig) -> anyhow::Result<()> {
+async fn serve_stdio(service: LeanHostService) -> anyhow::Result<()> {
     let parent_pid = processes::current_parent_pid();
-    let service = LeanHostService::new(broker, tool_config);
     let server = match service.serve(stdio()).await {
         Ok(server) => server,
         Err(err) => {

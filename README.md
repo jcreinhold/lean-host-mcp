@@ -213,6 +213,15 @@ and the nearest supported version, and `install-worker` refuses to build for it.
 
 Widening the window is a `lean-rs` change first, then a version bump here.
 
+## Durable Retained Requests
+
+New clients can use `retained_request_lifecycle_v2`: epoch-bound request IDs, independent execution disposition,
+result-preserving cancellation, and explicit acknowledgment. Enable durable result evidence with
+`--request-journal /path/to/private/request-journal` (or `LEAN_HOST_MCP_REQUEST_JOURNAL`), using one directory per
+broker. Without this option, retention remains process-local. Restart never replays work; an interrupted dispatch
+remains explicitly unknown unless a terminal result was durably retained. See the
+[lifecycle contract](docs/tool-catalog.md#epoch-bound-retained-lifecycle-v2).
+
 ## License
 
 MIT OR Apache-2.0. See `LICENSE-MIT`, `LICENSE-APACHE`.

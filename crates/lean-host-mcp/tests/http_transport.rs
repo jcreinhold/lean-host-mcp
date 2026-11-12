@@ -730,7 +730,10 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
     let mut status_client = TaskHttpClient::new(&server.url);
     let status = status_client.control(json!({"action":"status"})).await;
     assert_eq!(binding["server_instance_id"], status["pool"]["instance_id"]);
-    assert_eq!(status["capabilities"], json!(["retained_request_binding_v1"]));
+    assert_eq!(
+        status["capabilities"],
+        json!(["retained_request_binding_v1", "retained_request_lifecycle_v2"])
+    );
     // No Tasks negotiation, and the caller may disappear while work continues.
     drop(original);
     let mut reconnected = server.new_session().await;
@@ -814,6 +817,92 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
 }
 
 #[tokio::test]
+async fn durable_v2_result_survives_binary_restart_and_exact_acknowledgment() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("lakefile.lean"), "package retained\n").unwrap();
+    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
+    let journal = tempfile::tempdir().unwrap();
+    let args = [
+        ("--lake-root", root.path().to_str().unwrap()),
+        ("--request-journal", journal.path().to_str().unwrap()),
+    ];
+    let server = HttpMcpServer::start(&args).await;
+    let mut control = TaskHttpClient::new(&server.url);
+    let status = control.control(json!({"action":"status"})).await;
+    assert_eq!(status["request_registry"]["durable"], true);
+    assert_eq!(status["pool"]["occupied_slots"], 0);
+    let epoch = status["request_registry"]["request_epoch"].clone();
+    let submission = json!({"name":"lean_request","arguments":{
+        "action":"submit","request_id":"durable-receipt","request_epoch":epoch,
+        "tool":"lean_status","arguments":{"kind":"project"}
+    }});
+    let mut client = server.new_session().await;
+    client.request("tools/call", submission.clone()).await.unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = client
+                .request(
+                    "tools/call",
+                    json!({"name":"lean_request","arguments":{
+                        "action":"get","request_id":"durable-receipt","request_epoch":epoch
+                    }}),
+                )
+                .await
+                .unwrap();
+            let record = response.json["result"]["structuredContent"].clone();
+            if record["status"] != "working" {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed["execution"]["disposition"], "stopped");
+    assert_eq!(completed["result_available"], true);
+    // Kill only this test-owned, worker-free broker. The terminal snapshot must
+    // already be durable before the reply can be observed.
+    server.shutdown().await;
+    let restarted = HttpMcpServer::start(&args).await;
+    let mut control = TaskHttpClient::new(&restarted.url);
+    let new_status = control.control(json!({"action":"status"})).await;
+    assert_ne!(new_status["request_registry"]["request_epoch"], epoch);
+    assert_ne!(
+        new_status["pool"]["instance_id"],
+        completed["request"]["server_instance_id"]
+    );
+    assert_eq!(new_status["pool"]["occupied_slots"], 0);
+    let mut client = restarted.new_session().await;
+    let retry = client.request("tools/call", submission).await.unwrap();
+    assert_eq!(retry.json["result"]["structuredContent"], completed);
+    let ack = json!({"name":"lean_request","arguments":{
+        "action":"acknowledge","request_id":"durable-receipt","request_epoch":epoch,
+        "submission_sha256":completed["request"]["submission_sha256"]
+    }});
+    for _ in 0..2 {
+        let response = client.request("tools/call", ack.clone()).await.unwrap();
+        let record = &response.json["result"]["structuredContent"];
+        assert_eq!(record["acknowledged"], true);
+        assert_eq!(record["result_available"], false);
+        assert_eq!(record["execution"]["disposition"], "stopped");
+        assert!(record.get("result").is_none());
+    }
+    let stale = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"submit","request_id":"forgotten-old-id","request_epoch":epoch,
+                "tool":"lean_status","arguments":{"kind":"project"}
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.json["error"]["data"]["execution"]["disposition"], "unknown");
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
 async fn streamable_http_status_reports_resolved_settings_without_opening_worker() {
     let root = tempfile::tempdir().unwrap();
     let server = HttpMcpServer::start_with_env(
@@ -859,7 +948,8 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     assert_eq!(status["effective_settings"]["server"]["response_carrier"], "both");
     assert_eq!(
         status["request_registry"],
-        json!({"active":0,"retained_terminal":0,"capacity":128,"terminal_retention_millis":600_000})
+        json!({"active":0,"retained_terminal":0,"capacity":128,"terminal_retention_millis":600_000,
+            "request_epoch":status["request_registry"]["request_epoch"],"durable":false,"journal_healthy":true,"max_record_bytes":4*1024*1024})
     );
     server.shutdown().await;
 }
@@ -894,7 +984,7 @@ async fn streamable_http_retained_requests_wait_past_full_mailbox_and_cancel() {
     assert!(!finished.exists());
     client.request("tasks/cancel", json!({"taskId": cancel_id})).await;
     let cancel_result = client.terminal(&cancel_id, Duration::from_secs(10)).await;
-    assert_eq!(cancel_result.pointer("/result/status"), Some(&json!("cancelled")));
+    assert_eq!(cancel_result.pointer("/result/status"), Some(&json!("completed")));
     drop(client);
     let mut reconnected = TaskHttpClient::new(&server.url);
     for id in [blocker, first_id, last_id] {
@@ -946,7 +1036,7 @@ async fn streamable_http_queued_task_cancellation_skips_lean() {
     let cancelled = client.terminal(&queued, Duration::from_secs(10)).await;
     assert_eq!(
         cancelled.pointer("/result/status").and_then(Value::as_str),
-        Some("cancelled")
+        Some("completed")
     );
     let blocker = client.terminal(&blocker, Duration::from_secs(10)).await;
     assert_eq!(
@@ -1000,7 +1090,7 @@ async fn streamable_http_running_task_cancellation_stops_worker_and_drains() {
     let cancelled = client.terminal(&task, Duration::from_secs(2)).await;
     assert_eq!(
         cancelled.pointer("/result/status").and_then(Value::as_str),
-        Some("cancelled")
+        Some("completed")
     );
     let healthy = scratch.path().join("healthy-follow-up");
     let follow_up = client.command(&sentinel_command(&healthy, None)).await;
@@ -1085,7 +1175,7 @@ async fn streamable_http_cancelled_startup_preserves_coalesced_worker_at_capacit
     let cancelled = opener.terminal(&opening, Duration::from_secs(30)).await;
     assert_eq!(
         cancelled.pointer("/result/status").and_then(Value::as_str),
-        Some("cancelled"),
+        Some("completed"),
         "opening caller must observe its own cancellation: {cancelled}"
     );
     let completed = waiter.terminal(&waiting, Duration::from_secs(30)).await;

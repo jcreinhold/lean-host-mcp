@@ -17,7 +17,7 @@ use rmcp::transport::streamable_http_server::{
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use lean_host_mcp::{LeanHostService, ProjectBroker, ToolConfig};
+use lean_host_mcp::LeanHostService;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct HttpServeConfig {
@@ -29,11 +29,7 @@ pub(crate) struct HttpServeConfig {
     clippy::significant_drop_tightening,
     reason = "the HTTP service and router intentionally live until axum::serve returns"
 )]
-pub(crate) async fn serve(
-    broker: Arc<ProjectBroker>,
-    config: HttpServeConfig,
-    tool_config: ToolConfig,
-) -> anyhow::Result<()> {
+pub(crate) async fn serve(handler: LeanHostService, config: HttpServeConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("bind Streamable HTTP listener at {}", config.bind))?;
@@ -46,7 +42,6 @@ pub(crate) async fn serve(
     let http_config = StreamableHttpServerConfig::default()
         .enforce_origin_validation()
         .with_cancellation_token(cancellation.child_token());
-    let handler = LeanHostService::new(broker, tool_config);
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
