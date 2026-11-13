@@ -958,6 +958,10 @@ surfaces Lean diagnostics and linter messages produced while elaborating the fil
 The result includes `diagnostics` and the header `imports` used for the worker session, with a source `edit_fresh` trust
 fact for the file snapshot.
 
+If the worker crashes or times out during this call, the response has `status: "runtime_unavailable"`
+and `result: null`, not an empty successful diagnostics list. Interrupted results are never cached; retrying
+runs the check again. Planned worker recycling before a successful check does not invalidate its result.
+
 ## Maintainer Migration Table
 
 The old public tools are no longer registered. Existing implementation code is still reused internally behind the

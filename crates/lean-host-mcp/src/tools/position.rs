@@ -801,7 +801,7 @@ pub async fn file_diagnostics(
     .with_runtime(call.runtime)
     .with_trust_artifact(source_fact);
     if let Some(event) = response.runtime().and_then(crate::diagnosis::execution_taint).cloned() {
-        response = crate::diagnosis::warn_execution_taint(response, &event);
+        response = crate::diagnosis::unavailable_execution_result(response, &event);
     }
     Ok(warn_file_diagnostics_missing_imports(response, missing_imports))
 }

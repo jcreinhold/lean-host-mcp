@@ -496,9 +496,9 @@ impl ProjectBroker {
             .process_module_query(session_imports, source, query, options)
             .await?;
         let (value, runtime) = call.into_parts();
-        if let Some((key, context)) = key.zip(
-            context.and_then(|context| context.after_processing(project.canonical_root(), runtime.worker_generation)),
-        ) {
+        if let Some((key, context)) =
+            key.zip(context.and_then(|context| context.after_call(project.canonical_root(), &runtime)))
+        {
             project
                 .module_query_cache()
                 .insert(path, content_hash, context, key, value.clone());
@@ -587,9 +587,9 @@ impl ProjectBroker {
             .process_module_query_batch(session_imports, source, selectors, budgets, options)
             .await?;
         let (value, runtime) = call.into_parts();
-        if let Some((key, context)) = key.zip(
-            context.and_then(|context| context.after_processing(project.canonical_root(), runtime.worker_generation)),
-        ) {
+        if let Some((key, context)) =
+            key.zip(context.and_then(|context| context.after_call(project.canonical_root(), &runtime)))
+        {
             project
                 .module_query_cache()
                 .insert_batch(path, content_hash, context, key, value.clone());

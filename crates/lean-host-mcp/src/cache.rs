@@ -119,6 +119,16 @@ impl ModuleQueryContext {
         })
     }
 
+    /// Admit a result only if the worker completed the call reliably. A crash
+    /// can return an empty outcome alongside restart facts; caching that value
+    /// would strip the failure on the next hit, which uses fresh runtime facts.
+    pub(crate) fn after_call(&self, root: &Path, runtime: &crate::envelope::RuntimeFacts) -> Option<Self> {
+        if crate::diagnosis::execution_taint(runtime).is_some() {
+            return None;
+        }
+        self.after_processing(root, runtime.worker_generation)
+    }
+
     /// Resample only mutable inputs after processing. A changed generation is
     /// safe to store under the resulting generation if artifacts stayed equal.
     pub(crate) fn after_processing(&self, root: &Path, worker_generation: u64) -> Option<Self> {
@@ -436,6 +446,73 @@ mod tests {
         );
         assert_eq!(before.after_processing(root, 1), Some(before.clone()));
         assert_eq!(before.after_processing(root, 2).unwrap().worker_generation, 2);
+    }
+
+    #[test]
+    fn interrupted_call_cannot_cache_empty_outcome_for_retry() {
+        use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
+        let temp = tempfile::tempdir().unwrap();
+        let before = context(temp.path());
+        let cache = super::ModuleQueryCache::with_capacity(std::num::NonZeroUsize::new(4).unwrap());
+        let path = temp.path().join("Query.lean");
+        let hash = super::hash_bytes(b"source containing an error");
+        let key = ModuleQueryBatchKey::from_batch(&[], &LeanWorkerOutputBudgets::default()).unwrap();
+        for cause in [
+            "child_abort",
+            "child_exit",
+            "timeout",
+            "cancelled",
+            "worker_internal",
+            "session_missing",
+        ] {
+            let runtime = RuntimeFacts {
+                worker_generation: 2,
+                call_restart: Some(RuntimeRestartEvent {
+                    cause: cause.into(),
+                    ..RuntimeRestartEvent::default()
+                }),
+                ..RuntimeFacts::default()
+            };
+            if let Some(context) = before.after_call(temp.path(), &runtime) {
+                cache.insert_batch(
+                    path.clone(),
+                    hash,
+                    context,
+                    key.clone(),
+                    lean_rs_worker_parent::LeanWorkerModuleQueryBatchOutcome::Unsupported,
+                );
+            }
+            let retry = before.after_processing(temp.path(), 2).unwrap();
+            assert!(cache.get_batch(&path, hash, &retry, &key).is_none(), "{cause}");
+        }
+    }
+
+    #[test]
+    fn completed_calls_cache_after_planned_recycle_or_historical_crash() {
+        use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
+        let temp = tempfile::tempdir().unwrap();
+        let before = context(temp.path());
+        for cause in ["import_residue", "import_residue_idle", "artifacts_rebuilt"] {
+            let runtime = RuntimeFacts {
+                worker_generation: 2,
+                call_restart: Some(RuntimeRestartEvent {
+                    cause: cause.into(),
+                    planned: true,
+                    ..RuntimeRestartEvent::default()
+                }),
+                ..RuntimeFacts::default()
+            };
+            assert!(before.after_call(temp.path(), &runtime).is_some(), "{cause}");
+        }
+        let runtime = RuntimeFacts {
+            worker_generation: 2,
+            last_restart: Some(RuntimeRestartEvent {
+                cause: "child_abort".into(),
+                ..RuntimeRestartEvent::default()
+            }),
+            ..RuntimeFacts::default()
+        };
+        assert!(before.after_call(temp.path(), &runtime).is_some());
     }
 
     #[test]
