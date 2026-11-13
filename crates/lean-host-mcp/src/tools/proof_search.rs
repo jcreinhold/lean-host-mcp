@@ -1148,15 +1148,11 @@ fn is_structural_noise_candidate(lower_name: &str, module: Option<&str>, profile
     }
 
     let mentions_order_morphism = profile_mentions_any(profile, &["antitone", "monotone", "strictmono", "strictanti"]);
-    if !mentions_order_morphism
+    !mentions_order_morphism
         && contains_any(
             lower_name,
             &["antitone.", "monotone.", "strictmono.", "strictanti.", "reflect_lt"],
         )
-    {
-        return true;
-    }
-    false
 }
 
 fn profile_mentions_any(profile: &TargetProfile, needles: &[&str]) -> bool {
