@@ -221,8 +221,8 @@ stream closure are hidden, but SDK WARN/ERROR remain visible. To investigate tra
 `RUST_LOG=info,rmcp=debug`. Other explicit `RUST_LOG` directives retain their usual meaning. Logs go to stderr, never the
 stdio protocol stream.
 
-The low import-residue-budget advisory is emitted once when the broker is constructed, not every time a project worker
-reopens. Its 9216 MiB comparison is a Mathlib-oriented sizing baseline for retaining two large imports, not a required
+The import-budget sizing estimate appears only at DEBUG, once when the broker starts, not on worker restarts. Its
+9216 MiB comparison is a Mathlib-oriented sizing baseline for retaining two large imports, not a required
 minimum for every import or evidence of a failure. An explicitly configured smaller budget can be intentional; evaluate
 actual recycle frequency before changing it. Lowering the project count does not change an explicitly fixed budget.
 The heap-ceiling warning and real runtime error/recycle logs remain intact; no memory policy changes with logging.

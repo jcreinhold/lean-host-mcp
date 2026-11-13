@@ -321,12 +321,11 @@ impl ProjectRuntimeConfig {
     /// Configuration advisories belong to broker startup, not every worker reopen.
     pub(crate) fn log_advisories(&self) {
         if self.import_residue_budget_bytes < WORKER_IMPORT_RESIDUE_FLOOR_BYTES {
-            tracing::warn!(
+            tracing::debug!(
                 budget_mib = self.import_residue_budget_bytes / (1024 * 1024),
                 sizing_baseline_mib = WORKER_IMPORT_RESIDUE_FLOOR_BYTES / (1024 * 1024),
-                "configured import residue budget is below the two-import Mathlib sizing baseline; \
-             this is not a per-import minimum or an observed failure. Smaller budgets may recycle more often; \
-             tune runtime.worker_import_residue_budget_mib only if measured recycle frequency warrants it"
+                "configured import residue budget is below the two-import Mathlib sizing estimate; \
+             this is supported, not a detected memory problem"
             );
         }
         // Only reachable when an operator sets `runtime.lean_max_memory_kib`
@@ -3055,8 +3054,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn budget_advisory_is_a_startup_configuration_fact_not_a_per_import_minimum() {
-        let (_guard, buffer) = crate::request_log::tests::capture_at("lean_host_mcp", tracing::Level::WARN);
+    fn budget_sizing_estimate_is_debug_only_and_logged_once_at_startup() {
+        let (_guard, buffer) = crate::request_log::tests::capture_at("lean_host_mcp", tracing::Level::DEBUG);
         let config = ProjectRuntimeConfig::default().with_import_residue_budget_bytes(4 * 1024 * 1024 * 1024);
         let broker = crate::broker::ProjectBroker::new_with_runtime_config(
             crate::broker::BrokerConfig {
@@ -3072,10 +3071,25 @@ mod tests {
             let _ = broker.runtime_control(&crate::broker::RuntimeControlRequest::default());
         }
         let output = buffer.text();
-        assert_eq!(output.matches("two-import Mathlib sizing baseline").count(), 1);
-        assert!(output.contains("not a per-import minimum or an observed failure"));
+        assert_eq!(output.matches("two-import Mathlib sizing estimate").count(), 1);
+        assert!(output.contains("this is supported, not a detected memory problem"));
         assert!(output.contains("budget_mib=4096 sizing_baseline_mib=9216"));
         assert!(!output.contains("lower broker.max_projects"));
+    }
+
+    #[test]
+    fn supported_small_budget_does_not_warn_but_invalid_heap_ceiling_does() {
+        let (_guard, buffer) = crate::request_log::tests::capture_at("lean_host_mcp", tracing::Level::INFO);
+        let mut config = ProjectRuntimeConfig::default().with_import_residue_budget_bytes(4 * 1024 * 1024 * 1024);
+        config.log_advisories();
+        assert!(buffer.text().is_empty());
+
+        config.lean_max_memory_kib = 4 * 1024 * 1024;
+        config.log_advisories();
+        let output = buffer.text();
+        assert!(output.contains("WARN"));
+        assert!(output.contains("Lean heap ceiling is at or below the import residue budget"));
+        assert!(!output.contains("two-import Mathlib"));
     }
 
     #[test]
