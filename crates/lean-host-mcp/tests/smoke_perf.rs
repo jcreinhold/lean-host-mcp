@@ -249,7 +249,7 @@ async fn replay_for_stability(label: &str, calls: &[ToolCall], target: usize) ->
             if let Some(rss) = record.runtime_rss_kib {
                 replay.peak_runtime_rss_kib = replay.peak_runtime_rss_kib.max(rss);
             }
-            let seen = replay.statuses.entry(record.status.clone()).or_default();
+            let seen = replay.statuses.entry(record.status).or_default();
             *seen = seen.saturating_add(1);
             replay.calls = replay.calls.saturating_add(1);
         }
