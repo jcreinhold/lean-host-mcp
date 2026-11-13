@@ -3056,7 +3056,7 @@ mod tests {
 
     #[test]
     fn budget_advisory_is_a_startup_configuration_fact_not_a_per_import_minimum() {
-        let (_guard, buffer) = crate::request_log::tests::capture_with_filter("lean_host_mcp=warn");
+        let (_guard, buffer) = crate::request_log::tests::capture_at("lean_host_mcp", tracing::Level::WARN);
         let config = ProjectRuntimeConfig::default().with_import_residue_budget_bytes(4 * 1024 * 1024 * 1024);
         let broker = crate::broker::ProjectBroker::new_with_runtime_config(
             crate::broker::BrokerConfig {

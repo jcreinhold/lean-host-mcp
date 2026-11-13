@@ -1,8 +1,8 @@
 # lean-host-mcp
 
-A Model Context Protocol server that gives an AI agent direct access to a Lean 4 project's elaborator and kernel.
-The agent can read proof context, get ranked lemma suggestions, inspect declarations, test tactics, verify declarations,
-and find semantic references without applying source edits automatically.
+A Model Context Protocol server that gives an AI agent direct access to a Lean 4 project's elaborator and kernel. The
+agent can read proof context, get ranked lemma suggestions, inspect declarations, test tactics, verify declarations, and
+find semantic references without applying source edits automatically.
 
 Use only with trusted local clients and projects. Lean commands, tactics, and import initializers can perform IO with
 the server user's privileges. The supervised worker provides crash isolation, not an OS sandbox; a command such as
@@ -21,16 +21,16 @@ Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups d
 - **`lean_context`** — proof context. Initial mode: `proof_position`.
 - **`lean_trial`** — in-memory experiments. Modes: `proof_step` and `command`.
 - **`lean_verify`** — declaration verification for explicit, file-wide, or module-wide target groups.
-- **`lean_lookup`** — declaration inspection, declaration inventory, proof search, and references. Modes:
-  `declaration`, `declarations`, `proof_search`, and `references`.
+- **`lean_lookup`** — declaration inspection, declaration inventory, proof search, and references. Modes: `declaration`,
+  `declarations`, `proof_search`, and `references`.
 - **`lean_status`** — project/toolchain/config status and current-source file diagnostics. Modes: `project` and
   `file_diagnostics`.
 
 The semantic calls read source and elaborate in memory. The separate `lean_runtime` tool observes worker activity or
-obtains an expiring lease on an idle worker pool, keeping warm caches unless retirement is explicitly requested. No
-tool applies source edits automatically; executed Lean code can still perform IO. `lean_request` offers retrievable
-request IDs, retained final results and cancellation to clients without MCP Tasks negotiation. Busy projects wait for
-admission in FIFO order. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
+obtains an expiring lease on an idle worker pool, keeping warm caches unless retirement is explicitly requested. No tool
+applies source edits automatically; executed Lean code can still perform IO. `lean_request` offers retrievable request
+IDs, retained final results and cancellation to clients without MCP Tasks negotiation. Busy projects wait for admission
+in FIFO order. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
 
 ## Quick start
 
@@ -109,9 +109,9 @@ by `--bind` or `LEAN_HOST_MCP_BIND`:
 lean-host-mcp serve --lake-root /path/to/your/lake/project --bind 127.0.0.1:8765
 ```
 
-HTTP is for native local clients. Every request carrying an `Origin` header is rejected with HTTP 403; browser access
-is not supported. Host validation remains enabled, and binding is restricted to loopback because the server has no
-built-in authentication or TLS.
+HTTP is for native local clients. Every request carrying an `Origin` header is rejected with HTTP 403; browser access is
+not supported. Host validation remains enabled, and binding is restricted to loopback because the server has no built-in
+authentication or TLS.
 
 The default HTTP route is `/mcp`; override it with `--http-path /some-path` or `LEAN_HOST_MCP_HTTP_PATH`. `--http-path`
 requires `--bind`; it never switches transports by itself. HTTP binds are loopback-only (`127.0.0.1` or `::1`): the
@@ -201,9 +201,9 @@ Two proof-agent details are worth calling out:
 
 ## Versions
 
-`lean-host-mcp` 0.15.0 builds on `lean-rs-worker-parent` / `-child` 0.9, which transitively pin `lean-rs` /
-`lean-rs-host` 0.9 (0.9.6). It supports the Lean window `4.30.0 ..= 4.35.0` and is built and tested against the head
-of that window, Lean **4.35.0**.
+`lean-host-mcp` 0.16.0 builds on `lean-rs-worker-parent` / `-child` 0.9, which transitively pin `lean-rs` /
+`lean-rs-host` 0.9 (0.9.6). It supports the Lean window `4.30.0 ..= 4.35.0` and is built and tested against the head of
+that window, Lean **4.35.0**.
 
 A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long
 as it falls inside the supported window. The window is read directly from `lean-toolchain::SUPPORTED_TOOLCHAINS` (itself

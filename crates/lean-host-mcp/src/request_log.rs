@@ -202,20 +202,99 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn capture() -> (tracing::subscriber::DefaultGuard, Buffer) {
-        capture_with_filter("lean_host_mcp::request_log=info")
+    #[derive(Clone)]
+    struct Capture {
+        target: &'static str,
+        level: tracing::Level,
+        buffer: Buffer,
     }
 
-    pub(crate) fn capture_with_filter(filter: &str) -> (tracing::subscriber::DefaultGuard, Buffer) {
+    thread_local! {
+        static CAPTURE: std::cell::RefCell<Option<Capture>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) struct CaptureGuard {
+        previous: Option<Capture>,
+        // A capture must end on the thread where it began.
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CAPTURE.with(|capture| capture.replace(self.previous.take()));
+        }
+    }
+
+    pub(crate) fn capture() -> (CaptureGuard, Buffer) {
+        capture_at("lean_host_mcp::request_log", tracing::Level::INFO)
+    }
+
+    pub(crate) fn capture_at(target: &'static str, level: tracing::Level) -> (CaptureGuard, Buffer) {
+        use tracing_subscriber::prelude::*;
+        static SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+        // Callsite interest is global, even with thread-local subscribers.
+        // Keep one subscriber and evaluate capture settings per event instead
+        // of rebuilding that shared cache as parallel tests enter and exit.
+        SUBSCRIBER.call_once(|| {
+            let filter = tracing_subscriber::filter::dynamic_filter_fn(|metadata, _| {
+                CAPTURE.with(|capture| {
+                    capture.borrow().as_ref().is_some_and(|capture| {
+                        metadata.target().starts_with(capture.target) && *metadata.level() <= capture.level
+                    })
+                })
+            });
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(|| {
+                        CAPTURE.with(|capture| {
+                            capture
+                                .borrow()
+                                .as_ref()
+                                .map(|capture| capture.buffer.clone())
+                                .unwrap_or_default()
+                        })
+                    })
+                    .with_filter(filter),
+            );
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
         let buffer = Buffer::default();
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_env_filter(filter)
-            .with_writer(move || writer.clone())
-            .finish();
-        (tracing::subscriber::set_default(subscriber), buffer)
+        let previous = CAPTURE.with(|capture| {
+            capture.replace(Some(Capture {
+                target,
+                level,
+                buffer: buffer.clone(),
+            }))
+        });
+        (
+            CaptureGuard {
+                previous,
+                _thread: std::marker::PhantomData,
+            },
+            buffer,
+        )
+    }
+
+    #[test]
+    fn parallel_captures_keep_filters_and_buffers_separate() {
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        let target = if worker % 2 == 0 { "capture_a" } else { "capture_b" };
+                        let (_guard, buffer) = capture_at(target, tracing::Level::WARN);
+                        tracing::warn!(target: "capture_a", worker, "event_a");
+                        tracing::warn!(target: "capture_b", worker, "event_b");
+                        let output = buffer.text();
+                        assert_eq!(output.lines().count(), 1, "{output}");
+                        assert!(output.contains(&format!("worker={worker}")), "{output}");
+                        assert!(output.contains(if worker % 2 == 0 { "event_a" } else { "event_b" }));
+                    }
+                });
+            }
+        });
     }
 
     #[test]

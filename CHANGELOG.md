@@ -9,23 +9,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-13
+
+### Added
+
+- Optional durable request journal with epoch-bound request IDs, explicit acknowledgment, and execution status separate
+  from proof results. Restarted servers retain saved results without replaying work; interrupted execution remains
+  explicitly unknown.
+
+### Fixed
+
+- Acknowledged-result compaction preserves the request that triggered it.
+- Journal ownership releases explicitly on drop, even while a spawned child briefly retains an inherited file
+  descriptor.
+- Parallel test log capture no longer depends on process-wide tracing callsite state.
+
 ## [0.15.0] - 2026-11-11
 
 ### Added
 
-- Human-readable INFO request/response summaries with generated correlation numbers, tool/kind, bounded project
-  labels, elapsed time, allowlisted outcomes and result counts. Proof content, diagnostics and caller-supplied IDs
-  are excluded; retained polling stays quiet. Default logging suppresses routine SDK session churn but preserves
-  warnings, errors and explicit verbose overrides. Configuration advisories are emitted once per broker startup.
+- Human-readable INFO request/response summaries with generated correlation numbers, tool/kind, bounded project labels,
+  elapsed time, allowlisted outcomes and result counts. Proof content, diagnostics and caller-supplied IDs are excluded;
+  retained polling stays quiet. Default logging suppresses routine SDK session churn but preserves warnings, errors and
+  explicit verbose overrides. Configuration advisories are emitted once per broker startup.
 - Retained `lean_request` submission, retrieval and cancellation for clients without MCP Tasks negotiation.
   Client-selected request IDs are registered before execution, deduplicated against exact inputs, and bound to the
-  server instance, tool, request digest and project. Terminal results remain available for ten minutes while the
-  server process lives; they are not durable across restarts.
+  server instance, tool, request digest and project. Terminal results remain available for ten minutes while the server
+  process lives; they are not durable across restarts.
 - MCP Tasks support for reconnectable work and cancellation that remains responsive during silent worker execution.
   Existing token-gated progress reporting remains available across the semantic tool families.
-- `lean_runtime` status and expiring idle-pool leases for coordinating external work. Status reports the build
-  revision, effective settings, worker activity and retained-request counts. Idle retirement waits for confirmed
-  worker shutdown before capacity is reusable.
+- `lean_runtime` status and expiring idle-pool leases for coordinating external work. Status reports the build revision,
+  effective settings, worker activity and retained-request counts. Idle retirement waits for confirmed worker shutdown
+  before capacity is reusable.
 
 ### Changed
 
@@ -35,25 +50,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   RUSTSEC-2026-0386 and RUSTSEC-2026-0461. The Lean toolchain window remains 4.30.0 through 4.35.0.
 - Native-only HTTP rejects every present browser `Origin` with HTTP 403 while retaining loopback binding and Host
   validation. Modern MCP 2026-07-28 stateless requests and legacy sessions are covered.
-- Invocation and runtime failures set MCP `isError` while preserving the semantic envelope. Negative Lean proof
-  verdicts remain domain results. Malformed tool arguments have the same error shape with and without Tasks
-  negotiation.
+- Invocation and runtime failures set MCP `isError` while preserving the semantic envelope. Negative Lean proof verdicts
+  remain domain results. Malformed tool arguments have the same error shape with and without Tasks negotiation.
 
 ### Fixed
 
-- Linux process diagnostics tolerate zero or unavailable process-group IDs without panicking. Restricted observers
-  use procfs only as positive presence evidence; a failed observation still never authorizes stale-record cleanup.
-- Worker startup failures and uncertain replacement shutdowns no longer release capacity before child exit is
-  confirmed. Cancellation preserves the original request deadline and observes a worker that emits no progress.
+- Linux process diagnostics tolerate zero or unavailable process-group IDs without panicking. Restricted observers use
+  procfs only as positive presence evidence; a failed observation still never authorizes stale-record cleanup.
+- Worker startup failures and uncertain replacement shutdowns no longer release capacity before child exit is confirmed.
+  Cancellation preserves the original request deadline and observes a worker that emits no progress.
 - Unavailable process observations and relative executable labels remain inconclusive rather than being treated as
   evidence of process death.
-- Deprecated Rust lint names and SDK aliases, explicit lint-group priorities, and release installation guidance
-  using `--locked`.
+- Deprecated Rust lint names and SDK aliases, explicit lint-group priorities, and release installation guidance using
+  `--locked`.
 
 ### Security
 
-- Clarified the trusted-local-client boundary: Lean commands, tactics and import initializers may perform IO with
-  server privileges. The worker is process isolation, not an OS sandbox.
+- Clarified the trusted-local-client boundary: Lean commands, tactics and import initializers may perform IO with server
+  privileges. The worker is process isolation, not an OS sandbox.
 
 ## [0.14.2] - 2026-10-13
 
@@ -70,17 +84,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - **Widened the toolchain window head to Lean 4.35.0-rc3 and added 4.34.1 to the window.** The requirements rise to
-  lean-rs 0.9.2 and lean-semantic-search 0.7.6 on the unchanged 0.9 / 0.7 lines, because `lean-toolchain` 0.9.1's
-  build script rejects the 4.34.1 and 4.35.0-rc3 `lean.h`. Both ship new digests carrying a refcount-helper patch with
-  no struct declaration changes. The supported window is now `4.30.0 ..= 4.35.0-rc3`. The fixture pin, the worker the
+  lean-rs 0.9.2 and lean-semantic-search 0.7.6 on the unchanged 0.9 / 0.7 lines, because `lean-toolchain` 0.9.1's build
+  script rejects the 4.34.1 and 4.35.0-rc3 `lean.h`. Both ship new digests carrying a refcount-helper patch with no
+  struct declaration changes. The supported window is now `4.30.0 ..= 4.35.0-rc3`. The fixture pin, the worker the
   server is built and tested against, and the head-toolchain literals in the test suite and docs all move to
   v4.35.0-rc3. The Rust floor is unchanged at 1.94.
 
 ### Fixed
 
-- **API docs no longer link to private items.** Thirteen rustdoc warnings (links to crate-private items and one link
-  to a method that does not exist) rendered as dead text on docs.rs. The public `ProjectRuntimeConfig` accessor docs now state
-  the memory and pool policy directly instead of pointing at private constants, and the envelope module doc now
+- **API docs no longer link to private items.** Thirteen rustdoc warnings (links to crate-private items and one link to
+  a method that does not exist) rendered as dead text on docs.rs. The public `ProjectRuntimeConfig` accessor docs now
+  state the memory and pool policy directly instead of pointing at private constants, and the envelope module doc now
   describes the `quiet` telemetry gate accurately. CI and `scripts/prerelease.sh` now build both crates' docs with
   `-D warnings`.
 
@@ -88,11 +102,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **Widened the toolchain window head to Lean 4.35.0-rc2 and added 4.34.0 and 4.35.0-rc1 to the window.** The
-  `lean-rs` / `lean-semantic-search` line is unchanged at 0.9 / 0.7, but the requirements rise to lean-rs 0.9.1 and
+- **Widened the toolchain window head to Lean 4.35.0-rc2 and added 4.34.0 and 4.35.0-rc1 to the window.** The `lean-rs`
+  / `lean-semantic-search` line is unchanged at 0.9 / 0.7, but the requirements rise to lean-rs 0.9.1 and
   lean-semantic-search 0.7.5, because `lean-toolchain` 0.9.0's build script rejects the 4.35 `lean.h`. lean-rs 0.9.1's
-  `SUPPORTED_TOOLCHAINS` adds 4.34.0 (byte-identical header to 4.34.0-rc2), 4.35.0-rc1, and 4.35.0-rc2 (new digests,
-  no struct declaration changes). It also fixes scalar-array element sizes for arrays that 4.35 marks as linear. The
+  `SUPPORTED_TOOLCHAINS` adds 4.34.0 (byte-identical header to 4.34.0-rc2), 4.35.0-rc1, and 4.35.0-rc2 (new digests, no
+  struct declaration changes). It also fixes scalar-array element sizes for arrays that 4.35 marks as linear. The
   supported window is now `4.30.0 ..= 4.35.0-rc2`. The fixture pin, the worker the server is built and tested against,
   and the head-toolchain literals in the test suite and docs all move to v4.35.0-rc2. The Rust floor is unchanged at
   1.94.
@@ -101,9 +115,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Every tool emits token-gated progress notifications (start, 15-second heartbeats, completion), not only
-  `lean_verify`, so clients that extend their deadline on progress no longer abandon a cold import or a long
-  elaboration in `lean_trial`, `lean_context`, `lean_lookup`, or `lean_status`.
+- Every tool emits token-gated progress notifications (start, 15-second heartbeats, completion), not only `lean_verify`,
+  so clients that extend their deadline on progress no longer abandon a cold import or a long elaboration in
+  `lean_trial`, `lean_context`, `lean_lookup`, or `lean_status`.
 - Request synonyms: recurring mode and field spellings (`signature`, `tactic`, `command`, a bare `file` for
   `lean_lookup(kind="declarations")`, a top-level or singular `lean_verify` target, string target groups, and more) are
   normalized onto the canonical schema before decoding. A mode that names another tool's job, such as `search`, is
@@ -124,9 +138,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
-- `lean_lookup(kind="changed_coverage")` and the `lean_verify` `changed` target group, with the `coverage` result
-  field and the `unknown_coverage` summary field. No consumer used them; mapping a diff to declarations is the caller's
-  job.
+- `lean_lookup(kind="changed_coverage")` and the `lean_verify` `changed` target group, with the `coverage` result field
+  and the `unknown_coverage` summary field. No consumer used them; mapping a diff to declarations is the caller's job.
 
 ### Fixed
 
@@ -147,12 +160,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   contention-immune, generation-guarded so a mid-call recycle reports `null` rather than a bogus figure). CPU sampling
   comes from `lean-rs-worker-parent` 0.8's `cumulative_cpu_millis`: Linux reads `/proc/<pid>/stat`, macOS uses
   `proc_pidinfo` scaled by `mach_timebase_info`.
-- **Added a slow-elaboration warning.** When `call_cpu_millis` exceeds `output.slow_call_warning_millis` (default
-  10000 ms, env `LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS`), every tool response carries a warning issue naming
-  the CPU figure and recommending refactoring — split the declaration, add explicit type annotations to cut typeclass
-  search, or extract intermediate lemmas. Keying on CPU rather than wallclock keeps machine contention from triggering
-  it; when wallclock is more than twice the CPU figure the warning attributes the wait to contention instead. The
-  warning is emitted in the response funnel, so it survives the default `telemetry.verbosity = quiet` drop.
+- **Added a slow-elaboration warning.** When `call_cpu_millis` exceeds `output.slow_call_warning_millis` (default 10000
+  ms, env `LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS`), every tool response carries a warning issue naming the CPU
+  figure and recommending refactoring — split the declaration, add explicit type annotations to cut typeclass search, or
+  extract intermediate lemmas. Keying on CPU rather than wallclock keeps machine contention from triggering it; when
+  wallclock is more than twice the CPU figure the warning attributes the wait to contention instead. The warning is
+  emitted in the response funnel, so it survives the default `telemetry.verbosity = quiet` drop.
 
 ### Changed
 
@@ -664,7 +677,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.2...v0.15.0
 [0.14.2]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.14.0...v0.14.1

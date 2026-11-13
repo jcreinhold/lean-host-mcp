@@ -21,7 +21,7 @@ use crate::tasks::{MAX_RECORD_BYTES, StoredRequest};
 #[derive(Debug)]
 pub(crate) struct RequestJournal {
     directory: PathBuf,
-    _owner: File,
+    owner: File,
 }
 
 impl RequestJournal {
@@ -36,7 +36,7 @@ impl RequestJournal {
         owner.try_lock().map_err(io::Error::other)?;
         let journal = Self {
             directory: directory.to_path_buf(),
-            _owner: owner,
+            owner,
         };
         let mut records = Vec::new();
         for entry in fs::read_dir(directory)? {
@@ -99,5 +99,36 @@ impl RequestJournal {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+impl Drop for RequestJournal {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit this open file
+        // description before exec closes it. Closing only our descriptor would
+        // leave its lock held until that child execs or exits.
+        if let Err(error) = self.owner.unlock() {
+            tracing::warn!(%error, "could not unlock request journal");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "tests assert the journal owner lifetime")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_owner_unlocks_even_while_a_duplicate_descriptor_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (journal, _) = RequestJournal::open(dir.path(), 128).unwrap();
+        let inherited = journal.owner.try_clone().unwrap();
+        assert!(RequestJournal::open(dir.path(), 128).is_err());
+        drop(journal);
+        let (next, _) = RequestJournal::open(dir.path(), 128).unwrap();
+        drop(inherited);
+        assert!(RequestJournal::open(dir.path(), 128).is_err());
+        drop(next);
+        assert!(RequestJournal::open(dir.path(), 128).is_ok());
     }
 }
