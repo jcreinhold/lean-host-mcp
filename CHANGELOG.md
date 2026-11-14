@@ -9,6 +9,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.6] - 2026-11-14
+
+### Fixed
+
+- Resolve private declarations without duplicate verification targets, including UTF-16 source positions.
+- Use lean-rs 0.9.9 to report private theorem axioms correctly and reuse source headers without repeated imports.
+  Retire workers cleanly when import accounting is unavailable instead of treating planned retirement as a crash.
+- Report successful worker retries as completed checks while retaining the warning about the earlier interruption.
+- Bound project queue waits, reject expired dispatches, and let queued builds drain admitted requests fairly.
+- Keep completed results for a bounded period, recover journal writes after storage failures, and isolate damaged records.
+
+### Changed
+
+- Worker protocol 12 requires a matching parent and worker. Update both together, then restart the server.
+  Lean's supported toolchain range is unchanged.
+
 ## [0.16.5] - 2026-11-14
 
 ### Fixed

@@ -732,7 +732,11 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
     assert_eq!(binding["server_instance_id"], status["pool"]["instance_id"]);
     assert_eq!(
         status["capabilities"],
-        json!(["retained_request_binding_v1", "retained_request_lifecycle_v2"])
+        json!([
+            "retained_request_binding_v1",
+            "draining_lease_v1",
+            "retained_request_lifecycle_v2"
+        ])
     );
     // No Tasks negotiation, and the caller may disappear while work continues.
     drop(original);
