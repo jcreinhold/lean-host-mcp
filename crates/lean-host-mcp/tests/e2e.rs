@@ -70,6 +70,7 @@ fn open_ctx_with_residue_budget(root: &Path, budget_bytes: u64) -> ToolContext {
             env_default: Some(root.to_path_buf()),
             cwd: root.to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: BrokerConfig::default_idle_timeout(),
         },
         ProjectRuntimeConfig::default().with_import_residue_budget_bytes(budget_bytes),
@@ -89,6 +90,7 @@ fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
         env_default: Some(root.to_path_buf()),
         cwd: root.to_path_buf(),
         max_projects: BrokerConfig::default_max_projects(),
+        max_workers_per_project: std::num::NonZeroUsize::MIN,
         idle_timeout: BrokerConfig::default_idle_timeout(),
     });
     ToolContext { broker, config }

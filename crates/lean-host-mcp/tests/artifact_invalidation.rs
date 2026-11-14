@@ -145,6 +145,7 @@ async fn unchanged_query_observes_rebuilt_path_dependency_and_recycles_worker() 
             env_default: Some(root.clone()),
             cwd: root.clone(),
             max_projects: BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         }),
         config: ToolConfig {

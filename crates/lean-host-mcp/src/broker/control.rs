@@ -112,6 +112,8 @@ pub struct WorkerPoolStatus {
     pub instance_id: String,
     /// Configured upper bound on resident, opening, and retiring worker slots.
     pub max_projects: usize,
+    pub max_workers: usize,
+    pub max_workers_per_project: usize,
     /// Slots still owned, including shutdowns whose exit is not confirmed.
     pub occupied_slots: usize,
     /// Actor work across all controllers, including those removed from the registry.
@@ -134,6 +136,7 @@ pub struct WorkerPoolStatus {
 pub struct WorkerActivity {
     /// Canonical Lake root owned by this worker controller.
     pub project_root: String,
+    pub worker_lane: usize,
     /// True only when no admitted caller or actor message can use this worker.
     pub idle: bool,
     /// Messages or background maintenance running or completing cleanup.
@@ -213,7 +216,11 @@ impl MaintenanceAccess {
             return None;
         }
         // An evicted/replaced controller cannot start another idle recycle.
-        let guard = registry.registry.peek(root)?.begin_maintenance(session_id);
+        let guard = registry
+            .registry
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .find_map(|(_, actor)| actor.begin_maintenance(session_id));
         drop(registry);
         guard
     }
@@ -341,6 +348,8 @@ impl ProjectBroker {
             effective_settings: crate::status::EffectiveSettings {
                 broker: crate::status::BrokerSettings {
                     max_projects: self.config.max_projects.get(),
+                    max_workers: self.config.max_projects.get(),
+                    max_workers_per_project: self.config.max_workers_per_project.get(),
                     idle_timeout_secs: self.config.idle_timeout.as_secs(),
                 },
                 runtime: crate::status::RuntimeSettings::from(&self.runtime_config),
@@ -370,7 +379,8 @@ impl ProjectBroker {
                 let admitted_caller = Arc::strong_count(project) > 1;
                 let outstanding_jobs = project.outstanding_jobs();
                 WorkerActivity {
-                    project_root: root.to_string_lossy().into_owned(),
+                    project_root: root.root.to_string_lossy().into_owned(),
+                    worker_lane: root.lane,
                     idle: outstanding_jobs == 0 && !admitted_caller,
                     outstanding_jobs,
                     admitted_caller,
@@ -389,6 +399,8 @@ impl ProjectBroker {
         WorkerPoolStatus {
             instance_id: inner.control.instance_id.clone(),
             max_projects: self.config.max_projects.get(),
+            max_workers: self.config.max_projects.get(),
+            max_workers_per_project: self.config.max_workers_per_project.get(),
             occupied_slots,
             outstanding_jobs: inner.control.active_jobs.load(Ordering::Acquire),
             workers_stopped: occupied_slots == 0
@@ -458,6 +470,7 @@ mod tests {
             env_default: None,
             cwd: PathBuf::from("/unused"),
             max_projects: std::num::NonZeroUsize::MIN,
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         })
     }

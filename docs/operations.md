@@ -45,7 +45,8 @@ description (e.g. "8 GiB") is for reading, not for setting.
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
 | `runtime.worker_import_residue_budget_mib` | integer (MiB) | unset | `LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB` | How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects), clamped to [9216, 12288], and capped at one child's share of RAM after the import in flight (RAM / max_projects − 4608); set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it. |
 | `runtime.worker_session_pool_capacity` | integer | `8` | `LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY` | How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8. |
-| `broker.max_projects` | integer | `4` | `LEAN_HOST_MCP_MAX_PROJECTS` | How many distinct Lake projects stay open at once; on overflow the least-recently-used project's worker is evicted. |
+| `broker.max_workers` | integer | `4` | `LEAN_HOST_MCP_MAX_WORKERS (legacy: LEAN_HOST_MCP_MAX_PROJECTS)` | Maximum worker processes across all projects, including startup and shutdown. Idle workers may be evicted to serve another project. max_projects is a deprecated alias; environment values override file values, and the new name wins within each layer. |
+| `broker.max_workers_per_project` | integer | `1` | `LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT` | Maximum independent workers for one canonical project root. Extra workers open only with spare global capacity; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks. Each worker retains its own imports and cache. |
 | `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
 | `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
@@ -76,8 +77,8 @@ inherited `LEAN_PATH`. Rebuilt, removed, replaced, or newly available artifacts 
 pooled sessions. The worker is recycled before reuse; `artifacts_rebuilt` records that transition. Unrelated artifacts
 do not invalidate a warm query.
 
-Only named imports are watched rather than their full transitive closure: normal Lake dependency propagation must
-update the corresponding imported artifacts. Bundled shims and installed toolchain contents remain trusted fixed runtime
+Only named imports are watched rather than their full transitive closure: normal Lake dependency propagation must update
+the corresponding imported artifacts. Bundled shims and installed toolchain contents remain trusted fixed runtime
 inputs. Concurrent builds are not an atomic execution snapshot; changed artifacts prevent result-cache insertion.
 Callers requiring an exact source/build revision must coordinate those inputs.
 
@@ -169,7 +170,11 @@ below the budget is warned about at startup and is almost never what you want.
 
 ## Concurrency and admission
 
-Each resident project owns one worker child and one dedicated thread that runs a single job at a time.
+Each worker owns a child process and a dedicated thread that runs one job at a time. `broker.max_workers` caps workers
+across all projects. `broker.max_workers_per_project` defaults to one. With a larger per-project limit, the broker
+prefers an idle worker, starts another only with spare global capacity, or queues on the least-loaded existing worker.
+Each worker keeps its own import and result caches. The old `max_projects` setting is an alias for the global cap, not a
+separate project quota. Both environment aliases override either file key; the new name wins within the same layer.
 `runtime.project_mailbox_capacity` bounds the actor's mailbox. Further callers wait for mailbox admission in FIFO order
 rather than retrying `mailbox_full`. Cold projects also wait in FIFO order for worker capacity; the head waiter retires
 an idle LRU worker when one becomes available. Active workers are never evicted to make room. Different resident
@@ -180,7 +185,7 @@ Each admission wait is bounded by `runtime.request_timeout_millis`, separately f
 budget. Expiry returns `mailbox_admission_timeout` or `project_admission_timeout` without running that queued operation.
 This is not a whole-tool deadline: a tool that submits several worker operations can take longer. Explicit retained
 requests share a 128-record limit; legacy synchronous requests retain their normal transport behavior. Parallel server
-processes remain independent; lower `broker.max_projects` when the machine cannot hold that many workers.
+processes remain independent; lower `broker.max_workers` when the machine cannot hold that many workers.
 
 Cheap metadata paths never open a worker at all: degraded `needs_build` responses, invalid-request responses, and
 project-scope `.ilean` reference reads answer from the Lake files directly. A repeat module query on an unmodified file
@@ -189,18 +194,18 @@ behind in-flight Lean work.
 
 **Semantic search costs a second child, briefly.** `search_for_proof`'s semantic ranking runs in its own worker child,
 separate from the one serving elaboration. It is spawned for the call and released when the call ends, so two children
-are alive only for the duration of a semantic search and the steady-state footprint stays at one worker per resident
-project. Keeping that child resident between calls was tried and measured *slower*; the note on
+are alive only for the duration of a semantic search and the steady-state footprint stays within the configured
+elaboration-worker limit. Keeping that child resident between calls was tried and measured *slower*; the note on
 `open_semantic_capability` in `src/project.rs` records why.
 
 ## Request activity in the terminal
 
-Default INFO logging summarizes each actual semantic execution with a server-generated `request` number, tool,
-canonical kind and bounded project basename. The received line means preparation or queueing has begun, not that a
-worker has already started. The matching response line includes elapsed time (including queue wait), a fixed outcome
-label, an allowlisted `result_status` when present (such as `not_found` or `unsupported`), tool issue counts, and
-diagnostic or verification counts when available. `completed` means a response is ready,
-not that a theorem was proved; inspect `failed`, `diagnostic_errors`, and the actual client response for the verdict.
+Default INFO logging summarizes each actual semantic execution with a server-generated `request` number, tool, canonical
+kind and bounded project basename. The received line means preparation or queueing has begun, not that a worker has
+already started. The matching response line includes elapsed time (including queue wait), a fixed outcome label, an
+allowlisted `result_status` when present (such as `not_found` or `unsupported`), tool issue counts, and diagnostic or
+verification counts when available. `completed` means a response is ready, not that a theorem was proved; inspect
+`failed`, `diagnostic_errors`, and the actual client response for the verdict.
 
 ```text
 INFO Lean request received (preparing or waiting for worker) request=42 tool="lean_verify" kind="verification" project=proofs
@@ -218,14 +223,14 @@ Existing detailed debug/runtime logs are separate, and may contain paths or diag
 
 The default filter, also used for `RUST_LOG=info`, is `info,rmcp=warn`: routine SDK session creation, initialization and
 stream closure are hidden, but SDK WARN/ERROR remain visible. To investigate transport details explicitly, use
-`RUST_LOG=info,rmcp=debug`. Other explicit `RUST_LOG` directives retain their usual meaning. Logs go to stderr, never the
-stdio protocol stream.
+`RUST_LOG=info,rmcp=debug`. Other explicit `RUST_LOG` directives retain their usual meaning. Logs go to stderr, never
+the stdio protocol stream.
 
-The import-budget sizing estimate appears only at DEBUG, once when the broker starts, not on worker restarts. Its
-9216 MiB comparison is a Mathlib-oriented sizing baseline for retaining two large imports, not a required
-minimum for every import or evidence of a failure. An explicitly configured smaller budget can be intentional; evaluate
-actual recycle frequency before changing it. Lowering the project count does not change an explicitly fixed budget.
-The heap-ceiling warning and real runtime error/recycle logs remain intact; no memory policy changes with logging.
+The import-budget sizing estimate appears only at DEBUG, once when the broker starts, not on worker restarts. Its 9216
+MiB comparison is a Mathlib-oriented sizing baseline for retaining two large imports, not a required minimum for every
+import or evidence of a failure. An explicitly configured smaller budget can be intentional; evaluate actual recycle
+frequency before changing it. Lowering the project count does not change an explicitly fixed budget. The heap-ceiling
+warning and real runtime error/recycle logs remain intact; no memory policy changes with logging.
 
 ## Observing worker recycles
 
@@ -241,8 +246,8 @@ Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `r
   child was recycled), `import_residue` (the reactive half of the residue budget — the cycle a call had to wait for, and
   the frequency an operator tunes against), memory-pressure cycles (`rss_post_job`), plus `opened project` / `idle
   reaper evicted projects` lifecycle lines.
-- `debug` — pure hygiene (`import_residue_idle`, `max_imports`, `max_requests`, `idle`, `explicit`), detailed
-  project resolution, and the `job` span.
+- `debug` — pure hygiene (`import_residue_idle`, `max_imports`, `max_requests`, `idle`, `explicit`), detailed project
+  resolution, and the `job` span.
 
 The server no longer configures any resident-memory threshold, so in practice you see the abnormal causes above,
 `explicit`, `artifacts_rebuilt`, and the two residue causes (see "Import cycling"). `max_imports` should not appear at
@@ -256,15 +261,15 @@ Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for internal runtime
 INFO worker recycled (imports rebuilt on disk) cause=artifacts_rebuilt worker_generation=2 planned=true restarts_total=1
 ```
 
-The same data reaches the MCP client in `response.runtime`: the final-attempt cause in `call_restart`, the most recent in
-`last_restart`, and the lifetime frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause` (omitted
-when no recycle has happened). `import_residue_bytes` and `import_residue_limit_bytes` report the quantity the recycle
-policy actually reads, so how close a child is to its next cycle is observable rather than inferred. The two figures a
-cycle happened *on* are in the restart event's `reason` string.
+The same data reaches the MCP client in `response.runtime`: the final-attempt cause in `call_restart`, the most recent
+in `last_restart`, and the lifetime frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause`
+(omitted when no recycle has happened). `import_residue_bytes` and `import_residue_limit_bytes` report the quantity the
+recycle policy actually reads, so how close a child is to its next cycle is observable rather than inferred. The two
+figures a cycle happened *on* are in the restart event's `reason` string.
 
-If a worker attempt fails and a fresh retry completes, the result remains usable. The response includes a warning
-about the first failure. Full telemetry records `previous_attempt_failure`, `retry_count`, and
-`final_attempt: "completed"`. A failed or uncertain retry still returns no usable result.
+If a worker attempt fails and a fresh retry completes, the result remains usable. The response includes a warning about
+the first failure. Full telemetry records `previous_attempt_failure`, `retry_count`, and `final_attempt: "completed"`. A
+failed or uncertain retry still returns no usable result.
 
 ## Process lifetime
 
@@ -297,16 +302,17 @@ transport, bind/path, working directory, startup/current parent PID, process gro
 direct child PIDs. Liveness is `true`, `false` (kernel-confirmed absence), or `unknown`; `liveness_error` identifies
 permission denial or another observation failure. Missing process metadata and child lists remain unknown, not evidence
 of absence. It does not scan for process names. Only a confirmed live stdio server with a matching executable and a
-confirmed parent change receives an exact PID suggestion such as `kill -TERM <pid>` for the recorded server PID. Clean records left behind by abruptly killed
-servers with:
+confirmed parent change receives an exact PID suggestion such as `kill -TERM <pid>` for the recorded server PID. Clean
+records left behind by abruptly killed servers with:
 
 ```sh
 lean-host-mcp doctor processes --cleanup-stale-records
 ```
 
-Cleanup removes records only after kernel-confirmed PID absence is rechecked; unknown observations preserve records. It does not kill live processes and does not infer ownership from
-an executable name, command substring, or port number. Do not use broad process-name cleanup; identify the exact PID
-from the registry or from `ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
+Cleanup removes records only after kernel-confirmed PID absence is rechecked; unknown observations preserve records. It
+does not kill live processes and does not infer ownership from an executable name, command substring, or port number. Do
+not use broad process-name cleanup; identify the exact PID from the registry or from
+`ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
 
 ## Runtime-error contract
 

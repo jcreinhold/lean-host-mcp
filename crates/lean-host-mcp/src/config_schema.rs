@@ -108,12 +108,20 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
     },
     // ---- [broker] — project pool ---------------------------------------
     FieldDoc {
-        key: "broker.max_projects",
+        key: "broker.max_workers",
         ty: "integer",
         value: "4",
         commented: false,
-        overrides: "LEAN_HOST_MCP_MAX_PROJECTS",
-        description: "How many distinct Lake projects stay open at once; on overflow the least-recently-used project's worker is evicted.",
+        overrides: "LEAN_HOST_MCP_MAX_WORKERS (legacy: LEAN_HOST_MCP_MAX_PROJECTS)",
+        description: "Maximum worker processes across all projects, including startup and shutdown. Idle workers may be evicted to serve another project. max_projects is a deprecated alias; environment values override file values, and the new name wins within each layer.",
+    },
+    FieldDoc {
+        key: "broker.max_workers_per_project",
+        ty: "integer",
+        value: "1",
+        commented: false,
+        overrides: "LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT",
+        description: "Maximum independent workers for one canonical project root. Extra workers open only with spare global capacity; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks. Each worker retains its own imports and cache.",
     },
     FieldDoc {
         key: "broker.idle_timeout_secs",
@@ -365,7 +373,8 @@ mod tests {
             Some(rt.session_pool_capacity())
         );
 
-        assert_eq!(config.broker.max_projects, Some(broker::DEFAULT_MAX_PROJECTS));
+        assert_eq!(config.broker.max_workers, Some(broker::DEFAULT_MAX_PROJECTS));
+        assert_eq!(config.broker.max_workers_per_project, Some(1));
         assert_eq!(config.broker.idle_timeout_secs, Some(broker::DEFAULT_IDLE_TIMEOUT_SECS));
         assert_eq!(
             config.output.slow_call_warning_millis,

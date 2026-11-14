@@ -55,6 +55,7 @@ fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize) -> Arc<
         env_default,
         cwd,
         max_projects,
+        max_workers_per_project: std::num::NonZeroUsize::MIN,
         idle_timeout: Duration::ZERO,
     })
 }

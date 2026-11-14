@@ -34,6 +34,7 @@ fn open_ctx(root: &Path) -> ToolContext {
         env_default: Some(root.to_path_buf()),
         cwd: root.to_path_buf(),
         max_projects: BrokerConfig::default_max_projects(),
+        max_workers_per_project: std::num::NonZeroUsize::MIN,
         idle_timeout: BrokerConfig::default_idle_timeout(),
     });
     ToolContext {
@@ -363,6 +364,7 @@ async fn the_residue_recycle_reaches_the_child_before_the_heap_ceiling_aborts_it
             env_default: Some(root.clone()),
             cwd: root,
             max_projects: BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: BrokerConfig::default_idle_timeout(),
         },
         ProjectRuntimeConfig::default().with_import_residue_budget_bytes(budget_bytes),

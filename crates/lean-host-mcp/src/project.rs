@@ -3216,6 +3216,7 @@ mod tests {
                 env_default: None,
                 cwd: std::path::PathBuf::from("."),
                 max_projects: crate::broker::BrokerConfig::default_max_projects(),
+                max_workers_per_project: std::num::NonZeroUsize::MIN,
                 idle_timeout: Duration::ZERO,
             },
             config,

@@ -939,7 +939,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     assert_eq!(status["pool"]["workers_stopped"], true);
     assert_eq!(
         status["effective_settings"]["broker"],
-        json!({"max_projects":2,"idle_timeout_secs":91})
+        json!({"max_projects":2,"max_workers":2,"max_workers_per_project":1,"idle_timeout_secs":91})
     );
     let runtime = &status["effective_settings"]["runtime"];
     assert_eq!(runtime["request_timeout_millis"], 12_345);

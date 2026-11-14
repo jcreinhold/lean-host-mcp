@@ -14,6 +14,7 @@ async fn idle_lease_preserves_cache_across_reaper_ticks() -> Result<(), Box<dyn 
         env_default: Some(root.clone()),
         cwd: root,
         max_projects: BrokerConfig::default_max_projects(),
+        max_workers_per_project: std::num::NonZeroUsize::MIN,
         idle_timeout: Duration::from_nanos(1),
     });
     let first = broker.admitted_project_runtime(ProjectHint::Default, vec![]).await?;

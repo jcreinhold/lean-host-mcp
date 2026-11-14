@@ -580,6 +580,7 @@ mod tests {
                 env_default: None,
                 cwd: dir.path().to_path_buf(),
                 max_projects: crate::broker::BrokerConfig::default_max_projects(),
+                max_workers_per_project: std::num::NonZeroUsize::MIN,
                 idle_timeout: Duration::ZERO,
             }),
             ToolConfig::default(),
@@ -640,6 +641,7 @@ mod tests {
             env_default: None,
             cwd: dir.path().to_path_buf(),
             max_projects: crate::broker::BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         });
         let service = LeanHostService::new(broker, ToolConfig::default());

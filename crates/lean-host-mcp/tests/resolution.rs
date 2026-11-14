@@ -38,6 +38,7 @@ fn cfg(cwd: PathBuf, env_default: Option<PathBuf>, config_default: Option<PathBu
         env_default,
         cwd,
         max_projects: BrokerConfig::default_max_projects(),
+        max_workers_per_project: std::num::NonZeroUsize::MIN,
         idle_timeout: std::time::Duration::ZERO,
     }
 }

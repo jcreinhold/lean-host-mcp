@@ -40,6 +40,7 @@ fn bench_worker_roundtrip(c: &mut Criterion) {
         env_default: Some(root.clone()),
         cwd: root,
         max_projects: BrokerConfig::default_max_projects(),
+        max_workers_per_project: std::num::NonZeroUsize::MIN,
         idle_timeout: BrokerConfig::default_idle_timeout(),
     });
     let ctx = ToolContext {

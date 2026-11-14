@@ -56,9 +56,9 @@ bounded project queue, memory budget, and worker lifecycle presentation.
 
 MCP 2026-07-28 uses the SDK's stateless discovery and per-request capability/version metadata. Legacy clients retain
 initialize/session support. Both paths share the same service and retained-request registry. Protocol guards follow
-[the MCP versioning contract](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning).
-HTTP is native-only: every present `Origin` is rejected with 403, while requests without Origin still require an
-allowed loopback Host. This follows the
+[the MCP versioning contract](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning). HTTP is
+native-only: every present `Origin` is rejected with 403, while requests without Origin still require an allowed
+loopback Host. This follows the
 [Streamable HTTP security requirements](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
 
 Runtime pressure is not a transport error. Mailbox pressure, project-pool pressure, worker death, session loss, and
@@ -71,22 +71,21 @@ Cancellation remains bounded by supervisor observation and deadlines, rather tha
 owning operation waits for its terminal cleanup instead of treating a cancellation acknowledgement as termination.
 Dropping a caller's future also signals cancellation without freeing the worker's capacity early.
 
-`lean_runtime` is an additional synchronous operational tool, separate from the five semantic job families. Its idle-pool
-lease shares the broker registry mutex with both resident project borrowing and startup-lock acquisition. A claim is
-refused while any caller holds a project, any startup lock is retained, or any actor-owned message remains active.
-Background recycling and prewarming acquire actor activity under that same lock; old controllers cannot start it after
-eviction. Pool activity counts survive registry removal and remain held through cleanup. Once claimed, new worker
-admission is refused until release or monotonic expiry. Idle reaping also pauses, preserving
-warm caches unless the acquirer explicitly requests retirement. Retirement only closes idle actors' mailboxes; the
-existing worker permits still wait for confirmed shutdown. Snapshots and shutdown requests alone do not establish that
-resources have been freed. The token and broker instance identity are process-local, with no cross-process scheduling,
-priority policy, preemption, or persistence. See the [tool catalog](tool-catalog.md#worker-activity-and-admission-leases)
-for the public contract.
+`lean_runtime` is an additional synchronous operational tool, separate from the five semantic job families. Its
+idle-pool lease shares the broker registry mutex with both resident project borrowing and startup-lock acquisition. A
+claim is refused while any caller holds a project, any startup lock is retained, or any actor-owned message remains
+active. Background recycling and prewarming acquire actor activity under that same lock; old controllers cannot start it
+after eviction. Pool activity counts survive registry removal and remain held through cleanup. Once claimed, new worker
+admission is refused until release or monotonic expiry. Idle reaping also pauses, preserving warm caches unless the
+acquirer explicitly requests retirement. Retirement only closes idle actors' mailboxes; the existing worker permits
+still wait for confirmed shutdown. Snapshots and shutdown requests alone do not establish that resources have been
+freed. The token and broker instance identity are process-local, with no cross-process scheduling, priority policy,
+preemption, or persistence. See the [tool catalog](tool-catalog.md#worker-activity-and-admission-leases) for the public
+contract.
 
-The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's
-exit cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps
-the project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains
-uncertain.
+The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
+cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
+project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.
 
 ## Project And Worker Boundary
 
@@ -100,15 +99,15 @@ cancellable and deadline-bounded. Cold-project capacity uses a separate FIFO adm
 retries for idle workers. The parent binary never links `libleanshared`; the per-toolchain worker child does.
 
 The broker reserves capacity before opening a worker. Opening, resident and retiring project workers all count against
-`broker.max_projects`; a slot is released only after confirmed shutdown. An uncertain shutdown keeps its slot unavailable
-until server restart. Same-project startup is coalesced even when a caller disconnects. Idle LRU workers may be replaced
-when capacity is full, while a worker borrowed by a caller or processing queued work cannot be evicted. Capacity counts
-project runtimes rather than memory bytes. It does not cover the transient semantic-search companion child described
-below or external Lean processes. Different projects can still run
-concurrently, with one in-flight job per project. Degraded responses and pure `.ilean` reads use
-`project_identity_without_worker` so they can fill semantic trust identity without spawning, and a warm module-query
-cache hit is answered from the project handle without entering the mailbox. A full project queue is a structured
-retryable infrastructure error rather than unbounded memory growth.
+`broker.max_workers`; a slot is released only after confirmed shutdown. An uncertain shutdown keeps its slot unavailable
+until server restart. Same-project startup is serialized even when a caller disconnects, and rechecks the per-project
+worker limit. Idle LRU workers may be replaced when capacity is full, while a worker borrowed by a caller or processing
+queued work cannot be evicted. Capacity counts project runtimes rather than memory bytes. It does not cover the
+transient semantic-search companion child described below or external Lean processes. Different projects can still run
+concurrently. A project can use several workers when configured, with one in-flight job per worker. Degraded responses
+and pure `.ilean` reads use `project_identity_without_worker` so they can fill semantic trust identity without spawning,
+and a warm module-query cache hit is answered from the project handle without entering the mailbox. A full project queue
+is a structured retryable infrastructure error rather than unbounded memory growth.
 
 Worker memory is bounded by retained import bytes, not by watching the process. Above that sits
 `runtime.lean_max_memory_kib`, a Lean *heap* ceiling enforced by `lean_internal_set_max_memory` — a backstop rather than
@@ -142,20 +141,19 @@ itself idle above 60% of the budget it takes the same cycle early as `import_res
 profile so the spawn and the import both land between calls. Fatal child exits are reported by the worker layer; the
 host maps those structured outcomes once into MCP runtime facts and retries selected read-only semantic jobs once.
 Responses carry runtime facts (`worker_generation`, `worker_restarted`, `retry_count`, `queue_wait_millis`,
-`call_elapsed_millis`, `call_cpu_millis`, `call_restart`, `last_restart`, `final_attempt`,
-`previous_attempt_failure`) so clients can distinguish Lean-domain
-results from infrastructure recovery and lifecycle history. The two timing fields bracket the call:
-`queue_wait_millis` covers admission delay, `call_elapsed_millis` the worker-call wallclock (queue excluded),
-and `call_cpu_millis` the worker child's own CPU delta — contention-immune, and the figure the
-`output.slow_call_warning_millis` (default 10 s) per-call refactoring warning keys on. The server reports these facts and the client decides policy; the single exception is opt-in:
-`retry_tainted_non_positive` on trial/verify requests asks the server to apply one specific policy itself — re-issuing a
-non-positive verdict once when the runtime was recycled mid-call — and the retry is still surfaced through the same
-`retry_count` fact rather than hidden.
+`call_elapsed_millis`, `call_cpu_millis`, `call_restart`, `last_restart`, `final_attempt`, `previous_attempt_failure`)
+so clients can distinguish Lean-domain results from infrastructure recovery and lifecycle history. The two timing fields
+bracket the call: `queue_wait_millis` covers admission delay, `call_elapsed_millis` the worker-call wallclock (queue
+excluded), and `call_cpu_millis` the worker child's own CPU delta — contention-immune, and the figure the
+`output.slow_call_warning_millis` (default 10 s) per-call refactoring warning keys on. The server reports these facts
+and the client decides policy; the single exception is opt-in: `retry_tainted_non_positive` on trial/verify requests
+asks the server to apply one specific policy itself — re-issuing a non-positive verdict once when the runtime was
+recycled mid-call — and the retry is still surfaced through the same `retry_count` fact rather than hidden.
 
-The controller keeps an earlier failed attempt separate from the final attempt. A completed retry returns its
-result with a warning naming the earlier failure. A restart during the final attempt still invalidates the result;
-an unknown or interrupted retry never becomes cacheable merely because the retry started. The warning remains
-visible when runtime telemetry is off.
+The controller keeps an earlier failed attempt separate from the final attempt. A completed retry returns its result
+with a warning naming the earlier failure. A restart during the final attempt still invalidates the result; an unknown
+or interrupted retry never becomes cacheable merely because the retry started. The warning remains visible when runtime
+telemetry is off.
 
 Each semantic tool opens a worker session with imports derived from the source header or explicit request. The worker
 child answers a matching open from its live session, or from one it has pooled, rather than importing again — so a
@@ -259,10 +257,10 @@ operation modules:
 - `lean_trial(kind = "command")` runs bounded Lean command text such as `#check` or `#print axioms`, either under
   explicit imports or after a current file source snapshot. Info messages become rendered output; warnings and errors
   stay in diagnostics.
-- `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, or module-wide declaration
-  target groups under the requested sorry/axiom policy. Policy failures are normal results. All MCP handlers
-  wrap the operation with token-gated progress notifications, including 15-second heartbeats, so transport visibility
-  remains observational and does not enter the job or worker layers.
+- `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, or module-wide declaration target
+  groups under the requested sorry/axiom policy. Policy failures are normal results. All MCP handlers wrap the operation
+  with token-gated progress notifications, including 15-second heartbeats, so transport visibility remains observational
+  and does not enter the job or worker layers.
 - `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
   project declarations can resolve. Rendered fields are capped before crossing the worker boundary.
 - `lean_lookup(kind = "declarations")` lists declarations for a file or module. Source files use the edit-fresh worker
@@ -327,52 +325,39 @@ types, or unbounded source/project scans.
 
 ## Lake compilation options
 
-Source checks resolve the target file's options through the pinned Lake API before
-checking or looking up a cached result. The helper loads the owning package's
-configuration only. It does not resolve dependencies, download caches, or enter
-Lake's build graph. Root and dependency files use their own package and library
-settings, including `require ... with` options for direct dependencies. Source
-checks for transitive dependencies currently fail explicitly rather than guess
-their configuration; lookups of already-built declarations are unaffected. Direct
-dependency configuration compiles into temporary storage, with the original source
-paths and current `require ... with` options. This avoids both stale standalone
-configuration values and overwriting another build's saved config. Temporary files
-are removed on success, failure and cancellation. Lake may create a missing
-`.lake` directory in the dependency, but its config files and locks stay in
-temporary storage. Root configuration loading uses Lake's normal cache and may
-update that cache; this helper is not a strictly read-only filesystem operation.
-Files outside a configured library and file-less trials use Lake's
-root-package external-file defaults, not a guessed primary library.
+Source checks resolve the target file's options through the pinned Lake API before checking or looking up a cached
+result. The helper loads the owning package's configuration only. It does not resolve dependencies, download caches, or
+enter Lake's build graph. Root and dependency files use their own package and library settings, including
+`require ... with` options for direct dependencies. Source checks for transitive dependencies currently fail explicitly
+rather than guess their configuration; lookups of already-built declarations are unaffected. Direct dependency
+configuration compiles into temporary storage, with the original source paths and current `require ... with` options.
+This avoids both stale standalone configuration values and overwriting another build's saved config. Temporary files are
+removed on success, failure and cancellation. Lake may create a missing `.lake` directory in the dependency, but its
+config files and locks stay in temporary storage. Root configuration loading uses Lake's normal cache and may update
+that cache; this helper is not a strictly read-only filesystem operation. Files outside a configured library and
+file-less trials use Lake's root-package external-file defaults, not a guessed primary library.
 
-The worker receives typed options, including `weak.*` options. It resolves their
-types after imports load. `-Dname=value` compiler arguments use Lean's parser;
-other extra compiler arguments return an explicit unsupported error. Source,
-query and compilation options all contribute to the result-cache key.
-`freshness.elaboration_options` records the project options and the actual host
-heartbeat limit, which overrides the project's `maxHeartbeats`.
+The worker receives typed options, including `weak.*` options. It resolves their types after imports load.
+`-Dname=value` compiler arguments use Lean's parser; other extra compiler arguments return an explicit unsupported
+error. Source, query and compilation options all contribute to the result-cache key. `freshness.elaboration_options`
+records the project options and the actual host heartbeat limit, which overrides the project's `maxHeartbeats`.
 
-The helper currently starts once per source request, including cache hits. It
-adds about 0.6 seconds on the measured Mac. We do not cache arbitrary evaluated
-Lake configuration: it can read files or environment variables beyond the
-lakefile. A compiled helper could reduce startup cost without caching those
-inputs. Discovery has a 30-second timeout; cancellation kills the helper.
-Configuration errors return no proof verdict rather than retrying with defaults.
+The helper currently starts once per source request, including cache hits. It adds about 0.6 seconds on the measured
+Mac. We do not cache arbitrary evaluated Lake configuration: it can read files or environment variables beyond the
+lakefile. A compiled helper could reduce startup cost without caching those inputs. Discovery has a 30-second timeout;
+cancellation kills the helper. Configuration errors return no proof verdict rather than retrying with defaults.
 
 ## Queue and execution deadlines
 
-`runtime.request_timeout_millis` now also limits time waiting for dispatch,
-including mailbox admission and waiting behind earlier requests. The existing
-worker operation timeouts remain separate; they do not bound the whole request
-across setup, multiple operations, and retries.
-It starts when the project creates the message, not while opening the project.
+`runtime.request_timeout_millis` now also limits time waiting for dispatch, including mailbox admission and waiting
+behind earlier requests. The existing worker operation timeouts remain separate; they do not bound the whole request
+across setup, multiple operations, and retries. It starts when the project creates the message, not while opening the
+project.
 
-An expired queued request returns `queue_wait_timeout` and cannot run later.
-The actor and caller share one atomic start-or-expire decision. Expired messages
-stay in the bounded mailbox until the actor removes them; they do not reach Lean.
-Once dispatch starts, the existing worker operation limits apply. Cancellation
-of a running request waits for the worker's cleanup reply. Neither cancellation
-nor expiry counts as a successful proof check.
+An expired queued request returns `queue_wait_timeout` and cannot run later. The actor and caller share one atomic
+start-or-expire decision. Expired messages stay in the bounded mailbox until the actor removes them; they do not reach
+Lean. Once dispatch starts, the existing worker operation limits apply. Cancellation of a running request waits for the
+worker's cleanup reply. Neither cancellation nor expiry counts as a successful proof check.
 
-This does not change worker-slot recovery: an uncertain child shutdown still
-retains its slot. Automatic recovery needs the worker supervisor to retain child
-ownership until it confirms exit, including failed startup and controller panic.
+This does not change worker-slot recovery: an uncertain child shutdown still retains its slot. Automatic recovery needs
+the worker supervisor to retain child ownership until it confirms exit, including failed startup and controller panic.

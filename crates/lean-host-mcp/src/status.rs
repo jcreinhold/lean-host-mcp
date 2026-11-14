@@ -49,6 +49,8 @@ pub struct EffectiveSettings {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BrokerSettings {
     pub max_projects: usize,
+    pub max_workers: usize,
+    pub max_workers_per_project: usize,
     pub idle_timeout_secs: u64,
 }
 

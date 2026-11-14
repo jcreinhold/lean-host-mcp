@@ -184,7 +184,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let env_default = args.lake_root;
     let config_default = file.primary_project.clone();
     let (max_projects, idle_timeout) = BrokerConfig::pool_from_env_with_file(&file.broker)?;
-    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_projects.get())?;
+    let (max_workers, max_workers_per_project) = BrokerConfig::worker_limits_from_file(&file.broker, max_projects)?;
+    let max_projects = max_workers; // Legacy internal name; the limit counts worker processes.
+    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?;
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -194,7 +196,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         env_default = ?env_default,
         config_default = ?config_default,
         cwd = %cwd.display(),
-        max_projects = %max_projects,
+        max_workers = %max_projects,
+        max_workers_per_project = %max_workers_per_project,
         idle_timeout_secs = idle_timeout.as_secs(),
         lean_max_memory_kib = runtime_config.lean_max_memory_kib(),
         import_residue_budget_mib = runtime_config.import_residue_budget_bytes() / (1024 * 1024),
@@ -211,6 +214,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             env_default,
             cwd,
             max_projects,
+            max_workers_per_project,
             idle_timeout,
         },
         runtime_config,

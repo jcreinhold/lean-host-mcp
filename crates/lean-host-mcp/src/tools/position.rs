@@ -2136,6 +2136,7 @@ import Init -- comment
             env_default: Some(root.clone()),
             cwd: root,
             max_projects: crate::broker::BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
         });
         let ctx = crate::tools::ToolContext {

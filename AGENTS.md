@@ -72,12 +72,12 @@ E2E tests also honor `LEAN_HOST_MCP_TEST_PACKAGE` / `LEAN_HOST_MCP_TEST_LIBRARY`
 `LeanRsFixture`).
 
 When exercising a non-default toolchain locally (e2e, or a worker built by hand rather than via `install-worker`),
-export `LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---<id>` for the *whole* build-and-test invocation, the
-way CI does. The `lean-toolchain` crate's build script bakes the discovered toolchain's `lean.h` digest into every
-binary it is linked into — parent test binaries included — and the semantic-capability preflight compares that baked
-digest against the per-toolchain capability manifest. Building with only `LEAN_HOST_MCP_TARGET_TOOLCHAIN` set updates
-the worker's rpath but leaves the bindings (and the parent's baked digest) on whatever `lean --print-prefix` resolves
-to, so a worker built that way for a non-default toolchain fails bootstrap with
+export `LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---<id>` for the *whole* build-and-test invocation, the way
+CI does. The `lean-toolchain` crate's build script bakes the discovered toolchain's `lean.h` digest into every binary it
+is linked into — parent test binaries included — and the semantic-capability preflight compares that baked digest
+against the per-toolchain capability manifest. Building with only `LEAN_HOST_MCP_TARGET_TOOLCHAIN` set updates the
+worker's rpath but leaves the bindings (and the parent's baked digest) on whatever `lean --print-prefix` resolves to, so
+a worker built that way for a non-default toolchain fails bootstrap with
 `lean_rs.loader.unsupported_toolchain_fingerprint`.
 
 Running the server requires any Lake project whose requested imports have built `.olean` files. The 34 mandatory + 13
@@ -127,9 +127,10 @@ produced the worker binary's rpath. **A single server process can host workers f
 resolves its own pinned toolchain, the parent spawns one worker per toolchain, and the supervisor sets `LEAN_SYSROOT`
 invisibly per spawn. The MCP client does not need to set `LEAN_SYSROOT` in the server's `env` block.
 
-`LeanProject` (`src/project.rs`) is the actor. It parks the handle on a dedicated OS thread—one per project—so "exactly
-one owner of the Lean runtime at a time" is structural, not a lock discipline. The channel carries a closure type, not a
-Request enum:
+`LeanProject` (`src/project.rs`) is the actor. It parks each handle on a dedicated OS thread, so "exactly one owner of
+the Lean runtime at a time" is structural, not a lock discipline. The broker can keep several independent actors for a
+project within the global worker cap. Each actor owns its worker, cache, cancellation, and restart state. The channel
+carries a closure type, not a Request enum:
 
 ```rust
 type Job = Box<dyn FnOnce(&mut LeanWorkerHostHandle) + Send + 'static>;
@@ -274,9 +275,9 @@ Lean-domain failures (parse, elaboration, kernel rejection, meta timeout) are pa
 
 `crates/lean-host-mcp-worker/build.rs` bakes the Lean toolchain's `lib/lean` directory into the worker binary's rpath so
 `libleanshared.{dylib,so}` loads at runtime. The parent crate's `build.rs` embeds Git revision and dirty state only; it
-emits no linker directives and does not link `libleanshared`.
-Discovery order: `LEAN_HOST_MCP_TARGET_TOOLCHAIN` (resolved as `~/.elan/toolchains/leanprover--lean4---<id>`), then
-`LEAN_SYSROOT`, then `lean --print-prefix`. macOS/Linux only.
+emits no linker directives and does not link `libleanshared`. Discovery order: `LEAN_HOST_MCP_TARGET_TOOLCHAIN`
+(resolved as `~/.elan/toolchains/leanprover--lean4---<id>`), then `LEAN_SYSROOT`, then `lean --print-prefix`.
+macOS/Linux only.
 
 ## Lint posture
 

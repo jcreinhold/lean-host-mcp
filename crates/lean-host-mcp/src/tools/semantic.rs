@@ -1224,6 +1224,7 @@ mod tests {
             env_default: Some(root.clone()),
             cwd: root,
             max_projects: BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
         });
         let ctx = ToolContext {
@@ -1297,6 +1298,7 @@ mod tests {
             env_default: Some(root),
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
         });
         let ctx = ToolContext {
@@ -1331,6 +1333,7 @@ mod tests {
             env_default: Some(root),
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
         });
         let ctx = ToolContext {
@@ -1378,6 +1381,7 @@ mod tests {
             env_default: Some(root),
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
         });
         let ctx = ToolContext {

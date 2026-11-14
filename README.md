@@ -142,10 +142,11 @@ All tunable knobs (the worker's Lean heap budget, pool sizing, transport) can al
 env vars. Run `lean-host-mcp config init` to write a documented starter with every option at its default, then edit it.
 See [Configuration file](docs/operations.md#configuration-file) for discovery and precedence, and
 [Configuration reference](docs/operations.md#configuration-reference) for the full per-knob table. Concurrency is
-`broker.max_projects` resident workers, one in-flight call each: a project's calls are serialized by its own actor
-thread, but calls against different projects run at the same time. `runtime.project_mailbox_capacity` bounds how many
-calls may wait for one project before further ones are shed with a retryable `busy` status. Metadata-only degraded
-responses, project-scope `.ilean` reference reads, and warm module-query cache hits do not open or queue on a worker.
+`broker.max_workers` worker processes, one in-flight call each. `broker.max_workers_per_project` defaults to one; set it
+to two to allow independent calls in the same project to run together within the global limit.
+`runtime.project_mailbox_capacity` bounds how many calls may wait for one worker before further ones are shed with a
+retryable `busy` status. Metadata-only degraded responses, project-scope `.ilean` reference reads, and warm module-query
+cache hits do not open or queue on a worker.
 
 ## Response Shape
 

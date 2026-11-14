@@ -58,6 +58,8 @@ pub struct RuntimeFileConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct BrokerFileConfig {
     pub max_projects: Option<usize>,
+    pub max_workers: Option<usize>,
+    pub max_workers_per_project: Option<usize>,
     pub idle_timeout_secs: Option<u64>,
 }
 
