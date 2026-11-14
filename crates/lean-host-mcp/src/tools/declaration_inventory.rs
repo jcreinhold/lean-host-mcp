@@ -75,7 +75,7 @@ pub struct DeclarationInventoryRow {
     pub body_span: Option<DeclarationSpan>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct DeclarationSpan {
     pub start_line: u32,
     pub start_column: u32,
@@ -394,7 +394,15 @@ fn supplement_with_fresh_index(
     let original_len = result.declarations.len();
     let mut omitted_for_limit = false;
     for row in index_declarations_rows(&index) {
-        if !seen.insert(row.name.clone()) {
+        // Source overlays and compiled modules use different private prefixes.
+        // A private index row at the same name span is the existing source
+        // declaration, not another target to verify under its compiled name.
+        if !seen.insert(row.name.clone())
+            || result
+                .declarations
+                .iter()
+                .any(|source| same_private_declaration(source, &row))
+        {
             continue;
         }
         if result.declarations.len() >= limit {
@@ -411,6 +419,10 @@ fn supplement_with_fresh_index(
         index.module,
         display_path(root, &index.index),
     ))
+}
+
+fn same_private_declaration(source: &DeclarationInventoryRow, compiled: &DeclarationInventoryRow) -> bool {
+    compiled.name.starts_with("_private.") && source.name_span == compiled.name_span
 }
 
 fn truncate(mut declarations: Vec<DeclarationInventoryRow>, limit: usize) -> (Vec<DeclarationInventoryRow>, bool) {
@@ -598,6 +610,49 @@ mod tests {
         assert!(!result.truncated);
         assert_eq!(fact.artifact, ArtifactKind::Ilean);
         assert_eq!(fact.status, TrustStatus::BuildFresh);
+    }
+
+    #[test]
+    fn private_index_names_do_not_duplicate_source_declarations() {
+        let source = row("Demo.hidden", 3);
+        let compiled = row("_private.Demo.0.Demo.hidden", 3);
+        assert!(same_private_declaration(&source, &compiled));
+        assert!(same_private_declaration(
+            &row("_private._stdin.0.Demo.hidden", 3),
+            &compiled
+        ));
+        assert!(!same_private_declaration(&row("Demo.hidden", 4), &compiled));
+        // Source and index short names can differ for escaped identifiers.
+        assert!(same_private_declaration(&row("Demo.«foo.bar»", 3), &compiled));
+        assert!(!same_private_declaration(&source, &row("Demo.hidden", 3)));
+    }
+
+    #[test]
+    fn fresh_index_private_name_keeps_one_source_verification_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let index_path = copy_ilean(&root, "Demo.A", "demo_a.ilean");
+        let contents = std::fs::read_to_string(&index_path)
+            .unwrap()
+            .replace("Demo.A.foo", "_private.Demo.A.0.Demo.A.foo");
+        std::fs::write(&index_path, contents).unwrap();
+        let index = crate::ilean::declarations_in_module(&root, "Demo.A");
+        let mut source = index_declarations_rows(&index).remove(0);
+        source.name = "_private._stdin.0.Demo.A.foo".to_owned();
+        let mut result = DeclarationInventoryResult {
+            status: "ok".to_owned(),
+            declarations: vec![source],
+            truncated: false,
+            source: "worker".to_owned(),
+            files_scanned: 1,
+            message: None,
+            diagnostics: None,
+        };
+        assert!(supplement_with_fresh_index(&root, "Demo.A", &mut result, 1).is_some());
+        assert_eq!(result.declarations.len(), 1);
+        assert_eq!(result.declarations[0].name, "_private._stdin.0.Demo.A.foo");
+        assert!(!result.truncated, "a duplicate must not consume the target limit");
+        assert_eq!(result.source, "worker");
     }
 
     #[test]
