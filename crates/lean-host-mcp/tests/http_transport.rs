@@ -1933,15 +1933,61 @@ fn semantic_error_code(response: &Value) -> Option<String> {
 
 #[tokio::test]
 async fn streamable_http_drain_waits_then_resumes_without_client_retry() {
+    assert_drain_resumes(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires matching worker and Lean toolchain"]
+async fn streamable_http_drain_resumes_real_worker() {
+    assert_drain_resumes(true).await;
+}
+
+async fn assert_drain_resumes(real_worker: bool) {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
     std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
     std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
     let root_s = root.path().to_string_lossy();
-    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
+    // The transport-only test must not depend on a cold worker's shim build.
+    // An empty explicit worker directory gives a deterministic post-drain error.
+    let missing_workers = tempfile::tempdir().unwrap();
+    let missing_workers_s = missing_workers.path().to_string_lossy();
+    let envs = if real_worker {
+        vec![]
+    } else {
+        vec![("LEAN_HOST_MCP_WORKERS_DIR", missing_workers_s.as_ref())]
+    };
+    let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s.as_ref())], &envs).await;
+    if real_worker {
+        // Startup may build the bundled shim. Do not count that one-time work
+        // toward the bounded wait that tests release of the drain.
+        let mut warmup = server.new_session().await;
+        let response = warmup
+            .request(
+                "tools/call",
+                json!({"name":"lean_trial", "arguments":{
+                    "kind":"command", "imports":["Init"], "commands":"#check Nat"
+                }}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(envelope_status(&response.json), "ok", "{:?}", response.json);
+    }
     let mut owner = TaskHttpClient::new(&server.url);
-    let acquired = owner.control(json!({"action": "drain", "retire_idle": true})).await;
-    assert_eq!(acquired["status"], "acquired");
+    let mut acquired = owner.control(json!({"action": "drain", "retire_idle": true})).await;
+    let token = acquired["lease_id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while acquired["status"] == "draining" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            acquired = owner.control(json!({"action":"renew", "lease_id":token})).await;
+        }
+    })
+    .await
+    .expect("idle worker retirement must finish");
+    assert!(
+        acquired["status"] == "acquired" || acquired["status"] == "ok",
+        "{acquired}"
+    );
     assert_eq!(acquired["pool"]["workers_stopped"], true);
     assert!(
         acquired["capabilities"]
@@ -1950,9 +1996,8 @@ async fn streamable_http_drain_waits_then_resumes_without_client_retry() {
             .iter()
             .any(|v| v == "draining_lease_v1")
     );
-    let token = acquired["lease_id"].as_str().unwrap().to_owned();
     let mut session = server.new_session().await;
-    let request = tokio::spawn(async move {
+    let mut request = tokio::spawn(async move {
         session
             .request(
                 "tools/call",
@@ -1970,10 +2015,14 @@ async fn streamable_http_drain_waits_then_resumes_without_client_retry() {
     );
     let released = owner.control(json!({"action":"release", "lease_id":token})).await;
     assert_eq!(released["status"], "ok");
-    let response = tokio::time::timeout(Duration::from_secs(10), request)
-        .await
-        .unwrap()
-        .unwrap();
+    let response = match tokio::time::timeout(Duration::from_secs(10), &mut request).await {
+        Ok(result) => result.unwrap(),
+        Err(error) => {
+            request.abort();
+            server.shutdown().await;
+            panic!("request did not resume after drain release: {error}");
+        }
+    };
     assert_ne!(
         runtime_error_reason(&response.json).as_deref(),
         Some("worker_pool_draining")
@@ -1982,5 +2031,14 @@ async fn streamable_http_drain_waits_then_resumes_without_client_retry() {
         runtime_error_reason(&response.json).as_deref(),
         Some("worker_pool_leased")
     );
+    if real_worker {
+        assert_eq!(envelope_status(&response.json), "ok", "{:?}", response.json);
+    } else {
+        assert!(
+            response.json.to_string().contains("no worker binary for toolchain"),
+            "{:?}",
+            response.json
+        );
+    }
     server.shutdown().await;
 }

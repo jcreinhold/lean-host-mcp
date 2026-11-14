@@ -201,7 +201,7 @@ Two proof-agent details are worth calling out:
 
 ## Versions
 
-`lean-host-mcp` 0.16.6 builds on `lean-rs-worker-parent` / `-child` 0.9, which transitively pin `lean-rs` /
+`lean-host-mcp` 0.16.7 builds on `lean-rs-worker-parent` / `-child` 0.9, which transitively pin `lean-rs` /
 `lean-rs-host` 0.9 (0.9.9). It supports the Lean window `4.30.0 ..= 4.35.0` and is built and tested against the head of
 that window, Lean **4.35.0**.
 

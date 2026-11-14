@@ -9,10 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [0.16.6] - 2026-11-14
+## [0.16.7] - 2026-11-14
 
 ### Fixed
 
+- Separate HTTP drain tests from cold worker startup; test real-worker resumption after warm-up.
 - Resolve private declarations without duplicate verification targets, including UTF-16 source positions.
 - Use lean-rs 0.9.9 to report private theorem axioms correctly and reuse source headers without repeated imports.
   Retire workers cleanly when import accounting is unavailable instead of treating planned retirement as a crash.
