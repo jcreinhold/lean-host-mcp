@@ -1926,3 +1926,57 @@ fn semantic_error_code(response: &Value) -> Option<String> {
     }
     None
 }
+
+#[tokio::test]
+async fn streamable_http_drain_waits_then_resumes_without_client_retry() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
+    std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
+    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    let root_s = root.path().to_string_lossy();
+    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
+    let mut owner = TaskHttpClient::new(&server.url);
+    let acquired = owner.control(json!({"action": "drain", "retire_idle": true})).await;
+    assert_eq!(acquired["status"], "acquired");
+    assert_eq!(acquired["pool"]["workers_stopped"], true);
+    assert!(
+        acquired["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "draining_lease_v1")
+    );
+    let token = acquired["lease_id"].as_str().unwrap().to_owned();
+    let mut session = server.new_session().await;
+    let request = tokio::spawn(async move {
+        session
+            .request(
+                "tools/call",
+                json!({"name":"lean_trial", "arguments":{
+                    "kind":"command", "imports":["Init"], "commands":"#check Nat"
+                }}),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !request.is_finished(),
+        "new request must wait rather than fail or overtake drain"
+    );
+    let released = owner.control(json!({"action":"release", "lease_id":token})).await;
+    assert_eq!(released["status"], "ok");
+    let response = tokio::time::timeout(Duration::from_secs(10), request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        runtime_error_reason(&response.json).as_deref(),
+        Some("worker_pool_draining")
+    );
+    assert_ne!(
+        runtime_error_reason(&response.json).as_deref(),
+        Some("worker_pool_leased")
+    );
+    server.shutdown().await;
+}

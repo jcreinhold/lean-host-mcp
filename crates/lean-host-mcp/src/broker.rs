@@ -815,6 +815,24 @@ impl ProjectBroker {
     }
 
     async fn acquire_until(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
+        let cancellation = CallCancellation::current();
+        loop {
+            let result = self.acquire_attempt(root.clone(), deadline).await;
+            if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining") {
+                return result;
+            }
+            // Waiting callers own no project Arc, opening lock, or worker slot.
+            // A bounded local timer also observes expiry without another API call.
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(Self::pool_unavailable(&root, "request_cancelled", false)),
+                () = tokio::time::sleep_until(deadline) => return Err(Self::pool_unavailable(&root, "project_admission_timeout", true)),
+                () = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    }
+
+    async fn acquire_attempt(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
         if CallCancellation::current().is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
@@ -954,7 +972,12 @@ impl ProjectBroker {
 
     fn check_runtime_admission(inner: &mut BrokerInner, root: &Path) -> Result<()> {
         if let Some(remaining) = inner.control.remaining(Instant::now()) {
-            let mut error = Self::pool_unavailable(root, "worker_pool_leased", true);
+            let reason = if inner.control.is_draining() {
+                "worker_pool_draining"
+            } else {
+                "worker_pool_leased"
+            };
+            let mut error = Self::pool_unavailable(root, reason, true);
             if let ServerError::WorkerUnavailable(info) = &mut error {
                 info.retry_after_millis = Some(remaining);
             }
@@ -985,7 +1008,9 @@ impl ProjectBroker {
                         if inner.shutdown_epoch != epoch {
                             return Err(Self::pool_unavailable(root, "project_shutting_down", false));
                         }
-                        Self::check_runtime_admission(&mut inner, root)?;
+                        // This caller already owns an opening-lock Arc. A drain
+                        // waits for it; it must be allowed to finish startup.
+
                         if let Ok(slot) = Arc::clone(&self.worker_slots).try_acquire_owned() {
                             return Ok(slot);
                         }

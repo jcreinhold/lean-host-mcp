@@ -184,6 +184,7 @@ build identity, registry counts, and capability discovery never open a Lean work
 | --- | --- | --- |
 | `status` (default) | none | Observe resident workers, startup callers, occupied slots, and admission state. |
 | `acquire` | optional `lease_seconds`, `retire_idle` | Atomically pause admission if no worker request or startup is admitted. |
+| `drain` | optional `lease_seconds`, `retire_idle` | Pause new admission immediately and let already-admitted work finish. |
 | `renew` | `lease_id`, optional `lease_seconds` | Extend the caller's unexpired lease. |
 | `release` | `lease_id` | Release that lease and resume ordinary admission. |
 
@@ -197,6 +198,20 @@ Acquire returns `acquired`, `busy` (a request or startup already admitted), or `
 It never cancels existing work or waits for capacity. While held, new worker-backed calls return the retryable semantic
 reason `worker_pool_leased`; cheap project status and runtime coordination remain available. The ordinary worker queue
 and parallelism are unchanged outside a lease. There is no priority or fairness guarantee between competing acquirers.
+
+Servers advertising `draining_lease_v1` also accept `drain`. It returns an owned token with `draining` while earlier
+work finishes, or `acquired` when ready. Later worker-backed requests wait inside the server, with their existing timeout
+and cancellation, rather than overtaking the drain. They resume after release or expiry without client resubmission.
+Already-admitted startup continues; a waiting later caller owns no worker or startup slot.
+
+Renew the same token to advance the drain. With `retire_idle: true`, a successful `ok` renewal confirms workers have
+stopped; `draining` means they have not. A generic status call cannot advance a drain or grant permission to start a
+build. Do not hold a build-file lock while waiting for work that may need that lock to finish. After taking the build
+lock, recheck the live token before starting external work. Competing drain owners still have no fairness guarantee.
+
+Expiry restores server admission, but it does **not** prove an external build stopped. If its owner dies while its child
+keeps writing, TTL alone cannot exclude server work. Keep actual build-file/process protections and stop external work
+when lease ownership is lost. This feature does not claim crash-safe exclusion from arbitrary external writers.
 
 An ordinary status snapshot is advisory: another request can start immediately after it. Only a successful, unexpired
 owned lease closes that race. The admission check and lease acquisition share the registry lock. Admitted callers count

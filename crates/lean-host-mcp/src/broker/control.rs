@@ -29,6 +29,8 @@ pub enum RuntimeAction {
     Status,
     /// Pause worker admission only if all admitted requests have finished.
     Acquire,
+    /// Pause new admissions while already-admitted work finishes.
+    Drain,
     /// Extend an unexpired lease owned by the supplied token.
     Renew,
     /// Resume worker admission for the lease owned by the supplied token.
@@ -65,6 +67,8 @@ pub enum RuntimeControlStatus {
     Ok,
     /// The caller owns a live admission lease.
     Acquired,
+    /// An owned pause is draining existing work; no external work may start.
+    Draining,
     /// A request or startup is already admitted; no lease was taken.
     Busy,
     /// Another unexpired lease already owns admission.
@@ -145,6 +149,8 @@ pub struct WorkerActivity {
 struct Lease {
     token: String,
     expires: Instant,
+    drain: bool,
+    retire_idle: bool,
 }
 
 pub(super) struct ControlState {
@@ -164,6 +170,10 @@ impl Default for ControlState {
 }
 
 impl ControlState {
+    pub(super) fn is_draining(&self) -> bool {
+        self.lease.as_ref().is_some_and(|lease| lease.drain)
+    }
+
     pub(super) fn remaining(&mut self, now: Instant) -> Option<u64> {
         if self.lease.as_ref().is_some_and(|lease| lease.expires <= now) {
             self.lease = None;
@@ -239,28 +249,21 @@ impl ProjectBroker {
         } else {
             match request.action {
                 RuntimeAction::Status => {}
-                RuntimeAction::Acquire => {
+                RuntimeAction::Acquire | RuntimeAction::Drain => {
                     if inner.control.lease.is_some() {
                         result = RuntimeControlStatus::Leased;
-                    } else if pool_busy(&inner) {
+                    } else if matches!(request.action, RuntimeAction::Acquire) && pool_busy(&inner) {
                         result = RuntimeControlStatus::Busy;
                     } else {
                         let lease_token = uuid::Uuid::new_v4().to_string();
                         inner.control.lease = Some(Lease {
                             token: lease_token.clone(),
                             expires: deadline.unwrap_or(now),
+                            drain: matches!(request.action, RuntimeAction::Drain),
+                            retire_idle: request.retire_idle,
                         });
                         token = Some(lease_token);
                         result = RuntimeControlStatus::Acquired;
-                        if request.retire_idle {
-                            let paths: Vec<_> = inner.registry.iter().map(|(root, _)| root.clone()).collect();
-                            for path in paths {
-                                if let Some(project) = inner.registry.pop(&path) {
-                                    retiring.push(project);
-                                }
-                                inner.last_used.remove(&path);
-                            }
-                        }
                     }
                 }
                 RuntimeAction::Renew | RuntimeAction::Release => {
@@ -281,6 +284,25 @@ impl ProjectBroker {
                 }
             }
         }
+        // Only the token owner can advance a drain. Status is observation only.
+        if matches!(result, RuntimeControlStatus::Acquired | RuntimeControlStatus::Ok)
+            && matches!(
+                request.action,
+                RuntimeAction::Acquire | RuntimeAction::Drain | RuntimeAction::Renew
+            )
+        {
+            if pool_busy(&inner) {
+                result = RuntimeControlStatus::Draining;
+            } else if inner.control.lease.as_ref().is_some_and(|lease| lease.retire_idle) {
+                let paths: Vec<_> = inner.registry.iter().map(|(root, _)| root.clone()).collect();
+                for path in paths {
+                    if let Some(project) = inner.registry.pop(&path) {
+                        retiring.push(project);
+                    }
+                    inner.last_used.remove(&path);
+                }
+            }
+        }
         let retirement_requested = retiring.len();
         // Closing a mailbox is non-blocking. Do it while admission is fenced;
         // the actor retains its semaphore permit through confirmed child exit.
@@ -289,10 +311,25 @@ impl ProjectBroker {
         }
         drop(retiring);
         let pool = self.pool_snapshot(&mut inner, Instant::now());
-        drop(inner);
         if matches!(result, RuntimeControlStatus::Acquired | RuntimeControlStatus::Ok)
-            && matches!(request.action, RuntimeAction::Acquire | RuntimeAction::Renew)
-            && !pool.admission_paused
+            && inner
+                .control
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.drain && lease.retire_idle)
+            && !pool.workers_stopped
+            && matches!(request.action, RuntimeAction::Drain | RuntimeAction::Renew)
+        {
+            result = RuntimeControlStatus::Draining;
+        }
+        drop(inner);
+        if matches!(
+            result,
+            RuntimeControlStatus::Acquired | RuntimeControlStatus::Draining | RuntimeControlStatus::Ok
+        ) && matches!(
+            request.action,
+            RuntimeAction::Acquire | RuntimeAction::Drain | RuntimeAction::Renew
+        ) && !pool.admission_paused
         {
             // A suspended thread can outlive even the minimum lease. Never
             // confirm a lease that this response already knows has expired.
@@ -309,7 +346,7 @@ impl ProjectBroker {
                 runtime: crate::status::RuntimeSettings::from(&self.runtime_config),
                 server: None,
             },
-            capabilities: vec!["retained_request_binding_v1".to_owned()],
+            capabilities: vec!["retained_request_binding_v1".to_owned(), "draining_lease_v1".to_owned()],
             request_registry: None,
             status: result,
             detail,
@@ -381,7 +418,7 @@ fn validate(request: &RuntimeControlRequest) -> Option<&'static str> {
                 return Some("status takes no lease options");
             }
         }
-        RuntimeAction::Acquire => {
+        RuntimeAction::Acquire | RuntimeAction::Drain => {
             if request.lease_id.is_some() {
                 return Some("acquire does not take an existing lease_id");
             }
@@ -653,6 +690,165 @@ mod tests {
             RuntimeControlStatus::Ok
         );
         assert!(access.try_begin(root, &call.freshness.session_id).is_none());
+        Ok(())
+    }
+    fn drain() -> RuntimeControlRequest {
+        RuntimeControlRequest {
+            action: RuntimeAction::Drain,
+            ..RuntimeControlRequest::default()
+        }
+    }
+
+    #[test]
+    fn drain_fences_new_callers_until_existing_opening_finishes() -> TestResult {
+        let broker = broker();
+        let opening = broker.opening_lock(Path::new("/existing"))?;
+        let result = broker.runtime_control(&drain());
+        assert_eq!(result.status, RuntimeControlStatus::Draining);
+        let token = result.lease_id.ok_or("missing drain token")?;
+        assert!(broker.opening_lock(Path::new("/later")).is_err());
+        assert_eq!(
+            broker
+                .runtime_control(&token_request(RuntimeAction::Renew, &token))
+                .status,
+            RuntimeControlStatus::Draining
+        );
+        drop(opening);
+        assert_eq!(
+            broker
+                .runtime_control(&token_request(RuntimeAction::Renew, &token))
+                .status,
+            RuntimeControlStatus::Ok
+        );
+        assert!(broker.opening_lock(Path::new("/later")).is_err());
+        drop(broker.runtime_control(&token_request(RuntimeAction::Release, &token)));
+        assert!(broker.opening_lock(Path::new("/later")).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_admitted_opener_can_get_capacity_during_drain() -> TestResult {
+        let broker = broker();
+        let opening = broker.opening_lock(Path::new("/existing"))?;
+        let result = broker.runtime_control(&drain());
+        assert_eq!(result.status, RuntimeControlStatus::Draining);
+        let slot = broker
+            .reserve_worker_slot(
+                Path::new("/existing"),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await?;
+        drop(slot);
+        drop(opening);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_caller_waits_without_counting_as_admitted() -> TestResult {
+        let broker = broker();
+        let result = broker.runtime_control(&drain());
+        let token = result.lease_id.ok_or("missing drain token")?;
+        let waiter_broker = Arc::clone(&broker);
+        let waiter = tokio::spawn(async move {
+            waiter_broker
+                .acquire_until(
+                    PathBuf::from("/does-not-exist"),
+                    tokio::time::Instant::now() + Duration::from_millis(200),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let state = broker.runtime_control(&token_request(RuntimeAction::Renew, &token));
+        assert_eq!(state.status, RuntimeControlStatus::Ok);
+        assert!(state.pool.acquiring_projects.is_empty());
+        assert_eq!(state.pool.outstanding_jobs, 0);
+        let result = waiter.await?;
+        assert!(matches!(result, Err(crate::error::ServerError::WorkerUnavailable(info))
+            if info.reason == "project_admission_timeout"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_expiry_wakes_waiter_without_an_api_call() -> TestResult {
+        let broker = broker();
+        let result = broker.runtime_control(&drain());
+        assert!(result.lease_id.is_some());
+        {
+            let mut inner = broker.inner.lock();
+            inner.control.lease.as_mut().ok_or("missing lease")?.expires = Instant::now() + Duration::from_millis(40);
+        }
+        let result = broker
+            .acquire_until(
+                PathBuf::from("/does-not-exist"),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(
+            !matches!(result, Err(crate::error::ServerError::WorkerUnavailable(info))
+            if info.reason == "project_admission_timeout" || info.reason == "worker_pool_draining")
+        );
+        assert!(
+            !broker
+                .runtime_control(&RuntimeControlRequest::default())
+                .pool
+                .admission_paused
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn detached_startup_holds_drain_until_its_opening_guard_drops() -> TestResult {
+        let broker = broker();
+        let opening = broker.opening_lock(Path::new("/detached"))?;
+        let guard = Arc::clone(&opening).lock_owned().await;
+        drop(opening);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let startup = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let _sent = started_tx.send(());
+            let _finished = finish_rx.recv();
+        });
+        started_rx.await?;
+        startup.abort(); // A running blocking task continues after async cancellation.
+        let result = broker.runtime_control(&drain());
+        let token = result.lease_id.ok_or("missing drain token")?;
+        assert_eq!(result.status, RuntimeControlStatus::Draining);
+        assert!(!result.pool.acquiring_projects.is_empty());
+        finish_tx.send(())?;
+        startup.await?;
+        let result = broker.runtime_control(&token_request(RuntimeAction::Renew, &token));
+        assert_eq!(result.status, RuntimeControlStatus::Ok);
+        assert!(result.pool.workers_stopped);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn cancelling_native_drain_waiter_releases_no_other_owners_lease() -> TestResult {
+        let broker = broker();
+        let result = broker.runtime_control(&drain());
+        let token = result.lease_id.ok_or("missing lease")?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting_cancel = cancel.clone();
+        let waiting_broker = Arc::clone(&broker);
+        let waiter = tokio::spawn(async move {
+            crate::cancellation::with_cancellation(
+                &waiting_cancel,
+                waiting_broker.acquire_until(
+                    PathBuf::from("/no-worker-needed"),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                ),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter).await??;
+        assert!(matches!(result, Err(crate::error::ServerError::WorkerUnavailable(info))
+            if info.reason == "request_cancelled"));
+        let state = broker.runtime_control(&token_request(RuntimeAction::Renew, &token));
+        assert_eq!(state.status, RuntimeControlStatus::Ok);
+        assert!(state.pool.admission_paused);
+        assert!(state.pool.acquiring_projects.is_empty());
+        assert_eq!(state.pool.outstanding_jobs, 0);
         Ok(())
     }
 }
