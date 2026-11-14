@@ -9,6 +9,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.5] - 2026-11-14
+
+### Fixed
+
+- Source diagnostics, proof trials and verification now use the target module's Lake compilation options, including
+  `autoImplicit`. Changing options invalidates cached answers. Responses show the project options and host heartbeat
+  limit. This fixes checks that previously accepted code rejected by a project's normal build.
+- Direct dependency configuration keeps `require ... with` settings and compiles into temporary storage, without
+  overwriting an active build's configuration. Unsupported transitive dependency source checks and extra compiler
+  arguments fail clearly rather than fall back to defaults. No imports or Mathlib modules are built during discovery.
+- Update lean-rs to 0.9.8. Worker protocol 11 rejects older workers rather than silently ignoring compilation options.
+  Update the parent and worker together, then restart any running server.
+
+### Changed
+
+- Source requests resolve Lake configuration before checking the result cache. This currently adds about 0.6 seconds
+  per root-project request; direct dependency checks cost more. Lookups of built declarations are unchanged.
+
 ## [0.16.4] - 2026-11-14
 
 ### Fixed
@@ -704,7 +722,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.4...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.5...HEAD
+[0.16.5]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.1...v0.16.2
