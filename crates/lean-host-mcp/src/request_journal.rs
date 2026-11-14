@@ -47,21 +47,57 @@ impl RequestJournal {
                 .is_some_and(|name| name.starts_with("request-write-"))
             {
                 // Only our own incomplete atomic write, after taking ownership.
-                fs::remove_file(&path)?;
+                if let Err(error) = fs::remove_file(&path) {
+                    tracing::warn!(%error, path = %path.display(), "could not remove incomplete journal write; ignoring it");
+                }
                 continue;
             }
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            if records.len() >= capacity || fs::metadata(&path)?.len() > MAX_RECORD_BYTES as u64 {
-                return Err(io::Error::other("request journal exceeds configured bounds"));
+            let read = || -> io::Result<StoredRequest> {
+                if fs::metadata(&path)?.len() > MAX_RECORD_BYTES as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "request record exceeds size bound",
+                    ));
+                }
+                let snapshot: Snapshot = serde_json::from_slice(&fs::read(&path)?)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if snapshot.version != 1
+                    || !snapshot.record.is_epoch_bound()
+                    || path != journal.path(snapshot.record.id())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsupported or inconsistent request journal record",
+                    ));
+                }
+                Ok(snapshot.record)
+            };
+            let record = match read() {
+                Ok(record) => record,
+                Err(error) => {
+                    // The new broker has a fresh epoch: even an unreadable ID
+                    // cannot be retried as new work. Preserve the damaged bytes.
+                    tracing::warn!(%error, path = %path.display(), "request record invalid or unreadable; preserving it separately");
+                    let mut quarantine = path.with_extension("json.quarantined");
+                    if fs::symlink_metadata(&quarantine).is_ok() {
+                        quarantine = path.with_extension(format!("json.{}.quarantined", uuid::Uuid::new_v4()));
+                    }
+                    fs::rename(&path, &quarantine).map_err(|error| {
+                        io::Error::new(error.kind(), format!(
+                            "could not preserve unreadable request record {} separately: {error}; no requests were admitted",
+                            path.display()
+                        ))
+                    })?;
+                    continue;
+                }
+            };
+            if records.len() >= capacity {
+                return Err(io::Error::other("request journal exceeds configured capacity"));
             }
-            let snapshot: Snapshot = serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;
-            if snapshot.version != 1 || !snapshot.record.is_epoch_bound() || path != journal.path(snapshot.record.id())
-            {
-                return Err(io::Error::other("unsupported or inconsistent request journal record"));
-            }
-            records.push(snapshot.record);
+            records.push(record);
         }
         Ok((journal, records))
     }
@@ -90,6 +126,15 @@ impl RequestJournal {
         temp.write_all(&bytes)?;
         temp.as_file().sync_all()?;
         temp.persist(self.path(id)).map_err(io::Error::other)?;
+        File::open(&self.directory)?.sync_all()
+    }
+
+    pub(crate) fn check_writable(&self) -> io::Result<()> {
+        let probe = tempfile::Builder::new()
+            .prefix("request-write-")
+            .tempfile_in(&self.directory)?;
+        probe.as_file().sync_all()?;
+        probe.close()?;
         File::open(&self.directory)?.sync_all()
     }
 
@@ -130,5 +175,36 @@ mod tests {
         assert!(RequestJournal::open(dir.path(), 128).is_err());
         drop(next);
         assert!(RequestJournal::open(dir.path(), 128).is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_record_is_preserved_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unreadable.json");
+        std::os::unix::fs::symlink(dir.path().join("temporarily-missing"), &path).unwrap();
+        let (_, records) = RequestJournal::open(dir.path(), 128).unwrap();
+        assert!(records.is_empty());
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert!(std::fs::symlink_metadata(path.with_extension("json.quarantined")).is_ok());
+        // A dangling archived symlink still occupies its filename and must not
+        // be overwritten by a later unreadable record with the same source path.
+        std::os::unix::fs::symlink(dir.path().join("another-missing"), &path).unwrap();
+        RequestJournal::open(dir.path(), 128).unwrap();
+        assert_eq!(
+            std::fs::read_link(path.with_extension("json.quarantined")).unwrap(),
+            dir.path().join("temporarily-missing")
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "quarantined"))
+                .count(),
+            2
+        );
     }
 }

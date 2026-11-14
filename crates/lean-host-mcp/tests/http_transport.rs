@@ -948,7 +948,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     assert_eq!(status["effective_settings"]["server"]["response_carrier"], "both");
     assert_eq!(
         status["request_registry"],
-        json!({"active":0,"retained_terminal":0,"capacity":128,"terminal_retention_millis":600_000,
+        json!({"active":0,"retained_terminal":0,"capacity":128,"terminal_retention_millis":86_400_000,
             "request_epoch":status["request_registry"]["request_epoch"],"durable":false,"journal_healthy":true,"max_record_bytes":4*1024*1024})
     );
     server.shutdown().await;

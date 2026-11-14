@@ -83,14 +83,15 @@ Closing an HTTP connection alone does not request cancellation. A synchronous re
 its worker deadline, even when its response stream is lost. Synchronous clients should send MCP
 `notifications/cancelled` with the original request ID when they intend to stop work.
 
-The server retains at most 128 active, terminal or acknowledged records. Legacy completed results remain available
-for ten minutes; epoch-bound results remain until acknowledged.
-When that registry is full, negotiated task calls use the ordinary synchronous path; explicit `lean_request` submits
-are rejected without running, so they never silently lose retention. Follow the suggested polling interval; task push
-notifications and in-task input are not used. Legacy retention survives client disconnects, not a server restart. An automatically generated task ID
-identifies one request, not a deduplication key: resubmitting a semantic `tools/call` creates another request. The explicit
-`lean_request` client-chosen ID exception is described above. Callers remain
-responsible for binding requests to the source revision they require.
+The server retains at most 128 active or finished records. Epoch-bound results expire after 24 hours, including across
+a restart when a journal is configured. Legacy and negotiated task results keep their ten-minute retention. Reads and
+submissions remove expired records; an idle server needs no cleanup timer. At capacity, it first removes an acknowledged
+epoch-bound record, or otherwise the oldest finished epoch-bound result. It never evicts an active request. If no record can be removed, negotiated task
+calls use the ordinary synchronous path; explicit `lean_request` submits are rejected without running. Follow the
+suggested polling interval; task push notifications and in-task input are not used. Legacy retention survives client
+disconnects, not a server restart. An automatically generated task ID identifies one request, not a deduplication key:
+resubmitting a semantic `tools/call` creates another request. The explicit `lean_request` client-chosen ID exception is
+described above. Callers remain responsible for binding requests to the source revision they require.
 
 A cancellation acknowledgement records intent. A queued operation is skipped, while a running worker operation must
 finish its cleanup before normal cancellation becomes terminal. Supervisor observation and deadlines bound worker
@@ -104,7 +105,7 @@ epoch and a fresh client-chosen ID before submitting. Supply `request_epoch` on 
 `request` binding includes the original epoch and original broker instance, even after recovery. A duplicate retained ID
 with exactly the same epoch and input returns its original record, never another execution. A forgotten ID under a
 closed epoch is rejected as `unknown`, never relaunched. This is not a claim that the original operation never ran. An
-epoch may rotate to compact acknowledged records without restarting any warm worker.
+epoch rotates before removing expired or capacity-evicted records, without restarting a worker.
 
 Every bridge response adds:
 
@@ -136,24 +137,31 @@ compact deduplication evidence. A terminal `unknown` may be acknowledged only af
 lifetime in its own durable association; acknowledgment does not change `unknown` to `stopped`, release a source/build
 reader, or authorize replay. This keeps consumed errors from permanently filling the registry. Subsequent gets return
 `acknowledged: true`, `result_available: false` and no `result`/`error`. Repeated acknowledgments are idempotent while
-the record exists. At capacity, the next admission may rotate the epoch and compact acknowledged records; fetch the new
-epoch for genuinely new work, never blindly replay an unresolved old request with a new identity. Active and
-unacknowledged records are not evicted. The record bound is 4 MiB, so a too-large result explicitly loses its verdict
-(`result_available: false`) but retains execution evidence.
+the record exists. At capacity, the next admission may remove the oldest finished result even without acknowledgment.
+Fetch the new epoch for genuinely new work, never blindly replay an unresolved old request with a new identity. Active
+requests never expire or lose their records. The record bound is 4 MiB, so a too-large result explicitly loses its
+verdict (`result_available: false`) but retains execution evidence.
 
 Durability is explicit: `request_registry.durable` is true only when a healthy `--request-journal DIR` (or
-`LEAN_HOST_MCP_REQUEST_JOURNAL`) is configured. `journal_healthy: false` disables new retained admission and ack. With
-no journal the v2 lifetime and epoch rules still apply, but evidence is process-local. The directory has one broker
-owner, enforced by an OS file lock, and bounded per-request atomic, synced snapshots. It is not a worker queue.
-Snapshots contain response data and should be treated as private local application data. Only epoch-bound bridge
-requests are journalled, not negotiated MCP Tasks or legacy requests.
+`LEAN_HOST_MCP_REQUEST_JOURNAL`) is configured. `journal_healthy: false` reports a storage failure. New submissions and
+acknowledgments retry storage, re-save current records, and proceed only after that succeeds. Status, result reads and
+cancellation remain usable. With no journal the v2 lifetime and epoch rules still apply, but evidence is process-local.
+The directory has one broker owner, enforced by an OS file lock, and bounded per-request atomic, synced snapshots. It is
+not a worker queue. Snapshots contain response data and should be treated as private local application data. Only
+epoch-bound bridge requests are journalled, not negotiated MCP Tasks or legacy requests.
 
 On restart the admission epoch is fresh. Completed results are recovered. Accepted records durably known never to have
 reached dispatch intent become `not_started`; dispatch-intent records without a durable terminal outcome become
 `unknown`. Neither is replayed. The current worker supervisor cannot prove the old worker lifetime after arbitrary
 broker death, so a new healthy broker is not an exit witness. Journal recovery deliberately does not kill, adopt or
 relaunch workers, or claim that all old work stopped. Existing uncertain-outcome recovery remains necessary for those
-cases. Disk failure blocks further retained admission rather than silently degrading to non-durable execution.
+cases. An invalid or unreadable snapshot is moved aside with a warning; healthy records remain available. Moving it
+preserves its bytes without claiming an I/O error means corruption. If that move fails, startup reports the path and
+error rather than admitting work with uncounted records. The missing request returns
+`unknown`, never a pass or an automatic rerun. Disk failure blocks new retained work only while storage remains
+unusable. The service retries on the next submission or acknowledgment; it does not need a restart. Quarantined files
+retain their original bytes for inspection and do not count toward the active result limit. They are not deleted automatically;
+repeated read failures can grow this separate set of files and each occurrence logs its path.
 
 ## Worker Activity And Admission Leases
 

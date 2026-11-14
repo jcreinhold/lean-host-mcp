@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
@@ -18,7 +18,8 @@ use crate::cancellation::with_cancellation_evidence;
 use crate::request_journal::RequestJournal;
 
 const MAX_TASKS: usize = 128;
-const RETENTION: Duration = Duration::from_secs(600);
+const RETENTION: Duration = Duration::from_hours(24);
+const LEGACY_RETENTION: Duration = Duration::from_secs(600);
 pub(crate) const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -59,6 +60,8 @@ pub(crate) struct StoredRequest {
     cancellation_requested: bool,
     acknowledged: bool,
     result_available: bool,
+    #[serde(default)]
+    finished_at: Option<u64>,
 }
 
 impl StoredRequest {
@@ -67,6 +70,13 @@ impl StoredRequest {
     }
     pub(crate) fn is_epoch_bound(&self) -> bool {
         self.request.as_ref().and_then(|r| r.request_epoch.as_ref()).is_some()
+    }
+    fn retention(&self) -> Duration {
+        if self.is_epoch_bound() {
+            RETENTION
+        } else {
+            LEGACY_RETENTION
+        }
     }
 }
 
@@ -140,8 +150,22 @@ impl RequestTasks {
                     "The previous broker stopped; work was not replayed",
                 );
                 record.result_available = false;
-                registry.persist(&record)?;
+                record.finished_at = Some(unix_seconds());
+                if let Err(error) = registry.persist(&record) {
+                    tracing::warn!(%error, "could not save interrupted request; will retry before new work");
+                }
             }
+            if record.task.status().is_terminal() && record.finished_at.is_none() {
+                record.finished_at = Some(unix_seconds());
+                if let Err(error) = registry.persist(&record) {
+                    tracing::warn!(%error, "could not save result retention time; will retry");
+                }
+            }
+            let remaining = record.task.status().is_terminal().then(|| {
+                RETENTION.saturating_sub(Duration::from_secs(
+                    unix_seconds().saturating_sub(*record.finished_at.get_or_insert_with(unix_seconds)),
+                ))
+            });
             let id = record.task.task.task_id.clone();
             registry.entries.insert(
                 id,
@@ -149,7 +173,7 @@ impl RequestTasks {
                     stored: record,
                     cancellation: CancellationToken::new(),
                     created: Instant::now(),
-                    expires: None,
+                    expires: remaining.and_then(|duration| Instant::now().checked_add(duration)),
                 },
             );
         }
@@ -254,6 +278,7 @@ impl RequestTasks {
             // this absent ID was fresh in the still-open epoch under this lock.
             // Rotation now fences forgotten keys without relaunching any of them.
             registry.compact();
+            registry.recover_journal();
             if registry.journal_error {
                 return Err(no_start(
                     "request_journal_unavailable",
@@ -271,20 +296,35 @@ impl RequestTasks {
             let task = Task::new(task_id, TaskStatus::Working, &now, &now)
                 .with_status_message(format!("Accepted {tool}"))
                 .with_poll_interval_ms(2_000);
-            let stored = StoredRequest {
+            let mut stored = StoredRequest {
                 task: DetailedTask::new(task.clone(), TaskPayload::Working),
                 request,
                 execution: Execution::new(Disposition::Pending, "accepted"),
                 cancellation_requested: false,
                 acknowledged: false,
                 result_available: false,
+                finished_at: None,
             };
-            registry.persist(&stored).map_err(|_| {
-                no_start(
+            if registry.persist(&stored).is_err() {
+                // Rename may have succeeded before directory sync failed. Keep
+                // this ID accounted for and retry its no-start result on recovery.
+                stored.execution = Execution::new(Disposition::NotStarted, "request_journal_unavailable");
+                stored.task = failed_task(task.clone(), "request_journal_unavailable", "Work was not submitted");
+                stored.finished_at = Some(unix_seconds());
+                registry.entries.insert(
+                    task.task_id,
+                    Entry {
+                        stored,
+                        cancellation,
+                        created: Instant::now(),
+                        expires: Instant::now().checked_add(RETENTION),
+                    },
+                );
+                return Err(no_start(
                     "request_journal_unavailable",
                     "Could not retain acceptance; no work was submitted",
-                )
-            })?;
+                ));
+            }
             registry.entries.insert(
                 task.task_id.clone(),
                 Entry {
@@ -313,12 +353,9 @@ impl RequestTasks {
                     true,
                 ),
             }
-            let registry = Arc::downgrade(&tasks.0);
-            drop(tasks);
-            tokio::time::sleep(RETENTION).await;
-            if let Some(registry) = registry.upgrade() {
-                registry.lock().prune(Instant::now());
-            }
+            // Reads and admissions prune expired results. Avoid a sleeping task
+            // per completed call: evicted results would otherwise leave timers
+            // behind for the whole retention period.
         });
         Ok(Some(task))
     }
@@ -334,10 +371,18 @@ impl RequestTasks {
             entry.stored.task = DetailedTask::new(entry.stored.task.task.clone(), TaskPayload::Cancelled);
             entry.stored.task.task.last_updated_at = current_timestamp();
             entry.stored.task.task.status_message = None;
-            if !entry.stored.is_epoch_bound() {
-                entry.expires = Instant::now().checked_add(RETENTION);
+            entry.stored.finished_at = Some(unix_seconds());
+            {
+                entry.expires = Instant::now().checked_add(entry.stored.retention());
                 entry.stored.task.task.ttl_ms = Some(
-                    u64::try_from(entry.created.elapsed().saturating_add(RETENTION).as_millis()).unwrap_or(u64::MAX),
+                    u64::try_from(
+                        entry
+                            .created
+                            .elapsed()
+                            .saturating_add(entry.stored.retention())
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX),
                 );
             }
         } else {
@@ -347,6 +392,8 @@ impl RequestTasks {
         if registry.persist(&record).is_err() {
             if let Some(entry) = registry.entries.get_mut(id) {
                 entry.stored.execution = Execution::new(Disposition::NotStarted, "request_journal_unavailable");
+                entry.stored.finished_at = Some(unix_seconds());
+                entry.expires = Instant::now().checked_add(entry.stored.retention());
                 entry.stored.task = failed_task(
                     entry.stored.task.task.clone(),
                     "request_journal_unavailable",
@@ -411,6 +458,8 @@ impl RequestTasks {
 
     pub(crate) fn acknowledge(&self, id: &str, epoch: &str, digest: &str) -> Result<RetainedTask, McpError> {
         let mut registry = self.0.lock();
+        registry.prune(Instant::now());
+        registry.recover_journal();
         if registry.journal_error {
             return Err(McpError::internal_error("Request journal unavailable", None));
         }
@@ -470,17 +519,18 @@ impl RequestTasks {
         };
         entry.stored.task.task.last_updated_at = current_timestamp();
         entry.stored.task.task.status_message = None;
-        if entry
-            .stored
-            .request
-            .as_ref()
-            .and_then(|r| r.request_epoch.as_ref())
-            .is_none()
-        {
-            entry.stored.task.task.ttl_ms =
-                Some(u64::try_from(entry.created.elapsed().saturating_add(RETENTION).as_millis()).unwrap_or(u64::MAX));
-            entry.expires = Instant::now().checked_add(RETENTION);
-        }
+        entry.stored.finished_at = Some(unix_seconds());
+        entry.stored.task.task.ttl_ms = Some(
+            u64::try_from(
+                entry
+                    .created
+                    .elapsed()
+                    .saturating_add(entry.stored.retention())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+        );
+        entry.expires = Instant::now().checked_add(entry.stored.retention());
         entry.stored.task = DetailedTask::new(entry.stored.task.task.clone(), payload);
         entry.stored.result_available = true;
         if serde_json::to_vec(&entry.stored).is_ok_and(|bytes| bytes.len() > MAX_RECORD_BYTES.saturating_sub(64)) {
@@ -512,34 +562,76 @@ impl Registry {
         Ok(())
     }
 
+    // Retry on demand, under the registry lock. Re-save all current records before
+    // admitting work: a prior terminal write may have failed after execution.
+    fn recover_journal(&mut self) {
+        if !self.journal_error {
+            return;
+        }
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        if journal.check_writable().is_err() {
+            return;
+        }
+        for entry in self.entries.values().filter(|e| e.stored.is_epoch_bound()) {
+            if journal.write(entry.stored.id(), &entry.stored).is_err() {
+                return;
+            }
+        }
+        self.journal_error = false;
+    }
+
+    fn forget(&mut self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        // Rotation precedes removal, including partial disk failures. Restart
+        // also creates a fresh epoch, so forgotten IDs cannot execute again.
+        self.epoch = uuid::Uuid::new_v4().to_string();
+        for id in ids {
+            if let Some(journal) = &self.journal
+                && let Err(error) = journal.remove(&id)
+            {
+                self.journal_error = true;
+                tracing::warn!(%error, "could not remove expired result; will retry");
+                continue;
+            }
+            self.entries.remove(&id);
+        }
+    }
+
     fn prune(&mut self, now: Instant) {
-        self.entries.retain(|_, e| e.expires.is_none_or(|expiry| expiry > now));
+        let ids = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.stored.task.status().is_terminal() && e.expires.is_some_and(|expiry| expiry <= now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.forget(ids);
     }
 
     fn compact(&mut self) {
-        if self.entries.len() >= MAX_TASKS && self.entries.values().any(|e| e.stored.acknowledged) {
-            // Publish a fresh admission fence BEFORE forgetting any identities.
-            // Epochs are always fresh on process restart, so no disk epoch write
-            // is needed: deleted keys are rejected by both this and later brokers.
-            self.epoch = uuid::Uuid::new_v4().to_string();
-            let ids: Vec<_> = self
-                .entries
-                .iter()
-                .filter(|(_, e)| e.stored.acknowledged)
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in ids {
-                if let Some(journal) = &self.journal
-                    && let Err(error) = journal.remove(&id)
-                {
-                    self.journal_error = true;
-                    tracing::error!(%error, "could not prune request journal");
-                    break;
-                }
-                self.entries.remove(&id);
-            }
+        if self.entries.len() < MAX_TASKS {
+            return;
         }
+        // Prefer acknowledged records, then the oldest terminal result. Legacy
+        // IDs have no epoch and cannot safely be pressure-evicted.
+        let id = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.stored.is_epoch_bound() && e.stored.task.status().is_terminal())
+            .min_by_key(|(_, e)| (!e.stored.acknowledged, e.stored.finished_at, e.created))
+            .map(|(id, _)| id.clone());
+        self.forget(id.into_iter().collect());
     }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn completion_execution(result: &Result<CallToolResult, McpError>, panicked: bool) -> Execution {
@@ -891,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_results_survive_time_and_ack_requires_exact_consumed_identity() {
+    async fn v2_results_survive_until_expiry_and_ack_requires_exact_consumed_identity() {
         let tasks = RequestTasks::default();
         let binding = v2_binding(&tasks);
         let epoch = binding.request_epoch.clone().unwrap();
@@ -901,7 +993,7 @@ mod tests {
             })
             .unwrap();
         terminal(&tasks, "v2").await;
-        tasks.0.lock().prune(Instant::now() + RETENTION * 100);
+        tasks.0.lock().prune(Instant::now() + RETENTION / 2);
         assert!(tasks.get_retained("v2").unwrap().result_available);
         assert!(tasks.acknowledge("v2", &epoch, "wrong-digest").is_err());
         assert!(
@@ -1069,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_recovery_distinguishes_never_dispatched_from_uncertain_and_fails_on_corruption() {
+    fn journal_recovery_distinguishes_never_dispatched_from_uncertain_and_isolates_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let tasks = RequestTasks::open(dir.path()).unwrap();
         let binding = v2_binding(&tasks);
@@ -1081,6 +1173,7 @@ mod tests {
                 cancellation_requested: false,
                 acknowledged: false,
                 result_available: false,
+                finished_at: None,
             };
             tasks.0.lock().persist(&record).unwrap();
         }
@@ -1096,8 +1189,23 @@ mod tests {
             Disposition::Unknown
         );
         drop(recovered);
-        std::fs::write(dir.path().join("corrupt.json"), "not json").unwrap();
-        assert!(RequestTasks::open(dir.path()).is_err());
+        let damaged = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| std::fs::read_to_string(path).is_ok_and(|s| s.contains("dispatched")))
+            .unwrap();
+        std::fs::write(&damaged, "not json").unwrap();
+        let healthy = RequestTasks::open(dir.path()).unwrap();
+        assert!(healthy.get_retained("accepted").is_ok());
+        assert!(healthy.get_retained("dispatched").is_err());
+        assert!(
+            healthy
+                .submit("test", "dispatched".into(), binding, || async {
+                    panic!("damaged request replay")
+                })
+                .is_err()
+        );
+        assert!(damaged.with_extension("json.quarantined").exists());
     }
 
     #[tokio::test]
@@ -1206,11 +1314,25 @@ mod tests {
         assert!(!tasks.status().journal_healthy);
         assert!(
             tasks
-                .submit("test", "again".into(), binding, || async {
+                .submit("test", "again".into(), binding.clone(), || async {
                     panic!("unhealthy journal")
                 })
                 .is_err()
         );
+        std::fs::rename(dir.path().join("moved"), &path).unwrap();
+        tasks
+            .submit("test", "recovered".into(), v2_binding(&tasks), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "recovered").await;
+        assert!(tasks.status().journal_healthy);
+        let failed = tasks
+            .submit("test", "failed-write".into(), binding, || async {
+                panic!("failed acceptance ID must not execute on retry")
+            })
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
     }
 
     #[tokio::test]
@@ -1223,5 +1345,241 @@ mod tests {
         terminal(&tasks, &task.task_id).await;
         tasks.0.lock().prune(Instant::now() + RETENTION * 2);
         assert!(tasks.get(&task.task_id).is_err());
+    }
+    #[tokio::test]
+    async fn pressure_eviction_fences_old_ids_and_preserves_active_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(dir.path()).unwrap();
+        let active_binding = v2_binding(&tasks);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tasks
+            .submit("test", "active".into(), active_binding.clone(), || async {
+                rx.await.unwrap();
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        let original = v2_binding(&tasks);
+        for i in 0..(MAX_TASKS + 3) {
+            tasks
+                .submit("test", format!("done-{i}"), v2_binding(&tasks), || async {
+                    Ok(CallToolResult::success(vec![]))
+                })
+                .unwrap();
+            terminal(&tasks, &format!("done-{i}")).await;
+        }
+        assert_eq!(tasks.status().active, 1);
+        assert_eq!(tasks.0.lock().entries.len(), MAX_TASKS);
+        assert!(tasks.get("done-0").is_err());
+        assert!(
+            tasks
+                .submit("test", "done-0".into(), original, || async { panic!("expired retry") })
+                .is_err()
+        );
+        assert!(
+            tasks
+                .submit("test", "active".into(), active_binding, || async {
+                    panic!("active retry")
+                })
+                .is_ok()
+        );
+        tx.send(()).unwrap();
+        terminal(&tasks, "active").await;
+    }
+
+    #[tokio::test]
+    async fn finished_timestamp_expires_across_restart_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(dir.path()).unwrap();
+        let original = v2_binding(&tasks);
+        tasks
+            .submit("test", "old".into(), original.clone(), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "old").await;
+        while Arc::strong_count(&tasks.0) > 1 {
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut registry = tasks.0.lock();
+            let mut stored = registry.entries["old"].stored.clone();
+            stored.finished_at = Some(unix_seconds() - RETENTION.as_secs() - 1);
+            registry.persist(&stored).unwrap();
+        }
+        drop(tasks);
+        let recovered = RequestTasks::open(dir.path()).unwrap();
+        assert!(recovered.get("old").is_err());
+        assert!(
+            recovered
+                .submit("test", "old".into(), original, || async { panic!("expired retry") })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_write_failure_recovers_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let tasks = RequestTasks::open(&path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let original = v2_binding(&tasks);
+        tasks
+            .submit("test", "running".into(), original.clone(), || async {
+                rx.await.unwrap();
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        std::fs::rename(&path, dir.path().join("moved")).unwrap();
+        tx.send(()).unwrap();
+        terminal(&tasks, "running").await;
+        assert!(!tasks.status().journal_healthy);
+        std::fs::rename(dir.path().join("moved"), &path).unwrap();
+        tasks
+            .submit("test", "new".into(), v2_binding(&tasks), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "new").await;
+        assert!(tasks.status().journal_healthy);
+        while Arc::strong_count(&tasks.0) > 1 {
+            tokio::task::yield_now().await;
+        }
+        drop(tasks);
+        let recovered = RequestTasks::open(&path).unwrap();
+        assert_eq!(recovered.get("running").unwrap().status(), TaskStatus::Completed);
+        assert!(
+            recovered
+                .submit("test", "running".into(), original, || async { panic!("replay") })
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn failed_expiry_removal_keeps_result_until_storage_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let tasks = RequestTasks::open(&path).unwrap();
+        let original = v2_binding(&tasks);
+        tasks
+            .submit("test", "expired".into(), original.clone(), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "expired").await;
+        // A directory in place of this result simulates a delete failure without
+        // permission/root-dependent behavior or filling the user's disk.
+        let file = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .unwrap();
+        let saved = file.with_extension("saved");
+        std::fs::rename(&file, &saved).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        tasks.0.lock().prune(Instant::now() + RETENTION * 2);
+        assert!(tasks.get("expired").is_ok());
+        assert!(!tasks.status().journal_healthy);
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(&saved, &file).unwrap();
+        tasks.0.lock().prune(Instant::now() + RETENTION * 2);
+        assert!(tasks.get("expired").is_err());
+        assert!(
+            tasks
+                .submit("test", "expired".into(), original, || async {
+                    panic!("expired replay")
+                })
+                .is_err()
+        );
+        tasks
+            .submit("test", "next".into(), v2_binding(&tasks), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "next").await;
+        assert!(tasks.status().journal_healthy);
+    }
+    #[tokio::test]
+    async fn legacy_results_keep_ten_minute_expiry_without_expiring_v2_results() {
+        let tasks = RequestTasks::default();
+        tasks
+            .submit("test", "v2-kept".into(), v2_binding(&tasks), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "v2-kept").await;
+        for i in 0..MAX_TASKS - 1 {
+            let id = format!("legacy-{i}");
+            tasks
+                .submit("test", id.clone(), binding(1), || async {
+                    Ok(CallToolResult::success(vec![]))
+                })
+                .unwrap();
+            terminal(&tasks, &id).await;
+        }
+        tasks
+            .0
+            .lock()
+            .prune(Instant::now() + LEGACY_RETENTION + Duration::from_secs(1));
+        assert!(tasks.get("legacy-0").is_err());
+        assert!(tasks.get("v2-kept").is_ok());
+        assert_eq!(tasks.status().retained_terminal, 1);
+        tasks
+            .submit("test", "new-v2".into(), v2_binding(&tasks), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "new-v2").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_record_recovery_cannot_overflow_restart_or_replay_old_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(dir.path()).unwrap();
+        let original = v2_binding(&tasks);
+        tasks
+            .submit("test", "unreadable".into(), original.clone(), || async {
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "unreadable").await;
+        while Arc::strong_count(&tasks.0) > 1 {
+            tokio::task::yield_now().await;
+        }
+        drop(tasks);
+        let file = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let missing_target = dir.path().join("restored-snapshot");
+        std::os::unix::fs::symlink(&missing_target, &file).unwrap();
+        let tasks = RequestTasks::open(dir.path()).unwrap();
+        for i in 0..MAX_TASKS {
+            let id = format!("new-{i}");
+            tasks
+                .submit("test", id.clone(), v2_binding(&tasks), || async {
+                    Ok(CallToolResult::success(vec![]))
+                })
+                .unwrap();
+            terminal(&tasks, &id).await;
+        }
+        while Arc::strong_count(&tasks.0) > 1 {
+            tokio::task::yield_now().await;
+        }
+        drop(tasks);
+        std::fs::write(&missing_target, &bytes).unwrap();
+        assert_eq!(std::fs::read(file.with_extension("json.quarantined")).unwrap(), bytes);
+        let recovered = RequestTasks::open(dir.path()).unwrap();
+        assert_eq!(recovered.status().retained_terminal, MAX_TASKS);
+        assert!(recovered.get("unreadable").is_err());
+        assert!(
+            recovered
+                .submit("test", "unreadable".into(), original, || async {
+                    panic!("unreadable old request must not replay")
+                })
+                .is_err()
+        );
     }
 }
