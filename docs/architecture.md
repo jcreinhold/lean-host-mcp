@@ -331,7 +331,10 @@ their configuration; lookups of already-built declarations are unaffected. Direc
 dependency configuration compiles into temporary storage, with the original source
 paths and current `require ... with` options. This avoids both stale standalone
 configuration values and overwriting another build's saved config. Temporary files
-are removed on success, failure and cancellation.
+are removed on success, failure and cancellation. Lake may create a missing
+`.lake` directory in the dependency, but its config files and locks stay in
+temporary storage. Root configuration loading uses Lake's normal cache and may
+update that cache; this helper is not a strictly read-only filesystem operation.
 Files outside a configured library and file-less trials use Lake's
 root-package external-file defaults, not a guessed primary library.
 
