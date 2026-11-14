@@ -849,6 +849,9 @@ enum RestartCause {
     /// Imports retained the configured budget of unreclaimable bytes, and the
     /// child was cycled before the next one on the request path.
     ImportResidue,
+    /// A failed header import left retained memory unmeasured. Retire the child
+    /// before another request; the failed request keeps its original diagnostics.
+    ImportAccountingUnknown,
     /// The same budget crossed its soft threshold while the mailbox was empty,
     /// so the cycle ran between requests instead of inside one. The ratio of
     /// this cause to [`Self::ImportResidue`] is how much of the recycle cost the
@@ -873,6 +876,7 @@ impl RestartCause {
             Self::MaxRequests => "max_requests",
             Self::MaxImports => "max_imports",
             Self::ImportResidue => "import_residue",
+            Self::ImportAccountingUnknown => "import_accounting_unknown",
             Self::ImportResidueIdle => "import_residue_idle",
             Self::Idle => "idle",
             Self::Timeout => "timeout",
@@ -978,16 +982,25 @@ fn log_restart(event: &RuntimeRestartEvent, restarts_total: u64) {
         // ratio between them is the tuning signal, and it is the *reactive*
         // half — the cycle a call had to wait for — that an operator acts on.
         "import_residue" => emit!(info, "worker recycled (import residue budget)"),
+        "import_accounting_unknown" => emit!(
+            info,
+            "worker retired after an import error; retained memory could not be measured"
+        ),
         _ => emit!(debug, "worker recycled (hygiene)"),
     }
 }
 
 fn restart_cause_from_worker(reason: &LeanWorkerRestartReason) -> RestartCause {
-    match reason.stable_cause() {
+    restart_cause_from_worker_name(reason.stable_cause())
+}
+
+fn restart_cause_from_worker_name(cause: &str) -> RestartCause {
+    match cause {
         "explicit" => RestartCause::Explicit,
         "max_requests" => RestartCause::MaxRequests,
         "max_imports" => RestartCause::MaxImports,
         "import_residue" => RestartCause::ImportResidue,
+        "import_accounting_unknown" => RestartCause::ImportAccountingUnknown,
         "rss_ceiling" => RestartCause::RssPostJob,
         "rss_hard_limit" => RestartCause::RssHardLimit,
         "idle" => RestartCause::Idle,
@@ -3025,7 +3038,16 @@ fn worker_death_cause(err: &LeanWorkerError) -> RestartCause {
     }
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "protocol 12 accounting retirement is handled by stable name above the match, preserving compatibility with published lean-rs"
+)]
 fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
+    // Match the stable name to retain compatibility with the published lean-rs
+    // version while protocol 12 is prepared for release.
+    if reason.stable_cause() == RestartCause::ImportAccountingUnknown.as_str() {
+        return "import_accounting_unknown: retained memory could not be measured after an import error".to_owned();
+    }
     match reason {
         LeanWorkerRestartReason::Explicit => RestartCause::Explicit.as_str().to_owned(),
         LeanWorkerRestartReason::MaxRequests { limit } => format!("max_requests limit={limit}"),
@@ -3549,6 +3571,7 @@ mod tests {
         assert!(!RestartCause::MaxRequests.counts_toward_restart_limit());
         assert!(!RestartCause::MaxImports.counts_toward_restart_limit());
         assert!(!RestartCause::ImportResidue.counts_toward_restart_limit());
+        assert!(!RestartCause::ImportAccountingUnknown.counts_toward_restart_limit());
         assert!(!RestartCause::ImportResidueIdle.counts_toward_restart_limit());
         assert!(!RestartCause::Idle.counts_toward_restart_limit());
 
@@ -3558,6 +3581,16 @@ mod tests {
         assert!(RestartCause::Cancelled.counts_toward_restart_limit());
         assert!(RestartCause::SessionMissing.counts_toward_restart_limit());
         assert!(RestartCause::RssHardLimit.counts_toward_restart_limit());
+    }
+
+    #[test]
+    fn unknown_import_accounting_is_a_planned_retirement_not_a_crash() {
+        let cause = restart_cause_from_worker_name("import_accounting_unknown");
+        assert_eq!(cause, RestartCause::ImportAccountingUnknown);
+        assert_eq!(cause.as_str(), "import_accounting_unknown");
+        assert!(cause.is_planned());
+        assert!(!cause.counts_toward_restart_limit());
+        assert!(restart_cause_from_worker_name("unrecognized_policy").counts_toward_restart_limit());
     }
 
     #[test]

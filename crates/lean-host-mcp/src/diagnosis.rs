@@ -194,7 +194,7 @@ pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 ///
 /// Returns the `call_restart` event for a job-disrupting cause; `None`
 /// otherwise. `max_requests` / `max_imports` / `import_residue` /
-/// `import_residue_idle` / `idle` / `explicit` are excluded: they are planned
+/// `import_residue_idle` / `import_accounting_unknown` / `idle` / `explicit` are excluded: they are planned
 /// hygiene cycles, not duress. A residue cycle in particular runs *before* the
 /// import that would have crossed the budget, so the call it precedes runs in a
 /// fresh child under no pressure at all — the opposite of the RSS causes below,
@@ -396,6 +396,7 @@ mod tests {
             "max_imports",
             "import_residue",
             "import_residue_idle",
+            "import_accounting_unknown",
             "idle",
             "explicit",
         ] {
