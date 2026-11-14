@@ -33,6 +33,7 @@ pub mod envelope;
 pub mod error;
 mod ilean;
 pub mod lake_meta;
+mod lake_options;
 mod project;
 pub mod projections;
 mod request_journal;

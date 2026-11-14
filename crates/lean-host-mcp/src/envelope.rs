@@ -53,6 +53,7 @@ use crate::trust::ArtifactTrust;
 /// the verbosity-gated [`Telemetry`] block.
 #[derive(Debug, Clone)]
 pub struct Freshness {
+    pub elaboration_options: Option<ElaborationOptions>,
     pub project_root: String,
     pub project_hash: String,
     pub imports: Vec<String>,
@@ -71,9 +72,39 @@ pub struct Freshness {
 /// flips when the worker re-spawns, signalling a context reset.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct FreshnessIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elaboration_options: Option<ElaborationOptions>,
     pub project_root: String,
     pub session_id: String,
     pub lean_toolchain: String,
+}
+
+/// Compiler options used for this call, separate from operational telemetry.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ElaborationOptions {
+    pub project_options: BTreeMap<String, serde_json::Value>,
+    /// The host overrides the project's maxHeartbeats with this bounded value.
+    pub effective_max_heartbeats: u64,
+}
+
+impl ElaborationOptions {
+    pub(crate) fn from_worker(options: &lean_rs_worker_parent::LeanWorkerElabOptions) -> Self {
+        Self {
+            project_options: options
+                .lean_options
+                .iter()
+                .map(|(name, value)| {
+                    let value = match value {
+                        lean_toolchain::LeanOptionValue::Bool(value) => serde_json::Value::Bool(*value),
+                        lean_toolchain::LeanOptionValue::Nat(value) => serde_json::Value::from(*value),
+                        lean_toolchain::LeanOptionValue::String(value) => serde_json::Value::String(value.clone()),
+                    };
+                    (name.clone(), value)
+                })
+                .collect(),
+            effective_max_heartbeats: options.heartbeat_limit.min(lean_toolchain::LEAN_HEARTBEAT_LIMIT_MAX),
+        }
+    }
 }
 
 /// Operational telemetry, serialized as the envelope's `telemetry`.
@@ -219,6 +250,7 @@ where
 /// telemetry block, and the advisory list the envelope drains into `warnings`.
 fn split_freshness(freshness: Freshness, runtime: Option<RuntimeFacts>) -> (FreshnessIdentity, Telemetry, Vec<String>) {
     let Freshness {
+        elaboration_options,
         project_root,
         project_hash,
         imports,
@@ -228,6 +260,7 @@ fn split_freshness(freshness: Freshness, runtime: Option<RuntimeFacts>) -> (Fres
     } = freshness;
     (
         FreshnessIdentity {
+            elaboration_options,
             project_root,
             session_id,
             lean_toolchain,
@@ -386,6 +419,26 @@ mod tests {
         assert_eq!(
             json.pointer("/worker_restarted").and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn compilation_facts_show_project_options_and_host_override() {
+        let options = lean_rs_worker_parent::LeanWorkerElabOptions::default()
+            .lean_options(BTreeMap::from([(
+                "maxHeartbeats".into(),
+                lean_toolchain::LeanOptionValue::Nat(0),
+            )]))
+            .heartbeat_limit(u64::MAX);
+        let facts = ElaborationOptions::from_worker(&options);
+        let value = serde_json::to_value(facts).unwrap();
+        assert_eq!(
+            value.pointer("/project_options/maxHeartbeats"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            value.pointer("/effective_max_heartbeats"),
+            Some(&serde_json::json!(lean_toolchain::LEAN_HEARTBEAT_LIMIT_MAX))
         );
     }
 }

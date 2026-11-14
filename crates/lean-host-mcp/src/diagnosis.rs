@@ -415,6 +415,7 @@ mod tests {
         let response = Response::ok(
             Vec::<String>::new(),
             crate::envelope::Freshness {
+                elaboration_options: None,
                 project_root: "/project".into(),
                 project_hash: String::new(),
                 imports: Vec::new(),

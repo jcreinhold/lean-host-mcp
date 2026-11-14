@@ -437,11 +437,15 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryOutcome>> {
+        let meta = self.resolve_meta(&hint)?;
+        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project
             .process_module_query(session_imports, source, query, options)
             .await?;
-        let out = broker_call(&project, &freshness_imports, call);
+        let mut out = broker_call(&project, &freshness_imports, call);
+        out.freshness.elaboration_options = Some(option_facts);
         drop(project);
         Ok(out)
     }
@@ -458,6 +462,9 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryOutcome>> {
+        let meta = self.resolve_meta(&hint)?;
+        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         // A query this build cannot key is run uncached rather than filed under
         // a shared key; see `ModuleQueryKey`.
@@ -488,7 +495,10 @@ impl ProjectBroker {
             return Ok(CachedBrokerCall {
                 value,
                 runtime: project.runtime_facts(),
-                freshness: project.freshness(&freshness_imports),
+                freshness: Freshness {
+                    elaboration_options: Some(option_facts.clone()),
+                    ..project.freshness(&freshness_imports)
+                },
                 freshly_processed: false,
             });
         }
@@ -506,7 +516,10 @@ impl ProjectBroker {
         Ok(CachedBrokerCall {
             value,
             runtime,
-            freshness: project.freshness(&freshness_imports),
+            freshness: Freshness {
+                elaboration_options: Some(option_facts.clone()),
+                ..project.freshness(&freshness_imports)
+            },
             freshly_processed: true,
         })
     }
@@ -526,11 +539,15 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
+        let meta = self.resolve_meta(&hint)?;
+        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project
             .process_module_query_batch(session_imports, source, selectors, budgets, options)
             .await?;
-        let out = broker_call(&project, &freshness_imports, call);
+        let mut out = broker_call(&project, &freshness_imports, call);
+        out.freshness.elaboration_options = Some(option_facts);
         drop(project);
         Ok(out)
     }
@@ -548,6 +565,9 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
+        let meta = self.resolve_meta(&hint)?;
+        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
         let context = crate::cache::ModuleQueryContext::capture(
@@ -579,7 +599,10 @@ impl ProjectBroker {
             return Ok(CachedBrokerCall {
                 value,
                 runtime: project.runtime_facts(),
-                freshness: project.freshness(&freshness_imports),
+                freshness: Freshness {
+                    elaboration_options: Some(option_facts.clone()),
+                    ..project.freshness(&freshness_imports)
+                },
                 freshly_processed: false,
             });
         }
@@ -597,7 +620,10 @@ impl ProjectBroker {
         Ok(CachedBrokerCall {
             value,
             runtime,
-            freshness: project.freshness(&freshness_imports),
+            freshness: Freshness {
+                elaboration_options: Some(option_facts.clone()),
+                ..project.freshness(&freshness_imports)
+            },
             freshly_processed: true,
         })
     }
@@ -674,9 +700,13 @@ impl ProjectBroker {
         request: LeanWorkerProofAttemptRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerProofAttemptResult>> {
+        let meta = self.resolve_meta(&hint)?;
+        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project.attempt_proof(session_imports, request, options).await?;
-        let out = broker_call(&project, &freshness_imports, call);
+        let mut out = broker_call(&project, &freshness_imports, call);
+        out.freshness.elaboration_options = Some(option_facts);
         drop(project);
         Ok(out)
     }
@@ -694,9 +724,13 @@ impl ProjectBroker {
         request: LeanWorkerDeclarationVerificationRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationResult>> {
+        let meta = self.resolve_meta(&hint)?;
+        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project.verify_declaration(session_imports, request, options).await?;
-        let out = broker_call(&project, &freshness_imports, call);
+        let mut out = broker_call(&project, &freshness_imports, call);
+        out.freshness.elaboration_options = Some(option_facts);
         drop(project);
         Ok(out)
     }
@@ -714,11 +748,15 @@ impl ProjectBroker {
         request: LeanWorkerDeclarationVerificationBatchRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
+        let meta = self.resolve_meta(&hint)?;
+        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project
             .verify_declaration_batch(session_imports, request, options)
             .await?;
-        let out = broker_call(&project, &freshness_imports, call);
+        let mut out = broker_call(&project, &freshness_imports, call);
+        out.freshness.elaboration_options = Some(option_facts);
         drop(project);
         Ok(out)
     }
@@ -1164,6 +1202,7 @@ pub struct BrokerConfigSnapshot {
 
 fn freshness_from_meta(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
     Freshness {
+        elaboration_options: None,
         project_root: meta.canonical_root.to_string_lossy().into_owned(),
         project_hash: meta.manifest_hash.clone(),
         imports,

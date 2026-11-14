@@ -2008,6 +2008,7 @@ mod tests {
 
     fn freshness(root: &std::path::Path) -> Freshness {
         Freshness {
+            elaboration_options: None,
             project_root: root.to_string_lossy().into_owned(),
             project_hash: "hash".to_owned(),
             imports: Vec::new(),

@@ -318,3 +318,33 @@ are cached — a name lookup, proof attempt, or verification would key on a name
 
 Frame size is controlled by query shape, not transport tuning: no public tool requests a whole info tree, bulk rendered
 types, or unbounded source/project scans.
+
+## Lake compilation options
+
+Source checks resolve the target file's options through the pinned Lake API before
+checking or looking up a cached result. The helper loads the owning package's
+configuration only. It does not resolve dependencies, download caches, or enter
+Lake's build graph. Root and dependency files use their own package and library
+settings, including `require ... with` options for direct dependencies. Source
+checks for transitive dependencies currently fail explicitly rather than guess
+their configuration; lookups of already-built declarations are unaffected. Direct
+dependency configuration compiles into temporary storage, with the original source
+paths and current `require ... with` options. This avoids both stale standalone
+configuration values and overwriting another build's saved config. Temporary files
+are removed on success, failure and cancellation.
+Files outside a configured library and file-less trials use Lake's
+root-package external-file defaults, not a guessed primary library.
+
+The worker receives typed options, including `weak.*` options. It resolves their
+types after imports load. `-Dname=value` compiler arguments use Lean's parser;
+other extra compiler arguments return an explicit unsupported error. Source,
+query and compilation options all contribute to the result-cache key.
+`freshness.elaboration_options` records the project options and the actual host
+heartbeat limit, which overrides the project's `maxHeartbeats`.
+
+The helper currently starts once per source request, including cache hits. It
+adds about 0.6 seconds on the measured Mac. We do not cache arbitrary evaluated
+Lake configuration: it can read files or environment variables beyond the
+lakefile. A compiled helper could reduce startup cost without caching those
+inputs. Discovery has a 30-second timeout; cancellation kills the helper.
+Configuration errors return no proof verdict rather than retrying with defaults.

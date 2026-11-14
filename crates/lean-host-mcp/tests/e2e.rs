@@ -2016,3 +2016,74 @@ async fn batched_declaration_searches_answer_in_request_order() {
         );
     }
 }
+
+/// Regression: a file accepted with implicit universes must fail under the
+/// library's autoImplicit=false, even after its earlier diagnostics were cached.
+#[tokio::test]
+#[ignore = "requires paired updated worker; set LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN"]
+async fn lake_options_reach_diagnostics_verification_and_cache() {
+    use lean_host_mcp::tools::position::{FileDiagnosticsRequest, file_diagnostics};
+    let pin = std::env::var("LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::write(root.join("lean-toolchain"), pin).unwrap();
+    fs::write(
+        root.join("lake-manifest.json"),
+        r#"{"version":"1.1.0","packages":[],"name":"option_test","lakeDir":".lake","packagesDir":".lake/packages"}"#,
+    )
+    .unwrap();
+    let config = "import Lake\nopen Lake DSL\npackage option_test\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, true⟩]\n";
+    fs::write(root.join("lakefile.lean"), config).unwrap();
+    fs::write(root.join("Demo.lean"), "section\nuniverse u\ndef first (A : Type u) := A\nend\nsection\ntheorem second (A : Type u) : True := by trivial\nend\n").unwrap();
+    let ctx = open_ctx(&root);
+    let request = FileDiagnosticsRequest {
+        file: "Demo.lean".into(),
+        project: None,
+    };
+    for _ in 0..2 {
+        let result = file_diagnostics(&ctx, request.clone()).await.unwrap();
+        let diagnostics = result.result.unwrap().diagnostics;
+        assert!(
+            !diagnostics
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d.severity, Severity::Error)),
+            "{diagnostics:?}"
+        );
+    }
+    fs::write(root.join("lakefile.lean"), config.replace("true", "false")).unwrap();
+    let result = file_diagnostics(&ctx, request).await.unwrap();
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        json.pointer("/freshness/elaboration_options/project_options/autoImplicit"),
+        Some(&serde_json::json!(false))
+    );
+    let diagnostics = result.result.unwrap().diagnostics;
+    assert!(
+        diagnostics
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d.severity, Severity::Error)),
+        "{diagnostics:?}"
+    );
+    let verified = verify_declaration(
+        &ctx,
+        VerifyDeclarationRequest {
+            file: "Demo.lean".into(),
+            declaration: "second".into(),
+            project: None,
+            allow_sorry: false,
+            report_axioms: true,
+            retry_tainted_non_positive: false,
+        },
+    )
+    .await
+    .unwrap()
+    .result
+    .unwrap();
+    assert!(
+        !matches!(verified, DeclarationVerificationResult::Ok { ref verification_status, .. } if verification_status == "verified"),
+        "{verified:?}"
+    );
+    assert!(!root.join(".lake/build").exists());
+}

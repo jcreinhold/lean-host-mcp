@@ -1422,6 +1422,7 @@ impl LeanProject {
     #[must_use]
     pub(crate) fn freshness(&self, request_imports: &[String]) -> Freshness {
         Freshness {
+            elaboration_options: None,
             project_root: self.canonical_root.to_string_lossy().into_owned(),
             project_hash: self.manifest_hash.clone(),
             imports: request_imports.to_vec(),

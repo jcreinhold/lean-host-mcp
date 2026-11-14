@@ -49,6 +49,7 @@ pub struct WorkerUnavailable {
 impl WorkerUnavailable {
     pub(crate) fn freshness(&self) -> Freshness {
         Freshness {
+            elaboration_options: None,
             project_root: self.project_root.clone(),
             project_hash: self.project_hash.clone(),
             imports: self.imports.clone(),

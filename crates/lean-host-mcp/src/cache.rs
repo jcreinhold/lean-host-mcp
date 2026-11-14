@@ -419,6 +419,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let before = context(root);
+        let project_options = lean_rs_worker_parent::LeanWorkerElabOptions::default().lean_options(
+            std::collections::BTreeMap::from([("autoImplicit".into(), lean_toolchain::LeanOptionValue::Bool(false))]),
+        );
+        assert_ne!(
+            Some(before.clone()),
+            ModuleQueryContext::capture(root, &["Demo.A".into()], &[], &project_options, 1)
+        );
+
         let options = lean_rs_worker_parent::LeanWorkerElabOptions::default().heartbeat_limit(1);
         assert_ne!(
             Some(before.clone()),
