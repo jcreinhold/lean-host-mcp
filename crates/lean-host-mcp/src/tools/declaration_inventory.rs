@@ -75,7 +75,7 @@ pub struct DeclarationInventoryRow {
     pub body_span: Option<DeclarationSpan>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 pub struct DeclarationSpan {
     pub start_line: u32,
     pub start_column: u32,
@@ -131,6 +131,7 @@ async fn worker_declarations(
     limit: usize,
 ) -> Result<Response<DeclarationInventoryResult>> {
     let input = read_query_file(root, path)?;
+    let source_for_index = input.source.clone();
     let source_fact = ArtifactTrust::source_file_edit_fresh(root, &input.resolved, input.hash);
     let module = module_hint.or_else(|| module_name_for_file(root, &input.resolved));
     let file_label = input.resolved.to_string_lossy().into_owned();
@@ -157,7 +158,7 @@ async fn worker_declarations(
     };
     let mut result = project_worker_outline(call.value, limit);
     let index_fact = if let Some(module) = module.as_deref() {
-        supplement_with_fresh_index(root, module, &mut result, limit)
+        supplement_with_fresh_index(root, module, &source_for_index, &mut result, limit)
     } else {
         None
     };
@@ -375,6 +376,7 @@ fn index_declarations_rows(index: &crate::ilean::ModuleDeclarationIndex) -> Vec<
 fn supplement_with_fresh_index(
     root: &Path,
     module: &str,
+    source: &str,
     result: &mut DeclarationInventoryResult,
     limit: usize,
 ) -> Option<ArtifactTrust> {
@@ -391,6 +393,14 @@ fn supplement_with_fresh_index(
         .iter()
         .map(|row| row.name.clone())
         .collect::<HashSet<_>>();
+    // Worker columns count Unicode scalar values; .ilean uses LSP UTF-16.
+    // Normalize once before comparing source and compiled name spans.
+    let lines = source.lines().collect::<Vec<_>>();
+    let source_spans = result
+        .declarations
+        .iter()
+        .filter_map(|row| span_as_utf16(&row.name_span, &lines))
+        .collect::<HashSet<_>>();
     let original_len = result.declarations.len();
     let mut omitted_for_limit = false;
     for row in index_declarations_rows(&index) {
@@ -398,10 +408,7 @@ fn supplement_with_fresh_index(
         // A private index row at the same name span is the existing source
         // declaration, not another target to verify under its compiled name.
         if !seen.insert(row.name.clone())
-            || result
-                .declarations
-                .iter()
-                .any(|source| same_private_declaration(source, &row))
+            || (row.name.starts_with("_private.") && source_spans.contains(&row.name_span))
         {
             continue;
         }
@@ -421,8 +428,23 @@ fn supplement_with_fresh_index(
     ))
 }
 
-fn same_private_declaration(source: &DeclarationInventoryRow, compiled: &DeclarationInventoryRow) -> bool {
-    compiled.name.starts_with("_private.") && source.name_span == compiled.name_span
+fn span_as_utf16(span: &DeclarationSpan, lines: &[&str]) -> Option<DeclarationSpan> {
+    fn column(lines: &[&str], line: u32, scalar_column: u32) -> Option<u32> {
+        let text = lines.get(usize::try_from(line.checked_sub(1)?).ok()?)?;
+        let count = usize::try_from(scalar_column.checked_sub(1)?).ok()?;
+        let mut chars = text.chars();
+        let mut utf16_column = 1_u32;
+        for _ in 0..count {
+            utf16_column = utf16_column.checked_add(u32::try_from(chars.next()?.len_utf16()).ok()?)?;
+        }
+        Some(utf16_column)
+    }
+    Some(DeclarationSpan {
+        start_line: span.start_line,
+        start_column: column(lines, span.start_line, span.start_column)?,
+        end_line: span.end_line,
+        end_column: column(lines, span.end_line, span.end_column)?,
+    })
 }
 
 fn truncate(mut declarations: Vec<DeclarationInventoryRow>, limit: usize) -> (Vec<DeclarationInventoryRow>, bool) {
@@ -596,7 +618,7 @@ mod tests {
             diagnostics: None,
         };
 
-        let Some(fact) = supplement_with_fresh_index(&root, "Demo.A", &mut result, 200) else {
+        let Some(fact) = supplement_with_fresh_index(&root, "Demo.A", "\n\n\n    foo", &mut result, 200) else {
             panic!("fresh index should produce a trust fact");
         };
 
@@ -613,18 +635,15 @@ mod tests {
     }
 
     #[test]
-    fn private_index_names_do_not_duplicate_source_declarations() {
-        let source = row("Demo.hidden", 3);
-        let compiled = row("_private.Demo.0.Demo.hidden", 3);
-        assert!(same_private_declaration(&source, &compiled));
-        assert!(same_private_declaration(
-            &row("_private._stdin.0.Demo.hidden", 3),
-            &compiled
-        ));
-        assert!(!same_private_declaration(&row("Demo.hidden", 4), &compiled));
-        // Source and index short names can differ for escaped identifiers.
-        assert!(same_private_declaration(&row("Demo.«foo.bar»", 3), &compiled));
-        assert!(!same_private_declaration(&source, &row("Demo.hidden", 3)));
+    fn source_name_span_columns_convert_to_lsp_utf16() {
+        let mut span = row("Demo.hidden", 1).name_span;
+        span.start_column = 3;
+        span.end_column = 6;
+        let converted = span_as_utf16(&span, &["😀 «𝒳» x"]).unwrap();
+        assert_eq!(converted.start_column, 4);
+        assert_eq!(converted.end_column, 8);
+        assert!(span_as_utf16(&span, &[]).is_none());
+        assert!(span_as_utf16(&span, &["x"]).is_none());
     }
 
     #[test]
@@ -648,11 +667,38 @@ mod tests {
             message: None,
             diagnostics: None,
         };
-        assert!(supplement_with_fresh_index(&root, "Demo.A", &mut result, 1).is_some());
+        assert!(supplement_with_fresh_index(&root, "Demo.A", "\n\n\n    foo", &mut result, 1).is_some());
         assert_eq!(result.declarations.len(), 1);
         assert_eq!(result.declarations[0].name, "_private._stdin.0.Demo.A.foo");
         assert!(!result.truncated, "a duplicate must not consume the target limit");
         assert_eq!(result.source, "worker");
+    }
+
+    #[test]
+    fn fresh_index_private_unicode_span_keeps_one_source_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tmp.path());
+        let index_path = copy_ilean(&root, "Demo.A", "demo_a.ilean");
+        let contents = std::fs::read_to_string(&index_path)
+            .unwrap()
+            .replace("Demo.A.foo", "_private.Demo.A.0.Demo.A.𝒳")
+            .replace("[3,4,3,7,3,4,3,7]", "[0,3,0,7,0,3,0,7]");
+        std::fs::write(&index_path, contents).unwrap();
+        let mut source = row("_private._stdin.0.Demo.A.𝒳", 1);
+        source.name_span.start_column = 3;
+        source.name_span.end_column = 6;
+        let mut result = DeclarationInventoryResult {
+            status: "ok".to_owned(),
+            declarations: vec![source],
+            truncated: false,
+            source: "worker".to_owned(),
+            files_scanned: 1,
+            message: None,
+            diagnostics: None,
+        };
+        assert!(supplement_with_fresh_index(&root, "Demo.A", "😀 «𝒳»", &mut result, 1).is_some());
+        assert_eq!(result.declarations.len(), 1);
+        assert!(!result.truncated, "Unicode columns must not create a second target");
     }
 
     #[test]
@@ -673,7 +719,7 @@ mod tests {
             diagnostics: None,
         };
 
-        let fact = supplement_with_fresh_index(&root, "Demo.A", &mut result, 200);
+        let fact = supplement_with_fresh_index(&root, "Demo.A", "\n\n\n    foo", &mut result, 200);
 
         assert!(fact.is_none());
         assert_eq!(result.declarations.len(), 1);
