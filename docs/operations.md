@@ -256,11 +256,15 @@ Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for internal runtime
 INFO worker recycled (imports rebuilt on disk) cause=artifacts_rebuilt worker_generation=2 planned=true restarts_total=1
 ```
 
-The same data reaches the MCP client in `response.runtime`: the per-call cause in `call_restart`, the most recent in
+The same data reaches the MCP client in `response.runtime`: the final-attempt cause in `call_restart`, the most recent in
 `last_restart`, and the lifetime frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause` (omitted
 when no recycle has happened). `import_residue_bytes` and `import_residue_limit_bytes` report the quantity the recycle
 policy actually reads, so how close a child is to its next cycle is observable rather than inferred. The two figures a
 cycle happened *on* are in the restart event's `reason` string.
+
+If a worker attempt fails and a fresh retry completes, the result remains usable. The response includes a warning
+about the first failure. Full telemetry records `previous_attempt_failure`, `retry_count`, and
+`final_attempt: "completed"`. A failed or uncertain retry still returns no usable result.
 
 ## Process lifetime
 

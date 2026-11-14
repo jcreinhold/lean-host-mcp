@@ -33,7 +33,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use crate::cache::ModuleQueryCache;
 use crate::cancellation::CallCancellation;
 use crate::config_file::RuntimeFileConfig;
-use crate::envelope::{Freshness, RuntimeFacts, RuntimeRestartEvent};
+use crate::envelope::{FinalAttemptStatus, Freshness, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
 use crate::lake_meta::{self, LakeProjectMeta};
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
@@ -1030,6 +1030,8 @@ impl RuntimeSnapshot {
             worker_generation: self.worker_generation,
             worker_restarted: false,
             retry_count: 0,
+            final_attempt: FinalAttemptStatus::Unknown,
+            previous_attempt_failure: None,
             queue_wait_millis: 0,
             call_elapsed_millis: 0,
             call_cpu_millis: None,
@@ -1924,6 +1926,8 @@ impl ProjectActorState {
 
         let max_retries = meta.retry_policy.retries();
         let mut retry_count = 0_u32;
+        let mut previous_attempt_failure = None;
+        let mut final_attempt = FinalAttemptStatus::Interrupted;
         // The loop owns only control flow: run, classify, maybe retry. Every
         // exit funnels into the single finalization below, which is the one
         // place timing/restart facts are computed — threading them through six
@@ -1934,9 +1938,40 @@ impl ProjectActorState {
             }
             match job(&mut self.handle, meta.imports.clone(), meta.cancellation.worker()) {
                 Ok(value) => {
+                    let restarts = self
+                        .handle
+                        .lifecycle_snapshot()
+                        .restarts
+                        .saturating_sub(lifecycle_baseline.restarts);
                     if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
                         call_restart = Some(event);
                     }
+                    if meta.cancellation.is_cancelled() {
+                        break JobExit::Unavailable {
+                            reason: "request_cancelled".to_owned(),
+                            retryable: false,
+                            worker_restarted: self.observed_generation() > generation_before,
+                            cause: Some(RestartCause::Cancelled),
+                            limit_kib: None,
+                        };
+                    }
+                    final_attempt = if restarts > 1 {
+                        call_restart = Some(restart_event(
+                            RestartCause::WorkerInternal,
+                            "multiple worker restarts during final attempt; result unavailable",
+                            self.observed_generation(),
+                            self.last_rss_kib,
+                            None,
+                        ));
+                        FinalAttemptStatus::Unknown
+                    } else if call_restart
+                        .as_ref()
+                        .is_some_and(crate::diagnosis::restart_disrupts_result)
+                    {
+                        FinalAttemptStatus::Interrupted
+                    } else {
+                        FinalAttemptStatus::Completed
+                    };
                     // Sampled for `RuntimeFacts.rss_kib`, which is reporting
                     // only: no threshold reads it, and nothing restarts on it.
                     self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
@@ -1955,8 +1990,9 @@ impl ProjectActorState {
                 Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     let first_reason = err.to_string();
-                    call_restart =
+                    previous_attempt_failure =
                         Some(self.rebuild_after_worker_death(first_reason, worker_death_cause(&err), &meta)?);
+                    call_restart = None;
                     lifecycle_baseline = self.handle.lifecycle_snapshot();
                     retry_count = retry_count.saturating_add(1);
                 }
@@ -1974,11 +2010,12 @@ impl ProjectActorState {
                 }
                 Err(err) if worker_error_is_session_missing(&err) && retry_count < max_retries => {
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
-                    call_restart = Some(self.rebuild_after_worker_death(
+                    previous_attempt_failure = Some(self.rebuild_after_worker_death(
                         format!("session_missing: {err}"),
                         RestartCause::SessionMissing,
                         &meta,
                     )?);
+                    call_restart = None;
                     lifecycle_baseline = self.handle.lifecycle_snapshot();
                     retry_count = retry_count.saturating_add(1);
                 }
@@ -2036,7 +2073,7 @@ impl ProjectActorState {
         // and the facts are built and published exactly once per call.
         let call_elapsed_millis = millis_u64(job_started.elapsed());
         let call_cpu_millis = self.cpu_delta_since(cpu_baseline);
-        let runtime = self.runtime_facts(
+        let mut runtime = self.runtime_facts(
             &meta,
             generation_before,
             retry_count,
@@ -2045,6 +2082,8 @@ impl ProjectActorState {
             call_cpu_millis,
             call_restart,
         );
+        runtime.final_attempt = final_attempt;
+        runtime.previous_attempt_failure = previous_attempt_failure;
         self.publish_runtime(&runtime);
         match exit {
             JobExit::Done(value) => {
@@ -2062,7 +2101,14 @@ impl ProjectActorState {
                 worker_restarted,
                 cause,
                 limit_kib,
-            } => Err(self.worker_unavailable_for(&meta, reason, retryable, worker_restarted, cause, limit_kib, None)),
+            } => {
+                let mut error =
+                    self.worker_unavailable_for(&meta, reason, retryable, worker_restarted, cause, limit_kib, None);
+                if let ServerError::WorkerUnavailable(failure) = &mut error {
+                    failure.runtime = runtime;
+                }
+                Err(error)
+            }
         }
     }
 
@@ -2401,6 +2447,8 @@ impl ProjectActorState {
             worker_generation: event.worker_generation,
             worker_restarted: true,
             retry_count: 0,
+            final_attempt: FinalAttemptStatus::Unknown,
+            previous_attempt_failure: None,
             queue_wait_millis: 0,
             call_elapsed_millis: 0,
             call_cpu_millis: None,
@@ -2595,6 +2643,8 @@ impl ProjectActorState {
                 worker_generation: self.observed_generation(),
                 worker_restarted: false,
                 retry_count: MAX_JOB_RETRIES,
+                final_attempt: FinalAttemptStatus::Interrupted,
+                previous_attempt_failure: None,
                 queue_wait_millis: 0,
                 call_elapsed_millis: 0,
                 call_cpu_millis: None,
@@ -2641,6 +2691,8 @@ impl ProjectActorState {
             worker_generation: generation,
             worker_restarted: call_restart.is_some() || generation > generation_before,
             retry_count,
+            final_attempt: FinalAttemptStatus::Unknown,
+            previous_attempt_failure: None,
             queue_wait_millis,
             call_elapsed_millis,
             call_cpu_millis,
@@ -3762,6 +3814,100 @@ mod tests {
             module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
         };
         (project, rx)
+    }
+
+    #[test]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
+    fn simulated_crash_retry_reports_completed_or_interrupted_final_attempt() {
+        fn crash() -> LeanWorkerError {
+            LeanWorkerError::ChildPanicOrAbort {
+                exit: lean_rs_worker_parent::LeanWorkerExit {
+                    success: false,
+                    code: Some(134),
+                    status: "simulated abort".to_owned(),
+                    diagnostics: "injected controller retry test".to_owned(),
+                },
+            }
+        }
+        let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap());
+        let meta = LakeProjectMeta::from_explicit(&root).unwrap();
+        let (project, _receiver) = queued_test_project(Duration::from_secs(30));
+        let (config, _) = ActorConfig::from_meta(
+            &meta,
+            "retry-test".to_owned(),
+            Arc::clone(&project.runtime),
+            Arc::clone(&project.healthy),
+            ProjectRuntimeConfig::default(),
+        )
+        .unwrap();
+        let (handle, _) = open_worker(&config).unwrap();
+        let mut state = ProjectActorState {
+            config: config.clone(),
+            handle,
+            worker_generation_base: 1,
+            last_restart: None,
+            imports_seen: Vec::new(),
+            profile_switch_count: 0,
+            last_rss_kib: None,
+            runtime: Arc::clone(&config.runtime),
+            abnormal_restart_times: VecDeque::new(),
+            restart_stats: RestartStats::default(),
+            cycled_while_idle: false,
+        };
+        let options = LeanWorkerElabOptions::default();
+        let context = crate::cache::ModuleQueryContext::capture(&root, &[], &[], &options, 1).unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let call = state
+            .run_job(
+                project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+                |handle, imports, cancel| {
+                    attempts.set(attempts.get() + 1);
+                    if attempts.get() == 1 {
+                        // Inject the same typed error as a fatal exit. The actual
+                        // controller replaces only this test's private worker.
+                        return Err(crash());
+                    }
+                    handle.process_module_query_with_imports(
+                        imports,
+                        "theorem retry_ok : True := True.intro",
+                        &LeanWorkerModuleQuery::Diagnostics,
+                        &options,
+                        Some(cancel),
+                        None,
+                    )
+                },
+            )
+            .unwrap();
+        assert_eq!(attempts.get(), 2);
+        let (value, facts) = call.into_parts();
+        assert!(matches!(value, LeanWorkerModuleQueryOutcome::Ok { .. }), "{value:?}");
+        assert_eq!(facts.retry_count, 1);
+        assert_eq!(facts.final_attempt, FinalAttemptStatus::Completed);
+        assert_eq!(facts.previous_attempt_failure.as_ref().unwrap().cause, "child_abort");
+        assert!(facts.call_restart.is_none());
+        assert!(crate::diagnosis::execution_taint(&facts).is_none());
+        assert!(context.after_call(&root, &facts).is_some());
+
+        let attempts = std::cell::Cell::new(0);
+        let error = state
+            .run_job::<()>(
+                project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+                |handle, _, _| {
+                    attempts.set(attempts.get() + 1);
+                    let _ = handle;
+                    Err(crash())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(attempts.get(), 2);
+        let ServerError::WorkerUnavailable(failure) = error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(failure.runtime.final_attempt, FinalAttemptStatus::Interrupted);
+        assert_eq!(failure.runtime.retry_count, 1);
+        assert!(crate::diagnosis::execution_taint(&failure.runtime).is_some());
+        assert!(context.after_call(&root, &failure.runtime).is_none());
+        state.handle.shutdown().unwrap();
     }
 
     #[tokio::test]

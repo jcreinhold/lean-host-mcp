@@ -140,11 +140,26 @@ pub struct RuntimeRestartEvent {
     pub limit_kib: Option<u64>,
 }
 
+/// What the controller established about the final worker attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalAttemptStatus {
+    #[default]
+    Unknown,
+    Completed,
+    Interrupted,
+}
+
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RuntimeFacts {
     pub worker_generation: u64,
     pub worker_restarted: bool,
     pub retry_count: u32,
+    pub final_attempt: FinalAttemptStatus,
+    /// Failure before an explicit controller retry, distinct from a restart
+    /// affecting the final result. Never cleared merely because a retry began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_attempt_failure: Option<RuntimeRestartEvent>,
     /// Milliseconds the call spent queued on the project actor before the
     /// worker started it.
     pub queue_wait_millis: u64,
@@ -160,6 +175,8 @@ pub struct RuntimeFacts {
     /// one-second `ps` sampling, where sub-second calls may read as 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_cpu_millis: Option<u64>,
+    /// Restart affecting the final attempt; a failed earlier attempt lives in
+    /// `previous_attempt_failure` so a completed retry stays usable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_restart: Option<RuntimeRestartEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -330,6 +347,14 @@ where
 
     #[must_use]
     pub fn with_runtime(mut self, runtime: RuntimeFacts) -> Self {
+        if runtime.final_attempt == FinalAttemptStatus::Completed
+            && let Some(failure) = &runtime.previous_attempt_failure
+        {
+            self.warnings.push(format!(
+                "Worker attempt failed ({}); a fresh retry completed. This result is from the completed retry.",
+                failure.cause
+            ));
+        }
         if let Some(telemetry) = self.telemetry.as_mut() {
             telemetry.runtime = Some(runtime);
         }
@@ -388,6 +413,8 @@ mod tests {
             worker_generation: 4,
             worker_restarted: false,
             retry_count: 0,
+            final_attempt: FinalAttemptStatus::Unknown,
+            previous_attempt_failure: None,
             queue_wait_millis: 0,
             call_elapsed_millis: 0,
             call_cpu_millis: None,
@@ -419,6 +446,41 @@ mod tests {
         assert_eq!(
             json.pointer("/worker_restarted").and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn recovered_retry_warning_survives_quiet_telemetry() {
+        let runtime = RuntimeFacts {
+            final_attempt: FinalAttemptStatus::Completed,
+            retry_count: 1,
+            previous_attempt_failure: Some(RuntimeRestartEvent {
+                cause: "child_abort".to_owned(),
+                ..RuntimeRestartEvent::default()
+            }),
+            ..RuntimeFacts::default()
+        };
+        let mut response = Response::ok(
+            Vec::<String>::new(),
+            Freshness {
+                elaboration_options: None,
+                project_root: "/test".to_owned(),
+                project_hash: String::new(),
+                imports: Vec::new(),
+                session_id: "test".to_owned(),
+                lean_toolchain: "test".to_owned(),
+                toolchain_advisories: Vec::new(),
+            },
+        )
+        .with_runtime(runtime);
+        response.drop_telemetry();
+        assert!(response.result.is_some());
+        assert_eq!(response.warnings.len(), 1);
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("child_abort") && warning.contains("retry completed"))
         );
     }
 

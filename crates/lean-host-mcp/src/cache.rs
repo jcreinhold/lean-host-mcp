@@ -496,6 +496,35 @@ mod tests {
     }
 
     #[test]
+    fn retry_cache_requires_explicit_completed_final_attempt() {
+        use crate::envelope::{FinalAttemptStatus, RuntimeFacts, RuntimeRestartEvent};
+        let temp = tempfile::tempdir().unwrap();
+        let before = context(temp.path());
+        for status in [
+            FinalAttemptStatus::Unknown,
+            FinalAttemptStatus::Interrupted,
+            FinalAttemptStatus::Completed,
+        ] {
+            let mut runtime = RuntimeFacts {
+                worker_generation: 2,
+                retry_count: 1,
+                final_attempt: status,
+                previous_attempt_failure: Some(RuntimeRestartEvent {
+                    cause: "child_abort".into(),
+                    ..RuntimeRestartEvent::default()
+                }),
+                ..RuntimeFacts::default()
+            };
+            assert_eq!(
+                before.after_call(temp.path(), &runtime).is_some(),
+                status == FinalAttemptStatus::Completed
+            );
+            runtime.call_restart = runtime.previous_attempt_failure.clone();
+            assert!(before.after_call(temp.path(), &runtime).is_none());
+        }
+    }
+
+    #[test]
     fn completed_calls_cache_after_planned_recycle_or_historical_crash() {
         use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
         let temp = tempfile::tempdir().unwrap();

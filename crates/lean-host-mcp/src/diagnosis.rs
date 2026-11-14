@@ -192,8 +192,10 @@ pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 /// not reliable evidence about the declaration — it may be a casualty of the
 /// recycle, not a real result.
 ///
-/// Returns the `call_restart` event for a job-disrupting cause; `None`
-/// otherwise. `max_requests` / `max_imports` / `import_residue` /
+/// Returns a disrupting final-attempt `call_restart`, or an earlier attempt's
+/// failure unless the controller explicitly recorded a completed retry. A
+/// completed retry does not excuse a new failure in its own attempt.
+/// `max_requests` / `max_imports` / `import_residue` /
 /// `import_residue_idle` / `import_accounting_unknown` / `idle` / `explicit` are excluded: they are planned
 /// hygiene cycles, not duress. A residue cycle in particular runs *before* the
 /// import that would have crossed the budget, so the call it precedes runs in a
@@ -220,7 +222,18 @@ pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 /// test below pins the disrupting set so a new cause there is a conscious
 /// decision here.
 pub(crate) fn execution_taint(runtime: &RuntimeFacts) -> Option<&RuntimeRestartEvent> {
-    let event = runtime.call_restart.as_ref()?;
+    runtime
+        .call_restart
+        .as_ref()
+        .filter(|event| restart_disrupts_result(event))
+        .or_else(|| {
+            (runtime.final_attempt != crate::envelope::FinalAttemptStatus::Completed)
+                .then_some(runtime.previous_attempt_failure.as_ref())
+                .flatten()
+        })
+}
+
+pub(crate) fn restart_disrupts_result(event: &RuntimeRestartEvent) -> bool {
     matches!(
         event.cause.as_str(),
         "rss_post_job"
@@ -232,7 +245,6 @@ pub(crate) fn execution_taint(runtime: &RuntimeFacts) -> Option<&RuntimeRestartE
             | "timeout"
             | "cancelled"
     )
-    .then_some(event)
 }
 
 /// The canonical `(warning, next_action)` pair for an execution-tainted verdict.
@@ -407,6 +419,33 @@ mod tests {
         }
         // No restart at all: nothing to flag.
         assert!(execution_taint(&RuntimeFacts::default()).is_none());
+    }
+
+    #[test]
+    fn only_explicit_completed_retry_clears_previous_failure_not_final_restart() {
+        use crate::envelope::FinalAttemptStatus;
+        let failure = facts_with_restart("child_abort").call_restart;
+        for status in [
+            FinalAttemptStatus::Unknown,
+            FinalAttemptStatus::Interrupted,
+            FinalAttemptStatus::Completed,
+        ] {
+            let mut facts = RuntimeFacts {
+                retry_count: 1,
+                final_attempt: status,
+                previous_attempt_failure: failure.clone(),
+                ..RuntimeFacts::default()
+            };
+            assert_eq!(
+                execution_taint(&facts).is_none(),
+                status == FinalAttemptStatus::Completed
+            );
+            facts.call_restart = failure.clone();
+            assert!(
+                execution_taint(&facts).is_some(),
+                "final-attempt abort must never be excused"
+            );
+        }
     }
 
     #[test]

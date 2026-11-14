@@ -142,7 +142,8 @@ itself idle above 60% of the budget it takes the same cycle early as `import_res
 profile so the spawn and the import both land between calls. Fatal child exits are reported by the worker layer; the
 host maps those structured outcomes once into MCP runtime facts and retries selected read-only semantic jobs once.
 Responses carry runtime facts (`worker_generation`, `worker_restarted`, `retry_count`, `queue_wait_millis`,
-`call_elapsed_millis`, `call_cpu_millis`, `call_restart`, `last_restart`) so clients can distinguish Lean-domain
+`call_elapsed_millis`, `call_cpu_millis`, `call_restart`, `last_restart`, `final_attempt`,
+`previous_attempt_failure`) so clients can distinguish Lean-domain
 results from infrastructure recovery and lifecycle history. The two timing fields bracket the call:
 `queue_wait_millis` covers admission delay, `call_elapsed_millis` the worker-call wallclock (queue excluded),
 and `call_cpu_millis` the worker child's own CPU delta — contention-immune, and the figure the
@@ -150,6 +151,11 @@ and `call_cpu_millis` the worker child's own CPU delta — contention-immune, an
 `retry_tainted_non_positive` on trial/verify requests asks the server to apply one specific policy itself — re-issuing a
 non-positive verdict once when the runtime was recycled mid-call — and the retry is still surfaced through the same
 `retry_count` fact rather than hidden.
+
+The controller keeps an earlier failed attempt separate from the final attempt. A completed retry returns its
+result with a warning naming the earlier failure. A restart during the final attempt still invalidates the result;
+an unknown or interrupted retry never becomes cacheable merely because the retry started. The warning remains
+visible when runtime telemetry is off.
 
 Each semantic tool opens a worker session with imports derived from the source header or explicit request. The worker
 child answers a matching open from its live session, or from one it has pooled, rather than importing again — so a
