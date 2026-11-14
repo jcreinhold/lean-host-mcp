@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-11-14
+
+### Fixed
+
+- Update lean-rs to 0.9.7, which reuses unchanged module headers after source edits instead of repeatedly importing
+  them. Header, session, options and file-context changes invalidate reuse; failed header imports retry normally.
+  Worker resource limits and crash handling remain unchanged.
+
 ## [0.16.3] - 2026-11-13
 
 ### Fixed
@@ -696,7 +704,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.3...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.4...HEAD
+[0.16.4]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.15.0...v0.16.1
