@@ -685,7 +685,46 @@ struct CpuSampleBaseline {
     cpu_millis: u64,
 }
 
+/// One atomic decision separates queue expiry from dispatch. Once expired, a
+/// message can stay in the mailbox but can never reach the worker.
+struct QueueDeadline {
+    deadline: Instant,
+    state: AtomicUsize,
+}
+
+impl QueueDeadline {
+    const WAITING: usize = 0;
+    const STARTED: usize = 1;
+    const EXPIRED: usize = 2;
+
+    fn new(limit: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            deadline: now.checked_add(limit).unwrap_or(now),
+            state: AtomicUsize::new(Self::WAITING),
+        }
+    }
+
+    fn expire(&self) -> bool {
+        self.state
+            .compare_exchange(Self::WAITING, Self::EXPIRED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            || self.state.load(Ordering::Acquire) == Self::EXPIRED
+    }
+
+    fn start(&self) -> bool {
+        if Instant::now() >= self.deadline {
+            self.expire();
+            return false;
+        }
+        self.state
+            .compare_exchange(Self::WAITING, Self::STARTED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
 struct JobMeta {
+    queue: Arc<QueueDeadline>,
     imports: Vec<String>,
     import_fingerprint: String,
     _created_at: Instant,
@@ -1335,6 +1374,7 @@ impl LeanProject {
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
         self.pool_active_jobs.fetch_add(1, Ordering::AcqRel);
         JobMeta {
+            queue: Arc::new(QueueDeadline::new(self.admission_timeout)),
             import_fingerprint: import_fingerprint(&imports),
             imports,
             _created_at: created_at,
@@ -1352,11 +1392,12 @@ impl LeanProject {
     async fn enqueue<T>(
         &self,
         message: ProjectMessage,
-        reply_rx: oneshot::Receiver<Result<ProjectCall<T>>>,
+        mut reply_rx: oneshot::Receiver<Result<ProjectCall<T>>>,
     ) -> Result<ProjectCall<T>>
     where
         T: Send + 'static,
     {
+        let queue = Arc::clone(&message.meta().queue);
         let cancellation = message.meta().cancellation.clone();
         let mut on_drop = cancellation.cancel_on_drop();
         if cancellation.is_cancelled() {
@@ -1372,7 +1413,13 @@ impl LeanProject {
         // Tokio's reservation queue is FIFO. Keep one reservation future alive
         // while waiting, rather than racing repeated try_send calls. Cancellation
         // or expiry drops the unsent message and its activity guard.
-        match reserve_mailbox(&tx, &cancellation, self.admission_timeout).await {
+        match reserve_mailbox(
+            &tx,
+            &cancellation,
+            queue.deadline.saturating_duration_since(Instant::now()),
+        )
+        .await
+        {
             Ok(permit) => {
                 permit.send(message);
             }
@@ -1389,7 +1436,30 @@ impl LeanProject {
             }
         }
 
-        let result = match reply_rx.await {
+        let reply = tokio::select! {
+            biased;
+            reply = &mut reply_rx => reply,
+            () = cancellation.cancelled() => {
+                if queue.expire() {
+                    cancellation.mark_uncertain();
+                    return Err(self.unavailable("request_cancelled", false, false));
+                }
+                // A running worker owns cleanup; do not report cancellation
+                // complete until its reply confirms that cleanup finished.
+                reply_rx.await
+            }
+            () = tokio::time::sleep_until(queue.deadline.into()) => {
+                if queue.expire() {
+                    // The actor shares this state, so it cannot dispatch later.
+                    cancellation.mark_uncertain();
+                    on_drop.disarm();
+                    return Err(self.unavailable("queue_wait_timeout", true, false));
+                }
+                // Dispatch won the race. Its own execution timeout now applies.
+                reply_rx.await
+            }
+        };
+        let result = match reply {
             Ok(result) => result,
             Err(_) => {
                 self.shutdown();
@@ -2335,7 +2405,9 @@ impl ProjectActorState {
 
         // The cycle relocated the respawn; this relocates the import, which at
         // Mathlib scale is the expensive half by an order of magnitude.
-        let Some((fingerprint, imports)) = prewarm else { return };
+        let Some((fingerprint, imports)) = prewarm else {
+            return;
+        };
         let stamp =
             crate::cache::ImportArtifactStamp::capture(&lake_meta::artifact_roots(&self.config.lake_root), &imports);
         match self.handle.open_session_with_imports(imports.clone(), None, None) {
@@ -2719,6 +2791,10 @@ fn actor_main(
             message.reject(&state, "request_cancelled");
             continue;
         }
+        if !message.meta().queue.start() {
+            message.reject(&state, "queue_wait_timeout");
+            continue;
+        }
         state.handle_message(message);
         // Only where `idle_grace` can never arm. With a runtime available the
         // quiescence tick above does this job two seconds later and pre-warms as
@@ -2982,7 +3058,9 @@ fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
                 millis_u64(*limit)
             )
         }
-        LeanWorkerRestartReason::Cancelled { operation } => format!("cancelled operation={operation}"),
+        LeanWorkerRestartReason::Cancelled { operation } => {
+            format!("cancelled operation={operation}")
+        }
         // The child's stderr is drained once, at exit, and retained nowhere
         // else. Dropping it here would leave `child_abort operation=…` as the
         // whole record of a fatal child — enough to know something died, not
@@ -3622,6 +3700,168 @@ mod tests {
         );
     }
 
+    fn queued_test_project(limit: Duration) -> (LeanProject, mpsc::Receiver<ProjectMessage>) {
+        let (tx, rx) = mpsc::channel(2);
+        let project = LeanProject {
+            canonical_root: PathBuf::from("/test"),
+            toolchain: "test".into(),
+            package: None,
+            library: None,
+            manifest_hash: String::new(),
+            session_id: String::new(),
+            open_warnings: Vec::new(),
+            actor_tx: Mutex::new(Some(tx)),
+            admission_timeout: limit,
+            active_jobs: Arc::new(AtomicUsize::new(0)),
+            pool_active_jobs: Arc::new(AtomicUsize::new(0)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            runtime: Arc::new(Mutex::new(RuntimeSnapshot {
+                worker_generation: 1,
+                last_restart: None,
+                rss_kib: None,
+                import_profile: None,
+                profile_switch_count: 0,
+                restarts_total: 0,
+                restarts_by_cause: BTreeMap::new(),
+                import_residue_bytes: None,
+                import_residue_limit_bytes: None,
+            })),
+            module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
+        };
+        (project, rx)
+    }
+
+    #[tokio::test]
+    async fn queue_timeout_returns_before_actor_drains_and_prevents_dispatch() {
+        let (project, mut rx) = queued_test_project(Duration::from_millis(5));
+        let (reply, receive) = oneshot::channel();
+        let message = ProjectMessage::ModuleQuery {
+            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            source: String::new(),
+            query: LeanWorkerModuleQuery::Diagnostics,
+            options: LeanWorkerElabOptions::default(),
+            reply,
+        };
+        let result = tokio::time::timeout(Duration::from_secs(1), project.enqueue(message, receive))
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("queue_wait_timeout"));
+        let message = rx.recv().await.unwrap();
+        assert!(!message.meta().queue.start());
+        drop(message);
+        assert_eq!(project.active_jobs.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_deadline_includes_both_admission_and_actor_wait() {
+        let (project, mut rx) = queued_test_project(Duration::from_millis(500));
+        let tx = project.actor_tx.lock().as_ref().unwrap().clone();
+        // Occupy every mailbox slot without dispatching a worker request.
+        let permits = tx.reserve_many(2).await.unwrap();
+        let (reply, receive) = oneshot::channel();
+        let message = ProjectMessage::ModuleQuery {
+            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            source: String::new(),
+            query: LeanWorkerModuleQuery::Diagnostics,
+            options: LeanWorkerElabOptions::default(),
+            reply,
+        };
+        let mut call = Box::pin(project.enqueue(message, receive));
+        tokio::select! {
+            biased;
+            _ = &mut call => panic!("must wait for mailbox admission"),
+            () = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+        drop(permits);
+        // The actor never drains the request. The original deadline must win;
+        // granting a fresh 500ms after admission would fail this bound.
+        let result = tokio::time::timeout(Duration::from_millis(350), &mut call)
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("queue_wait_timeout"));
+        let message = rx.recv().await.unwrap();
+        assert!(!message.meta().queue.start());
+    }
+
+    #[tokio::test]
+    async fn dropping_queued_caller_cancels_message_before_dispatch() {
+        let (project, mut rx) = queued_test_project(Duration::from_secs(1));
+        let (reply, receive) = oneshot::channel();
+        let message = ProjectMessage::ModuleQuery {
+            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            source: String::new(),
+            query: LeanWorkerModuleQuery::Diagnostics,
+            options: LeanWorkerElabOptions::default(),
+            reply,
+        };
+        let mut call = Box::pin(project.enqueue(message, receive));
+        tokio::select! { biased; _ = &mut call => panic!("must wait"), () = tokio::task::yield_now() => {} }
+        drop(call);
+        let message = rx.recv().await.unwrap();
+        // The actor checks cancellation before the atomic start decision.
+        assert!(message.meta().cancellation.is_cancelled());
+        drop(message);
+        assert_eq!(project.active_jobs.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_running_message_waits_for_actor_cleanup() {
+        let (project, mut rx) = queued_test_project(Duration::from_secs(1));
+        let (reply, receive) = oneshot::channel();
+        let message = ProjectMessage::ModuleQuery {
+            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            source: String::new(),
+            query: LeanWorkerModuleQuery::Diagnostics,
+            options: LeanWorkerElabOptions::default(),
+            reply,
+        };
+        let mut call = Box::pin(project.enqueue(message, receive));
+        tokio::select! { biased; _ = &mut call => panic!("must wait"), () = tokio::task::yield_now() => {} }
+        let message = rx.recv().await.unwrap();
+        assert!(message.meta().queue.start());
+        message.meta().cancellation.cancel();
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut call).await.is_err());
+        if let ProjectMessage::ModuleQuery { reply, .. } = message {
+            let _ = reply.send(Err(ServerError::Internal("stopped, outcome unknown".into())));
+        }
+        assert!(call.await.unwrap_err().to_string().contains("outcome unknown"));
+    }
+
+    #[test]
+    fn expired_queue_entry_never_starts() {
+        let queue = QueueDeadline::new(Duration::ZERO);
+        assert!(!queue.start());
+        assert!(queue.expire());
+        assert!(!queue.start());
+    }
+
+    #[test]
+    fn cancelled_waiting_queue_entry_never_starts() {
+        let queue = QueueDeadline::new(Duration::from_secs(30));
+        assert!(queue.expire());
+        assert!(!queue.start());
+    }
+
+    #[test]
+    fn started_job_is_not_expired_by_queue_deadline() {
+        let queue = QueueDeadline::new(Duration::from_secs(30));
+        assert!(queue.start());
+        assert!(!queue.expire());
+        assert!(!queue.start());
+    }
+
+    #[test]
+    fn queue_expiry_race_has_only_one_winner() {
+        for _ in 0..100 {
+            let queue = Arc::new(QueueDeadline::new(Duration::from_secs(30)));
+            let other = Arc::clone(&queue);
+            let start = std::thread::spawn(move || other.start());
+            let expired = queue.expire();
+            let started = start.join().unwrap();
+            assert_ne!(expired, started);
+        }
+    }
+
     #[test]
     fn worker_capacity_is_released_only_after_confirmed_shutdown() {
         let capacity = Arc::new(tokio::sync::Semaphore::new(1));
@@ -3640,6 +3880,7 @@ mod tests {
         let (reply, _receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
             meta: JobMeta {
+                queue: Arc::new(QueueDeadline::new(Duration::from_secs(30))),
                 imports: vec!["Init".to_owned()],
                 import_fingerprint: "Init".to_owned(),
                 _created_at: Instant::now(),

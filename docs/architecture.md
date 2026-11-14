@@ -351,3 +351,22 @@ Lake configuration: it can read files or environment variables beyond the
 lakefile. A compiled helper could reduce startup cost without caching those
 inputs. Discovery has a 30-second timeout; cancellation kills the helper.
 Configuration errors return no proof verdict rather than retrying with defaults.
+
+## Queue and execution deadlines
+
+`runtime.request_timeout_millis` now also limits time waiting for dispatch,
+including mailbox admission and waiting behind earlier requests. The existing
+worker operation timeouts remain separate; they do not bound the whole request
+across setup, multiple operations, and retries.
+It starts when the project creates the message, not while opening the project.
+
+An expired queued request returns `queue_wait_timeout` and cannot run later.
+The actor and caller share one atomic start-or-expire decision. Expired messages
+stay in the bounded mailbox until the actor removes them; they do not reach Lean.
+Once dispatch starts, the existing worker operation limits apply. Cancellation
+of a running request waits for the worker's cleanup reply. Neither cancellation
+nor expiry counts as a successful proof check.
+
+This does not change worker-slot recovery: an uncertain child shutdown still
+retains its slot. Automatic recovery needs the worker supervisor to retain child
+ownership until it confirms exit, including failed startup and controller panic.
