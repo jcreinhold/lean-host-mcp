@@ -143,11 +143,11 @@ impl LeanHostService {
 #[serde(deny_unknown_fields)]
 struct RetainedRequest {
     action: RetainedAction,
-    /// Admission epoch from `lean_runtime.request_registry`; opt in to v2 replay safety.
+    /// Immutable epoch from the prepared ticket; retain it for every retry.
     request_epoch: Option<String>,
     /// Required with `request_epoch` when acknowledging a consumed result.
     submission_sha256: Option<String>,
-    /// Existing ID for get/cancel; optional client-chosen ID for retry-safe submit.
+    /// Server-issued prepared ticket ID, required for submit/get/cancel/acknowledge.
     request_id: Option<String>,
     /// One of `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup` or `lean_status`.
     tool: Option<String>,
@@ -155,9 +155,10 @@ struct RetainedRequest {
     arguments: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum RetainedAction {
+    Prepare,
     Submit,
     Get,
     Cancel,
@@ -167,27 +168,52 @@ enum RetainedAction {
 #[tool_router]
 impl LeanHostService {
     #[tool(
-        description = "Submit, retrieve or cancel a retained Lean request without MCP Tasks negotiation. action=submit takes tool and arguments and returns a taskId immediately. Use that ID as request_id for get/cancel. Supply a unique request_id on submit to retry a lost receipt without duplicate work. Legacy records expire after ten minutes. For v2 use request_epoch from lean_runtime; v2 results remain until acknowledge with request_epoch and submission_sha256. Execution disposition is separate from the proof verdict. Journal durability is reported by lean_runtime; old work is never replayed after restart."
+        description = "Prepare, submit, retrieve or cancel a retained Lean request without MCP Tasks negotiation. For new work call action=prepare with tool and arguments; it reserves a five-minute ticket without executing the tool. Save the returned taskId and immutable request binding, then submit the exact tool/arguments with that request_id and request_epoch. Retrying that ticket never runs twice; missing/expired IDs never create work. Capacity returns explicit no-start backpressure. Get/cancel use the same ticket; acknowledge a durably saved result with its epoch and submission_sha256. Execution disposition is separate from the proof verdict. Journal durability is reported by lean_runtime; old work is never replayed after restart."
     )]
     async fn lean_request(&self, Parameters(request): Parameters<RetainedRequest>) -> Result<CallToolResult, McpError> {
         let task = match request.action {
-            RetainedAction::Submit => {
-                if request.submission_sha256.is_some() {
-                    return Err(McpError::invalid_params(
-                        "submit does not accept submission_sha256",
-                        None,
+            RetainedAction::Prepare | RetainedAction::Submit => {
+                let preparing = matches!(request.action, RetainedAction::Prepare);
+                if !preparing && request.request_id.is_none() {
+                    return Err(crate::tasks::no_start(
+                        "invalid_submission",
+                        "submit requires a prepared request_id",
                     ));
+                }
+                // A malformed retry says nothing about work already accepted
+                // under this ticket. Only pure preparation has no old lifetime.
+                let invalid_submission = |message: &str| {
+                    if preparing {
+                        crate::tasks::no_start("invalid_submission", message)
+                    } else {
+                        McpError::invalid_params(
+                            message.to_owned(),
+                            Some(serde_json::json!({"reason":"invalid_ticket_submission",
+                                "execution":{"disposition":"unknown","reason":"invalid_ticket_submission"}})),
+                        )
+                    }
+                };
+                if preparing && (request.request_id.is_some() || request.request_epoch.is_some()) {
+                    return Err(crate::tasks::no_start(
+                        "invalid_submission",
+                        "prepare does not accept request_id or request_epoch",
+                    ));
+                }
+                if request.submission_sha256.is_some() {
+                    return Err(invalid_submission("prepare/submit do not accept submission_sha256"));
+                }
+                if !preparing && request.arguments.is_none() {
+                    return Err(invalid_submission("submit requires the prepared arguments object"));
                 }
                 let tool = request
                     .tool
-                    .ok_or_else(|| McpError::invalid_params("submit requires tool", None))?;
+                    .ok_or_else(|| invalid_submission("prepare/submit require tool"))?;
                 let call =
                     CallToolRequestParams::new(tool.clone()).with_arguments(request.arguments.unwrap_or_default());
-                let parsed = TaskCall::parse(&call)
-                    .map_err(|error| crate::tasks::no_start("invalid_submission", &error.message))?;
+                let parsed = TaskCall::parse(&call).map_err(|error| invalid_submission(&error.message))?;
                 let digest = Sha256::digest(
                     serde_json::to_vec(&(&tool, &call.arguments))
-                        .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+                        .map_err(|error| invalid_submission(&error.to_string()))?,
                 );
                 let mut submission_sha256 = String::with_capacity(64);
                 for byte in &digest {
@@ -205,12 +231,18 @@ impl LeanHostService {
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
                 };
-                let request_id = request.request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let service = self.clone();
-                let accepted = self.tasks.submit(&tool, request_id, submission, move || async move {
-                    service.run_task(parsed).await
-                })?;
-                self.tasks.get_retained(&accepted.task_id)?
+                if preparing {
+                    self.tasks.prepare(submission)?
+                } else {
+                    let request_id = request.request_id.ok_or_else(|| {
+                        crate::tasks::no_start("invalid_submission", "submit requires a prepared request_id")
+                    })?;
+                    let service = self.clone();
+                    let accepted = self.tasks.submit(&tool, request_id, submission, move || async move {
+                        service.run_task(parsed).await
+                    })?;
+                    self.tasks.get_retained(&accepted.task_id)?
+                }
             }
             RetainedAction::Get | RetainedAction::Cancel | RetainedAction::Acknowledge => {
                 if request.tool.is_some() || request.arguments.is_some() {
@@ -220,17 +252,27 @@ impl LeanHostService {
                     .request_id
                     .ok_or_else(|| McpError::invalid_params("get/cancel requires request_id", None))?;
                 if matches!(request.action, RetainedAction::Acknowledge) {
-                    self.tasks.acknowledge(
-                        &request_id,
-                        request
-                            .request_epoch
-                            .as_deref()
-                            .ok_or_else(|| McpError::invalid_params("acknowledge requires request_epoch", None))?,
-                        request
-                            .submission_sha256
-                            .as_deref()
-                            .ok_or_else(|| McpError::invalid_params("acknowledge requires submission_sha256", None))?,
-                    )?
+                    let epoch = request
+                        .request_epoch
+                        .as_deref()
+                        .ok_or_else(|| McpError::invalid_params("acknowledge requires request_epoch", None))?;
+                    let digest = request
+                        .submission_sha256
+                        .as_deref()
+                        .ok_or_else(|| McpError::invalid_params("acknowledge requires submission_sha256", None))?;
+                    match self.tasks.acknowledge_if_retained(&request_id, epoch, digest)? {
+                        Some(task) => task,
+                        None => {
+                            return Ok(carry(
+                                &serde_json::json!({
+                                    "status":"absent", "acknowledged":true, "result_available":false,
+                                    "request_id":request_id, "request_epoch":epoch, "submission_sha256":digest,
+                                    "identity_verified":false,
+                                }),
+                                self.ctx.config.carrier,
+                            ));
+                        }
+                    }
                 } else {
                     if request.submission_sha256.is_some() {
                         return Err(McpError::invalid_params(
@@ -261,7 +303,7 @@ impl LeanHostService {
         let mut result = self.ctx.broker.runtime_control(&request);
         result.effective_settings.server = Some(self.ctx.config.into());
         result.request_registry = Some(self.tasks.status());
-        result.capabilities.push("retained_request_lifecycle_v2".to_owned());
+        result.capabilities.push("retained_request_lifecycle_v3".to_owned());
         Ok(carry(&result, self.ctx.config.carrier))
     }
 
@@ -585,11 +627,36 @@ mod tests {
             }),
             ToolConfig::default(),
         );
-        let submit = || RetainedRequest {
-            action: RetainedAction::Submit,
+        let prepare = RetainedRequest {
+            action: RetainedAction::Prepare,
             request_epoch: None,
             submission_sha256: None,
-            request_id: Some("SECRET_CLIENT_ID".to_owned()),
+            request_id: None,
+            tool: Some("lean_trial".to_owned()),
+            arguments: Some(
+                serde_json::from_value(serde_json::json!({"kind":"SECRET_KIND","commands":"SECRET_PROOF"})).unwrap(),
+            ),
+        };
+        let prepared = service.lean_request(Parameters(prepare)).await.unwrap();
+        let prepared: serde_json::Value =
+            serde_json::from_str(&prepared.content.first().unwrap().as_text().unwrap().text).unwrap();
+        let request_id = prepared
+            .get("taskId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_owned();
+        let epoch = prepared
+            .get("request")
+            .and_then(|binding| binding.get("request_epoch"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_owned();
+        assert_eq!(buffer.text().matches("Lean request received").count(), 0);
+        let submit = || RetainedRequest {
+            action: RetainedAction::Submit,
+            request_epoch: Some(epoch.clone()),
+            submission_sha256: None,
+            request_id: Some(request_id.clone()),
             tool: Some("lean_trial".to_owned()),
             arguments: Some(
                 serde_json::from_value(serde_json::json!({"kind":"SECRET_KIND","commands":"SECRET_PROOF"})).unwrap(),
@@ -598,7 +665,7 @@ mod tests {
         service.lean_request(Parameters(submit())).await.unwrap();
         service.lean_request(Parameters(submit())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !service.tasks.get("SECRET_CLIENT_ID").unwrap().status().is_terminal() {
+            while !service.tasks.get(&request_id).unwrap().status().is_terminal() {
                 tokio::task::yield_now().await;
             }
         })
@@ -608,9 +675,9 @@ mod tests {
             service
                 .lean_request(Parameters(RetainedRequest {
                     action: RetainedAction::Get,
-                    request_epoch: None,
+                    request_epoch: Some(epoch.clone()),
                     submission_sha256: None,
-                    request_id: Some("SECRET_CLIENT_ID".to_owned()),
+                    request_id: Some(request_id.clone()),
                     tool: None,
                     arguments: None,
                 }))

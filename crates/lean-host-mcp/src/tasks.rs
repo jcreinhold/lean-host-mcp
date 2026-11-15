@@ -1,5 +1,5 @@
 //! Bounded retained requests. The optional journal stores evidence, never work to
-//! replay. A fresh admission epoch fences forgotten IDs without cycling workers.
+//! replay. Only preparation creates tickets; submission never recreates missing IDs.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -20,6 +20,7 @@ use crate::request_journal::RequestJournal;
 
 const MAX_TASKS: usize = 128;
 const RETENTION: Duration = Duration::from_hours(24);
+const PREPARED_RETENTION: Duration = Duration::from_secs(300);
 const LEGACY_RETENTION: Duration = Duration::from_secs(600);
 pub(crate) const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
@@ -30,6 +31,7 @@ pub(crate) struct RequestTasks(Arc<Mutex<Registry>>);
 struct Registry {
     entries: HashMap<String, Entry>,
     epoch: String,
+    next_ticket: u64,
     journal: Option<RequestJournal>,
     journal_error: bool,
 }
@@ -39,6 +41,7 @@ impl Default for Registry {
         Self {
             entries: HashMap::new(),
             epoch: uuid::Uuid::new_v4().to_string(),
+            next_ticket: 0,
             journal: None,
             journal_error: false,
         }
@@ -119,7 +122,7 @@ pub(crate) struct RequestBinding {
     pub tool: String,
     pub submission_sha256: String,
     pub project: Option<String>,
-    /// Required for v2 retry safety; omitted by legacy clients.
+    /// Immutable incarnation carried by a prepared ticket or legacy evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_epoch: Option<String>,
 }
@@ -146,7 +149,7 @@ impl RequestTasks {
             if record.execution.disposition == Disposition::Pending {
                 // Accepted is synced before spawn; dispatch_intent is synced
                 // before invoking any tool code. Neither state is relaunched.
-                record.execution = if record.execution.reason == "accepted" {
+                record.execution = if matches!(record.execution.reason.as_str(), "accepted" | "prepared") {
                     Execution::new(Disposition::NotStarted, "broker_restarted_before_dispatch")
                 } else {
                     Execution::new(Disposition::Unknown, "broker_restarted_during_execution")
@@ -207,6 +210,38 @@ impl RequestTasks {
         }
     }
 
+    /// Reserve a bounded, immutable submission identity without executing tool code.
+    pub(crate) fn prepare(&self, mut submission: RequestBinding) -> Result<RetainedTask, McpError> {
+        let mut registry = self.0.lock();
+        registry.prune(Instant::now());
+        registry.compact();
+        registry.recover_journal();
+        if registry.journal_error {
+            return Err(no_start(
+                "request_journal_unavailable",
+                "Request journal unavailable; nothing was prepared",
+            ));
+        }
+        if registry.entries.len() >= MAX_TASKS {
+            return Err(no_start(
+                "request_registry_full",
+                "Request registry full; no work was submitted",
+            ));
+        }
+        let sequence = registry.next_ticket.checked_add(1).ok_or_else(|| {
+            no_start(
+                "request_ticket_exhausted",
+                "Request ticket counter exhausted; no work was submitted",
+            )
+        })?;
+        registry.next_ticket = sequence;
+        submission.request_epoch = Some(registry.epoch.clone());
+        let id = format!("{}:{sequence}", registry.epoch);
+        let stored = registry.prepare_record(id, submission)?;
+        drop(registry);
+        retained_snapshot(stored)
+    }
+
     pub(crate) fn spawn<F, Fut>(&self, tool: &str, operation: F) -> Option<Task>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -255,36 +290,35 @@ impl RequestTasks {
         let task = {
             let mut registry = self.0.lock();
             registry.prune(Instant::now());
-            if let Some((id, submission)) = &identity {
-                if let Some(entry) = registry.entries.get(id) {
-                    // Origin instance is evidence, not part of retry equality:
-                    // an exact retained input can be read after a restart.
-                    let mut original = entry.stored.request.clone();
-                    if let Some(original) = &mut original {
-                        original.server_instance_id.clone_from(&submission.server_instance_id);
-                    }
-                    return if original.as_ref() == Some(submission) {
-                        Ok(Some(entry.stored.task.task.clone()))
-                    } else {
-                        Err(McpError::invalid_params(
-                            "request_id already belongs to a different submission",
-                            Some(serde_json::json!({"reason":"request_identity_conflict"})),
-                        ))
-                    };
+            let prepared = if let Some((id, submission)) = &identity {
+                let entry = registry
+                    .entries
+                    .get(id)
+                    .ok_or_else(|| unknown_request("request_ticket_unknown"))?;
+                // Origin is evidence, not retry equality, including after restart.
+                let mut original = entry.stored.request.clone();
+                if let Some(original) = &mut original {
+                    original.server_instance_id.clone_from(&submission.server_instance_id);
                 }
-                if let Some(epoch) = &submission.request_epoch
-                    && epoch != &registry.epoch
+                if original.as_ref() != Some(submission) {
+                    return Err(McpError::invalid_params(
+                        "request_id already belongs to a different submission",
+                        Some(serde_json::json!({"reason":"request_identity_conflict",
+                            "execution":{"disposition":"unknown","reason":"request_identity_conflict"}})),
+                    ));
+                }
+                if entry.stored.execution.disposition != Disposition::Pending
+                    || entry.stored.execution.reason != "prepared"
                 {
-                    // Refusing this retry says nothing about the old lifetime.
-                    return Err(unknown_request("request_epoch_closed"));
+                    return Ok(Some(entry.stored.task.task.clone()));
                 }
+                Some(entry.stored.clone())
+            } else {
+                None
+            };
+            if identity.is_none() {
+                registry.compact();
             }
-            // Qualify identity and epoch BEFORE compaction. Otherwise the new
-            // request that reclaims capacity would invalidate its own observed
-            // epoch. Existing identities return above without being forgotten;
-            // this absent ID was fresh in the still-open epoch under this lock.
-            // Rotation now fences forgotten keys without relaunching any of them.
-            registry.compact();
             registry.recover_journal();
             if registry.journal_error {
                 return Err(no_start(
@@ -292,7 +326,7 @@ impl RequestTasks {
                     "Request journal unavailable; no work was submitted",
                 ));
             }
-            if registry.entries.len() >= MAX_TASKS {
+            if prepared.is_none() && registry.entries.len() >= MAX_TASKS {
                 return Ok(None);
             }
             let (task_id, request) = identity.map_or_else(
@@ -300,7 +334,11 @@ impl RequestTasks {
                 |(id, request)| (id, Some(request)),
             );
             let now = current_timestamp();
-            let task = Task::new(task_id, TaskStatus::Working, &now, &now)
+            let task = prepared
+                .map_or_else(
+                    || Task::new(task_id, TaskStatus::Working, &now, &now),
+                    |record| record.task.task,
+                )
                 .with_status_message(format!("Accepted {tool}"))
                 .with_poll_interval_ms(2_000);
             let mut stored = StoredRequest {
@@ -454,6 +492,12 @@ impl RequestTasks {
             entry.stored.cancellation_requested = true;
             entry.stored.task.task.status_message = Some("Cancellation requested; waiting for work to stop".to_owned());
             entry.stored.task.task.last_updated_at = current_timestamp();
+            if entry.stored.execution.reason == "prepared" {
+                entry.stored.execution = Execution::new(Disposition::NotStarted, "cancelled_before_dispatch");
+                entry.stored.task = DetailedTask::new(entry.stored.task.task.clone(), TaskPayload::Cancelled);
+                entry.stored.finished_at = Some(unix_seconds());
+                entry.expires = Instant::now().checked_add(RETENTION);
+            }
             let record = entry.stored.clone();
             registry
                 .persist(&record)
@@ -463,14 +507,27 @@ impl RequestTasks {
         Ok(())
     }
 
-    pub(crate) fn acknowledge(&self, id: &str, epoch: &str, digest: &str) -> Result<RetainedTask, McpError> {
+    #[cfg(test)]
+    fn acknowledge(&self, id: &str, epoch: &str, digest: &str) -> Result<RetainedTask, McpError> {
+        self.acknowledge_if_retained(id, epoch, digest)?
+            .ok_or_else(unknown_task)
+    }
+
+    pub(crate) fn acknowledge_if_retained(
+        &self,
+        id: &str,
+        epoch: &str,
+        digest: &str,
+    ) -> Result<Option<RetainedTask>, McpError> {
         let mut registry = self.0.lock();
         registry.prune(Instant::now());
         registry.recover_journal();
         if registry.journal_error {
             return Err(McpError::internal_error("Request journal unavailable", None));
         }
-        let entry = registry.entries.get_mut(id).ok_or_else(unknown_task)?;
+        let Some(entry) = registry.entries.get_mut(id) else {
+            return Ok(None);
+        };
         let request = entry.stored.request.as_ref().ok_or_else(unknown_task)?;
         if request.request_epoch.as_deref() != Some(epoch) || request.submission_sha256 != digest {
             return Err(McpError::invalid_params("Acknowledgment identity mismatch", None));
@@ -494,7 +551,7 @@ impl RequestTasks {
             entry.stored = record.clone();
         }
         drop(registry);
-        retained_snapshot(record)
+        retained_snapshot(record).map(Some)
     }
 
     fn finish(
@@ -595,9 +652,8 @@ impl Registry {
         if ids.is_empty() {
             return;
         }
-        // Rotation precedes removal, including partial disk failures. Restart
-        // also creates a fresh epoch, so forgotten IDs cannot execute again.
-        self.epoch = uuid::Uuid::new_v4().to_string();
+        // Submission never creates a missing ID. Forgetting records therefore
+        // cannot authorize replay and does not invalidate unrelated tickets.
         for id in ids {
             if let Some(journal) = &self.journal
                 && let Err(error) = journal.remove(&id)
@@ -611,10 +667,40 @@ impl Registry {
     }
 
     fn prune(&mut self, now: Instant) {
+        let expired_prepared = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.stored.execution.reason == "prepared" && entry.expires.is_some_and(|expiry| expiry <= now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in expired_prepared {
+            if let Some(entry) = self.entries.get_mut(&id) {
+                entry.stored.execution = Execution::new(Disposition::NotStarted, "request_ticket_expired");
+                entry.stored.task = failed_task(
+                    entry.stored.task.task.clone(),
+                    "request_ticket_expired",
+                    "Prepared ticket expired; work was not submitted",
+                );
+                entry.stored.finished_at = Some(unix_seconds());
+                entry.expires = now.checked_add(RETENTION);
+                entry.stored.task.task.last_updated_at = current_timestamp();
+                entry.stored.task.task.ttl_ms = Some(
+                    u64::try_from(entry.created.elapsed().saturating_add(RETENTION).as_millis()).unwrap_or(u64::MAX),
+                );
+                let record = entry.stored.clone();
+                if let Err(error) = self.persist(&record) {
+                    tracing::warn!(%error, "could not persist expired preparation; admission disabled until recovery");
+                }
+            }
+        }
         let ids = self
             .entries
             .iter()
-            .filter(|(_, e)| e.stored.task.status().is_terminal() && e.expires.is_some_and(|expiry| expiry <= now))
+            .filter(|(_, entry)| {
+                entry.stored.task.status().is_terminal() && entry.expires.is_some_and(|expiry| expiry <= now)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         self.forget(ids);
@@ -624,15 +710,75 @@ impl Registry {
         if self.entries.len() < MAX_TASKS {
             return;
         }
-        // Prefer acknowledged records, then the oldest terminal result. Legacy
-        // IDs have no epoch and cannot safely be pressure-evicted.
+        // Never discard an unacknowledged result under pressure. Expired pure
+        // preparation has no tool result; its ticket remains permanently fenced.
         let id = self
             .entries
             .iter()
-            .filter(|(_, e)| e.stored.is_epoch_bound() && e.stored.task.status().is_terminal())
-            .min_by_key(|(_, e)| (!e.stored.acknowledged, e.stored.finished_at, e.created))
+            .filter(|(_, entry)| {
+                entry.stored.task.status().is_terminal()
+                    && (entry.stored.acknowledged
+                        || matches!(
+                            entry.stored.execution.reason.as_str(),
+                            "request_ticket_expired" | "request_preparation_unavailable"
+                        ))
+            })
+            .min_by_key(|(_, entry)| (entry.stored.finished_at, entry.created))
             .map(|(id, _)| id.clone());
         self.forget(id.into_iter().collect());
+    }
+
+    fn prepare_record(&mut self, id: String, submission: RequestBinding) -> Result<StoredRequest, McpError> {
+        let now = current_timestamp();
+        let task = Task::new(id.clone(), TaskStatus::Working, &now, &now)
+            .with_status_message("Prepared; awaiting submission")
+            .with_ttl_ms(u64::try_from(PREPARED_RETENTION.as_millis()).unwrap_or(u64::MAX))
+            .with_poll_interval_ms(2_000);
+        let mut stored = StoredRequest {
+            task: DetailedTask::new(task, TaskPayload::Working),
+            request: Some(submission),
+            execution: Execution::new(Disposition::Pending, "prepared"),
+            cancellation_requested: false,
+            acknowledged: false,
+            result_available: false,
+            finished_at: None,
+        };
+        // A failed persist never dispatches. Consume the sequence even on error:
+        // atomic rename may already have stored this never-submitted ticket.
+        if self.persist(&stored).is_err() {
+            // Rename may have succeeded. Account for this ID in memory too;
+            // recovery must not accumulate uncounted orphan snapshots.
+            stored.execution = Execution::new(Disposition::NotStarted, "request_preparation_unavailable");
+            stored.task = failed_task(
+                stored.task.task,
+                "request_journal_unavailable",
+                "Could not persist preparation; no work was submitted",
+            );
+            stored.finished_at = Some(unix_seconds());
+            self.entries.insert(
+                id,
+                Entry {
+                    stored,
+                    cancellation: CancellationToken::new(),
+                    created: Instant::now(),
+                    expires: Instant::now().checked_add(RETENTION),
+                },
+            );
+            return Err(no_start(
+                "request_journal_unavailable",
+                "Could not persist preparation; no work was submitted",
+            ));
+        }
+        self.entries.insert(
+            id,
+            Entry {
+                stored: stored.clone(),
+                cancellation: CancellationToken::new(),
+                created: Instant::now(),
+                expires: Instant::now().checked_add(PREPARED_RETENTION),
+            },
+        );
+        Ok(stored)
     }
 }
 
@@ -774,11 +920,58 @@ fn failed_task(task: Task, reason: &str, message: &str) -> DetailedTask {
 mod tests {
     use super::*;
 
+    // Named prepared fixtures keep legacy journal/binding assertions readable.
+    // Replay and v3 identity invariants use the real prepare/submit API in
+    // admission_tests; this helper never replaces an existing record.
+    impl RequestTasks {
+        fn prepare_submit<F, Fut>(
+            &self,
+            tool: &str,
+            id: String,
+            submission: RequestBinding,
+            operation: F,
+        ) -> Result<Task, McpError>
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
+        {
+            {
+                let mut registry = self.0.lock();
+                if !registry.entries.contains_key(&id) {
+                    if submission
+                        .request_epoch
+                        .as_ref()
+                        .is_some_and(|epoch| epoch != &registry.epoch)
+                    {
+                        return Err(unknown_request("request_ticket_unknown"));
+                    }
+                    registry.prune(Instant::now());
+                    registry.compact();
+                    registry.recover_journal();
+                    if registry.journal_error {
+                        return Err(no_start("request_journal_unavailable", "Journal unavailable"));
+                    }
+                    if registry.entries.len() >= MAX_TASKS {
+                        return Err(no_start("request_registry_full", "Registry full"));
+                    }
+                    registry.prepare_record(id.clone(), submission.clone())?;
+                }
+            }
+            self.submit(tool, id, submission, operation)
+        }
+    }
+
     fn stop_receipt() -> WorkerStopReceipt {
         WorkerStopReceipt {
             operation_id: "operation-1".to_owned(),
             worker_session_id: "worker-session-1".to_owned(),
             worker_generation: 7,
+            worker_scope: "main".to_owned(),
+            worker_request_id: Some(1),
+            worker_pid: Some(123),
+            exit_success: Some(false),
+            exit_code: None,
+            exit_status: Some("killed".to_owned()),
             operation: "module_query".to_owned(),
             cause: "timeout".to_owned(),
         }
@@ -814,13 +1007,13 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = Arc::clone(&calls);
         let original = tasks
-            .submit("test", "client-chosen-id".into(), binding(1), move || async move {
+            .prepare_submit("test", "client-chosen-id".into(), binding(1), move || async move {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
         let retry = tasks
-            .submit("test", "client-chosen-id".into(), binding(1), || async {
+            .prepare_submit("test", "client-chosen-id".into(), binding(1), || async {
                 panic!("retry must not execute")
             })
             .unwrap();
@@ -830,13 +1023,13 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             tasks
-                .submit("test", "client-chosen-id".into(), binding(2), || async {
+                .prepare_submit("test", "client-chosen-id".into(), binding(2), || async {
                     panic!("conflict must not execute")
                 })
                 .is_err()
         );
         let retry = tasks
-            .submit("test", "client-chosen-id".into(), binding(1), || async {
+            .prepare_submit("test", "client-chosen-id".into(), binding(1), || async {
                 panic!("completed retry must not execute")
             })
             .unwrap();
@@ -855,21 +1048,21 @@ mod tests {
         let tasks = RequestTasks::default();
         for index in 0..MAX_TASKS {
             tasks
-                .submit("test", format!("id-{index}"), binding(1), || async {
+                .prepare_submit("test", format!("id-{index}"), binding(1), || async {
                     Ok(CallToolResult::success(vec![]))
                 })
                 .unwrap();
         }
         assert!(
             tasks
-                .submit("test", "overflow".into(), binding(1), || async {
+                .prepare_submit("test", "overflow".into(), binding(1), || async {
                     panic!("overflow must not execute")
                 })
                 .is_err()
         );
         assert!(
             tasks
-                .submit("test", "id-0".into(), binding(1), || async {
+                .prepare_submit("test", "id-0".into(), binding(1), || async {
                     panic!("retry must not execute even when full")
                 })
                 .is_ok()
@@ -883,7 +1076,7 @@ mod tests {
         let tasks = RequestTasks::default();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let working = tasks
-            .submit("test", "working-fixture".into(), binding(1), || async {
+            .prepare_submit("test", "working-fixture".into(), binding(1), || async {
                 finish_rx.await.unwrap();
                 Ok(CallToolResult::success(vec![]))
             })
@@ -900,14 +1093,14 @@ mod tests {
         terminal(&tasks, &working.task_id).await;
         observe(&working.task_id, "completed");
         let failed = tasks
-            .submit("test", "failed-fixture".into(), binding(1), || async {
+            .prepare_submit("test", "failed-fixture".into(), binding(1), || async {
                 Err(McpError::invalid_params("test failure", None))
             })
             .unwrap();
         terminal(&tasks, &failed.task_id).await;
         observe(&failed.task_id, "failed");
         let cancelled = tasks
-            .submit("test", "cancelled-fixture".into(), binding(1), || async {
+            .prepare_submit("test", "cancelled-fixture".into(), binding(1), || async {
                 crate::cancellation::CallCancellation::current().cancelled().await;
                 Ok(CallToolResult::success(vec![]))
             })
@@ -1030,7 +1223,7 @@ mod tests {
         let binding = v2_binding(&tasks);
         let epoch = binding.request_epoch.clone().unwrap();
         tasks
-            .submit("test", "v2".into(), binding.clone(), || async {
+            .prepare_submit("test", "v2".into(), binding.clone(), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1052,7 +1245,7 @@ mod tests {
         assert!(response.get("result").is_none());
         assert!(tasks.get("v2").is_err());
         tasks
-            .submit("test", "v2".into(), binding, || async {
+            .prepare_submit("test", "v2".into(), binding, || async {
                 panic!("acknowledged ID must not replay")
             })
             .unwrap();
@@ -1063,7 +1256,7 @@ mod tests {
         let tasks = RequestTasks::default();
         let binding = v2_binding(&tasks);
         tasks
-            .submit("test", "cancel".into(), binding, || async {
+            .prepare_submit("test", "cancel".into(), binding, || async {
                 panic!("cancelled before dispatch")
             })
             .unwrap();
@@ -1080,7 +1273,7 @@ mod tests {
         let tasks = RequestTasks::default();
         let binding = v2_binding(&tasks);
         tasks
-            .submit("test", "panic".into(), binding.clone(), || async { panic!("fixture") })
+            .prepare_submit("test", "panic".into(), binding.clone(), || async { panic!("fixture") })
             .unwrap();
         terminal(&tasks, "panic").await;
         assert_eq!(
@@ -1097,7 +1290,7 @@ mod tests {
         assert!(acknowledged.acknowledged);
         assert_eq!(acknowledged.execution.disposition, Disposition::Unknown);
         tasks
-            .submit("test", "uncertain".into(), binding, || async {
+            .prepare_submit("test", "uncertain".into(), binding, || async {
                 Ok(CallToolResult::success(vec![rmcp::model::ContentBlock::text(
                     r#"{"status":"runtime_unavailable"}"#,
                 )]))
@@ -1111,12 +1304,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_compaction_rotates_only_admission_epoch_and_fences_forgotten_keys() {
+    async fn ack_compaction_preserves_admission_identity_and_fences_forgotten_keys() {
         let tasks = RequestTasks::default();
         let binding = v2_binding(&tasks);
         for index in 0..MAX_TASKS {
             tasks
-                .submit("test", format!("id-{index}"), binding.clone(), || async {
+                .prepare_submit("test", format!("id-{index}"), binding.clone(), || async {
                     Ok(CallToolResult::success(vec![]))
                 })
                 .unwrap();
@@ -1132,7 +1325,7 @@ mod tests {
         // An exact retry of a still-retained acknowledged key is idempotent,
         // even at capacity; it must not cause its own record to disappear.
         tasks
-            .submit("test", "id-0".into(), binding.clone(), || async {
+            .prepare_submit("test", "id-0".into(), binding.clone(), || async {
                 panic!("acknowledged ID must not replay")
             })
             .unwrap();
@@ -1140,19 +1333,19 @@ mod tests {
         // A fresh submission observed the current epoch before admission. The
         // compaction it triggers must admit that same request, not return unknown.
         tasks
-            .submit("test", "new".into(), binding.clone(), || async {
+            .prepare_submit("test", "new".into(), binding.clone(), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
         terminal(&tasks, "new").await;
-        assert_ne!(tasks.status().request_epoch, binding.request_epoch.clone().unwrap());
+        assert_eq!(tasks.status().request_epoch, binding.request_epoch.clone().unwrap());
         assert_eq!(
             tasks.get_retained("new").unwrap().execution.disposition,
             Disposition::Stopped
         );
-        // It retains its original binding and remains retry-safe across rotation.
+        // Its original binding remains retry-safe without global rotation.
         tasks
-            .submit("test", "new".into(), binding.clone(), || async {
+            .prepare_submit("test", "new".into(), binding.clone(), || async {
                 panic!("accepted old-epoch request must not replay")
             })
             .unwrap();
@@ -1162,11 +1355,11 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.data.unwrap()["execution"]["disposition"], "unknown");
-        // Other original IDs survive the rotation; a stale absent ID stays fenced.
+        // Other original IDs survive compaction; every absent ticket stays fenced.
         assert!(tasks.get_retained("id-1").is_ok());
         assert!(
             tasks
-                .submit("test", "stale".into(), binding, || async { panic!("closed epoch") })
+                .submit("test", "stale".into(), binding, || async { panic!("absent ticket") })
                 .is_err()
         );
     }
@@ -1177,7 +1370,7 @@ mod tests {
         let tasks = RequestTasks::open(dir.path()).unwrap();
         let original = v2_binding(&tasks);
         tasks
-            .submit("test", "durable".into(), original.clone(), || async {
+            .prepare_submit("test", "durable".into(), original.clone(), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1195,7 +1388,7 @@ mod tests {
         let mut retry = original.clone();
         retry.server_instance_id = "new-broker".into();
         recovered
-            .submit("test", "durable".into(), retry, || async {
+            .prepare_submit("test", "durable".into(), retry, || async {
                 panic!("restart must not replay")
             })
             .unwrap();
@@ -1242,7 +1435,7 @@ mod tests {
         assert!(healthy.get_retained("dispatched").is_err());
         assert!(
             healthy
-                .submit("test", "dispatched".into(), binding, || async {
+                .prepare_submit("test", "dispatched".into(), binding, || async {
                     panic!("damaged request replay")
                 })
                 .is_err()
@@ -1255,13 +1448,13 @@ mod tests {
         let tasks = RequestTasks::default();
         for index in 0..MAX_TASKS {
             tasks
-                .submit("test", format!("id-{index}"), binding(1), || async {
+                .prepare_submit("test", format!("id-{index}"), binding(1), || async {
                     std::future::pending().await
                 })
                 .unwrap();
         }
         let error = tasks
-            .submit("test", "full".into(), binding(1), || async { panic!("not admitted") })
+            .prepare_submit("test", "full".into(), binding(1), || async { panic!("not admitted") })
             .unwrap_err();
         assert_eq!(error.data.unwrap()["execution"]["disposition"], "not_started");
     }
@@ -1270,7 +1463,7 @@ mod tests {
     async fn oversized_result_has_no_verdict_but_keeps_execution_disposition() {
         let tasks = RequestTasks::default();
         tasks
-            .submit("test", "large".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "large".into(), v2_binding(&tasks), || async {
                 Ok(CallToolResult::success(vec![rmcp::model::ContentBlock::text(
                     "x".repeat(MAX_RECORD_BYTES),
                 )]))
@@ -1286,7 +1479,7 @@ mod tests {
     async fn uncertainty_survives_successful_tool_fallback() {
         let tasks = RequestTasks::default();
         tasks
-            .submit("test", "fallback".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "fallback".into(), v2_binding(&tasks), || async {
                 crate::cancellation::CallCancellation::current().mark_uncertain();
                 Ok(CallToolResult::success(vec![]))
             })
@@ -1330,7 +1523,7 @@ mod tests {
             let tasks = RequestTasks::default();
             let id = format!("stopped-{index}");
             tasks
-                .submit("test", id.clone(), v2_binding(&tasks), || async {
+                .prepare_submit("test", id.clone(), v2_binding(&tasks), || async {
                     crate::cancellation::CallCancellation::current()
                         .begin_operation()
                         .stopped(stop_receipt());
@@ -1349,7 +1542,7 @@ mod tests {
     async fn successful_fallback_cannot_settle_an_earlier_unknown_operation() {
         let tasks = RequestTasks::default();
         tasks
-            .submit("test", "mixed-fallback".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "mixed-fallback".into(), v2_binding(&tasks), || async {
                 let cancellation = crate::cancellation::CallCancellation::current();
                 cancellation.begin_operation().unknown();
                 cancellation.begin_operation().stopped(stop_receipt());
@@ -1410,7 +1603,7 @@ mod tests {
         let tasks = RequestTasks::open(dir.path()).unwrap();
         let original = v2_binding(&tasks);
         tasks
-            .submit("test", "stopped-durable".into(), original.clone(), || async {
+            .prepare_submit("test", "stopped-durable".into(), original.clone(), || async {
                 crate::cancellation::CallCancellation::current()
                     .begin_operation()
                     .stopped(stop_receipt());
@@ -1424,7 +1617,7 @@ mod tests {
         drop(tasks);
         let recovered = RequestTasks::open(dir.path()).unwrap();
         recovered
-            .submit("test", "stopped-durable".into(), original.clone(), || async {
+            .prepare_submit("test", "stopped-durable".into(), original.clone(), || async {
                 panic!("a stopped error must not replay")
             })
             .unwrap();
@@ -1441,7 +1634,7 @@ mod tests {
         for earlier_check_returned in [false, true] {
             let tasks = RequestTasks::default();
             tasks
-                .submit(
+                .prepare_submit(
                     "test",
                     "preparation-failed".into(),
                     v2_binding(&tasks),
@@ -1474,12 +1667,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_request_keeps_actual_actor_stop_receipt_without_a_proof_result() {
+        for failed_replacement in [false, true] {
+            let tasks = RequestTasks::default();
+            let prepared = tasks.prepare(binding(1)).unwrap();
+            let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+            let original = prepared.request.unwrap();
+            tasks
+                .submit("test", id.clone(), original.clone(), move || async move {
+                    crate::project::receipt_tests::retained_timeout_call(failed_replacement)
+                        .await
+                        .map(|_| CallToolResult::success(vec![]))
+                        .map_err(McpError::from)
+                })
+                .unwrap();
+            let result = terminal(&tasks, &id).await;
+            assert_eq!(result.status(), TaskStatus::Failed);
+            let retained = tasks.get_retained(&id).unwrap();
+            assert_eq!(retained.execution.disposition, Disposition::Stopped);
+            let receipt = retained.execution.worker_stop_receipt.unwrap();
+            assert_eq!(receipt.worker_scope, "main");
+            assert!(receipt.worker_request_id.is_some());
+            assert!(receipt.worker_pid.is_some());
+            assert_eq!(receipt.exit_success, Some(false));
+            tasks
+                .submit("test", id.clone(), original, || async {
+                    panic!("a stopped error cannot replay")
+                })
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_preparation_then_actor_cancellation_is_stopped_without_a_proof_result() {
+        let tasks = RequestTasks::default();
+        let root = tempfile::tempdir().unwrap();
+        let effect = root.path().join("preparation-effect");
+        let effect_in_call = effect.clone();
+        let prepared = tasks.prepare(binding(1)).unwrap();
+        let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+        tasks
+            .submit("test", id.clone(), prepared.request.unwrap(), move || async move {
+                crate::lake_options::successful_preparation_for_test(&effect_in_call)
+                    .await
+                    .map_err(McpError::from)?;
+                crate::project::receipt_tests::retained_cancelled_before_dispatch_call()
+                    .await
+                    .map(|_| CallToolResult::success(vec![]))
+                    .map_err(McpError::from)
+            })
+            .unwrap();
+        assert_eq!(terminal(&tasks, &id).await.status(), TaskStatus::Failed);
+        assert_eq!(std::fs::read_to_string(effect).unwrap(), "prepared");
+        let retained = tasks.get_retained(&id).unwrap();
+        assert_eq!(retained.execution.disposition, Disposition::Stopped);
+        assert!(retained.execution.worker_stop_receipt.is_none());
+    }
+
+    #[tokio::test]
     async fn wrong_epoch_cancel_cannot_signal_an_unrelated_request() {
         let tasks = RequestTasks::default();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let binding = v2_binding(&tasks);
         tasks
-            .submit("test", "scoped".into(), binding.clone(), || async {
+            .prepare_submit("test", "scoped".into(), binding.clone(), || async {
                 finish_rx.await.unwrap();
                 Ok(CallToolResult::success(vec![]))
             })
@@ -1508,7 +1759,7 @@ mod tests {
         let binding = v2_binding(&tasks);
         std::fs::rename(&path, dir.path().join("moved")).unwrap();
         let error = tasks
-            .submit("test", "failed-write".into(), binding.clone(), || async {
+            .prepare_submit("test", "failed-write".into(), binding.clone(), || async {
                 panic!("journal acceptance failed")
             })
             .unwrap_err();
@@ -1517,21 +1768,21 @@ mod tests {
         assert!(!tasks.status().journal_healthy);
         assert!(
             tasks
-                .submit("test", "again".into(), binding.clone(), || async {
+                .prepare_submit("test", "again".into(), binding.clone(), || async {
                     panic!("unhealthy journal")
                 })
                 .is_err()
         );
         std::fs::rename(dir.path().join("moved"), &path).unwrap();
         tasks
-            .submit("test", "recovered".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "recovered".into(), v2_binding(&tasks), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
         terminal(&tasks, "recovered").await;
         assert!(tasks.status().journal_healthy);
         let failed = tasks
-            .submit("test", "failed-write".into(), binding, || async {
+            .prepare_submit("test", "failed-write".into(), binding, || async {
                 panic!("failed acceptance ID must not execute on retry")
             })
             .unwrap();
@@ -1550,21 +1801,21 @@ mod tests {
         assert!(tasks.get(&task.task_id).is_err());
     }
     #[tokio::test]
-    async fn pressure_eviction_fences_old_ids_and_preserves_active_work() {
+    async fn pressure_backpressure_preserves_unacknowledged_results_and_active_work() {
         let dir = tempfile::tempdir().unwrap();
         let tasks = RequestTasks::open(dir.path()).unwrap();
         let active_binding = v2_binding(&tasks);
         let (tx, rx) = tokio::sync::oneshot::channel();
         tasks
-            .submit("test", "active".into(), active_binding.clone(), || async {
+            .prepare_submit("test", "active".into(), active_binding.clone(), || async {
                 rx.await.unwrap();
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
         let original = v2_binding(&tasks);
-        for i in 0..(MAX_TASKS + 3) {
+        for i in 0..(MAX_TASKS - 1) {
             tasks
-                .submit("test", format!("done-{i}"), v2_binding(&tasks), || async {
+                .prepare_submit("test", format!("done-{i}"), v2_binding(&tasks), || async {
                     Ok(CallToolResult::success(vec![]))
                 })
                 .unwrap();
@@ -1572,15 +1823,15 @@ mod tests {
         }
         assert_eq!(tasks.status().active, 1);
         assert_eq!(tasks.0.lock().entries.len(), MAX_TASKS);
-        assert!(tasks.get("done-0").is_err());
+        assert!(tasks.get("done-0").is_ok());
         assert!(
             tasks
-                .submit("test", "done-0".into(), original, || async { panic!("expired retry") })
-                .is_err()
+                .submit("test", "done-0".into(), original, || async { panic!("retained retry") })
+                .is_ok()
         );
         assert!(
             tasks
-                .submit("test", "active".into(), active_binding, || async {
+                .prepare_submit("test", "active".into(), active_binding, || async {
                     panic!("active retry")
                 })
                 .is_ok()
@@ -1595,7 +1846,7 @@ mod tests {
         let tasks = RequestTasks::open(dir.path()).unwrap();
         let original = v2_binding(&tasks);
         tasks
-            .submit("test", "old".into(), original.clone(), || async {
+            .prepare_submit("test", "old".into(), original.clone(), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1614,7 +1865,7 @@ mod tests {
         assert!(recovered.get("old").is_err());
         assert!(
             recovered
-                .submit("test", "old".into(), original, || async { panic!("expired retry") })
+                .prepare_submit("test", "old".into(), original, || async { panic!("expired retry") })
                 .is_err()
         );
     }
@@ -1627,7 +1878,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let original = v2_binding(&tasks);
         tasks
-            .submit("test", "running".into(), original.clone(), || async {
+            .prepare_submit("test", "running".into(), original.clone(), || async {
                 rx.await.unwrap();
                 Ok(CallToolResult::success(vec![]))
             })
@@ -1639,7 +1890,7 @@ mod tests {
         assert!(!tasks.status().journal_healthy);
         std::fs::rename(dir.path().join("moved"), &path).unwrap();
         tasks
-            .submit("test", "new".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "new".into(), v2_binding(&tasks), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1653,7 +1904,7 @@ mod tests {
         assert_eq!(recovered.get("running").unwrap().status(), TaskStatus::Completed);
         assert!(
             recovered
-                .submit("test", "running".into(), original, || async { panic!("replay") })
+                .prepare_submit("test", "running".into(), original, || async { panic!("replay") })
                 .is_ok()
         );
     }
@@ -1664,7 +1915,7 @@ mod tests {
         let tasks = RequestTasks::open(&path).unwrap();
         let original = v2_binding(&tasks);
         tasks
-            .submit("test", "expired".into(), original.clone(), || async {
+            .prepare_submit("test", "expired".into(), original.clone(), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1694,7 +1945,7 @@ mod tests {
                 .is_err()
         );
         tasks
-            .submit("test", "next".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "next".into(), v2_binding(&tasks), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1705,7 +1956,7 @@ mod tests {
     async fn legacy_results_keep_ten_minute_expiry_without_expiring_v2_results() {
         let tasks = RequestTasks::default();
         tasks
-            .submit("test", "v2-kept".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "v2-kept".into(), v2_binding(&tasks), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1713,7 +1964,7 @@ mod tests {
         for i in 0..MAX_TASKS - 1 {
             let id = format!("legacy-{i}");
             tasks
-                .submit("test", id.clone(), binding(1), || async {
+                .prepare_submit("test", id.clone(), binding(1), || async {
                     Ok(CallToolResult::success(vec![]))
                 })
                 .unwrap();
@@ -1727,7 +1978,7 @@ mod tests {
         assert!(tasks.get("v2-kept").is_ok());
         assert_eq!(tasks.status().retained_terminal, 1);
         tasks
-            .submit("test", "new-v2".into(), v2_binding(&tasks), || async {
+            .prepare_submit("test", "new-v2".into(), v2_binding(&tasks), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1740,7 +1991,7 @@ mod tests {
         let tasks = RequestTasks::open(dir.path()).unwrap();
         let original = v2_binding(&tasks);
         tasks
-            .submit("test", "unreadable".into(), original.clone(), || async {
+            .prepare_submit("test", "unreadable".into(), original.clone(), || async {
                 Ok(CallToolResult::success(vec![]))
             })
             .unwrap();
@@ -1762,7 +2013,7 @@ mod tests {
         for i in 0..MAX_TASKS {
             let id = format!("new-{i}");
             tasks
-                .submit("test", id.clone(), v2_binding(&tasks), || async {
+                .prepare_submit("test", id.clone(), v2_binding(&tasks), || async {
                     Ok(CallToolResult::success(vec![]))
                 })
                 .unwrap();
@@ -1779,10 +2030,14 @@ mod tests {
         assert!(recovered.get("unreadable").is_err());
         assert!(
             recovered
-                .submit("test", "unreadable".into(), original, || async {
+                .prepare_submit("test", "unreadable".into(), original, || async {
                     panic!("unreadable old request must not replay")
                 })
                 .is_err()
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tasks/admission_tests.rs"]
+mod admission_tests;

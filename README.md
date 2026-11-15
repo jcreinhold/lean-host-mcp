@@ -202,9 +202,10 @@ Two proof-agent details are worth calling out:
 
 ## Versions
 
-`lean-host-mcp` 0.16.7 builds on `lean-rs-worker-parent` / `-child` 0.9, which transitively pin `lean-rs` /
-`lean-rs-host` 0.9 (0.9.9). It supports the Lean window `4.30.0 ..= 4.35.0` and is built and tested against the head of
-that window, Lean **4.35.0**.
+`lean-host-mcp` 0.16.7 requires `lean-rs-worker-parent` **0.9.10** for operation-bound stop receipts. The worker child,
+protocol, `lean-rs` and `lean-rs-host` remain at 0.9.9. It supports the Lean window `4.30.0 ..= 4.35.0` and is built and
+tested against the head of that window, Lean **4.35.0**. The parent 0.9.10 dependency must be published before this
+server can be released; development uses the local upstream checkout while that release is pending.
 
 A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long
 as it falls inside the supported window. The window is read directly from `lean-toolchain::SUPPORTED_TOOLCHAINS` (itself
@@ -216,12 +217,13 @@ Widening the window is a `lean-rs` change first, then a version bump here.
 
 ## Durable Retained Requests
 
-New clients can use `retained_request_lifecycle_v2`: epoch-bound request IDs, independent execution disposition,
-result-preserving cancellation, and explicit acknowledgment. Enable durable result evidence with
-`--request-journal /path/to/private/request-journal` (or `LEAN_HOST_MCP_REQUEST_JOURNAL`), using one directory per
-broker. Without this option, retention remains process-local. Restart never replays work; an interrupted dispatch
-remains explicitly unknown unless a terminal result was durably retained. See the
-[lifecycle contract](docs/tool-catalog.md#epoch-bound-retained-lifecycle-v2).
+New clients use `retained_request_lifecycle_v3`: prepare a bounded server-issued ticket, save its immutable binding,
+then submit that exact ticket once. Capacity returns explicit backpressure; unknown or forgotten tickets never create
+work. Execution disposition, result-preserving cancellation and acknowledgment remain separate from proof verdicts.
+Enable durable result evidence with `--request-journal /path/to/private/request-journal` (or
+`LEAN_HOST_MCP_REQUEST_JOURNAL`), using one directory per broker. Without this option, retention remains process-local.
+Restart never replays work; an interrupted dispatch remains explicitly unknown unless a terminal result was durably
+retained. See the [lifecycle contract](docs/tool-catalog.md#prepared-retained-lifecycle-v3).
 
 ## License
 

@@ -265,6 +265,12 @@ mod tests {
             operation_id: "operation-1".to_owned(),
             worker_session_id: "worker-session-1".to_owned(),
             worker_generation: 7,
+            worker_scope: "main".to_owned(),
+            worker_request_id: Some(1),
+            worker_pid: Some(123),
+            exit_success: Some(false),
+            exit_code: None,
+            exit_status: Some("killed".to_owned()),
             operation: "module_query".to_owned(),
             cause: "timeout".to_owned(),
         };

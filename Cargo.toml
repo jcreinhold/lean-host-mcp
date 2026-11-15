@@ -18,7 +18,7 @@ version = "0.16.7"
 # `deny.toml` enforces the no-duplicate-version invariant across the full graph.
 [workspace.dependencies]
 lean-rs-worker-child = "0.9.9"
-lean-rs-worker-parent = "0.9.9"
+lean-rs-worker-parent = "0.9.10"
 lean-rs-worker-protocol = "0.9.9"
 lean-semantic-search-capability = "0.7.7"
 lean-semantic-search-contract = "0.7.7"

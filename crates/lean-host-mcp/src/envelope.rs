@@ -224,6 +224,18 @@ pub struct WorkerStopReceipt {
     pub worker_generation: u64,
     pub operation: String,
     pub cause: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_request_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<String>,
 }
 
 /// A named check was never reached; other initialization activity may be unknown.

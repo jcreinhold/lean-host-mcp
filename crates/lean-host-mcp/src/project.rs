@@ -24,7 +24,8 @@ use lean_rs_worker_parent::{
     LeanWorkerError, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder, LeanWorkerLifecycleSnapshot,
     LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome,
     LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets, LeanWorkerProcessTracker,
-    LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRestartPolicy, LeanWorkerRestartReason,
+    LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRequestStopReceipt, LeanWorkerRestartPolicy,
+    LeanWorkerRestartReason, LeanWorkerShutdownReport,
 };
 use lean_semantic_search_runtime::SemanticSearchRuntimeBuild;
 use parking_lot::Mutex;
@@ -258,7 +259,6 @@ const QUIESCENCE_GRACE: Duration = Duration::from_secs(2);
 /// A minute of silence is not evidence the caller is coming back to the same
 /// file, and a wrong guess costs a full import.
 const PREWARM_RECENCY: Duration = Duration::from_mins(1);
-const MAX_JOB_RETRIES: u32 = 1;
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_mins(1);
 /// Backstop on *every* worker cycle in one [`RESTART_WINDOW`], planned or not.
@@ -636,15 +636,17 @@ impl<T> ProjectCall<T> {
     }
 }
 
+/// Lean elaboration and commands may perform IO. Recovery never replays a
+/// submitted job, even when its direct child is known to have stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetryPolicy {
-    RetryOnceReadOnly,
+    Never,
 }
 
 impl RetryPolicy {
     fn retries(self) -> u32 {
         match self {
-            Self::RetryOnceReadOnly => MAX_JOB_RETRIES,
+            Self::Never => 0,
         }
     }
 }
@@ -1187,7 +1189,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             source,
             query,
             options,
@@ -1212,7 +1214,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQueryBatch {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             source,
             selectors,
             budgets,
@@ -1235,7 +1237,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerDeclarationInspectionResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationInspection {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             request,
             reply,
         };
@@ -1271,7 +1273,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<Vec<LeanWorkerDeclarationSearchResult>>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationSearch {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             requests,
             reply,
         };
@@ -1291,7 +1293,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<SemanticProofSearchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::SemanticProofSearch {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             request,
             reply,
         };
@@ -1312,7 +1314,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerProofAttemptResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ProofAttempt {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             request,
             options,
             reply,
@@ -1334,7 +1336,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerification {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             request,
             options,
             reply,
@@ -1357,7 +1359,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationBatchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerificationBatch {
-            meta: self.job_meta(imports, RetryPolicy::RetryOnceReadOnly),
+            meta: self.job_meta(imports, RetryPolicy::Never),
             request,
             options,
             reply,
@@ -1930,25 +1932,39 @@ impl ProjectActorState {
         let mut previous_attempt_failure = None;
         let mut final_attempt = FinalAttemptStatus::Interrupted;
         let mut worker_stop_receipt = None;
-        // The loop owns only control flow: run, classify, maybe retry. Every
-        // exit funnels into the single finalization below, which is the one
-        // place timing/restart facts are computed — threading them through six
-        // exits complects measurement with the retry state machine.
+        // Every submitted job uses Never: a stopped worker does not authorize
+        // replaying Lean IO. Outcomes share this finalization point so timing
+        // and lifecycle facts describe the one submitted attempt.
         let exit = loop {
             if meta.cancellation.is_cancelled() {
                 return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
             }
-            let attempt_before = self.handle.lifecycle_snapshot();
+            let checkpoint = self.handle.request_checkpoint();
             let result = job(&mut self.handle, meta.imports.clone(), meta.cancellation.worker());
             if let Err(error) = &result {
-                worker_stop_receipt = confirmed_stop_receipt(
-                    &self.config.session_id,
-                    meta.correlation_id,
-                    self.worker_generation_base,
-                    &attempt_before,
-                    &self.handle.lifecycle_snapshot(),
-                    error,
-                );
+                // Observing status never dispatches work. In particular, an old
+                // request's receipt cannot settle a failed replacement startup.
+                match self.handle.status() {
+                    Ok(lean_rs_worker_parent::LeanWorkerStatus::Running) => {}
+                    Ok(lean_rs_worker_parent::LeanWorkerStatus::Exited(_)) => {
+                        self.config.healthy.store(false, Ordering::Release);
+                    }
+                    Err(_) => {
+                        self.config.healthy.store(false, Ordering::Release);
+                        self.config.startup_uncertain.store(true, Ordering::Release);
+                        meta.cancellation.mark_uncertain();
+                    }
+                }
+                worker_stop_receipt = self.handle.confirmed_request_stop_since(&checkpoint).map(|receipt| {
+                    confirmed_stop_receipt(
+                        &self.config.session_id,
+                        meta.correlation_id,
+                        "main",
+                        self.worker_generation_base,
+                        receipt,
+                        stop_cause(error, &self.handle.lifecycle_snapshot()),
+                    )
+                });
             }
             match result {
                 Ok(value) => {
@@ -1957,7 +1973,10 @@ impl ProjectActorState {
                         .lifecycle_snapshot()
                         .restarts
                         .saturating_sub(lifecycle_baseline.restarts);
-                    if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
+                    if let Some(event) = self
+                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
+                    {
                         call_restart = Some(event);
                     }
                     if meta.cancellation.is_cancelled() {
@@ -2007,7 +2026,8 @@ impl ProjectActorState {
                     };
                 }
                 Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
                     let first_reason = err.to_string();
                     previous_attempt_failure =
                         Some(self.rebuild_after_worker_death(first_reason, worker_death_cause(&err), &meta)?);
@@ -2016,11 +2036,14 @@ impl ProjectActorState {
                     retry_count = retry_count.saturating_add(1);
                 }
                 Err(err) if worker_error_is_recoverable_death(&err) => {
-                    if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
+                    if let Some(event) = self
+                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
+                    {
                         call_restart = Some(event);
                     }
                     break JobExit::Unavailable {
-                        reason: format!("worker_died_after_retry: {err}"),
+                        reason: format!("worker_died: {err}"),
                         retryable: true,
                         worker_restarted: self.observed_generation() > generation_before,
                         cause: Some(worker_death_cause(&err)),
@@ -2028,7 +2051,8 @@ impl ProjectActorState {
                     };
                 }
                 Err(err) if worker_error_is_session_missing(&err) && retry_count < max_retries => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
                     previous_attempt_failure = Some(self.rebuild_after_worker_death(
                         format!("session_missing: {err}"),
                         RestartCause::SessionMissing,
@@ -2039,7 +2063,10 @@ impl ProjectActorState {
                     retry_count = retry_count.saturating_add(1);
                 }
                 Err(err) if worker_error_is_session_missing(&err) => {
-                    if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
+                    if let Some(event) = self
+                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
+                    {
                         call_restart = Some(event);
                     }
                     break JobExit::Unavailable {
@@ -2056,7 +2083,10 @@ impl ProjectActorState {
                     limit_kib,
                     ..
                 }) => {
-                    if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
+                    if let Some(event) = self
+                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
+                    {
                         call_restart = Some(event);
                     }
                     break JobExit::Unavailable {
@@ -2096,8 +2126,15 @@ impl ProjectActorState {
                     ) {
                         self.config.healthy.store(false, Ordering::Release);
                     }
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
-                    return Err(map_worker_err(err));
+                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
+                    break JobExit::Unavailable {
+                        reason: format!("worker_operation_failed: {err}"),
+                        retryable: false,
+                        worker_restarted: self.observed_generation() > generation_before,
+                        cause: None,
+                        limit_kib: None,
+                    };
                 }
             }
         };
@@ -2168,6 +2205,7 @@ impl ProjectActorState {
         // The semantic search runs in this separate capability child, so the
         // CPU delta samples it rather than the main worker handle.
         let cpu_baseline = capability.cumulative_cpu_millis();
+        let checkpoint = capability.request_checkpoint();
         let result = (|| {
             let mut session = capability
                 .open_session_with_imports(meta.imports.clone(), Some(meta.cancellation.worker()), None)
@@ -2178,18 +2216,14 @@ impl ProjectActorState {
             cpu_baseline.and_then(|start| capability.cumulative_cpu_millis().map(|end| end.saturating_sub(start)));
         // A pool lease must not advertise confirmed exit after an unobserved
         // companion shutdown. Retain the project's slot if its child is uncertain.
-        if let Err(error) = capability.shutdown() {
-            self.config.startup_uncertain.store(true, Ordering::Release);
-            return Err(self.worker_unavailable_for(
-                &meta,
-                format!("semantic capability shutdown uncertain: {error}"),
-                false,
-                false,
-                None,
-                None,
-                None,
-            ));
-        }
+        let shutdown = capability.try_shutdown();
+        let after = capability.lifecycle_snapshot();
+        let worker_stop_receipt = self.finish_semantic_shutdown(
+            &meta,
+            &after,
+            shutdown,
+            capability.confirmed_request_stop_since(&checkpoint),
+        )?;
         let runtime = self.runtime_facts(
             &meta,
             generation_before,
@@ -2200,7 +2234,65 @@ impl ProjectActorState {
             None,
         );
         self.publish_runtime(&runtime);
-        result.map(|value| ProjectCall::new(value, runtime))
+        match result {
+            Ok(value) => Ok(ProjectCall::new(value, runtime)),
+            Err(error) => Err(with_stop_receipt(
+                self.worker_unavailable_for(
+                    &meta,
+                    format!("semantic operation failed: {error}"),
+                    false,
+                    after.restarts > 0,
+                    None,
+                    None,
+                    None,
+                ),
+                worker_stop_receipt,
+            )),
+        }
+    }
+
+    /// Settle only this semantic companion's observed shutdown. An original
+    /// request receipt remains useful even when replacement cleanup is unknown.
+    fn finish_semantic_shutdown(
+        &self,
+        meta: &JobMeta,
+        after: &LeanWorkerLifecycleSnapshot,
+        shutdown: std::result::Result<LeanWorkerShutdownReport, LeanWorkerError>,
+        receipt: Option<&LeanWorkerRequestStopReceipt>,
+    ) -> Result<Option<WorkerStopReceipt>> {
+        let worker_stop_receipt = receipt.map(|receipt| {
+            confirmed_stop_receipt(
+                &self.config.session_id,
+                meta.correlation_id,
+                "semantic",
+                0,
+                receipt,
+                after
+                    .last_restart_reason
+                    .as_ref()
+                    .map_or("worker_stopped", |reason| restart_cause_from_worker(reason).as_str()),
+            )
+        });
+        if let Err(error) = shutdown {
+            self.config.startup_uncertain.store(true, Ordering::Release);
+            self.config.healthy.store(false, Ordering::Release);
+            // An original request receipt does not certify a replacement or
+            // any other companion whose shutdown has not been observed.
+            meta.cancellation.mark_uncertain();
+            return Err(with_stop_receipt(
+                self.worker_unavailable_for(
+                    meta,
+                    format!("semantic capability shutdown uncertain: {error}"),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+                worker_stop_receipt,
+            ));
+        }
+        Ok(worker_stop_receipt)
     }
 
     /// Spawn the semantic-search child for one call. The child is dropped when
@@ -2676,7 +2768,7 @@ impl ProjectActorState {
             self.publish_runtime(&RuntimeFacts {
                 worker_generation: self.observed_generation(),
                 worker_restarted: false,
-                retry_count: MAX_JOB_RETRIES,
+                retry_count: 0,
                 final_attempt: FinalAttemptStatus::Interrupted,
                 previous_attempt_failure: None,
                 queue_wait_millis: 0,
@@ -2827,47 +2919,46 @@ impl ProjectActorState {
     }
 }
 
-/// Registry 0.9.9 returns these typed interruption errors only after a
-/// synchronous kill/reap and successful replacement. Pre-send cancellation
-/// also uses `Cancelled`, so require a matching new lifecycle transition.
-/// Never substitute an unscoped historical `last_exit` for this evidence.
+/// Project one exact upstream request receipt; never infer one from counters
+/// or a typed error whose original stop may precede a failed replacement.
 fn confirmed_stop_receipt(
     session_id: &str,
     operation_id: uuid::Uuid,
+    scope: &str,
     generation_base: u64,
-    before: &LeanWorkerLifecycleSnapshot,
-    after: &LeanWorkerLifecycleSnapshot,
-    error: &LeanWorkerError,
-) -> Option<WorkerStopReceipt> {
-    let (operation, cause, matches_restart) = match (error, &after.last_restart_reason) {
-        (
-            LeanWorkerError::Timeout { operation, .. },
-            Some(LeanWorkerRestartReason::RequestTimeout {
-                operation: restarted, ..
-            }),
-        ) => (*operation, "timeout", operation == restarted),
-        (
-            LeanWorkerError::Cancelled { operation, .. },
-            Some(LeanWorkerRestartReason::Cancelled { operation: restarted }),
-        ) => (*operation, "cancelled", operation == restarted),
-        _ => return None,
-    };
-    if !matches_restart
-        || after.worker_generation <= before.worker_generation
-        || after.restarts <= before.restarts
-        || after.exits <= before.exits
-    {
-        return None;
-    }
-    Some(WorkerStopReceipt {
+    receipt: &LeanWorkerRequestStopReceipt,
+    cause: &str,
+) -> WorkerStopReceipt {
+    WorkerStopReceipt {
         operation_id: operation_id.to_string(),
         worker_session_id: session_id.to_owned(),
-        worker_generation: generation_base
-            .saturating_add(after.worker_generation)
-            .saturating_sub(1),
-        operation: operation.to_owned(),
+        worker_scope: scope.to_owned(),
+        worker_generation: generation_base.saturating_add(receipt.worker_generation()),
+        worker_request_id: Some(receipt.request_id()),
+        worker_pid: Some(receipt.process_id()),
+        operation: receipt.operation().to_owned(),
         cause: cause.to_owned(),
-    })
+        exit_success: Some(receipt.exit().success),
+        exit_code: receipt.exit().code,
+        exit_status: Some(receipt.exit().status.clone()),
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "receipt identity is authoritative; other worker errors share a diagnostic cause"
+)]
+fn stop_cause(error: &LeanWorkerError, after: &LeanWorkerLifecycleSnapshot) -> &'static str {
+    match error {
+        LeanWorkerError::Timeout { .. } => "timeout",
+        LeanWorkerError::Cancelled { .. } => "cancelled",
+        LeanWorkerError::ChildPanicOrAbort { .. } => "child_abort",
+        LeanWorkerError::ChildExited { .. } => "child_exit",
+        _ => after
+            .last_restart_reason
+            .as_ref()
+            .map_or("worker_stopped", |reason| restart_cause_from_worker(reason).as_str()),
+    }
 }
 
 fn with_stop_receipt(mut error: ServerError, receipt: Option<WorkerStopReceipt>) -> ServerError {
@@ -3909,106 +4000,12 @@ mod tests {
         (project, rx)
     }
 
-    #[test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
-    fn simulated_crash_retry_reports_completed_or_interrupted_final_attempt() {
-        fn crash() -> LeanWorkerError {
-            LeanWorkerError::ChildPanicOrAbort {
-                exit: lean_rs_worker_parent::LeanWorkerExit {
-                    success: false,
-                    code: Some(134),
-                    status: "simulated abort".to_owned(),
-                    diagnostics: "injected controller retry test".to_owned(),
-                },
-            }
-        }
-        let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap());
-        let meta = LakeProjectMeta::from_explicit(&root).unwrap();
-        let (project, _receiver) = queued_test_project(Duration::from_secs(30));
-        let (config, _) = ActorConfig::from_meta(
-            &meta,
-            "retry-test".to_owned(),
-            Arc::clone(&project.runtime),
-            Arc::clone(&project.healthy),
-            ProjectRuntimeConfig::default(),
-        )
-        .unwrap();
-        let (handle, _) = open_worker(&config).unwrap();
-        let mut state = ProjectActorState {
-            config: config.clone(),
-            handle,
-            worker_generation_base: 1,
-            last_restart: None,
-            imports_seen: Vec::new(),
-            profile_switch_count: 0,
-            last_rss_kib: None,
-            runtime: Arc::clone(&config.runtime),
-            abnormal_restart_times: VecDeque::new(),
-            restart_stats: RestartStats::default(),
-            cycled_while_idle: false,
-        };
-        let options = LeanWorkerElabOptions::default();
-        let context = crate::cache::ModuleQueryContext::capture(&root, &[], &[], &options, 1).unwrap();
-        let attempts = std::cell::Cell::new(0);
-        let call = state
-            .run_job(
-                project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
-                |handle, imports, cancel| {
-                    attempts.set(attempts.get() + 1);
-                    if attempts.get() == 1 {
-                        // Inject the same typed error as a fatal exit. The actual
-                        // controller replaces only this test's private worker.
-                        return Err(crash());
-                    }
-                    handle.process_module_query_with_imports(
-                        imports,
-                        "theorem retry_ok : True := True.intro",
-                        &LeanWorkerModuleQuery::Diagnostics,
-                        &options,
-                        Some(cancel),
-                        None,
-                    )
-                },
-            )
-            .unwrap();
-        assert_eq!(attempts.get(), 2);
-        let (value, facts) = call.into_parts();
-        assert!(matches!(value, LeanWorkerModuleQueryOutcome::Ok { .. }), "{value:?}");
-        assert_eq!(facts.retry_count, 1);
-        assert_eq!(facts.final_attempt, FinalAttemptStatus::Completed);
-        assert_eq!(facts.previous_attempt_failure.as_ref().unwrap().cause, "child_abort");
-        assert!(facts.call_restart.is_none());
-        assert!(crate::diagnosis::execution_taint(&facts).is_none());
-        assert!(context.after_call(&root, &facts).is_some());
-
-        let attempts = std::cell::Cell::new(0);
-        let error = state
-            .run_job::<()>(
-                project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
-                |handle, _, _| {
-                    attempts.set(attempts.get() + 1);
-                    let _ = handle;
-                    Err(crash())
-                },
-            )
-            .unwrap_err();
-        assert_eq!(attempts.get(), 2);
-        let ServerError::WorkerUnavailable(failure) = error else {
-            panic!("{error:?}")
-        };
-        assert_eq!(failure.runtime.final_attempt, FinalAttemptStatus::Interrupted);
-        assert_eq!(failure.runtime.retry_count, 1);
-        assert!(crate::diagnosis::execution_taint(&failure.runtime).is_some());
-        assert!(context.after_call(&root, &failure.runtime).is_none());
-        state.handle.shutdown().unwrap();
-    }
-
     #[tokio::test]
     async fn queue_timeout_returns_before_actor_drains_and_prevents_dispatch() {
         let (project, mut rx) = queued_test_project(Duration::from_millis(5));
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            meta: project.job_meta(vec![], RetryPolicy::Never),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4032,7 +4029,7 @@ mod tests {
         let permits = tx.reserve_many(2).await.unwrap();
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            meta: project.job_meta(vec![], RetryPolicy::Never),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4060,7 +4057,7 @@ mod tests {
         let (project, mut rx) = queued_test_project(Duration::from_secs(1));
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            meta: project.job_meta(vec![], RetryPolicy::Never),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4081,7 +4078,7 @@ mod tests {
         let (project, mut rx) = queued_test_project(Duration::from_secs(1));
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::RetryOnceReadOnly),
+            meta: project.job_meta(vec![], RetryPolicy::Never),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4167,11 +4164,12 @@ mod tests {
         )
         .unwrap();
         let before = worker.lifecycle_snapshot();
+        let checkpoint = worker.request_checkpoint();
         let error = worker.health().unwrap_err();
         assert!(matches!(error, LeanWorkerError::Timeout { .. }));
-        let after = worker.lifecycle_snapshot();
         let operation_id = uuid::Uuid::new_v4();
-        let receipt = confirmed_stop_receipt("session", operation_id, 1, &before, &after, &error).unwrap();
+        let upstream = worker.confirmed_request_stop_since(&checkpoint).unwrap();
+        let receipt = confirmed_stop_receipt("session", operation_id, "main", 1, upstream, "timeout");
         assert_eq!(receipt.operation_id, operation_id.to_string());
         assert_eq!(receipt.worker_session_id, "session");
         assert_eq!(receipt.worker_generation, 1 + before.worker_generation);
@@ -4181,26 +4179,16 @@ mod tests {
             1,
             "only the healthy replacement is still owned"
         );
+        assert_eq!(receipt.worker_scope, "main");
+        assert_eq!(receipt.worker_request_id, Some(upstream.request_id()));
+        assert_eq!(receipt.worker_pid, Some(upstream.process_id()));
+        assert_eq!(receipt.exit_success, Some(false));
+        assert_eq!(receipt.exit_status.as_deref(), Some(upstream.exit().status.as_str()));
         assert!(
-            confirmed_stop_receipt("session", operation_id, 1, &after, &after, &error).is_none(),
-            "a historical stop cannot certify the current generation"
-        );
-        let mut unrelated = after.clone();
-        unrelated.last_restart_reason = Some(LeanWorkerRestartReason::Cancelled { operation: "other" });
-        assert!(confirmed_stop_receipt("session", operation_id, 1, &before, &unrelated, &error).is_none());
-        assert!(
-            confirmed_stop_receipt(
-                "session",
-                operation_id,
-                1,
-                &before,
-                &after,
-                &LeanWorkerError::WaitTimeout {
-                    operation: "kill_wait",
-                    duration: Duration::ZERO
-                }
-            )
-            .is_none()
+            worker
+                .confirmed_request_stop_since(&worker.request_checkpoint())
+                .is_none(),
+            "a historical stop cannot certify a fresh checkpoint"
         );
         worker.shutdown().unwrap();
         assert_eq!(tracker.active_processes(), 0);
@@ -4220,7 +4208,7 @@ mod tests {
                 _created_at: Instant::now(),
                 queued_at: Instant::now(),
                 correlation_id: uuid::Uuid::new_v4(),
-                retry_policy: RetryPolicy::RetryOnceReadOnly,
+                retry_policy: RetryPolicy::Never,
                 _active_job: ActiveJobGuard {
                     active_jobs: Arc::clone(&active),
                     pool_active_jobs: Arc::clone(&pool_active),
@@ -4255,3 +4243,7 @@ mod tests {
         }));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "project/receipt_tests.rs"]
+pub(crate) mod receipt_tests;

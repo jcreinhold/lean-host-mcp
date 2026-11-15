@@ -708,14 +708,37 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
     let root_s = root.path().to_string_lossy();
     let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
     let mut original = server.new_session().await;
+    let prepared = prepare_retained(&mut original, "lean_verify", json!({"targets":[]})).await;
+    let request_id = prepared["taskId"].clone();
+    let epoch = prepared["request"]["request_epoch"].clone();
+    assert_eq!(prepared["execution"]["disposition"], "pending");
+    assert_eq!(prepared["execution"]["reason"], "prepared");
     let submission = json!({"name": "lean_request", "arguments": {
-        "action": "submit", "request_id": "lost-receipt", "tool": "lean_verify", "arguments": {"targets": []}
+        "action": "submit", "request_id": request_id, "request_epoch": epoch,
+        "tool": "lean_verify", "arguments": {"targets": []}
     }});
     let accepted = original.request("tools/call", submission.clone()).await.unwrap();
     assert_eq!(
         accepted.json.pointer("/result/structuredContent/taskId"),
-        Some(&json!("lost-receipt"))
+        Some(&request_id)
     );
+    for malformed in [
+        json!({"tool":"lean_runtime","arguments":{}}),
+        json!({"tool":"lean_trial","arguments":{"kind":42}}),
+        json!({"arguments":{"targets":[]}}),
+        json!({"tool":"lean_verify"}),
+        json!({"tool":"lean_verify","arguments":{"targets":[]},"submission_sha256":"unexpected"}),
+    ] {
+        let mut arguments = malformed;
+        arguments["action"] = json!("submit");
+        arguments["request_id"] = request_id.clone();
+        arguments["request_epoch"] = epoch.clone();
+        let rejected = original
+            .request("tools/call", json!({"name":"lean_request","arguments":arguments}))
+            .await
+            .unwrap();
+        assert_eq!(rejected.json["error"]["data"]["execution"]["disposition"], "unknown");
+    }
     let binding = accepted
         .json
         .pointer("/result/structuredContent/request")
@@ -735,7 +758,7 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
         json!([
             "retained_request_binding_v1",
             "draining_lease_v1",
-            "retained_request_lifecycle_v2"
+            "retained_request_lifecycle_v3"
         ])
     );
     // No Tasks negotiation, and the caller may disappear while work continues.
@@ -744,7 +767,7 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
     let retry = reconnected.request("tools/call", submission).await.unwrap();
     assert_eq!(
         retry.json.pointer("/result/structuredContent/taskId"),
-        Some(&json!("lost-receipt"))
+        Some(&request_id)
     );
     let retained = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -752,7 +775,7 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
                 .request(
                     "tools/call",
                     json!({"name": "lean_request", "arguments": {
-                        "action": "get", "request_id": "lost-receipt"
+                        "action": "get", "request_id": request_id, "request_epoch": epoch
                     }}),
                 )
                 .await
@@ -772,9 +795,16 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
         retained.pointer("/result/structuredContent/errors").is_some(),
         "original invalid-target result retained: {retained}"
     );
-    let conflicting = reconnected.request("tools/call", json!({"name": "lean_request", "arguments": {
-        "action": "submit", "request_id": "lost-receipt", "tool": "lean_status", "arguments": {"kind": "project"}
-    }})).await.unwrap();
+    let conflicting = reconnected
+        .request(
+            "tools/call",
+            json!({"name": "lean_request", "arguments": {
+                "action": "submit", "request_id": request_id, "request_epoch": epoch,
+                "tool": "lean_status", "arguments": {"kind": "project"}
+            }}),
+        )
+        .await
+        .unwrap();
     assert!(
         conflicting.json.get("error").is_some(),
         "changed inputs must not rerun: {conflicting:?}"
@@ -783,7 +813,7 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
         .request(
             "tools/call",
             json!({"name": "lean_request", "arguments": {
-                "action": "cancel", "request_id": "lost-receipt"
+                "action": "cancel", "request_id": request_id, "request_epoch": epoch
             }}),
         )
         .await
@@ -798,7 +828,7 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
         .request(
             "tools/call",
             json!({"name": "lean_request", "arguments": {
-                "action": "get", "request_id": "lost-receipt"
+                "action": "get", "request_id": request_id, "request_epoch": epoch
             }}),
         )
         .await;
@@ -821,7 +851,199 @@ async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_r
 }
 
 #[tokio::test]
-async fn durable_v2_result_survives_binary_restart_and_exact_acknowledgment() {
+async fn streamable_http_prepared_ticket_does_not_execute_and_cancel_prevents_submission() {
+    let root = tempfile::tempdir().unwrap();
+    let server = HttpMcpServer::start(&[("--lake-root", root.path().to_str().unwrap())]).await;
+    let mut client = server.new_session().await;
+    let arguments = json!({"kind":"command","commands":"#check Nat"});
+    let prepared = prepare_retained(&mut client, "lean_trial", arguments.clone()).await;
+    let id = prepared["taskId"].clone();
+    let epoch = prepared["request"]["request_epoch"].clone();
+    let get = json!({"name":"lean_request","arguments":{"action":"get","request_id":id,"request_epoch":epoch}});
+    let unchanged = client.request("tools/call", get).await.unwrap();
+    assert_eq!(unchanged.json["result"]["structuredContent"], prepared);
+    assert_eq!(prepared["execution"]["reason"], "prepared");
+    let mut status = TaskHttpClient::new(&server.url);
+    assert_eq!(
+        status.control(json!({"action":"status"})).await["pool"]["occupied_slots"],
+        0
+    );
+    let cancelled = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"cancel","request_id":id,"request_epoch":epoch
+            }}),
+        )
+        .await
+        .unwrap();
+    let cancelled = cancelled.json["result"]["structuredContent"].clone();
+    assert_eq!(cancelled["execution"]["disposition"], "not_started");
+    let late = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"submit","request_id":id,"request_epoch":epoch,"tool":"lean_trial","arguments":arguments
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late.json["result"]["structuredContent"], cancelled);
+    for (field, value) in [
+        ("request_id", json!("chosen")),
+        ("request_epoch", epoch),
+        ("submission_sha256", json!("bad")),
+    ] {
+        let mut arguments = json!({"action":"prepare","tool":"lean_verify","arguments":{"targets":[]}});
+        arguments[field] = value;
+        let response = client
+            .request("tools/call", json!({"name":"lean_request","arguments":arguments}))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.json["error"]["data"]["execution"]["disposition"],
+            "not_started"
+        );
+    }
+    let missing = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"submit","tool":"lean_verify","arguments":{"targets":[]}
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.json["error"]["data"]["execution"]["disposition"], "not_started");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn streamable_http_retained_capacity_backpressures_without_forgetting_unacknowledged_results() {
+    let root = tempfile::tempdir().unwrap();
+    let server = HttpMcpServer::start(&[("--lake-root", root.path().to_str().unwrap())]).await;
+    let mut client = server.new_session().await;
+    let first = prepare_retained(&mut client, "lean_verify", json!({"targets":[]})).await;
+    let id = first["taskId"].clone();
+    let epoch = first["request"]["request_epoch"].clone();
+    let mut ids = BTreeSet::from([id.as_str().unwrap().to_owned()]);
+    for _ in 1..128 {
+        let ticket = prepare_retained(&mut client, "lean_verify", json!({"targets":[]})).await;
+        assert_eq!(ticket["request"]["request_epoch"], epoch);
+        assert!(ids.insert(ticket["taskId"].as_str().unwrap().to_owned()));
+    }
+    client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"submit","request_id":id,"request_epoch":epoch,"tool":"lean_verify","arguments":{"targets":[]}
+            }}),
+        )
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = client
+                .request(
+                    "tools/call",
+                    json!({"name":"lean_request","arguments":{
+                        "action":"get","request_id":id,"request_epoch":epoch
+                    }}),
+                )
+                .await
+                .unwrap();
+            let record = response.json["result"]["structuredContent"].clone();
+            if record["execution"]["disposition"] != "pending" {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed["result_available"], true);
+    let busy = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"prepare","tool":"lean_verify","arguments":{"targets":[]}
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(busy.json["error"]["data"]["reason"], "request_registry_full");
+    assert_eq!(busy.json["error"]["data"]["execution"]["disposition"], "not_started");
+    let still_retained = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"get","request_id":id,"request_epoch":epoch
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_retained.json["result"]["structuredContent"], completed);
+    let wrong_digest = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"acknowledge","request_id":id,"request_epoch":epoch,
+                "submission_sha256":"wrong-digest"
+            }}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrong_digest.json.get("error").is_some(),
+        "a retained binding must be verified"
+    );
+    // The result has been saved above. Ignore the acknowledgement receipt to
+    // model a lost response, then force its compact tombstone out under pressure.
+    client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"acknowledge","request_id":id,"request_epoch":epoch,
+                "submission_sha256":completed["request"]["submission_sha256"]
+            }}),
+        )
+        .await
+        .unwrap();
+    let fresh = prepare_retained(&mut client, "lean_verify", json!({"targets":[]})).await;
+    assert_eq!(fresh["request"]["request_epoch"], epoch);
+    assert!(!ids.contains(fresh["taskId"].as_str().unwrap()));
+    let repeated_ack = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"acknowledge","request_id":id,"request_epoch":epoch,
+                "submission_sha256":completed["request"]["submission_sha256"]
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated_ack.json["result"]["structuredContent"],
+        json!({"status":"absent","acknowledged":true,"result_available":false,
+            "request_id":id,"request_epoch":epoch,"submission_sha256":completed["request"]["submission_sha256"],
+            "identity_verified":false}),
+        "absence must not fabricate an execution or proof result"
+    );
+    let replay = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"submit","request_id":id,"request_epoch":epoch,"tool":"lean_verify","arguments":{"targets":[]}
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.json["error"]["data"]["execution"]["disposition"], "unknown");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_v3_result_survives_binary_restart_and_exact_acknowledgment() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("lakefile.lean"), "package retained\n").unwrap();
     std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
@@ -836,12 +1058,14 @@ async fn durable_v2_result_survives_binary_restart_and_exact_acknowledgment() {
     let status = control.control(json!({"action":"status"})).await;
     assert_eq!(status["request_registry"]["durable"], true);
     assert_eq!(status["pool"]["occupied_slots"], 0);
-    let epoch = status["request_registry"]["request_epoch"].clone();
+    let mut client = server.new_session().await;
+    let prepared = prepare_retained(&mut client, "lean_status", json!({"kind":"project"})).await;
+    let request_id = prepared["taskId"].clone();
+    let epoch = prepared["request"]["request_epoch"].clone();
     let submission = json!({"name":"lean_request","arguments":{
-        "action":"submit","request_id":"durable-receipt","request_epoch":epoch,
+        "action":"submit","request_id":request_id,"request_epoch":epoch,
         "tool":"lean_status","arguments":{"kind":"project"}
     }});
-    let mut client = server.new_session().await;
     client.request("tools/call", submission.clone()).await.unwrap();
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -849,7 +1073,7 @@ async fn durable_v2_result_survives_binary_restart_and_exact_acknowledgment() {
                 .request(
                     "tools/call",
                     json!({"name":"lean_request","arguments":{
-                        "action":"get","request_id":"durable-receipt","request_epoch":epoch
+                        "action":"get","request_id":request_id,"request_epoch":epoch
                     }}),
                 )
                 .await
@@ -865,6 +1089,7 @@ async fn durable_v2_result_survives_binary_restart_and_exact_acknowledgment() {
     .unwrap();
     assert_eq!(completed["execution"]["disposition"], "stopped");
     assert_eq!(completed["result_available"], true);
+    let unsubmitted = prepare_retained(&mut client, "lean_status", json!({"kind":"project"})).await;
     // Kill only this test-owned, worker-free broker. The terminal snapshot must
     // already be durable before the reply can be observed.
     server.shutdown().await;
@@ -878,10 +1103,31 @@ async fn durable_v2_result_survives_binary_restart_and_exact_acknowledgment() {
     );
     assert_eq!(new_status["pool"]["occupied_slots"], 0);
     let mut client = restarted.new_session().await;
+    let closed_preparation = client
+        .request("tools/call", json!({"name":"lean_request","arguments":{
+            "action":"submit","request_id":unsubmitted["taskId"],
+            "request_epoch":unsubmitted["request"]["request_epoch"],"tool":"lean_status","arguments":{"kind":"project"}
+        }}))
+        .await
+        .unwrap();
+    assert_eq!(
+        closed_preparation.json["result"]["structuredContent"]["execution"]["disposition"],
+        "not_started"
+    );
+    assert_eq!(
+        closed_preparation.json["result"]["structuredContent"]["result_available"],
+        false
+    );
+    let fresh = prepare_retained(&mut client, "lean_status", json!({"kind":"project"})).await;
+    assert_eq!(
+        fresh["request"]["server_instance_id"],
+        new_status["pool"]["instance_id"]
+    );
+    assert_ne!(fresh["request"]["server_instance_id"], status["pool"]["instance_id"]);
     let retry = client.request("tools/call", submission).await.unwrap();
     assert_eq!(retry.json["result"]["structuredContent"], completed);
     let ack = json!({"name":"lean_request","arguments":{
-        "action":"acknowledge","request_id":"durable-receipt","request_epoch":epoch,
+        "action":"acknowledge","request_id":request_id,"request_epoch":epoch,
         "submission_sha256":completed["request"]["submission_sha256"]
     }});
     for _ in 0..2 {
@@ -950,11 +1196,14 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     assert_eq!(runtime["worker_import_residue_soft_bytes"], 2_576_980_320_u64);
     assert_eq!(runtime["worker_session_pool_capacity"], 6);
     assert_eq!(status["effective_settings"]["server"]["response_carrier"], "both");
-    assert_eq!(
-        status["request_registry"],
-        json!({"active":0,"retained_terminal":0,"capacity":128,"terminal_retention_millis":86_400_000,
-            "request_epoch":status["request_registry"]["request_epoch"],"durable":false,"journal_healthy":true,"max_record_bytes":4*1024*1024})
-    );
+    let registry = &status["request_registry"];
+    assert_eq!(registry["active"], 0);
+    assert_eq!(registry["retained_terminal"], 0);
+    assert_eq!(registry["capacity"], 128);
+    assert_eq!(registry["terminal_retention_millis"], 86_400_000);
+    assert_eq!(registry["durable"], false);
+    assert_eq!(registry["journal_healthy"], true);
+    assert_eq!(registry["max_record_bytes"], 4 * 1024 * 1024);
     server.shutdown().await;
 }
 
@@ -978,10 +1227,51 @@ async fn streamable_http_retained_requests_wait_past_full_mailbox_and_cancel() {
     )
     .await;
     let mut client = TaskHttpClient::new(&server.url);
-    let blocker = client
-        .command(&sentinel_command(&running, Some((&finished, 4_000))))
-        .await;
+    let mut bridge = server.new_session().await;
+    let blocker_arguments = json!({"kind":"command","commands":sentinel_command(&running, Some((&finished, 4_000)))});
+    let prepared = prepare_retained(&mut bridge, "lean_trial", blocker_arguments.clone()).await;
+    let blocker = prepared["taskId"].as_str().unwrap().to_owned();
+    bridge
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"submit","request_id":blocker,"request_epoch":prepared["request"]["request_epoch"],
+                "tool":"lean_trial","arguments":blocker_arguments
+            }}),
+        )
+        .await
+        .unwrap();
     wait_for_sentinel(&running, Duration::from_secs(30)).await;
+    let malformed = bridge
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"submit","request_id":blocker,"request_epoch":prepared["request"]["request_epoch"],
+                "tool":"lean_trial","arguments":{"kind":42}
+            }}),
+        )
+        .await;
+    assert_eq!(
+        malformed.unwrap().json["error"]["data"]["execution"]["disposition"],
+        "unknown"
+    );
+    let still_running = bridge
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{
+                "action":"get","request_id":blocker,"request_epoch":prepared["request"]["request_epoch"]
+            }}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        still_running.json["result"]["structuredContent"]["execution"]["disposition"],
+        "pending"
+    );
+    assert!(
+        !finished.exists(),
+        "malformed retry cannot stop or replace the running command"
+    );
     let first_id = client.command(&sentinel_command(&first, None)).await;
     let cancel_id = client.command(&sentinel_command(&cancelled, None)).await;
     let last_id = client.command(&sentinel_command(&last, None)).await;
@@ -1606,6 +1896,18 @@ impl HttpMcpServer {
             eprintln!("HTTP test server stderr:\n{stderr}");
         }
     }
+}
+
+async fn prepare_retained(client: &mut HttpSession, tool: &str, arguments: Value) -> Value {
+    let response = client
+        .request(
+            "tools/call",
+            json!({"name":"lean_request","arguments":{"action":"prepare","tool":tool,"arguments":arguments}}),
+        )
+        .await
+        .unwrap();
+    assert!(response.json.get("error").is_none(), "prepare failed: {response:?}");
+    response.json["result"]["structuredContent"].clone()
 }
 
 #[derive(Debug)]

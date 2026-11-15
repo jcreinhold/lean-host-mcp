@@ -5,6 +5,7 @@
 //! hashing only `lakefile.lean` is sufficient to cache its evaluated options.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,10 +30,44 @@ struct ModuleOptions {
 
 /// Evaluate the owning package, then carry its options through every worker/cache path.
 pub(crate) async fn resolve(root: &Path, options: LeanWorkerElabOptions) -> Result<LeanWorkerElabOptions> {
-    let file_label = options.file_label.clone();
-    resolve_inner(root, options)
-        .await
-        .map_err(|error| preparation_failed(file_label, error))
+    observe_preparation(options.file_label.clone(), resolve_inner(root, options)).await
+}
+
+async fn observe_preparation(
+    file_label: String,
+    preparation: impl Future<Output = Result<LeanWorkerElabOptions>>,
+) -> Result<LeanWorkerElabOptions> {
+    let operation = CallCancellation::current().begin_operation();
+    match preparation.await {
+        Ok(options) => {
+            operation.returned();
+            Ok(options)
+        }
+        Err(error) => {
+            operation.unknown();
+            Err(preparation_failed(file_label, error))
+        }
+    }
+}
+
+/// Exercise preparation's real child/effect boundary without a Lean toolchain.
+#[cfg(test)]
+pub(crate) async fn successful_preparation_for_test(effect_path: &Path) -> Result<LeanWorkerElabOptions> {
+    observe_preparation("PreparationFixture.lean".to_owned(), async {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf prepared > \"$1\"")
+            .arg("lean-host-mcp-preparation-test")
+            .arg(effect_path)
+            .kill_on_drop(true);
+        let output = discovery_output(&mut command, Duration::from_secs(5)).await?;
+        if !output.status.success() {
+            return Err(bad_project(format!("test preparation child exited: {}", output.status)));
+        }
+        Ok(LeanWorkerElabOptions::new().file_label("PreparationFixture.lean"))
+    })
+    .await
 }
 
 fn preparation_failed(file_label: String, error: ServerError) -> ServerError {
@@ -219,6 +254,22 @@ fn owning_package(root: &Path, file: Option<&Path>) -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_preparation_remains_started_when_the_target_is_never_dispatched() {
+        let request = tokio_util::sync::CancellationToken::new();
+        let ((), evidence) = crate::cancellation::with_cancellation_evidence(&request, async {
+            observe_preparation("Demo.lean".to_owned(), async { Ok(LeanWorkerElabOptions::new()) })
+                .await
+                .unwrap();
+            CallCancellation::current().begin_operation().not_started();
+        })
+        .await;
+        assert_eq!(evidence.returned, 1);
+        assert_eq!(evidence.not_started, 1);
+        assert_eq!(evidence.pending, 0);
+        assert!(!evidence.uncertain);
+    }
 
     #[cfg(unix)]
     #[tokio::test]

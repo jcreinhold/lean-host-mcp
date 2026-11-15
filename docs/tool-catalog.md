@@ -43,138 +43,116 @@ request cancellation. Cheap project status remains synchronous. Existing clients
 HTTP server shares task records across client sessions, so reconnecting clients can retrieve their existing handles. A
 task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
 
-Clients without the Tasks extension can use the ordinary `lean_request` tool:
+### Prepared retained lifecycle (v3)
+
+Clients without the Tasks extension use `lean_request`. Servers advertise `retained_request_lifecycle_v3` in
+`lean_runtime`. Prepare new work first:
 
 ```json
-{"name":"lean_request","arguments":{"action":"submit","request_id":"unique-client-id","tool":"lean_verify","arguments":{"targets":[]}}}
-{"name":"lean_request","arguments":{"action":"get","request_id":"unique-client-id"}}
-{"name":"lean_request","arguments":{"action":"cancel","request_id":"unique-client-id"}}
+{"name":"lean_request","arguments":{"action":"prepare","tool":"lean_verify","arguments":{"targets":[]}}}
 ```
 
-`submit` accepts any of the five semantic tools and immediately returns task metadata in the configured tool result
-carrier. Use its `taskId` as `request_id` for `get` or `cancel`. `get` returns the same metadata plus `result` on
-`completed`, or a JSON-RPC `error` on `failed`; the retained `result` is the original `CallToolResult`, including its
-content and structured content. `cancel` returns the current record, which may still be `working` during cleanup. The
-bridge remains synchronous even for task-aware clients. It never submits `lean_runtime` or another `lean_request`.
+`prepare` validates the tool and arguments, reserves one retained-record slot and returns a server-issued `taskId` and
+immutable `request` binding. It does not invoke the tool, open a worker, or evaluate Lake configuration. The ticket is
+valid for five minutes. Its `execution` remains `pending` with reason `prepared`, because it can still be submitted.
+Preparing does not reserve a worker lane. `prepare` rejects client-supplied IDs, epochs and digests.
 
-An optional client-chosen `request_id` makes a lost submission receipt retryable: submitting the same ID, tool and
-argument object returns the original record without running again. Changed inputs under that ID are rejected. IDs allow
-1–128 ASCII letters, digits, underscores, hyphens, dots or colons. Prefer a fresh UUID per logical request and save it
-before submission. Omit the ID to generate one, but a lost generated receipt cannot be recovered by resubmission.
-Without `request_epoch`, this legacy deduplication lasts only while the record exists, not after its ten-minute terminal
-retention or a server restart. After an unknown/expired response, reconcile the outcome before deciding whether to
-submit again. New clients should use the epoch-bound lifecycle below.
+Save the returned ticket and binding before submitting the exact input:
 
-Servers advertising `retained_request_binding_v1` in `lean_runtime` status include an immutable `request` alongside each
-plain bridge record: `server_instance_id`, `tool`, `submission_sha256`, and `project`. The instance matches
-`pool.instance_id`. The digest is lowercase SHA-256 of the compact JSON array `[tool, arguments]`, with object keys
-sorted by the server's JSON serializer. `project` is the exact submitted string (or null), not a resolved-root or source
-revision claim. The binding is stored before execution and remains unchanged through completion or cancellation. Clients
-can persist their ID and input binding before submission, then validate every recovered response without relying on a
-separate status call racing a restart. Native Tasks records not created through the bridge have no such binding. Source
-validation and uncertain-outcome rules still apply; failed/cancelled task state alone is not a universal certificate
-that all worker processes are confirmed stopped.
+```json
+{"name":"lean_request","arguments":{"action":"submit","request_id":"ticket-from-prepare","request_epoch":"epoch-from-ticket","tool":"lean_verify","arguments":{"targets":[]}}}
+{"name":"lean_request","arguments":{"action":"get","request_id":"ticket-from-prepare","request_epoch":"epoch-from-ticket"}}
+{"name":"lean_request","arguments":{"action":"cancel","request_id":"ticket-from-prepare","request_epoch":"epoch-from-ticket"}}
+```
 
-Busy project mailboxes and cold-project capacity admit waiting callers in FIFO order. An admission wait is bounded by
-the configured worker timeout and can be cancelled; an admission timeout means that queued operation did not run. Worker
-execution has its own budget after admission. A multi-operation tool may already have completed earlier steps.
+`submit` requires an existing prepared ticket. It never creates work for a missing ID. An exact retry of an accepted,
+running or retained terminal ticket returns its original record without executing again. Changed inputs are rejected.
+Malformed submit retries report `unknown` for the referenced ticket; a rejected retry cannot certify that previously
+accepted work never started. Pure invalid preparation or submission without a ticket can report typed `not_started`. Use
+the ticket's original epoch and origin instance on every recovery; status observations are advisory. Expiry,
+acknowledgment and unrelated requests do not rotate the live broker's epoch or invalidate another prepared ticket.
 
-Closing an HTTP connection alone does not request cancellation. A synchronous request may continue until completion or
-its worker deadline, even when its response stream is lost. Synchronous clients should send MCP
-`notifications/cancelled` with the original request ID when they intend to stop work.
+The immutable `request` binding contains `server_instance_id`, `request_epoch`, `tool`, `submission_sha256`, and
+`project`. The digest is lowercase SHA-256 of the compact JSON array `[tool, arguments]`, with object keys sorted by the
+server's JSON serializer. `project` is the exact submitted string or null, not a source-revision claim. The origin
+instance and epoch remain unchanged after recovery by a restarted broker. The prepare receipt is authoritative even if
+an earlier status observation described a previous broker instance. Native Tasks records have no such binding.
 
-The server retains at most 128 active or finished records. Epoch-bound results expire after 24 hours, including across a
-restart when a journal is configured. Legacy and negotiated task results keep their ten-minute retention. Reads and
-submissions remove expired records; an idle server needs no cleanup timer. At capacity, it first removes an acknowledged
-epoch-bound record, or otherwise the oldest finished epoch-bound result. It never evicts an active request. If no record
-can be removed, negotiated task calls use the ordinary synchronous path; explicit `lean_request` submits are rejected
-without running. Follow the suggested polling interval; task push notifications and in-task input are not used. Legacy
-retention survives client disconnects, not a server restart. An automatically generated task ID identifies one request,
-not a deduplication key: resubmitting a semantic `tools/call` creates another request. The explicit `lean_request`
-client-chosen ID exception is described above. Callers remain responsible for binding requests to the source revision
-they require.
+Persist the logical request before preparing, the returned ticket before submitting, and submit intent before sending. A
+lost prepare response can be followed by another prepare because the unobserved ticket was never submitted. After
+submission might have occurred, recover only the same ticket and input. A missing or forgotten ticket is `unknown` and
+never authorizes a replacement submission. Earlier v2 records keep their immutable identities for retrieval,
+cancellation, acknowledgment and exact retained retries; fresh client-chosen IDs are no longer admitted.
 
-A cancellation acknowledgement records intent. A queued operation is skipped, while a running worker operation must
-finish its cleanup before normal cancellation becomes terminal. Supervisor observation and deadlines bound worker
-cancellation; it is not instantaneous. Completed task status means the tool returned a result, which may contain Lean
-errors or a negative verification verdict. It does not itself establish successful verification.
+`get` returns task metadata plus the original `CallToolResult` on completion or a JSON-RPC error on failure. A completed
+task can contain Lean errors or a negative verification verdict; it does not establish successful verification. The
+bridge remains synchronous for task-aware clients and never submits `lean_runtime` or another `lean_request`.
 
-### Epoch-bound retained lifecycle (v2)
+The registry holds at most 128 prepared, active and finished records. Preparing can reclaim acknowledged records and
+expired records, but pressure never removes an unacknowledged terminal result. If all slots are protected, it returns
+`request_registry_full` with typed `execution.disposition: not_started`; no tool was submitted. Read or acknowledge
+existing results, then prepare new work. Unsubmitted tickets expire after five minutes and become irrevocably
+`not_started`; cancellation can close them earlier. Active dispatched requests never expire. Terminal bridge results
+have 24-hour retention; negotiated MCP Tasks keep their ten-minute process-local retention. Reads and admissions prune
+expired records. The record bound is 4 MiB, so an oversized result explicitly loses its verdict
+(`result_available: false`) while retaining execution evidence.
 
-Servers advertising `retained_request_lifecycle_v2` report `request_registry.request_epoch` in `lean_runtime`. Save that
-epoch and a fresh client-chosen ID before submitting. Supply `request_epoch` on submit, get and cancel. The immutable
-`request` binding includes the original epoch and original broker instance, even after recovery. A duplicate retained ID
-with exactly the same epoch and input returns its original record, never another execution. A forgotten ID under a
-closed epoch is rejected as `unknown`, never relaunched. This is not a claim that the original operation never ran. An
-epoch rotates before removing expired or capacity-evicted records, without restarting a worker.
-
-Every bridge response adds:
+Every bridge record includes:
 
 - `execution.disposition`: `pending`, `not_started`, `stopped`, or `unknown`.
 - `execution.reason`: a stable diagnostic code, separate from the Lean verdict.
 - `cancellation_requested`: intent, not evidence of exit.
-- `result_available` and `acknowledged`: whether the original terminal result is still available and consumed.
+- `result_available` and `acknowledged`: whether the terminal payload is available or consumed.
 
-`not_started` means the whole retained tool invocation could not dispatch and cannot later dispatch. Registry-full,
-invalid-submit and acceptance-journal failures use the same typed no-start data in their JSON-RPC error. A cancellation
-before dispatch is terminal `not_started`. Once invoked, a returned semantic result normally means `stopped`, but
-runtime errors without matching stop evidence, uncertain actor cleanup and task panic remain conservatively `unknown`. A
-multi-operation tool can have performed earlier steps even when a later step failed. Uncertainty is retained even if the
-tool degrades a worker failure into a fallback result. A negative Lean verdict can be a perfectly valid result of a
-stopped execution.
+`not_started` means the entire retained invocation cannot dispatch. Failed preparation of one named target can instead
+carry scoped `execution.target_check` evidence while the overall execution remains `unknown`. Configuration evaluation
+and its subprocesses may already have started. A multi-operation tool may have completed earlier steps.
 
-A confirmed worker timeout/cancellation can return `execution.disposition: stopped` with an optional
-`execution.worker_stop_receipt` while the semantic response still reports runtime unavailability and contains no proof
-verdict. The receipt binds the interrupted operation to its project actor session and worker generation. It covers the
-direct worker only; it does not certify Lake descendants or rollback external effects, and does not authorize replay.
-Per-operation evidence is aggregated: an unresolved operation remains `unknown` even after a successful fallback, and a
-later queue refusal cannot make earlier completed work `not_started`.
+A confirmed worker timeout/cancellation can return `stopped` with an optional `execution.worker_stop_receipt` while the
+semantic response reports runtime unavailability and contains no proof verdict. The receipt binds the interrupted
+operation to its actor session and worker generation. It covers the direct worker only; it does not certify Lake
+descendants, roll back external effects or authorize replay. Unresolved operation evidence remains `unknown` through a
+successful fallback. Later queue refusal cannot turn earlier completed preparation or worker work into `not_started`.
 
-Lake option discovery failures add a scoped `target_check` record naming the source file and preparation stage, with
-`disposition: not_started`. This says that check was never reached. The overall execution remains `unknown` because
-configuration evaluation and its subprocesses may have started. The same scoped fact is included in JSON-RPC error data.
+Cancellation records intent. A queued operation is skipped; a running operation retains cleanup ownership until it
+returns. If completion races cancellation, the original result is preserved. Failed/cancelled task status and the
+presence of a proof verdict do not independently release an execution lifetime.
 
-Cancellation never overwrites a returned result. If completion races cancellation, clients receive the original result
-and a separate intent flag. Only the execution disposition, not failed/cancelled task status or the presence of a proof
-verdict, can release a caller's execution lifetime.
-
-After validating and durably saving the complete response and atomically updating its own source/build association, the
-client may send:
+After durably saving the complete response and atomically updating its local source/build association, a client may
+acknowledge it:
 
 ```json
-{"name":"lean_request","arguments":{"action":"acknowledge","request_id":"saved-id","request_epoch":"saved-epoch","submission_sha256":"digest-from-request-binding"}}
+{"name":"lean_request","arguments":{"action":"acknowledge","request_id":"saved-ticket","request_epoch":"saved-epoch","submission_sha256":"digest-from-request-binding"}}
 ```
 
-Acknowledgment requires the exact immutable identity and a terminal request. It releases the large payload, not the
-compact deduplication evidence. A terminal `unknown` may be acknowledged only after the client preserves that unresolved
-lifetime in its own durable association; acknowledgment does not change `unknown` to `stopped`, release a source/build
-reader, or authorize replay. This keeps consumed errors from permanently filling the registry. Subsequent gets return
-`acknowledged: true`, `result_available: false` and no `result`/`error`. Repeated acknowledgments are idempotent while
-the record exists. At capacity, the next admission may remove the oldest finished result even without acknowledgment.
-Fetch the new epoch for genuinely new work, never blindly replay an unresolved old request with a new identity. Active
-requests never expire or lose their records. The record bound is 4 MiB, so a too-large result explicitly loses its
-verdict (`result_available: false`) but retains execution evidence.
+Acknowledgment requires the exact binding and a terminal record. It releases the payload, preserving execution evidence
+while the record remains retained. Repeated acknowledgments are idempotent. Acknowledged records can be reclaimed for
+new tickets; subsequent access to a forgotten ID returns `unknown` and never relaunches work. A terminal `unknown` may
+be acknowledged only after its unresolved lifetime is preserved locally; acknowledgment does not certify exit.
 
-Durability is explicit: `request_registry.durable` is true only when a healthy `--request-journal DIR` (or
-`LEAN_HOST_MCP_REQUEST_JOURNAL`) is configured. `journal_healthy: false` reports a storage failure. New submissions and
-acknowledgments retry storage, re-save current records, and proceed only after that succeeds. Status, result reads and
-cancellation remain usable. With no journal the v2 lifetime and epoch rules still apply, but evidence is process-local.
-The directory has one broker owner, enforced by an OS file lock, and bounded per-request atomic, synced snapshots. It is
-not a worker queue. Snapshots contain response data and should be treated as private local application data. Only
-epoch-bound bridge requests are journalled, not negotiated MCP Tasks or legacy requests.
+If a lost acknowledgment is retried after its record was reclaimed, the server returns `status: absent`,
+`acknowledged: true`, `result_available: false`, the echoed `request_id`/`request_epoch`/`submission_sha256`, and
+`identity_verified: false`. It includes no `execution`, request binding or proof result. This confirms only that no
+retained record remains; a client that already archived the bound result can clear its pending acknowledgment. It does
+not verify the echoed identity or establish an execution outcome. While a record remains retained, a wrong epoch or
+digest is still rejected.
 
-On restart the admission epoch is fresh. Completed results are recovered. Accepted records durably known never to have
-reached dispatch intent become `not_started`; dispatch-intent records without a durable terminal outcome become
-`unknown`. Neither is replayed. The current worker supervisor cannot prove the old worker lifetime after arbitrary
-broker death, so a new healthy broker is not an exit witness. Journal recovery deliberately does not kill, adopt or
-relaunch workers, or claim that all old work stopped. Existing uncertain-outcome recovery remains necessary for those
-cases. An invalid or unreadable snapshot is moved aside with a warning; healthy records remain available. Moving it
-preserves its bytes without claiming an I/O error means corruption. If that move fails, startup reports the path and
-error rather than admitting work with uncounted records. The missing request returns `unknown`, never a pass or an
-automatic rerun. Disk failure blocks new retained work only while storage remains unusable. The service retries on the
-next submission or acknowledgment; it does not need a restart. Quarantined files retain their original bytes for
-inspection and do not count toward the active result limit. They are not deleted automatically; repeated read failures
-can grow this separate set of files and each occurrence logs its path.
+Durability is explicit: `request_registry.durable` requires a healthy `--request-journal DIR` or
+`LEAN_HOST_MCP_REQUEST_JOURNAL`. With no journal, retention is process-local. Storage failure disables new admission
+until current records can be synchronized again; reads and cancellation remain usable. The journal has one OS-locked
+broker owner and bounded atomic, synced request snapshots. It stores private response evidence, not a replay queue.
+
+Restart creates a new incarnation for new tickets. Recovered prepared and accepted-before-dispatch records become
+`not_started`; dispatch-intent records without a terminal outcome become `unknown`. Terminal results retain their
+original binding. No old work is replayed. A healthy new broker is not an old-worker exit witness. Journal recovery
+neither adopts nor kills old workers. Invalid or unreadable snapshots are preserved separately with a warning; failure
+to preserve them blocks startup. Missing evidence remains unknown. Quarantined files are retained for inspection and do
+not count toward registry capacity; repeated failures can grow that separate set of files.
+
+Busy project mailboxes and cold-project capacity admit waiting callers in FIFO order. Their admission wait and worker
+execution use separate bounded budgets. Closing an HTTP connection alone does not request cancellation. A synchronous
+client should send MCP `notifications/cancelled` with the original request ID when it intends to stop work. Reconnect
+and retrieve the same retained ticket after a lost response.
 
 ## Worker Activity And Admission Leases
 

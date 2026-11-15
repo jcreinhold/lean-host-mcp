@@ -78,8 +78,8 @@ impl RequestJournal {
             let record = match read() {
                 Ok(record) => record,
                 Err(error) => {
-                    // The new broker has a fresh epoch: even an unreadable ID
-                    // cannot be retried as new work. Preserve the damaged bytes.
+                    // Submission never creates an absent ticket, including an
+                    // unreadable one. Preserve the damaged evidence separately.
                     tracing::warn!(%error, path = %path.display(), "request record invalid or unreadable; preserving it separately");
                     let mut quarantine = path.with_extension("json.quarantined");
                     if fs::symlink_metadata(&quarantine).is_ok() {

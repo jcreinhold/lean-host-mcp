@@ -30,6 +30,7 @@ pub struct RequestRegistryStatus {
     pub retained_terminal: usize,
     pub capacity: usize,
     pub terminal_retention_millis: u64,
+    /// Server admission incarnation; prepared tickets carry their own binding.
     pub request_epoch: String,
     pub durable: bool,
     pub journal_healthy: bool,
