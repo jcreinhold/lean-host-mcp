@@ -14,7 +14,8 @@ use rmcp::task_manager::current_timestamp;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::cancellation::with_cancellation_evidence;
+use crate::cancellation::{CallExecutionEvidence, with_cancellation_evidence};
+use crate::envelope::{TargetCheckNotStarted, WorkerStopReceipt};
 use crate::request_journal::RequestJournal;
 
 const MAX_TASKS: usize = 128;
@@ -85,6 +86,10 @@ impl StoredRequest {
 struct Execution {
     disposition: Disposition,
     reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_stop_receipt: Option<WorkerStopReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_check: Option<TargetCheckNotStarted>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +106,8 @@ impl Execution {
         Self {
             disposition,
             reason: reason.to_owned(),
+            worker_stop_receipt: None,
+            target_check: None,
         }
     }
 }
@@ -345,12 +352,12 @@ impl RequestTasks {
             let result =
                 tokio::spawn(async move { with_cancellation_evidence(&cancellation, operation()).await }).await;
             match result {
-                Ok((result, uncertain)) => tasks.finish(&task_id, result, false, uncertain),
+                Ok((result, evidence)) => tasks.finish(&task_id, result, false, evidence),
                 Err(error) => tasks.finish(
                     &task_id,
                     Err(McpError::internal_error(format!("task failed: {error}"), None)),
                     true,
-                    true,
+                    CallExecutionEvidence::default(),
                 ),
             }
             // Reads and admissions prune expired results. Avoid a sleeping task
@@ -490,18 +497,20 @@ impl RequestTasks {
         retained_snapshot(record)
     }
 
-    fn finish(&self, id: &str, result: Result<CallToolResult, McpError>, panicked: bool, uncertain: bool) {
+    fn finish(
+        &self,
+        id: &str,
+        result: Result<CallToolResult, McpError>,
+        panicked: bool,
+        evidence: CallExecutionEvidence,
+    ) {
         let mut registry = self.0.lock();
         let Some(entry) = registry.entries.get_mut(id) else {
             return;
         };
         // A cancellation signal is not a result. In particular it must never
         // overwrite a real proof result returned while cancellation raced it.
-        entry.stored.execution = if uncertain && !panicked {
-            Execution::new(Disposition::Unknown, "worker_operation_failed_without_exit_witness")
-        } else {
-            completion_execution(&result, panicked)
-        };
+        entry.stored.execution = execution_with_evidence(&result, panicked, evidence);
         let payload = match result {
             Ok(result) => match serde_json::to_value(result) {
                 Ok(serde_json::Value::Object(result)) => TaskPayload::Completed { result },
@@ -665,6 +674,29 @@ fn completion_execution(result: &Result<CallToolResult, McpError>, panicked: boo
     }
 }
 
+fn execution_with_evidence(
+    result: &Result<CallToolResult, McpError>,
+    panicked: bool,
+    evidence: CallExecutionEvidence,
+) -> Execution {
+    let mut execution = if panicked {
+        Execution::new(Disposition::Unknown, "task_panicked")
+    } else if evidence.uncertain || evidence.pending > 0 {
+        Execution::new(Disposition::Unknown, "worker_operation_failed_without_exit_witness")
+    } else if evidence.stopped > 0 {
+        Execution::new(Disposition::Stopped, "worker_operation_stopped")
+    } else if evidence.returned > 0 {
+        Execution::new(Disposition::Stopped, "worker_operations_returned")
+    } else if evidence.not_started > 0 {
+        Execution::new(Disposition::NotStarted, "worker_operations_not_started")
+    } else {
+        completion_execution(result, false)
+    };
+    execution.worker_stop_receipt = evidence.worker_stop_receipt;
+    execution.target_check = evidence.target_check;
+    execution
+}
+
 fn retained_snapshot(entry: StoredRequest) -> Result<RetainedTask, McpError> {
     let serde_json::Value::Object(mut fields) =
         serde_json::to_value(&entry.task).map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -741,6 +773,16 @@ fn failed_task(task: Task, reason: &str, message: &str) -> DetailedTask {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    fn stop_receipt() -> WorkerStopReceipt {
+        WorkerStopReceipt {
+            operation_id: "operation-1".to_owned(),
+            worker_session_id: "worker-session-1".to_owned(),
+            worker_generation: 7,
+            operation: "module_query".to_owned(),
+            cause: "timeout".to_owned(),
+        }
+    }
 
     fn binding(byte: u8) -> RequestBinding {
         RequestBinding {
@@ -1267,6 +1309,167 @@ mod tests {
                 completion_execution(&Ok(result), false).disposition,
                 Disposition::Unknown
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_worker_error_keeps_its_original_result_in_every_carrier() {
+        let value = serde_json::json!({"data":null,"errors":[{"code":"runtime_unavailable"}]});
+        let text = rmcp::model::ContentBlock::text(value.to_string());
+        let mut both = CallToolResult::structured(value.clone());
+        both.content.push(text.clone());
+        for (index, result) in [
+            CallToolResult::success(vec![text]),
+            CallToolResult::structured(value),
+            both,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = serde_json::to_value(&result).unwrap();
+            let tasks = RequestTasks::default();
+            let id = format!("stopped-{index}");
+            tasks
+                .submit("test", id.clone(), v2_binding(&tasks), || async {
+                    crate::cancellation::CallCancellation::current()
+                        .begin_operation()
+                        .stopped(stop_receipt());
+                    Ok(result)
+                })
+                .unwrap();
+            terminal(&tasks, &id).await;
+            let record = tasks.get_retained(&id).unwrap();
+            assert_eq!(record.execution.disposition, Disposition::Stopped);
+            assert_eq!(record.execution.worker_stop_receipt, Some(stop_receipt()));
+            assert_eq!(serde_json::to_value(record).unwrap()["result"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_fallback_cannot_settle_an_earlier_unknown_operation() {
+        let tasks = RequestTasks::default();
+        tasks
+            .submit("test", "mixed-fallback".into(), v2_binding(&tasks), || async {
+                let cancellation = crate::cancellation::CallCancellation::current();
+                cancellation.begin_operation().unknown();
+                cancellation.begin_operation().stopped(stop_receipt());
+                cancellation.begin_operation().returned();
+                Ok(CallToolResult::success(vec![]))
+            })
+            .unwrap();
+        terminal(&tasks, "mixed-fallback").await;
+        let record = tasks.get_retained("mixed-fallback").unwrap();
+        assert_eq!(record.execution.disposition, Disposition::Unknown);
+        assert_eq!(record.execution.worker_stop_receipt, Some(stop_receipt()));
+    }
+
+    #[test]
+    fn later_queue_refusal_does_not_hide_earlier_completed_work() {
+        let result = Err(no_start("queue_wait_timeout", "No later operation was dispatched"));
+        let execution = execution_with_evidence(
+            &result,
+            false,
+            CallExecutionEvidence {
+                returned: 1,
+                not_started: 1,
+                ..CallExecutionEvidence::default()
+            },
+        );
+        assert_eq!(execution.disposition, Disposition::Stopped);
+        let never_started = execution_with_evidence(
+            &result,
+            false,
+            CallExecutionEvidence {
+                not_started: 1,
+                ..CallExecutionEvidence::default()
+            },
+        );
+        assert_eq!(never_started.disposition, Disposition::NotStarted);
+    }
+
+    #[test]
+    fn pending_operation_or_panic_cannot_be_settled_by_a_stop_receipt() {
+        for (panicked, pending) in [(false, 1), (true, 0)] {
+            let execution = execution_with_evidence(
+                &Ok(CallToolResult::success(vec![])),
+                panicked,
+                CallExecutionEvidence {
+                    pending,
+                    stopped: 1,
+                    worker_stop_receipt: Some(stop_receipt()),
+                    ..CallExecutionEvidence::default()
+                },
+            );
+            assert_eq!(execution.disposition, Disposition::Unknown);
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_error_receipt_survives_restart_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(dir.path()).unwrap();
+        let original = v2_binding(&tasks);
+        tasks
+            .submit("test", "stopped-durable".into(), original.clone(), || async {
+                crate::cancellation::CallCancellation::current()
+                    .begin_operation()
+                    .stopped(stop_receipt());
+                Err(McpError::internal_error("worker timed out; no proof result", None))
+            })
+            .unwrap();
+        terminal(&tasks, "stopped-durable").await;
+        while Arc::strong_count(&tasks.0) > 1 {
+            tokio::task::yield_now().await;
+        }
+        drop(tasks);
+        let recovered = RequestTasks::open(dir.path()).unwrap();
+        recovered
+            .submit("test", "stopped-durable".into(), original.clone(), || async {
+                panic!("a stopped error must not replay")
+            })
+            .unwrap();
+        let record = recovered.get_retained("stopped-durable").unwrap();
+        assert_eq!(record.execution.disposition, Disposition::Stopped);
+        assert_eq!(record.execution.worker_stop_receipt, Some(stop_receipt()));
+        assert_eq!(record.request, Some(original));
+        assert_eq!(record.fields["status"], "failed");
+        assert!(record.fields.get("result").is_none());
+    }
+
+    #[tokio::test]
+    async fn preparation_failure_only_certifies_the_named_target_check_not_started() {
+        for earlier_check_returned in [false, true] {
+            let tasks = RequestTasks::default();
+            tasks
+                .submit(
+                    "test",
+                    "preparation-failed".into(),
+                    v2_binding(&tasks),
+                    move || async move {
+                        let cancellation = crate::cancellation::CallCancellation::current();
+                        if earlier_check_returned {
+                            cancellation.begin_operation().returned();
+                        }
+                        cancellation.preparation_failed(TargetCheckNotStarted {
+                            disposition: "not_started".to_owned(),
+                            file_label: "UnitIndexed.lean".to_owned(),
+                            stage: "lake_option_discovery".to_owned(),
+                        });
+                        Err(McpError::internal_error(
+                            "Lake option discovery timed out; no target proof check ran",
+                            None,
+                        ))
+                    },
+                )
+                .unwrap();
+            terminal(&tasks, "preparation-failed").await;
+            let record = tasks.get_retained("preparation-failed").unwrap();
+            assert_eq!(record.execution.disposition, Disposition::Unknown);
+            assert!(record.execution.worker_stop_receipt.is_none());
+            let value = serde_json::to_value(record).unwrap();
+            assert_eq!(value["execution"]["target_check"]["disposition"], "not_started");
+            assert_eq!(value["execution"]["target_check"]["file_label"], "UnitIndexed.lean");
+            assert_eq!(value["execution"]["target_check"]["stage"], "lake_option_discovery");
         }
     }
 

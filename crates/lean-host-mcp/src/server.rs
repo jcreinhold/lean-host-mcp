@@ -749,6 +749,7 @@ mod tests {
         let error = ServerError::worker_unavailable(WorkerUnavailable {
             retryable: true,
             worker_restarted: true,
+            worker_stop_receipt: None,
             project_root: "/tmp/project".to_owned(),
             project_hash: "hash".to_owned(),
             imports: vec!["Init".to_owned()],

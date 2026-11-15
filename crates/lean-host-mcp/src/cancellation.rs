@@ -1,13 +1,13 @@
 //! Request cancellation shared by async callers and the synchronous worker owner.
 
 use std::future::Future;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use lean_rs_worker_parent::LeanWorkerCancellationToken;
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
+
+use crate::envelope::{TargetCheckNotStarted, WorkerStopReceipt};
 
 tokio::task_local! {
     static CURRENT: CallCancellation;
@@ -17,7 +17,63 @@ tokio::task_local! {
 pub(crate) struct CallCancellation {
     worker: LeanWorkerCancellationToken,
     signal: CancellationToken,
-    uncertain: Arc<AtomicBool>,
+    execution: Arc<Mutex<CallExecutionEvidence>>,
+}
+
+/// Aggregate operation evidence, independent of semantic results and carriers.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CallExecutionEvidence {
+    pub(crate) pending: usize,
+    pub(crate) returned: usize,
+    pub(crate) stopped: usize,
+    pub(crate) not_started: usize,
+    pub(crate) uncertain: bool,
+    pub(crate) worker_stop_receipt: Option<WorkerStopReceipt>,
+    pub(crate) target_check: Option<TargetCheckNotStarted>,
+}
+
+/// Each enqueued operation owns its own terminal evidence. A later successful
+/// fallback cannot settle an earlier operation whose cleanup remains unknown.
+pub(crate) struct CallOperation(Option<Arc<Mutex<CallExecutionEvidence>>>);
+
+impl CallOperation {
+    pub(crate) fn not_started(self) {
+        self.resolve(|evidence| evidence.not_started = evidence.not_started.saturating_add(1));
+    }
+
+    pub(crate) fn returned(self) {
+        self.resolve(|evidence| evidence.returned = evidence.returned.saturating_add(1));
+    }
+
+    pub(crate) fn stopped(self, receipt: WorkerStopReceipt) {
+        self.resolve(|evidence| {
+            evidence.stopped = evidence.stopped.saturating_add(1);
+            evidence.worker_stop_receipt = Some(receipt);
+        });
+    }
+
+    pub(crate) fn unknown(self) {
+        self.resolve(|evidence| evidence.uncertain = true);
+    }
+
+    fn resolve(mut self, update: impl FnOnce(&mut CallExecutionEvidence)) {
+        if let Some(execution) = self.0.take() {
+            let mut evidence = execution.lock();
+            evidence.pending = evidence.pending.saturating_sub(1);
+            update(&mut evidence);
+            drop(evidence);
+        }
+    }
+}
+
+impl Drop for CallOperation {
+    fn drop(&mut self) {
+        if let Some(execution) = self.0.take() {
+            let mut evidence = execution.lock();
+            evidence.pending = evidence.pending.saturating_sub(1);
+            evidence.uncertain = true;
+        }
+    }
 }
 
 impl CallCancellation {
@@ -45,7 +101,22 @@ impl CallCancellation {
     /// Retain uncertainty even when a tool degrades a failed worker call into
     /// another successful semantic result. The outer lifecycle must not lose it.
     pub(crate) fn mark_uncertain(&self) {
-        self.uncertain.store(true, Ordering::Release);
+        self.execution.lock().uncertain = true;
+    }
+
+    /// Preparation can prove a named target check never ran without proving
+    /// that every subprocess started during preparation has stopped.
+    pub(crate) fn preparation_failed(&self, target_check: TargetCheckNotStarted) {
+        self.mark_uncertain();
+        let mut evidence = self.execution.lock();
+        evidence.target_check = Some(target_check);
+    }
+
+    pub(crate) fn begin_operation(&self) -> CallOperation {
+        let mut evidence = self.execution.lock();
+        evidence.pending = evidence.pending.saturating_add(1);
+        drop(evidence);
+        CallOperation(Some(Arc::clone(&self.execution)))
     }
 
     pub(crate) fn cancel_on_drop(&self) -> CancelOnDrop {
@@ -78,7 +149,7 @@ pub(crate) async fn with_cancellation<T>(request: &CancellationToken, operation:
 pub(crate) async fn with_cancellation_evidence<T>(
     request: &CancellationToken,
     operation: impl Future<Output = T>,
-) -> (T, bool) {
+) -> (T, CallExecutionEvidence) {
     let cancellation = CallCancellation::default();
     let _on_drop = cancellation.cancel_on_drop();
     if request.is_cancelled() {
@@ -96,7 +167,8 @@ pub(crate) async fn with_cancellation_evidence<T>(
             }
         })
         .await;
-    (result, cancellation.uncertain.load(Ordering::Acquire))
+    let evidence = cancellation.execution.lock().clone();
+    (result, evidence)
 }
 
 #[cfg(test)]
@@ -155,5 +227,54 @@ mod tests {
         guard.disarm();
         drop(guard);
         assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn abandoned_operation_stays_uncertain_after_a_later_return() {
+        let cancellation = CallCancellation::default();
+        drop(cancellation.begin_operation());
+        cancellation.begin_operation().returned();
+        let evidence = cancellation.execution.lock();
+        assert!(evidence.uncertain);
+        assert_eq!(evidence.pending, 0);
+        assert_eq!(evidence.returned, 1);
+    }
+
+    #[test]
+    fn operation_resolutions_are_independent() {
+        let cancellation = CallCancellation::default();
+        let pending = cancellation.begin_operation();
+        cancellation.begin_operation().not_started();
+        cancellation.begin_operation().returned();
+        {
+            let evidence = cancellation.execution.lock();
+            assert_eq!(evidence.pending, 1);
+            assert_eq!(evidence.not_started, 1);
+            assert_eq!(evidence.returned, 1);
+            assert!(!evidence.uncertain);
+            drop(evidence);
+        }
+        pending.unknown();
+        assert!(cancellation.execution.lock().uncertain);
+    }
+
+    #[tokio::test]
+    async fn scoped_execution_evidence_keeps_the_stopped_worker_identity() {
+        let request = CancellationToken::new();
+        let receipt = WorkerStopReceipt {
+            operation_id: "operation-1".to_owned(),
+            worker_session_id: "worker-session-1".to_owned(),
+            worker_generation: 7,
+            operation: "module_query".to_owned(),
+            cause: "timeout".to_owned(),
+        };
+        let ((), evidence) = with_cancellation_evidence(&request, async {
+            CallCancellation::current().begin_operation().stopped(receipt.clone());
+        })
+        .await;
+        assert_eq!(evidence.worker_stop_receipt, Some(receipt));
+        assert_eq!(evidence.pending, 0);
+        assert_eq!(evidence.stopped, 1);
+        assert!(!evidence.uncertain);
     }
 }

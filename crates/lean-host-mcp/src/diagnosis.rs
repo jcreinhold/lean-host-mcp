@@ -292,6 +292,7 @@ where
         session_id: resp.freshness.session_id.clone(),
         worker_generation: event.worker_generation,
         worker_restarted: true,
+        worker_stop_receipt: None,
         restart_cause: Some(event.cause.clone()),
         rss_kib: event.rss_kib,
         limit_kib: event.limit_kib,

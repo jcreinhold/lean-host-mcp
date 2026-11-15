@@ -240,6 +240,7 @@ impl ProjectBroker {
     /// relying on released memory, and renew the lease while waiting or working.
     #[must_use]
     pub fn runtime_control(&self, request: &RuntimeControlRequest) -> RuntimeControlResult {
+        crate::worker_retirement::poll_retirements();
         let mut inner = self.inner.lock();
         let now = Instant::now();
         let deadline = now.checked_add(Duration::from_secs(

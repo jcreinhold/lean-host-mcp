@@ -13,6 +13,8 @@ use lean_rs_worker_parent::LeanWorkerElabOptions;
 use lean_toolchain::LeanOptionValue;
 use serde::Deserialize;
 
+use crate::cancellation::CallCancellation;
+use crate::envelope::TargetCheckNotStarted;
 use crate::error::{Result, ServerError};
 use crate::toolchain::ToolchainId;
 
@@ -27,6 +29,30 @@ struct ModuleOptions {
 
 /// Evaluate the owning package, then carry its options through every worker/cache path.
 pub(crate) async fn resolve(root: &Path, options: LeanWorkerElabOptions) -> Result<LeanWorkerElabOptions> {
+    let file_label = options.file_label.clone();
+    resolve_inner(root, options)
+        .await
+        .map_err(|error| preparation_failed(file_label, error))
+}
+
+fn preparation_failed(file_label: String, error: ServerError) -> ServerError {
+    let target_check = TargetCheckNotStarted {
+        file_label,
+        stage: "lake_option_discovery".to_owned(),
+        disposition: "not_started".to_owned(),
+    };
+    // Option discovery can execute Lake configuration and spawn subprocesses.
+    // Its failure proves only that this target check was not reached.
+    CallCancellation::current().preparation_failed(target_check.clone());
+    let message = if let ServerError::BadProject(message) = error {
+        message
+    } else {
+        error.to_string()
+    };
+    ServerError::PreparationFailed { message, target_check }
+}
+
+async fn resolve_inner(root: &Path, options: LeanWorkerElabOptions) -> Result<LeanWorkerElabOptions> {
     let toolchain = ToolchainId::from_lake_root(root).map_err(bad_project)?;
     let sysroot = toolchain.elan_dir().map_err(bad_project)?;
     let file = source_path(root, &options.file_label);
@@ -57,12 +83,7 @@ pub(crate) async fn resolve(root: &Path, options: LeanWorkerElabOptions) -> Resu
         .arg(config_workspace.path())
         .arg(file.as_deref().unwrap_or_else(|| Path::new("")))
         .kill_on_drop(true);
-    let output = tokio::time::timeout(TIMEOUT, command.output())
-        .await
-        .map_err(|_| {
-            ServerError::BadProject("Lake option discovery timed out after 30 seconds; no proof check ran".into())
-        })?
-        .map_err(bad_project)?;
+    let output = discovery_output(&mut command, TIMEOUT).await?;
     if !output.status.success() {
         return Err(ServerError::BadProject(format!(
             "could not resolve Lake compilation options (no proof check ran): {}{}",
@@ -79,6 +100,18 @@ pub(crate) async fn resolve(root: &Path, options: LeanWorkerElabOptions) -> Resu
         "resolved Lake compilation options; host heartbeat limit overrides project maxHeartbeats"
     );
     Ok(options.lean_options(resolved.options))
+}
+
+async fn discovery_output(command: &mut tokio::process::Command, timeout: Duration) -> Result<std::process::Output> {
+    tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| {
+            ServerError::BadProject(format!(
+                "Lake option discovery timed out after {} seconds; no proof check ran",
+                timeout.as_secs_f64()
+            ))
+        })?
+        .map_err(bad_project)
 }
 
 fn bad_project(error: impl std::fmt::Display) -> ServerError {
@@ -186,6 +219,32 @@ fn owning_package(root: &Path, file: Option<&Path>) -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_child_timeout_only_certifies_the_named_check_was_not_started() {
+        let request = tokio_util::sync::CancellationToken::new();
+        let (error, evidence) = crate::cancellation::with_cancellation_evidence(&request, async {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.arg("-c").arg("exec /bin/sleep 1").kill_on_drop(true);
+            let error = discovery_output(&mut command, Duration::from_millis(30))
+                .await
+                .unwrap_err();
+            preparation_failed("UnitIndexed.lean".to_owned(), error)
+        })
+        .await;
+        assert!(evidence.uncertain, "kill_on_drop supplies no descendant exit receipt");
+        let target = evidence.target_check.unwrap();
+        assert_eq!(target.file_label, "UnitIndexed.lean");
+        assert_eq!(target.disposition, "not_started");
+        let error: rmcp::ErrorData = error.into();
+        let data = error.data.unwrap();
+        assert_eq!(data["target_check"]["stage"], "lake_option_discovery");
+        assert!(
+            data.get("execution").is_none(),
+            "target evidence cannot certify the entire invocation"
+        );
+    }
 
     #[test]
     fn typed_metadata_preserves_option_types() {

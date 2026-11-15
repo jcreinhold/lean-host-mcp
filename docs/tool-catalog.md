@@ -14,8 +14,8 @@ lean_context -> lean_lookup -> lean_trial -> lean_verify
 ```
 
 The semantic tools read files and elaborate in memory without applying source edits automatically. Lean commands,
-tactics, and import initializers can perform IO with the server user's privileges; the worker is not an OS sandbox.
-Only use trusted local clients and projects. `lean_runtime` may pause admission or explicitly retire idle workers.
+tactics, and import initializers can perform IO with the server user's privileges; the worker is not an OS sandbox. Only
+use trusted local clients and projects. `lean_runtime` may pause admission or explicitly retire idle workers.
 
 Invocation/runtime failures with no domain data set MCP `isError: true` and retain the semantic `errors` and `trust`
 envelope. Negative proof/check verdicts remain successful tool executions with domain data, not MCP errors.
@@ -38,10 +38,10 @@ only while progress arrives, so a cold import or a large file's elaboration is n
 worker keeps computing. Clients that omit the token keep the same single-response behavior.
 
 Clients declaring the `io.modelcontextprotocol/tasks` extension may receive a standard task handle from `tools/call`.
-Use `tasks/get` with its `taskId` to retrieve status and the eventual original tool result; use `tasks/cancel` to request
-cancellation. Cheap project status remains synchronous. Existing clients keep synchronous tool responses. The HTTP
-server shares task records across client sessions, so reconnecting clients can retrieve their existing handles.
-A task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
+Use `tasks/get` with its `taskId` to retrieve status and the eventual original tool result; use `tasks/cancel` to
+request cancellation. Cheap project status remains synchronous. Existing clients keep synchronous tool responses. The
+HTTP server shares task records across client sessions, so reconnecting clients can retrieve their existing handles. A
+task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
 
 Clients without the Tasks extension can use the ordinary `lean_request` tool:
 
@@ -54,44 +54,45 @@ Clients without the Tasks extension can use the ordinary `lean_request` tool:
 `submit` accepts any of the five semantic tools and immediately returns task metadata in the configured tool result
 carrier. Use its `taskId` as `request_id` for `get` or `cancel`. `get` returns the same metadata plus `result` on
 `completed`, or a JSON-RPC `error` on `failed`; the retained `result` is the original `CallToolResult`, including its
-content and structured content. `cancel` returns the current record, which may still be `working` during cleanup.
-The bridge remains synchronous even for task-aware clients. It never submits `lean_runtime` or another `lean_request`.
+content and structured content. `cancel` returns the current record, which may still be `working` during cleanup. The
+bridge remains synchronous even for task-aware clients. It never submits `lean_runtime` or another `lean_request`.
 
 An optional client-chosen `request_id` makes a lost submission receipt retryable: submitting the same ID, tool and
-argument object returns the original record without running again. Changed inputs under that ID are rejected. IDs
-allow 1–128 ASCII letters, digits, underscores, hyphens, dots or colons. Prefer a fresh UUID per logical request and save
-it before submission. Omit the ID to generate one, but a lost generated receipt cannot be recovered by resubmission.
-Without `request_epoch`, this legacy deduplication lasts only while the record exists, not after its ten-minute
-terminal retention or a server restart. After an unknown/expired response, reconcile the outcome before deciding
-whether to submit again. New clients should use the epoch-bound lifecycle below.
+argument object returns the original record without running again. Changed inputs under that ID are rejected. IDs allow
+1–128 ASCII letters, digits, underscores, hyphens, dots or colons. Prefer a fresh UUID per logical request and save it
+before submission. Omit the ID to generate one, but a lost generated receipt cannot be recovered by resubmission.
+Without `request_epoch`, this legacy deduplication lasts only while the record exists, not after its ten-minute terminal
+retention or a server restart. After an unknown/expired response, reconcile the outcome before deciding whether to
+submit again. New clients should use the epoch-bound lifecycle below.
 
-Servers advertising `retained_request_binding_v1` in `lean_runtime` status include an immutable `request` alongside
-each plain bridge record: `server_instance_id`, `tool`, `submission_sha256`, and `project`. The instance matches
+Servers advertising `retained_request_binding_v1` in `lean_runtime` status include an immutable `request` alongside each
+plain bridge record: `server_instance_id`, `tool`, `submission_sha256`, and `project`. The instance matches
 `pool.instance_id`. The digest is lowercase SHA-256 of the compact JSON array `[tool, arguments]`, with object keys
 sorted by the server's JSON serializer. `project` is the exact submitted string (or null), not a resolved-root or source
-revision claim. The binding is stored before execution and remains unchanged through completion or cancellation.
-Clients can persist their ID and input binding before submission, then validate every recovered response without
-relying on a separate status call racing a restart. Native Tasks records not created through the bridge have no such
-binding. Source validation and uncertain-outcome rules still apply; failed/cancelled task state alone is not a universal
-certificate that all worker processes are confirmed stopped.
+revision claim. The binding is stored before execution and remains unchanged through completion or cancellation. Clients
+can persist their ID and input binding before submission, then validate every recovered response without relying on a
+separate status call racing a restart. Native Tasks records not created through the bridge have no such binding. Source
+validation and uncertain-outcome rules still apply; failed/cancelled task state alone is not a universal certificate
+that all worker processes are confirmed stopped.
 
 Busy project mailboxes and cold-project capacity admit waiting callers in FIFO order. An admission wait is bounded by
-the configured worker timeout and can be cancelled; an admission timeout means that queued operation did not run.
-Worker execution has its own budget after admission. A multi-operation tool may already have completed earlier steps.
+the configured worker timeout and can be cancelled; an admission timeout means that queued operation did not run. Worker
+execution has its own budget after admission. A multi-operation tool may already have completed earlier steps.
 
 Closing an HTTP connection alone does not request cancellation. A synchronous request may continue until completion or
 its worker deadline, even when its response stream is lost. Synchronous clients should send MCP
 `notifications/cancelled` with the original request ID when they intend to stop work.
 
-The server retains at most 128 active or finished records. Epoch-bound results expire after 24 hours, including across
-a restart when a journal is configured. Legacy and negotiated task results keep their ten-minute retention. Reads and
+The server retains at most 128 active or finished records. Epoch-bound results expire after 24 hours, including across a
+restart when a journal is configured. Legacy and negotiated task results keep their ten-minute retention. Reads and
 submissions remove expired records; an idle server needs no cleanup timer. At capacity, it first removes an acknowledged
-epoch-bound record, or otherwise the oldest finished epoch-bound result. It never evicts an active request. If no record can be removed, negotiated task
-calls use the ordinary synchronous path; explicit `lean_request` submits are rejected without running. Follow the
-suggested polling interval; task push notifications and in-task input are not used. Legacy retention survives client
-disconnects, not a server restart. An automatically generated task ID identifies one request, not a deduplication key:
-resubmitting a semantic `tools/call` creates another request. The explicit `lean_request` client-chosen ID exception is
-described above. Callers remain responsible for binding requests to the source revision they require.
+epoch-bound record, or otherwise the oldest finished epoch-bound result. It never evicts an active request. If no record
+can be removed, negotiated task calls use the ordinary synchronous path; explicit `lean_request` submits are rejected
+without running. Follow the suggested polling interval; task push notifications and in-task input are not used. Legacy
+retention survives client disconnects, not a server restart. An automatically generated task ID identifies one request,
+not a deduplication key: resubmitting a semantic `tools/call` creates another request. The explicit `lean_request`
+client-chosen ID exception is described above. Callers remain responsible for binding requests to the source revision
+they require.
 
 A cancellation acknowledgement records intent. A queued operation is skipped, while a running worker operation must
 finish its cleanup before normal cancellation becomes terminal. Supervisor observation and deadlines bound worker
@@ -117,9 +118,21 @@ Every bridge response adds:
 `not_started` means the whole retained tool invocation could not dispatch and cannot later dispatch. Registry-full,
 invalid-submit and acceptance-journal failures use the same typed no-start data in their JSON-RPC error. A cancellation
 before dispatch is terminal `not_started`. Once invoked, a returned semantic result normally means `stopped`, but
-runtime errors, uncertain actor cleanup and task panic remain conservatively `unknown`. A multi-operation tool can have
-performed earlier steps even when a later step failed. Uncertainty is retained even if the tool degrades a worker
-failure into a fallback result. A negative Lean verdict can be a perfectly valid result of a stopped execution.
+runtime errors without matching stop evidence, uncertain actor cleanup and task panic remain conservatively `unknown`. A
+multi-operation tool can have performed earlier steps even when a later step failed. Uncertainty is retained even if the
+tool degrades a worker failure into a fallback result. A negative Lean verdict can be a perfectly valid result of a
+stopped execution.
+
+A confirmed worker timeout/cancellation can return `execution.disposition: stopped` with an optional
+`execution.worker_stop_receipt` while the semantic response still reports runtime unavailability and contains no proof
+verdict. The receipt binds the interrupted operation to its project actor session and worker generation. It covers the
+direct worker only; it does not certify Lake descendants or rollback external effects, and does not authorize replay.
+Per-operation evidence is aggregated: an unresolved operation remains `unknown` even after a successful fallback, and a
+later queue refusal cannot make earlier completed work `not_started`.
+
+Lake option discovery failures add a scoped `target_check` record naming the source file and preparation stage, with
+`disposition: not_started`. This says that check was never reached. The overall execution remains `unknown` because
+configuration evaluation and its subprocesses may have started. The same scoped fact is included in JSON-RPC error data.
 
 Cancellation never overwrites a returned result. If completion races cancellation, clients receive the original result
 and a separate intent flag. Only the execution disposition, not failed/cancelled task status or the presence of a proof
@@ -157,19 +170,19 @@ broker death, so a new healthy broker is not an exit witness. Journal recovery d
 relaunch workers, or claim that all old work stopped. Existing uncertain-outcome recovery remains necessary for those
 cases. An invalid or unreadable snapshot is moved aside with a warning; healthy records remain available. Moving it
 preserves its bytes without claiming an I/O error means corruption. If that move fails, startup reports the path and
-error rather than admitting work with uncounted records. The missing request returns
-`unknown`, never a pass or an automatic rerun. Disk failure blocks new retained work only while storage remains
-unusable. The service retries on the next submission or acknowledgment; it does not need a restart. Quarantined files
-retain their original bytes for inspection and do not count toward the active result limit. They are not deleted automatically;
-repeated read failures can grow this separate set of files and each occurrence logs its path.
+error rather than admitting work with uncounted records. The missing request returns `unknown`, never a pass or an
+automatic rerun. Disk failure blocks new retained work only while storage remains unusable. The service retries on the
+next submission or acknowledgment; it does not need a restart. Quarantined files retain their original bytes for
+inspection and do not count toward the active result limit. They are not deleted automatically; repeated read failures
+can grow this separate set of files and each occurrence logs its path.
 
 ## Worker Activity And Admission Leases
 
 `lean_runtime` is always synchronous, including for task-aware clients. It has four actions:
 
 Every response includes `build` with package `version`, full Git `revision`, and build-time `dirty` state. Missing Git
-metadata (for example, an exported source archive) is reported as null, never guessed from the runtime checkout.
-A Git revision identifies source, not the resolved dependency graph or binary hash. Build/install with `--locked` for
+metadata (for example, an exported source archive) is reported as null, never guessed from the runtime checkout. A Git
+revision identifies source, not the resolved dependency graph or binary hash. Build/install with `--locked` for
 reproducible dependency selection, and retain the executable hash when an exact runtime artifact must be pinned.
 `effective_settings` reports resolved broker/runtime values, including derived heap/residue limits, plus server
 presentation and output overrides. Null output overrides mean each tool keeps its own default budget. These are the
@@ -191,8 +204,8 @@ build identity, registry counts, and capability discovery never open a Lean work
 Lease lifetimes default to 30 seconds and must be between 1 and 300 seconds. Keep the returned `lease_id` private;
 status never reveals it. Another connection can renew or release the lease with its token. An expired token cannot
 affect a later lease. Leases expire after client failure and do not survive a server restart; `pool.instance_id`
-identifies this broker lifetime. Renew well before expiry while depending on the pause, and stop relying on it if renewal
-fails. Losing a response can lose the token; in that case wait for expiry rather than assuming ownership.
+identifies this broker lifetime. Renew well before expiry while depending on the pause, and stop relying on it if
+renewal fails. Losing a response can lose the token; in that case wait for expiry rather than assuming ownership.
 
 Acquire returns `acquired`, `busy` (a request or startup already admitted), or `leased` (another lease holds admission).
 It never cancels existing work or waits for capacity. While held, new worker-backed calls return the retryable semantic
@@ -200,9 +213,9 @@ reason `worker_pool_leased`; cheap project status and runtime coordination remai
 and parallelism are unchanged outside a lease. There is no priority or fairness guarantee between competing acquirers.
 
 Servers advertising `draining_lease_v1` also accept `drain`. It returns an owned token with `draining` while earlier
-work finishes, or `acquired` when ready. Later worker-backed requests wait inside the server, with their existing timeout
-and cancellation, rather than overtaking the drain. They resume after release or expiry without client resubmission.
-Already-admitted startup continues; a waiting later caller owns no worker or startup slot.
+work finishes, or `acquired` when ready. Later worker-backed requests wait inside the server, with their existing
+timeout and cancellation, rather than overtaking the drain. They resume after release or expiry without client
+resubmission. Already-admitted startup continues; a waiting later caller owns no worker or startup slot.
 
 Renew the same token to advance the drain. With `retire_idle: true`, a successful `ok` renewal confirms workers have
 stopped; `draining` means they have not. A generic status call cannot advance a drain or grant permission to start a
@@ -216,13 +229,13 @@ when lease ownership is lost. This feature does not claim crash-safe exclusion f
 An ordinary status snapshot is advisory: another request can start immediately after it. Only a successful, unexpired
 owned lease closes that race. The admission check and lease acquisition share the registry lock. Admitted callers count
 as active before enqueue, and queued/running messages remain active through cancellation cleanup. An opening caller
-retains startup ownership even if its HTTP connection disappears.
-Background recycling and prewarming use the same admission boundary and count as active work. The pool-level
-`outstanding_jobs` count also retains work owned by a controller that has been removed from the resident registry.
+retains startup ownership even if its HTTP connection disappears. Background recycling and prewarming use the same
+admission boundary and count as active work. The pool-level `outstanding_jobs` count also retains work owned by a
+controller that has been removed from the resident registry.
 
 By default acquire keeps workers and their warm caches, including across idle-reaper ticks. For a caller that actually
-needs their memory, explicitly set `retire_idle: true` on acquire. `retirement_requested` counts shutdown requests;
-it does not acknowledge child exit. Wait for `pool.workers_stopped: true`, under the same live lease, before relying on
+needs their memory, explicitly set `retire_idle: true` on acquire. `retirement_requested` counts shutdown requests; it
+does not acknowledge child exit. Wait for `pool.workers_stopped: true`, under the same live lease, before relying on
 released worker capacity. An occupied slot may represent a starting, resident, retiring, or uncertain worker; uncertain
 shutdown continues to count and must not be treated as freed memory. Poll no faster than once per second while waiting,
 and renew the lease if needed.
@@ -282,13 +295,12 @@ implementation are also carried as warning issues in `errors`.
 Every call's telemetry `runtime` block carries three timing facts: `queue_wait_millis` (admission delay before the
 worker started the call), `call_elapsed_millis` (worker-call wallclock, queue wait excluded, including any recycle and
 retries the call triggered), and `call_cpu_millis` (the worker child process's own CPU delta around the call — sampled
-at 10 ms granularity on Linux, nanosecond precision on macOS — omitted
-when the platform cannot sample it or a mid-call recycle invalidated the baseline). Under the default
-`telemetry.verbosity = quiet` the telemetry block is dropped, but the actionable signal is not: when
-`call_cpu_millis` exceeds `output.slow_call_warning_millis` (default 10000), the response carries a warning issue
-naming the CPU figure and recommending refactoring (split the declaration, add explicit type annotations, extract
-intermediate lemmas). Keying on CPU rather than wallclock keeps machine contention from ever triggering it; when
-wallclock is more than twice the CPU figure the warning says so instead.
+at 10 ms granularity on Linux, nanosecond precision on macOS — omitted when the platform cannot sample it or a mid-call
+recycle invalidated the baseline). Under the default `telemetry.verbosity = quiet` the telemetry block is dropped, but
+the actionable signal is not: when `call_cpu_millis` exceeds `output.slow_call_warning_millis` (default 10000), the
+response carries a warning issue naming the CPU figure and recommending refactoring (split the declaration, add explicit
+type annotations, extract intermediate lemmas). Keying on CPU rather than wallclock keeps machine contention from ever
+triggering it; when wallclock is more than twice the CPU figure the warning says so instead.
 
 Omission convention: completeness flags named `*_truncated` (plus `RenderedText.truncated`, `partial`, and advisory
 containers such as `post_closure_diagnostics`, `entry_goals`, and `locals`) are omitted from the JSON when they carry
@@ -420,17 +432,17 @@ The old user-facing phrase `verify_declaration` maps to `lean_verify` with one e
 ### Request Synonyms
 
 Requests are decoded forgivingly. The recurring synonyms agents write are mapped onto the canonical schema before typed
-decoding, so the first call succeeds; the canonical shapes below remain the documented ones, and responses never use
-the synonyms.
+decoding, so the first call succeeds; the canonical shapes below remain the documented ones, and responses never use the
+synonyms.
 
 - Modes: `lean_lookup` `signature`/`print`/`decl` → `declaration`; `inventory`/`outline` → `declarations`; `lean_trial`
   `tactic`/`step` → `proof_step`, `snippet`/`eval`/`check` → `command`; `lean_context` `goal`/`state` →
   `proof_position`; `lean_status` `health`/`capabilities` → `project`, `diagnostics` → `file_diagnostics`.
 - Fields: `lean_lookup(kind="declarations")` accepts a bare `file`/`path` or `module` in place of `target`;
   `lean_lookup(kind="declaration")` accepts `declaration` for `name` and `value`/`type`/`docs` as field names;
-  `lean_trial(kind="command")` accepts `command`, `code`, or a line array for `commands`; `lean_trial(kind="proof_step")`
-  accepts `tactic` for `snippet` and `candidates` for `snippets`; a `proof_position` given as a string is the entry goal
-  (`"start"`) or an `after_text` match, and as an integer an `index`.
+  `lean_trial(kind="command")` accepts `command`, `code`, or a line array for `commands`;
+  `lean_trial(kind="proof_step")` accepts `tactic` for `snippet` and `candidates` for `snippets`; a `proof_position`
+  given as a string is the entry goal (`"start"`) or an `after_text` match, and as an integer an `index`.
 - `lean_verify` accepts one group at top level (`file` with `declarations`, `file` alone, or `module` alone), a singular
   `target`, string groups (`"Proofs/A.lean"`, `"Proofs.A"`), and the group kinds `file` → `file_all`, `module` →
   `module_all`, `declarations` → `explicit`.
@@ -688,8 +700,8 @@ from the JSON when empty and appears only on `closed` candidates.
 
 ### `kind: "command"`
 
-The trial does not apply source edits automatically. It is not an OS sandbox: commands, tactics, and import
-initializers can perform IO with the server user's privileges. Only run trusted Lean code.
+The trial does not apply source edits automatically. It is not an OS sandbox: commands, tactics, and import initializers
+can perform IO with the server user's privileges. Only run trusted Lean code.
 
 Runs bounded Lean command text as an in-memory trial. Use it for import-context snippets such as `#check` and
 `#print axioms`; it is not a replacement for project-wide shell workflows.
@@ -822,10 +834,10 @@ tainted and non-positive, the rows are relabeled to `worker_recycled` with the u
 unset. At most one retry per batch; it is surfaced through `runtime.retry_count`.
 
 A `not_found` row for an explicit target carries, in `facts.candidates` (with `"detail": "full"`) and in a response
-warning, the file's declarations whose short name matches the requested one across namespaces and case — the usual
-cause is a namespace or capitalization slip, and the warning names the intended declaration so the next call can use
-it. Mapping a git diff to declarations is the caller's job; the stacks verifier does it from `git diff` and passes
-explicit groups.
+warning, the file's declarations whose short name matches the requested one across namespaces and case — the usual cause
+is a namespace or capitalization slip, and the warning names the intended declaration so the next call can use it.
+Mapping a git diff to declarations is the caller's job; the stacks verifier does it from `git diff` and passes explicit
+groups.
 
 ## `lean_lookup`
 
@@ -981,9 +993,9 @@ surfaces Lean diagnostics and linter messages produced while elaborating the fil
 The result includes `diagnostics` and the header `imports` used for the worker session, with a source `edit_fresh` trust
 fact for the file snapshot.
 
-If the worker crashes or times out during this call, the response has `status: "runtime_unavailable"`
-and `result: null`, not an empty successful diagnostics list. Interrupted results are never cached; retrying
-runs the check again. Planned worker recycling before a successful check does not invalidate its result.
+If the worker crashes or times out during this call, the response has `status: "runtime_unavailable"` and
+`result: null`, not an empty successful diagnostics list. Interrupted results are never cached; retrying runs the check
+again. Planned worker recycling before a successful check does not invalidate its result.
 
 ## Maintainer Migration Table
 

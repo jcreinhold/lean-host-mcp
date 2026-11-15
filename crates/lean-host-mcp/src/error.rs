@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::envelope::{Freshness, RuntimeFacts, RuntimeFailure};
+use crate::envelope::{Freshness, RuntimeFacts, RuntimeFailure, TargetCheckNotStarted, WorkerStopReceipt};
 use lean_rs_worker_parent::LeanWorkerError;
 
 #[derive(Debug, Clone, Serialize, JsonSchema, thiserror::Error)]
@@ -20,6 +20,8 @@ use lean_rs_worker_parent::LeanWorkerError;
 pub struct WorkerUnavailable {
     pub(crate) retryable: bool,
     pub(crate) worker_restarted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_stop_receipt: Option<WorkerStopReceipt>,
     pub(crate) project_root: String,
     pub(crate) project_hash: String,
     pub(crate) imports: Vec<String>,
@@ -67,6 +69,7 @@ impl WorkerUnavailable {
             session_id: self.session_id.clone(),
             worker_generation: self.worker_generation,
             worker_restarted: self.worker_restarted,
+            worker_stop_receipt: self.worker_stop_receipt.clone(),
             restart_cause: self.restart_cause.clone(),
             rss_kib: self.rss_kib,
             limit_kib: self.limit_kib,
@@ -90,6 +93,12 @@ pub enum ServerError {
 
     #[error("lake project not usable: {0}")]
     BadProject(String),
+
+    #[error("lake project not usable: {message}")]
+    PreparationFailed {
+        message: String,
+        target_check: TargetCheckNotStarted,
+    },
 
     #[error("incompatible Lean worker: {message}")]
     IncompatibleWorker { message: String, recovery_command: String },
@@ -119,6 +128,7 @@ impl From<ServerError> for McpError {
                 let data = json!({
                     "retryable": info.retryable,
                     "worker_restarted": info.worker_restarted,
+                    "worker_stop_receipt": info.worker_stop_receipt,
                     "project_root": &info.project_root,
                     "project_hash": &info.project_hash,
                     "imports": &info.imports,
@@ -135,6 +145,10 @@ impl From<ServerError> for McpError {
                 });
                 Self::internal_error(message, Some(data))
             }
+            ServerError::PreparationFailed { message, target_check } => Self::internal_error(
+                format!("lake project not usable: {message}"),
+                Some(json!({ "target_check": target_check })),
+            ),
             other @ (ServerError::Lean(_)
             | ServerError::SessionGone
             | ServerError::BadProject(_)

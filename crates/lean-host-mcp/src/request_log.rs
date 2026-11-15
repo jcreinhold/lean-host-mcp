@@ -87,7 +87,7 @@ impl RequestLog {
                     ServerError::WorkerUnavailable(info) if info.reason == "request_cancelled" => "cancelled",
                     ServerError::WorkerUnavailable(_) => "runtime_unavailable",
                     ServerError::IncompatibleWorker { .. } => "incompatible_worker",
-                    ServerError::BadProject(_) => "bad_project",
+                    ServerError::BadProject(_) | ServerError::PreparationFailed { .. } => "bad_project",
                     ServerError::SessionGone => "session_gone",
                     ServerError::Lean(_) => "lean_error",
                     ServerError::Io(_) => "io_error",

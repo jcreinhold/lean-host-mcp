@@ -46,6 +46,7 @@ mod tasks;
 pub mod toolchain;
 pub mod tools;
 pub mod trust;
+mod worker_retirement;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
 pub use config_file::ConfigFile;

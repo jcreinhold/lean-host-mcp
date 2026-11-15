@@ -867,6 +867,11 @@ impl ProjectBroker {
         loop {
             let result = self.acquire_attempt(root.clone(), deadline).await;
             if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining") {
+                if result.is_err() {
+                    // Startup may already have spawned a child before failing.
+                    // Earlier completed operations cannot settle this scope.
+                    cancellation.mark_uncertain();
+                }
                 return result;
             }
             // Waiting callers own no project Arc, opening lock, or worker slot.
@@ -962,6 +967,9 @@ impl ProjectBroker {
         let inner = Arc::clone(&self.inner);
         let maintenance = MaintenanceAccess::new(&self.inner);
         let root = root.clone();
+        // The blocking startup keeps running if this async caller disappears.
+        // Its evidence guard must outlive the await and remain unknown on drop.
+        let initialization = cancellation.begin_operation();
         let opened = tokio::task::spawn_blocking(move || {
             // Hold same-root serialization through registration even when the
             // async caller disappears while blocking startup is still running.
@@ -987,6 +995,11 @@ impl ProjectBroker {
         })
         .await
         .map_err(|err| ServerError::Internal(format!("project open task failed: {err}")))?;
+        if opened.is_ok() {
+            initialization.returned();
+        } else {
+            initialization.unknown();
+        }
         on_drop.disarm();
         opened
     }
@@ -1091,6 +1104,7 @@ impl ProjectBroker {
     }
 
     async fn reserve_worker_slot(&self, root: &Path, deadline: tokio::time::Instant) -> Result<OwnedSemaphorePermit> {
+        crate::worker_retirement::poll_retirements();
         let cancellation = CallCancellation::current();
         if cancellation.is_cancelled() {
             return Err(Self::pool_unavailable(root, "request_cancelled", false));
@@ -1171,6 +1185,7 @@ impl ProjectBroker {
         ServerError::worker_unavailable(crate::error::WorkerUnavailable {
             retryable,
             worker_restarted: false,
+            worker_stop_receipt: None,
             project_root: root.to_string_lossy().into_owned(),
             project_hash: String::new(),
             imports: Vec::new(),
@@ -1193,6 +1208,7 @@ impl ProjectBroker {
     /// `config.idle_timeout`. Called every `REAPER_TICK` by the
     /// background task; tests call this directly to avoid waiting.
     pub fn reap_idle(&self) {
+        crate::worker_retirement::poll_retirements();
         if self.config.idle_timeout.is_zero() {
             return;
         }

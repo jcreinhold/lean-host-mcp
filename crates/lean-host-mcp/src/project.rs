@@ -23,7 +23,7 @@ use lean_rs_worker_parent::{
     LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions,
     LeanWorkerError, LeanWorkerHostHandle, LeanWorkerHostHandleBuilder, LeanWorkerLifecycleSnapshot,
     LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome,
-    LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets,
+    LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets, LeanWorkerProcessTracker,
     LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRestartPolicy, LeanWorkerRestartReason,
 };
 use lean_semantic_search_runtime::SemanticSearchRuntimeBuild;
@@ -33,11 +33,12 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use crate::cache::ModuleQueryCache;
 use crate::cancellation::CallCancellation;
 use crate::config_file::RuntimeFileConfig;
-use crate::envelope::{FinalAttemptStatus, Freshness, RuntimeFacts, RuntimeRestartEvent};
+use crate::envelope::{FinalAttemptStatus, Freshness, RuntimeFacts, RuntimeRestartEvent, WorkerStopReceipt};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
 use crate::lake_meta::{self, LakeProjectMeta};
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
+use crate::worker_retirement::WorkerSlot;
 
 /// LRU capacity for exact bounded module-query results, applied to the single
 /// and batch caches separately.
@@ -729,7 +730,7 @@ struct JobMeta {
     import_fingerprint: String,
     _created_at: Instant,
     queued_at: Instant,
-    _correlation_id: uuid::Uuid,
+    correlation_id: uuid::Uuid,
     retry_policy: RetryPolicy,
     _active_job: ActiveJobGuard,
     cancellation: CallCancellation,
@@ -1091,24 +1092,6 @@ async fn reserve_mailbox<'a, T>(
     }
 }
 
-/// Keep uncertain shutdowns counted rather than starting a replacement beside
-/// a possibly live child. Unwinding also retains capacity until server restart.
-struct WorkerSlot(Option<OwnedSemaphorePermit>);
-
-impl WorkerSlot {
-    fn release(mut self) {
-        self.0.take();
-    }
-}
-
-impl Drop for WorkerSlot {
-    fn drop(&mut self) {
-        if let Some(slot) = self.0.take() {
-            slot.forget();
-        }
-    }
-}
-
 impl std::fmt::Debug for LeanProject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LeanProject")
@@ -1161,10 +1144,8 @@ impl LeanProject {
             .spawn(move || {
                 // The permit outlives the handle's structured shutdown, including
                 // failed startup and unwinding. Registry eviction alone frees nothing.
-                let slot = WorkerSlot(Some(slot));
-                if actor_main(config, init_tx) {
-                    slot.release();
-                }
+                let _slot = WorkerSlot::new(slot, config.process_tracker.clone());
+                actor_main(config, init_tx);
             })
             .map_err(|e| ServerError::Internal(format!("spawn project actor thread: {e}")))?;
 
@@ -1394,7 +1375,7 @@ impl LeanProject {
             imports,
             _created_at: created_at,
             queued_at: Instant::now(),
-            _correlation_id: uuid::Uuid::new_v4(),
+            correlation_id: uuid::Uuid::new_v4(),
             retry_policy,
             _active_job: ActiveJobGuard {
                 active_jobs: Arc::clone(&self.active_jobs),
@@ -1414,8 +1395,11 @@ impl LeanProject {
     {
         let queue = Arc::clone(&message.meta().queue);
         let cancellation = message.meta().cancellation.clone();
+        let operation_id = message.meta().correlation_id.to_string();
+        let operation = cancellation.begin_operation();
         let mut on_drop = cancellation.cancel_on_drop();
         if cancellation.is_cancelled() {
+            operation.not_started();
             return Err(self.unavailable("request_cancelled", false, false));
         }
         let project_info = self.worker_error_context(message.imports());
@@ -1442,9 +1426,11 @@ impl LeanProject {
                 if reason == "mailbox_closed" {
                     self.shutdown();
                 }
+                operation.not_started();
                 return Err(ServerError::worker_unavailable(WorkerUnavailable {
                     retryable: reason != "request_cancelled",
                     worker_restarted: false,
+                    worker_stop_receipt: None,
                     reason: reason.to_owned(),
                     ..project_info
                 }));
@@ -1456,7 +1442,7 @@ impl LeanProject {
             reply = &mut reply_rx => reply,
             () = cancellation.cancelled() => {
                 if queue.expire() {
-                    cancellation.mark_uncertain();
+                    operation.not_started();
                     return Err(self.unavailable("request_cancelled", false, false));
                 }
                 // A running worker owns cleanup; do not report cancellation
@@ -1466,7 +1452,7 @@ impl LeanProject {
             () = tokio::time::sleep_until(queue.deadline.into()) => {
                 if queue.expire() {
                     // The actor shares this state, so it cannot dispatch later.
-                    cancellation.mark_uncertain();
+                    operation.not_started();
                     on_drop.disarm();
                     return Err(self.unavailable("queue_wait_timeout", true, false));
                 }
@@ -1481,8 +1467,20 @@ impl LeanProject {
                 Err(self.unavailable("mailbox_closed_before_reply", true, false))
             }
         };
-        if result.is_err() {
-            cancellation.mark_uncertain();
+        match &result {
+            Ok(_) => operation.returned(),
+            Err(_) if queue.expire() => operation.not_started(),
+            Err(ServerError::WorkerUnavailable(failure)) => {
+                if let Some(receipt) = &failure.worker_stop_receipt
+                    && receipt.operation_id == operation_id
+                    && receipt.worker_session_id == self.session_id
+                {
+                    operation.stopped(receipt.clone());
+                } else {
+                    operation.unknown();
+                }
+            }
+            Err(_) => operation.unknown(),
         }
         on_drop.disarm();
         result
@@ -1566,6 +1564,7 @@ impl LeanProject {
         WorkerUnavailable {
             retryable: true,
             worker_restarted: false,
+            worker_stop_receipt: None,
             project_root: self.canonical_root.to_string_lossy().into_owned(),
             project_hash: self.manifest_hash.clone(),
             imports: imports.to_vec(),
@@ -1603,6 +1602,7 @@ struct ActorConfig {
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     healthy: Arc<AtomicBool>,
     startup_uncertain: Arc<AtomicBool>,
+    process_tracker: LeanWorkerProcessTracker,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -1726,6 +1726,7 @@ impl ActorConfig {
             runtime,
             healthy,
             startup_uncertain: Arc::new(AtomicBool::new(false)),
+            process_tracker: LeanWorkerProcessTracker::new(),
             lean_max_memory_kib: runtime_config.lean_max_memory_kib(),
             request_timeout_millis: runtime_config.request_timeout_millis(),
             mailbox_capacity: runtime_config.mailbox_capacity(),
@@ -1928,6 +1929,7 @@ impl ProjectActorState {
         let mut retry_count = 0_u32;
         let mut previous_attempt_failure = None;
         let mut final_attempt = FinalAttemptStatus::Interrupted;
+        let mut worker_stop_receipt = None;
         // The loop owns only control flow: run, classify, maybe retry. Every
         // exit funnels into the single finalization below, which is the one
         // place timing/restart facts are computed — threading them through six
@@ -1936,7 +1938,19 @@ impl ProjectActorState {
             if meta.cancellation.is_cancelled() {
                 return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
             }
-            match job(&mut self.handle, meta.imports.clone(), meta.cancellation.worker()) {
+            let attempt_before = self.handle.lifecycle_snapshot();
+            let result = job(&mut self.handle, meta.imports.clone(), meta.cancellation.worker());
+            if let Err(error) = &result {
+                worker_stop_receipt = confirmed_stop_receipt(
+                    &self.config.session_id,
+                    meta.correlation_id,
+                    self.worker_generation_base,
+                    &attempt_before,
+                    &self.handle.lifecycle_snapshot(),
+                    error,
+                );
+            }
+            match result {
                 Ok(value) => {
                     let restarts = self
                         .handle
@@ -1978,7 +1992,12 @@ impl ProjectActorState {
                     break JobExit::Done(value);
                 }
                 Err(_err) if meta.cancellation.is_cancelled() => {
-                    call_restart = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
+                    if worker_stop_receipt.is_none() {
+                        self.config.healthy.store(false, Ordering::Release);
+                    }
+                    call_restart = self
+                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
                     break JobExit::Unavailable {
                         reason: "request_cancelled".to_owned(),
                         retryable: false,
@@ -2051,7 +2070,10 @@ impl ProjectActorState {
                     };
                 }
                 Err(err) if matches!(err, LeanWorkerError::Timeout { .. }) => {
-                    if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)? {
+                    if let Some(event) = self
+                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
+                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
+                    {
                         call_restart = Some(event);
                     }
                     break JobExit::Unavailable {
@@ -2063,6 +2085,17 @@ impl ProjectActorState {
                     };
                 }
                 Err(err) => {
+                    // An infrastructure failure may leave an owned generation
+                    // unresolved. Seal this actor before another job can spawn.
+                    if matches!(
+                        err,
+                        LeanWorkerError::Kill { .. }
+                            | LeanWorkerError::Wait { .. }
+                            | LeanWorkerError::WaitTimeout { .. }
+                            | LeanWorkerError::Setup { .. }
+                    ) {
+                        self.config.healthy.store(false, Ordering::Release);
+                    }
                     self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)?;
                     return Err(map_worker_err(err));
                 }
@@ -2106,6 +2139,7 @@ impl ProjectActorState {
                     self.worker_unavailable_for(&meta, reason, retryable, worker_restarted, cause, limit_kib, None);
                 if let ServerError::WorkerUnavailable(failure) = &mut error {
                     failure.runtime = runtime;
+                    failure.worker_stop_receipt = worker_stop_receipt;
                 }
                 Err(error)
             }
@@ -2737,6 +2771,7 @@ impl ProjectActorState {
         ServerError::worker_unavailable(WorkerUnavailable {
             retryable,
             worker_restarted,
+            worker_stop_receipt: None,
             project_root: self.config.lake_root.to_string_lossy().into_owned(),
             project_hash: self.config.manifest_hash.clone(),
             imports: meta.imports.clone(),
@@ -2772,6 +2807,7 @@ impl ProjectActorState {
         ServerError::worker_unavailable(WorkerUnavailable {
             retryable: false,
             worker_restarted: false,
+            worker_stop_receipt: None,
             project_root: self.config.lake_root.to_string_lossy().into_owned(),
             project_hash: self.config.manifest_hash.clone(),
             imports: imports.to_vec(),
@@ -2791,6 +2827,56 @@ impl ProjectActorState {
     }
 }
 
+/// Registry 0.9.9 returns these typed interruption errors only after a
+/// synchronous kill/reap and successful replacement. Pre-send cancellation
+/// also uses `Cancelled`, so require a matching new lifecycle transition.
+/// Never substitute an unscoped historical `last_exit` for this evidence.
+fn confirmed_stop_receipt(
+    session_id: &str,
+    operation_id: uuid::Uuid,
+    generation_base: u64,
+    before: &LeanWorkerLifecycleSnapshot,
+    after: &LeanWorkerLifecycleSnapshot,
+    error: &LeanWorkerError,
+) -> Option<WorkerStopReceipt> {
+    let (operation, cause, matches_restart) = match (error, &after.last_restart_reason) {
+        (
+            LeanWorkerError::Timeout { operation, .. },
+            Some(LeanWorkerRestartReason::RequestTimeout {
+                operation: restarted, ..
+            }),
+        ) => (*operation, "timeout", operation == restarted),
+        (
+            LeanWorkerError::Cancelled { operation, .. },
+            Some(LeanWorkerRestartReason::Cancelled { operation: restarted }),
+        ) => (*operation, "cancelled", operation == restarted),
+        _ => return None,
+    };
+    if !matches_restart
+        || after.worker_generation <= before.worker_generation
+        || after.restarts <= before.restarts
+        || after.exits <= before.exits
+    {
+        return None;
+    }
+    Some(WorkerStopReceipt {
+        operation_id: operation_id.to_string(),
+        worker_session_id: session_id.to_owned(),
+        worker_generation: generation_base
+            .saturating_add(after.worker_generation)
+            .saturating_sub(1),
+        operation: operation.to_owned(),
+        cause: cause.to_owned(),
+    })
+}
+
+fn with_stop_receipt(mut error: ServerError, receipt: Option<WorkerStopReceipt>) -> ServerError {
+    if let ServerError::WorkerUnavailable(failure) = &mut error {
+        failure.worker_stop_receipt = receipt;
+    }
+    error
+}
+
 struct RestartLimitExceeded {
     message: String,
     cause: RestartCause,
@@ -2801,12 +2887,12 @@ struct RestartLimitExceeded {
 fn actor_main(
     config: ActorConfig,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>>,
-) -> bool {
+) {
     let (handle, runtime_toolchain) = match open_worker(&config) {
         Ok(value) => value,
         Err(err) => {
             let _ = init_reply.send(Err(err));
-            return !config.startup_uncertain.load(Ordering::Acquire);
+            return;
         }
     };
     let mut state = ProjectActorState {
@@ -2861,6 +2947,11 @@ fn actor_main(
             continue;
         }
         state.handle_message(message);
+        if config.startup_uncertain.load(Ordering::Acquire) || !config.healthy.load(Ordering::Acquire) {
+            config.healthy.store(false, Ordering::Release);
+            rx.close();
+            continue;
+        }
         // Only where `idle_grace` can never arm. With a runtime available the
         // quiescence tick above does this job two seconds later and pre-warms as
         // well, so cycling here would spend the generation on the strictly worse
@@ -2878,11 +2969,9 @@ fn actor_main(
                 wait_millis = millis_u64(report.wait_elapsed),
                 "project worker shutdown complete"
             );
-            !state.config.startup_uncertain.load(Ordering::Acquire)
         }
         Err(err) => {
             tracing::error!(error = %err, "project worker shutdown uncertain; retaining worker capacity");
-            false
         }
     }
 }
@@ -2959,6 +3048,7 @@ fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
         ))
         .startup_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_millis(config.request_timeout_millis))
+        .process_tracker(config.process_tracker.clone())
         .restart_policy(restart_policy)
         .session_pool_capacity(config.session_pool_capacity)
         .lean_max_memory_kib(config.lean_max_memory_kib)
@@ -2981,6 +3071,7 @@ fn semantic_capability_builder(
         ))
         .startup_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_millis(config.request_timeout_millis))
+        .process_tracker(config.process_tracker.clone())
         .restart_policy(restart_policy)
         .session_pool_capacity(config.session_pool_capacity)
         .lean_max_memory_kib(config.lean_max_memory_kib)
@@ -3592,6 +3683,7 @@ mod tests {
             runtime,
             healthy: Arc::new(AtomicBool::new(true)),
             startup_uncertain: Arc::new(AtomicBool::new(false)),
+            process_tracker: LeanWorkerProcessTracker::new(),
             lean_max_memory_kib: ProjectRuntimeConfig::default().lean_max_memory_kib(),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -4042,14 +4134,76 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn worker_capacity_is_released_only_after_confirmed_shutdown() {
-        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
-        WorkerSlot(Some(Arc::clone(&capacity).try_acquire_owned().unwrap())).release();
-        assert_eq!(capacity.available_permits(), 1);
-        let uncertain = WorkerSlot(Some(Arc::clone(&capacity).try_acquire_owned().unwrap()));
-        drop(uncertain);
-        assert_eq!(capacity.available_permits(), 0);
+    fn real_child_timeout_binds_stop_to_the_interrupted_generation_only() {
+        use lean_rs_worker_parent::{LeanWorker, LeanWorkerConfig};
+        use lean_rs_worker_protocol::protocol::{MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, write_frame};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut handshake = Vec::new();
+        write_frame(
+            &mut handshake,
+            Message::Handshake {
+                worker_version: "stop-receipt-test".into(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("handshake"), handshake).unwrap();
+        let executable = root.path().join("fake-worker");
+        std::fs::write(&executable, "#!/bin/sh\n/bin/cat handshake\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tracker = LeanWorkerProcessTracker::new();
+        let mut worker = LeanWorker::spawn(
+            &LeanWorkerConfig::new(executable)
+                .current_dir(root.path())
+                .process_tracker(tracker.clone())
+                .startup_timeout(Duration::from_secs(5))
+                .shutdown_timeout(Duration::from_millis(20))
+                .request_timeout(Duration::from_millis(30)),
+        )
+        .unwrap();
+        let before = worker.lifecycle_snapshot();
+        let error = worker.health().unwrap_err();
+        assert!(matches!(error, LeanWorkerError::Timeout { .. }));
+        let after = worker.lifecycle_snapshot();
+        let operation_id = uuid::Uuid::new_v4();
+        let receipt = confirmed_stop_receipt("session", operation_id, 1, &before, &after, &error).unwrap();
+        assert_eq!(receipt.operation_id, operation_id.to_string());
+        assert_eq!(receipt.worker_session_id, "session");
+        assert_eq!(receipt.worker_generation, 1 + before.worker_generation);
+        assert_eq!(receipt.operation, "health");
+        assert_eq!(
+            tracker.active_processes(),
+            1,
+            "only the healthy replacement is still owned"
+        );
+        assert!(
+            confirmed_stop_receipt("session", operation_id, 1, &after, &after, &error).is_none(),
+            "a historical stop cannot certify the current generation"
+        );
+        let mut unrelated = after.clone();
+        unrelated.last_restart_reason = Some(LeanWorkerRestartReason::Cancelled { operation: "other" });
+        assert!(confirmed_stop_receipt("session", operation_id, 1, &before, &unrelated, &error).is_none());
+        assert!(
+            confirmed_stop_receipt(
+                "session",
+                operation_id,
+                1,
+                &before,
+                &after,
+                &LeanWorkerError::WaitTimeout {
+                    operation: "kill_wait",
+                    duration: Duration::ZERO
+                }
+            )
+            .is_none()
+        );
+        worker.shutdown().unwrap();
+        assert_eq!(tracker.active_processes(), 0);
     }
 
     #[test]
@@ -4065,7 +4219,7 @@ mod tests {
                 import_fingerprint: "Init".to_owned(),
                 _created_at: Instant::now(),
                 queued_at: Instant::now(),
-                _correlation_id: uuid::Uuid::new_v4(),
+                correlation_id: uuid::Uuid::new_v4(),
                 retry_policy: RetryPolicy::RetryOnceReadOnly,
                 _active_job: ActiveJobGuard {
                     active_jobs: Arc::clone(&active),

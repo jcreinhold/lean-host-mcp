@@ -99,11 +99,15 @@ cancellable and deadline-bounded. Cold-project capacity uses a separate FIFO adm
 retries for idle workers. The parent binary never links `libleanshared`; the per-toolchain worker child does.
 
 The broker reserves capacity before opening a worker. Opening, resident and retiring project workers all count against
-`broker.max_workers`; a slot is released only after confirmed shutdown. An uncertain shutdown keeps its slot unavailable
-until server restart. Same-project startup is serialized even when a caller disconnects, and rechecks the per-project
-worker limit. Idle LRU workers may be replaced when capacity is full, while a worker borrowed by a caller or processing
-queued work cannot be evicted. Capacity counts project runtimes rather than memory bytes. It does not cover the
-transient semantic-search companion child described below or external Lean processes. Different projects can still run
+`broker.max_workers`; a slot is released only after confirmed shutdown. Ordinary workers, semantic companions and
+replacement generations share an actor-owned process tracker. When the actor stops accepting jobs and its scope ends, a
+retirement registry keeps the slot and tracker until every direct child has been reaped. Late exit observation
+automatically restores capacity, including after cleanup-thread creation fails and broker polling retries. An
+unconfirmed exit keeps the slot unavailable. This registry is process-local; it does not reconcile server crashes or
+Lake descendants. Same-project startup is serialized even when a caller disconnects, and rechecks the per-project worker
+limit. Idle LRU workers may be replaced when capacity is full, while a worker borrowed by a caller or processing queued
+work cannot be evicted. Capacity counts project runtimes rather than memory bytes. It does not cover the transient
+semantic-search companion child described below or external Lean processes. Different projects can still run
 concurrently. A project can use several workers when configured, with one in-flight job per worker. Degraded responses
 and pure `.ilean` reads use `project_identity_without_worker` so they can fill semantic trust identity without spawning,
 and a warm module-query cache hit is answered from the project handle without entering the mailbox. A full project queue

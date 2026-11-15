@@ -41,7 +41,7 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::trust::ArtifactTrust;
 
@@ -215,6 +215,25 @@ pub enum ResponseStatus {
     RuntimeUnavailable,
 }
 
+/// Evidence that a particular direct-worker operation stopped without a result.
+/// This does not certify descendants, a proof verdict, or replay safety.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkerStopReceipt {
+    pub operation_id: String,
+    pub worker_session_id: String,
+    pub worker_generation: u64,
+    pub operation: String,
+    pub cause: String,
+}
+
+/// A named check was never reached; other initialization activity may be unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TargetCheckNotStarted {
+    pub file_label: String,
+    pub stage: String,
+    pub disposition: String,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RuntimeFailure {
     pub reason: String,
@@ -223,6 +242,8 @@ pub struct RuntimeFailure {
     pub session_id: String,
     pub worker_generation: u64,
     pub worker_restarted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_stop_receipt: Option<WorkerStopReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_cause: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
