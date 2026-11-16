@@ -24,6 +24,7 @@
 //! case of a checkout that moved after the binary was built. `cargo` output
 //! streams to stdout/stderr unchanged so the user sees real build errors.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -617,6 +618,17 @@ fn resolve_worker_source(explicit: Option<&Path>) -> anyhow::Result<WorkerSource
     Ok(WorkerSource::Registry)
 }
 
+/// Resolve the local build output using the same working directory as Cargo.
+/// An explicit empty value is rejected before starting a build.
+fn local_worker_binary(workspace: &Path, target_dir: Option<&OsStr>) -> anyhow::Result<PathBuf> {
+    let target = match target_dir {
+        None => workspace.join("target"),
+        Some(path) if path.is_empty() => return Err(anyhow::anyhow!("CARGO_TARGET_DIR must not be empty")),
+        Some(path) => workspace.join(path),
+    };
+    Ok(target.join("release").join(WORKER_FILE_NAME))
+}
+
 /// Build a worker binary for `id` with the matching toolchain rpath baked in,
 /// returning its path (and, for the registry build, the temp-dir guard that
 /// must outlive the relocate). This is the only place the two source strategies
@@ -624,6 +636,8 @@ fn resolve_worker_source(explicit: Option<&Path>) -> anyhow::Result<WorkerSource
 fn build_worker(source: &WorkerSource, id: &ToolchainId) -> anyhow::Result<StagedWorker> {
     match source {
         WorkerSource::LocalWorkspace(workspace) => {
+            let target_dir = std::env::var_os("CARGO_TARGET_DIR");
+            let built = local_worker_binary(workspace, target_dir.as_deref())?;
             println!("==> building lean-host-mcp-worker for {id} (workspace source)");
             let status = Command::new("cargo")
                 .arg("build")
@@ -638,7 +652,6 @@ fn build_worker(source: &WorkerSource, id: &ToolchainId) -> anyhow::Result<Stage
                     "cargo build -p lean-host-mcp-worker (toolchain {id}) failed with status {status}"
                 ));
             }
-            let built = workspace.join("target").join("release").join(WORKER_FILE_NAME);
             if !built.is_file() {
                 return Err(anyhow::anyhow!(
                     "expected worker binary at {} but did not find one",
@@ -800,8 +813,8 @@ mod tests {
     use clap::{Args as _, Command, FromArgMatches};
 
     use super::{
-        Freshness, InstallWorkerArgs, WorkerSource, check_arg_combination, clean_in, format_mib, prune_in,
-        prune_reason, resolve_worker_source, worker_freshness_in,
+        Freshness, InstallWorkerArgs, WorkerSource, check_arg_combination, clean_in, format_mib, local_worker_binary,
+        prune_in, prune_reason, resolve_worker_source, worker_freshness_in,
     };
     use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WorkerSidecar};
 
@@ -851,6 +864,46 @@ mod tests {
         let err = parse(&["install-worker", "--auto", "--list"]).expect_err("mode flags conflict");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn local_worker_binary_defaults_to_the_workspace_target() {
+        let workspace = std::path::Path::new("/workspace");
+        assert_eq!(
+            local_worker_binary(workspace, None).expect("default target"),
+            workspace.join("target/release").join(WORKER_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn local_worker_binary_honors_an_absolute_external_target() {
+        assert_eq!(
+            local_worker_binary(
+                std::path::Path::new("/workspace"),
+                Some(std::ffi::OsStr::new("/tmp/shared-target")),
+            )
+            .expect("absolute target"),
+            std::path::Path::new("/tmp/shared-target/release").join(WORKER_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn local_worker_binary_resolves_a_relative_target_against_the_cargo_workspace() {
+        assert_eq!(
+            local_worker_binary(
+                std::path::Path::new("/workspace"),
+                Some(std::ffi::OsStr::new("../shared-target")),
+            )
+            .expect("workspace-relative target"),
+            std::path::Path::new("/workspace/../shared-target/release").join(WORKER_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn local_worker_binary_rejects_an_explicit_empty_target() {
+        let error = local_worker_binary(std::path::Path::new("/workspace"), Some(std::ffi::OsStr::new("")))
+            .expect_err("an empty override must not select a stale or unintended binary");
+        assert!(error.to_string().contains("CARGO_TARGET_DIR must not be empty"));
     }
 
     #[test]
