@@ -109,6 +109,17 @@ admission deadline, closes transient gates before waiting, and observes its priv
 again before Ready. EOF or deadline expiry emits no Ready. Metadata executes once in the caller after that receipt;
 neither a metadata body nor a target check is retried. SDK multi-domain readiness probes retain the fail-fast default.
 
+Whole-domain admission owns the complete fixed input set. Its opted-in pure helpers report normal exit 75 only for
+typed pre-custody contention (`--report-contention`); every malformed receipt, descriptor, helper failure or uncertain
+cleanup remains a hard error. The SDK verifies successful pre-transfer classification, releases all tentative shared
+locks (including confirmed EOF-proxy helper closure), then waits within the original deadline and cancellation budget.
+It never waits for a later domain while retaining an earlier partial set, and never repeats a payload or metadata body.
+A full-set gate preflight avoids spawning repeated helpers while known writer demand remains; it grants no read
+custody, and the actual nonblocking transfer checks close the following race. Native payload bootstrap and cold worker
+admission finish the full set before guardian acknowledgement. A warm worker's guardian retains earlier generation
+locks, so warm contention uses the existing confirmed pre-body generation cycle instead of waiting behind its own
+custody. Graph, epoch, inheritance and guardian failures after admission are not retried.
+
 The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
 cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
 project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.

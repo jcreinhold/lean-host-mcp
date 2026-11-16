@@ -78,7 +78,10 @@ while True:
                 time.sleep(60)
         send('healthy')
     elif operation == 'open_host_session':
-        if (root / 'refuse_artifact_read').exists():
+        if (root / 'change_artifact_epoch_once').exists():
+            (root / 'change_artifact_epoch_once').unlink()
+            send('artifact_epoch_changed')
+        elif (root / 'refuse_artifact_read').exists():
             send('artifact_refusal')
         elif (root / 'require_missing_import').exists() and not (root / '.lake/build/lib/lean/B.olean').exists():
             send('missing_import')
@@ -99,6 +102,11 @@ while True:
             effects.write('effect before abrupt exit\n')
         sys.exit(17)
     elif operation == 'process_module_query':
+        if (root / 'complete_module_query').exists():
+            with (root / 'query_effects').open('a') as effects:
+                effects.write(str(os.getpid()) + '\n')
+            send('query_completed')
+            continue
         if (root / 'remove_executable').exists():
             Path(__file__).unlink()
         while True:
@@ -125,6 +133,26 @@ fn fake_worker(root: &Path, remove_executable: bool) -> PathBuf {
     write_message(root, "healthy", Message::Response(Response::HealthOk));
     write_message(root, "terminating", Message::Response(Response::Terminating));
     write_message(root, "read_released", Message::Response(Response::HostReadReleased));
+    write_message(
+        root,
+        "artifact_epoch_changed",
+        Message::Response(Response::HostArtifactEpochChanged),
+    );
+    write_message(
+        root,
+        "query_completed",
+        Message::Response(Response::ProcessModuleQuery {
+            outcome: LeanWorkerModuleQueryOutcome::Ok {
+                imports: Vec::new(),
+                result: lean_rs_worker_parent::LeanWorkerModuleQueryResult::Diagnostics(
+                    lean_rs_worker_parent::LeanWorkerElabFailure {
+                        diagnostics: Vec::new(),
+                        truncated: false,
+                    },
+                ),
+            },
+        }),
+    );
     write_message(
         root,
         "artifact_refusal",
@@ -456,6 +484,59 @@ pub(crate) async fn retained_timeout_call(
     let harness = ActorHarness::start(remove_executable);
     let result = query(&harness.project).await;
     assert_eq!(harness.requests("process_module_query").len(), 1);
+    harness.finish().await;
+    result
+}
+
+/// Compose the real actor/supervisor protocol with an outer retained request.
+/// This tests pre-body generation cycling, not physical artifact-lock custody
+/// or Lean elaboration; those have separate real-worker coverage.
+pub(crate) async fn retained_warm_prebody_cycle_call() -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
+    let harness = ActorHarness::start(false);
+    harness
+        .project
+        .native_compatibility()
+        .await
+        .expect("warm first protocol generation without executing a target");
+    let old_pid = harness.requests("open_host_session")[0]["pid"].clone();
+    assert!(harness.requests("process_module_query").is_empty());
+    fs::write(harness.root.path().join("complete_module_query"), "").expect("complete one target body");
+    fs::write(harness.root.path().join("change_artifact_epoch_once"), "").expect("refuse the warm pre-body open once");
+
+    let result = query(&harness.project).await;
+    let call = result
+        .as_ref()
+        .expect("one pre-body cycle resumes the original actor call");
+    assert!(matches!(call.value, LeanWorkerModuleQueryOutcome::Ok { .. }));
+    assert_eq!(call.runtime.worker_generation, 2);
+    assert!(call.runtime.worker_restarted);
+    assert_eq!(call.runtime.retry_count, 0, "the target body was never retried");
+    assert_eq!(call.runtime.final_attempt, FinalAttemptStatus::Completed);
+    let opens = harness.requests("open_host_session");
+    assert_eq!(opens.len(), 3, "warm open, refused pre-body open, replacement open");
+    assert_eq!(opens[1]["pid"], old_pid);
+    assert_ne!(opens[2]["pid"], old_pid);
+    let bodies = harness.requests("process_module_query");
+    assert_eq!(bodies.len(), 1, "only the replacement receives a target body");
+    assert_eq!(bodies[0]["pid"], opens[2]["pid"]);
+    assert_eq!(
+        fs::read_to_string(harness.root.path().join("query_effects")).expect("one target effect"),
+        format!("{}\n", bodies[0]["pid"]),
+    );
+    let stopped = harness.requests("terminate");
+    assert_eq!(
+        stopped.len(),
+        1,
+        "old generation stopped before returning the target result"
+    );
+    assert_eq!(stopped[0]["pid"], old_pid);
+    assert_eq!(harness.requests("spawn").len(), 2, "bounded one-generation cycle");
+    assert_eq!(
+        harness.tracker.active_processes(),
+        1,
+        "old child is reaped; only replacement remains"
+    );
+    assert!(harness.requests("attempt_proof").is_empty());
     harness.finish().await;
     result
 }

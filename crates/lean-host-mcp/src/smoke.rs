@@ -278,6 +278,254 @@ mod tests {
         );
     }
 
+    /// The writer controller is another test process so its registry binding is
+    /// private without mutating this multithreaded test process's environment.
+    #[test]
+    #[ignore = "internal actual warm-handoff writer controller"]
+    fn actual_warm_handoff_writer_child() {
+        use std::process::Command;
+        let helper = std::env::var_os("LEAN_HOST_MCP_SMOKE_HELPER").expect("actual helper");
+        let root = std::path::PathBuf::from(
+            std::env::var_os("LEAN_HOST_MCP_WARM_TEST_ROOT").expect("private warm-handoff root"),
+        );
+        let mut writer =
+            lean_toolchain::shared_writer::SharedWriter::open(Path::new(&helper), &root, Duration::from_secs(15))
+                .expect("writer demand eventually receives actual exclusive custody");
+        let mut command = Command::new("/usr/bin/touch");
+        command.arg(root.join("writer-finished"));
+        let result = writer
+            .run(&command, Duration::from_secs(5))
+            .expect("one actual writer stage");
+        assert!(result.status.success(), "the actual writer stage completed normally");
+    }
+
+    /// Bypass broker admission to reproduce the race after a caller has already
+    /// borrowed its warm actor. The guardian still owns the old SH descriptions.
+    #[test]
+    #[ignore = "requires matching LEAN_HOST_MCP_SMOKE_WORKER and LEAN_HOST_MCP_SMOKE_HELPER"]
+    fn actual_warm_worker_contention_cycles_before_one_target_body() {
+        use std::fs;
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+        use std::process::{Child, Command, Stdio};
+
+        use lean_rs_worker_parent::{
+            LeanWorkerElabOptions, LeanWorkerModuleQuery, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQueryResult,
+        };
+        use lean_toolchain::writer_demand::ReadAdmission;
+
+        struct WriterController(Child);
+        impl Drop for WriterController {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    // Only this test's actual unreaped controller. Its EOF
+                    // leaves real H responsible for any native cleanup.
+                    let _kill_result = self.0.kill();
+                    let _wait_result = self.0.wait();
+                }
+            }
+        }
+
+        let worker = std::path::PathBuf::from(std::env::var_os("LEAN_HOST_MCP_SMOKE_WORKER").expect("worker"))
+            .canonicalize()
+            .expect("canonical worker");
+        let helper = std::path::PathBuf::from(std::env::var_os("LEAN_HOST_MCP_SMOKE_HELPER").expect("helper"))
+            .canonicalize()
+            .expect("canonical helper");
+        let toolchain = ToolchainId::parse("v4.35.0").expect("supported toolchain");
+        let sysroot = toolchain.elan_dir().expect("installed matching toolchain");
+        // Keep the private guardian socket below Darwin's pathname limit.
+        let project = tempfile::Builder::new()
+            .prefix("warm-")
+            .tempdir_in("/tmp")
+            .expect("private warm-handoff workspace");
+        let workspace = project.path().canonicalize().expect("canonical private workspace");
+        let root = workspace.join("project");
+        fs::create_dir(&root).expect("private consumer root");
+        fs::create_dir(root.join(".lake")).expect("private Lake domain");
+        fs::write(root.join("lake-manifest.json"), "{\"packages\":[]}\n").expect("fixed empty dependency graph");
+        let registry = workspace.join("owners");
+        fs::create_dir(&registry).expect("private native registry");
+        let prepared =
+            crate::host_preparation::probe_ready(&worker, &sysroot, &helper, SMOKE_STARTUP_TIMEOUT, &|| false)
+                .expect("actual runtime-free readiness")
+                .expect("actual bundled artifacts must already be ready");
+        let expectation = crate::runtime_compatibility::session_expectation(toolchain.as_str(), None)
+            .expect("compiled matching ABI expectation");
+        let tracker = LeanWorkerProcessTracker::new();
+        let child = LeanWorkerChild::for_toolchain(&worker, &sysroot)
+            .shared_writer_executable(helper.clone())
+            .native_guardian(helper.clone())
+            .lifetime_directory(&registry)
+            .prepared_host_artifacts(prepared)
+            .shared_artifact_reads(true);
+        let mut handle = LeanWorkerHostHandleBuilder::shims_only(&root, std::iter::empty::<String>())
+            .require_host_runtime(expectation)
+            .worker_child(child)
+            .process_tracker(tracker.clone())
+            .startup_timeout(SMOKE_STARTUP_TIMEOUT)
+            .request_timeout(Duration::from_secs(15))
+            .open()
+            .expect("actual private guarded worker");
+        let mut writer = None;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            handle
+                .inspect_declaration_with_imports(
+                    vec!["Init".to_owned()],
+                    &LeanWorkerDeclarationInspectionRequest::new("Nat.add_zero"),
+                    None,
+                    None,
+                )
+                .expect("warm actual Init session");
+            let old_metadata = handle.host_runtime_metadata().expect("actual warm metadata").clone();
+            let before = handle.lifecycle_snapshot();
+            handle
+                .release_host_read()
+                .expect("close logical request aliases, retain generation custody");
+            assert_eq!(
+                tracker.active_processes(),
+                1,
+                "the warm generation still owns its guardian scope"
+            );
+            let counter = root.join("target-effects");
+            fs::write(&counter, "").expect("private target counter");
+            writer = Some(WriterController(
+                Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--ignored", "--exact", "smoke::tests::actual_warm_handoff_writer_child"])
+                    .env("LEAN_HOST_MCP_SMOKE_HELPER", &helper)
+                    .env("LEAN_HOST_MCP_WARM_TEST_ROOT", &root)
+                    .env(lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV, &registry)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("actual private writer controller"),
+            ));
+            let lock = lean_toolchain::shared_writer::project_lock_path(&root).expect("exact project domain");
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                match ReadAdmission::try_acquire(std::slice::from_ref(&lock)) {
+                    Ok(None) => break,
+                    Ok(Some(_)) => {}
+                    Err(error) => assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock,
+                        "handoff observation failed: {error}"
+                    ),
+                }
+                assert!(Instant::now() < until, "actual writer did not announce demand");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                !root.join("writer-finished").exists(),
+                "old guardian SH still excludes the writer"
+            );
+            let marker = serde_json::to_string(&root.join("writer-finished")).expect("Lean writer marker path");
+            let counter_path = serde_json::to_string(&counter).expect("Lean target counter path");
+            let source = format!(
+                "#eval do\n  let before ← IO.FS.readFile {counter_path}\n  IO.FS.writeFile {counter_path} (before ++ \"body\\n\")\n  let _writer ← IO.FS.readFile {marker}\n  pure ()\n"
+            );
+            // Record every body entry before checking writer ordering. An
+            // illicit early failure followed by a body retry would count twice.
+            // One target submission. Only pre-body session admission may cycle.
+            let outcome = handle
+                .process_module_query_with_imports(
+                    vec!["Init".to_owned()],
+                    &source,
+                    &LeanWorkerModuleQuery::Diagnostics,
+                    &LeanWorkerElabOptions::default(),
+                    None,
+                    None,
+                )
+                .expect("one target runs after the contending writer and confirmed old-generation stop");
+            assert!(
+                matches!(
+                    &outcome,
+                    LeanWorkerModuleQueryOutcome::Ok {
+                        result: LeanWorkerModuleQueryResult::Diagnostics(diagnostics), ..
+                    } if !diagnostics.truncated && diagnostics.diagnostics.iter().all(|item| item.severity != "error")
+                ),
+                "actual target diagnostics must be clean: {outcome:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&counter).expect("actual target effect"),
+                "body\n",
+                "body ran exactly once"
+            );
+            let after = handle.lifecycle_snapshot();
+            assert_eq!(
+                after.worker_generation,
+                before.worker_generation.saturating_add(1),
+                "one pre-body generation cycle"
+            );
+            assert_eq!(
+                after.restarts,
+                before.restarts.saturating_add(1),
+                "no extra or body retry cycle"
+            );
+            let actual = handle.host_runtime_metadata().expect("actual replacement metadata");
+            let old_epoch = old_metadata
+                .artifact_read_epochs
+                .as_ref()
+                .expect("old actual read custody")
+                .iter()
+                .find(|epoch| Path::new(&epoch.project_root) == root)
+                .expect("old private domain");
+            let new_epoch = actual
+                .artifact_read_epochs
+                .as_ref()
+                .expect("replacement actual read custody")
+                .iter()
+                .find(|epoch| Path::new(&epoch.project_root) == root)
+                .expect("replacement private domain");
+            assert_ne!(
+                new_epoch.epoch, old_epoch.epoch,
+                "actual writer epoch changed before replacement body"
+            );
+            assert_eq!(
+                actual.checked_host_bindings, old_metadata.checked_host_bindings,
+                "actual ABI remains checked"
+            );
+        }));
+        // Preserve the fixture on any failure; a known proof result never
+        // substitutes for confirmed native cleanup in this actual-image test.
+        let shutdown = handle.try_shutdown();
+        let writer_status = writer.as_mut().map(|controller| {
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                match controller.0.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {}
+                    Err(_) => break None,
+                }
+                if Instant::now() >= until {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        if result.is_err()
+            || shutdown.is_err()
+            || tracker.active_processes() != 0
+            || !matches!(writer_status, Some(Some(status)) if status.success())
+        {
+            let retained = project.keep();
+            eprintln!("retained actual warm-handoff fixture: {}", retained.display());
+        }
+        if let Err(panic) = result {
+            resume_unwind(panic);
+        }
+        shutdown.expect("confirmed replacement native scope closure");
+        assert_eq!(
+            tracker.active_processes(),
+            0,
+            "all actual generations physically closed"
+        );
+        assert!(
+            matches!(writer_status, Some(Some(status)) if status.success()),
+            "actual writer controller completed normally"
+        );
+    }
+
     #[test]
     fn outcome_round_trips_through_sidecar_json() {
         let passed = SmokeOutcome::Passed;

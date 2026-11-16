@@ -1935,6 +1935,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_request_survives_one_warm_prebody_cycle_without_body_replay() {
+        let tasks = RequestTasks::default();
+        let prepared = tasks.prepare(binding(1)).unwrap();
+        let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+        let original = prepared.request.unwrap();
+        tasks
+            .submit("test", id.clone(), original.clone(), || async {
+                let (outcome, _) = crate::project::receipt_tests::retained_warm_prebody_cycle_call()
+                    .await
+                    .map_err(McpError::from)?
+                    .into_parts();
+                Ok(CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                    serde_json::to_string(&outcome).unwrap(),
+                )]))
+            })
+            .unwrap();
+        assert_eq!(terminal(&tasks, &id).await.status(), TaskStatus::Completed);
+        let retained = tasks.get_retained(&id).unwrap();
+        assert_eq!(retained.fields["taskId"], id);
+        assert_eq!(retained.request.as_ref().unwrap(), &original);
+        assert_eq!(retained.execution.disposition, Disposition::Stopped);
+        assert!(
+            retained.result_available,
+            "completed protocol result remains on its original ticket"
+        );
+        assert!(retained.fields.get("result").is_some());
+        assert_eq!(
+            tasks.0.lock().entries.len(),
+            1,
+            "the pre-body cycle creates no outer request"
+        );
+        let saved = serde_json::to_value(retained).unwrap();
+        tasks
+            .submit("test", id.clone(), original, || async {
+                panic!("a lost response cannot redispatch the completed target")
+            })
+            .unwrap();
+        assert_eq!(serde_json::to_value(tasks.get_retained(&id).unwrap()).unwrap(), saved);
+    }
+
+    #[tokio::test]
     async fn prepared_request_keeps_actual_actor_stop_receipt_without_a_proof_result() {
         for failed_replacement in [false, true] {
             let tasks = RequestTasks::default();

@@ -969,10 +969,11 @@ fn prepare_payload(args: &NativeReaderArgs, deadline: Instant) -> io::Result<(Gu
         remaining(deadline)?,
     )?;
     let roots = args.roots()?;
-    let readers = roots
-        .iter()
-        .map(|root| SharedReader::acquire(&helper.executable, root, remaining(deadline)?))
-        .collect::<io::Result<Vec<_>>>()?;
+    // This fresh guardian has received no read loans yet. The union owner can
+    // close every tentative SH before waiting, so a later-domain writer never
+    // waits cyclically on an earlier partial read. Payload launch remains once.
+    // Parent cancellation/lifeline stop owns this entire pre-body process group.
+    let readers = SharedReader::acquire_union(&helper.executable, &roots, remaining(deadline)?, &|| false)?;
     if args.roots()? != roots {
         return Err(invalid("native-reader artifact union changed during admission"));
     }

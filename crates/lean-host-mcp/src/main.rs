@@ -170,14 +170,14 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("lean-host-mcp read-proxy: {error}");
-                ExitCode::FAILURE
+                ExitCode::from(lean_host_mcp::shared_writer::reader_failure_exit_code(&error))
             }
         },
         Some(Command::Reader(args)) => match lean_host_mcp::shared_writer::run_reader(&args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("lean-host-mcp reader: {error}");
-                ExitCode::FAILURE
+                ExitCode::from(lean_host_mcp::shared_writer::reader_failure_exit_code(&error))
             }
         },
         Some(Command::WriterExec) => match lean_host_mcp::shared_writer::run_exec() {

@@ -103,6 +103,9 @@ pub struct WriterArgs {
 /// Internal one-shot transfer of shared read custody to an actual worker.
 #[derive(Debug, clap::Args)]
 pub struct ReaderArgs {
+    /// Return normal exit 75 for typed pre-transfer contention, without custody.
+    #[arg(long)]
+    report_contention: bool,
     root: PathBuf,
     lock: PathBuf,
     admission: f64,
@@ -114,8 +117,11 @@ pub struct ReaderArgs {
 #[derive(Debug, clap::Args)]
 pub struct ReadProxyArgs {
     /// Wait on one metadata domain; caller must hold no other artifact custody.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "report_contention")]
     single_domain_wait: bool,
+    /// Report typed pre-Ready contention to a whole-union acquisition owner.
+    #[arg(long, conflicts_with = "single_domain_wait")]
+    report_contention: bool,
     root: PathBuf,
     lock: PathBuf,
     admission: f64,
@@ -278,10 +284,31 @@ fn canonical(path: &Path) -> io::Result<()> {
 enum ReaderDemandPolicy {
     FailFast,
     WaitSingleDomain,
+    ReportContention,
 }
 
-fn acquire(path: &Path, timeout: Duration, shared: bool) -> io::Result<(File, Option<Record>)> {
-    acquire_while(path, timeout, shared, || Ok(true))
+#[derive(Debug)]
+struct ReaderContention(&'static str);
+impl std::fmt::Display for ReaderContention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "reader admission contended before custody: {}", self.0)
+    }
+}
+impl std::error::Error for ReaderContention {}
+
+fn reader_contention(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, ReaderContention(reason))
+}
+
+/// A flagged pure reader can report contention only before transferring custody.
+/// Other I/O errors and every legacy unflagged reader keep ordinary failure status.
+#[must_use]
+pub fn reader_failure_exit_code(error: &io::Error) -> u8 {
+    if error.get_ref().is_some_and(|cause| cause.is::<ReaderContention>()) {
+        75
+    } else {
+        1
+    }
 }
 
 fn acquire_while(
@@ -339,6 +366,7 @@ fn acquire_while_until(
                             "artifact writer demand prevents new read admission",
                         ));
                     }
+                    ReaderDemandPolicy::ReportContention => return Err(reader_contention("writer_demand")),
                     ReaderDemandPolicy::WaitSingleDomain => {
                         // try_acquire closed every transient gate. Retry only
                         // admission under the original deadline and FIFO owner.
@@ -347,6 +375,9 @@ fn acquire_while_until(
                     }
                 },
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if matches!(demand_policy, ReaderDemandPolicy::ReportContention) {
+                        return Err(reader_contention("reader_gate"));
+                    }
                     // Another reader holds only a transient gate, never an
                     // artifact wait. All partial gates were closed by try_acquire.
                     if Instant::now() >= deadline {
@@ -367,6 +398,9 @@ fn acquire_while_until(
         };
         match attempt {
             Ok(()) => {}
+            Err(TryLockError::WouldBlock) if matches!(demand_policy, ReaderDemandPolicy::ReportContention) => {
+                return Err(reader_contention("artifact_lock"));
+            }
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 drop(admission);
                 thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
@@ -395,6 +429,9 @@ fn acquire_while_until(
                     (opened.dev(), opened.ino()),
                 )?)
         {
+            if matches!(demand_policy, ReaderDemandPolicy::ReportContention) {
+                return Err(reader_contention("previous_writer_scope"));
+            }
             file.unlock()?;
             drop(admission);
             if Instant::now() >= deadline {
@@ -480,7 +517,13 @@ fn lock_workspaces(
     }
 }
 
-fn reader_lease(root: &Path, path: &Path, admission: f64, nonce: &str) -> io::Result<(File, Value)> {
+fn reader_lease(
+    root: &Path,
+    path: &Path,
+    deadline: Instant,
+    nonce: &str,
+    report_contention: bool,
+) -> io::Result<(File, Value)> {
     canonical(root)?;
     if path != lean_toolchain::shared_writer::project_lock_path(root)? {
         return Err(invalid("reader lock differs from canonical project domain"));
@@ -488,7 +531,12 @@ fn reader_lease(root: &Path, path: &Path, admission: f64, nonce: &str) -> io::Re
     if nonce.is_empty() || nonce.len() > 256 {
         return Err(invalid("bounded reader nonce required"));
     }
-    let (file, previous) = acquire(path, duration(admission)?, true)?;
+    let policy = if report_contention {
+        ReaderDemandPolicy::ReportContention
+    } else {
+        ReaderDemandPolicy::FailFast
+    };
+    let (file, previous) = acquire_while_until(path, deadline, true, policy, || Ok(true))?;
     let epoch = serde_json::to_string(&previous.as_ref().map(|record| &record.owner)).map_err(io::Error::other)?;
     let metadata = file.metadata()?;
     let receipt = json!({"protocol":PROTOCOL,"state":"read_ready","project_root":root,
@@ -548,6 +596,8 @@ pub fn run_read_proxy(args: &ReadProxyArgs) -> io::Result<()> {
     }
     let demand_policy = if args.single_domain_wait {
         ReaderDemandPolicy::WaitSingleDomain
+    } else if args.report_contention {
+        ReaderDemandPolicy::ReportContention
     } else {
         ReaderDemandPolicy::FailFast
     };
@@ -588,6 +638,9 @@ pub fn run_read_proxy(args: &ReadProxyArgs) -> io::Result<()> {
 /// # Errors
 /// Returns admission, stale owned-work, socket, or descriptor-transfer errors.
 pub fn run_reader(args: &ReaderArgs) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(duration(args.admission)?)
+        .ok_or_else(|| invalid("reader timeout is too large"))?;
     canonical(
         args.socket
             .parent()
@@ -601,8 +654,14 @@ pub fn run_reader(args: &ReaderArgs) -> io::Result<()> {
     if !directory.is_dir() || directory.uid() != rustix::process::getuid().as_raw() || directory.mode() & 0o077 != 0 {
         return Err(invalid("reader transfer requires its own private socket directory"));
     }
-    let timeout = duration(args.admission)?;
-    let (file, receipt) = reader_lease(&args.root, &args.lock, args.admission, &args.nonce)?;
+    let (file, receipt) = reader_lease(&args.root, &args.lock, deadline, &args.nonce, args.report_contention)?;
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "reader transfer deadline elapsed",
+        ));
+    }
     let mut payload = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
     payload.push(b'\n');
     let mut stream = UnixStream::connect(&args.socket)?;

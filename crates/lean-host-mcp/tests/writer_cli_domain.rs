@@ -756,3 +756,66 @@ fn own_completed_writer_can_transition_directly_to_one_metadata_proxy() {
     drop(endpoints.control);
     closed_proxy_with_one_ready(proxy);
 }
+
+#[test]
+#[serial]
+fn only_opted_in_pre_custody_contention_reports_normal_75() {
+    let fixture = Fixture::new();
+    let demand =
+        lean_toolchain::writer_demand::WriterDemand::announce(std::slice::from_ref(&fixture.domain), LIMIT, &|| false)
+            .expect("hold actual writer demand");
+    for client in [Client::Reader, Client::Proxy] {
+        let endpoints = Endpoints::new();
+        let mut command = client.command(&fixture.root, &fixture.domain, &endpoints, "2");
+        command.arg("--report-contention");
+        let mut helper = OwnedHelper::spawn(&mut command);
+        helper.close_input();
+        let output = helper.finish();
+        assert_eq!(
+            output.status.code(),
+            Some(75),
+            "only known pre-custody contention: {output:?}"
+        );
+        assert!(output.stdout.is_empty(), "contention must not emit a Ready/frame");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("writer_demand"),
+            "bounded reason diagnostic"
+        );
+        endpoints.no_reader_ack();
+        let mut legacy = OwnedHelper::spawn(&mut client.command(&fixture.root, &fixture.domain, &endpoints, "2"));
+        legacy.close_input();
+        let output = legacy.finish();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "legacy fail-fast status unchanged: {output:?}"
+        );
+        assert!(output.stdout.is_empty());
+        endpoints.no_reader_ack();
+    }
+    drop(demand);
+}
+
+#[test]
+#[serial]
+fn opted_in_hard_domain_errors_never_report_retryable_contention() {
+    let fixture = Fixture::new();
+    for client in [Client::Reader, Client::Proxy] {
+        let endpoints = Endpoints::new();
+        let bad = fixture.root.join("alternate.lock");
+        let mut command = client.command(&fixture.root, &bad, &endpoints, "2");
+        command.arg("--report-contention");
+        let mut helper = OwnedHelper::spawn(&mut command);
+        helper.close_input();
+        let output = helper.finish();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "hard errors must not ask union retry: {output:?}"
+        );
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("canonical project domain"));
+        assert!(!bad.exists());
+        endpoints.no_reader_ack();
+    }
+}
