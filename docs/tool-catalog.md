@@ -239,7 +239,9 @@ retains startup ownership even if its HTTP connection disappears. Background rec
 admission boundary and count as active work. The pool-level `outstanding_jobs` count also retains work owned by a
 controller that has been removed from the resident registry.
 
-By default acquire keeps workers and their warm caches, including across idle-reaper ticks. For a caller that actually
+By default acquire keeps workers and their warm caches across ordinary idle-reaper ticks. Independent artifact-writer
+demand can still retire an affected idle generation after admitted work finishes; the lease continues to fence MCP
+admission and is neither advanced nor released by that handoff. For a caller that actually
 needs their memory, explicitly set `retire_idle: true` on acquire. `retirement_requested` counts shutdown requests; it
 does not acknowledge child exit. Wait for `pool.workers_stopped: true`, under the same live lease, before relying on
 released worker capacity. An occupied slot may represent a starting, resident, retiring, or uncertain worker; uncertain

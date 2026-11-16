@@ -90,6 +90,17 @@ freed. The token and broker instance identity are process-local, with no cross-p
 preemption, or persistence. See the [tool catalog](tool-catalog.md#worker-activity-and-admission-leases) for the public
 contract.
 
+Cooperating artifact writers announce process-bound demand on the same canonical physical domains before waiting for
+exclusive artifact custody. The broker checks that handoff gate before borrowing a resident actor or admitting idle
+maintenance. Contention pauses affected new calls within their existing cancellation/deadline budget; admitted calls
+finish normally. A separate 100 ms observation in the existing reaper retires only affected idle, unborrowed actors,
+even when ordinary idle expiry is disabled or a lease preserves warm caches. It does not advance or release that lease.
+Retirement still uses the ordinary process owner, so an acknowledgement never releases capacity or artifact custody
+before actual scope closure. Nonoverlapping actors remain available. Matching uses the actor's retained actual read-domain
+receipts, including frozen dependencies and companions, rather than a newly reduced manifest. A brief competing reader
+gate can also cause conservative backpressure or idle retirement; it is not evidence of a writer identity. The protocol
+does not claim FIFO ordering among multiple writers or defeat OS scheduling/filesystem stalls.
+
 The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
 cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
 project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.

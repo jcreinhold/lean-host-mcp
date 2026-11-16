@@ -205,6 +205,7 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
         pool_active_jobs: Arc::new(AtomicUsize::new(0)),
         healthy: Arc::new(AtomicBool::new(true)),
         runtime: Arc::new(Mutex::new(RuntimeSnapshot {
+            protected_artifact_domains: BTreeSet::new(),
             worker_generation: 1,
             last_restart: None,
             rss_kib: None,
@@ -961,6 +962,13 @@ async fn known_metadata_result_survives_read_release_failure_without_replay() {
     let ((), runtime) = call.into_parts();
     let evidence = runtime.native_compatibility.expect("actual observed metadata");
     assert_eq!(evidence.loaded[0].worker_generation, 1);
+    assert!(
+        harness
+            .project
+            .protected_artifact_domains()
+            .contains(&harness.root.path().to_path_buf()),
+        "actual read domains survive a failed release independently of returned runtime facts"
+    );
     harness.wait_for_retirement().await;
     assert_eq!(harness.requests("host_runtime_metadata").len(), 1);
     assert_eq!(harness.requests("release_host_read").len(), 1);

@@ -8,7 +8,7 @@
 
 #![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1025,6 +1025,9 @@ fn restart_cause_from_worker_name(cause: &str) -> RestartCause {
 
 #[derive(Debug, Clone)]
 struct RuntimeSnapshot {
+    /// Physical domains observed from actual worker read receipts. Keep the
+    /// actor-lifetime union: metadata drift cannot erase a still-held domain.
+    protected_artifact_domains: BTreeSet<PathBuf>,
     worker_generation: u64,
     last_restart: Option<RuntimeRestartEvent>,
     rss_kib: Option<u64>,
@@ -1059,6 +1062,21 @@ impl RuntimeSnapshot {
             import_residue_bytes: self.import_residue_bytes,
             import_residue_limit_bytes: self.import_residue_limit_bytes,
         }
+    }
+}
+
+/// Preserve physical read domains before a read alias or companion is closed.
+/// A confirmed group stop may make an old entry redundant, but retaining it
+/// until actor retirement is conservative and avoids guessing after failure.
+fn retain_artifact_domains(
+    runtime: &Mutex<RuntimeSnapshot>,
+    actual: Option<&lean_rs_worker_protocol::types::LeanWorkerHostRuntimeMetadata>,
+) {
+    if let Some(epochs) = actual.and_then(|metadata| metadata.artifact_read_epochs.as_ref()) {
+        runtime
+            .lock()
+            .protected_artifact_domains
+            .extend(epochs.iter().map(|epoch| PathBuf::from(&epoch.project_root)));
     }
 }
 
@@ -1127,7 +1145,10 @@ impl LeanProject {
         initialization: CallOperation,
     ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
+        let mut protected_artifact_domains = BTreeSet::from([meta.canonical_root.clone()]);
+        protected_artifact_domains.extend(prepared_host_artifacts.artifact_roots.iter().map(PathBuf::from));
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
+            protected_artifact_domains,
             worker_generation: 1,
             last_restart: None,
             rss_kib: None,
@@ -1203,6 +1224,48 @@ impl LeanProject {
             runtime,
             module_queries: ModuleQueryCache::with_capacity(cache_cap),
         }))
+    }
+
+    /// A test controller whose real shared-lock owner exits with its mailbox.
+    #[cfg(test)]
+    pub(crate) fn test_handoff_actor(
+        root: &Path,
+        manifest_hash: String,
+        domains: Vec<PathBuf>,
+        keepalive: Box<dyn Send>,
+    ) -> Arc<Self> {
+        let (tx, mut rx) = mpsc::channel::<ProjectMessage>(1);
+        thread::spawn(move || {
+            let _keepalive = keepalive;
+            while rx.blocking_recv().is_some() {}
+        });
+        Arc::new(Self {
+            canonical_root: root.to_path_buf(),
+            toolchain: "test".into(),
+            package: None,
+            library: None,
+            manifest_hash,
+            session_id: "handoff-test".into(),
+            open_warnings: Vec::new(),
+            actor_tx: Mutex::new(Some(tx)),
+            admission_timeout: Duration::from_secs(1),
+            active_jobs: Arc::new(AtomicUsize::new(0)),
+            pool_active_jobs: Arc::new(AtomicUsize::new(0)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            runtime: Arc::new(Mutex::new(RuntimeSnapshot {
+                protected_artifact_domains: domains.into_iter().collect(),
+                worker_generation: 1,
+                last_restart: None,
+                rss_kib: None,
+                import_profile: None,
+                profile_switch_count: 0,
+                restarts_total: 0,
+                restarts_by_cause: BTreeMap::new(),
+                import_residue_bytes: None,
+                import_residue_limit_bytes: None,
+            })),
+            module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
+        })
     }
 
     /// Process one module query through this project's serialized worker actor.
@@ -1568,6 +1631,13 @@ impl LeanProject {
     #[must_use]
     pub(crate) fn runtime_facts(&self) -> RuntimeFacts {
         self.runtime.lock().facts()
+    }
+
+    /// Domains retained by this actor's ordinary or companion native scopes.
+    /// These come from captured admission inputs and actual worker receipts,
+    /// never from a fresh manifest that may have dropped a frozen dependency.
+    pub(crate) fn protected_artifact_domains(&self) -> Vec<PathBuf> {
+        self.runtime.lock().protected_artifact_domains.iter().cloned().collect()
     }
 
     pub(crate) fn shutdown(&self) {
@@ -1998,6 +2068,7 @@ impl ProjectActorState {
     }
 
     fn finish_host_read(&mut self) {
+        retain_artifact_domains(&self.runtime, self.handle.host_runtime_metadata());
         if let Err(error) = self.handle.release_host_read() {
             // This is resource cleanup after the recorded body outcome. Keep
             // that outcome, seal this owner, and retain its actual process slot.
@@ -2420,6 +2491,7 @@ impl ProjectActorState {
             cpu_baseline.and_then(|start| capability.cumulative_cpu_millis().map(|end| end.saturating_sub(start)));
         // A pool lease must not advertise confirmed exit after an unobserved
         // companion shutdown. Retain the project's slot if its child is uncertain.
+        retain_artifact_domains(&self.runtime, capability.host_runtime_metadata());
         let shutdown = capability.try_shutdown();
         let after = capability.lifecycle_snapshot();
         let deferred_stop = self.defer_stop_observation(
@@ -3095,7 +3167,9 @@ impl ProjectActorState {
     }
 
     fn publish_runtime(&self, runtime: &RuntimeFacts) {
-        *self.runtime.lock() = RuntimeSnapshot {
+        let mut snapshot = self.runtime.lock();
+        *snapshot = RuntimeSnapshot {
+            protected_artifact_domains: std::mem::take(&mut snapshot.protected_artifact_domains),
             worker_generation: runtime.worker_generation,
             last_restart: runtime.last_restart.clone().or_else(|| runtime.call_restart.clone()),
             rss_kib: runtime.rss_kib,
@@ -4144,6 +4218,7 @@ mod tests {
             .package("lean_semantic_search")
             .module("LeanSemanticSearch");
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
+            protected_artifact_domains: BTreeSet::new(),
             worker_generation: 1,
             last_restart: None,
             rss_kib: None,
@@ -4383,6 +4458,7 @@ mod tests {
             pool_active_jobs: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
             runtime: Arc::new(Mutex::new(RuntimeSnapshot {
+                protected_artifact_domains: BTreeSet::new(),
                 worker_generation: 1,
                 last_restart: None,
                 rss_kib: None,

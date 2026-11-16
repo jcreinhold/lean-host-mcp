@@ -61,7 +61,7 @@ async fn stdio_shutdown_after_tool_call_exits_worker_child() {
     let registry = tempfile::tempdir().expect("temp registry");
     let mut server = StdioServer::start(&fixture_root(), registry.path());
     server.initialize().await;
-    server
+    let response = server
         .request_allow_error(
             "tools/call",
             json!({
@@ -78,7 +78,7 @@ async fn stdio_shutdown_after_tool_call_exits_worker_child() {
     let worker_pids = wait_for_child_pids(server.pid()).await;
     assert!(
         !worker_pids.is_empty(),
-        "tool call should leave a direct worker child for exact-PID shutdown assertion"
+        "tool call should leave a direct worker child for exact-PID shutdown assertion; response: {response:?}"
     );
 
     server.close_stdin_and_wait().await;
@@ -149,11 +149,16 @@ struct StdioServer {
 
 impl StdioServer {
     fn start(project_root: &Path, registry: &Path) -> Self {
-        let config_dir = tempfile::tempdir().expect("temp config dir").keep();
+        let config_dir = tempfile::tempdir()
+            .expect("temp config dir")
+            .keep()
+            .canonicalize()
+            .expect("canonical private config directory");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command
             .arg("--lake-root")
             .arg(project_root)
+            .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", config_dir.join("native-owners"))
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", registry)
             .env("RUST_LOG", "warn")

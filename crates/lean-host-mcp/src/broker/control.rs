@@ -56,6 +56,7 @@ pub struct RuntimeControlRequest {
     #[serde(default)]
     pub lease_seconds: Option<u64>,
     /// On acquire, explicitly retire idle workers instead of keeping caches warm.
+    /// Independent artifact-writer demand may also retire an affected idle cache.
     #[serde(default)]
     pub retire_idle: bool,
 }
@@ -254,6 +255,8 @@ impl MaintenanceAccess {
         if registry.control.remaining(Instant::now()).is_some() {
             return None;
         }
+        // Demand and a brief reader admission gate both defer new idle work.
+        let _artifact_admission = ProjectBroker::check_artifact_admission(&registry, root).ok()?;
         // An evicted/replaced controller cannot start another idle recycle.
         let guard = registry
             .registry
@@ -269,6 +272,7 @@ impl ProjectBroker {
     fn try_begin_preparation_activity(&self, root: &Path) -> crate::error::Result<PreparationActivityGuard> {
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;
+        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         // The lease check and count change are one registry critical section.
         // Acquire cannot observe idle and win between admission and child spawn.
         let active_jobs = Arc::clone(&inner.control.active_jobs);
@@ -300,7 +304,7 @@ impl ProjectBroker {
                 return Err(Self::pool_unavailable(root, "project_admission_timeout", true));
             }
             let result = self.try_begin_preparation_activity(root);
-            if !matches!(&result, Err(crate::error::ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining")
+            if !matches!(&result, Err(crate::error::ServerError::WorkerUnavailable(info)) if matches!(info.reason.as_str(), "worker_pool_draining" | "artifact_admission_busy"))
             {
                 return result;
             }

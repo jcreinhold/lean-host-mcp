@@ -112,6 +112,7 @@ fn mailbox_project() -> (Arc<LeanProject>, mpsc::Receiver<ProjectMessage>) {
         pool_active_jobs: Arc::new(AtomicUsize::new(0)),
         healthy: Arc::new(AtomicBool::new(true)),
         runtime: Arc::new(Mutex::new(RuntimeSnapshot {
+            protected_artifact_domains: BTreeSet::new(),
             worker_generation: 1,
             last_restart: None,
             rss_kib: None,

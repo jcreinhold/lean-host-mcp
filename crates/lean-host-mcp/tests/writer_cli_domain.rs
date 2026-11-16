@@ -420,3 +420,97 @@ fn source_package_writer_keeps_the_canonical_primary_and_external_entry_loans() 
     .expect("one valid project-first/source-entry loan transaction");
     assert!(package_root.join("Fixture.lean").is_file());
 }
+
+fn wait_for_writer_demand(paths: &[PathBuf]) {
+    let deadline = Instant::now().checked_add(LIMIT).expect("demand observation deadline");
+    loop {
+        if paths.iter().all(|path| {
+            lean_toolchain::writer_demand::ReadAdmission::try_acquire(std::slice::from_ref(path))
+                .expect("observe canonical domain demand")
+                .is_none()
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "writer did not announce every domain before EX"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[serial]
+fn waiting_cli_writer_fences_new_readers_and_caller_loss_clears_demand() {
+    let fixture = Fixture::new();
+    let original = SharedReadProxy::acquire(executable(), &fixture.root, LIMIT).expect("existing shared reader");
+    let endpoints = Endpoints::new();
+    let mut writer = OwnedHelper::spawn(&mut Client::Writer.command(&fixture.root, &fixture.domain, &endpoints, "4"));
+    wait_for_writer_demand(std::slice::from_ref(&fixture.domain));
+    assert!(
+        matches!(writer.lines.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "writer admitted beneath live SH"
+    );
+    let started = Instant::now();
+    let error = SharedReadProxy::acquire(executable(), &fixture.root, LIMIT)
+        .err()
+        .expect("new reader must not overtake waiting writer");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "reader waited behind demand: {error}"
+    );
+    writer.close_input();
+    let output = writer.finish();
+    assert!(
+        !output.status.success() && output.stdout.is_empty(),
+        "cancelled writer released no stage: {output:?}"
+    );
+    assert!(
+        lean_toolchain::writer_demand::ReadAdmission::try_acquire(std::slice::from_ref(&fixture.domain))
+            .expect("closed caller leaves no demand")
+            .is_some()
+    );
+    let successor =
+        SharedReadProxy::acquire(executable(), &fixture.root, LIMIT).expect("compatible reader after demand closure");
+    drop(successor);
+    drop(original);
+    cli_writer_succeeds(&fixture);
+}
+
+#[test]
+#[serial]
+fn partial_multi_domain_reader_refuses_demand_without_a_reader_writer_cycle() {
+    let fixture = Fixture::new();
+    let dependency = fixture.root.parent().expect("fixture parent").join("Dependency");
+    fs::create_dir_all(dependency.join(".lake")).expect("dependency directory");
+    fs::write(dependency.join("lake-manifest.json"), "{\"packages\":[]}").expect("dependency manifest");
+    fs::write(
+        fixture.root.join("lake-manifest.json"),
+        serde_json::to_vec(&json!({
+            "version":"1.3.0",
+            "packages":[{"name":"dependency","type":"path","dir":dependency,"manifestFile":"lake-manifest.json"}]
+        }))
+        .expect("primary graph"),
+    )
+    .expect("primary manifest");
+    let partial = SharedReadProxy::acquire(executable(), &fixture.root, LIMIT).expect("reader already holds first SH");
+    let endpoints = Endpoints::new();
+    let mut writer = OwnedHelper::spawn(&mut Client::Writer.command(&fixture.root, &fixture.domain, &endpoints, "4"));
+    let dependency_lock = project_lock_path(&dependency).expect("dependency lock domain");
+    wait_for_writer_demand(&[fixture.domain.clone(), dependency_lock]);
+    let started = Instant::now();
+    assert!(SharedReadProxy::acquire(executable(), &dependency, LIMIT).is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "partial reader waited while holding earlier SH"
+    );
+    drop(partial);
+    assert_eq!(
+        writer.frame()["state"],
+        "locked",
+        "writer succeeds after partial scope releases"
+    );
+    writer.close_input();
+    assert!(writer.finish().status.success());
+    cli_writer_succeeds(&fixture);
+}

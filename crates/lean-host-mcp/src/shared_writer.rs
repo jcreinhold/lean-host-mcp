@@ -12,6 +12,7 @@
 //! The Linux backend is weaker: after leader reap it only observes group absence
 //! and cannot safely signal a surviving or late-forked descendant.
 
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, IoSlice, Read, Seek, Write};
 use std::mem::MaybeUninit;
@@ -26,6 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lean_toolchain::process_group::OwnedCommandGroup;
+use lean_toolchain::writer_demand::{ReadAdmission, WriterDemand};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
@@ -299,6 +301,32 @@ fn acquire_while(
                 "read proxy caller closed before admission",
             ));
         }
+        // A multi-domain reader may already hold an earlier SH domain. Never
+        // wait behind demand here: refuse before the body and drop its partial
+        // scope, otherwise an all-domain writer can wait cyclically on that SH.
+        let admission = if shared {
+            match ReadAdmission::try_acquire(&[path.to_path_buf()]) {
+                Ok(Some(admission)) => Some(admission),
+                Ok(None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "artifact writer demand prevents new read admission",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // Another reader holds only a transient gate, never an
+                    // artifact wait. All partial gates were closed by try_acquire.
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "reader admission gate is busy"));
+                    }
+                    thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let attempt = if shared {
             file.try_lock_shared()
         } else {
@@ -307,6 +335,7 @@ fn acquire_while(
         match attempt {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                drop(admission);
                 thread::sleep(POLL);
                 continue;
             }
@@ -334,6 +363,7 @@ fn acquire_while(
                 )?)
         {
             file.unlock()?;
+            drop(admission);
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -377,15 +407,25 @@ fn validate_workspace_custody(workspaces: &[PathBuf], locks: &[(PathBuf, File)])
     Ok(())
 }
 
-fn lock_workspaces(workspaces: &[PathBuf], primary: &Path, timeout: Duration) -> io::Result<Vec<(PathBuf, File)>> {
+fn lock_workspaces(
+    workspaces: &[PathBuf],
+    primary: &Path,
+    timeout: Duration,
+    cancelled: &(impl Fn() -> bool + ?Sized),
+) -> io::Result<(Vec<(PathBuf, File)>, WriterDemand)> {
     let started = Instant::now();
     loop {
         let mut paths = workspace_domains(workspaces)?;
         paths.sort();
         paths.dedup();
+        // Announce the complete union before taking any EX. Compatible shared
+        // demand guards let overlapping writers retain one sorted EX order.
+        let demand = WriterDemand::announce(&paths, timeout.saturating_sub(started.elapsed()), cancelled)?;
         let mut locks = Vec::new();
         for path in &paths {
-            let (file, _) = acquire(path, timeout.saturating_sub(started.elapsed()), false)?;
+            let (file, _) = acquire_while(path, timeout.saturating_sub(started.elapsed()), false, || {
+                Ok(!cancelled())
+            })?;
             locks.push((path.clone(), file));
         }
         let mut rechecked = workspace_domains(workspaces)?;
@@ -394,9 +434,10 @@ fn lock_workspaces(workspaces: &[PathBuf], primary: &Path, timeout: Duration) ->
         if paths == rechecked {
             locks.sort_by_key(|(path, _)| path != primary);
             validate_workspace_custody(workspaces, &locks)?;
-            return Ok(locks);
+            return Ok((locks, demand));
         }
         drop(locks);
+        drop(demand);
         if started.elapsed() >= timeout {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1060,14 +1101,28 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
         setsid()?;
     }
     let workspaces = lean_toolchain::shared_writer::inherited_writer_workspaces(&args.root)?;
+    let input = control();
+    let admission_closed = Cell::new(false);
+    let cancelled = || {
+        if !matches!(input.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            admission_closed.set(true);
+        }
+        admission_closed.get()
+    };
     let borrowed = inherited.is_some();
-    let locks = if let Some(locks) = inherited {
+    // This guard coordinates admission only. Artifact EX aliases and process
+    // fences still prevent readers after helper death or uncertain cleanup.
+    let (locks, _demand) = if let Some(locks) = inherited {
         if locks.first().is_none_or(|(path, _)| path != &args.lock) {
             return Err(invalid("writer primary loan does not match its lock domain"));
         }
-        locks
+        // Inherited custody may also include source-entry locks. Only physical
+        // artifact domains participate in native reader demand coordination.
+        let paths = workspace_domains(&workspaces)?;
+        let demand = WriterDemand::announce(&paths, duration(args.admission)?, &cancelled)?;
+        (locks, demand)
     } else {
-        lock_workspaces(&workspaces, &args.lock, duration(args.admission)?)?
+        lock_workspaces(&workspaces, &args.lock, duration(args.admission)?, &cancelled)?
     };
     validate_workspace_custody(&workspaces, &locks)?;
     let receipt = if borrowed {
@@ -1104,7 +1159,6 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
         .canonicalize()?;
     let result = (|| -> io::Result<()> {
         send(&json!({"state":"locked","owner":record,"lock_loans":receipt,"asset_dir":asset_dir}))?;
-        let input = control();
         while let Ok(message) = input.recv() {
             let message = message?;
             match field(&message, "action").as_str() {

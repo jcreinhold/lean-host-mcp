@@ -36,7 +36,8 @@
 //! until confirmed exit. Ordinary concurrency is [`BrokerConfig::max_projects`]
 //! workers × one in-flight job each. An explicit [`ProjectBroker::runtime_control`] lease
 //! can atomically pause idle-pool admission for a cooperating external caller;
-//! it preserves warm caches unless the caller requests retirement.
+//! it preserves warm caches against ordinary expiry unless the caller requests
+//! retirement. Independent artifact-writer demand can still retire an idle cache.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -68,6 +69,7 @@ use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResu
 
 mod control;
 mod preparation;
+mod writer_handoff;
 pub(crate) use control::MaintenanceAccess;
 pub use control::{
     RuntimeAction, RuntimeControlRequest, RuntimeControlResult, RuntimeControlStatus, WorkerActivity, WorkerPoolStatus,
@@ -85,6 +87,7 @@ pub const DEFAULT_MAX_PROJECTS: usize = 4;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
 const REAPER_TICK: Duration = Duration::from_mins(1);
+const ARTIFACT_HANDOFF_TICK: Duration = Duration::from_millis(100);
 
 /// Bag of broker inputs. Built once at startup from the CLI / env /
 /// config; `cwd` is injectable so tests can drive the cwd-walk step
@@ -315,7 +318,8 @@ impl ProjectBroker {
     /// Construct a broker and spawn the background idle reaper.
     ///
     /// The reaper is only spawned when a tokio runtime is available
-    /// ([`tokio::runtime::Handle::try_current`]) and `idle_timeout > 0`.
+    /// ([`tokio::runtime::Handle::try_current`]). Artifact handoff remains active
+    /// when `idle_timeout` is zero; only ordinary expiry is disabled.
     /// Sync test contexts get a working broker without a reaper, which is
     /// fine because tests call [`Self::reap_idle`] directly.
     #[must_use]
@@ -383,25 +387,38 @@ impl ProjectBroker {
     }
 
     fn spawn_reaper(self: &Arc<Self>) {
-        if self.config.idle_timeout.is_zero() {
-            return;
-        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let weak: Weak<Self> = Arc::downgrade(self);
         handle.spawn(async move {
-            let mut tick = tokio::time::interval(REAPER_TICK);
-            // First tick fires immediately; skip it so the test contract
-            // (`reap_idle` is the only thing that can evict synchronously)
-            // is undisturbed.
-            tick.tick().await;
+            let mut idle = tokio::time::interval(REAPER_TICK);
+            let mut handoff = tokio::time::interval(ARTIFACT_HANDOFF_TICK);
+            idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            handoff.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            idle.tick().await;
+            handoff.tick().await;
             loop {
-                tick.tick().await;
+                let reap_idle = tokio::select! {
+                    _ = idle.tick() => true,
+                    _ = handoff.tick() => false,
+                };
                 let Some(broker) = weak.upgrade() else {
                     break;
                 };
-                broker.reap_idle();
+                // Filesystem/lock observation and retirement stay off the async
+                // executor. Writer handoff remains enabled when idle expiry is 0.
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    if reap_idle {
+                        broker.reap_idle();
+                    } else {
+                        broker.reap_artifact_handoffs();
+                    }
+                })
+                .await
+                {
+                    tracing::warn!(%error, "broker housekeeping failed; later ticks will observe again");
+                }
             }
         });
     }
@@ -934,7 +951,8 @@ impl ProjectBroker {
         let cancellation = CallCancellation::current();
         loop {
             let result = self.acquire_attempt(root.clone(), deadline).await;
-            if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining") {
+            if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if matches!(info.reason.as_str(), "worker_pool_draining" | "artifact_admission_busy"))
+            {
                 return result;
             }
             // Waiting callers own no project Arc, opening lock, or worker slot.
@@ -997,14 +1015,14 @@ impl ProjectBroker {
         let slot = if growing {
             let Ok(_turn) = self.capacity_admission.try_lock() else {
                 return self
-                    .select_existing_worker(&root)
+                    .select_existing_worker(&root)?
                     .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
             };
             match Arc::clone(&self.worker_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
                     return self
-                        .select_existing_worker(&root)
+                        .select_existing_worker(&root)?
                         .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
                 }
             }
@@ -1086,6 +1104,7 @@ impl ProjectBroker {
         {
             let mut inner = self.inner.lock();
             Self::check_runtime_admission(&mut inner, root)?;
+            let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
             if !inner.registry.iter().any(|(key, _)| key.root == root) {
                 return Ok(None);
             }
@@ -1093,6 +1112,7 @@ impl ProjectBroker {
         let manifest_hash = self.meta(root)?.manifest_hash;
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;
+        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         let stale: Vec<_> = inner
             .registry
             .iter()
@@ -1132,8 +1152,10 @@ impl ProjectBroker {
         Ok(inner.registry.get(&key).cloned())
     }
 
-    fn select_existing_worker(&self, root: &Path) -> Option<Arc<LeanProject>> {
+    fn select_existing_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
         let mut inner = self.inner.lock();
+        Self::check_runtime_admission(&mut inner, root)?;
+        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         let key = inner
             .registry
             .iter()
@@ -1143,9 +1165,10 @@ impl ProjectBroker {
                     .outstanding_jobs()
                     .saturating_add(usize::from(Arc::strong_count(actor) > 1))
             })
-            .map(|(key, _)| key.clone())?;
+            .map(|(key, _)| key.clone());
+        let Some(key) = key else { return Ok(None) };
         inner.last_used.insert(key.clone(), Instant::now());
-        inner.registry.get(&key).cloned()
+        Ok(inner.registry.get(&key).cloned())
     }
 
     fn opening_lock(&self, root: &Path) -> Result<Arc<AsyncMutex<()>>> {
@@ -1153,6 +1176,7 @@ impl ProjectBroker {
         // Claim acquisition uses this same mutex. A cold caller must either
         // retain its opening lock before the claim, or observe the held lease.
         Self::check_runtime_admission(&mut inner, root)?;
+        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         inner.opening_locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = inner.opening_locks.get(root).and_then(Weak::upgrade) {
             return Ok(lock);

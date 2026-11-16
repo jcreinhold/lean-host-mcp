@@ -322,7 +322,7 @@ impl LeanHostService {
     }
 
     #[tool(
-        description = "Observe worker activity or atomically lease the idle worker pool. Actions: status, acquire, renew, release. Leases keep warm caches unless retire_idle is explicitly true; renew before expiry while relying on the pause."
+        description = "Observe worker activity or atomically lease the idle worker pool. Actions: status, acquire, renew, release. Leases pause MCP admission; independent artifact writers may retire idle caches. Set retire_idle for explicit retirement and renew before expiry while relying on the pause."
     )]
     async fn lean_runtime(
         &self,
