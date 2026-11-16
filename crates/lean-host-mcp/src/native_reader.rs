@@ -49,6 +49,7 @@ const PRIVATE_ENV: &[&str] = &[
 pub struct NativeReaderArgs {
     #[arg(long)]
     project_root: PathBuf,
+    /// Already selected physical read domain; its manifest is not re-expanded.
     #[arg(long)]
     artifact_root: Vec<PathBuf>,
     #[arg(long)]
@@ -73,6 +74,7 @@ pub(crate) struct NativeReaderProgram {
     pub(crate) command: Vec<OsString>,
     pub(crate) environment: Vec<(OsString, OsString)>,
     pub(crate) cwd: PathBuf,
+    /// Frozen physical domains; only `project_root` is expanded as a workspace.
     pub(crate) artifact_roots: Vec<PathBuf>,
 }
 
@@ -293,8 +295,8 @@ fn canonical(path: &Path) -> io::Result<()> {
 impl NativeReaderArgs {
     fn validate(&self) -> io::Result<()> {
         canonical(&self.project_root)?;
-        if self.artifact_root.len() >= lean_toolchain::native_guardian::MAX_READ_DOMAINS {
-            return Err(invalid("native-reader workspace count exceeds limit"));
+        if self.artifact_root.len() > lean_toolchain::native_guardian::MAX_READ_DOMAINS {
+            return Err(invalid("native-reader explicit artifact-domain count exceeds limit"));
         }
         for root in &self.artifact_root {
             canonical(root)?;
@@ -312,9 +314,10 @@ impl NativeReaderArgs {
     }
 
     fn roots(&self) -> io::Result<Vec<PathBuf>> {
-        let mut workspaces = vec![self.project_root.clone()];
-        workspaces.extend(self.artifact_root.iter().cloned());
-        let roots = lean_toolchain::shared_writer::project_artifact_root_union(&workspaces)?;
+        let roots = lean_toolchain::shared_writer::project_artifact_roots_with_domains(
+            std::slice::from_ref(&self.project_root),
+            &self.artifact_root,
+        )?;
         let mut domains = roots
             .into_iter()
             .map(|root| Ok((lean_toolchain::shared_writer::project_lock_path(&root)?, root)))

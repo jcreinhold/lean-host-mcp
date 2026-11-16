@@ -401,3 +401,28 @@ fn guardian_self_exit_with_live_controller_reaps_group_and_recovers_capacity() {
     assert_eq!(next.state, "completed", "{next:?}");
     assert_eq!(next.exit_code, Some(0));
 }
+
+#[test]
+fn explicit_domain_input_limit_preserves_deduplication_and_complete_union_bound() {
+    let fixture = Fixture::new();
+    let mut args = NativeReaderArgs {
+        project_root: fixture.project.clone(),
+        artifact_root: vec![fixture.project.clone(); lean_toolchain::native_guardian::MAX_READ_DOMAINS],
+        timeout_millis: 1_000,
+        capacity_limit: 1,
+        stdin: false,
+        cancel_fd: None,
+        max_output_bytes: OUTPUT_LIMIT,
+        command: vec![fixture.script.into_os_string()],
+    };
+    args.validate().expect("32 canonical explicit inputs are allowed");
+    assert_eq!(
+        args.roots().expect("deduplicate physical domains"),
+        vec![fixture.project.clone()]
+    );
+    args.artifact_root.push(fixture.project);
+    assert!(
+        args.validate().is_err(),
+        "33 explicit inputs exceed the bounded input list"
+    );
+}
