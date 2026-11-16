@@ -9,22 +9,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Bind native workers, build helpers and external readers to one supervised process scope and canonical artifact-lock
+  union. Preserve confirmed stop evidence through timeout and replacement failures; recover capacity after actual
+  cleanup without replaying Lean commands.
+- Replace rotating retained-request admission epochs with durable prepared tickets and bounded backpressure. Unresolved
+  request identities remain protected across restart and lost replies.
+- Enforce compiled host ABI expectations before every first or replacement session. Add runtime-free
+  `lean_compatibility` discovery with explicit `pure_v1` mode.
+- Reevaluate Lake options under shared custody with generation-owned private caches, preserving warm workers and saved
+  root options. Require matched SDK 0.9.10 and worker protocol 13.
+
+
 ## [0.16.7] - 2026-11-14
 
 ### Fixed
 
 - Separate HTTP drain tests from cold worker startup; test real-worker resumption after warm-up.
 - Resolve private declarations without duplicate verification targets, including UTF-16 source positions.
-- Use lean-rs 0.9.9 to report private theorem axioms correctly and reuse source headers without repeated imports.
-  Retire workers cleanly when import accounting is unavailable instead of treating planned retirement as a crash.
+- Use lean-rs 0.9.9 to report private theorem axioms correctly and reuse source headers without repeated imports. Retire
+  workers cleanly when import accounting is unavailable instead of treating planned retirement as a crash.
 - Report successful worker retries as completed checks while retaining the warning about the earlier interruption.
 - Bound project queue waits, reject expired dispatches, and let queued builds drain admitted requests fairly.
-- Keep completed results for a bounded period, recover journal writes after storage failures, and isolate damaged records.
+- Keep completed results for a bounded period, recover journal writes after storage failures, and isolate damaged
+  records.
 
 ### Changed
 
-- Worker protocol 12 requires a matching parent and worker. Update both together, then restart the server.
-  Lean's supported toolchain range is unchanged.
+- Worker protocol 12 requires a matching parent and worker. Update both together, then restart the server. Lean's
+  supported toolchain range is unchanged.
 
 ## [0.16.5] - 2026-11-14
 
@@ -41,23 +55,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Source requests resolve Lake configuration before checking the result cache. This currently adds about 0.6 seconds
-  per root-project request; direct dependency checks cost more. Lookups of built declarations are unchanged.
+- Source requests resolve Lake configuration before checking the result cache. This currently adds about 0.6 seconds per
+  root-project request; direct dependency checks cost more. Lookups of built declarations are unchanged.
 
 ## [0.16.4] - 2026-11-14
 
 ### Fixed
 
 - Update lean-rs to 0.9.7, which reuses unchanged module headers after source edits instead of repeatedly importing
-  them. Header, session, options and file-context changes invalidate reuse; failed header imports retry normally.
-  Worker resource limits and crash handling remain unchanged.
+  them. Header, session, options and file-context changes invalidate reuse; failed header imports retry normally. Worker
+  resource limits and crash handling remain unchanged.
 
 ## [0.16.3] - 2026-11-13
 
 ### Fixed
 
-- Interrupted worker calls no longer enter the module query cache. Retrying after a crash, timeout, or cancellation
-  runs the check again instead of returning a cached empty result without the original warning.
+- Interrupted worker calls no longer enter the module query cache. Retrying after a crash, timeout, or cancellation runs
+  the check again instead of returning a cached empty result without the original warning.
 - File diagnostics now report `runtime_unavailable` with no result when the worker fails to finish the call reliably,
   rather than presenting an empty diagnostic list as a successful check. Completed checks still cache normally after
   planned worker recycling.

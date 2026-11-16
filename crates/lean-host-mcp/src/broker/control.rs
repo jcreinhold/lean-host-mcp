@@ -2,8 +2,9 @@
 //!
 //! The registry lock is the admission boundary: a caller holds a project Arc
 //! before using a resident worker, or an opening-lock Arc before starting one.
-//! A lease can therefore be granted only before admission or after all such
-//! callers and actor-owned messages have finished. Network connections are not
+//! Preparation joins the same activity counter under that registry lock before
+//! reading options or launching native work. A lease can therefore be granted
+//! only before admission or after all callers and owned cleanup have finished. Network connections are not
 //! activity or ownership; disconnecting cannot release somebody else's lease.
 
 use std::path::Path;
@@ -116,9 +117,9 @@ pub struct WorkerPoolStatus {
     pub max_workers_per_project: usize,
     /// Slots still owned, including shutdowns whose exit is not confirmed.
     pub occupied_slots: usize,
-    /// Actor work across all controllers, including those removed from the registry.
+    /// Admitted actor and preparation work, including cleanup after caller loss.
     pub outstanding_jobs: usize,
-    /// True only when this server has confirmed release of every worker slot.
+    /// True only after every worker slot and admitted preparation cleanup is released.
     pub workers_stopped: bool,
     /// Whether an unexpired lease currently prevents new worker admission.
     pub admission_paused: bool,
@@ -189,6 +190,19 @@ impl ControlState {
     }
 }
 
+/// One admitted preparation, retained by its actual native cleanup owner.
+/// It participates in the existing pool activity count without taking a worker slot.
+#[derive(Debug)]
+pub(crate) struct PreparationActivityGuard {
+    active_jobs: Arc<AtomicUsize>,
+}
+
+impl Drop for PreparationActivityGuard {
+    fn drop(&mut self) {
+        self.active_jobs.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Actor access to the same admission boundary used by clients.
 #[derive(Clone, Default)]
 pub(crate) struct MaintenanceAccess {
@@ -203,6 +217,31 @@ impl MaintenanceAccess {
             inner: Arc::downgrade(inner),
             active_jobs,
         }
+    }
+
+    /// The expected ABI exists before any worker and is never learned from one.
+    pub(crate) fn native_contract(
+        toolchain: &str,
+    ) -> Result<Option<crate::runtime_compatibility::ExpectedContract>, String> {
+        let expected = crate::runtime_compatibility::session_expectation(toolchain, None)?;
+        crate::runtime_compatibility::ExpectedContract::new(expected.checked_host_bindings).map(Some)
+    }
+
+    pub(crate) fn bind_native_contract(
+        &self,
+        toolchain: &str,
+        actual: &crate::runtime_compatibility::ExpectedContract,
+    ) -> Result<(String, crate::runtime_compatibility::ExpectedContract), String> {
+        let compiled = Self::native_contract(toolchain)?.ok_or("compiled host contract missing")?;
+        if actual != &compiled {
+            return Err("loaded host ABI differs from compiled requirements".into());
+        }
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or("broker lifetime ended before compatibility binding")?;
+        let state = inner.lock();
+        Ok((state.control.instance_id.clone(), compiled))
     }
 
     pub(crate) fn activity_counter(&self) -> Arc<AtomicUsize> {
@@ -227,6 +266,55 @@ impl MaintenanceAccess {
 }
 
 impl ProjectBroker {
+    fn try_begin_preparation_activity(&self, root: &Path) -> crate::error::Result<PreparationActivityGuard> {
+        let mut inner = self.inner.lock();
+        Self::check_runtime_admission(&mut inner, root)?;
+        // The lease check and count change are one registry critical section.
+        // Acquire cannot observe idle and win between admission and child spawn.
+        let active_jobs = Arc::clone(&inner.control.active_jobs);
+        active_jobs.fetch_add(1, Ordering::AcqRel);
+        drop(inner); // Publish activity before another caller can acquire the lease.
+        Ok(PreparationActivityGuard { active_jobs })
+    }
+
+    pub(crate) async fn preparation_activity(&self, root: &Path) -> crate::error::Result<PreparationActivityGuard> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(self.request_timeout_millis()))
+            .ok_or_else(|| {
+                crate::error::ServerError::Internal("preparation admission deadline is out of range".into())
+            })?;
+        self.preparation_activity_until(root, deadline).await
+    }
+
+    async fn preparation_activity_until(
+        &self,
+        root: &Path,
+        deadline: tokio::time::Instant,
+    ) -> crate::error::Result<PreparationActivityGuard> {
+        let cancellation = crate::cancellation::CallCancellation::current();
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(Self::pool_unavailable(root, "request_cancelled", false));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Self::pool_unavailable(root, "project_admission_timeout", true));
+            }
+            let result = self.try_begin_preparation_activity(root);
+            if !matches!(&result, Err(crate::error::ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining")
+            {
+                return result;
+            }
+            // Drain waiters own no activity guard and cannot delay that drain.
+            // An ordinary lease remains an immediate, explicitly retryable refusal.
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(Self::pool_unavailable(root, "request_cancelled", false)),
+                () = tokio::time::sleep_until(deadline) => return Err(Self::pool_unavailable(root, "project_admission_timeout", true)),
+                () = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    }
+
     /// Identity shared by status and immutable retained-request bindings.
     #[must_use]
     pub fn instance_id(&self) -> String {
@@ -474,6 +562,36 @@ mod tests {
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         })
+    }
+
+    #[test]
+    fn compatibility_contract_is_compiled_before_any_worker_and_cannot_rebind() -> TestResult {
+        let broker = broker();
+        let access = MaintenanceAccess::new(&broker.inner);
+        let original = crate::runtime_compatibility::ExpectedContract::compiled()?;
+        assert_eq!(
+            MaintenanceAccess::native_contract("leanprover/lean4:v4.35.0")?,
+            Some(original.clone())
+        );
+        let (instance, saved) = access.bind_native_contract("leanprover/lean4:v4.35.0", &original)?;
+        assert_eq!(instance, broker.instance_id());
+        assert_eq!(saved, original);
+        let mut changed = original.clone();
+        changed
+            .required_host_bindings
+            .insert("verify_declaration_batch".into(), "b".repeat(64));
+        assert!(access.bind_native_contract("v4.35.0", &changed).is_err());
+        assert_eq!(MaintenanceAccess::native_contract("v4.35.0")?, Some(original));
+        let status = broker.runtime_control(&RuntimeControlRequest::default());
+        assert_eq!(status.pool.occupied_slots, 0);
+        assert_eq!(status.pool.outstanding_jobs, 0);
+        assert!(status.pool.projects.is_empty());
+        drop(broker);
+        // Static requirements authorize no dispatch and remain available during
+        // startup/retirement without retaining an otherwise finished broker.
+        assert_eq!(MaintenanceAccess::native_contract("v4.35.0")?, Some(saved.clone()));
+        assert!(access.bind_native_contract("v4.35.0", &saved).is_err());
+        Ok(())
     }
 
     fn acquire() -> RuntimeControlRequest {
@@ -863,6 +981,122 @@ mod tests {
         assert!(state.pool.admission_paused);
         assert!(state.pool.acquiring_projects.is_empty());
         assert_eq!(state.pool.outstanding_jobs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_activity_blocks_idle_acquire_without_a_worker_slot() -> TestResult {
+        let broker = broker();
+        let activity = broker.try_begin_preparation_activity(Path::new("/preparation"))?;
+        let busy = broker.runtime_control(&acquire());
+        assert_eq!(busy.status, RuntimeControlStatus::Busy);
+        assert_eq!(busy.pool.occupied_slots, 0);
+        assert_eq!(busy.pool.outstanding_jobs, 1);
+        assert!(!busy.pool.workers_stopped);
+        drop(activity);
+        let acquired = broker.runtime_control(&acquire());
+        assert_eq!(acquired.status, RuntimeControlStatus::Acquired);
+        assert_eq!(acquired.pool.outstanding_jobs, 0);
+        assert!(acquired.pool.workers_stopped);
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_and_idle_lease_share_the_atomic_admission_boundary() -> TestResult {
+        let broker = broker();
+        let barrier = Arc::new(Barrier::new(2));
+        let activity_broker = Arc::clone(&broker);
+        let activity_barrier = Arc::clone(&barrier);
+        let activity = std::thread::spawn(move || {
+            activity_barrier.wait();
+            activity_broker.try_begin_preparation_activity(Path::new("/racing-preparation"))
+        });
+        barrier.wait();
+        let claimed = broker.runtime_control(&acquire());
+        let activity = activity.join().map_err(|_| "preparation admission panicked")?;
+        match (claimed.status, activity) {
+            (RuntimeControlStatus::Busy, Ok(guard)) => drop(guard),
+            (RuntimeControlStatus::Acquired, Err(crate::error::ServerError::WorkerUnavailable(info)))
+                if info.reason == "worker_pool_leased" => {}
+            (status, result) => return Err(format!("non-atomic preparation admission: {status:?} {result:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preparation_drain_waits_for_owned_activity_then_resumes_on_release() -> TestResult {
+        let broker = broker();
+        let activity = broker.try_begin_preparation_activity(Path::new("/admitted-preparation"))?;
+        let draining = broker.runtime_control(&drain());
+        let token = draining.lease_id.ok_or("missing drain token")?;
+        assert_eq!(draining.status, RuntimeControlStatus::Draining);
+        let waiter = broker.preparation_activity(Path::new("/waiting-preparation"));
+        tokio::pin!(waiter);
+        tokio::select! {
+            result = &mut waiter => return Err(format!("preparation overtook drain: {result:?}").into()),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(
+            broker
+                .runtime_control(&RuntimeControlRequest::default())
+                .pool
+                .outstanding_jobs,
+            1
+        );
+        drop(activity);
+        let renewed = broker.runtime_control(&token_request(RuntimeAction::Renew, &token));
+        assert_eq!(renewed.status, RuntimeControlStatus::Ok);
+        assert!(renewed.pool.workers_stopped);
+        let released = broker.runtime_control(&token_request(RuntimeAction::Release, &token));
+        assert_eq!(released.status, RuntimeControlStatus::Ok);
+        let activity = tokio::time::timeout(Duration::from_secs(1), waiter).await??;
+        assert_eq!(
+            broker
+                .runtime_control(&RuntimeControlRequest::default())
+                .pool
+                .outstanding_jobs,
+            1
+        );
+        drop(activity);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preparation_drain_waiter_keeps_its_original_deadline_without_activity() -> TestResult {
+        let broker = broker();
+        let draining = broker.runtime_control(&drain());
+        let token = draining.lease_id.ok_or("missing drain token")?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(30))
+            .ok_or("deadline overflow")?;
+        let result = broker
+            .preparation_activity_until(Path::new("/waiting-preparation"), deadline)
+            .await;
+        assert!(
+            matches!(result, Err(crate::error::ServerError::WorkerUnavailable(info)) if info.reason == "project_admission_timeout")
+        );
+        let renewed = broker.runtime_control(&token_request(RuntimeAction::Renew, &token));
+        assert_eq!(renewed.status, RuntimeControlStatus::Ok);
+        assert_eq!(renewed.pool.outstanding_jobs, 0);
+        assert!(renewed.pool.workers_stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_preparation_deadline_never_admits_even_when_unleased() -> TestResult {
+        let broker = broker();
+        let expired = tokio::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .ok_or("deadline underflow")?;
+        let result = broker
+            .preparation_activity_until(Path::new("/expired-preparation"), expired)
+            .await;
+        assert!(
+            matches!(result, Err(crate::error::ServerError::WorkerUnavailable(info)) if info.reason == "project_admission_timeout")
+        );
+        let status = broker.runtime_control(&RuntimeControlRequest::default());
+        assert_eq!(status.pool.outstanding_jobs, 0);
+        assert!(status.pool.workers_stopped);
         Ok(())
     }
 }

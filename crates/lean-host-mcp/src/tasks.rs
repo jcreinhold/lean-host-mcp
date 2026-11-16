@@ -34,6 +34,7 @@ struct Registry {
     next_ticket: u64,
     journal: Option<RequestJournal>,
     journal_error: bool,
+    lifecycle_watch_running: bool,
 }
 
 impl Default for Registry {
@@ -44,6 +45,7 @@ impl Default for Registry {
             next_ticket: 0,
             journal: None,
             journal_error: false,
+            lifecycle_watch_running: false,
         }
     }
 }
@@ -54,6 +56,7 @@ struct Entry {
     cancellation: CancellationToken,
     created: Instant,
     expires: Option<Instant>,
+    pending_lifecycle: Option<CallExecutionEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +69,10 @@ pub(crate) struct StoredRequest {
     result_available: bool,
     #[serde(default)]
     finished_at: Option<u64>,
+    /// Durable evidence that broker-local observers were unresolved. This is
+    /// metadata only after restart, never proof of OS process ownership.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_lifecycle_operations: Vec<String>,
 }
 
 impl StoredRequest {
@@ -181,6 +188,7 @@ impl RequestTasks {
                 id,
                 Entry {
                     stored: record,
+                    pending_lifecycle: None,
                     cancellation: CancellationToken::new(),
                     created: Instant::now(),
                     expires: remaining.and_then(|duration| Instant::now().checked_add(duration)),
@@ -349,6 +357,7 @@ impl RequestTasks {
                 acknowledged: false,
                 result_available: false,
                 finished_at: None,
+                pending_lifecycle_operations: Vec::new(),
             };
             if registry.persist(&stored).is_err() {
                 // Rename may have succeeded before directory sync failed. Keep
@@ -360,6 +369,7 @@ impl RequestTasks {
                     task.task_id,
                     Entry {
                         stored,
+                        pending_lifecycle: None,
                         cancellation,
                         created: Instant::now(),
                         expires: Instant::now().checked_add(RETENTION),
@@ -374,6 +384,7 @@ impl RequestTasks {
                 task.task_id.clone(),
                 Entry {
                     stored,
+                    pending_lifecycle: None,
                     cancellation: cancellation.clone(),
                     created: Instant::now(),
                     expires: None,
@@ -559,7 +570,7 @@ impl RequestTasks {
         id: &str,
         result: Result<CallToolResult, McpError>,
         panicked: bool,
-        evidence: CallExecutionEvidence,
+        mut evidence: CallExecutionEvidence,
     ) {
         let mut registry = self.0.lock();
         let Some(entry) = registry.entries.get_mut(id) else {
@@ -567,6 +578,13 @@ impl RequestTasks {
         };
         // A cancellation signal is not a result. In particular it must never
         // overwrite a real proof result returned while cancellation raced it.
+        evidence.refresh_deferred();
+        entry.stored.pending_lifecycle_operations = evidence
+            .deferred
+            .iter()
+            .map(|observer| observer.operation_id.clone())
+            .collect();
+        entry.pending_lifecycle = (!evidence.deferred.is_empty()).then(|| evidence.clone());
         entry.stored.execution = execution_with_evidence(&result, panicked, evidence);
         let payload = match result {
             Ok(result) => match serde_json::to_value(result) {
@@ -611,10 +629,69 @@ impl RequestTasks {
         if let Err(error) = registry.persist(&record) {
             tracing::error!(%error, "could not journal terminal request; new admission disabled");
         }
+        drop(registry);
+        self.watch_lifecycle();
+    }
+
+    fn watch_lifecycle(&self) {
+        let mut registry = self.0.lock();
+        if registry.lifecycle_watch_running || !registry.entries.values().any(|entry| entry.pending_lifecycle.is_some())
+        {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        registry.lifecycle_watch_running = true;
+        let weak = Arc::downgrade(&self.0);
+        drop(registry);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let Some(shared) = weak.upgrade() else { return };
+                let mut registry = shared.lock();
+                registry.refresh_lifecycle();
+                let pending = registry.entries.values().any(|entry| entry.pending_lifecycle.is_some());
+                if !pending {
+                    registry.lifecycle_watch_running = false;
+                }
+                drop(registry);
+                if !pending {
+                    return;
+                }
+            }
+        });
     }
 }
 
 impl Registry {
+    fn refresh_lifecycle(&mut self) {
+        let mut changed = Vec::new();
+        for entry in self.entries.values_mut() {
+            let Some(evidence) = &mut entry.pending_lifecycle else {
+                continue;
+            };
+            evidence.refresh_deferred();
+            if !evidence.deferred.is_empty() {
+                continue;
+            }
+            if !evidence.uncertain && evidence.pending == 0 && evidence.stopped > 0 {
+                entry.stored.execution =
+                    Execution::new(Disposition::Stopped, "worker_operation_stopped_after_retirement");
+                entry.stored.execution.worker_stop_receipt = evidence.worker_stop_receipt.clone();
+                entry.stored.execution.target_check = evidence.target_check.clone();
+                entry.stored.task.task.last_updated_at = current_timestamp();
+            }
+            entry.pending_lifecycle = None;
+            entry.stored.pending_lifecycle_operations.clear();
+            changed.push(entry.stored.clone());
+        }
+        for record in changed {
+            if let Err(error) = self.persist(&record) {
+                tracing::error!(%error, "could not journal late worker exit; new admission disabled");
+            }
+        }
+    }
     fn persist(&mut self, record: &StoredRequest) -> std::io::Result<()> {
         // Negotiated MCP tasks and legacy submissions retain their original
         // process-local contract. Only epoch-bound v2 records are journalled.
@@ -667,6 +744,7 @@ impl Registry {
     }
 
     fn prune(&mut self, now: Instant) {
+        self.refresh_lifecycle();
         let expired_prepared = self
             .entries
             .iter()
@@ -699,7 +777,9 @@ impl Registry {
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.stored.task.status().is_terminal() && entry.expires.is_some_and(|expiry| expiry <= now)
+                entry.pending_lifecycle.is_none()
+                    && entry.stored.task.status().is_terminal()
+                    && entry.expires.is_some_and(|expiry| expiry <= now)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -716,7 +796,8 @@ impl Registry {
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.stored.task.status().is_terminal()
+                entry.pending_lifecycle.is_none()
+                    && entry.stored.task.status().is_terminal()
                     && (entry.stored.acknowledged
                         || matches!(
                             entry.stored.execution.reason.as_str(),
@@ -742,6 +823,7 @@ impl Registry {
             acknowledged: false,
             result_available: false,
             finished_at: None,
+            pending_lifecycle_operations: Vec::new(),
         };
         // A failed persist never dispatches. Consume the sequence even on error:
         // atomic rename may already have stored this never-submitted ticket.
@@ -759,6 +841,7 @@ impl Registry {
                 id,
                 Entry {
                     stored,
+                    pending_lifecycle: None,
                     cancellation: CancellationToken::new(),
                     created: Instant::now(),
                     expires: Instant::now().checked_add(RETENTION),
@@ -773,6 +856,7 @@ impl Registry {
             id,
             Entry {
                 stored: stored.clone(),
+                pending_lifecycle: None,
                 cancellation: CancellationToken::new(),
                 created: Instant::now(),
                 expires: Instant::now().checked_add(PREPARED_RETENTION),
@@ -827,7 +911,7 @@ fn execution_with_evidence(
 ) -> Execution {
     let mut execution = if panicked {
         Execution::new(Disposition::Unknown, "task_panicked")
-    } else if evidence.uncertain || evidence.pending > 0 {
+    } else if evidence.uncertain || evidence.pending > 0 || !evidence.deferred.is_empty() {
         Execution::new(Disposition::Unknown, "worker_operation_failed_without_exit_witness")
     } else if evidence.stopped > 0 {
         Execution::new(Disposition::Stopped, "worker_operation_stopped")
@@ -919,6 +1003,153 @@ fn failed_task(task: Task, reason: &str, message: &str) -> DetailedTask {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn late_reap_after_ack_preserves_request_and_refreshes_only_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(directory.path()).unwrap();
+        let prepared = tasks.prepare(binding(1)).unwrap();
+        let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+        let binding = prepared.request.unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let source = Arc::clone(&observed);
+        tasks
+            .submit("test", id.clone(), binding.clone(), move || async move {
+                let cancellation = crate::cancellation::CallCancellation::current();
+                let operation = cancellation.begin_operation_for("late-op".to_owned());
+                cancellation.defer_stop("late-op".to_owned(), Arc::new(move || source.lock().clone()));
+                operation.unknown();
+                Err(McpError::internal_error("proof result unavailable", None))
+            })
+            .unwrap();
+        terminal(&tasks, &id).await;
+        assert_eq!(
+            tasks.get_retained(&id).unwrap().execution.disposition,
+            Disposition::Unknown
+        );
+        tasks
+            .acknowledge(
+                &id,
+                binding.request_epoch.as_deref().unwrap(),
+                &binding.submission_sha256,
+            )
+            .unwrap();
+        for _ in 0..MAX_TASKS - 1 {
+            tasks.prepare(binding.clone()).unwrap();
+        }
+        assert!(tasks.prepare(binding.clone()).is_err());
+        assert!(tasks.get_retained(&id).unwrap().acknowledged);
+        tasks.0.lock().prune(Instant::now() + RETENTION * 2);
+        assert!(
+            tasks.get_retained(&id).is_ok(),
+            "TTL must preserve an unresolved lifecycle"
+        );
+        *observed.lock() = Some(WorkerStopReceipt {
+            operation_id: "late-op".to_owned(),
+            worker_session_id: "session".to_owned(),
+            worker_generation: 7,
+            worker_scope: "main".to_owned(),
+            worker_request_id: Some(1),
+            worker_pid: Some(123),
+            exit_success: Some(false),
+            exit_code: None,
+            exit_status: Some("killed".to_owned()),
+            operation: "check".to_owned(),
+            cause: "timeout".to_owned(),
+        });
+        let retained = tasks.get_retained(&id).unwrap();
+        assert_eq!(retained.execution.disposition, Disposition::Stopped);
+        assert_eq!(retained.execution.worker_stop_receipt.unwrap().operation_id, "late-op");
+        assert!(retained.acknowledged && !retained.result_available);
+        let stored = tasks.0.lock().entries[&id].stored.clone();
+        assert!(stored.task.status().is_terminal());
+        assert!(tasks.0.lock().entries[&id].pending_lifecycle.is_none());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    std::fs::read_to_string(entry.path())
+                        .is_ok_and(|text| text.contains("worker_operation_stopped_after_retirement"))
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_scope_without_wait_status_clears_retention_hold_but_preserves_unknown() {
+        use crate::cancellation::DeferredStopState;
+        let directory = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(directory.path()).unwrap();
+        let prepared = tasks.prepare(binding(1)).unwrap();
+        let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+        let binding = prepared.request.unwrap();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source = Arc::clone(&closed);
+        tasks
+            .submit("test", id.clone(), binding.clone(), move || async move {
+                let cancellation = crate::cancellation::CallCancellation::current();
+                let operation = cancellation.begin_operation_for("lost-wait".to_owned());
+                cancellation.defer_stop_state(
+                    "lost-wait".to_owned(),
+                    Arc::new(move || {
+                        if source.load(std::sync::atomic::Ordering::Acquire) {
+                            DeferredStopState::ScopeClosedWithoutStatus
+                        } else {
+                            DeferredStopState::Pending
+                        }
+                    }),
+                );
+                operation.unknown();
+                Err(McpError::internal_error("proof result unavailable", None))
+            })
+            .unwrap();
+        terminal(&tasks, &id).await;
+        assert!(tasks.0.lock().entries[&id].pending_lifecycle.is_some());
+        tasks
+            .acknowledge(
+                &id,
+                binding.request_epoch.as_deref().unwrap(),
+                &binding.submission_sha256,
+            )
+            .unwrap();
+        closed.store(true, std::sync::atomic::Ordering::Release);
+        let retained = tasks.get_retained(&id).unwrap();
+        assert_eq!(retained.execution.disposition, Disposition::Unknown);
+        assert!(retained.execution.worker_stop_receipt.is_none());
+        assert!(retained.acknowledged && !retained.result_available);
+        let mut registry = tasks.0.lock();
+        assert!(registry.entries[&id].pending_lifecycle.is_none());
+        assert!(registry.entries[&id].stored.pending_lifecycle_operations.is_empty());
+        registry.prune(Instant::now() + RETENTION * 2);
+        assert!(!registry.entries.contains_key(&id));
+        drop(registry);
+    }
+
+    #[test]
+    fn pending_journal_metadata_does_not_fabricate_post_restart_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(directory.path()).unwrap();
+        let prepared = tasks.prepare(binding(1)).unwrap();
+        let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+        {
+            let mut registry = tasks.0.lock();
+            let entry = registry.entries.get_mut(&id).unwrap();
+            entry.stored.execution = Execution::new(Disposition::Unknown, "cleanup_unconfirmed");
+            entry.stored.pending_lifecycle_operations = vec!["operation-with-lost-owner".to_owned()];
+            entry.stored.task = failed_task(entry.stored.task.task.clone(), "cleanup_unconfirmed", "no proof result");
+            entry.stored.finished_at = Some(unix_seconds());
+            let record = entry.stored.clone();
+            registry.persist(&record).unwrap();
+        }
+        drop(tasks);
+        let recovered = RequestTasks::open(directory.path()).unwrap();
+        let registry = recovered.0.lock();
+        let entry = &registry.entries[&id];
+        assert_eq!(entry.stored.pending_lifecycle_operations, ["operation-with-lost-owner"]);
+        assert_eq!(entry.stored.execution.disposition, Disposition::Unknown);
+        assert!(entry.pending_lifecycle.is_none());
+        drop(registry);
+    }
 
     // Named prepared fixtures keep legacy journal/binding assertions readable.
     // Replay and v3 identity invariants use the real prepare/submit API in
@@ -1409,6 +1640,7 @@ mod tests {
                 acknowledged: false,
                 result_available: false,
                 finished_at: None,
+                pending_lifecycle_operations: Vec::new(),
             };
             tasks.0.lock().persist(&record).unwrap();
         }
@@ -1643,7 +1875,8 @@ mod tests {
                         if earlier_check_returned {
                             cancellation.begin_operation().returned();
                         }
-                        cancellation.preparation_failed(TargetCheckNotStarted {
+                        cancellation.begin_operation().unknown();
+                        cancellation.target_check_not_started(TargetCheckNotStarted {
                             disposition: "not_started".to_owned(),
                             file_label: "UnitIndexed.lean".to_owned(),
                             stage: "lake_option_discovery".to_owned(),
@@ -1664,6 +1897,41 @@ mod tests {
             assert_eq!(value["execution"]["target_check"]["file_label"], "UnitIndexed.lean");
             assert_eq!(value["execution"]["target_check"]["stage"], "lake_option_discovery");
         }
+    }
+
+    #[tokio::test]
+    async fn missing_import_after_replacement_is_stopped_without_a_target_proof_or_replay() {
+        let tasks = RequestTasks::default();
+        let prepared = tasks.prepare(binding(1)).unwrap();
+        let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+        let original = prepared.request.unwrap();
+        tasks
+            .submit("test", id.clone(), original.clone(), || async {
+                crate::project::receipt_tests::retained_missing_import_after_replacement_call()
+                    .await
+                    .map(|_| CallToolResult::success(vec![]))
+                    .map_err(McpError::from)
+            })
+            .unwrap();
+        terminal(&tasks, &id).await;
+        let retained = tasks.get_retained(&id).unwrap();
+        assert_eq!(retained.execution.disposition, Disposition::Stopped);
+        assert!(
+            retained.execution.worker_stop_receipt.is_none(),
+            "no old receipt reused"
+        );
+        let target = retained.execution.target_check.as_ref().unwrap();
+        assert_eq!(target.disposition, "not_started");
+        assert_eq!(target.file_label, "UnitIndexed.lean");
+        assert_eq!(target.stage, "host_session_import");
+        assert!(retained.fields.get("result").is_none(), "no proof result invented");
+        let saved = serde_json::to_value(&retained).unwrap();
+        tasks
+            .submit("test", id.clone(), original, || async {
+                panic!("never replay missing-build target")
+            })
+            .unwrap();
+        assert_eq!(serde_json::to_value(tasks.get_retained(&id).unwrap()).unwrap(), saved);
     }
 
     #[tokio::test]

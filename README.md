@@ -26,11 +26,14 @@ Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups d
 - **`lean_status`** — project/toolchain/config status and current-source file diagnostics. Modes: `project` and
   `file_diagnostics`.
 
-The semantic calls read source and elaborate in memory. The separate `lean_runtime` tool observes worker activity or
-obtains an expiring lease on an idle worker pool, keeping warm caches unless retirement is explicitly requested. No tool
-applies source edits automatically; executed Lean code can still perform IO. `lean_request` offers retrievable request
-IDs, retained final results and cancellation to clients without MCP Tasks negotiation. Busy projects wait for admission
-in FIFO order. The workflow and request/result schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
+`lean_compatibility` with `mode: "pure_v1"` describes compiled expectations without starting Lean. Its default loaded
+mode establishes a project-bound native contract through normal broker admission and an actual host session. It returns
+loaded worker/toolchain/shim facts without executing a target proof. The semantic calls read source and elaborate in
+memory. The separate `lean_runtime` tool observes worker activity or obtains an expiring lease on an idle worker pool,
+keeping warm caches unless retirement is explicitly requested. No tool applies source edits automatically; executed Lean
+code can still perform IO. `lean_request` offers retrievable request IDs, retained final results and cancellation to
+clients without MCP Tasks negotiation. Busy projects wait for admission in FIFO order. The workflow and request/result
+schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
 
 ## Quick start
 
@@ -202,10 +205,13 @@ Two proof-agent details are worth calling out:
 
 ## Versions
 
-`lean-host-mcp` 0.16.7 requires `lean-rs-worker-parent` **0.9.10** for operation-bound stop receipts. The worker child,
-protocol, `lean-rs` and `lean-rs-host` remain at 0.9.9. It supports the Lean window `4.30.0 ..= 4.35.0` and is built and
-tested against the head of that window, Lean **4.35.0**. The parent 0.9.10 dependency must be published before this
-server can be released; development uses the local upstream checkout while that release is pending.
+`lean-host-mcp` 0.16.8 requires the matching **lean-rs 0.9.10** stack: parent, child, protocol, host runtime and
+`lean-toolchain`, plus **lean-semantic-search 0.7.8**. Worker protocol **13** rejects older workers before requests.
+Install the parent and per-toolchain workers together. Local development uses the complete upstream source graph; these
+versions have not been publicly released as part of this change.
+
+The supported Lean window remains `4.30.0 ..= 4.35.0`; the current development validation uses Lean **4.35.0**. A local
+install is not qualification of the full toolchain/platform release matrix.
 
 A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long
 as it falls inside the supported window. The window is read directly from `lean-toolchain::SUPPORTED_TOOLCHAINS` (itself

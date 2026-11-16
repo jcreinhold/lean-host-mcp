@@ -294,6 +294,34 @@ impl LeanHostService {
     }
 
     #[tool(
+        description = "Describe compiled native requirements without work using mode=\"pure_v1\", or verify an actual loaded worker using the default mode=\"loaded\". Pure discovery never starts a worker or preparer."
+    )]
+    async fn lean_compatibility(
+        &self,
+        Parameters(request): Parameters<crate::runtime_compatibility::CompatibilityRequest>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        if request.project.trim().is_empty() {
+            return Err(McpError::invalid_params("explicit project required", None));
+        }
+        let hint = crate::broker::ProjectHint::Explicit(std::path::PathBuf::from(request.project));
+        if matches!(request.mode, crate::runtime_compatibility::CompatibilityMode::PureV1) {
+            let result = self
+                .ctx
+                .broker
+                .describe_native_compatibility(&hint)
+                .map_err(McpError::from)?;
+            return Ok(carry(&result, self.ctx.config.carrier));
+        }
+        let result = self
+            .ctx
+            .broker
+            .native_compatibility(hint)
+            .await
+            .map_err(McpError::from)?;
+        Ok(carry(&result, self.ctx.config.carrier))
+    }
+
+    #[tool(
         description = "Observe worker activity or atomically lease the idle worker pool. Actions: status, acquire, renew, release. Leases keep warm caches unless retire_idle is explicitly true; renew before expiry while relying on the pause."
     )]
     async fn lean_runtime(
@@ -390,8 +418,10 @@ impl ServerHandler for LeanHostService {
     ) -> Result<CallToolResponse, McpError> {
         // Coordination is immediate and must return its lease token directly,
         // even for clients that negotiate asynchronous Lean job handles.
-        if !matches!(request.name.as_ref(), "lean_runtime" | "lean_request")
-            && context.client_capabilities().is_some_and(|caps| caps.supports_tasks())
+        if !matches!(
+            request.name.as_ref(),
+            "lean_runtime" | "lean_request" | "lean_compatibility"
+        ) && context.client_capabilities().is_some_and(|caps| caps.supports_tasks())
         {
             // Parse before acceptance. Task calls use no request-scoped peer or
             // cancellation token, so disconnecting cannot abandon their result.
@@ -461,7 +491,7 @@ impl ServerHandler for LeanHostService {
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
         info.instructions = Some(
-            "MCP server hosting Lean 4 in-process via lean-rs. \
+            "MCP server hosting Lean 4 in supervised worker children via lean-rs. \
              Tools expose five semantic Lean job families: context, trial, \
              verification, lookup, and status. Context, trial, lookup, and \
              status select a mode with `kind`; verification takes explicit \
@@ -817,6 +847,7 @@ mod tests {
             retryable: true,
             worker_restarted: true,
             worker_stop_receipt: None,
+            preparation_closed: false,
             project_root: "/tmp/project".to_owned(),
             project_hash: "hash".to_owned(),
             imports: vec!["Init".to_owned()],

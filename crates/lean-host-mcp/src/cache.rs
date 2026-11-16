@@ -8,7 +8,9 @@
 //! There is no TTL: source bytes, elaboration options, import artifacts and
 //! worker generation must match instead. Import metadata is checked before a
 //! lookup and again before insertion, so a rebuild during processing cannot
-//! poison subsequent hits. As with the worker's session invalidation, this
+//! poison subsequent hits. Each sampling pass holds the complete cooperating
+//! workspace read union; no partial lock set is retained across worker dispatch.
+//! As with the worker's session invalidation, this
 //! relies on Lake propagating dependency changes to the named imports; it does
 //! not scan their entire transitive closure on each query.
 //!
@@ -52,13 +54,34 @@ impl ImportArtifactStamp {
     /// An unreadable artifact is uncacheable; a missing artifact is recorded
     /// explicitly so creating it changes the stamp. Roots are searched in the
     /// same order as the actor's artifact freshness check.
+    pub(crate) fn capture_for_project(root: &Path, imports: &[String]) -> Option<Self> {
+        let guard = crate::artifact_reads::ArtifactReadGuard::for_project(root).ok()?;
+        let roots = crate::lake_meta::artifact_roots(root);
+        if roots.iter().any(|root| !guard.covers_artifact_root(root)) {
+            return None;
+        }
+        Self::capture_checked(&roots, imports, Some(&guard))
+    }
+
+    #[cfg(test)]
     pub(crate) fn capture(roots: &[PathBuf], imports: &[String]) -> Option<Self> {
+        Self::capture_checked(roots, imports, None)
+    }
+
+    fn capture_checked(
+        roots: &[PathBuf],
+        imports: &[String],
+        guard: Option<&crate::artifact_reads::ArtifactReadGuard>,
+    ) -> Option<Self> {
         let mut stamps = Vec::with_capacity(imports.len());
         for import in imports {
             let relative = import.split('.').collect::<PathBuf>().with_extension("olean");
             let mut resolved = None;
             for root in roots {
                 let path = root.join(&relative);
+                if guard.is_some_and(|guard| !guard.covers_artifact_root(&path)) {
+                    return None;
+                }
                 let metadata = match std::fs::metadata(&path) {
                     Ok(metadata) => metadata,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -110,7 +133,7 @@ impl ModuleQueryContext {
         imports.extend_from_slice(freshness_imports);
         imports.sort();
         imports.dedup();
-        let artifacts = ImportArtifactStamp::capture(&crate::lake_meta::artifact_roots(root), &imports)?;
+        let artifacts = ImportArtifactStamp::capture_for_project(root, &imports)?;
         Some(Self {
             request_hash,
             imports,
@@ -132,7 +155,7 @@ impl ModuleQueryContext {
     /// Resample only mutable inputs after processing. A changed generation is
     /// safe to store under the resulting generation if artifacts stayed equal.
     pub(crate) fn after_processing(&self, root: &Path, worker_generation: u64) -> Option<Self> {
-        let artifacts = ImportArtifactStamp::capture(&crate::lake_meta::artifact_roots(root), &self.imports)?;
+        let artifacts = ImportArtifactStamp::capture_for_project(root, &self.imports)?;
         if artifacts != self.artifacts {
             return None;
         }

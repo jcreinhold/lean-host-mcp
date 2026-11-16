@@ -314,6 +314,7 @@ pub(crate) mod tests {
                 details: None,
             }],
             trust: SemanticTrust {
+                    native_compatibility: None,
                 project_root: "/private/proofs".to_owned(),
                 session_id: "SECRET_SESSION".to_owned(),
                 lean_toolchain: String::new(),
@@ -397,6 +398,7 @@ pub(crate) mod tests {
                 errors: Vec::new(),
                 telemetry: None,
                 trust: SemanticTrust {
+                    native_compatibility: None,
                     project_root: String::new(),
                     session_id: String::new(),
                     lean_toolchain: String::new(),
@@ -441,6 +443,7 @@ pub(crate) mod tests {
                 errors: Vec::new(),
                 telemetry: None,
                 trust: SemanticTrust {
+                    native_compatibility: None,
                     project_root: String::new(),
                     session_id: String::new(),
                     lean_toolchain: String::new(),

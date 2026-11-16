@@ -67,6 +67,7 @@ use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
 mod control;
+mod preparation;
 pub(crate) use control::MaintenanceAccess;
 pub use control::{
     RuntimeAction, RuntimeControlRequest, RuntimeControlResult, RuntimeControlStatus, WorkerActivity, WorkerPoolStatus,
@@ -347,6 +348,17 @@ impl ProjectBroker {
         broker
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_register_actor(&self, project: Arc<LeanProject>) {
+        let root = project.canonical_root().to_path_buf();
+        self.inner.lock().registry.put(WorkerKey { root, lane: 0 }, project);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_maintenance_access(&self) -> MaintenanceAccess {
+        MaintenanceAccess::new(&self.inner)
+    }
+
     /// The configured per-request worker deadline, in milliseconds. Tools that
     /// fan a single call out across many worker requests (project-scope
     /// `find_references`) reuse it as an overall wall-clock budget so the whole
@@ -486,7 +498,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryOutcome>> {
         let meta = self.resolve_meta(&hint)?;
-        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let options = self.resolve_options(&meta, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project
@@ -511,7 +523,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryOutcome>> {
         let meta = self.resolve_meta(&hint)?;
-        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let options = self.resolve_options(&meta, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         // A query this build cannot key is run uncached rather than filed under
@@ -588,7 +600,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
         let meta = self.resolve_meta(&hint)?;
-        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let options = self.resolve_options(&meta, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project
@@ -614,7 +626,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
         let meta = self.resolve_meta(&hint)?;
-        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let options = self.resolve_options(&meta, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
@@ -749,7 +761,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerProofAttemptResult>> {
         let meta = self.resolve_meta(&hint)?;
-        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let options = self.resolve_options(&meta, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project.attempt_proof(session_imports, request, options).await?;
@@ -773,7 +785,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationResult>> {
         let meta = self.resolve_meta(&hint)?;
-        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let options = self.resolve_options(&meta, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project.verify_declaration(session_imports, request, options).await?;
@@ -797,7 +809,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
         let meta = self.resolve_meta(&hint)?;
-        let options = crate::lake_options::resolve(&meta.canonical_root, options).await?;
+        let options = self.resolve_options(&meta, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let project = self.project_for(hint).await?;
         let call = project
@@ -827,6 +839,44 @@ impl ProjectBroker {
         })
     }
 
+    /// Describe compiled compatibility without opening, preparing or admitting a worker.
+    ///
+    /// # Errors
+    /// Returns project metadata, unsupported toolchain or helper-identity errors.
+    pub fn describe_native_compatibility(
+        &self,
+        hint: &ProjectHint,
+    ) -> Result<crate::runtime_compatibility::PureCompatibilityResponse> {
+        let meta = self.resolve_meta(hint)?;
+        crate::runtime_compatibility::PureCompatibilityResponse::describe(
+            self.instance_id(),
+            meta.canonical_root,
+            meta.toolchain,
+        )
+        .map_err(ServerError::BadProject)
+    }
+
+    /// Establish compatibility through normal worker admission and an actual
+    /// checked empty-import session, without executing a target proof.
+    ///
+    /// # Errors
+    /// Returns admission, worker startup, or loaded compatibility failures.
+    pub async fn native_compatibility(
+        &self,
+        hint: ProjectHint,
+    ) -> Result<crate::runtime_compatibility::CompatibilityResponse> {
+        let project = self.project_for(hint).await?;
+        let call = project.native_compatibility().await?;
+        let ((), runtime) = call.into_parts();
+        let native_compatibility = runtime
+            .native_compatibility
+            .ok_or_else(|| ServerError::Internal("actual native compatibility receipt is missing".into()))?;
+        Ok(crate::runtime_compatibility::CompatibilityResponse {
+            status: "ok".into(),
+            native_compatibility,
+        })
+    }
+
     /// Return runtime/freshness metadata for a project, opening its worker if
     /// this is the first call.
     ///
@@ -848,6 +898,24 @@ impl ProjectBroker {
         Ok(out)
     }
 
+    async fn resolve_options(
+        &self,
+        meta: &LakeProjectMeta,
+        options: LeanWorkerElabOptions,
+    ) -> Result<LeanWorkerElabOptions> {
+        let activity = self.preparation_activity(&meta.canonical_root).await?;
+        // Resolve availability before evaluating arbitrary project configuration.
+        // This is metadata-only and preserves ordinary missing-worker precedence.
+        let _worker = crate::project::resolve_worker(meta)?;
+        crate::lake_options::resolve(
+            &meta.canonical_root,
+            options,
+            self.config.max_projects.get(),
+            Some(Box::new(activity)),
+        )
+        .await
+    }
+
     async fn project_for(&self, hint: ProjectHint) -> Result<Arc<LeanProject>> {
         let root = self.resolve(&hint)?;
         self.acquire(root).await
@@ -867,11 +935,6 @@ impl ProjectBroker {
         loop {
             let result = self.acquire_attempt(root.clone(), deadline).await;
             if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining") {
-                if result.is_err() {
-                    // Startup may already have spawned a child before failing.
-                    // Earlier completed operations cannot settle this scope.
-                    cancellation.mark_uncertain();
-                }
                 return result;
             }
             // Waiting callers own no project Arc, opening lock, or worker slot.
@@ -894,22 +957,19 @@ impl ProjectBroker {
             return Ok(project);
         }
 
-        let open_lock = self.opening_lock(&root)?;
+        // Preparation can need EX artifact locks. Do it before retaining an
+        // opening Arc or slot: the owned drain must never wait on this caller.
+        let meta_root = root.clone();
+        let meta = tokio::task::spawn_blocking(move || LakeProjectMeta::from_explicit(&meta_root))
+            .await
+            .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
+        let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
+        let writer = crate::shared_writer::contract()?.executable;
         let cancellation = CallCancellation::current();
-        let open_guard = tokio::select! {
-            guard = tokio::time::timeout_at(deadline, Arc::clone(&open_lock).lock_owned()) => {
-                guard.map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
-            },
-            () = cancellation.cancelled() => {
-                return Err(Self::pool_unavailable(&root, "request_cancelled", false));
-            }
-        };
-        if cancellation.is_cancelled() {
-            return Err(Self::pool_unavailable(&root, "request_cancelled", false));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(Self::pool_unavailable(&root, "project_admission_timeout", true));
-        }
+        let prepared = self
+            .prepare_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
+            .await?;
+        let open_guard = self.acquire_opening_guard(&root, deadline, &cancellation).await?;
 
         // Root-local startup serialization closes the race between callers that
         // both saw spare capacity. Selection pins the returned actor with an Arc.
@@ -956,25 +1016,21 @@ impl ProjectBroker {
         if cancellation.is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
-        let meta_root = root.clone();
-        let meta = tokio::task::spawn_blocking(move || LakeProjectMeta::from_explicit(&meta_root))
-            .await
-            .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
-        if cancellation.is_cancelled() {
-            return Err(Self::pool_unavailable(&root, "request_cancelled", false));
-        }
         let runtime_config = self.runtime_config.clone();
         let inner = Arc::clone(&self.inner);
         let maintenance = MaintenanceAccess::new(&self.inner);
+        let native_capacity_limit = self.config.max_projects.get();
         let root = root.clone();
         // The blocking startup keeps running if this async caller disappears.
-        // Its evidence guard must outlive the await and remain unknown on drop.
+        // The actor owns initialization evidence independently of this waiter.
         let initialization = cancellation.begin_operation();
         let opened = tokio::task::spawn_blocking(move || {
             // Hold same-root serialization through registration even when the
             // async caller disappears while blocking startup is still running.
             let _open_guard = open_guard;
-            let opened = LeanProject::open(meta, runtime_config, slot, maintenance)?;
+            let opened = LeanProject::open(
+                meta, runtime_config, slot, maintenance, prepared, native_capacity_limit, initialization,
+            )?;
             let mut registry = inner.lock();
             if registry.shutdown_epoch != epoch {
                 drop(registry);
@@ -995,13 +1051,33 @@ impl ProjectBroker {
         })
         .await
         .map_err(|err| ServerError::Internal(format!("project open task failed: {err}")))?;
-        if opened.is_ok() {
-            initialization.returned();
-        } else {
-            initialization.unknown();
-        }
         on_drop.disarm();
         opened
+    }
+
+    /// Root-local serialization starts only after runtime-free preparation.
+    async fn acquire_opening_guard(
+        &self,
+        root: &Path,
+        deadline: tokio::time::Instant,
+        cancellation: &CallCancellation,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let open_lock = self.opening_lock(root)?;
+        let guard = tokio::select! {
+            guard = tokio::time::timeout_at(deadline, open_lock.lock_owned()) => {
+                guard.map_err(|_| Self::pool_unavailable(root, "project_admission_timeout", true))?
+            },
+            () = cancellation.cancelled() => {
+                return Err(Self::pool_unavailable(root, "request_cancelled", false));
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Err(Self::pool_unavailable(root, "request_cancelled", false));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Self::pool_unavailable(root, "project_admission_timeout", true));
+        }
+        Ok(guard)
     }
 
     /// Prefer a free actor; grow only while the global pool has spare capacity.
@@ -1186,6 +1262,7 @@ impl ProjectBroker {
             retryable,
             worker_restarted: false,
             worker_stop_receipt: None,
+            preparation_closed: false,
             project_root: root.to_string_lossy().into_owned(),
             project_hash: String::new(),
             imports: Vec::new(),
@@ -1737,7 +1814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_root_waiters_share_their_own_end_to_end_admission_budget() {
+    async fn same_root_opening_waiters_preserve_their_original_admission_deadline() {
         let mut config = cfg(PathBuf::from("/unused"), None, None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
@@ -1749,9 +1826,11 @@ mod tests {
             .checked_add(Duration::from_millis(30))
             .unwrap();
         let root = PathBuf::from("/same-cold-project");
-        let first = broker.acquire_until(root.clone(), deadline);
-        let second = broker.acquire_until(root.clone(), deadline);
-        let last = broker.acquire_until(root, deadline);
+        let held = broker.opening_lock(&root).unwrap().lock_owned().await;
+        let cancellation = CallCancellation::default();
+        let first = broker.acquire_opening_guard(&root, deadline, &cancellation);
+        let second = broker.acquire_opening_guard(&root, deadline, &cancellation);
+        let last = broker.acquire_opening_guard(&root, deadline, &cancellation);
         tokio::pin!(first, second, last);
         pending(first.as_mut()).await;
         pending(second.as_mut()).await;
@@ -1767,7 +1846,7 @@ mod tests {
         }
         assert_eq!(broker.worker_slots.available_permits(), 0);
         assert!(broker.resident_paths().is_empty());
-        drop(occupied);
+        drop((occupied, held));
     }
 
     async fn pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
@@ -1915,15 +1994,18 @@ mod tests {
             Duration::from_secs(2),
             crate::cancellation::with_cancellation(&request, async {
                 cancel.cancel();
-                broker.acquire(root).await
+                broker
+                    .acquire_opening_guard(&root, capacity_deadline(), &CallCancellation::current())
+                    .await
             }),
         )
         .await
         .unwrap();
-        let reason = match result {
-            Err(ServerError::WorkerUnavailable(info)) => info.reason,
+        let reason = match &result {
+            Err(ServerError::WorkerUnavailable(info)) => info.reason.clone(),
             _ => panic!("cancelled opening wait must return before startup completes"),
         };
+        drop(result);
         assert_eq!(reason, "request_cancelled");
         assert_eq!(
             broker.worker_slots.available_permits(),

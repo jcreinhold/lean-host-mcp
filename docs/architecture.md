@@ -71,6 +71,13 @@ Cancellation remains bounded by supervisor observation and deadlines, rather tha
 owning operation waits for its terminal cleanup instead of treating a cancellation acknowledgement as termination.
 Dropping a caller's future also signals cancellation without freeing the worker's capacity early.
 
+`lean_compatibility` uses the same broker admission, actor mailbox, startup accounting, and worker-slot lifecycle as
+semantic calls. Its actor job opens a checked host session but submits no target proof. The broker owns one required
+host-binding subset per supported compiled-header ABI; loaded actor/generation receipts remain separate from that
+expected contract. Worker-session configuration enforces the subset after every recycle, and semantic trust preserves
+actual receipts independently of telemetry verbosity. This replaces caller-side binary/shim profiles rather than adding
+a second admission queue.
+
 `lean_runtime` is an additional synchronous operational tool, separate from the five semantic job families. Its
 idle-pool lease shares the broker registry mutex with both resident project borrowing and startup-lock acquisition. A
 claim is refused while any caller holds a project, any startup lock is retained, or any actor-owned message remains
@@ -331,26 +338,32 @@ types, or unbounded source/project scans.
 ## Lake compilation options
 
 Source checks resolve the target file's options through the pinned Lake API before checking or looking up a cached
-result. The helper loads the owning package's configuration only. It does not resolve dependencies, download caches, or
-enter Lake's build graph. Root and dependency files use their own package and library settings, including
-`require ... with` options for direct dependencies. Source checks for transitive dependencies currently fail explicitly
-rather than guess their configuration; lookups of already-built declarations are unaffected. Direct dependency
-configuration compiles into temporary storage, with the original source paths and current `require ... with` options.
-This avoids both stale standalone configuration values and overwriting another build's saved config. Temporary files are
-removed on success, failure and cancellation. Lake may create a missing `.lake` directory in the dependency, but its
-config files and locks stay in temporary storage. Root configuration loading uses Lake's normal cache and may update
-that cache; this helper is not a strictly read-only filesystem operation. Files outside a configured library and
-file-less trials use Lake's root-package external-file defaults, not a guessed primary library.
+result. The helper evaluates configuration afresh without resolving or materializing dependencies or entering Lake's
+build graph. Root and direct dependency files use their own package and library settings, including saved root `-K`
+options and current `require ... with` options. Source checks for transitive dependencies fail explicitly rather than
+guess their configuration; lookups of already-built declarations are unaffected.
+
+The helper uses the same guardian-owned native reader as external checks. Both root and dependency configuration caches
+live under the existing generation's private `inputs/` directory; framework loading creates no project `.lake` directory
+and changes no shared cache or trace. Real package paths, cwd and `__dir__` remain intact. Parent shared custody
+protects metadata resolution until the guardian receives the same complete read union. These are cooperating read-only
+programs; arbitrary user configuration IO is not sandboxed. Private inputs survive uncertain cleanup and are removed
+only after actual scope closure. Files outside a configured library and file-less trials use Lake's root-package
+defaults.
+
+Configuration admission shares the existing broker lease mutex and activity counter. A held lease refuses before
+configuration work; a drain waits without dispatch. An admitted utility keeps its activity guard through the existing
+owned cleanup job, including after its async waiter disappears. One preparation group may coexist with a full resident
+actor quota, so option discovery does not evict a warm worker or request exclusive project access.
 
 The worker receives typed options, including `weak.*` options. It resolves their types after imports load.
 `-Dname=value` compiler arguments use Lean's parser; other extra compiler arguments return an explicit unsupported
 error. Source, query and compilation options all contribute to the result-cache key. `freshness.elaboration_options`
 records the project options and the actual host heartbeat limit, which overrides the project's `maxHeartbeats`.
 
-The helper currently starts once per source request, including cache hits. It adds about 0.6 seconds on the measured
-Mac. We do not cache arbitrary evaluated Lake configuration: it can read files or environment variables beyond the
-lakefile. A compiled helper could reduce startup cost without caching those inputs. Discovery has a 30-second timeout;
-cancellation kills the helper. Configuration errors return no proof verdict rather than retrying with defaults.
+A helper starts once per source request, including cache hits. Evaluated configuration is not cached: it may read files
+or environment variables beyond the lakefile. Discovery has one 30-second admission/execution budget; cancellation
+requests owned group cleanup. Configuration errors return no proof verdict and never retry with defaults.
 
 ## Queue and execution deadlines
 
@@ -364,5 +377,59 @@ start-or-expire decision. Expired messages stay in the bounded mailbox until the
 Lean. Once dispatch starts, the existing worker operation limits apply. Cancellation of a running request waits for the
 worker's cleanup reply. Neither cancellation nor expiry counts as a successful proof check.
 
-This does not change worker-slot recovery: an uncertain child shutdown still retains its slot. Automatic recovery needs
-the worker supervisor to retain child ownership until it confirms exit, including failed startup and controller panic.
+## Native ownership and artifact custody
+
+Each project actor owns its actual worker child and its reaper. Ordinary and semantic generations share one durable
+actor quota in the canonical private ownership registry. A native guardian owns the generation's inherited process group
+and retains the complete set of shared artifact descriptors. It acknowledges durable custody before a worker loads a
+library, runs an initializer, imports a module, or executes a submitted body. Cooperating writers acquire the same
+canonical domains exclusively and check ownership fences before dispatch.
+
+The parent first asks the worker's runtime-free readiness entry for an exact prepared manifest snapshot. A warm probe
+only reads under shared custody. A cold preparation uses the existing owned drain before acquiring an opening lock or
+native slot, then performs source publication, Lake build and manifest publication through the one writer helper.
+Prepared domains cannot expand within a generation. A changed snapshot or artifact union refuses before the body and
+retires the actor; a later request prepares a fresh actor. The refused request is never replayed.
+
+Parent-only cache and index reads hold close-on-exec shared descriptors through parsing and freshness observation.
+External native tools use `native-reader`, whose controlled bootstrap transfers the full read union to the same guardian
+before spawning its one payload. An external read receipt does not assert the loaded shim ABI. All read/write domain
+unions use the same canonical lock-path order.
+
+A timeout or cancelled caller returns no proof result. A confirmed request-bound child exit remains available through
+replacement failure and late reaping. Capacity is released only when the actor is sealed and its actual process scopes
+close. If wait authority is lost but group absence is confirmed, resource capacity and retained observation can recover
+without inventing an exit status or changing the unknown proof outcome. Retained request identities cannot silently
+redispatch after expiry, restart, lost replies, or full retention; safe storage exhaustion returns backpressure.
+
+Server death is observed by the guardian through the private channel and exact parent identity. If the guardian dies
+while the parent survives, the parent retains its actual unreaped child and uses the same owned-group termination
+primitive as other supervised commands. Failed kill, or loss of both parent and guardian, retains passive ownership
+fences until actual group absence; recovery never signals a PID recovered from disk. The supported boundary requires
+descendants to remain in the inherited process group. Deliberate detachment and weaker Linux process observation do not
+become successful proof results. The actor quota bounds admitted generations, not every paused pre-admission OS process;
+one bounded preparation utility may coexist without evicting a warm actor. Independent uncoordinated writers and
+arbitrary user IO outside declared cooperating domains are outside this lock protocol.
+
+## Pure compatibility and external input
+
+`lean_compatibility` with explicit `mode: "pure_v1"` describes compiled expectations, project/toolchain identity and the
+canonical helper/ownership namespace. It starts no worker, preparer or native helper and claims no loaded runtime. Its
+expected binding fingerprints come from the same signature declarations and canonical encoder as typed host bindings.
+Every cold or replacement session validates those expectations plus the pinned header/runtime before exposing a body.
+Default `loaded` mode remains an explicit manual handshake returning actual worker receipts. A client requiring pure
+discovery must retain the mode on failure; older servers reject it before their loaded handler.
+
+External `native-reader` payloads have closed stdin by default. Explicit `--stdin` stages one EOF-terminated stream of
+at most 16 MiB in the generation's own inputs. The caller supplies an owned pipe read end or regular file and must not
+share read aliases during capture; terminals and sockets are refused. After guardian admission, the bootstrap hashes and
+rewinds the exact read-only descriptor installed at payload fd0. Optional `stdin_sha256` and `stdin_bytes` receipts bind
+that offered descriptor. They do not attest consumption or loaded ABI. Callers require a matching receipt and a
+complete, non-intervened result before using output; missing output never authorizes implicit replay.
+
+An optional `--cancel-fd` accepts a private, already nonblocking pipe read end. The helper seals inherited descriptors
+against exec; any byte or EOF requests the existing owned-group shutdown while the caller stays alive. Cancellation is
+intent, not a successful result or permission to replay. Optional `payload_usage` comes from the sole wait that reaped
+the actual payload: wall time, user/system CPU and peak RSS normalized to bytes. Kernel accounting may include
+descendants the payload waited for; it does not measure the entire native group. Missing wait evidence produces no usage
+facts, and RSS remains observation only.

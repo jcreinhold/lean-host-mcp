@@ -1,5 +1,6 @@
 //! Request cancellation shared by async callers and the synchronous worker owner.
 
+use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -30,11 +31,60 @@ pub(crate) struct CallExecutionEvidence {
     pub(crate) uncertain: bool,
     pub(crate) worker_stop_receipt: Option<WorkerStopReceipt>,
     pub(crate) target_check: Option<TargetCheckNotStarted>,
+    pub(crate) deferred: Vec<DeferredStop>,
+}
+
+/// One operation's exact supervisor-bound observation, without a replay action.
+#[derive(Clone)]
+pub(crate) struct DeferredStop {
+    pub(crate) operation_id: String,
+    observe: Arc<dyn Fn() -> DeferredStopState + Send + Sync>,
+}
+
+/// Physical scope closure can terminate observation without an exit status.
+/// This does not settle the operation's semantic outcome.
+#[derive(Clone, Debug)]
+pub(crate) enum DeferredStopState {
+    Pending,
+    Stopped(WorkerStopReceipt),
+    ScopeClosedWithoutStatus,
+}
+
+impl fmt::Debug for DeferredStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferredStop")
+            .field("operation_id", &self.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CallExecutionEvidence {
+    pub(crate) fn refresh_deferred(&mut self) {
+        let mut pending = Vec::new();
+        for observer in self.deferred.drain(..) {
+            match (observer.observe)() {
+                DeferredStopState::Stopped(receipt) if receipt.operation_id == observer.operation_id => {
+                    self.stopped = self.stopped.saturating_add(1);
+                    self.worker_stop_receipt = Some(receipt);
+                }
+                DeferredStopState::ScopeClosedWithoutStatus => {
+                    // No observer can recover a wait status now. Capacity and
+                    // retention recover independently of the unknown result.
+                    self.uncertain = true;
+                }
+                DeferredStopState::Pending | DeferredStopState::Stopped(_) => pending.push(observer),
+            }
+        }
+        self.deferred = pending;
+    }
 }
 
 /// Each enqueued operation owns its own terminal evidence. A later successful
 /// fallback cannot settle an earlier operation whose cleanup remains unknown.
-pub(crate) struct CallOperation(Option<Arc<Mutex<CallExecutionEvidence>>>);
+pub(crate) struct CallOperation {
+    execution: Option<Arc<Mutex<CallExecutionEvidence>>>,
+    operation_id: String,
+}
 
 impl CallOperation {
     pub(crate) fn not_started(self) {
@@ -46,18 +96,47 @@ impl CallOperation {
     }
 
     pub(crate) fn stopped(self, receipt: WorkerStopReceipt) {
+        let operation_id = self.operation_id.clone();
         self.resolve(|evidence| {
+            evidence
+                .deferred
+                .retain(|observer| observer.operation_id != operation_id);
             evidence.stopped = evidence.stopped.saturating_add(1);
             evidence.worker_stop_receipt = Some(receipt);
         });
     }
 
     pub(crate) fn unknown(self) {
-        self.resolve(|evidence| evidence.uncertain = true);
+        let operation_id = self.operation_id.clone();
+        self.resolve(|evidence| {
+            if !evidence
+                .deferred
+                .iter()
+                .any(|observer| observer.operation_id == operation_id)
+            {
+                evidence.uncertain = true;
+            }
+        });
+    }
+
+    /// The initialization owner has returned, while exact owned cleanup remains
+    /// pending. This observer can end capacity/retention observation without
+    /// inventing either an exit status or a semantic result.
+    pub(crate) fn defer_scope_closed(self, observe: Arc<dyn Fn() -> DeferredStopState + Send + Sync>) {
+        let operation_id = self.operation_id.clone();
+        self.resolve(|evidence| {
+            if !evidence
+                .deferred
+                .iter()
+                .any(|observer| observer.operation_id == operation_id)
+            {
+                evidence.deferred.push(DeferredStop { operation_id, observe });
+            }
+        });
     }
 
     fn resolve(mut self, update: impl FnOnce(&mut CallExecutionEvidence)) {
-        if let Some(execution) = self.0.take() {
+        if let Some(execution) = self.execution.take() {
             let mut evidence = execution.lock();
             evidence.pending = evidence.pending.saturating_sub(1);
             update(&mut evidence);
@@ -68,7 +147,7 @@ impl CallOperation {
 
 impl Drop for CallOperation {
     fn drop(&mut self) {
-        if let Some(execution) = self.0.take() {
+        if let Some(execution) = self.execution.take() {
             let mut evidence = execution.lock();
             evidence.pending = evidence.pending.saturating_sub(1);
             evidence.uncertain = true;
@@ -104,19 +183,54 @@ impl CallCancellation {
         self.execution.lock().uncertain = true;
     }
 
-    /// Preparation can prove a named target check never ran without proving
-    /// that every subprocess started during preparation has stopped.
-    pub(crate) fn preparation_failed(&self, target_check: TargetCheckNotStarted) {
-        self.mark_uncertain();
+    /// Record only that this target check was not reached. The preparation's
+    /// own operation decides whether it returned, stopped, or remains unknown.
+    pub(crate) fn target_check_not_started(&self, target_check: TargetCheckNotStarted) {
+        // Target phase evidence cannot decide whether earlier owned work
+        // returned, stopped, or remains unconfirmed; its operation owns that.
         let mut evidence = self.execution.lock();
         evidence.target_check = Some(target_check);
     }
 
     pub(crate) fn begin_operation(&self) -> CallOperation {
+        self.begin_operation_for(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub(crate) fn begin_operation_for(&self, operation_id: String) -> CallOperation {
         let mut evidence = self.execution.lock();
         evidence.pending = evidence.pending.saturating_add(1);
         drop(evidence);
-        CallOperation(Some(Arc::clone(&self.execution)))
+        CallOperation {
+            execution: Some(Arc::clone(&self.execution)),
+            operation_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_stop(
+        &self,
+        operation_id: String,
+        observe: Arc<dyn Fn() -> Option<WorkerStopReceipt> + Send + Sync>,
+    ) {
+        self.defer_stop_state(
+            operation_id,
+            Arc::new(move || observe().map_or(DeferredStopState::Pending, DeferredStopState::Stopped)),
+        );
+    }
+
+    pub(crate) fn defer_stop_state(
+        &self,
+        operation_id: String,
+        observe: Arc<dyn Fn() -> DeferredStopState + Send + Sync>,
+    ) {
+        let mut evidence = self.execution.lock();
+        if !evidence
+            .deferred
+            .iter()
+            .any(|observer| observer.operation_id == operation_id)
+        {
+            evidence.deferred.push(DeferredStop { operation_id, observe });
+        }
     }
 
     pub(crate) fn cancel_on_drop(&self) -> CancelOnDrop {
@@ -174,6 +288,120 @@ pub(crate) async fn with_cancellation_evidence<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_check_marker_preserves_completed_preparation_without_native_stop() {
+        let cancellation = CallCancellation::default();
+        cancellation.begin_operation().returned();
+        let target = TargetCheckNotStarted {
+            file_label: "Prepared.lean".to_owned(),
+            stage: "lake_option_discovery".to_owned(),
+            disposition: "not_started".to_owned(),
+        };
+        cancellation.target_check_not_started(target.clone());
+        let evidence = cancellation.execution.lock().clone();
+        assert_eq!(evidence.target_check, Some(target));
+        assert_eq!(evidence.returned, 1);
+        assert_eq!(evidence.pending, 0);
+        assert!(!evidence.uncertain);
+        assert!(evidence.worker_stop_receipt.is_none());
+    }
+
+    #[test]
+    fn target_check_marker_does_not_settle_unconfirmed_preparation() {
+        let cancellation = CallCancellation::default();
+        cancellation.begin_operation().unknown();
+        cancellation.target_check_not_started(TargetCheckNotStarted {
+            file_label: "Unknown.lean".to_owned(),
+            stage: "lake_option_discovery".to_owned(),
+            disposition: "not_started".to_owned(),
+        });
+        let evidence = cancellation.execution.lock().clone();
+        assert!(evidence.uncertain);
+        assert_eq!(evidence.stopped, 0);
+        assert_eq!(evidence.returned, 0);
+        assert_eq!(evidence.not_started, 0);
+        assert!(evidence.worker_stop_receipt.is_none());
+    }
+
+    #[test]
+    fn unconfirmed_preparation_stays_unknown_after_prior_return() {
+        let cancellation = CallCancellation::default();
+        cancellation.begin_operation().returned();
+        cancellation.begin_operation().unknown();
+        cancellation.target_check_not_started(TargetCheckNotStarted {
+            file_label: "Legacy.lean".to_owned(),
+            stage: "lake_option_discovery".to_owned(),
+            disposition: "not_started".to_owned(),
+        });
+        let evidence = cancellation.execution.lock().clone();
+        assert!(evidence.uncertain);
+        assert_eq!(evidence.returned, 1);
+        assert!(evidence.worker_stop_receipt.is_none());
+    }
+
+    #[test]
+    fn deferred_exit_settles_only_its_named_operation() {
+        let cancellation = CallCancellation::default();
+        let operation = cancellation.begin_operation_for("late-op".to_owned());
+        let observed = Arc::new(Mutex::new(None));
+        let receipt_source = Arc::clone(&observed);
+        cancellation.defer_stop("late-op".to_owned(), Arc::new(move || receipt_source.lock().clone()));
+        operation.unknown();
+        let mut evidence = cancellation.execution.lock().clone();
+        assert!(!evidence.uncertain);
+        assert_eq!(evidence.deferred.len(), 1);
+        evidence.refresh_deferred();
+        assert_eq!(evidence.stopped, 0);
+        *observed.lock() = Some(test_receipt("other-op"));
+        evidence.refresh_deferred();
+        assert_eq!(evidence.deferred.len(), 1);
+        *observed.lock() = Some(test_receipt("late-op"));
+        evidence.refresh_deferred();
+        assert!(evidence.deferred.is_empty());
+        assert_eq!(evidence.stopped, 1);
+    }
+
+    #[test]
+    fn deferred_exit_cannot_clear_independent_uncertainty() {
+        let cancellation = CallCancellation::default();
+        cancellation.begin_operation().unknown();
+        let operation = cancellation.begin_operation_for("late-op".to_owned());
+        cancellation.defer_stop("late-op".to_owned(), Arc::new(|| Some(test_receipt("late-op"))));
+        operation.unknown();
+        let mut evidence = cancellation.execution.lock().clone();
+        evidence.refresh_deferred();
+        assert!(evidence.uncertain && evidence.deferred.is_empty());
+        assert_eq!(evidence.stopped, 1);
+    }
+
+    #[test]
+    fn synchronous_stop_consumes_its_deferred_observer_once() {
+        let cancellation = CallCancellation::default();
+        let operation = cancellation.begin_operation_for("late-op".to_owned());
+        cancellation.defer_stop("late-op".to_owned(), Arc::new(|| Some(test_receipt("late-op"))));
+        operation.stopped(test_receipt("late-op"));
+        let mut evidence = cancellation.execution.lock().clone();
+        evidence.refresh_deferred();
+        assert!(evidence.deferred.is_empty() && !evidence.uncertain);
+        assert_eq!(evidence.stopped, 1);
+    }
+
+    fn test_receipt(operation_id: &str) -> WorkerStopReceipt {
+        WorkerStopReceipt {
+            operation_id: operation_id.to_owned(),
+            worker_session_id: "session".to_owned(),
+            worker_generation: 7,
+            worker_scope: "main".to_owned(),
+            worker_request_id: Some(1),
+            worker_pid: Some(123),
+            exit_success: Some(false),
+            exit_code: None,
+            exit_status: Some("killed".to_owned()),
+            operation: "check".to_owned(),
+            cause: "timeout".to_owned(),
+        }
+    }
 
     #[tokio::test]
     async fn cancellation_waits_for_terminal_cleanup_and_reaches_worker() {

@@ -994,6 +994,10 @@ pub struct MissingImportsFile {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum FindReferencesResult {
+    Unavailable {
+        message: String,
+        semantic_based: bool,
+    },
     Ok {
         references: Vec<ReferenceHit>,
         /// The `limit` (or `MAX_REFERENCES`) cap was hit; the returned set is a
@@ -1275,6 +1279,18 @@ async fn find_references_in_project(
         .await
         .map_err(|err| ServerError::Internal(format!("reference index scan task failed: {err}")))?
     };
+
+    if index.status == crate::ilean::IndexStatus::Unavailable {
+        return Ok(Response::ok(
+            FindReferencesResult::Unavailable {
+                message: "artifact read custody is unavailable; no reference indices were read".to_owned(),
+                semantic_based: true,
+            },
+            freshness,
+        )
+        .with_runtime(runtime)
+        .warn("artifact read custody is unavailable; retry when the artifact workspace is ready"));
+    }
 
     // A wholly-absent build directory is the honest "the project is not built"
     // verdict — degrade to the shared `needs_build` warning, never a silent
@@ -2128,7 +2144,7 @@ import Init -- comment
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("lakefile.lean"), "package proj\nlean_lib Proj\n").unwrap();
         std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-        std::fs::write(root.join("lake-manifest.json"), "{}\n").unwrap();
+        std::fs::write(root.join("lake-manifest.json"), "{\"packages\":[]}\n").unwrap();
         let root = root.canonicalize().unwrap();
 
         let broker = crate::broker::ProjectBroker::new(crate::broker::BrokerConfig {
@@ -2511,5 +2527,37 @@ import Init -- comment
             panic!("expected header-parse failure");
         };
         assert_eq!(cache_status_label(facts.cache_status), "evicted");
+    }
+
+    #[tokio::test]
+    async fn blocked_project_reference_read_reports_unavailable_without_freshness_claim() {
+        let project = stage_ilean_module("Demo.A", "demo_a.ilean");
+        let lock_path = lean_toolchain::shared_writer::project_lock_path(project.path()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let response = find_references_in_project(
+            project.path(),
+            &references_request(),
+            freshness(project.path()),
+            RuntimeFacts::default(),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response.result_ref(),
+            Some(super::FindReferencesResult::Unavailable { .. })
+        ));
+        assert!(response.trust_artifacts.is_empty());
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["result"]["status"],
+            "unavailable"
+        );
     }
 }

@@ -457,6 +457,8 @@ fn semantic_examples(tool: &str, allowed: &[&str]) -> Option<Value> {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SemanticTrust {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
     pub project_root: String,
     pub session_id: String,
     pub lean_toolchain: String,
@@ -467,6 +469,7 @@ pub struct SemanticTrust {
 impl SemanticTrust {
     fn unknown() -> Self {
         Self {
+            native_compatibility: None,
             project_root: String::new(),
             session_id: "request-invalid".to_owned(),
             lean_toolchain: String::new(),
@@ -476,6 +479,7 @@ impl SemanticTrust {
 
     fn from_parts(freshness: FreshnessIdentity, artifacts: Vec<ArtifactTrust>) -> Self {
         Self {
+            native_compatibility: None,
             project_root: freshness.project_root,
             session_id: freshness.session_id,
             lean_toolchain: freshness.lean_toolchain,
@@ -877,6 +881,9 @@ where
     ) {
         response.warnings.push(warning);
     }
+    let compatibility = response
+        .runtime()
+        .and_then(|runtime| runtime.native_compatibility.clone());
     if !config.verbosity.is_full() {
         response.drop_telemetry();
     }
@@ -885,7 +892,8 @@ where
         .map(serde_json::to_value)
         .transpose()
         .map_err(|err| ServerError::Internal(err.to_string()))?;
-    let trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
+    let mut trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
+    trust.native_compatibility = compatibility;
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
     Ok(SemanticResponse {
         data,
@@ -897,7 +905,11 @@ where
 }
 
 fn from_runtime_response(response: Response<Value>) -> SemanticResponse<Value> {
-    let trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
+    let compatibility = response
+        .runtime()
+        .and_then(|runtime| runtime.native_compatibility.clone());
+    let mut trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
+    trust.native_compatibility = compatibility;
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
     SemanticResponse {
         data: response.result,
@@ -1089,6 +1101,64 @@ mod tests {
             lean_toolchain: "leanprover/lean4:v4.35.0".to_owned(),
             toolchain_advisories: Vec::new(),
         }
+    }
+
+    #[test]
+    fn actual_compatibility_receipt_survives_quiet_telemetry() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::runtime_compatibility::{
+            CompatibilityEvidence, ExpectedContract, LoadedHostRuntime, LoadedReceipt, SCHEMA,
+        };
+        let tmp = tempfile::tempdir()?;
+        let root = make_lake_dir(tmp.path());
+        let expected = ExpectedContract::new(std::collections::BTreeMap::from([(
+            "verify_declaration_batch".into(),
+            "a".repeat(64),
+        )]))?;
+        let receipt = LoadedReceipt {
+            schema: SCHEMA.into(),
+            contract_sha256: expected.digest()?,
+            server_instance_id: "original".into(),
+            project_root: root.to_string_lossy().into_owned(),
+            lean_toolchain: "leanprover/lean4:v4.35.0".into(),
+            worker_session_id: "actor-1".into(),
+            worker_generation: 7,
+            worker_version: "test".into(),
+            protocol_version: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
+            loaded: LoadedHostRuntime {
+                artifact_read_epochs: Some(vec![crate::runtime_compatibility::ArtifactReadEpoch {
+                    project_root: root.to_string_lossy().into_owned(),
+                    epoch: "fixture-writer-17".into(),
+                }]),
+                compiled_lean_version: "4.35.0".into(),
+                compiled_header_sha256: "b".repeat(64),
+                runtime_lean_version: Some("4.35.0".into()),
+                checked_host_bindings: expected.required_host_bindings.clone(),
+            },
+        };
+        let evidence = CompatibilityEvidence::new("original".into(), expected, vec![receipt])?;
+        let runtime = RuntimeFacts {
+            native_compatibility: Some(evidence),
+            ..RuntimeFacts::default()
+        };
+        let result = from_tool_response(
+            Response::ok(json!({"verified":true}), freshness(&root)).with_runtime(runtime),
+            ToolConfig::default(),
+        )?;
+        assert!(result.telemetry.is_none());
+        assert_eq!(
+            result
+                .trust
+                .native_compatibility
+                .as_ref()
+                .map(|v| v.server_instance_id.as_str()),
+            Some("original")
+        );
+        let json = serde_json::to_value(result)?;
+        assert_eq!(
+            json.pointer("/trust/native_compatibility/loaded/0/worker_generation"),
+            Some(&json!(7))
+        );
+        Ok(())
     }
 
     #[test]

@@ -17,7 +17,9 @@
 //! callers never see them.
 //!
 //! "Index absent / stale" is reported as **data**, not an error: a project
-//! that was never built yields [`IndexStatus::NotBuilt`]; a single malformed
+//! that was never built yields [`IndexStatus::NotBuilt`]; unavailable shared
+//! artifact custody yields [`IndexStatus::Unavailable`] before any index read.
+//! A single malformed
 //! or unreadable `.ilean` is skipped and counted, never fatal. The consumer
 //! (`find_references`) maps those signals onto the response envelope.
 //!
@@ -70,6 +72,8 @@ pub(crate) struct ReferenceLocation {
 /// Whether the project's reference index exists on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexStatus {
+    /// Artifact read custody could not be established; no indices were read.
+    Unavailable,
     /// `<root>/.lake/build/lib/lean` is missing — the project was never built.
     NotBuilt,
     /// The index directory exists and was scanned.
@@ -94,6 +98,8 @@ pub(crate) struct ReferenceIndex {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModuleDeclarationIndexStatus {
+    /// Artifact read custody could not be established; no index was read.
+    Unavailable,
     /// `<root>/.lake/build/lib/lean` is missing — the project was never built.
     ProjectNotBuilt,
     /// The build tree exists, but this module has no `.ilean` file.
@@ -160,7 +166,25 @@ pub(crate) enum IleanError {
 /// [`IndexStatus::NotBuilt`]; an individual unreadable or malformed `.ilean`
 /// is counted in [`ReferenceIndex::modules_skipped`] and skipped. Never panics.
 pub(crate) fn references_to(project_root: &Path, name: &str, files: Option<&[PathBuf]>) -> ReferenceIndex {
+    let Ok(guard) = crate::artifact_reads::ArtifactReadGuard::for_project(project_root) else {
+        return ReferenceIndex {
+            status: IndexStatus::Unavailable,
+            references: Vec::new(),
+            modules_scanned: 0,
+            modules_skipped: 0,
+            stale_sources: Vec::new(),
+        };
+    };
     let build_dir = project_root.join(BUILD_LIB_REL);
+    if !guard.covers_artifact_root(&build_dir) {
+        return ReferenceIndex {
+            status: IndexStatus::Unavailable,
+            references: Vec::new(),
+            modules_scanned: 0,
+            modules_skipped: 0,
+            stale_sources: Vec::new(),
+        };
+    }
     if !build_dir.is_dir() {
         return ReferenceIndex {
             status: IndexStatus::NotBuilt,
@@ -177,7 +201,7 @@ pub(crate) fn references_to(project_root: &Path, name: &str, files: Option<&[Pat
     match files.and_then(|files| indices_for(project_root, &build_dir, files)) {
         Some(indices) => {
             for index_path in &indices {
-                scan.visit(project_root, index_path, &matcher);
+                scan.visit(project_root, index_path, &matcher, &guard);
             }
         }
         None => {
@@ -186,7 +210,7 @@ pub(crate) fn references_to(project_root: &Path, name: &str, files: Option<&[Pat
                 if !entry.file_type().is_file() || index_path.extension().is_none_or(|ext| ext != "ilean") {
                     continue;
                 }
-                scan.visit(project_root, index_path, &matcher);
+                scan.visit(project_root, index_path, &matcher, &guard);
             }
         }
     }
@@ -213,7 +237,17 @@ struct ReferenceScan {
 }
 
 impl ReferenceScan {
-    fn visit(&mut self, project_root: &Path, index_path: &Path, matcher: &KeyMatcher<'_>) {
+    fn visit(
+        &mut self,
+        project_root: &Path,
+        index_path: &Path,
+        matcher: &KeyMatcher<'_>,
+        guard: &crate::artifact_reads::ArtifactReadGuard,
+    ) {
+        if !guard.covers_artifact_root(index_path) {
+            self.modules_skipped = self.modules_skipped.saturating_add(1);
+            return;
+        }
         let Ok(module) = load_references(index_path, matcher) else {
             self.modules_skipped = self.modules_skipped.saturating_add(1);
             return;
@@ -284,9 +318,27 @@ fn indices_for(project_root: &Path, build_dir: &Path, files: &[PathBuf]) -> Opti
 }
 
 pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> ModuleDeclarationIndex {
+    let Ok(guard) = crate::artifact_reads::ArtifactReadGuard::for_project(project_root) else {
+        return ModuleDeclarationIndex {
+            status: ModuleDeclarationIndexStatus::Unavailable,
+            module: module.to_owned(),
+            index: module_to_index(project_root, module),
+            declarations: Vec::new(),
+            stale: false,
+        };
+    };
     let build_dir = project_root.join(BUILD_LIB_REL);
     let source = module_to_source(project_root, module);
     let index = module_to_index(project_root, module);
+    if !guard.covers_artifact_root(&build_dir) || !guard.covers_artifact_root(&index) {
+        return ModuleDeclarationIndex {
+            status: ModuleDeclarationIndexStatus::Unavailable,
+            module: module.to_owned(),
+            index,
+            declarations: Vec::new(),
+            stale: false,
+        };
+    }
     if !build_dir.is_dir() {
         return ModuleDeclarationIndex {
             status: ModuleDeclarationIndexStatus::ProjectNotBuilt,

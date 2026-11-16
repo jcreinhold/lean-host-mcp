@@ -22,6 +22,7 @@
 //! - [`tools`]: tool implementations, grouped by proof workflow stage.
 //! - [`server`]: rmcp glue.
 
+mod artifact_reads;
 pub mod broker;
 mod cache;
 mod cancellation;
@@ -31,15 +32,19 @@ pub mod config_schema;
 mod diagnosis;
 pub mod envelope;
 pub mod error;
+mod host_preparation;
 mod ilean;
 pub mod lake_meta;
 mod lake_options;
+pub mod native_reader;
 mod project;
 pub mod projections;
 mod request_journal;
 mod request_log;
+pub mod runtime_compatibility;
 mod semantic_search;
 pub mod server;
+pub mod shared_writer;
 mod smoke;
 pub mod status;
 mod tasks;

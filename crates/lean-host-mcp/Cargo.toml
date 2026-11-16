@@ -93,7 +93,7 @@ lean-semantic-search-runtime.workspace = true
 lean-toolchain.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "pipe", "fs", "net"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -103,3 +103,6 @@ tokio = { version = "1", features = ["process"] }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14.11"

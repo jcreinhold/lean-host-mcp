@@ -32,11 +32,11 @@ use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use crate::cache::ModuleQueryCache;
-use crate::cancellation::CallCancellation;
+use crate::cancellation::{CallCancellation, CallOperation};
 use crate::config_file::RuntimeFileConfig;
 use crate::envelope::{FinalAttemptStatus, Freshness, RuntimeFacts, RuntimeRestartEvent, WorkerStopReceipt};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
-use crate::lake_meta::{self, LakeProjectMeta};
+use crate::lake_meta::LakeProjectMeta;
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
 use crate::worker_retirement::WorkerSlot;
@@ -248,11 +248,11 @@ const WORKER_SESSION_POOL_CAPACITY: usize = 8;
 /// How long the actor waits for another call before treating the project as
 /// quiescent and cycling an over-budget child.
 ///
-/// Only armed when the child is already over its soft residue budget; under it
-/// the actor blocks on its mailbox with no timer at all. Two seconds is short
-/// enough that a pause between proof steps is usually enough, and long enough
-/// that a burst of calls is never interrupted mid-flight.
+/// Applied only when the child is above its soft residue budget. The
+/// independent lifecycle poll may observe quiescence up to one tick later.
 const QUIESCENCE_GRACE: Duration = Duration::from_secs(2);
+/// Observe owned-child death and cleanup when no new job arrives.
+const WORKER_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How recently a profile must have been served for an idle cycle to re-import
 /// it into the fresh child.
 ///
@@ -727,6 +727,7 @@ impl QueueDeadline {
 }
 
 struct JobMeta {
+    file_label: Option<String>,
     queue: Arc<QueueDeadline>,
     imports: Vec<String>,
     import_fingerprint: String,
@@ -739,6 +740,10 @@ struct JobMeta {
 }
 
 enum ProjectMessage {
+    NativeCompatibility {
+        meta: JobMeta,
+        reply: oneshot::Sender<Result<ProjectCall<()>>>,
+    },
     ModuleQuery {
         meta: JobMeta,
         source: String,
@@ -794,7 +799,8 @@ enum ProjectMessage {
 impl ProjectMessage {
     fn meta(&self) -> &JobMeta {
         match self {
-            Self::ModuleQuery { meta, .. }
+            Self::NativeCompatibility { meta, .. }
+            | Self::ModuleQuery { meta, .. }
             | Self::ModuleQueryBatch { meta, .. }
             | Self::DeclarationInspection { meta, .. }
             | Self::DeclarationSearch { meta, .. }
@@ -811,6 +817,9 @@ impl ProjectMessage {
 
     fn reject(self, state: &ProjectActorState, reason: &'static str) {
         match self {
+            Self::NativeCompatibility { meta, reply } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
             Self::ModuleQuery { meta, reply, .. } => {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
@@ -1030,6 +1039,7 @@ struct RuntimeSnapshot {
 impl RuntimeSnapshot {
     fn facts(&self) -> RuntimeFacts {
         RuntimeFacts {
+            native_compatibility: None,
             worker_generation: self.worker_generation,
             worker_restarted: false,
             retry_count: 0,
@@ -1112,6 +1122,9 @@ impl LeanProject {
         runtime_config: ProjectRuntimeConfig,
         slot: OwnedSemaphorePermit,
         maintenance: crate::broker::MaintenanceAccess,
+        prepared_host_artifacts: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts,
+        native_capacity_limit: usize,
+        initialization: CallOperation,
     ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
@@ -1129,27 +1142,45 @@ impl LeanProject {
         let pool_active_jobs = maintenance.activity_counter();
         let healthy = Arc::new(AtomicBool::new(true));
         let admission_timeout = Duration::from_millis(runtime_config.request_timeout_millis());
-        let (mut config, open_warnings) = ActorConfig::from_meta(
+        let (mut config, open_warnings) = match ActorConfig::from_meta(
             &meta,
             session_id.clone(),
             Arc::clone(&runtime),
             Arc::clone(&healthy),
             runtime_config,
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                initialization.not_started();
+                return Err(error);
+            }
+        };
         config.maintenance = maintenance;
+        config.prepared_host_artifacts = Some(prepared_host_artifacts);
+        config.native_capacity_limit = native_capacity_limit;
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
 
-        thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                // The permit outlives the handle's structured shutdown, including
-                // failed startup and unwinding. Registry eviction alone frees nothing.
-                let _slot = WorkerSlot::new(slot, config.process_tracker.clone());
-                actor_main(config, init_tx);
-            })
-            .map_err(|e| ServerError::Internal(format!("spawn project actor thread: {e}")))?;
+        // Retain the not-yet-dispatched guard until thread creation succeeds;
+        // std::thread drops a failed spawn's closure before returning its error.
+        let handoff = Arc::new(Mutex::new(Some(initialization)));
+        let actor_handoff = Arc::clone(&handoff);
+        if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
+            let Some(initialization) = actor_handoff.lock().take() else {
+                return;
+            };
+            // The permit outlives shutdown, failed startup and unwinding.
+            let _slot = WorkerSlot::new(slot, config.process_tracker.clone());
+            actor_main(config, init_tx, initialization);
+        }) {
+            let initialization = handoff.lock().take();
+            if let Some(initialization) = initialization {
+                initialization.not_started();
+            }
+            return Err(ServerError::Internal(format!("spawn project actor thread: {error}")));
+        }
+        drop(handoff);
 
         let (runtime_toolchain, actor_tx) = init_rx
             .recv()
@@ -1367,11 +1398,24 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
+    pub(crate) async fn native_compatibility(&self) -> Result<ProjectCall<()>> {
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(
+            ProjectMessage::NativeCompatibility {
+                meta: self.job_meta(Vec::new(), RetryPolicy::Never),
+                reply,
+            },
+            rx,
+        )
+        .await
+    }
+
     fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy) -> JobMeta {
         let created_at = Instant::now();
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
         self.pool_active_jobs.fetch_add(1, Ordering::AcqRel);
         JobMeta {
+            file_label: None,
             queue: Arc::new(QueueDeadline::new(self.admission_timeout)),
             import_fingerprint: import_fingerprint(&imports),
             imports,
@@ -1398,7 +1442,7 @@ impl LeanProject {
         let queue = Arc::clone(&message.meta().queue);
         let cancellation = message.meta().cancellation.clone();
         let operation_id = message.meta().correlation_id.to_string();
-        let operation = cancellation.begin_operation();
+        let operation = cancellation.begin_operation_for(operation_id.clone());
         let mut on_drop = cancellation.cancel_on_drop();
         if cancellation.is_cancelled() {
             operation.not_started();
@@ -1478,6 +1522,10 @@ impl LeanProject {
                     && receipt.worker_session_id == self.session_id
                 {
                     operation.stopped(receipt.clone());
+                } else if failure.preparation_closed || failure.runtime.final_attempt == FinalAttemptStatus::Completed {
+                    // This operation returned or its predispatch writer scope
+                    // closed. The unavailable payload carries no proof result.
+                    operation.returned();
                 } else {
                     operation.unknown();
                 }
@@ -1567,6 +1615,7 @@ impl LeanProject {
             retryable: true,
             worker_restarted: false,
             worker_stop_receipt: None,
+            preparation_closed: false,
             project_root: self.canonical_root.to_string_lossy().into_owned(),
             project_hash: self.manifest_hash.clone(),
             imports: imports.to_vec(),
@@ -1600,6 +1649,8 @@ struct ActorConfig {
     toolchain_label: String,
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
+    prepared_host_artifacts: Option<lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts>,
+    native_capacity_limit: usize,
     session_id: String,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     healthy: Arc<AtomicBool>,
@@ -1629,6 +1680,85 @@ struct ActorConfig {
     toolchain_advisories: Vec<String>,
 }
 
+/// Resolve one spawnable worker before taking broker admission resources.
+pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf, Vec<String>)> {
+    let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
+    let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready_for(&toolchain_id) {
+        Readiness::Ready {
+            worker,
+            lean_sysroot,
+            note,
+        } => (worker.path, lean_sysroot, note.into_iter().collect()),
+        Readiness::UnknownPin {
+            pin,
+            worker,
+            lean_sysroot,
+        } => (
+            worker.path,
+            lean_sysroot,
+            vec![format!(
+                "lean-toolchain pins {pin}, which is not a recognized lean-rs supported version \
+                 (e.g. a nightly); proceeding, but the host cannot vouch for ABI compatibility"
+            )],
+        ),
+        Readiness::Unsupported { window, nearest } => {
+            return Err(ServerError::BadProject(format!(
+                "lean-toolchain pins {toolchain_id}, outside the lean-rs supported window {window}; \
+                 nearest supported: {nearest}. Pin a supported toolchain (or bump lean-rs) and reopen."
+            )));
+        }
+        Readiness::Stale { toolchain, install_cmd } => {
+            return Err(ServerError::BadProject(format!(
+                "worker for {toolchain} was built against a different lean.h than the toolchain now \
+                 provides (header drift); rebuild it: {install_cmd}"
+            )));
+        }
+        Readiness::Incompatible {
+            toolchain,
+            worker_protocol,
+            host_protocol,
+            install_cmd: _,
+        } => {
+            return Err(ServerError::IncompatibleWorker {
+                message: format!(
+                    "worker for {toolchain} uses protocol {worker_protocol}, but this host requires \
+                     protocol {host_protocol}"
+                ),
+                recovery_command: "lean-host-mcp install-worker --auto".to_owned(),
+            });
+        }
+        Readiness::Unusable {
+            toolchain,
+            detail,
+            install_cmd,
+        } => {
+            return Err(ServerError::BadProject(format!(
+                "worker for {toolchain} failed its runtime smoke test ({detail}); the toolchain's \
+                 libleanshared is ABI-incompatible with this lean-rs build and cannot be served. \
+                 Pin a supported toolchain the host can run, or rebuild lean-rs and reinstall: {install_cmd}"
+            )));
+        }
+        Readiness::NotInstalled { toolchain, install_cmd } => {
+            return Err(ServerError::BadProject(format!(
+                "no worker binary for toolchain {toolchain}; run: {install_cmd}"
+            )));
+        }
+        Readiness::ToolchainNotInstalled { toolchain, elan_dir } => {
+            return Err(ServerError::BadProject(format!(
+                "elan toolchain {toolchain} is not installed (expected {})",
+                elan_dir.display()
+            )));
+        }
+    };
+    tracing::debug!(
+        toolchain = %toolchain_id,
+        worker = %worker_path.display(),
+        sysroot = %lean_sysroot.display(),
+        "resolved ready worker binary"
+    );
+    Ok((worker_path, lean_sysroot, open_warnings))
+}
+
 impl ActorConfig {
     /// Resolve the pinned toolchain into a spawnable config plus any
     /// open-time provenance advisories. All version-drift situations collapse
@@ -1643,80 +1773,7 @@ impl ActorConfig {
         healthy: Arc<AtomicBool>,
         runtime_config: ProjectRuntimeConfig,
     ) -> Result<(Self, Vec<String>)> {
-        let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
-        let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready_for(&toolchain_id) {
-            Readiness::Ready {
-                worker,
-                lean_sysroot,
-                note,
-            } => (worker.path, lean_sysroot, note.into_iter().collect()),
-            Readiness::UnknownPin {
-                pin,
-                worker,
-                lean_sysroot,
-            } => (
-                worker.path,
-                lean_sysroot,
-                vec![format!(
-                    "lean-toolchain pins {pin}, which is not a recognized lean-rs supported version \
-                     (e.g. a nightly); proceeding, but the host cannot vouch for ABI compatibility"
-                )],
-            ),
-            Readiness::Unsupported { window, nearest } => {
-                return Err(ServerError::BadProject(format!(
-                    "lean-toolchain pins {toolchain_id}, outside the lean-rs supported window {window}; \
-                     nearest supported: {nearest}. Pin a supported toolchain (or bump lean-rs) and reopen."
-                )));
-            }
-            Readiness::Stale { toolchain, install_cmd } => {
-                return Err(ServerError::BadProject(format!(
-                    "worker for {toolchain} was built against a different lean.h than the toolchain now \
-                     provides (header drift); rebuild it: {install_cmd}"
-                )));
-            }
-            Readiness::Incompatible {
-                toolchain,
-                worker_protocol,
-                host_protocol,
-                install_cmd: _,
-            } => {
-                return Err(ServerError::IncompatibleWorker {
-                    message: format!(
-                        "worker for {toolchain} uses protocol {worker_protocol}, but this host requires \
-                         protocol {host_protocol}"
-                    ),
-                    recovery_command: "lean-host-mcp install-worker --auto".to_owned(),
-                });
-            }
-            Readiness::Unusable {
-                toolchain,
-                detail,
-                install_cmd,
-            } => {
-                return Err(ServerError::BadProject(format!(
-                    "worker for {toolchain} failed its runtime smoke test ({detail}); the toolchain's \
-                     libleanshared is ABI-incompatible with this lean-rs build and cannot be served. \
-                     Pin a supported toolchain the host can run, or rebuild lean-rs and reinstall: {install_cmd}"
-                )));
-            }
-            Readiness::NotInstalled { toolchain, install_cmd } => {
-                return Err(ServerError::BadProject(format!(
-                    "no worker binary for toolchain {toolchain}; run: {install_cmd}"
-                )));
-            }
-            Readiness::ToolchainNotInstalled { toolchain, elan_dir } => {
-                return Err(ServerError::BadProject(format!(
-                    "elan toolchain {toolchain} is not installed (expected {})",
-                    elan_dir.display()
-                )));
-            }
-        };
-        tracing::debug!(
-            toolchain = %toolchain_id,
-            worker = %worker_path.display(),
-            sysroot = %lean_sysroot.display(),
-            "resolved ready worker binary"
-        );
+        let (worker_path, lean_sysroot, open_warnings) = resolve_worker(meta)?;
         let config = Self {
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: meta.canonical_root.clone(),
@@ -1724,6 +1781,8 @@ impl ActorConfig {
             toolchain_label: meta.toolchain.clone(),
             worker_path,
             lean_sysroot,
+            prepared_host_artifacts: None,
+            native_capacity_limit: crate::broker::DEFAULT_MAX_PROJECTS,
             session_id,
             runtime,
             healthy,
@@ -1797,6 +1856,13 @@ impl ProjectActorState {
         // A call was served, so the next quiet period earns a fresh idle cycle.
         self.cycled_while_idle = false;
         match message {
+            ProjectMessage::NativeCompatibility { meta, reply } => {
+                let result = self.run_job(meta, |handle, imports, cancellation| {
+                    let _session = handle.open_session_with_imports(imports, Some(cancellation), None)?;
+                    Ok(())
+                });
+                let _ = reply.send(result);
+            }
             ProjectMessage::ModuleQuery {
                 meta,
                 source,
@@ -1804,6 +1870,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
+                let mut meta = meta;
+                meta.file_label = Some(options.file_label.clone());
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     handle.process_module_query_with_imports(
                         imports,
@@ -1824,6 +1892,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
+                let mut meta = meta;
+                meta.file_label = Some(options.file_label.clone());
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     handle.process_module_query_batch_with_imports(
                         imports,
@@ -1864,6 +1934,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
+                let mut meta = meta;
+                meta.file_label = Some(options.file_label.clone());
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     handle.attempt_proof_with_imports(imports, &request, &options, Some(cancellation), None)
                 });
@@ -1875,6 +1947,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
+                let mut meta = meta;
+                meta.file_label = Some(options.file_label.clone());
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     handle.verify_declaration_with_imports(imports, &request, &options, Some(cancellation), None)
                 });
@@ -1886,6 +1960,8 @@ impl ProjectActorState {
                 options,
                 reply,
             } => {
+                let mut meta = meta;
+                meta.file_label = Some(options.file_label.clone());
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     handle.verify_declaration_batch_with_imports(imports, &request, &options, Some(cancellation), None)
                 });
@@ -1898,7 +1974,53 @@ impl ProjectActorState {
         }
     }
 
+    /// Observe owned process state without sending a health request.
+    /// Return whether an active call must retain lifecycle uncertainty.
+    fn poll_worker_liveness(&mut self) -> bool {
+        match self.handle.status() {
+            Ok(lean_rs_worker_parent::LeanWorkerStatus::Running) => {
+                if self.handle.cleanup_pending() {
+                    self.config.healthy.store(false, Ordering::Release);
+                    return true;
+                }
+                false
+            }
+            Ok(lean_rs_worker_parent::LeanWorkerStatus::Exited(_)) => {
+                self.config.healthy.store(false, Ordering::Release);
+                false
+            }
+            Err(_) => {
+                self.config.healthy.store(false, Ordering::Release);
+                self.config.startup_uncertain.store(true, Ordering::Release);
+                true
+            }
+        }
+    }
+
+    fn finish_host_read(&mut self) {
+        if let Err(error) = self.handle.release_host_read() {
+            // This is resource cleanup after the recorded body outcome. Keep
+            // that outcome, seal this owner, and retain its actual process slot.
+            self.config.healthy.store(false, Ordering::Release);
+            tracing::warn!(error = %error, "host read cleanup unconfirmed; retiring its owned worker");
+        }
+    }
+
     fn run_job<R>(
+        &mut self,
+        meta: JobMeta,
+        job: impl Fn(
+            &mut LeanWorkerHostHandle,
+            Vec<String>,
+            &LeanWorkerCancellationToken,
+        ) -> std::result::Result<R, LeanWorkerError>,
+    ) -> Result<ProjectCall<R>> {
+        let result = self.run_job_inner(meta, job);
+        self.finish_host_read();
+        result
+    }
+
+    fn run_job_inner<R>(
         &mut self,
         meta: JobMeta,
         job: impl Fn(
@@ -1925,6 +2047,14 @@ impl ProjectActorState {
         let job_started = Instant::now();
         let cpu_baseline = self.cpu_baseline();
         let mut call_restart: Option<RuntimeRestartEvent> = self.cycle_if_imports_rebuilt(&meta)?;
+        let established = crate::broker::MaintenanceAccess::native_contract(&self.config.toolchain_label)
+            .map_err(ServerError::BadProject)?;
+        let expectation =
+            crate::runtime_compatibility::session_expectation(&self.config.toolchain_label, established.as_ref())
+                .map_err(ServerError::BadProject)?;
+        self.handle
+            .set_host_runtime_expectation(expectation)
+            .map_err(map_worker_err)?;
         let mut lifecycle_baseline = self.handle.lifecycle_snapshot();
 
         let max_retries = meta.retry_policy.retries();
@@ -1944,14 +2074,52 @@ impl ProjectActorState {
             if let Err(error) = &result {
                 // Observing status never dispatches work. In particular, an old
                 // request's receipt cannot settle a failed replacement startup.
-                match self.handle.status() {
-                    Ok(lean_rs_worker_parent::LeanWorkerStatus::Running) => {}
-                    Ok(lean_rs_worker_parent::LeanWorkerStatus::Exited(_)) => {
-                        self.config.healthy.store(false, Ordering::Release);
+                let metadata_refusal =
+                    self.handle.host_session_refusal_since(&checkpoint) == Some("worker_host_runtime_metadata");
+                let lifecycle_uncertain = self.poll_worker_liveness();
+                // This exact marker exists only after a typed metadata response
+                // returned and the parent rejected compatibility. Later cleanup
+                // cannot turn that pre-body refusal into unknown execution.
+                let returned = metadata_refusal
+                    || (matches!(error, LeanWorkerError::Worker { .. })
+                        && !lifecycle_uncertain
+                        && self.config.healthy.load(Ordering::Acquire)
+                        && !self.config.startup_uncertain.load(Ordering::Acquire));
+                if let (Some(file_label), Some(operation)) = (
+                    meta.file_label.as_ref(),
+                    self.handle.host_session_refusal_since(&checkpoint),
+                ) {
+                    let stage = match operation {
+                        "open_worker_session" => Some("host_session_import"),
+                        "worker_host_runtime_metadata" => Some("host_runtime_validation"),
+                        _ => None,
+                    };
+                    if let Some(stage) = stage {
+                        meta.cancellation
+                            .target_check_not_started(crate::envelope::TargetCheckNotStarted {
+                                disposition: "not_started".to_owned(),
+                                file_label: file_label.clone(),
+                                stage: stage.to_owned(),
+                            });
                     }
-                    Err(_) => {
-                        self.config.healthy.store(false, Ordering::Release);
-                        self.config.startup_uncertain.store(true, Ordering::Release);
+                }
+                self.seal_artifact_refusal(error);
+                if metadata_refusal {
+                    self.config.healthy.store(false, Ordering::Release);
+                }
+                if returned {
+                    // A typed terminal error from the healthy owned child is
+                    // known to have returned. It is not a proof result or exit.
+                    final_attempt = FinalAttemptStatus::Completed;
+                } else {
+                    let deferred_stop = self.defer_stop_observation(
+                        &meta,
+                        self.handle.pending_request_stop_since(&checkpoint),
+                        "main",
+                        self.worker_generation_base,
+                        stop_cause(error, &self.handle.lifecycle_snapshot()),
+                    );
+                    if lifecycle_uncertain && !deferred_stop {
                         meta.cancellation.mark_uncertain();
                     }
                 }
@@ -2154,6 +2322,31 @@ impl ProjectActorState {
         );
         runtime.final_attempt = final_attempt;
         runtime.previous_attempt_failure = previous_attempt_failure;
+        if matches!(&exit, JobExit::Done(_)) {
+            let actual = self.handle.host_runtime_metadata().ok_or_else(|| {
+                ServerError::BadProject("actual host runtime metadata missing after completed native call".into())
+            })?;
+            let proposed =
+                crate::runtime_compatibility::contract_from_loaded(actual).map_err(ServerError::BadProject)?;
+            let (instance, contract) = self
+                .config
+                .maintenance
+                .bind_native_contract(&self.config.toolchain_label, &proposed)
+                .map_err(ServerError::BadProject)?;
+            runtime.native_compatibility = Some(
+                crate::runtime_compatibility::evidence(
+                    contract,
+                    instance,
+                    &self.config.lake_root.to_string_lossy(),
+                    &self.config.toolchain_label,
+                    &self.config.session_id,
+                    self.observed_generation(),
+                    &self.handle.runtime_metadata(),
+                    actual,
+                )
+                .map_err(ServerError::BadProject)?,
+            );
+        }
         self.publish_runtime(&runtime);
         match exit {
             JobExit::Done(value) => {
@@ -2183,6 +2376,14 @@ impl ProjectActorState {
         }
     }
 
+    /// An immutable admission snapshot is refreshed by a new broker actor.
+    /// This only retires the owner; it never replays the refused request.
+    fn seal_artifact_refusal(&self, error: &LeanWorkerError) {
+        if matches!(error, LeanWorkerError::Worker { code, .. } if code == "lean_rs.worker.artifact_read_unavailable") {
+            self.config.healthy.store(false, Ordering::Release);
+        }
+    }
+
     fn run_semantic_job(
         &self,
         meta: JobMeta,
@@ -2209,7 +2410,10 @@ impl ProjectActorState {
         let result = (|| {
             let mut session = capability
                 .open_session_with_imports(meta.imports.clone(), Some(meta.cancellation.worker()), None)
-                .map_err(map_worker_err)?;
+                .map_err(|error| {
+                    self.seal_artifact_refusal(&error);
+                    map_worker_err(error)
+                })?;
             crate::semantic_search::run_semantic_proof_search(&mut session, request, meta.cancellation.worker())
         })();
         let call_cpu_millis =
@@ -2218,11 +2422,19 @@ impl ProjectActorState {
         // companion shutdown. Retain the project's slot if its child is uncertain.
         let shutdown = capability.try_shutdown();
         let after = capability.lifecycle_snapshot();
+        let deferred_stop = self.defer_stop_observation(
+            &meta,
+            capability.pending_request_stop_since(&checkpoint),
+            "semantic",
+            0,
+            "semantic_cleanup",
+        );
         let worker_stop_receipt = self.finish_semantic_shutdown(
             &meta,
             &after,
             shutdown,
             capability.confirmed_request_stop_since(&checkpoint),
+            deferred_stop,
         )?;
         let runtime = self.runtime_facts(
             &meta,
@@ -2251,6 +2463,44 @@ impl ProjectActorState {
         }
     }
 
+    /// Retain one exact unresolved direct child for an eventual owned reap.
+    /// A receipt already confirmed before another cleanup failure cannot settle
+    /// that independent replacement uncertainty.
+    fn defer_stop_observation(
+        &self,
+        meta: &JobMeta,
+        pending: Option<lean_rs_worker_parent::LeanWorkerPendingRequestStop>,
+        scope: &'static str,
+        generation_base: u64,
+        cause: &'static str,
+    ) -> bool {
+        let Some(pending) = pending else { return false };
+        let unresolved = pending.confirmed_stop().is_none();
+        let session = self.config.session_id.clone();
+        let id = meta.correlation_id;
+        meta.cancellation.defer_stop_state(
+            id.to_string(),
+            Arc::new(move || {
+                use crate::cancellation::DeferredStopState;
+                if let Some(receipt) = pending.confirmed_stop() {
+                    DeferredStopState::Stopped(confirmed_stop_receipt(
+                        &session,
+                        id,
+                        scope,
+                        generation_base,
+                        &receipt,
+                        cause,
+                    ))
+                } else if pending.scope_closed_without_status() {
+                    DeferredStopState::ScopeClosedWithoutStatus
+                } else {
+                    DeferredStopState::Pending
+                }
+            }),
+        );
+        unresolved
+    }
+
     /// Settle only this semantic companion's observed shutdown. An original
     /// request receipt remains useful even when replacement cleanup is unknown.
     fn finish_semantic_shutdown(
@@ -2259,6 +2509,7 @@ impl ProjectActorState {
         after: &LeanWorkerLifecycleSnapshot,
         shutdown: std::result::Result<LeanWorkerShutdownReport, LeanWorkerError>,
         receipt: Option<&LeanWorkerRequestStopReceipt>,
+        deferred_stop: bool,
     ) -> Result<Option<WorkerStopReceipt>> {
         let worker_stop_receipt = receipt.map(|receipt| {
             confirmed_stop_receipt(
@@ -2278,7 +2529,9 @@ impl ProjectActorState {
             self.config.healthy.store(false, Ordering::Release);
             // An original request receipt does not certify a replacement or
             // any other companion whose shutdown has not been observed.
-            meta.cancellation.mark_uncertain();
+            if !deferred_stop {
+                meta.cancellation.mark_uncertain();
+            }
             return Err(with_stop_receipt(
                 self.worker_unavailable_for(
                     meta,
@@ -2321,8 +2574,13 @@ impl ProjectActorState {
     /// Revisit only with a workload where the semantic child's spawn is a
     /// measured majority of the call — and revert again unless the bench moves.
     fn open_semantic_capability(&self, meta: &JobMeta) -> Result<lean_rs_worker_parent::LeanWorkerCapability> {
-        let runtime = semantic_runtime(&self.config.toolchain_label, &self.config.lean_sysroot).map_err(|err| {
-            self.worker_unavailable_for(
+        let runtime = semantic_runtime(
+            &self.config.toolchain_label,
+            &self.config.lean_sysroot,
+            &meta.cancellation,
+        )
+        .map_err(|err| {
+            let mut error = self.worker_unavailable_for(
                 meta,
                 format!("semantic runtime build failed for this toolchain: {err}"),
                 true,
@@ -2330,11 +2588,16 @@ impl ProjectActorState {
                 None,
                 None,
                 None,
-            )
+            );
+            if let ServerError::WorkerUnavailable(failure) = &mut error {
+                failure.preparation_closed = err.closed();
+            }
+            error
         })?;
         semantic_capability_builder(&self.config, &runtime.built)?
             .open()
             .map_err(|err| {
+                self.seal_artifact_refusal(&err);
                 if startup_outcome_uncertain(&err) {
                     self.config.startup_uncertain.store(true, Ordering::Release);
                 }
@@ -2371,16 +2634,13 @@ impl ProjectActorState {
     /// rebuilt since. Recycling before the job means the job then runs on a
     /// fresh worker, which is why `artifacts_rebuilt` is not an execution taint.
     ///
-    /// Stamps track each named import, including removal and backdated
-    /// replacement, rather than only the newest mtime. Lake must propagate a
-    /// changed transitive dependency to these named imports. A build concurrent
-    /// with execution is not an atomic snapshot; the broker refuses to cache
-    /// such a result, and the following job compares against this pre-job stamp.
+    /// Named-import stamps are a per-profile hint, including removal and
+    /// backdated replacement. They are insufficient when a failed build changed
+    /// a transitive dependency without rebuilding the named import. Actual
+    /// worker read epochs independently invalidate the whole child before
+    /// imported state or a body is reused after such a writer.
     fn cycle_if_imports_rebuilt(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
-        let stamp = crate::cache::ImportArtifactStamp::capture(
-            &lake_meta::artifact_roots(&self.config.lake_root),
-            &meta.imports,
-        );
+        let stamp = crate::cache::ImportArtifactStamp::capture_for_project(&self.config.lake_root, &meta.imports);
         // Recorded unconditionally: this is the stamp of the artifacts the
         // session about to serve the job will have imported, whether that
         // session is a pooled one, the live one, or the replacement opened
@@ -2472,16 +2732,11 @@ impl ProjectActorState {
     /// fresh child, so the next caller does not pay for the emptiness this
     /// created. Bounded by recency: a profile nobody has touched in
     /// [`PREWARM_RECENCY`] is a guess, and a wrong guess costs a real import.
-    /// The bounded wait to arm before the next receive, or `None` to block.
-    ///
-    /// `None` is the normal answer and costs nothing: under the soft budget
-    /// there is no cycle to schedule, so the actor blocks on its mailbox with no
-    /// timer and no extra wakeups. It is also the answer in a synchronous test
-    /// context, where there is no runtime to borrow — the mailbox-empty check in
-    /// the loop still fires, so idle cycling degrades rather than disappearing.
-    fn idle_grace(&self) -> Option<(&tokio::runtime::Handle, Duration)> {
-        let handle = self.config.tokio_handle.as_ref()?;
-        self.over_soft_budget().map(|_residue| (handle, QUIESCENCE_GRACE))
+    /// Minimum quiet period for a residue cycle. Lifecycle observation is
+    /// independent of the residue policy and never resets this quiet period.
+    fn idle_grace(&self) -> Option<Duration> {
+        self.config.tokio_handle.as_ref()?;
+        self.over_soft_budget().map(|_residue| QUIESCENCE_GRACE)
     }
 
     /// The generation's retained residue, if it is worth cycling for.
@@ -2570,6 +2825,7 @@ impl ProjectActorState {
         );
         self.record_restart(event.clone());
         self.publish_runtime(&RuntimeFacts {
+            native_compatibility: None,
             worker_generation: event.worker_generation,
             worker_restarted: true,
             retry_count: 0,
@@ -2595,8 +2851,7 @@ impl ProjectActorState {
         let Some((fingerprint, imports)) = prewarm else {
             return;
         };
-        let stamp =
-            crate::cache::ImportArtifactStamp::capture(&lake_meta::artifact_roots(&self.config.lake_root), &imports);
+        let stamp = crate::cache::ImportArtifactStamp::capture_for_project(&self.config.lake_root, &imports);
         match self.handle.open_session_with_imports(imports.clone(), None, None) {
             Ok(_session) => {
                 // Record it the same way a served job would, so the *next* call
@@ -2605,11 +2860,13 @@ impl ProjectActorState {
                 let _changed = self.note_import_profile(&fingerprint, &imports, stamp);
             }
             Err(err) => {
+                self.seal_artifact_refusal(&err);
                 // Same posture as a failed cycle: nobody is waiting, and the
                 // next real call imports this itself.
                 tracing::debug!(error = %err, "idle pre-warm failed; the next call will import normally");
             }
         }
+        self.finish_host_read();
     }
 
     /// Forget every pooled profile except the one the current job is serving.
@@ -2766,6 +3023,7 @@ impl ProjectActorState {
             );
             self.record_restart(event.clone());
             self.publish_runtime(&RuntimeFacts {
+                native_compatibility: None,
                 worker_generation: self.observed_generation(),
                 worker_restarted: false,
                 retry_count: 0,
@@ -2814,6 +3072,7 @@ impl ProjectActorState {
         let generation = self.observed_generation();
         let snapshot = self.handle.lifecycle_snapshot();
         RuntimeFacts {
+            native_compatibility: None,
             worker_generation: generation,
             worker_restarted: call_restart.is_some() || generation > generation_before,
             retry_count,
@@ -2864,6 +3123,7 @@ impl ProjectActorState {
             retryable,
             worker_restarted,
             worker_stop_receipt: None,
+            preparation_closed: false,
             project_root: self.config.lake_root.to_string_lossy().into_owned(),
             project_hash: self.config.manifest_hash.clone(),
             imports: meta.imports.clone(),
@@ -2900,6 +3160,7 @@ impl ProjectActorState {
             retryable: false,
             worker_restarted: false,
             worker_stop_receipt: None,
+            preparation_closed: false,
             project_root: self.config.lake_root.to_string_lossy().into_owned(),
             project_hash: self.config.manifest_hash.clone(),
             imports: imports.to_vec(),
@@ -2978,10 +3239,28 @@ struct RestartLimitExceeded {
 fn actor_main(
     config: ActorConfig,
     init_reply: std::sync::mpsc::Sender<std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>>,
+    initialization: CallOperation,
 ) {
     let (handle, runtime_toolchain) = match open_worker(&config) {
-        Ok(value) => value,
+        Ok(value) => {
+            initialization.returned();
+            value
+        }
         Err(err) => {
+            // open_worker has returned and this actor is about to exit, so no
+            // later spawn can invalidate zero on this exact configuration.
+            if config.process_tracker.active_processes() == 0 {
+                initialization.returned();
+            } else {
+                let tracker = config.process_tracker.clone();
+                initialization.defer_scope_closed(Arc::new(move || {
+                    if tracker.active_processes() == 0 {
+                        crate::cancellation::DeferredStopState::ScopeClosedWithoutStatus
+                    } else {
+                        crate::cancellation::DeferredStopState::Pending
+                    }
+                }));
+            }
             let _ = init_reply.send(Err(err));
             return;
         }
@@ -3001,6 +3280,7 @@ fn actor_main(
     };
 
     let (tx, mut rx) = mpsc::channel::<ProjectMessage>(config.mailbox_capacity);
+    state.poll_worker_liveness();
     // If the opener disappeared, dropping the returned sender closes rx and
     // still takes the same acknowledged worker shutdown path below.
     let _ = init_reply.send(Ok((runtime_toolchain, tx)));
@@ -3009,24 +3289,34 @@ fn actor_main(
     // time control reaches the bottom of this loop the client already has its
     // answer. That is what makes an idle cycle free: it happens after the work
     // it would otherwise have delayed.
+    let mut idle_since = Instant::now();
     loop {
-        let message = match state.idle_grace() {
+        let message = match config.tokio_handle.as_ref() {
             None => rx.blocking_recv(),
-            // Over the soft budget: wait a bounded moment for the next call
-            // instead of forever, so a genuine pause becomes a chance to
-            // recycle. `block_on` wraps the *receive* only — no Lean session
-            // exists at this point, let alone crosses it.
-            Some((handle, grace)) => match handle.block_on(async { tokio::time::timeout(grace, rx.recv()).await }) {
-                Ok(message) => message,
-                Err(_elapsed) => {
-                    state.cycle_on_quiescence();
-                    continue;
+            Some(handle) => {
+                match handle.block_on(async { tokio::time::timeout(WORKER_LIVENESS_POLL_INTERVAL, rx.recv()).await }) {
+                    Ok(message) => message,
+                    Err(_elapsed) => {
+                        state.poll_worker_liveness();
+                        if !config.healthy.load(Ordering::Acquire) {
+                            rx.close();
+                            continue;
+                        }
+                        if state.idle_grace().is_some_and(|grace| idle_since.elapsed() >= grace) {
+                            state.cycle_on_quiescence();
+                        }
+                        continue;
+                    }
                 }
-            },
+            }
         };
         let Some(message) = message else { break };
+        idle_since = Instant::now();
+        // Even a full mailbox must not starve owned process observation.
+        state.poll_worker_liveness();
         if !config.healthy.load(Ordering::Acquire) {
             message.reject(&state, "project_shutting_down");
+            rx.close();
             continue;
         }
         if message.meta().cancellation.is_cancelled() {
@@ -3038,6 +3328,7 @@ fn actor_main(
             continue;
         }
         state.handle_message(message);
+        idle_since = Instant::now();
         if config.startup_uncertain.load(Ordering::Acquire) || !config.healthy.load(Ordering::Acquire) {
             config.healthy.store(false, Ordering::Release);
             rx.close();
@@ -3071,15 +3362,16 @@ fn open_worker(config: &ActorConfig) -> Result<(LeanWorkerHostHandle, String)> {
     // `open` performs static validation and retains the one resulting worker.
     // `check` would spawn a second preflight child and discard its shutdown
     // result, which cannot establish safe capacity accounting.
-    let builder = worker_builder(config);
+    let builder = worker_builder(config)?;
     // No `RssHardLimitExceeded` arm: this server no longer sets
     // `rss_hard_limit`, so the supervisor cannot produce one. See
     // `lean_max_memory_kib_for`.
     let handle = builder.open().map_err(|error| {
-        if startup_outcome_uncertain(&error) {
-            config.startup_uncertain.store(true, Ordering::Release);
+        let unresolved = config.process_tracker.active_processes() != 0;
+        config.startup_uncertain.store(unresolved, Ordering::Release);
+        if unresolved {
             config.healthy.store(false, Ordering::Release);
-            tracing::error!(error = %error, "worker startup has no confirmed child exit; retaining capacity");
+            tracing::error!(error = %error, "worker startup has an unresolved owned scope; retaining capacity");
         }
         map_worker_err(error)
     })?;
@@ -3129,21 +3421,56 @@ fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
         .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW)
 }
 
-fn worker_builder(config: &ActorConfig) -> LeanWorkerHostHandleBuilder {
+/// One explicit owner namespace and actor slot for ordinary and companion
+/// generations. Prepared storage facts never substitute for loaded checks.
+fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerChild> {
+    let writer = crate::shared_writer::contract()?;
+    // Unit actor tests use a framed Python child that never loads Lean. The
+    // production and integration-test binaries always require prepared custody.
+    #[cfg(test)]
+    if config.prepared_host_artifacts.is_none() {
+        return Ok(
+            LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
+                .shared_writer_executable(writer.executable)
+                .shared_artifact_reads(true),
+        );
+    }
+    if config.prepared_host_artifacts.is_none() {
+        return Err(ServerError::BadProject(
+            "native actor requires prepared host artifacts".to_owned(),
+        ));
+    }
+    let mut child = LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
+        .shared_writer_executable(writer.executable.clone())
+        .native_guardian(writer.executable)
+        .lifetime_directory(writer.ownership_registry)
+        .native_capacity_slot(config.session_id.clone(), scope, config.native_capacity_limit)
+        .shared_artifact_reads(true);
+    if let Some(artifacts) = &config.prepared_host_artifacts {
+        child = child.prepared_host_artifacts(artifacts.clone());
+    }
+    Ok(child)
+}
+
+fn worker_builder(config: &ActorConfig) -> Result<LeanWorkerHostHandleBuilder> {
     let restart_policy = residue_restart_policy(config);
     let module_cache_limits = module_cache_limits();
-    LeanWorkerHostHandleBuilder::shims_only(&config.lake_root, std::iter::empty::<String>())
-        .worker_child(LeanWorkerChild::for_toolchain(
-            config.worker_path.clone(),
-            config.lean_sysroot.clone(),
-        ))
-        .startup_timeout(Duration::from_secs(30))
-        .request_timeout(Duration::from_millis(config.request_timeout_millis))
-        .process_tracker(config.process_tracker.clone())
-        .restart_policy(restart_policy)
-        .session_pool_capacity(config.session_pool_capacity)
-        .lean_max_memory_kib(config.lean_max_memory_kib)
-        .module_cache_limits(module_cache_limits)
+    let contract =
+        crate::broker::MaintenanceAccess::native_contract(&config.toolchain_label).map_err(ServerError::BadProject)?;
+    let expectation = crate::runtime_compatibility::session_expectation(&config.toolchain_label, contract.as_ref())
+        .map_err(ServerError::BadProject)?;
+    Ok(
+        LeanWorkerHostHandleBuilder::shims_only(&config.lake_root, std::iter::empty::<String>())
+            .require_host_runtime(expectation)
+            .worker_child(native_worker_child(config, "main")?)
+            .startup_timeout(Duration::from_secs(30))
+            .request_timeout(Duration::from_millis(config.request_timeout_millis))
+            .process_tracker(config.process_tracker.clone())
+            .restart_policy(restart_policy)
+            .session_pool_capacity(config.session_pool_capacity)
+            .lean_max_memory_kib(config.lean_max_memory_kib)
+            .module_cache_limits(module_cache_limits),
+    )
 }
 
 fn semantic_capability_builder(
@@ -3153,13 +3480,15 @@ fn semantic_capability_builder(
     // See `residue_restart_policy`: bounded by retained bytes, one Lean heap
     // ceiling.
     let restart_policy = residue_restart_policy(config);
+    let contract =
+        crate::broker::MaintenanceAccess::native_contract(&config.toolchain_label).map_err(ServerError::BadProject)?;
+    let expectation = crate::runtime_compatibility::session_expectation(&config.toolchain_label, contract.as_ref())
+        .map_err(ServerError::BadProject)?;
     let builder = LeanWorkerCapabilityBuilder::from_built_capability(built, std::iter::empty::<String>())
         .map_err(map_worker_err)?
+        .require_host_runtime(expectation)
         .import_workspace_root(config.lake_root.clone())
-        .worker_child(LeanWorkerChild::for_toolchain(
-            config.worker_path.clone(),
-            config.lean_sysroot.clone(),
-        ))
+        .worker_child(native_worker_child(config, "semantic")?)
         .startup_timeout(Duration::from_secs(30))
         .request_timeout(Duration::from_millis(config.request_timeout_millis))
         .process_tracker(config.process_tracker.clone())
@@ -3174,7 +3503,7 @@ fn semantic_capability_builder(
 
 /// Built semantic-search runtimes, one per `(toolchain label, Lean sysroot)`.
 ///
-/// `lean_semantic_search_runtime::build_cached` is cached *on disk*, not in
+/// `lean_semantic_search_runtime::build_cached_with_writer` is cached *on disk*, not in
 /// process: every call re-materializes the source package, takes a filesystem
 /// build lock, and runs a Lake build to conclude there is nothing to do.
 /// Measured warm on this machine at **5.5 ms**, paid on the project's actor
@@ -3193,17 +3522,67 @@ static SEMANTIC_RUNTIMES: std::sync::LazyLock<
     Mutex<std::collections::HashMap<(String, PathBuf), lean_semantic_search_runtime::SemanticSearchRuntime>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// Memoized [`lean_semantic_search_runtime::build_cached`]; see
-/// [`SEMANTIC_RUNTIMES`]. Failures are never cached — a build that failed
-/// because a toolchain was mid-install must be retried, not remembered.
-///
-/// The error is a rendered message rather than a [`ServerError`] so the caller
-/// keeps deciding what a failure means; it wraps this in the same structured
-/// `worker_unavailable` it always did.
+/// Preserve writer evidence until the parent resolves this operation. A
+/// diagnostic string alone cannot distinguish no result from uncertain cleanup.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct SemanticRuntimeFailure {
+    message: String,
+    writer: Option<lean_toolchain::shared_writer::WriterFailure>,
+}
+
+impl SemanticRuntimeFailure {
+    fn from_error(error: impl std::error::Error + 'static) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut writer = None;
+        while let Some(current) = source {
+            writer = current
+                .downcast_ref::<lean_toolchain::shared_writer::WriterFailure>()
+                .cloned()
+                .or_else(|| {
+                    current
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(lean_toolchain::shared_writer::WriterFailure::from_io)
+                        .cloned()
+                });
+            if writer.is_some() {
+                break;
+            }
+            source = current.source();
+        }
+        Self {
+            message: error.to_string(),
+            writer,
+        }
+    }
+
+    fn closed(&self) -> bool {
+        matches!(
+            self.writer.as_ref().map(|failure| failure.disposition),
+            Some(
+                lean_toolchain::shared_writer::WriterDisposition::NotStarted
+                    | lean_toolchain::shared_writer::WriterDisposition::Stopped
+            )
+        )
+    }
+}
+
+/// Memoized supervised semantic runtime build; failures are never cached.
 fn semantic_runtime(
     toolchain_label: &str,
     lean_sysroot: &Path,
-) -> std::result::Result<lean_semantic_search_runtime::SemanticSearchRuntime, String> {
+    cancellation: &CallCancellation,
+) -> std::result::Result<lean_semantic_search_runtime::SemanticSearchRuntime, SemanticRuntimeFailure> {
+    if cancellation.is_cancelled() {
+        return Err(SemanticRuntimeFailure::from_error(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            lean_toolchain::shared_writer::WriterFailure {
+                disposition: lean_toolchain::shared_writer::WriterDisposition::NotStarted,
+                detail: "semantic runtime preparation cancelled before admission".to_owned(),
+                stop_receipt: None,
+            },
+        )));
+    }
     let key = (toolchain_label.to_owned(), lean_sysroot.to_path_buf());
     // Bound the guard to a statement so the lock is released before the build
     // below, rather than living to the end of an `if let`.
@@ -3211,13 +3590,21 @@ fn semantic_runtime(
     if let Some(runtime) = cached {
         return Ok(runtime);
     }
-    let cache_root = semantic_runtime_cache_root().map_err(|err| err.to_string())?;
-    let runtime = lean_semantic_search_runtime::build_cached(SemanticSearchRuntimeBuild {
-        cache_root,
-        toolchain_label: toolchain_label.to_owned(),
-        lean_sysroot: lean_sysroot.to_path_buf(),
-    })
-    .map_err(|err| err.to_string())?;
+    let cache_root = semantic_runtime_cache_root().map_err(SemanticRuntimeFailure::from_error)?;
+    // This build runs in the parent, so a child-only environment binding cannot
+    // provide writer custody. Select this executable's helper explicitly.
+    let writer = crate::shared_writer::contract().map_err(SemanticRuntimeFailure::from_error)?;
+    let runtime = lean_semantic_search_runtime::build_cached_with_writer(
+        SemanticSearchRuntimeBuild {
+            cache_root,
+            toolchain_label: toolchain_label.to_owned(),
+            lean_sysroot: lean_sysroot.to_path_buf(),
+        },
+        &writer.executable,
+        Duration::from_secs(120),
+        || cancellation.is_cancelled(),
+    )
+    .map_err(SemanticRuntimeFailure::from_error)?;
     SEMANTIC_RUNTIMES.lock().insert(key, runtime.clone());
     Ok(runtime)
 }
@@ -3227,6 +3614,10 @@ fn semantic_runtime_cache_root() -> Result<PathBuf> {
         dirs::cache_dir().ok_or_else(|| ServerError::Internal("could not resolve user cache directory".to_owned()))?;
     Ok(cache_dir.join("lean-host-mcp").join("semantic-runtimes"))
 }
+
+#[cfg(test)]
+#[path = "project/semantic_preparation_tests.rs"]
+mod semantic_preparation_tests;
 
 /// Worker-side module snapshot cache limits.
 ///
@@ -3274,11 +3665,11 @@ fn worker_death_cause(err: &LeanWorkerError) -> RestartCause {
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "protocol 12 accounting retirement is handled by stable name above the match, preserving compatibility with published lean-rs"
+    reason = "protocol 13 accounting retirement is handled by stable name above the match, preserving compatibility with published lean-rs"
 )]
 fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
     // Match the stable name to retain compatibility with the published lean-rs
-    // version while protocol 12 is prepared for release.
+    // version while protocol 13 is prepared for release.
     if reason.stable_cause() == RestartCause::ImportAccountingUnknown.as_str() {
         return "import_accounting_unknown: retained memory could not be measured after an import error".to_owned();
     }
@@ -3763,13 +4154,15 @@ mod tests {
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
         }));
-        let config = ActorConfig {
+        let mut config = ActorConfig {
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: tmp.path().join("consumer"),
             manifest_hash: "sha256-test".to_owned(),
-            toolchain_label: "leanprover/lean4:test".to_owned(),
+            toolchain_label: "leanprover/lean4:v4.35.0".to_owned(),
             worker_path: tmp.path().join("worker"),
             lean_sysroot: tmp.path().join("lean"),
+            prepared_host_artifacts: None,
+            native_capacity_limit: crate::broker::DEFAULT_MAX_PROJECTS,
             session_id: "session-test".to_owned(),
             runtime,
             healthy: Arc::new(AtomicBool::new(true)),
@@ -3798,6 +4191,11 @@ mod tests {
         assert!(
             debug.contains("import_workspace_root: Some"),
             "builder should import sessions against the consumer workspace: {debug}"
+        );
+        config.toolchain_label = "leanprover/lean4:test".to_owned();
+        assert!(
+            semantic_capability_builder(&config, &built).is_err(),
+            "unsupported toolchain cannot bypass the first-session expectation"
         );
     }
 
@@ -4202,6 +4600,7 @@ mod tests {
         let (reply, _receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
             meta: JobMeta {
+                file_label: None,
                 queue: Arc::new(QueueDeadline::new(Duration::from_secs(30))),
                 imports: vec!["Init".to_owned()],
                 import_fingerprint: "Init".to_owned(),

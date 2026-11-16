@@ -44,6 +44,25 @@ struct Cli {
 enum Command {
     /// Run the stdio MCP server (default when no subcommand is given).
     Serve(ServeArgs),
+    /// Internal process-bound shared-writer supervisor.
+    Writer(lean_host_mcp::shared_writer::WriterArgs),
+    /// Resolve the shared project-lock domain without starting runtime work.
+    #[command(hide = true)]
+    WriterLockPath(lean_host_mcp::shared_writer::WriterLockPathArgs),
+    /// Internal transfer of shared read custody to an actual worker.
+    Reader(lean_host_mcp::shared_writer::ReaderArgs),
+    /// Internal parent-cache read without a parent locked descriptor.
+    ReadProxy(lean_host_mcp::shared_writer::ReadProxyArgs),
+    #[command(hide = true)]
+    WriterExec,
+    /// Internal independent owner for a native worker generation.
+    #[command(hide = true)]
+    NativeGuardian,
+    /// Internal guardian-owned execution of one prebuilt native reader.
+    #[command(hide = true)]
+    NativeReader(lean_host_mcp::native_reader::NativeReaderArgs),
+    #[command(hide = true)]
+    NativeReaderExec(lean_host_mcp::native_reader::NativeReaderArgs),
     /// Build and install a per-toolchain worker binary.
     InstallWorker(InstallWorkerArgs),
     /// Generate and manage the configuration file.
@@ -115,6 +134,63 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("lean-host-mcp doctor processes: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::NativeReader(args)) => match lean_host_mcp::native_reader::run_cli(&args) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(error) => {
+                eprintln!("lean-host-mcp native-reader: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::NativeReaderExec(args)) => match lean_host_mcp::native_reader::run_exec(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp native-reader-exec: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::NativeGuardian) => match lean_toolchain::native_guardian::run_guardian_cli() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp native-guardian: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::WriterLockPath(args)) => match lean_host_mcp::shared_writer::run_lock_path_cli(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp writer-lock-path: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::ReadProxy(args)) => match lean_host_mcp::shared_writer::run_read_proxy(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp read-proxy: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Reader(args)) => match lean_host_mcp::shared_writer::run_reader(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp reader: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::WriterExec) => match lean_host_mcp::shared_writer::run_exec() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp writer-exec: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Writer(args)) => match lean_host_mcp::shared_writer::run_cli(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp writer: {error}");
                 ExitCode::FAILURE
             }
         },

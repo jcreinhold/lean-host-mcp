@@ -20,6 +20,34 @@ use trusted local clients and projects. `lean_runtime` may pause admission or ex
 Invocation/runtime failures with no domain data set MCP `isError: true` and retain the semantic `errors` and `trust`
 envelope. Negative proof/check verdicts remain successful tool executions with domain data, not MCP errors.
 
+## Native compatibility
+
+`lean_compatibility` is a synchronous operational handshake:
+
+```json
+{"name":"lean_compatibility","arguments":{"project":"/absolute/project"}}
+```
+
+The broker admits and opens a real host session under its ordinary worker capacity. The handshake executes no target
+proof. It returns `status: "ok"` and one `native_compatibility` object containing the broker instance, a contract
+digest, the expected native API/lifecycle/binding contract, and actual actor/generation-bound loaded receipts. The same
+object carries `shared_writer: {protocol: 1, executable: ...}` from the server's current executable; its required
+protocol is part of the expected contract while the executable is an instance-bound observation. Every writer client
+negotiates that executable's JSON protocol before launching a write. Worker package versions are observations;
+compatibility is not tied to an executable hash or source checkout revision. Compiled Lean version/header facts are
+separate from `runtime_lean_version`, which comes through the loaded version shim.
+
+The broker binds its required host ABI subset for its lifetime and checks that subset on every later host session,
+including after internal replacement. Extra compatible loaded operations are allowed. A missing or incompatible runtime
+is refused before the caller submits its proof. Compatibility never certifies execution, a proof verdict, worker exit,
+absence of prior IO, or readiness of arbitrary first-party artifacts.
+
+Save the contract and instance with the prepared request. Semantic responses carry the actual call's receipt at
+`trust.native_compatibility`, even with quiet telemetry. Validate it against the saved contract before accepting a
+result; a later broker instance does not rewrite the old request's identity. Retained recovery uses the original ticket
+rather than submitting again. `lean_runtime(action=status)` remains a non-mutating advisory snapshot and never opens a
+worker.
+
 ## Tool Roles
 
 - `lean_status`: cheap project, toolchain, build-artifact, and diagnostics status. Use it before spending a worker
@@ -990,3 +1018,12 @@ semantic modes.
 | `find_references` | `lean_lookup`, `kind: "references"` |
 
 Do not re-add compatibility aliases for the old names.
+
+Artifact-backed declaration inventory and reference queries report `unavailable` when shared read custody cannot be
+established. They do not reinterpret a busy or unconfirmed writer as an empty index or a missing build. Retry after the
+current writer finishes. Custody describes a consistent artifact read; source/index freshness and exact content binding
+remain separate trust facts.
+
+`lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and helper
+configuration without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded handshake.
+A client requiring pure discovery must not remove the mode or fall back to loaded discovery after an error.
