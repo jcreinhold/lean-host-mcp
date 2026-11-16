@@ -22,7 +22,23 @@ const LIMIT: Duration = Duration::from_secs(5);
 const ADMISSION: &str = "0.05";
 
 fn executable() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
+    // Explicit frozen images let the same real lifecycle assertions qualify a
+    // release binary. An unset override retains ordinary Cargo integration tests.
+    static HELPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HELPER
+        .get_or_init(|| match std::env::var_os("LEAN_HOST_MCP_CLI_TEST_HELPER") {
+            Some(value) => {
+                let path = PathBuf::from(value);
+                assert!(
+                    path.is_absolute() && path.is_file(),
+                    "explicit helper must be an absolute executable file"
+                );
+                assert_eq!(path.canonicalize().expect("canonical test helper"), path);
+                path
+            }
+            None => PathBuf::from(env!("CARGO_BIN_EXE_lean-host-mcp")),
+        })
+        .as_path()
 }
 
 struct Fixture {
