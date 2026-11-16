@@ -76,9 +76,33 @@ const SMOKE_STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
 /// failure, or inability to complete the probe — it never panics and never
 /// returns an `Err`, so the caller always gets a recordable verdict.
 ///
-/// `toolchain` is used only for diagnostics framing; resolution of the worker
-/// binary and sysroot is the caller's job (it just built them).
+/// `toolchain` selects the compiled host compatibility expectation; resolution
+/// of the worker binary and sysroot is the caller's job (it just built them).
 pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &ToolchainId) -> SmokeOutcome {
+    let writer = match crate::shared_writer::contract() {
+        Ok(writer) => writer,
+        Err(error) => {
+            return SmokeOutcome::Failed {
+                detail: format!("smoke helper configuration failed: {error}"),
+            };
+        }
+    };
+    probe_with_writer(
+        worker_path,
+        lean_sysroot,
+        toolchain,
+        writer,
+        &LeanWorkerProcessTracker::new(),
+    )
+}
+
+fn probe_with_writer(
+    worker_path: &Path,
+    lean_sysroot: &Path,
+    toolchain: &ToolchainId,
+    writer: crate::shared_writer::WriterContract,
+    tracker: &LeanWorkerProcessTracker,
+) -> SmokeOutcome {
     // A throwaway working directory: the probe imports only `Init` (resident in
     // the toolchain's sysroot), so `LeanHost::from_lake_project` needs the root
     // to be a directory, not a real Lake project.
@@ -91,11 +115,14 @@ pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &Toolcha
         }
     };
 
-    let writer = match crate::shared_writer::contract() {
-        Ok(writer) => writer,
+    // macOS temporary directories commonly use /var, an alias of /private/var.
+    // The child reports canonical custody domains, and the supervisor compares
+    // that receipt with the configured project root before permitting a body.
+    let canonical_root = match project_root.path().canonicalize() {
+        Ok(root) => root,
         Err(error) => {
             return SmokeOutcome::Failed {
-                detail: format!("smoke helper configuration failed: {error}"),
+                detail: format!("could not canonicalize smoke working directory for {toolchain}: {error}"),
             };
         }
     };
@@ -128,7 +155,7 @@ pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &Toolcha
                 };
             }
         };
-    if let Err(error) = std::fs::create_dir(project_root.path().join(".lake")) {
+    if let Err(error) = std::fs::create_dir(canonical_root.join(".lake")) {
         return SmokeOutcome::Failed {
             detail: format!("could not prepare private smoke workspace: {error}"),
         };
@@ -137,7 +164,6 @@ pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &Toolcha
         Ok(expectation) => expectation,
         Err(detail) => return SmokeOutcome::Failed { detail },
     };
-    let tracker = LeanWorkerProcessTracker::new();
     // An install smoke owns a temporary unscoped generation; it must never
     // invent a broker capacity limit or share an unrelated actor's slot.
     let child = LeanWorkerChild::for_toolchain(worker_path, lean_sysroot)
@@ -146,7 +172,7 @@ pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &Toolcha
         .lifetime_directory(writer.ownership_registry)
         .prepared_host_artifacts(prepared)
         .shared_artifact_reads(true);
-    let open = LeanWorkerHostHandleBuilder::shims_only(project_root.path(), std::iter::empty::<String>())
+    let open = LeanWorkerHostHandleBuilder::shims_only(&canonical_root, std::iter::empty::<String>())
         .require_host_runtime(expectation)
         .worker_child(child)
         .process_tracker(tracker.clone())
@@ -223,6 +249,33 @@ mod tests {
         );
         assert!(matches!(result, SmokeOutcome::Failed { detail } if detail.contains("artifact readiness failed")));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Runs the same guarded install probe with an actual matching worker and
+    /// helper. The common registry must be drained, just as for installation.
+    #[test]
+    #[ignore = "requires LEAN_HOST_MCP_SMOKE_WORKER, LEAN_HOST_MCP_SMOKE_HELPER and a drained native registry"]
+    fn actual_guarded_smoke_uses_canonical_temporary_project_custody() {
+        let worker = std::env::var_os("LEAN_HOST_MCP_SMOKE_WORKER").expect("actual worker path");
+        let helper = std::env::var_os("LEAN_HOST_MCP_SMOKE_HELPER").expect("actual helper path");
+        let toolchain = ToolchainId::parse("v4.35.0").expect("supported toolchain");
+        let sysroot = toolchain.elan_dir().expect("installed test toolchain");
+        let mut writer = crate::shared_writer::contract().expect("common native namespace");
+        writer.executable = std::path::PathBuf::from(helper)
+            .canonicalize()
+            .expect("canonical helper");
+        let tracker = LeanWorkerProcessTracker::new();
+        let outcome = probe_with_writer(Path::new(&worker), &sysroot, &toolchain, writer, &tracker);
+        assert_eq!(
+            outcome,
+            SmokeOutcome::Passed,
+            "actual guarded Init/Nat.add_zero smoke must complete and reap"
+        );
+        assert_eq!(
+            tracker.active_processes(),
+            0,
+            "all actual native scopes must be physically closed"
+        );
     }
 
     #[test]

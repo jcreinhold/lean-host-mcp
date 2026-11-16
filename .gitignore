@@ -16,3 +16,6 @@ __pycache__/
 .claude/scheduled_tasks.lock
 .pi/sessions/
 .pi/tasks/
+
+# Persistent artifact-lock inodes remain on disk and are never source inputs.
+**/.lean-rs-writer-*.lock
