@@ -32,6 +32,11 @@ import urllib.parse
 LIMIT = 20.0
 CAPACITY = 4
 PROOF = "example (n : Nat) : n + 0 = n := Nat.add_zero n"
+HEADER_DIGEST = "eb951e1171d39b828e7ad60aed0b90759598b678bfe58cf85c65a1559c021bf9"
+DEVELOPMENT_PROVENANCE_WARNING = (
+    "worker for v4.35.0 has no provenance record (installed by an older host); "
+    "reinstall to enable header-drift detection: lean-host-mcp install-worker --toolchain v4.35.0"
+)
 
 
 def utc():
@@ -117,6 +122,30 @@ def unwrap(raw):
     if isinstance(raw.get("structuredContent"), dict):
         return raw["structuredContent"]
     return json.loads(next(row["text"] for row in raw["content"] if row.get("type") == "text"))
+
+
+def trial_receipt(payload, project):
+    # Bare developer images have no installer sidecar. Accept precisely that
+    # known warning; the frozen byte hashes and actual loaded ABI/header/runtime
+    # receipts below remain mandatory. Never manufacture provenance metadata.
+    for error in payload["errors"]:
+        require(error == {"severity": "warning", "code": "warning",
+                          "message": DEVELOPMENT_PROVENANCE_WARNING}, error)
+    require(payload["data"]["diagnostics"]["summary"]["errors"] == 0, payload)
+    compatibility = payload["trust"]["native_compatibility"]
+    expected = compatibility["expected"]["required_host_bindings"]
+    require(len(expected) == 3, "compiled expected ABI contract must contain all three bindings")
+    loaded = compatibility["loaded"]
+    require(loaded, "actual loaded compatibility required")
+    for row in loaded:
+        require(row["project_root"] == str(project) and row["protocol_version"] == 13, row)
+        facts = row["loaded"]
+        require(facts["compiled_header_sha256"] == HEADER_DIGEST, facts)
+        require(facts["compiled_lean_version"] == "4.35.0" and facts["runtime_lean_version"] == "4.35.0", facts)
+        require(facts["checked_host_bindings"].items() >= expected.items(), facts)
+        require(any(epoch["project_root"] == str(project) and epoch["epoch"]
+                    for epoch in facts["artifact_read_epochs"]), facts)
+    return [(row["worker_session_id"], row["worker_generation"]) for row in loaded]
 
 
 class Client:
@@ -207,12 +236,7 @@ class Client:
     def trial(self, project, commands=PROOF):
         payload = self.tool("lean_trial", {"kind": "command", "project": str(project),
                                           "imports": ["Init"], "commands": commands})
-        require(not payload["errors"], payload)
-        require(payload["data"]["diagnostics"]["summary"]["errors"] == 0, payload)
-        loaded = payload["trust"]["native_compatibility"]["loaded"]
-        require(loaded, "actual loaded compatibility required")
-        require(all(row["loaded"]["artifact_read_epochs"] for row in loaded), loaded)
-        return [(row["worker_session_id"], row["worker_generation"]) for row in loaded]
+        return trial_receipt(payload, project)
 
 
 def project(root, name):
@@ -535,9 +559,7 @@ class Harness:
         require(result["status"] == "completed" and result["result_available"], result)
         require(result["execution"]["disposition"] != "unknown", result)
         payload = unwrap(result["result"])
-        require(not payload["errors"] and payload["data"]["diagnostics"]["summary"]["errors"] == 0, payload)
-        successor = [(row["worker_session_id"], row["worker_generation"])
-                     for row in payload["trust"]["native_compatibility"]["loaded"]]
+        successor = trial_receipt(payload, self.a)
         require(matching_marker.exists() and successor and successor != after_a,
                 "successor did not run after actual closure")
         # The complete terminal result is already saved before the sole own ACK.
