@@ -27,7 +27,8 @@ if os.environ.get('NATIVE_READER_CANCEL_ID'):
 signal.alarm(8)
 if os.environ.get('NATIVE_READER_STDIN_FIXTURE'):
     (root / 'received-stdin').write_bytes(sys.stdin.buffer.read())
-(root / 'payload').write_text(str(os.getpid()))
+(root / 'payload.pending').write_text(str(os.getpid()))
+(root / 'payload.pending').replace(root / 'payload')
 if (root / 'descendant-mode').exists():
     leaf = '''import os,signal,time,sys
 from pathlib import Path
@@ -35,7 +36,8 @@ root=Path(sys.argv[1]); signal.alarm(8)
 for fd in range(0,4096):
  try: os.close(fd)
  except OSError: pass
-(root/'leaf').write_text(str(os.getpid()))
+(root/'leaf.pending').write_text(str(os.getpid()))
+(root/'leaf.pending').replace(root/'leaf')
 while True:
  (root/'heartbeat').write_text(str(time.monotonic_ns()))
  time.sleep(.01)
@@ -294,7 +296,8 @@ root=Path(sys.argv[1])
 env=os.environ.copy(); env['LEAN_RS_WORKER_OWNERS_DIRECTORY']=str(root/'owners')
 with (root/'reader-result').open('wb') as output:
  child=subprocess.Popen(json.loads(sys.argv[2]),env=env,stdout=output,stderr=subprocess.DEVNULL)
- (root/'controller').write_text(str(child.pid))
+ (root/'controller.pending').write_text(str(child.pid))
+ (root/'controller.pending').replace(root/'controller')
  while not (root/'caller-exit').exists(): time.sleep(.01)
 os._exit(0)
 ";
