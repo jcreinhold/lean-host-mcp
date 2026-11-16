@@ -302,7 +302,7 @@ mod tests {
     /// Bypass broker admission to reproduce the race after a caller has already
     /// borrowed its warm actor. The guardian still owns the old SH descriptions.
     #[test]
-    #[ignore = "requires matching LEAN_HOST_MCP_SMOKE_WORKER and LEAN_HOST_MCP_SMOKE_HELPER"]
+    #[ignore = "requires matching worker/helper and explicit canonical LEAN_RS_WORKER_OWNERS_DIRECTORY"]
     fn actual_warm_worker_contention_cycles_before_one_target_body() {
         use std::fs;
         use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -343,8 +343,18 @@ mod tests {
         fs::create_dir(&root).expect("private consumer root");
         fs::create_dir(root.join(".lake")).expect("private Lake domain");
         fs::write(root.join("lake-manifest.json"), "{\"packages\":[]}\n").expect("fixed empty dependency graph");
-        let registry = workspace.join("owners");
-        fs::create_dir(&registry).expect("private native registry");
+        // The parent validates this explicit lifetime directory against the
+        // inherited registry used by readiness helpers and the writer client.
+        // The opt-in test caller creates and binds a private registry first.
+        let registry = std::path::PathBuf::from(
+            std::env::var_os(lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV)
+                .expect("explicit private native registry for the actual warm test"),
+        );
+        assert!(
+            registry.is_absolute() && registry.is_dir(),
+            "existing absolute private registry required"
+        );
+        assert_eq!(registry.canonicalize().expect("canonical private registry"), registry);
         let prepared =
             crate::host_preparation::probe_ready(&worker, &sysroot, &helper, SMOKE_STARTUP_TIMEOUT, &|| false)
                 .expect("actual runtime-free readiness")
