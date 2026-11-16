@@ -101,6 +101,14 @@ receipts, including frozen dependencies and companions, rather than a newly redu
 gate can also cause conservative backpressure or idle retirement; it is not evidence of a writer identity. The protocol
 does not claim FIFO ordering among multiple writers or defeat OS scheduling/filesystem stalls.
 
+The generic `reader` and `read-proxy` admissions still refuse writer demand before Ready. They can be composed across
+multiple physical domains, so waiting while retaining an earlier shared lock would create a reader/writer cycle.
+A metadata caller holding no other artifact read or write custody may explicitly select
+`read-proxy --single-domain-wait`. This one-domain proxy retries only lock admission under its original absolute
+admission deadline, closes transient gates before waiting, and observes its private FIFO caller on each iteration and
+again before Ready. EOF or deadline expiry emits no Ready. Metadata executes once in the caller after that receipt;
+neither a metadata body nor a target check is retried. SDK multi-domain readiness probes retain the fail-fast default.
+
 The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
 cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
 project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.

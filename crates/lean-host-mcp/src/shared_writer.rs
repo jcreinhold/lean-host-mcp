@@ -113,6 +113,9 @@ pub struct ReaderArgs {
 /// Internal read custody for parent-only cache work, without a parent lock FD.
 #[derive(Debug, clap::Args)]
 pub struct ReadProxyArgs {
+    /// Wait on one metadata domain; caller must hold no other artifact custody.
+    #[arg(long)]
+    single_domain_wait: bool,
     root: PathBuf,
     lock: PathBuf,
     admission: f64,
@@ -271,6 +274,12 @@ fn canonical(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ReaderDemandPolicy {
+    FailFast,
+    WaitSingleDomain,
+}
+
 fn acquire(path: &Path, timeout: Duration, shared: bool) -> io::Result<(File, Option<Record>)> {
     acquire_while(path, timeout, shared, || Ok(true))
 }
@@ -279,6 +288,19 @@ fn acquire_while(
     path: &Path,
     timeout: Duration,
     shared: bool,
+    caller_alive: impl FnMut() -> io::Result<bool>,
+) -> io::Result<(File, Option<Record>)> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| invalid("writer timeout is too large"))?;
+    acquire_while_until(path, deadline, shared, ReaderDemandPolicy::FailFast, caller_alive)
+}
+
+fn acquire_while_until(
+    path: &Path,
+    deadline: Instant,
+    shared: bool,
+    demand_policy: ReaderDemandPolicy,
     mut caller_alive: impl FnMut() -> io::Result<bool>,
 ) -> io::Result<(File, Option<Record>)> {
     canonical(path.parent().ok_or_else(|| invalid("writer lock has no parent"))?)?;
@@ -291,9 +313,6 @@ fn acquire_while(
         .create(true)
         .truncate(false)
         .open(path)?;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| invalid("writer timeout is too large"))?;
     loop {
         if !caller_alive()? {
             return Err(io::Error::new(
@@ -301,18 +320,32 @@ fn acquire_while(
                 "read proxy caller closed before admission",
             ));
         }
-        // A multi-domain reader may already hold an earlier SH domain. Never
-        // wait behind demand here: refuse before the body and drop its partial
-        // scope, otherwise an all-domain writer can wait cyclically on that SH.
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "artifact admission deadline elapsed",
+            ));
+        }
+        // Generic readers can already hold earlier SH domains and must refuse
+        // demand before their body. Only the explicit single-domain metadata
+        // proxy may wait, with no other artifact custody and no target replay.
         let admission = if shared {
             match ReadAdmission::try_acquire(&[path.to_path_buf()]) {
                 Ok(Some(admission)) => Some(admission),
-                Ok(None) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "artifact writer demand prevents new read admission",
-                    ));
-                }
+                Ok(None) => match demand_policy {
+                    ReaderDemandPolicy::FailFast => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "artifact writer demand prevents new read admission",
+                        ));
+                    }
+                    ReaderDemandPolicy::WaitSingleDomain => {
+                        // try_acquire closed every transient gate. Retry only
+                        // admission under the original deadline and FIFO owner.
+                        thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+                        continue;
+                    }
+                },
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     // Another reader holds only a transient gate, never an
                     // artifact wait. All partial gates were closed by try_acquire.
@@ -336,7 +369,7 @@ fn acquire_while(
             Ok(()) => {}
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 drop(admission);
-                thread::sleep(POLL);
+                thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
                 continue;
             }
             Err(TryLockError::WouldBlock) => {
@@ -370,7 +403,7 @@ fn acquire_while(
                     "previous writer process group remains live",
                 ));
             }
-            thread::sleep(POLL);
+            thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
             continue;
         }
         return Ok((file, previous));
@@ -482,6 +515,9 @@ fn fifo_closed(file: &mut File) -> io::Result<bool> {
 /// # Errors
 /// Returns admission, private FIFO, or metadata delivery errors.
 pub fn run_read_proxy(args: &ReadProxyArgs) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(duration(args.admission)?)
+        .ok_or_else(|| invalid("reader proxy timeout is too large"))?;
     canonical(&args.root)?;
     if args.lock != lean_toolchain::shared_writer::project_lock_path(&args.root)? {
         return Err(invalid("reader proxy lock differs from canonical project domain"));
@@ -510,11 +546,28 @@ pub fn run_read_proxy(args: &ReadProxyArgs) -> io::Result<()> {
     if args.nonce.is_empty() || args.nonce.len() > 256 {
         return Err(invalid("bounded reader nonce required"));
     }
-    let (file, previous) = acquire_while(&args.lock, duration(args.admission)?, true, || {
+    let demand_policy = if args.single_domain_wait {
+        ReaderDemandPolicy::WaitSingleDomain
+    } else {
+        ReaderDemandPolicy::FailFast
+    };
+    let (file, previous) = acquire_while_until(&args.lock, deadline, true, demand_policy, || {
         fifo_closed(&mut control).map(|closed| !closed)
     })?;
     let epoch = serde_json::to_string(&previous.as_ref().map(|record| &record.owner)).map_err(io::Error::other)?;
     let identity = file.metadata()?;
+    if fifo_closed(&mut control)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "read proxy caller closed before readiness",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "reader proxy admission deadline elapsed",
+        ));
+    }
     send(
         &json!({"protocol":PROTOCOL,"state":"read_ready","project_root":args.root,
         "nonce":args.nonce,"epoch":epoch,"custody":"proxy",

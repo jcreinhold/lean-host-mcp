@@ -54,7 +54,7 @@ struct Endpoints {
     socket: PathBuf,
     listener: UnixListener,
     fifo: PathBuf,
-    _control: File,
+    control: File,
 }
 
 impl Endpoints {
@@ -86,7 +86,7 @@ impl Endpoints {
             socket,
             listener,
             fifo,
-            _control: control,
+            control,
         }
     }
 
@@ -186,6 +186,32 @@ impl OwnedHelper {
         let line = self.lines.recv_timeout(LIMIT).expect("bounded helper reply");
         self.observed.extend_from_slice(&line);
         serde_json::from_slice(&line).expect("valid helper JSON")
+    }
+
+    fn waiting_without_frame(&mut self) {
+        assert!(
+            self.child
+                .as_mut()
+                .expect("owned helper")
+                .try_wait()
+                .expect("live admission waiter")
+                .is_none(),
+            "helper exited before its held-domain wait"
+        );
+        match self.lines.recv_timeout(Duration::from_millis(50)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(frame) => panic!("helper emitted a frame beneath held writer custody: {frame:?}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("helper refused instead of waiting for writer custody"),
+        }
+        assert!(
+            self.child
+                .as_mut()
+                .expect("owned helper")
+                .try_wait()
+                .expect("same live admission waiter")
+                .is_none(),
+            "helper exited rather than retaining the same admission attempt"
+        );
     }
 
     fn close_input(&mut self) {
@@ -513,4 +539,204 @@ fn partial_multi_domain_reader_refuses_demand_without_a_reader_writer_cycle() {
     writer.close_input();
     assert!(writer.finish().status.success());
     cli_writer_succeeds(&fixture);
+}
+
+fn single_domain_proxy(fixture: &Fixture, endpoints: &Endpoints, admission: &str) -> OwnedHelper {
+    let mut command = Client::Proxy.command(&fixture.root, &fixture.domain, endpoints, admission);
+    command.arg("--single-domain-wait");
+    OwnedHelper::spawn(&mut command)
+}
+
+fn one_proxy_ready(proxy: &mut OwnedHelper, fixture: &Fixture) {
+    let ready = proxy.frame();
+    assert_eq!(ready["state"], "read_ready");
+    assert_eq!(
+        ready["project_root"],
+        fixture.root.to_str().expect("canonical UTF8 root")
+    );
+    assert_eq!(ready["nonce"], "domain-test-nonce");
+    assert_eq!(ready["custody"], "proxy");
+    assert!(ready["epoch"].as_str().is_some_and(|epoch| !epoch.is_empty()));
+}
+
+fn closed_proxy_with_one_ready(proxy: OwnedHelper) {
+    let output = proxy.finish();
+    assert!(
+        output.status.success(),
+        "proxy failed after actual read admission: {output:?}"
+    );
+    let frames = String::from_utf8(output.stdout).expect("UTF8 proxy frames");
+    assert_eq!(
+        frames.lines().count(),
+        1,
+        "same proxy emitted more than one ready frame"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(frames.trim()).expect("one ready frame")["state"],
+        "read_ready"
+    );
+}
+
+#[test]
+#[serial]
+fn explicit_single_domain_proxy_waits_through_demand_and_ex_in_one_attempt() {
+    let fixture = Fixture::new();
+    // Model a separate reader client with its own helper-owned SH. The metadata
+    // proxy receives no artifact descriptor or partial multi-domain read scope.
+    let original_endpoints = Endpoints::new();
+    let mut original =
+        OwnedHelper::spawn(&mut Client::Proxy.command(&fixture.root, &fixture.domain, &original_endpoints, "3"));
+    one_proxy_ready(&mut original, &fixture);
+    let writer_endpoints = Endpoints::new();
+    let mut writer =
+        OwnedHelper::spawn(&mut Client::Writer.command(&fixture.root, &fixture.domain, &writer_endpoints, "4"));
+    wait_for_writer_demand(std::slice::from_ref(&fixture.domain));
+    let endpoints = Endpoints::new();
+    let mut proxy = single_domain_proxy(&fixture, &endpoints, "4");
+    let attempt_pid = proxy.child.as_ref().expect("actual proxy attempt").id();
+    proxy.waiting_without_frame();
+
+    drop(original_endpoints.control);
+    assert!(original.finish().status.success());
+    assert_eq!(
+        writer.frame()["state"],
+        "locked",
+        "waiting proxy must not retain a gate that blocks writer EX"
+    );
+    proxy.waiting_without_frame();
+    let marker = fixture.root.join("completed-writer-metadata");
+    writer.send(&marker_command(&marker));
+    assert_eq!(writer.frame()["state"], "started");
+    let stopped = writer.frame();
+    assert_eq!(stopped["state"], "stopped");
+    assert_eq!(stopped["owned_work_stopped"], true);
+    assert_eq!(stopped["result"], "result");
+    assert_eq!(stopped["intervened"], false);
+    assert_eq!(stopped["exit_code"], 0);
+    writer.close_input();
+
+    one_proxy_ready(&mut proxy, &fixture);
+    assert_eq!(proxy.child.as_ref().expect("same proxy attempt").id(), attempt_pid);
+    assert_eq!(
+        fs::read(&marker).expect("metadata body only after ready"),
+        b"dispatched"
+    );
+    assert!(writer.finish().status.success());
+    drop(endpoints.control);
+    closed_proxy_with_one_ready(proxy);
+}
+
+#[test]
+#[serial]
+fn explicit_single_domain_proxy_fifo_eof_while_waiting_emits_no_ready() {
+    let fixture = Fixture::new();
+    let writer_endpoints = Endpoints::new();
+    let mut writer =
+        OwnedHelper::spawn(&mut Client::Writer.command(&fixture.root, &fixture.domain, &writer_endpoints, "3"));
+    assert_eq!(writer.frame()["state"], "locked");
+    let endpoints = Endpoints::new();
+    let mut proxy = single_domain_proxy(&fixture, &endpoints, "3");
+    proxy.waiting_without_frame();
+    let started = Instant::now();
+    drop(endpoints.control);
+    let output = proxy.finish();
+    assert!(
+        !output.status.success(),
+        "closed caller must refuse before ready: {output:?}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "caller loss must not publish readiness: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("caller closed"),
+        "caller loss must remain explicit: {output:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "FIFO loss exceeded the bounded wait"
+    );
+    assert!(
+        writer
+            .child
+            .as_mut()
+            .expect("actual writer")
+            .try_wait()
+            .expect("writer still holds EX")
+            .is_none()
+    );
+    writer.close_input();
+    assert!(writer.finish().status.success());
+}
+
+#[test]
+#[serial]
+fn explicit_single_domain_proxy_uses_one_absolute_admission_deadline() {
+    let fixture = Fixture::new();
+    let writer_endpoints = Endpoints::new();
+    let mut writer =
+        OwnedHelper::spawn(&mut Client::Writer.command(&fixture.root, &fixture.domain, &writer_endpoints, "3"));
+    assert_eq!(writer.frame()["state"], "locked");
+    let endpoints = Endpoints::new();
+    let started = Instant::now();
+    let proxy = single_domain_proxy(&fixture, &endpoints, "0.15");
+    let output = proxy.finish();
+    let elapsed = started.elapsed();
+    assert!(
+        !output.status.success() && output.stdout.is_empty(),
+        "deadline must refuse without readiness: {output:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "single-domain proxy refused immediately instead of waiting: {output:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "admission loop reset its original deadline"
+    );
+    let detail = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        detail.contains("timed") || detail.contains("busy") || detail.contains("deadline"),
+        "deadline detail missing: {output:?}"
+    );
+    assert!(
+        writer
+            .child
+            .as_mut()
+            .expect("actual writer")
+            .try_wait()
+            .expect("writer stayed live throughout budget")
+            .is_none()
+    );
+    writer.close_input();
+    assert!(writer.finish().status.success());
+}
+
+#[test]
+#[serial]
+fn own_completed_writer_can_transition_directly_to_one_metadata_proxy() {
+    let fixture = Fixture::new();
+    let writer_endpoints = Endpoints::new();
+    let mut writer =
+        OwnedHelper::spawn(&mut Client::Writer.command(&fixture.root, &fixture.domain, &writer_endpoints, "3"));
+    assert_eq!(writer.frame()["state"], "locked");
+    let marker = fixture.root.join("own-writer-completed");
+    writer.send(&marker_command(&marker));
+    assert_eq!(writer.frame()["state"], "started");
+    let stopped = writer.frame();
+    assert_eq!(stopped["state"], "stopped");
+    assert_eq!(stopped["owned_work_stopped"], true);
+    assert_eq!(stopped["result"], "result");
+    assert_eq!(stopped["intervened"], false);
+    assert_eq!(stopped["exit_code"], 0);
+    writer.close_input();
+    // Start the read immediately after closing the writer control, before any
+    // explicit writer wait or separate drain action.
+    let endpoints = Endpoints::new();
+    let mut proxy = single_domain_proxy(&fixture, &endpoints, "3");
+    one_proxy_ready(&mut proxy, &fixture);
+    assert_eq!(fs::read(&marker).expect("completed writer metadata"), b"dispatched");
+    assert!(writer.finish().status.success());
+    drop(endpoints.control);
+    closed_proxy_with_one_ready(proxy);
 }
