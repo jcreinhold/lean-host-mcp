@@ -625,18 +625,20 @@ fn native_registry_fence_fixture() {
     const NATIVE: &str = r"
 import os, pathlib, signal, sys, time
 root=pathlib.Path(sys.argv[1]); os.setsid(); signal.alarm(5)
+def ready(name, value):
+    temporary=root/(name+'.new'); temporary.write_text(value); temporary.replace(root/name)
 os.closerange(3,4096)
 guardian=os.fork()
 if guardian == 0:
     signal.alarm(5)
     os.setpgid(0,0)
-    (root/'guardian-ready').write_text(str(os.getpid()))
+    ready('guardian-ready', str(os.getpid()))
     while not (root/'end-guardian').exists(): time.sleep(.002)
     os._exit(0)
-(root/'native-ready').write_text(str(os.getpid()))
+ready('native-ready', str(os.getpid()))
 while not (root/'end-guardian').exists(): time.sleep(.002)
 os.waitpid(guardian,0)
-(root/'guardian-reaped').write_text('yes')
+ready('guardian-reaped', 'yes')
 with (root/'native-heartbeat').open('ab',buffering=0) as f:
     while True: f.write(b'x'); time.sleep(.005)
 ";
