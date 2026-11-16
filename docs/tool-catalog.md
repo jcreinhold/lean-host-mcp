@@ -136,6 +136,14 @@ Every bridge record includes:
 carry scoped `execution.target_check` evidence while the overall execution remains `unknown`. Configuration evaluation
 and its subprocesses may already have started. A multi-operation tool may have completed earlier steps.
 
+Source-backed module queries, proof attempts and declaration verification also retain this scoped receipt with
+`stage: "project_admission"` when typed admission expiry or cancellation returns before the actor call. It identifies
+only the check named by `file_label`; option discovery, startup and earlier checks may already have run. The overall
+execution remains `unknown` without independent operation evidence, or `stopped` only when all started operations have
+independently confirmed termination or return. This is retained-request evidence; direct tool envelopes and historical
+stored results are unchanged. No receipt authorizes replay or supplies a proof verdict. Errors after admission do not
+gain this receipt.
+
 A confirmed worker timeout/cancellation can return `stopped` with an optional `execution.worker_stop_receipt` while the
 semantic response reports runtime unavailability and contains no proof verdict. The receipt binds the interrupted
 operation to its actor session and worker generation. It covers the direct worker only; it does not certify Lake

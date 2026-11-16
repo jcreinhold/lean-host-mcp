@@ -1528,10 +1528,9 @@ mod tests {
             })
             .unwrap();
         terminal(&tasks, "uncertain").await;
-        assert_eq!(
-            tasks.get_retained("uncertain").unwrap().execution.disposition,
-            Disposition::Unknown
-        );
+        let uncertain = tasks.get_retained("uncertain").unwrap();
+        assert_eq!(uncertain.execution.disposition, Disposition::Unknown);
+        assert!(uncertain.execution.target_check.is_none());
     }
 
     #[tokio::test]
@@ -1861,6 +1860,304 @@ mod tests {
         assert!(record.fields.get("result").is_none());
     }
 
+    /// A private warm controller keeps genuine SH custody while writer demand
+    /// excludes new readers. No Lean process, installed helper, or live registry
+    /// participates; constructing outside Tokio disables automatic retirement.
+    struct AdmissionExpiryFixture {
+        _directory: tempfile::TempDir,
+        root: std::path::PathBuf,
+        broker: Arc<crate::broker::ProjectBroker>,
+        _demand: lean_toolchain::writer_demand::WriterDemand,
+    }
+
+    impl AdmissionExpiryFixture {
+        fn new(timeout_millis: u64) -> Self {
+            use std::fs::{self, OpenOptions};
+            use std::num::NonZeroUsize;
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap().join("Project");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("lakefile.lean"), "package Project\nlean_lib Project\n").unwrap();
+            fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+            fs::write(root.join("lake-manifest.json"), "{\"packages\":[]}\n").unwrap();
+            let runtime = crate::project::ProjectRuntimeConfig::from_env_with_file(
+                &crate::config_file::RuntimeFileConfig {
+                    request_timeout_millis: Some(timeout_millis),
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+            assert_eq!(runtime.request_timeout_millis(), timeout_millis);
+            let broker = crate::broker::ProjectBroker::new_with_runtime_config(
+                crate::broker::BrokerConfig {
+                    config_default: None,
+                    env_default: None,
+                    cwd: root.clone(),
+                    max_projects: NonZeroUsize::MIN,
+                    max_workers_per_project: NonZeroUsize::MIN,
+                    idle_timeout: Duration::ZERO,
+                },
+                runtime,
+            );
+            let lock = lean_toolchain::shared_writer::project_lock_path(&root).unwrap();
+            let shared = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock)
+                .unwrap();
+            shared.lock_shared().unwrap();
+            broker.test_register_actor(crate::project::LeanProject::test_handoff_actor(
+                &root,
+                crate::lake_meta::LakeProjectMeta::from_explicit(&root)
+                    .unwrap()
+                    .manifest_hash,
+                vec![root.clone()],
+                Box::new(shared),
+            ));
+            let demand =
+                lean_toolchain::writer_demand::WriterDemand::announce(&[lock], Duration::from_secs(1), &|| false)
+                    .unwrap();
+            Self {
+                _directory: directory,
+                root,
+                broker,
+                _demand: demand,
+            }
+        }
+    }
+
+    async fn verify_after_admission(
+        broker: Arc<crate::broker::ProjectBroker>,
+        root: std::path::PathBuf,
+    ) -> Result<CallToolResult, McpError> {
+        use lean_rs_worker_parent::{
+            LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationTarget, LeanWorkerElabOptions,
+            LeanWorkerOutputBudgets, LeanWorkerSorryPolicy,
+        };
+
+        broker
+            .verify_declaration(
+                crate::broker::ProjectHint::Explicit(root),
+                vec!["Init".to_owned()],
+                vec!["Init".to_owned()],
+                LeanWorkerDeclarationVerificationRequest {
+                    source: "theorem pending_target : True := True.intro".to_owned(),
+                    target: LeanWorkerDeclarationVerificationTarget::Name {
+                        name: "pending_target".to_owned(),
+                    },
+                    sorry_policy: LeanWorkerSorryPolicy::Deny,
+                    report_axioms: true,
+                    budgets: LeanWorkerOutputBudgets::default(),
+                },
+                LeanWorkerElabOptions::new().file_label("AdmissionTarget.lean"),
+            )
+            .await
+            .map(|_| CallToolResult::success(vec![]))
+            .map_err(McpError::from)
+    }
+
+    #[test]
+    fn retained_admission_expiry_scopes_non_dispatch_without_erasing_preparation() {
+        for preparation in ["none", "returned", "uncertain"] {
+            let fixture = AdmissionExpiryFixture::new(40);
+            let journal = fixture.root.join("requests");
+            let effect = fixture.root.join("preparation-effect");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let tasks = RequestTasks::open(&journal).unwrap();
+                let prepared = tasks.prepare(binding(1)).unwrap();
+                let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+                let original = prepared.request.unwrap();
+                let broker = Arc::clone(&fixture.broker);
+                let root = fixture.root.clone();
+                let effect_in_call = effect.clone();
+                tasks
+                    .submit("test", id.clone(), original.clone(), move || async move {
+                        if preparation != "none" {
+                            crate::lake_options::successful_preparation_for_test(&effect_in_call)
+                                .await
+                                .map_err(McpError::from)?;
+                        }
+                        if preparation == "uncertain" {
+                            crate::cancellation::CallCancellation::current()
+                                .begin_operation()
+                                .unknown();
+                        }
+                        let result = verify_after_admission(broker, root).await;
+                        if preparation == "returned" {
+                            let error = result.unwrap_err();
+                            Ok(CallToolResult::structured(serde_json::json!({
+                                "status": "runtime_unavailable", "result": null, "runtime_error": error.data
+                            })))
+                        } else {
+                            result
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(
+                    terminal(&tasks, &id).await.status(),
+                    if preparation == "returned" {
+                        TaskStatus::Completed
+                    } else {
+                        TaskStatus::Failed
+                    }
+                );
+                let retained = tasks.get_retained(&id).unwrap();
+                assert_eq!(retained.request, Some(original.clone()));
+                assert!(retained.result_available && !retained.acknowledged);
+                if preparation == "returned" {
+                    let envelope = &retained.fields["result"]["structuredContent"];
+                    assert_eq!(envelope["status"], "runtime_unavailable");
+                    assert_eq!(envelope["runtime_error"]["reason"], "project_admission_timeout");
+                    assert!(envelope["result"].is_null(), "no proof verdict exists");
+                } else {
+                    assert_eq!(retained.fields["error"]["data"]["reason"], "project_admission_timeout");
+                    assert!(retained.fields.get("result").is_none(), "no proof verdict exists");
+                }
+                assert_eq!(
+                    retained.execution.disposition,
+                    if preparation == "returned" {
+                        Disposition::Stopped
+                    } else {
+                        Disposition::Unknown
+                    }
+                );
+                assert_eq!(
+                    retained.execution.target_check,
+                    Some(TargetCheckNotStarted {
+                        file_label: "AdmissionTarget.lean".to_owned(),
+                        stage: "project_admission".to_owned(),
+                        disposition: "not_started".to_owned(),
+                    })
+                );
+                assert!(retained.execution.worker_stop_receipt.is_none());
+                assert_eq!(effect.exists(), preparation != "none");
+                if effect.exists() {
+                    assert_eq!(std::fs::read_to_string(&effect).unwrap(), "prepared");
+                }
+                assert_eq!(
+                    fixture
+                        .broker
+                        .runtime_control(&crate::broker::RuntimeControlRequest::default())
+                        .pool
+                        .outstanding_jobs,
+                    0
+                );
+                let saved = serde_json::to_value(retained).unwrap();
+                tasks
+                    .submit("test", id.clone(), original.clone(), || async {
+                        panic!("retained admission result must never dispatch again")
+                    })
+                    .unwrap();
+                assert_eq!(serde_json::to_value(tasks.get_retained(&id).unwrap()).unwrap(), saved);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while Arc::strong_count(&tasks.0) > 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                drop(tasks);
+                let reopened = RequestTasks::open(&journal).unwrap();
+                reopened
+                    .submit("test", id.clone(), original, || async {
+                        panic!("journal recovery must never replay the named check")
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(reopened.get_retained(&id).unwrap()).unwrap(),
+                    saved
+                );
+            });
+            fixture.broker.shutdown_all();
+        }
+    }
+
+    #[test]
+    fn retained_cancellation_during_admission_certifies_only_the_named_check() {
+        let fixture = AdmissionExpiryFixture::new(1_000);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tasks = RequestTasks::default();
+            let prepared = tasks.prepare(binding(1)).unwrap();
+            let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
+            let original = prepared.request.unwrap();
+            let broker = Arc::clone(&fixture.broker);
+            let root = fixture.root.clone();
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            tasks
+                .submit("test", id.clone(), original.clone(), move || async move {
+                    entered.send(()).unwrap();
+                    verify_after_admission(broker, root).await
+                })
+                .unwrap();
+            waiting.await.unwrap();
+            assert_eq!(tasks.get(&id).unwrap().status(), TaskStatus::Working);
+            tasks.cancel(&id).unwrap();
+            assert_eq!(terminal(&tasks, &id).await.status(), TaskStatus::Failed);
+            let retained = tasks.get_retained(&id).unwrap();
+            assert_eq!(retained.request, Some(original));
+            assert!(retained.cancellation_requested);
+            assert_eq!(retained.execution.disposition, Disposition::Unknown);
+            assert_eq!(retained.fields["error"]["data"]["reason"], "request_cancelled");
+            let target = retained.execution.target_check.unwrap();
+            assert_eq!(target.file_label, "AdmissionTarget.lean");
+            assert_eq!(target.stage, "project_admission");
+            assert_eq!(target.disposition, "not_started");
+            assert!(retained.fields.get("result").is_none());
+            assert!(retained.execution.worker_stop_receipt.is_none());
+        });
+        fixture.broker.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn retained_runtime_unavailable_history_keeps_unknown_without_dispatch_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let tasks = RequestTasks::open(directory.path()).unwrap();
+        let original = v2_binding(&tasks);
+        tasks
+            .prepare_submit("test", "saved-unknown-admission".into(), original.clone(), || async {
+                Ok(CallToolResult::structured(serde_json::json!({
+                    "status": "runtime_unavailable", "result": null,
+                    "runtime_error": {"reason":"project_admission_timeout", "retryable":true, "worker_generation":0}
+                })))
+            })
+            .unwrap();
+        terminal(&tasks, "saved-unknown-admission").await;
+        let record = tasks.get_retained("saved-unknown-admission").unwrap();
+        assert_eq!(record.execution.disposition, Disposition::Unknown);
+        assert!(record.execution.target_check.is_none());
+        let saved = serde_json::to_value(record).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&tasks.0) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(tasks);
+        let reopened = RequestTasks::open(directory.path()).unwrap();
+        reopened
+            .prepare_submit("test", "saved-unknown-admission".into(), original, || async {
+                panic!("historical unknown admission outcome must not be replayed")
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_retained("saved-unknown-admission").unwrap()).unwrap(),
+            saved
+        );
+    }
+
     #[tokio::test]
     async fn preparation_failure_only_certifies_the_named_target_check_not_started() {
         for earlier_check_returned in [false, true] {
@@ -1994,6 +2291,10 @@ mod tests {
             assert_eq!(result.status(), TaskStatus::Failed);
             let retained = tasks.get_retained(&id).unwrap();
             assert_eq!(retained.execution.disposition, Disposition::Stopped);
+            assert!(
+                retained.execution.target_check.is_none(),
+                "the actor already dispatched this operation"
+            );
             let receipt = retained.execution.worker_stop_receipt.unwrap();
             assert_eq!(receipt.worker_scope, "main");
             assert!(receipt.worker_request_id.is_some());
@@ -2030,6 +2331,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(effect).unwrap(), "prepared");
         let retained = tasks.get_retained(&id).unwrap();
         assert_eq!(retained.execution.disposition, Disposition::Stopped);
+        assert!(
+            retained.execution.target_check.is_none(),
+            "actor queue cancellation is outside broker admission"
+        );
         assert!(retained.execution.worker_stop_receipt.is_none());
     }
 

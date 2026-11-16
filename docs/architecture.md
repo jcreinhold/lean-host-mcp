@@ -407,6 +407,14 @@ start-or-expire decision. Expired messages stay in the bounded mailbox until the
 Lean. Once dispatch starts, the existing worker operation limits apply. Cancellation of a running request waits for the
 worker's cleanup reply. Neither cancellation nor expiry counts as a successful proof check.
 
+Before source-backed actor calls, the broker keeps metadata/options preparation and project admission within one private
+boundary. Only typed `project_admission_timeout` or `request_cancelled` errors returned from that boundary record a
+named `execution.target_check` with stage `project_admission` on retained requests. The actor operation was not
+dispatched; preparation or earlier internal checks may still have effects or uncertain cleanup. Aggregate lifetime
+classification continues to use its existing operation evidence. A post-admission error cannot acquire this receipt, and
+no stored historical result is reclassified. Native-reader ACK precedes its read-admission/payload boundary, so a lost
+post-ACK result still cannot infer payload non-dispatch from a null start field or missing domains.
+
 ## Native ownership and artifact custody
 
 Each project actor owns its actual worker child and its reaper. Ordinary and semantic generations share one durable

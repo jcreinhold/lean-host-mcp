@@ -514,10 +514,8 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryOutcome>> {
-        let meta = self.resolve_meta(&hint)?;
-        let options = self.resolve_options(&meta, options).await?;
+        let (project, options) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let project = self.project_for(hint).await?;
         let call = project
             .process_module_query(session_imports, source, query, options)
             .await?;
@@ -539,10 +537,8 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryOutcome>> {
-        let meta = self.resolve_meta(&hint)?;
-        let options = self.resolve_options(&meta, options).await?;
+        let (project, options) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let project = self.project_for(hint).await?;
         // A query this build cannot key is run uncached rather than filed under
         // a shared key; see `ModuleQueryKey`.
         let key = ModuleQueryKey::from_query(&query);
@@ -616,10 +612,8 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
-        let meta = self.resolve_meta(&hint)?;
-        let options = self.resolve_options(&meta, options).await?;
+        let (project, options) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let project = self.project_for(hint).await?;
         let call = project
             .process_module_query_batch(session_imports, source, selectors, budgets, options)
             .await?;
@@ -642,10 +636,8 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
-        let meta = self.resolve_meta(&hint)?;
-        let options = self.resolve_options(&meta, options).await?;
+        let (project, options) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let project = self.project_for(hint).await?;
         let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
         let context = crate::cache::ModuleQueryContext::capture(
             project.canonical_root(),
@@ -777,10 +769,8 @@ impl ProjectBroker {
         request: LeanWorkerProofAttemptRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerProofAttemptResult>> {
-        let meta = self.resolve_meta(&hint)?;
-        let options = self.resolve_options(&meta, options).await?;
+        let (project, options) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let project = self.project_for(hint).await?;
         let call = project.attempt_proof(session_imports, request, options).await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -801,10 +791,8 @@ impl ProjectBroker {
         request: LeanWorkerDeclarationVerificationRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationResult>> {
-        let meta = self.resolve_meta(&hint)?;
-        let options = self.resolve_options(&meta, options).await?;
+        let (project, options) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let project = self.project_for(hint).await?;
         let call = project.verify_declaration(session_imports, request, options).await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -825,10 +813,8 @@ impl ProjectBroker {
         request: LeanWorkerDeclarationVerificationBatchRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
-        let meta = self.resolve_meta(&hint)?;
-        let options = self.resolve_options(&meta, options).await?;
+        let (project, options) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let project = self.project_for(hint).await?;
         let call = project
             .verify_declaration_batch(session_imports, request, options)
             .await?;
@@ -913,6 +899,35 @@ impl ProjectBroker {
         };
         drop(project);
         Ok(out)
+    }
+
+    /// All source-check preparation precedes the actor call. A typed admission
+    /// expiry/cancellation here proves only that this named check was not sent.
+    /// Preparation or earlier checks may already have run; their independent
+    /// operation evidence still determines the retained invocation's disposition.
+    async fn prepare_check(
+        &self,
+        hint: ProjectHint,
+        options: LeanWorkerElabOptions,
+    ) -> Result<(Arc<LeanProject>, LeanWorkerElabOptions)> {
+        let file_label = options.file_label.clone();
+        let admission = async {
+            let meta = self.resolve_meta(&hint)?;
+            let options = self.resolve_options(&meta, options).await?;
+            let project = self.project_for(hint).await?;
+            Ok((project, options))
+        }
+        .await;
+        if let Err(ServerError::WorkerUnavailable(info)) = &admission
+            && matches!(info.reason.as_str(), "project_admission_timeout" | "request_cancelled")
+        {
+            CallCancellation::current().target_check_not_started(crate::envelope::TargetCheckNotStarted {
+                file_label,
+                stage: "project_admission".to_owned(),
+                disposition: "not_started".to_owned(),
+            });
+        }
+        admission
     }
 
     async fn resolve_options(
