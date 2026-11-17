@@ -137,3 +137,13 @@ ABI provisioning resolved the reference worker's nine-image closure, but that bi
 cannot authorize a positive run. The source-only supervisor/driver now has independent review assigned. ABI receives
 the released two-job lane for compile-only supervisor and actual fixture-feature binary/manifests. Native execution
 still requires review of these exact identities, load commands and allocator provenance. No positive ABI test has run.
+
+### Build/review handoff: 21:11 UTC
+
+ABI compile-only completed at 21:10:43; worker `95322540…`, revised supervisor `51acdf3f…`, outer record `6e1c0b70…`
+are recorded in `task-20/fixture-policy/candidate-evidence.json`. Neither executable ran. The supervisor now owns the
+actual worker; independent exact-source/artifact review remains required before one native positive. The lane was
+released and assigned to host/dup turn `01a1eb59-da7f-7693-a990-d6db443f936e` for isolated Lean-only 4.36 qualification,
+not unqualified SDK/Rust execution. ABI review proceeds independently and waits for the lane before any approved run.
+Warm's revised private checkpoint passed independent review: its retirement failure is injected, and successful framed
+cases use the post-arm seam. It does not establish authenticated GO, production shutdown precedence or native custody.
