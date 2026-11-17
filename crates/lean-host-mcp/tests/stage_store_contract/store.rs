@@ -70,6 +70,11 @@ pub(crate) enum Reject {
     IdentifierRange,
     Oversized,
     WrongSchema,
+    UnknownCaller,
+    CallerBindingChanged,
+    ConflictingCallerResult,
+    ResultUnavailable,
+    InvalidResult,
 }
 type Answer<T> = Result<T, Problem>;
 fn reject<T>(why: Reject) -> Answer<T> {
@@ -133,6 +138,33 @@ pub(crate) struct Binding {
     pub(crate) key: NativeKey,
     pub(crate) scope: Scope,
 }
+/// A committed/recovered caller copy, not producer authentication or permission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CallerResult {
+    caller: CallerKey,
+    binding: Binding,
+    result: Id,
+    hash: Vec<u8>,
+    body: Vec<u8>,
+}
+impl CallerResult {
+    pub(crate) fn caller(&self) -> &CallerKey {
+        &self.caller
+    }
+    pub(crate) fn binding(&self) -> Binding {
+        self.binding
+    }
+    pub(crate) fn result_id(&self) -> Id {
+        self.result
+    }
+    pub(crate) fn hash(&self) -> &[u8] {
+        &self.hash
+    }
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Gate {
     Pending,
@@ -201,24 +233,27 @@ fn commit(tx: Transaction<'_>, point: &str) -> Answer<()> {
     crate::cut(&format!("{point}:after"));
     Ok(())
 }
-fn has_role(db: &Connection, expected: i64) -> rusqlite::Result<bool> {
+fn has_role(db: &Connection, expected: i64, expected_version: i64) -> rusqlite::Result<bool> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let role: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-    Ok(version == 1 && role == expected)
+    Ok(version == expected_version && role == expected)
 }
 // These bounded metadata reads identify the supported format; no history scan,
 // migration or journal-mode write runs before them.
 pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
-    if !has_role(db, CALLER_ROLE)? {
+    if !has_role(db, CALLER_ROLE, 2)? {
         return Ok(false);
     }
     drop(
         db.prepare("SELECT job,stage,revision,store,epoch,nonce,native_stage,intent,capability FROM bindings LIMIT 0")?,
     );
+    drop(db.prepare(
+        "SELECT job,stage,revision,scope,generation,owner,result_id,result_hash,body FROM accepted_results LIMIT 0",
+    )?);
     Ok(true)
 }
 pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
-    if !has_role(db, NATIVE_ROLE)? {
+    if !has_role(db, NATIVE_ROLE, 1)? {
         return Ok(false);
     }
     drop(db.prepare("SELECT epoch,nonce,stage,intent,cap_hash,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages LIMIT 0")?);
@@ -240,11 +275,17 @@ impl CallerJournal {
         let tx = db
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(&format!("PRAGMA application_id={CALLER_ROLE}; PRAGMA user_version=1;\n\
-            CREATE TABLE bindings(job BLOB NOT NULL,stage INTEGER NOT NULL,revision INTEGER NOT NULL,\n\
-            store BLOB NOT NULL CHECK(length(store)=16),epoch INTEGER NOT NULL,nonce BLOB NOT NULL CHECK(length(nonce)=16),\n\
-            native_stage INTEGER NOT NULL,intent BLOB NOT NULL CHECK(length(intent)<=65536),\n\
-            capability BLOB NOT NULL CHECK(length(capability)=32),PRIMARY KEY(job,stage,revision),UNIQUE(store,epoch,nonce,native_stage)) STRICT;"))?;
+        tx.execute_batch(&format!(
+            r"PRAGMA application_id={CALLER_ROLE}; PRAGMA user_version=2;
+            CREATE TABLE bindings(job BLOB NOT NULL,stage INTEGER NOT NULL,revision INTEGER NOT NULL,
+            store BLOB NOT NULL CHECK(length(store)=16),epoch INTEGER NOT NULL,nonce BLOB NOT NULL CHECK(length(nonce)=16),
+            native_stage INTEGER NOT NULL,intent BLOB NOT NULL CHECK(length(intent)<=65536),
+            capability BLOB NOT NULL CHECK(length(capability)=32),PRIMARY KEY(job,stage,revision),UNIQUE(store,epoch,nonce,native_stage)) STRICT;
+            CREATE TABLE accepted_results(job BLOB NOT NULL,stage INTEGER NOT NULL,revision INTEGER NOT NULL,
+            scope BLOB NOT NULL CHECK(length(scope)=16),generation INTEGER NOT NULL CHECK(generation>=0),owner BLOB NOT NULL CHECK(length(owner)=16),
+            result_id BLOB NOT NULL CHECK(length(result_id)=16),result_hash BLOB NOT NULL CHECK(length(result_hash)=32),body BLOB NOT NULL CHECK(length(body)<=65536),
+            PRIMARY KEY(job,stage,revision),FOREIGN KEY(job,stage,revision) REFERENCES bindings(job,stage,revision)) STRICT;"
+        ))?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -254,6 +295,62 @@ impl CallerJournal {
     }
     pub(crate) fn get(&self, key: &CallerKey) -> Answer<Option<SavedRequest>> {
         caller_get(self.db.connection(), key)
+    }
+    pub(crate) fn saved_result(&self, key: &CallerKey) -> Answer<Option<CallerResult>> {
+        caller_result_get(self.db.connection(), key)
+    }
+    /// The source snapshot comes from the original native store, checked by the
+    /// client bridge. This does not authenticate a producer or infer OS closure.
+    pub(crate) fn save_result(&mut self, request: &SavedRequest, source: &Snapshot) -> Answer<CallerResult> {
+        self.db.check_profile()?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual = caller_get(&tx, &request.caller)?.ok_or(Problem::Rejected(Reject::UnknownCaller))?;
+        if actual != *request || source.key != request.key || source.intent != request.intent {
+            return reject(Reject::CallerBindingChanged);
+        }
+        let scope = source.scope.ok_or(Problem::Rejected(Reject::WrongScope))?;
+        let binding = Binding {
+            key: request.key,
+            scope,
+        };
+        let (result, hash, body) = result_parts(source)?;
+        if let Some(saved) = caller_result_get(&tx, &request.caller)? {
+            if saved.binding != binding
+                || saved.result != result
+                || saved.hash != hash
+                || body.is_some_and(|bytes| saved.body != bytes)
+            {
+                return reject(Reject::ConflictingCallerResult);
+            }
+            return Ok(saved);
+        }
+        let body = body.ok_or(Problem::Rejected(Reject::ResultUnavailable))?;
+        let saved = CallerResult {
+            caller: request.caller.clone(),
+            binding,
+            result,
+            hash: hash.to_vec(),
+            body: body.to_vec(),
+        };
+        tx.execute(
+            "INSERT INTO accepted_results VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                request.caller.job,
+                number(request.caller.stage)?,
+                number(request.caller.revision)?,
+                scope.id.as_slice(),
+                number(scope.generation)?,
+                scope.owner.as_slice(),
+                result.as_slice(),
+                hash,
+                body
+            ],
+        )?;
+        commit(tx, "caller-result")?;
+        Ok(saved)
     }
     pub(crate) fn bind(
         &mut self,
@@ -317,6 +414,37 @@ fn caller_get(db: &Connection, key: &CallerKey) -> Answer<Option<SavedRequest>> 
     Ok(db.query_row("SELECT store,epoch,nonce,native_stage,intent,capability FROM bindings WHERE job=?1 AND stage=?2 AND revision=?3",params![key.job,number(key.stage)?,number(key.revision)?],|row| {
         Ok(SavedRequest{caller:key.clone(),key:NativeKey{store:id(row.get(0)?)?,epoch:positive(row.get(1)?)?,nonce:id(row.get(2)?)?,stage:positive(row.get(3)?)?},intent:row.get(4)?,capability:Capability(row.get::<_,Vec<u8>>(5)?.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?)})
     }).optional()?)
+}
+
+fn result_parts(source: &Snapshot) -> Answer<(Id, &[u8], Option<&[u8]>)> {
+    match &source.result {
+        ResultKnowledge::Retained { id, hash, body } | ResultKnowledge::Acknowledged { id, hash, body } => {
+            bounded(body)?;
+            if hash.len() != 32 || *hash != digest(body) {
+                return reject(Reject::InvalidResult);
+            }
+            Ok((*id, hash, Some(body)))
+        }
+        ResultKnowledge::Expired { id, hash } => {
+            if hash.len() != 32 {
+                return reject(Reject::InvalidResult);
+            }
+            Ok((*id, hash, None))
+        }
+        ResultKnowledge::Pending => reject(Reject::ResultUnavailable),
+    }
+}
+fn caller_result_get(db: &Connection, key: &CallerKey) -> Answer<Option<CallerResult>> {
+    let saved=db.query_row("SELECT b.store,b.epoch,b.nonce,b.native_stage,r.scope,r.generation,r.owner,r.result_id,r.result_hash,r.body FROM accepted_results r JOIN bindings b USING(job,stage,revision) WHERE r.job=?1 AND r.stage=?2 AND r.revision=?3",params![key.job,number(key.stage)?,number(key.revision)?],|r|{
+        Ok(CallerResult{caller:key.clone(),binding:Binding{key:NativeKey{store:id(r.get(0)?)?,epoch:positive(r.get(1)?)?,nonce:id(r.get(2)?)?,stage:positive(r.get(3)?)?},scope:Scope{id:id(r.get(4)?)?,generation:positive(r.get(5)?)?,owner:id(r.get(6)?)?}},result:id(r.get(7)?)?,hash:r.get(8)?,body:r.get(9)?})
+    }).optional()?;
+    if saved
+        .as_ref()
+        .is_some_and(|saved| saved.body.len() > LIMIT || saved.hash.len() != 32 || saved.hash != digest(&saved.body))
+    {
+        return reject(Reject::InvalidResult);
+    }
+    Ok(saved)
 }
 
 pub(crate) struct NativeStore {
@@ -585,13 +713,31 @@ impl NativeStore {
         self.retain_result(binding, capability, result, true)
     }
     fn retain_result(&mut self, binding: Binding, capability: &Capability, result: Id, expire: bool) -> Answer<()> {
-        self.mutate_bound(binding,capability,|tx,old|{
-            let Some((previous,_))=old.result.identity() else{return reject(Reject::ResultUnknown)};
-            if previous!=result {return reject(Reject::ConflictingResult)}
-            let kind=if expire || matches!(old.result,ResultKnowledge::Expired{..}){3}else{2};
-            tx.execute("UPDATE stages SET result_kind=?1,result_body=CASE WHEN ?1=3 THEN NULL ELSE result_body END WHERE epoch=?2 AND nonce=?3 AND stage=?4",params![kind,number(binding.key.epoch)?,binding.key.nonce.as_slice(),number(binding.key.stage)?])?;
-            Ok(())
-        })
+        self.checked_key(binding.key)?;
+        self.db.check_profile()?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = bound_stage(&tx, binding, capability)?;
+        let Some((previous, _)) = old.result.identity() else {
+            return reject(Reject::ResultUnknown);
+        };
+        if previous != result {
+            return reject(Reject::ConflictingResult);
+        }
+        let kind = if expire || matches!(old.result, ResultKnowledge::Expired { .. }) {
+            3
+        } else {
+            2
+        };
+        tx.execute("UPDATE stages SET result_kind=?1,result_body=CASE WHEN ?1=3 THEN NULL ELSE result_body END WHERE epoch=?2 AND nonce=?3 AND stage=?4",params![kind,number(binding.key.epoch)?,binding.key.nonce.as_slice(),number(binding.key.stage)?])?;
+        if expire {
+            tx.commit()?;
+        } else {
+            commit(tx, "native-ack")?;
+        }
+        Ok(())
     }
     fn mutate_bound(
         &mut self,

@@ -15,6 +15,8 @@ SDK still owns child processes and the guardian; no SQLite API moved into it.
 | `stage_store_contract.rs` | Database-only test entry on Unix |
 | `stage_store_contract/connection.rs` | Checked SQLite build, format-before-configuration and connection settings |
 | `stage_store_contract/store.rs` | Separate caller journal and native store |
+| `stage_store_contract/result_client.rs` | Save the caller copy before acknowledging its original native result |
+| `stage_store_contract/caller_results.rs` | Result identity, two-commit crash cuts and SQL rejection tests |
 | `stage_store_contract/cases.rs`, `cuts.rs` | Contract tests and disposable process-crash pause points |
 | `stage_store_runtime_contract.rs` | Four macOS cases using the existing process fixture and runtime by relative path |
 
@@ -49,8 +51,35 @@ Result expiry retains its ID and SHA-256 digest, preventing restoration or
 replacement by a late callback. Resource reports never prove physical cleanup or
 authorize conflicting work. The native owner must supply actual observations.
 
-Observation authentication and saving a caller-owned result before ACK remain
-external requirements. The journal here saves requests, not durable result assets.
+### Caller copy before acknowledgement
+
+The caller schema is now **version 2**; the native schema remains **version 1**.
+Existing caller-v1 files fail validation. These fresh test stores implement no
+migration or compatibility fallback.
+
+The caller's separate `accepted_results` table stores one immutable bounded inline
+result, at most 64 KiB, for the original job/stage/revision. Its foreign key points
+to the saved request. Reads recover the native identity from that request and
+check the stored bytes against their SHA-256 digest. Equal retries return the
+original copy; changed request, scope, result ID or contents fail. The code never
+replaces a saved result.
+
+`result_client::accept_then_ack` checks the complete original request and native
+snapshot, including scope generation and owner. It then:
+
+1. Commits the verified caller copy, or recovers an identical copy already saved.
+2. Acknowledges (ACKs) that original native result in a separate transaction.
+
+No transaction spans both databases. A lost caller-save reply leaves either no
+copy or the original committed copy. A failed or lost ACK leaves the caller copy
+readable through `saved_result`, even if the native store is unavailable. Native
+expiry cannot delete that copy. Expired native metadata can reconcile a matching
+caller copy; it cannot supply bytes that the caller never saved.
+
+This enforces the tested client's order, not a native server's ability to prove
+that a remote caller saved data. Raw native ACK still relies on that caller duty.
+Snapshots and hashes do not authenticate producers, prove process cleanup or
+permit launch replay. External result files remain outside this component.
 
 ## SQLite and opening files
 
@@ -93,11 +122,27 @@ consumption and result writes. They use checkpointed and uncheckpointed history.
 Fresh connections verify the original records; both stores cold-open after all
 old connections close. These are process-crash tests, not OS/power-loss tests.
 
+Eight further helper-kill cases cover both sides of caller-result COMMIT and native
+ACK COMMIT, with both checkpoint baselines. A fresh reader checks each cut;
+retries then preserve the original binding, result ID, hash and bytes through
+native expiry and a cold reopen. The after-caller-commit cut specifically covers
+the gap between the two commits. Before caller commit neither copy nor ACK exists;
+after it the caller copy exists, whether or not ACK committed.
+
+Actual SQL INSERT rejection in the caller database prevents native ACK. Actual
+native ACK UPDATE rejection preserves the caller's committed copy. The latter
+case expires native bytes, reopens the caller journal and retries using that same
+copy. Fresh readers verify the original rows, and errors retain SQLite's actual
+1811 code and trigger message. These are statement errors, not uncertain COMMIT
+or physical disk failures.
+
 The macOS target keeps the **same live runtime and actual child owner** while
 reopening database handles. A dropped GO starts no target; a written GO with a
 lost reply starts exactly one. SQL-to-kernel identity checks reject mixed records
-before either launch gate changes. Results remain separate from resource closure.
-An exclusive-lock contender blocked before cleanup checks for no protected group
+before either launch gate changes. The actual-result case also saves and ACKs
+the caller copy, expires native bytes, reopens the caller journal and recovers exactly the same bytes while the original
+runtime and child owner remain alive. Results remain separate from resource
+closure. An exclusive-lock contender blocked before cleanup checks for no protected group
 and no later target writes at first acquisition.
 
 Two more cases reject actual SQLite UPDATEs before GO and while saving an
@@ -117,20 +162,23 @@ the failing statement; these methods made no earlier writes in their transaction
 and transaction Drop requests rollback. The trigger was committed separately and
 remains active throughout cleanup.
 
-Four deliberately broken copies were tested outside the checkout: reissuing a
-consumed permit, redirecting an old ACK to a newer row, and omitting the SQL/native
-identity check, and omitting the shared storage-error cleanup request. Each
-compiled and failed its intended assertion. The identity error actually started
+Five deliberately broken copies were tested outside the checkout: reissuing a
+consumed permit, redirecting an old ACK to a newer row, omitting the SQL/native
+identity check, omitting the shared storage-error cleanup request, and ACKing
+before committing the caller copy. Each compiled and failed its intended assertion. The identity error actually started
 a target using the other row's permission. Omitting cleanup left both original
 roots alive at the two-second closure deadline; panic cleanup happened afterward,
 not as a passed observation. The blocked contender helpers also timed out in those
-negative cases. No safety expiry supplied a pass. Generated logs, databases and
-copied broken sources are not required to run or maintain the committed tests.
+negative cases. The early-ACK control fails the fresh-native-row assertion under
+caller INSERT rejection: native history became Acknowledged while no caller copy
+committed. ACK itself retains native bytes; the failure is the ordering violation,
+not a claim of immediate data loss. No safety expiry supplied a pass. Generated
+logs, databases and copied broken sources are not required to run or maintain the committed tests.
 
-Recorded host-package validation, 2026-11-17: the database target passed 19 tests
+Recorded host-package validation, 2026-11-17: the database target passed 26 tests
 and the native target passed 37 checks, including four actual process cases, 25
 kernel tests, five connection tests and three helper entry points. The targets
-reuse some checks; these are not 56 distinct native fault cases. Focused lint and
+reuse some checks; these are not 63 distinct native fault cases. Focused lint and
 format checks accompany the integration.
 
 ## Run and remaining limits
@@ -160,3 +208,40 @@ cancellation, OS crashes and power loss. See the
 [execution-service design](../../docs/native-execution-lifecycle-design.md) for
 those separate requirements. No server deployment or release follows from these
 test-only changes.
+
+## Next service-death boundary: proposal only
+
+Stop adding storage features here. The next proposed test kills the disposable
+**service process**, then starts a passive observer. It tests no replay and safe
+cleanup; it does not recover the old process handles or resume work.
+
+Use the already tested SDK topology: service → worker → healthy guardian. Only
+the guardian retains the acknowledged shared artifact lock. The outer controller
+and new observer inherit no protective lock, runtime, worker `Child` or guardian
+control channel. Existing SDK tests cover service death with a healthy guardian;
+this host-store combination has **not** run yet.
+
+Test two cuts: after the unused-to-consumed commit but before GO, then after GO with
+its reply and durable spawn record absent. For the latter cut, a private fixture
+marker must witness an actual target start before killing the service; writing GO
+alone does not ensure the target starts before cleanup. That marker is test
+evidence, not a saved success or resource-closure fact. The new observer reopens
+only the original caller/native IDs and must find `AlreadyConsumed`, never new
+permission. Target-start counts must be zero at the before-GO cut and remain one
+at the witnessed-start cut. A deliberately broken replay branch must make the
+count exceed its bound.
+
+An independent exclusive-lock contender must demonstrate it is blocked before
+the fault, then inspect the protected group and worker immediately after its first
+successful acquisition, and check for later payload writes. These observations
+are not an atomic snapshot at acquisition. Require guardian exit and cleanup
+before the safety deadline;
+emergency rescue is a failed observation. Keep the SDK's owner-record check:
+lock acquisition alone can succeed after guardian death while payloads still run.
+
+A restarted observer cannot recover actual-child authority from a PID or a
+SQLite row. The SDK offers no reopen/adopt-by-record lease. Thus this test must
+not inject a generation-closed event into a new runtime or signal old payloads.
+Missing durable spawn/result facts remain unknown even after separately observed
+resource cleanup. Frozen guardian, missing custody records, simultaneous owner
+loss and general service reattachment require a separate contract decision.

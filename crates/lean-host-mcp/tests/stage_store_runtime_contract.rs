@@ -18,6 +18,8 @@ mod connection;
 mod fixtures;
 #[path = "../../../specs/native-execution/stage_kernel.rs"]
 mod kernel;
+#[path = "stage_store_contract/result_client.rs"]
+mod result_client;
 #[path = "stage_runtime_contract/runtime.rs"]
 mod runtime;
 #[path = "stage_store_contract/store.rs"]
@@ -359,7 +361,7 @@ fn committed_go_with_lost_reply_reconciles_same_live_child_after_database_reopen
     let contender = Contender::start(runtime.native());
     drop(store);
     drop(journal); // SAME actual Runtime, Child and guardian stay alive.
-    let journal = CallerJournal::open(&fixture.root.join("caller.sqlite3")).unwrap();
+    let mut journal = CallerJournal::open(&fixture.root.join("caller.sqlite3")).unwrap();
     assert_eq!(
         journal.get(&mapping.request.caller).unwrap(),
         Some(mapping.request.clone())
@@ -390,6 +392,31 @@ fn committed_go_with_lost_reply_reconciles_same_live_child_after_database_reopen
     assert!(matches!(result.result,ResultKnowledge::Retained{body,..} if body==actual));
     assert_eq!(result.resource_report, ResourceReport::Open);
     assert!(!runtime.scope().closed);
+    let scope_before_ack = runtime.scope();
+    let accepted = result_client::accept_then_ack(&mut journal, &mut store, &mapping.request, mapping.sql).unwrap();
+    assert_eq!(accepted.body(), actual.as_slice());
+    assert_eq!(accepted.binding(), mapping.sql);
+    runtime.ack(original, kernel::ResultId(42)).unwrap();
+    store
+        .expire(mapping.sql, &mapping.request.capability, [42; 16])
+        .unwrap();
+    runtime.expire(original, kernel::ResultId(42)).unwrap();
+    drop(journal);
+    let mut journal = CallerJournal::open(&fixture.root.join("caller.sqlite3")).unwrap();
+    assert_eq!(
+        journal.saved_result(&mapping.request.caller).unwrap(),
+        Some(accepted.clone())
+    );
+    assert_eq!(
+        result_client::accept_then_ack(&mut journal, &mut store, &mapping.request, mapping.sql).unwrap(),
+        accepted
+    );
+    assert!(matches!(
+        store.get(mapping.request.key).unwrap().unwrap().result,
+        ResultKnowledge::Expired { .. }
+    ));
+    assert_eq!(runtime.scope(), scope_before_ack);
+    assert!(runtime.native().birth().is_live().unwrap());
     stop_original(&mut runtime, original);
     actual_closed(&mut runtime, original, &mut store, &mapping);
     let observed = contender.finish();

@@ -13,6 +13,8 @@
 mod connection;
 #[path = "stage_store_contract/cuts.rs"]
 mod cuts;
+#[path = "stage_store_contract/result_client.rs"]
+mod result_client;
 #[path = "stage_store_contract/store.rs"]
 mod store;
 #[path = "stage_store_contract/cases.rs"]

@@ -531,6 +531,13 @@ fn process_cut_helper() {
                 .observe_result(binding, &request.capability, [42; 16], b"checked dummy output")
                 .unwrap();
         }
+        "accept-and-ack" => {
+            let binding = Binding {
+                key: request.key,
+                scope: scope(0),
+            };
+            crate::result_client::accept_then_ack(&mut caller, &mut store, &request, binding).unwrap();
+        }
         _ => panic!("unknown isolated cut"),
     }
 }
@@ -738,7 +745,8 @@ fn rejected_delete_mode_databases_keep_their_schema_and_journal_mode() {
         ("wrong-role", 1234, 1),
         ("incomplete-native", 0x4c53_4e53, 1),
         ("unsupported-native", 0x4c53_4e53, 9),
-        ("incomplete-caller", 0x4c53_434a, 1),
+        ("incomplete-caller", 0x4c53_434a, 2),
+        ("old-caller", 0x4c53_434a, 1),
         ("unsupported-caller", 0x4c53_434a, 9),
     ] {
         let path = fixture.root.join(format!("{name}.sqlite3"));
@@ -776,3 +784,6 @@ fn rejected_delete_mode_databases_keep_their_schema_and_journal_mode() {
     assert!(CallerJournal::open(&empty).is_err());
     assert!(fs::read(&empty).unwrap().is_empty());
 }
+
+#[path = "caller_results.rs"]
+mod caller_results;

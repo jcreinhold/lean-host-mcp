@@ -813,7 +813,9 @@ cannot reconstruct them or establish that a command never ran.
   unrun. No existing custody fixture or pure lifecycle model establishes these
   storage guarantees. The [test-only store qualification](../specs/native-execution/stage-store-contract.md)
   covers process-kill/reopen, same-owner dummy-runtime cases and native cleanup
-  after actual SQLite UPDATE rejection. VFS fault injection,
+  after actual SQLite UPDATE rejection. It also checks saving a caller-owned
+  inline result before native ACK, including both commit boundaries and SQL
+  rejection. It does not test service death/restart. VFS fault injection,
   external assets, OS-crash and power-loss qualification remain unrun.
 
 ### SQLite linked-runtime provenance and WAL-reset compatibility
