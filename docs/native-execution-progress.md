@@ -240,3 +240,12 @@ resumed independent source migration. Root is resolving the exact authorization 
 four host examples, core profiling/examples/benchmark, three callback tests and four host fixture tests. The broader
 all-target inventory still failed at 22:39:46; residual count is requested. No native target execution is established.
 The owner remains active on the single two-job lane, with concrete compile evidence within the preceding two minutes.
+
+### Caller migration checkpoint: 22:55 UTC
+
+Configured 4.36 compilation now clears 26 of the original 29 failing targets. Tour stays standalone; session benchmark
+and four attempt-envelope cases compile, not runtime-qualified. Remaining: long_session_memory (14 errors), core
+library tests (94), host library tests (156). Owner continues these three targets on the two-job lane. Independent
+review checks snapshot `41304eb5c47f08d47c49f3add7d32ffba0201e1b7dc45beb256aa18b33f907f8` for retained safety and
+test value, including documented CLI-to-embedding changes. Scalar run remains denied before launch pending the
+existing explicit approval question; no retry or canonical change occurred.
