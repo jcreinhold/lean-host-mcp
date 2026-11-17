@@ -56,7 +56,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "18874368",
         commented: true,
         overrides: "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
-        description: "Lean heap ceiling for each worker child, enforced inside Lean rather than by watching the process. Crossing it kills the child: Lean's allocator signals the overrun with a C++ exception, which cannot unwind through the Rust frame at the shim boundary and aborts the process. Commented out because the default tracks runtime.worker_import_residue_budget_mib doubled, which keeps the clean recycle strictly ahead of the abort by more than the 4.4-6.3 GiB the heap counts and the budget does not — a fixed value below the budget makes the abort fire first and the residue policy unreachable. Set it only to raise the backstop; lowering it below the budget is warned about at startup.",
+        description: "Lean heap ceiling per worker child. Allocator exhaustion can abort the child when a C++ exception reaches the Rust FFI boundary. Unset derives the residue budget plus max(residue budget, 8 GiB), converted to KiB, leaving headroom above clean import recycling. Startup warns when an explicit ceiling is at or below the residue budget.",
     },
     FieldDoc {
         key: "runtime.request_timeout_millis",
@@ -64,7 +64,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "120000",
         commented: false,
         overrides: "LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS",
-        description: "Per-worker-operation deadline, also used separately to bound each admission wait. Execution expiry recycles the worker; admission expiry returns without dispatching that operation. A tool with multiple operations can take longer than this budget. Default 120 s.",
+        description: "One shared budget for worker-capacity admission, mailbox admission and queued waiting for each worker operation. After dispatch, worker execution has a separate timeout of the same length; execution expiry recycles the worker. Admission expiry does not dispatch that queued operation. This is not a whole-tool deadline: preparation and multiple operations can take longer. Default 120 s.",
     },
     FieldDoc {
         key: "runtime.project_mailbox_capacity",
@@ -72,7 +72,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "16",
         commented: false,
         overrides: "LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY",
-        description: "How many calls fit in one project's worker mailbox. Further callers wait in FIFO order for admission, bounded by request_timeout_millis; cancellation removes only that caller.",
+        description: "Maximum queued calls in each worker actor's mailbox. Further callers wait in FIFO order for mailbox space within the same original request_timeout_millis admission deadline. Cancellation removes only that caller.",
     },
     FieldDoc {
         key: "runtime.worker_restart_limit",
@@ -96,7 +96,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "9216",
         commented: true,
         overrides: "LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB",
-        description: "How many megabytes of unreclaimable import residue one worker child may retain before it is recycled. A Lean environment imported with loadExts := true is never reclaimed, so this is the only bound on a child's growth. Commented out because the default is derived from system RAM (a quarter of it, split across broker.max_projects), clamped to [9216, 12288], and capped at one child's share of RAM after the import in flight (RAM / max_projects − 4608); set it explicitly only to fit a smaller machine or to trade restart frequency against memory. Below one import's residue the policy degenerates to recycling before every import, so lowering it far is worse than leaving it.",
+        description: "Unreclaimable import bytes per worker before a clean recycle. Unset uses a quarter of RAM divided among broker.max_workers, clamped to 9-12 GiB and capped at each worker's RAM share minus 4608 MiB (minimum 1 MiB). This affordability cap can lower the default below 9 GiB. Explicit MiB values bypass RAM sizing; a budget below one import's residue can force frequent recycling.",
     },
     FieldDoc {
         key: "runtime.worker_session_pool_capacity",
