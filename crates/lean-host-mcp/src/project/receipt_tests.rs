@@ -643,7 +643,8 @@ async fn immediate_or_past_admission_deadline_sends_no_frame_to_an_idle_worker()
 async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
     use crate::broker::{ProjectHint, RuntimeAction, RuntimeControlRequest, RuntimeControlStatus};
 
-    let harness = ActorHarness::start_with_runtime(false, None, None, Some(Duration::from_secs(1)));
+    let admission_budget = Duration::from_secs(1);
+    let harness = ActorHarness::start_with_runtime(false, None, None, Some(admission_budget));
     fs::write(harness.root.path().join("hold_runtime_metadata"), "").expect("hold the active request");
     let mut active = Box::pin(harness.project.native_compatibility(admission_deadline()));
     super::tests::poll_pending(active.as_mut()).await;
@@ -654,6 +655,14 @@ async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
     })
     .await
     .expect("active request reached its causal hold");
+    // Inspect the actual broker-to-actor message without adding a production hook.
+    let (probe_tx, mut probe_rx) = mpsc::channel(1);
+    let actor_tx = harness
+        .project
+        .actor_tx
+        .lock()
+        .replace(probe_tx)
+        .expect("retain the actual actor sender");
     let drain = harness.broker.runtime_control(&RuntimeControlRequest {
         action: RuntimeAction::Drain,
         retire_idle: false,
@@ -663,6 +672,12 @@ async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
     let hint = ProjectHint::Explicit(harness.project.canonical_root.clone());
     let mut waiting = Box::pin(harness.broker.native_compatibility(hint.clone()));
     super::tests::poll_pending(waiting.as_mut()).await;
+    // The broker created its deadline during that poll. This ceiling stays
+    // anchored there, even if observing the later handoff is delayed.
+    let observed_admission = Instant::now();
+    let original_deadline_ceiling = observed_admission
+        .checked_add(admission_budget)
+        .expect("finite original admission budget");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let released = harness.broker.runtime_control(&RuntimeControlRequest {
         action: RuntimeAction::Release,
@@ -670,20 +685,39 @@ async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
         ..RuntimeControlRequest::default()
     });
     assert_eq!(released.status, RuntimeControlStatus::Ok);
-    tokio::time::timeout(Duration::from_millis(350), async {
-        while harness.project.outstanding_jobs() != 2 {
-            tokio::select! {
-                biased;
-                result = &mut waiting => panic!("request must reach the held actor before expiry: {result:?}"),
-                () = tokio::time::sleep(Duration::from_millis(5)) => {},
-            }
+    let message = tokio::time::timeout_at(original_deadline_ceiling.into(), async {
+        tokio::select! {
+            biased;
+            message = probe_rx.recv() => message.expect("the original queued message"),
+            result = &mut waiting => panic!("request must reach the held actor before expiry: {result:?}"),
         }
     })
     .await
     .expect("waiter moved from broker admission to the actor mailbox");
-    let result = tokio::time::timeout(Duration::from_millis(700), &mut waiting)
+    let queue_deadline = message.meta().queue.deadline;
+    eprintln!(
+        "admission handoff: elapsed_ms={}, original_remaining_ms={}, queue_remaining_ms={}",
+        observed_admission.elapsed().as_millis(),
+        original_deadline_ceiling
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+        queue_deadline.saturating_duration_since(Instant::now()).as_millis(),
+    );
+    assert!(
+        queue_deadline <= original_deadline_ceiling,
+        "actor queue extended the original admission deadline by {:?}",
+        queue_deadline.saturating_duration_since(original_deadline_ceiling),
+    );
+    actor_tx
+        .send(message)
         .await
-        .expect("broker waiting must not grant a fresh actor-queue budget");
+        .expect("forward the same message to the held real actor");
+    *harness.project.actor_tx.lock() = Some(actor_tx);
+    // This is only a liveness bound; the exact stored-deadline check above is
+    // the reset-budget oracle, independent of observer scheduling.
+    let result = tokio::time::timeout_at(original_deadline_ceiling.into(), &mut waiting)
+        .await
+        .expect("queued request expires at the original admission deadline");
     assert!(matches!(result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "queue_wait_timeout"));
     assert_eq!(harness.requests("open_host_session").len(), 1);
     assert_eq!(harness.requests("host_runtime_metadata").len(), 1);
