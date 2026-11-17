@@ -809,3 +809,36 @@ cannot reconstruct them or establish that a command never ran.
   OS-crash testing and physical power-loss qualification. Unrun categories stay
   unrun. No existing custody fixture or pure lifecycle model establishes these
   storage guarantees; all new native-store durability tests remain NOT RUN.
+
+### SQLite linked-runtime provenance and WAL-reset compatibility
+
+The [official WAL-reset advisory](https://sqlite.org/wal.html#the_wal_reset_bug)
+identifies a rare corruption race with multiple connections to the same WAL
+file concurrently writing/checkpointing. Fixes include SQLite 3.51.3 and later,
+with specified backports 3.44.6 and 3.50.7. FULL synchronization is not a substitute
+for this fix. This is a future dependency/qualification requirement, not a claim
+of observed corruption or a defect in the current non-SQLite runtime slice.
+
+At this inspection the host Cargo manifests/lockfile contain no SQLite dependency
+for the proposed store. Updating a Proofs Python interpreter does not establish
+which SQLite a future Rust binary, helper, maintenance tool or another interpreter
+actually uses. Before permitting access to the future store:
+
+- Record `sqlite_version()` and `sqlite_source_id()` from EACH accessing runtime,
+  plus executable identity, wrapper crate/package version, compile options and
+  selected VFS. Record bundled/static versus system/dynamic link mode and actual
+  loaded library provenance where applicable; do not infer it from Cargo.lock or
+  the shell's unrelated `sqlite3` executable alone.
+- Require a fixed release or explicitly verified vendor backport in the supported
+  runtime matrix. Do not compare versions lexically or reject documented fixed
+  backports merely because their minor version is lower. Recheck packaged binaries
+  and every new connection factory/tooling entry point after dependency updates.
+- Keep one service-owned writer policy, but enumerate checkpoint/reader/maintenance
+  connections too. One logical writer does not exclude a concurrent checkpoint
+  from another connection. Unqualified external tools must not open the live store.
+- Test runtime provenance enforcement, mismatched linked versions and concurrent
+  write/checkpoint behavior on disposable databases. Stress tests passing alone do
+  not prove absence of this rare race or replace verified fixed-build provenance.
+
+No SQLite upgrade, live database access or runtime configuration change occurred
+for this documentation check. Planned native-store tests remain unrun.
