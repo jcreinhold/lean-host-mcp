@@ -179,3 +179,12 @@ paired configured build/signature/image evidence; production provisioning remain
 Lean-dup local integration completed at `19fc765ae4b4291b895ec059f8de4f9e5df2f8cd`; coordinator verified clean canonical
 main and the 15-file commit at 21:21 UTC. The exact patches had passed strict Lean/direct-worker/four-fixture/JSONL
 qualification. Rust/SDK/package and remote dependency reproducibility remain pending. No push or publication occurred.
+
+### Scoped import/theorem review: 21:37 UTC
+
+ABI compile-only scoped 4.35 harness completed and released the lane at 21:36:23. No native import/theorem ran.
+`task-20/scoped-435/REVIEW.md` and exact artifact hashes are assigned to independent review, including the added
+guardian/group closure checks and six writer probes. Reported official-prefix comparison covers 15,291 selected files
+and 105 fixture files; this is not itself executed ABI evidence. 4.36 metadata remains unapplied. Formatter's existing
+owner is preparing a finite release-gate plan source-only; no repeated integration or publication is authorized by that
+assignment. The lane is free pending review, not occupied by these source checks.
