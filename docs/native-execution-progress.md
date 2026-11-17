@@ -258,3 +258,11 @@ is under independent review; warning cleanup, formatting and applicable strict C
 `01a1ebcc-355a-73ca-81d9-ea9ff5fa18f3`. Host unsafe-code prohibition and private Meta constructor remain intact.
 Nonempty trace destinations are rejected. Broader runtime workload records/pre-exec custody, reviewed temporary
 projects and optional-service negative shim are still required. No native test or canonical integration occurred.
+
+### Runtime-preparation corrections: 23:29 UTC
+
+Checkpoint 10 corrects the source-options output path and includes private/server/ilean/IR sidecars in project
+comparison; host all-target, strict Clippy and formatting pass. Patch `b175b7785dea0a99758cef9ba943344fb16d7e4c537fed26bb3e63a264281d0f`
+is under review. Nine apparently Rust-only cases actually link 4.36 libleanshared before test entry and were NOT run.
+A single representative 4.35 host-test provisioner has only placeholder/static evidence. Exact compile-only artifacts
+and custody reuse are being prepared; no new native execution, permission bypass or canonical activation is assigned.
