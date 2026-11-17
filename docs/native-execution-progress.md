@@ -1,6 +1,6 @@
 # Native execution progress
 
-Snapshot: 2026-11-17, 19:26 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
+Snapshot: 2026-11-17, 19:28 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
 Requirements remain in [lifecycle §16](native-execution-lifecycle-design.md#16-remaining-implementation-and-acceptance-gates).
 Update this file after reviewed results, ownership changes or build-lane transfers; do not mark a gate complete from a
 session ending. Distinguish source review, executed tests, canonical integration and deployment.
@@ -45,9 +45,12 @@ before removing a scratch tree. Archived model evidence and replay instructions 
 ## Build lane and immediate sequence
 
 - One substantial build lane, at most two jobs. Warm released it at 18:54:08 UTC after sequential qualification.
-- Formatter now has the lane; its 19:08 status records full `lake test -- --all --jobs 1` at isolated `4f59119`, with two Lean threads. Focused extraction and server-only invalidation are reported passed; the full run passed 39 of 40 suites; the remaining whitespace failure was corrected at isolated `ee1c6b6`. Modes/downstream recheck is active before lane release. ABI, guardian and warm repairs/reviews proceed without substantial builds.
-- Next ready short campaign is warm unwind qualification, then ABI crate checks. Guardian native qualification remains
-  blocked on safe containment regardless of lane availability; source repair continues. A lane grant is not permission to deploy or run proof/Mathlib builds.
+- Formatter released the lane at 19:27:20 UTC with no owned processes. Isolated `ee1c6b6` has a 39/40 full run
+  followed by passing Modes/downstream after the sole whitespace correction. Both worktrees are clean; canonical fmt
+  remains `81899c2`. A cold Lake plugin race was preserved; Linux remains unqualified.
+- Warm now owns the lane for revised unwind positives, Clippy, nine compiled mutation controls and restored positives.
+  ABI real-crate checks follow readiness. Guardian native qualification remains blocked on safe containment regardless
+  of lane availability; source repair continues. A lane grant is not deployment or proof/Mathlib authorization.
 - Semantic 4.36 Lean build/tests passed on an isolated archive of `333c219`; its Rust/runtime qualification still needs
   an immutable SDK. SDK isolated `750846a1c27783fbc7b71c652fe596aa36635b52` removes the two missing string exports coherently; all 91 retained exports pass bounded audits across four inspected Apple Silicon libraries, including 4.36. Independent ABI review confirmed consistency; integration requires audit `e9baea03` followed by removal `750846a1`, not removal alone. Cargo/Lake qualification and runtime/header pairing remain open. These are
   compatibility inputs to the ABI family, not reasons to halt independent lifecycle work.
