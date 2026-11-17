@@ -574,3 +574,132 @@ supervisor death, including simultaneous death; (2) exact process identity/absen
 retention details; (5) concrete service installation and compatibility scope. The proposal chooses Rust native ownership,
 SQLite, finite deadlines and recovery independent of historical result, but does not label these unresolved mechanisms
 as solved. No code, deployment or proof-worker changes are authorized by this document.
+
+## 13. Research-backed validation plan and implementation handoff
+
+Added 2026-11-17 after primary-source research and independent review. Jacob has now authorized design, review,
+refinement and implementation in new sessions. This document remains a proposed design, not a claim of implementation
+or qualification. That authorization does not waive the containment gates or authorize deployment/pushing. This edit
+adds documentation only. The source-scaffold description in §2 is the historical inspection baseline, not a claim that
+those uncommitted files still exist; cleanup owns the current tree inventory.
+
+### Priority 1: specify the public contract and model custody before service implementation
+
+Use [Lamport, *Specifying Systems*](https://lamport.azurewebsites.net/tla/book.html), chapters 3–5 and 7
+(specification/refinement), 8 (fairness), 9 (time) and 14 (TLC). The
+[PlusCal introduction](https://lamport.azurewebsites.net/tla/tutorial/intro.html) is an optional notation aid, not a
+second specification to maintain. [Session 9: Liveness](https://lamport.azurewebsites.net/tla/tutorial/session9.html)
+explains why mutual exclusion alone permits a useless system that never makes progress. Require both safety and
+conditional progress. [Herlihy and Wing, *Linearizability*](https://www.cs.columbia.edu/~wing/publications/HerlihyWing90.pdf)
+provides the sequential-operation contract: identify CREATE's durable acceptance point, START's single-use authorization
+point and CANCEL's request-acceptance point. CANCEL acknowledgment is not scope closure. None of these points makes
+SQLite commit and OS spawn atomic.
+
+**Required artifact:** a small TLA+ lifecycle/custody specification and checked TLC configurations, proposed location
+`HOST/specs/native-execution/{Lifecycle.tla,Lifecycle.cfg,README.md}`. No such new model is claimed to exist or have run.
+Start bounded: two attempts, two artifact domains, one warm generation, service/supervisor/guardian identities and
+failures, holder/alias sets, protected live work, epochs, durable intent, result knowledge, deadlines and lost replies.
+Separate all OS operations from persistence transitions; include a crash between every meaningful pair. Do not model
+“spawn-and-record” or “kill-and-close” as atomic actions merely to obtain a passing check.
+
+Check these properties explicitly:
+
+1. No conflicting protected work overlaps, even after a controller dies and the payload closes inherited descriptors.
+2. An attempt launches at most once; expired attempts and closed epochs cannot be revived by stale messages.
+3. Resource custody is not released while its protected work can still run, under stated platform assumptions.
+4. Unknown historical result can coexist with recovered resources and does not itself consume a capacity slot.
+5. Eligible healthy work eventually runs or receives explicit deadline rejection; abandoned killable scopes eventually
+   release custody. State fairness, eventual OS observation and eventual availability assumptions. Do not assign fairness
+   to crashed actors, or assume unkillable processes eventually exit.
+6. Warm generation reuse cannot let one request renew another request's deadline or inherit prior CPU activity.
+
+Define a refinement mapping from the internal protocol to §6's orthogonal public execution/result/resource states.
+Internal recovery steps may leave public state unchanged, but cannot invent success or erase uncertainty. Include
+negative variants that deliberately release custody early or resend GO; TLC must find counterexamples, demonstrating
+that the asserted property actually detects the intended failure. Record model revision, tool version, bounds, explored
+states, assumptions, counterexample traces and checked properties. A bounded model check is not an unbounded proof.
+
+The official [TLA+ transaction-commit example, `TwoPhase.tla`](https://github.com/tlaplus/Examples/blob/master/specifications/transaction_commit/TwoPhase.tla)
+is a useful example of concrete protocol versus abstract contract and refinement, not a recommendation to add two-phase
+commit to this service. [Newcombe et al., *How Amazon Web Services Uses Formal Methods*](https://www.amazon.science/publications/how-amazon-web-services-uses-formal-methods)
+provides practical motivation for design checking; convert discovered traces into executable fault fixtures rather than
+treating modeling as a substitute for implementation tests.
+
+[Chandra and Toueg, *Unreliable Failure Detectors for Reliable Distributed Systems*](https://ecommons.cornell.edu/entities/publication/7948ff49-7263-49f8-a29b-d062e7cbb240)
+provides the useful distinction between suspicion and actual failure. Lease expiry triggers cleanup; it is not proof
+of process death. This is conceptual guidance, not a reason to introduce consensus machinery on one machine or keep
+an indefinite evidence-only fence.
+
+### Priority 2: resolve the OS custody assumptions with disposable competing fixtures
+
+Run the §4 disposable fixture and compare mechanisms BEFORE choosing the full service topology. The model's kernel
+holder/identity rules are assumptions until these platform tests support them. Test guardian-only, supervisor-only and
+simultaneous death, descriptor transfer before/after ACK, payload closing descriptors and stdio, concurrent fork, leader
+exit, and conflicting successor acquisition. Instrument independent write intervals and actual scope closure. A signal
+returning successfully is not the oracle. Record safety and recovery outcomes separately.
+
+- **macOS existing code:** inspect and retain the exact guarantees in `T/process_group.rs` (leader observation/pinning
+  using `waitid` with `WNOWAIT`) and `T/native_guardian.rs` (`validate_pin`/`kill_payload` and same-session/separate-group
+  assumptions). [Apple's kqueue manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html)
+  describes observation, not process-tree containment or safe signaling authority. It is archived documentation; qualify
+  against the installed supported macOS release.
+- **macOS alternative:** [Apple's published launchd manual](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
+  describes cleanup of the job's remaining PGID unless `AbandonProcessGroup` is enabled. Investigate a launchd-owned
+  direct executor, but verify current behavior and whether private sessions move work outside the relevant PGID.
+  Crucially, eventual group termination after owner death does not prove the absence of a lock-release-before-exit
+  overlap window. The fixture must test that ordering. Do not claim launchd solves artifact custody without it.
+- **Linux alternative:** [kernel cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) offers a candidate
+  per-scope containment boundary: controlled membership before execution, `cgroup.kill`, then `cgroup.events:populated`
+  observation. Prevent new entries after emptiness and prevent managed payload escape. Verify delegation permissions
+  and supported kernel versions. [pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html) and
+  [pidfd_send_signal](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html) improve identity-safe process
+  operations, not descendant containment. Current Linux SDK restraint after leader reaping must not be replaced by
+  a retry loop that signals a possibly reused PGID.
+
+[systemd's killing contract](https://www.freedesktop.org/software/systemd/man/262/systemd.kill.html) and
+[its implementation](https://github.com/systemd/systemd/blob/main/src/core/unit.c) demonstrate the distinction between
+main-process and group cleanup. Borrow `request_stop` versus `observe_scope_empty`, not the entire service manager.
+Likewise [s6-supervise](https://www.skarnet.org/software/s6/s6-supervise.html) and
+[s6 status](https://www.skarnet.org/software/s6/s6-svstat.html) are comparators for a small actual-child owner and explicit
+cleanup-in-progress. They do not prove this application's artifact-lock safety under supervisor failure, and their
+restart behavior must not be copied for commands with unknown outcome.
+
+### Priority 3: narrow Rust guarantees, durable protocol and independent review
+
+Only after the model/fixture resolves the supported custody contract should the new sessions implement the narrow
+scope API, service/store and caller migration. Use these sources to make specific implementation obligations explicit:
+
+- [Rust typestate](https://doc.rust-lang.org/embedded-book/static-guarantees/typestate-programming.html): consuming,
+  non-`Clone` launch tokens and custody-transfer states can prevent local reuse. Avoid a giant cross-product typestate
+  for orthogonal outcome/resource states. Types do not prove process survival or cross-process durability.
+- [Rust `OwnedFd`](https://doc.rust-lang.org/std/os/fd/struct.OwnedFd.html): cloned descriptors can share an underlying
+  open file description. Rust ownership of one FD is not exclusive ownership of the kernel lock. Keep alias accounting
+  and close-only rules explicit. [Rustonomicon, Leaking](https://doc.rust-lang.org/nomicon/leaking.html): destructors are
+  not guaranteed to run; `Drop` is best-effort cleanup, not the custody proof.
+- [Tokio shutdown](https://tokio.rs/tokio/topics/shutdown), [`Child`](https://docs.rs/tokio/latest/tokio/process/struct.Child.html)
+  and [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html): cancellation notification is
+  separate from observed task/child completion. Dropped children can continue; a kill request is not a wait result;
+  direct-child exit is not descendant closure. Keep guardian deadline/liveness enforcement independent of busy Lean
+  actors, database work and executor congestion. Bounded dedicated OS/I/O work is not an excuse to hide infinite
+  supervisor loops inside uncancellable blocking tasks.
+- [Loom](https://github.com/tokio-rs/loom): check small Rust synchronization boundaries such as GO-versus-cancel,
+  transfer-ACK/last-alias arbitration and duplicate publication. It does not test real descriptors, SQLite fsync,
+  process groups or power-loss durability. Use model-specific primitives and retain actual process tests.
+- [Temporal's activity crash example](https://docs.temporal.io/activity-definition): completing work then losing the
+  completion report is a real ambiguity even in durable systems. Temporal's retry/idempotency model is not our default.
+  Preserve original identity for control retries; keep unknown outcome and recovered resources separate; do not add
+  a workflow engine or automatic payload replay.
+
+### Review checkpoints, evidence and stopping rules
+
+The simplicity criteria in §1 remain the architectural filter: independent concerns, a deep minimal client API and
+measurable removal of old authorities. Adding a model, SQLite or actors is not itself simplification. Review the model,
+then custody fixtures, then scope API/storage, then migration as separate evidence-bearing checkpoints. Independent
+review should challenge the assumptions and attempt counterexamples rather than merely confirm passing tests.
+
+For each checkpoint record proposed/implemented/reviewed/tested/deployed separately, exact revisions and coverage.
+An unresolved OS counterexample blocks the dependent custody claim; narrow the supported contract or choose another
+mechanism instead of adding a timeout and declaring success. No model or reference above establishes actual Mac safety
+without fixture evidence. No platform's results automatically qualify another platform. This addition ran no TLC,
+Loom, process fixture, build, migration or production test. Implementation in new sessions must preserve the existing
+proof inputs/receipts and separately authorized deployment boundary.
