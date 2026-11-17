@@ -49,5 +49,5 @@ before removing a scratch tree. Archived model evidence and replay instructions 
 - Guardian qualification follows formatter only after cleanup review and explicit lane admission; ABI/warm test needs
   are coordinated by readiness. A lane grant is not permission to deploy or run proof/Mathlib builds.
 - Semantic 4.36 Lean build/tests passed on an isolated archive of `333c219`; its Rust/runtime qualification still needs
-  an immutable SDK. SDK isolated `750846a1c27783fbc7b71c652fe596aa36635b52` removes the two missing string exports coherently; all 91 retained exports pass bounded audits across four inspected Apple Silicon libraries, including 4.36. Cargo/Lake qualification and runtime/header pairing remain open. These are
+  an immutable SDK. SDK isolated `750846a1c27783fbc7b71c652fe596aa36635b52` removes the two missing string exports coherently; all 91 retained exports pass bounded audits across four inspected Apple Silicon libraries, including 4.36. Independent ABI review confirmed consistency; integration requires audit `e9baea03` followed by removal `750846a1`, not removal alone. Cargo/Lake qualification and runtime/header pairing remain open. These are
   compatibility inputs to the ABI family, not reasons to halt independent lifecycle work.
