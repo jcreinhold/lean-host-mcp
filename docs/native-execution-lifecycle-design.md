@@ -505,6 +505,8 @@ durability. Storage failure cannot trap cleanup, fabricate no-start or erase ori
 
 ## 16. Remaining implementation and acceptance gates
 
+See the [current gate ledger](native-execution-progress.md) for session ownership, latest evidence, blockers and build-lane allocation.
+
 Independent preparation can proceed; dependent production wiring cannot assume an unresolved predecessor passed.
 Existing private tests are reusable evidence, not a production implementation.
 
