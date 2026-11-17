@@ -703,3 +703,17 @@ mechanism instead of adding a timeout and declaring success. No model or referen
 without fixture evidence. No platform's results automatically qualify another platform. This addition ran no TLC,
 Loom, process fixture, build, migration or production test. Implementation in new sessions must preserve the existing
 proof inputs/receipts and separately authorized deployment boundary.
+
+## 14. Compact model integration checkpoint
+
+The reviewed Python model/checker sources and unparsed TLA+ files are now kept in
+[`specs/native-execution`](../specs/native-execution/README.md). Its README records
+the archive hash, replay commands and incomplete/unrun coverage. This integration
+changes no runtime behavior. Sixty recorded tests and reduced graph checks are
+not a completed combined model, TLC run or restart-recovery qualification.
+
+Custody refinement additionally forbids SH/EX lock-mode conversion while live
+custody exists, as well as explicit unlock through an alias. Use close-only
+ownership; the model does not assume a conversion preserves exclusion atomically.
+This assumption does not assert that every failed nonblocking conversion loses
+its lock. Runtime syscall evidence and platform semantics remain separate gates.
