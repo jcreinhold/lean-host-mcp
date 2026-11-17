@@ -514,10 +514,10 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryOutcome>> {
-        let (project, options) = self.prepare_check(hint, options).await?;
+        let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .process_module_query(session_imports, source, query, options)
+            .process_module_query(session_imports, source, query, options, admission_deadline)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -537,7 +537,7 @@ impl ProjectBroker {
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryOutcome>> {
-        let (project, options) = self.prepare_check(hint, options).await?;
+        let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         // A query this build cannot key is run uncached rather than filed under
         // a shared key; see `ModuleQueryKey`.
@@ -576,7 +576,7 @@ impl ProjectBroker {
             });
         }
         let call = project
-            .process_module_query(session_imports, source, query, options)
+            .process_module_query(session_imports, source, query, options, admission_deadline)
             .await?;
         let (value, runtime) = call.into_parts();
         if let Some((key, context)) =
@@ -612,10 +612,10 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
-        let (project, options) = self.prepare_check(hint, options).await?;
+        let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .process_module_query_batch(session_imports, source, selectors, budgets, options)
+            .process_module_query_batch(session_imports, source, selectors, budgets, options, admission_deadline)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -636,7 +636,7 @@ impl ProjectBroker {
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
     ) -> Result<CachedBrokerCall<LeanWorkerModuleQueryBatchOutcome>> {
-        let (project, options) = self.prepare_check(hint, options).await?;
+        let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
         let context = crate::cache::ModuleQueryContext::capture(
@@ -676,7 +676,7 @@ impl ProjectBroker {
             });
         }
         let call = project
-            .process_module_query_batch(session_imports, source, selectors, budgets, options)
+            .process_module_query_batch(session_imports, source, selectors, budgets, options, admission_deadline)
             .await?;
         let (value, runtime) = call.into_parts();
         if let Some((key, context)) =
@@ -709,8 +709,10 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: LeanWorkerDeclarationInspectionRequest,
     ) -> Result<BrokerCall<LeanWorkerDeclarationInspectionResult>> {
-        let project = self.project_for(hint).await?;
-        let call = project.inspect_declaration(session_imports, request).await?;
+        let (project, admission_deadline) = self.project_for(hint).await?;
+        let call = project
+            .inspect_declaration(session_imports, request, admission_deadline)
+            .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
         Ok(out)
@@ -729,8 +731,10 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         requests: Vec<LeanWorkerDeclarationSearch>,
     ) -> Result<BrokerCall<Vec<LeanWorkerDeclarationSearchResult>>> {
-        let project = self.project_for(hint).await?;
-        let call = project.search_declarations(session_imports, requests).await?;
+        let (project, admission_deadline) = self.project_for(hint).await?;
+        let call = project
+            .search_declarations(session_imports, requests, admission_deadline)
+            .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
         Ok(out)
@@ -749,8 +753,10 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
-        let project = self.project_for(hint).await?;
-        let call = project.semantic_proof_search(session_imports, request).await?;
+        let (project, admission_deadline) = self.project_for(hint).await?;
+        let call = project
+            .semantic_proof_search(session_imports, request, admission_deadline)
+            .await?;
         let out = broker_call(&project, &freshness_imports, call);
         drop(project);
         Ok(out)
@@ -769,9 +775,11 @@ impl ProjectBroker {
         request: LeanWorkerProofAttemptRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerProofAttemptResult>> {
-        let (project, options) = self.prepare_check(hint, options).await?;
+        let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let call = project.attempt_proof(session_imports, request, options).await?;
+        let call = project
+            .attempt_proof(session_imports, request, options, admission_deadline)
+            .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
         drop(project);
@@ -791,9 +799,11 @@ impl ProjectBroker {
         request: LeanWorkerDeclarationVerificationRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationResult>> {
-        let (project, options) = self.prepare_check(hint, options).await?;
+        let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
-        let call = project.verify_declaration(session_imports, request, options).await?;
+        let call = project
+            .verify_declaration(session_imports, request, options, admission_deadline)
+            .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
         drop(project);
@@ -813,10 +823,10 @@ impl ProjectBroker {
         request: LeanWorkerDeclarationVerificationBatchRequest,
         options: LeanWorkerElabOptions,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
-        let (project, options) = self.prepare_check(hint, options).await?;
+        let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let call = project
-            .verify_declaration_batch(session_imports, request, options)
+            .verify_declaration_batch(session_imports, request, options, admission_deadline)
             .await?;
         let mut out = broker_call(&project, &freshness_imports, call);
         out.freshness.elaboration_options = Some(option_facts);
@@ -868,8 +878,8 @@ impl ProjectBroker {
         &self,
         hint: ProjectHint,
     ) -> Result<crate::runtime_compatibility::CompatibilityResponse> {
-        let project = self.project_for(hint).await?;
-        let call = project.native_compatibility().await?;
+        let (project, admission_deadline) = self.project_for(hint).await?;
+        let call = project.native_compatibility(admission_deadline).await?;
         let ((), runtime) = call.into_parts();
         let native_compatibility = runtime
             .native_compatibility
@@ -891,7 +901,7 @@ impl ProjectBroker {
         hint: ProjectHint,
         freshness_imports: Vec<String>,
     ) -> Result<BrokerCall<()>> {
-        let project = self.project_for(hint).await?;
+        let (project, _) = self.project_for(hint).await?;
         let out = BrokerCall {
             value: (),
             runtime: project.runtime_facts(),
@@ -909,13 +919,13 @@ impl ProjectBroker {
         &self,
         hint: ProjectHint,
         options: LeanWorkerElabOptions,
-    ) -> Result<(Arc<LeanProject>, LeanWorkerElabOptions)> {
+    ) -> Result<(Arc<LeanProject>, LeanWorkerElabOptions, Instant)> {
         let file_label = options.file_label.clone();
         let admission = async {
             let meta = self.resolve_meta(&hint)?;
             let options = self.resolve_options(&meta, options).await?;
-            let project = self.project_for(hint).await?;
-            Ok((project, options))
+            let (project, admission_deadline) = self.project_for(hint).await?;
+            Ok((project, options, admission_deadline))
         }
         .await;
         if let Err(ServerError::WorkerUnavailable(info)) = &admission
@@ -948,18 +958,20 @@ impl ProjectBroker {
         .await
     }
 
-    async fn project_for(&self, hint: ProjectHint) -> Result<Arc<LeanProject>> {
+    async fn project_for(&self, hint: ProjectHint) -> Result<(Arc<LeanProject>, Instant)> {
         let root = self.resolve(&hint)?;
         self.acquire(root).await
     }
 
     /// Look up or open the project for `root`. Mutex is released around
-    /// the slow path so concurrent calls for different roots parallelize.
-    async fn acquire(&self, root: PathBuf) -> Result<Arc<LeanProject>> {
+    /// the slow path so concurrent calls for different roots parallelize. The
+    /// original deadline continues through the returned actor's queue admission.
+    async fn acquire(&self, root: PathBuf) -> Result<(Arc<LeanProject>, Instant)> {
         let deadline = tokio::time::Instant::now()
             .checked_add(Duration::from_millis(self.request_timeout_millis()))
             .ok_or_else(|| ServerError::Internal("admission deadline is out of range".to_owned()))?;
-        self.acquire_until(root, deadline).await
+        let project = self.acquire_until(root, deadline).await?;
+        Ok((project, deadline.into_std()))
     }
 
     async fn acquire_until(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
@@ -1257,7 +1269,7 @@ impl ProjectBroker {
                         tracing::debug!(evicted = %path.root.display(), "retiring idle LRU project before replacement startup");
                         project.shutdown();
                         // Do not retire another worker while this one is stopping.
-                        return self.wait_for_worker_slot(root, epoch).await;
+                        return self.wait_for_worker_slot(root, epoch, deadline).await;
                     }
                     // Only the head waiter polls. Resident activity holds Arc and
                     // job guards; neither it nor uncertain retirement frees capacity.
@@ -1267,11 +1279,15 @@ impl ProjectBroker {
         }
     }
 
-    async fn wait_for_worker_slot(&self, root: &Path, epoch: u64) -> Result<OwnedSemaphorePermit> {
+    async fn wait_for_worker_slot(
+        &self,
+        root: &Path,
+        epoch: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<OwnedSemaphorePermit> {
         let cancellation = CallCancellation::current();
-        let limit = Duration::from_millis(self.request_timeout_millis());
         let slot = Arc::clone(&self.worker_slots).acquire_owned();
-        let deadline = tokio::time::sleep(limit);
+        let deadline = tokio::time::sleep_until(deadline);
         tokio::pin!(slot, deadline);
         let mut shutdown_check = tokio::time::interval(Duration::from_millis(25));
         shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1284,7 +1300,7 @@ impl ProjectBroker {
                         return Err(Self::pool_unavailable(root, "project_shutting_down", false));
                     }
                 }
-                () = &mut deadline => return Err(Self::pool_unavailable(root, "worker_retirement_timeout", false)),
+                () = &mut deadline => return Err(Self::pool_unavailable(root, "project_admission_timeout", true)),
                 slot = &mut slot => {
                     let slot = slot.map_err(|err| ServerError::Internal(format!("worker capacity closed: {err}")))?;
                     if self.inner.lock().shutdown_epoch != epoch {
@@ -1526,10 +1542,10 @@ mod tests {
         config.max_projects = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
         let broker = ProjectBroker::new(config);
-        let first = broker.acquire(root.clone()).await.unwrap();
-        let second = broker.acquire(root.clone()).await.unwrap();
+        let (first, _) = broker.acquire(root.clone()).await.unwrap();
+        let (second, _) = broker.acquire(root.clone()).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
-        let third = broker.acquire(root.clone()).await.unwrap();
+        let (third, _) = broker.acquire(root.clone()).await.unwrap();
         assert!(Arc::ptr_eq(&third, &first) || Arc::ptr_eq(&third, &second));
         assert_eq!(broker.worker_slots.available_permits(), 0);
         assert_eq!(broker.resident_paths(), vec![root.clone()]);
@@ -1960,6 +1976,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_retirement_wait_preserves_admission_timeout_and_owned_capacity() {
+        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        config.max_projects = NonZeroUsize::MIN;
+        let broker = ProjectBroker::new(config);
+        let retiring = broker
+            .reserve_worker_slot(Path::new("/retiring"), capacity_deadline())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.wait_for_worker_slot(Path::new("/waiting"), 0, tokio::time::Instant::now()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&result, Err(ServerError::WorkerUnavailable(info))
+            if info.reason == "project_admission_timeout" && info.retryable));
+        drop(result);
+        assert_eq!(broker.worker_slots.available_permits(), 0);
+        drop(retiring);
+        assert_eq!(broker.worker_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn shutdown_interrupts_retirement_wait_without_unconfirmed_slot_release() {
         let mut config = cfg(PathBuf::from("/unused"), None, None);
         config.max_projects = NonZeroUsize::MIN;
@@ -1968,7 +2007,7 @@ mod tests {
             .reserve_worker_slot(Path::new("/retiring"), capacity_deadline())
             .await
             .unwrap();
-        let waiting = broker.wait_for_worker_slot(Path::new("/waiting"), 0);
+        let waiting = broker.wait_for_worker_slot(Path::new("/waiting"), 0, capacity_deadline());
         tokio::pin!(waiting);
         pending(waiting.as_mut()).await;
         broker.shutdown_all();
@@ -2008,7 +2047,9 @@ mod tests {
         let cancelled = request.clone();
         let result = crate::cancellation::with_cancellation(&request, async {
             cancelled.cancel();
-            broker.wait_for_worker_slot(Path::new("/next"), 0).await
+            broker
+                .wait_for_worker_slot(Path::new("/next"), 0, capacity_deadline())
+                .await
         })
         .await;
         let reason = match &result {

@@ -107,7 +107,6 @@ fn mailbox_project() -> (Arc<LeanProject>, mpsc::Receiver<ProjectMessage>) {
         session_id: uuid::Uuid::new_v4().to_string(),
         open_warnings: Vec::new(),
         actor_tx: Mutex::new(Some(tx)),
-        admission_timeout: Duration::from_secs(5),
         active_jobs: Arc::new(AtomicUsize::new(0)),
         pool_active_jobs: Arc::new(AtomicUsize::new(0)),
         healthy: Arc::new(AtomicBool::new(true)),
@@ -175,7 +174,11 @@ async fn retained_preparation_error(disposition: WriterDisposition, prior_unknow
     tasks
         .submit("test", id.clone(), binding.clone(), move || async move {
             project
-                .native_compatibility()
+                .native_compatibility(
+                    Instant::now()
+                        .checked_add(Duration::from_secs(5))
+                        .expect("finite test admission"),
+                )
                 .await
                 .map(|_| CallToolResult::success(vec![]))
                 .map_err(McpError::from)

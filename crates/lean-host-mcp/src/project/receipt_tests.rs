@@ -26,6 +26,12 @@ use crate::cancellation::with_cancellation_evidence;
 const EXECUTION_TIMEOUT: Duration = Duration::from_millis(300);
 const TEST_DEADLINE: Duration = Duration::from_secs(5);
 
+fn admission_deadline() -> Instant {
+    Instant::now()
+        .checked_add(TEST_DEADLINE)
+        .expect("finite test admission")
+}
+
 /// One real protocol process per generation; no Lean or Lake installation is used.
 const FAKE_WORKER: &str = r"#!/usr/bin/env python3
 import json
@@ -88,6 +94,8 @@ while True:
         else:
             send('session')
     elif operation == 'host_runtime_metadata':
+        while (root / 'hold_runtime_metadata').exists():
+            time.sleep(0.005)
         send('metadata')
     elif operation == 'release_host_read':
         if (root / 'hang_read_release').exists():
@@ -228,7 +236,6 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
         session_id: uuid::Uuid::new_v4().to_string(),
         open_warnings: Vec::new(),
         actor_tx: Mutex::new(None),
-        admission_timeout: TEST_DEADLINE,
         active_jobs: Arc::new(AtomicUsize::new(0)),
         pool_active_jobs: Arc::new(AtomicUsize::new(0)),
         healthy: Arc::new(AtomicBool::new(true)),
@@ -358,34 +365,50 @@ struct ActorHarness {
 
 impl ActorHarness {
     fn start(remove_executable: bool) -> Self {
-        Self::start_with_runtime(remove_executable, None, None)
+        Self::start_with_runtime(remove_executable, None, None, None)
     }
 
     fn start_with_runtime(
         remove_executable: bool,
         tokio_handle: Option<tokio::runtime::Handle>,
         soft_budget: Option<u64>,
+        admission_timeout: Option<Duration>,
     ) -> Self {
         let root = tempfile::tempdir().expect("private actor fixture");
         let executable = fake_worker(root.path(), remove_executable);
-        let broker = crate::broker::ProjectBroker::new(crate::broker::BrokerConfig {
+        let broker_config = crate::broker::BrokerConfig {
             config_default: None,
             env_default: None,
             cwd: root.path().to_path_buf(),
             max_projects: NonZeroUsize::MIN,
             max_workers_per_project: NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
-        });
+        };
+        let mut runtime_config = ProjectRuntimeConfig::default();
+        if let Some(timeout) = admission_timeout {
+            runtime_config.request_timeout_millis = millis_u64(timeout);
+        }
+        let broker = crate::broker::ProjectBroker::new_with_runtime_config(broker_config, runtime_config);
         let maintenance = broker.test_maintenance_access();
         let mut project = fixture_project(root.path());
-        Arc::get_mut(&mut project)
-            .expect("private fixture project")
-            .pool_active_jobs = maintenance.activity_counter();
+        let fixture = Arc::get_mut(&mut project).expect("private fixture project");
+        fixture.pool_active_jobs = maintenance.activity_counter();
+        if admission_timeout.is_some() {
+            fs::write(root.path().join("lakefile.lean"), "package fixture\n").expect("private Lake metadata");
+            fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").expect("private pin");
+            fs::write(root.path().join("lake-manifest.json"), "{\"packages\":[]}\n").expect("private manifest");
+            let meta = LakeProjectMeta::from_explicit(root.path()).expect("read metadata without running Lake");
+            fixture.canonical_root = meta.canonical_root;
+            fixture.manifest_hash = meta.manifest_hash;
+        }
         broker.test_register_actor(Arc::clone(&project));
         let tracker = LeanWorkerProcessTracker::new();
         let mut config = fixture_config(root.path(), executable, &project, &tracker);
         config.maintenance = maintenance;
         config.tokio_handle = tokio_handle;
+        if admission_timeout.is_some() {
+            config.request_timeout_millis = millis_u64(TEST_DEADLINE);
+        }
         if let Some(soft_budget) = soft_budget {
             config.import_residue_soft_bytes = soft_budget;
         }
@@ -472,6 +495,7 @@ async fn query(project: &LeanProject) -> Result<ProjectCall<LeanWorkerModuleQuer
             "theorem fixture : True := True.intro".into(),
             LeanWorkerModuleQuery::Diagnostics,
             LeanWorkerElabOptions::default(),
+            admission_deadline(),
         )
         .await
 }
@@ -495,7 +519,7 @@ pub(crate) async fn retained_warm_prebody_cycle_call() -> Result<ProjectCall<Lea
     let harness = ActorHarness::start(false);
     harness
         .project
-        .native_compatibility()
+        .native_compatibility(admission_deadline())
         .await
         .expect("warm first protocol generation without executing a target");
     let old_pid = harness.requests("open_host_session")[0]["pid"].clone();
@@ -591,6 +615,105 @@ fn assert_stopped_call(
 }
 
 #[tokio::test]
+async fn immediate_or_past_admission_deadline_sends_no_frame_to_an_idle_worker() {
+    let harness = ActorHarness::start(false);
+    for deadline in [
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("past deadline"),
+        Instant::now(),
+    ] {
+        let result = harness.project.native_compatibility(deadline).await;
+        assert!(matches!(result, Err(ServerError::WorkerUnavailable(info))
+            if matches!(info.reason.as_str(), "queue_wait_timeout" | "mailbox_admission_timeout")));
+        assert!(harness.requests("open_host_session").is_empty());
+        assert_eq!(harness.capacity.available_permits(), 0);
+    }
+    harness
+        .project
+        .native_compatibility(admission_deadline())
+        .await
+        .expect("idle worker remains usable");
+    assert_eq!(harness.requests("open_host_session").len(), 1);
+    assert_eq!(harness.requests("spawn").len(), 1);
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
+    use crate::broker::{ProjectHint, RuntimeAction, RuntimeControlRequest, RuntimeControlStatus};
+
+    let harness = ActorHarness::start_with_runtime(false, None, None, Some(Duration::from_secs(1)));
+    fs::write(harness.root.path().join("hold_runtime_metadata"), "").expect("hold the active request");
+    let mut active = Box::pin(harness.project.native_compatibility(admission_deadline()));
+    super::tests::poll_pending(active.as_mut()).await;
+    tokio::time::timeout(TEST_DEADLINE, async {
+        while harness.requests("host_runtime_metadata").is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("active request reached its causal hold");
+    let drain = harness.broker.runtime_control(&RuntimeControlRequest {
+        action: RuntimeAction::Drain,
+        retire_idle: false,
+        ..RuntimeControlRequest::default()
+    });
+    assert_eq!(drain.status, RuntimeControlStatus::Draining);
+    let hint = ProjectHint::Explicit(harness.project.canonical_root.clone());
+    let mut waiting = Box::pin(harness.broker.native_compatibility(hint.clone()));
+    super::tests::poll_pending(waiting.as_mut()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let released = harness.broker.runtime_control(&RuntimeControlRequest {
+        action: RuntimeAction::Release,
+        lease_id: drain.lease_id,
+        ..RuntimeControlRequest::default()
+    });
+    assert_eq!(released.status, RuntimeControlStatus::Ok);
+    tokio::time::timeout(Duration::from_millis(350), async {
+        while harness.project.outstanding_jobs() != 2 {
+            tokio::select! {
+                biased;
+                result = &mut waiting => panic!("request must reach the held actor before expiry: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {},
+            }
+        }
+    })
+    .await
+    .expect("waiter moved from broker admission to the actor mailbox");
+    let result = tokio::time::timeout(Duration::from_millis(700), &mut waiting)
+        .await
+        .expect("broker waiting must not grant a fresh actor-queue budget");
+    assert!(matches!(result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "queue_wait_timeout"));
+    assert_eq!(harness.requests("open_host_session").len(), 1);
+    assert_eq!(harness.requests("host_runtime_metadata").len(), 1);
+    assert_eq!(
+        harness.capacity.available_permits(),
+        0,
+        "queued expiry releases no actor-owned capacity"
+    );
+    assert_eq!(harness.tracker.active_processes(), 1);
+
+    fs::remove_file(harness.root.path().join("hold_runtime_metadata")).expect("release the active request");
+    active.await.expect("queued expiry does not cancel the active request");
+    harness
+        .broker
+        .native_compatibility(hint)
+        .await
+        .expect("warm actor remains reusable");
+    let opens = harness.requests("open_host_session");
+    assert_eq!(
+        opens.len(),
+        2,
+        "expired queued request sends no frame, even after actor release"
+    );
+    assert_eq!(opens[0]["pid"], opens[1]["pid"], "reuse the same warm generation");
+    assert_eq!(harness.capacity.available_permits(), 0);
+    drop(waiting);
+    harness.finish().await;
+}
+
+#[tokio::test]
 async fn actor_timeout_preserves_direct_worker_receipt_without_replay() {
     let harness = ActorHarness::start(false);
     let (result, evidence) =
@@ -653,6 +776,7 @@ async fn abrupt_worker_exit_after_effect_never_replays_actual_proof_attempt() {
                     budgets: LeanWorkerOutputBudgets::default(),
                 },
                 LeanWorkerElabOptions::default(),
+                admission_deadline(),
             )
             .await
     })
@@ -750,7 +874,7 @@ async fn semantic_shutdown_receipt_cannot_settle_ordinary_or_new_companion_scope
         .confirmed_request_stop_since(&companion_checkpoint)
         .expect("genuine companion request stop")
         .clone();
-    let meta = project.job_meta(Vec::new(), RetryPolicy::Never);
+    let meta = project.job_meta(Vec::new(), RetryPolicy::Never, admission_deadline());
     let receipt = state
         .finish_semantic_shutdown(&meta, &after, shutdown, Some(&upstream), false)
         .expect("same production adapter confirms shutdown")
@@ -833,7 +957,7 @@ async fn injected_semantic_cleanup_failure_keeps_original_receipt_and_live_repla
     let after = companion.lifecycle_snapshot();
 
     let (error, evidence) = crate::cancellation::with_cancellation_evidence(&CancellationToken::new(), async {
-        let meta = project.job_meta(Vec::new(), RetryPolicy::Never);
+        let meta = project.job_meta(Vec::new(), RetryPolicy::Never, admission_deadline());
         let operation = meta.cancellation.begin_operation();
         // Fault-inject only the cleanup syscall outcome. Both processes and the
         // interrupted request receipt are genuine; replacement stays live here.
@@ -891,7 +1015,7 @@ async fn cold_compatibility_opens_actual_session_without_target_proof() {
     assert!(harness.requests("open_host_session").is_empty());
     let call = harness
         .project
-        .native_compatibility()
+        .native_compatibility(admission_deadline())
         .await
         .expect("actual fake metadata compatibility");
     let ((), runtime) = call.into_parts();
@@ -912,7 +1036,7 @@ async fn incompatible_session_metadata_refuses_before_target_body() {
     let harness = ActorHarness::start(false);
     harness
         .project
-        .native_compatibility()
+        .native_compatibility(admission_deadline())
         .await
         .expect("establish actual contract");
     let mut incompatible =
@@ -944,7 +1068,7 @@ async fn incompatible_session_metadata_refuses_before_target_body() {
 
 #[tokio::test]
 async fn idle_worker_death_after_healthy_observation_recovers_capacity_without_a_request() {
-    let harness = ActorHarness::start_with_runtime(false, Some(tokio::runtime::Handle::current()), None);
+    let harness = ActorHarness::start_with_runtime(false, Some(tokio::runtime::Handle::current()), None, None);
     assert!(
         harness.project.is_healthy(),
         "initial owner status observed a live worker"
@@ -965,7 +1089,7 @@ async fn idle_worker_death_after_healthy_observation_recovers_capacity_without_a
 
 #[tokio::test]
 async fn lifecycle_polls_keep_healthy_idle_workers_warm_without_health_rpcs() {
-    let harness = ActorHarness::start_with_runtime(false, Some(tokio::runtime::Handle::current()), None);
+    let harness = ActorHarness::start_with_runtime(false, Some(tokio::runtime::Handle::current()), None, None);
     tokio::time::sleep(WORKER_LIVENESS_POLL_INTERVAL * 3).await;
     assert!(harness.project.is_healthy());
     assert_eq!(harness.requests("spawn").len(), 1);
@@ -977,7 +1101,7 @@ async fn lifecycle_polls_keep_healthy_idle_workers_warm_without_health_rpcs() {
 
 #[tokio::test]
 async fn lifecycle_ticks_preserve_residue_quiescence_and_one_cycle_per_quiet_period() {
-    let harness = ActorHarness::start_with_runtime(false, Some(tokio::runtime::Handle::current()), Some(1));
+    let harness = ActorHarness::start_with_runtime(false, Some(tokio::runtime::Handle::current()), Some(1), None);
     let mut bytes = fs::File::open(harness.root.path().join("session")).expect("import response");
     let frame =
         lean_rs_worker_protocol::protocol::read_frame(&mut bytes, MAX_FRAME_BYTES).expect("read import response");
@@ -993,7 +1117,7 @@ async fn lifecycle_ticks_preserve_residue_quiescence_and_one_cycle_per_quiet_per
     let request_started = Instant::now();
     let call = harness
         .project
-        .search_declarations(vec!["Init".into()], Vec::new())
+        .search_declarations(vec!["Init".into()], Vec::new(), admission_deadline())
         .await
         .expect("one import and no searches");
     assert_eq!(
@@ -1037,7 +1161,7 @@ async fn known_metadata_result_survives_read_release_failure_without_replay() {
     fs::write(harness.root.path().join("hang_read_release"), "").expect("configure resource cleanup hang");
     let call = harness
         .project
-        .native_compatibility()
+        .native_compatibility(admission_deadline())
         .await
         .expect("known metadata outcome survives cleanup failure");
     let ((), runtime) = call.into_parts();
@@ -1079,6 +1203,7 @@ pub(crate) async fn retained_missing_import_after_replacement_call() -> Result<P
             "theorem UnitIndexed : True := True.intro".into(),
             LeanWorkerModuleQuery::Diagnostics,
             LeanWorkerElabOptions::new().file_label("UnitIndexed.lean"),
+            admission_deadline(),
         )
         .await;
     let error = result.as_ref().expect_err("missing import refuses before target body");
@@ -1318,6 +1443,7 @@ async fn cold_compiled_abi_header_and_runtime_refuse_before_first_target_body() 
                     "theorem fixture : True := True.intro".into(),
                     LeanWorkerModuleQuery::Diagnostics,
                     LeanWorkerElabOptions::default().file_label("Cold.lean"),
+                    admission_deadline(),
                 )
                 .await
         })
@@ -1394,6 +1520,7 @@ async fn unexpected_metadata_transport_response_does_not_claim_known_refusal() {
                 "theorem fixture : True := True.intro".into(),
                 LeanWorkerModuleQuery::Diagnostics,
                 LeanWorkerElabOptions::default().file_label("Unknown.lean"),
+                admission_deadline(),
             )
             .await
     })

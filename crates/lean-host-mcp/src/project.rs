@@ -689,7 +689,8 @@ struct CpuSampleBaseline {
 }
 
 /// One atomic decision separates queue expiry from dispatch. Once expired, a
-/// message can stay in the mailbox but can never reach the worker.
+/// message can stay in the mailbox but can never reach the worker. The broker
+/// supplies its original admission deadline; entering this queue adds no budget.
 struct QueueDeadline {
     deadline: Instant,
     state: AtomicUsize,
@@ -700,10 +701,9 @@ impl QueueDeadline {
     const STARTED: usize = 1;
     const EXPIRED: usize = 2;
 
-    fn new(limit: Duration) -> Self {
-        let now = Instant::now();
+    fn new(deadline: Instant) -> Self {
         Self {
-            deadline: now.checked_add(limit).unwrap_or(now),
+            deadline,
             state: AtomicUsize::new(Self::WAITING),
         }
     }
@@ -1094,7 +1094,6 @@ pub(crate) struct LeanProject {
     /// [`Self::freshness`]; empty for a fully-vouched-for worker.
     open_warnings: Vec<String>,
     actor_tx: Mutex<Option<mpsc::Sender<ProjectMessage>>>,
-    admission_timeout: Duration,
     active_jobs: Arc<AtomicUsize>,
     pool_active_jobs: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -1162,7 +1161,6 @@ impl LeanProject {
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let pool_active_jobs = maintenance.activity_counter();
         let healthy = Arc::new(AtomicBool::new(true));
-        let admission_timeout = Duration::from_millis(runtime_config.request_timeout_millis());
         let (mut config, open_warnings) = match ActorConfig::from_meta(
             &meta,
             session_id.clone(),
@@ -1217,7 +1215,6 @@ impl LeanProject {
             session_id,
             open_warnings,
             actor_tx: Mutex::new(Some(actor_tx)),
-            admission_timeout,
             active_jobs,
             pool_active_jobs,
             healthy,
@@ -1248,7 +1245,6 @@ impl LeanProject {
             session_id: "handoff-test".into(),
             open_warnings: Vec::new(),
             actor_tx: Mutex::new(Some(tx)),
-            admission_timeout: Duration::from_secs(1),
             active_jobs: Arc::new(AtomicUsize::new(0)),
             pool_active_jobs: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -1280,10 +1276,11 @@ impl LeanProject {
         source: String,
         query: LeanWorkerModuleQuery,
         options: LeanWorkerElabOptions,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             source,
             query,
             options,
@@ -1305,10 +1302,11 @@ impl LeanProject {
         selectors: Vec<LeanWorkerModuleQuerySelector>,
         budgets: LeanWorkerOutputBudgets,
         options: LeanWorkerElabOptions,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQueryBatch {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             source,
             selectors,
             budgets,
@@ -1328,10 +1326,11 @@ impl LeanProject {
         &self,
         imports: Vec<String>,
         request: LeanWorkerDeclarationInspectionRequest,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<LeanWorkerDeclarationInspectionResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationInspection {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             request,
             reply,
         };
@@ -1364,10 +1363,11 @@ impl LeanProject {
         &self,
         imports: Vec<String>,
         requests: Vec<LeanWorkerDeclarationSearch>,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<Vec<LeanWorkerDeclarationSearchResult>>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationSearch {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             requests,
             reply,
         };
@@ -1384,10 +1384,11 @@ impl LeanProject {
         &self,
         imports: Vec<String>,
         request: SemanticProofSearchRequest,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<SemanticProofSearchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::SemanticProofSearch {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             request,
             reply,
         };
@@ -1405,10 +1406,11 @@ impl LeanProject {
         imports: Vec<String>,
         request: LeanWorkerProofAttemptRequest,
         options: LeanWorkerElabOptions,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<LeanWorkerProofAttemptResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ProofAttempt {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             request,
             options,
             reply,
@@ -1427,10 +1429,11 @@ impl LeanProject {
         imports: Vec<String>,
         request: LeanWorkerDeclarationVerificationRequest,
         options: LeanWorkerElabOptions,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerification {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             request,
             options,
             reply,
@@ -1450,10 +1453,11 @@ impl LeanProject {
         imports: Vec<String>,
         request: LeanWorkerDeclarationVerificationBatchRequest,
         options: LeanWorkerElabOptions,
+        admission_deadline: Instant,
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationBatchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerificationBatch {
-            meta: self.job_meta(imports, RetryPolicy::Never),
+            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
             request,
             options,
             reply,
@@ -1461,11 +1465,11 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
-    pub(crate) async fn native_compatibility(&self) -> Result<ProjectCall<()>> {
+    pub(crate) async fn native_compatibility(&self, admission_deadline: Instant) -> Result<ProjectCall<()>> {
         let (reply, rx) = oneshot::channel();
         self.enqueue(
             ProjectMessage::NativeCompatibility {
-                meta: self.job_meta(Vec::new(), RetryPolicy::Never),
+                meta: self.job_meta(Vec::new(), RetryPolicy::Never, admission_deadline),
                 reply,
             },
             rx,
@@ -1473,13 +1477,13 @@ impl LeanProject {
         .await
     }
 
-    fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy) -> JobMeta {
+    fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy, admission_deadline: Instant) -> JobMeta {
         let created_at = Instant::now();
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
         self.pool_active_jobs.fetch_add(1, Ordering::AcqRel);
         JobMeta {
             file_label: None,
-            queue: Arc::new(QueueDeadline::new(self.admission_timeout)),
+            queue: Arc::new(QueueDeadline::new(admission_deadline)),
             import_fingerprint: import_fingerprint(&imports),
             imports,
             _created_at: created_at,
@@ -4390,7 +4394,7 @@ mod tests {
             "idle"
         );
     }
-    async fn poll_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+    pub(super) async fn poll_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
         std::future::poll_fn(|cx| {
             assert!(future.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
@@ -4442,7 +4446,11 @@ mod tests {
         );
     }
 
-    fn queued_test_project(limit: Duration) -> (LeanProject, mpsc::Receiver<ProjectMessage>) {
+    fn test_admission_deadline(limit: Duration) -> Instant {
+        Instant::now().checked_add(limit).unwrap()
+    }
+
+    fn queued_test_project(limit: Duration) -> (LeanProject, mpsc::Receiver<ProjectMessage>, Instant) {
         let (tx, rx) = mpsc::channel(2);
         let project = LeanProject {
             canonical_root: PathBuf::from("/test"),
@@ -4453,7 +4461,6 @@ mod tests {
             session_id: String::new(),
             open_warnings: Vec::new(),
             actor_tx: Mutex::new(Some(tx)),
-            admission_timeout: limit,
             active_jobs: Arc::new(AtomicUsize::new(0)),
             pool_active_jobs: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -4471,15 +4478,15 @@ mod tests {
             })),
             module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
         };
-        (project, rx)
+        (project, rx, test_admission_deadline(limit))
     }
 
     #[tokio::test]
     async fn queue_timeout_returns_before_actor_drains_and_prevents_dispatch() {
-        let (project, mut rx) = queued_test_project(Duration::from_millis(5));
+        let (project, mut rx, admission_deadline) = queued_test_project(Duration::from_millis(5));
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::Never),
+            meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4497,13 +4504,13 @@ mod tests {
 
     #[tokio::test]
     async fn queue_deadline_includes_both_admission_and_actor_wait() {
-        let (project, mut rx) = queued_test_project(Duration::from_millis(500));
+        let (project, mut rx, admission_deadline) = queued_test_project(Duration::from_millis(500));
         let tx = project.actor_tx.lock().as_ref().unwrap().clone();
         // Occupy every mailbox slot without dispatching a worker request.
         let permits = tx.reserve_many(2).await.unwrap();
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::Never),
+            meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4528,10 +4535,10 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_queued_caller_cancels_message_before_dispatch() {
-        let (project, mut rx) = queued_test_project(Duration::from_secs(1));
+        let (project, mut rx, admission_deadline) = queued_test_project(Duration::from_secs(1));
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::Never),
+            meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4549,10 +4556,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_of_running_message_waits_for_actor_cleanup() {
-        let (project, mut rx) = queued_test_project(Duration::from_secs(1));
+        let (project, mut rx, admission_deadline) = queued_test_project(Duration::from_secs(1));
         let (reply, receive) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: project.job_meta(vec![], RetryPolicy::Never),
+            meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,
             options: LeanWorkerElabOptions::default(),
@@ -4572,7 +4579,7 @@ mod tests {
 
     #[test]
     fn expired_queue_entry_never_starts() {
-        let queue = QueueDeadline::new(Duration::ZERO);
+        let queue = QueueDeadline::new(Instant::now());
         assert!(!queue.start());
         assert!(queue.expire());
         assert!(!queue.start());
@@ -4580,14 +4587,14 @@ mod tests {
 
     #[test]
     fn cancelled_waiting_queue_entry_never_starts() {
-        let queue = QueueDeadline::new(Duration::from_secs(30));
+        let queue = QueueDeadline::new(test_admission_deadline(Duration::from_secs(30)));
         assert!(queue.expire());
         assert!(!queue.start());
     }
 
     #[test]
     fn started_job_is_not_expired_by_queue_deadline() {
-        let queue = QueueDeadline::new(Duration::from_secs(30));
+        let queue = QueueDeadline::new(test_admission_deadline(Duration::from_secs(30)));
         assert!(queue.start());
         assert!(!queue.expire());
         assert!(!queue.start());
@@ -4596,7 +4603,7 @@ mod tests {
     #[test]
     fn queue_expiry_race_has_only_one_winner() {
         for _ in 0..100 {
-            let queue = Arc::new(QueueDeadline::new(Duration::from_secs(30)));
+            let queue = Arc::new(QueueDeadline::new(test_admission_deadline(Duration::from_secs(30))));
             let other = Arc::clone(&queue);
             let start = std::thread::spawn(move || other.start());
             let expired = queue.expire();
@@ -4677,7 +4684,7 @@ mod tests {
         let message = ProjectMessage::ModuleQuery {
             meta: JobMeta {
                 file_label: None,
-                queue: Arc::new(QueueDeadline::new(Duration::from_secs(30))),
+                queue: Arc::new(QueueDeadline::new(test_admission_deadline(Duration::from_secs(30)))),
                 imports: vec!["Init".to_owned()],
                 import_fingerprint: "Init".to_owned(),
                 _created_at: Instant::now(),
