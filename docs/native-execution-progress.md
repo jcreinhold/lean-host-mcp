@@ -89,7 +89,7 @@ ten minutes. No active compile was recorded. This is progress evidence, not cont
 
 ## Cross-track assignments
 
-Updated 2026-11-17 at 20:44 UTC. This table includes waiting work, not just running sessions. Assignment times are
+Updated 2026-11-17 at 20:58 UTC. This table includes waiting work, not just running sessions. Assignment times are
 coordinator observation windows unless an exact admission time was returned. No completion range is established for
 unfinished integration; use the next evidence checkpoint, not an invented ETA. Callback review plus approximately
 15-minute coordination checks remain in place; twenty minutes without new evidence triggers investigation, not a kill.
@@ -116,5 +116,12 @@ cache remain untouched.
 At about 20:49, formatter and semantic source upgrades are integrated locally, not published. Warm SDK candidate is
 `fbf0e62`; private host adapter source is under joint review before tests. Host/dup owner is preparing independent
 Lean-only pins. New IUT read-only native Mac audit `01a1eb44-d62f-7830-b8f7-034e4ca1f26c` compares Mathlib 4.36
-release/signatures/consumers; no builds, fetch, cache or source changes. Future new sessions use native Mac creation;
-existing cloud-managed Mac-backed sessions continue only through safe checkpoints.
+release/signatures/consumers; no builds, fetch, cache or source changes. The owner subsequently permits whichever session type is best for management, preferring the Mac executor for repository work. Existing owners remain assigned; no duplicate sessions are needed.
+
+### Current checkpoint: 20:58 UTC
+
+- ABI turn `01a1eb35-ab0c-724b-8e4b-5e03f7a13597` completed. Composed SDK `16b625ac` contains ten ABI patches, guardian changes and raw-symbol audit/removal. Host `b8fd321` and SDK all-target checks passed on 4.35. Two fresh-process rejection controls passed using extracted production functions/test doubles, not a Lean native regression. Lane released at 20:48:33. New source-only provisioning turn `01a1eb4b-f8a4-77c4-9bfe-1d28fa577748` is admitted; runtime/helper identity, load-command resolution and pre-exec custody remain required.
+- Warm turn `01a1eb4b-df9e-723b-9bf4-c52d4abd751f` is admitted and owns the single two-job test lane. Independent review found missing invoked regression coverage and seal-error/primary-error preservation gaps in the private adapter. The assignment includes frame counts, one-use consumption, validation ordering, failed retirement and slot retention. Canonical activation remains disabled; admission is not evidence tests have run.
+- Host/dup completed an applicable source-pin patch against `a1189fb`: six Lean toolchains and CLI default to 4.36, both Lake semantic pins to `c30d8b3`. Static checks passed; no compile or canonical change. Lean-only checks wait for the lane; Rust/package checks wait for the coherent SDK family.
+- Native Mathlib audit completed at 20:53:33, after 4m54s, per IUT coordinator. Four source-inspected candidates, no compiled theorem claim. Proofs remains clean at `bc2c4ca264`; no active IUT task.
+- Mac briefly disconnected and was confirmed connected and reattached before this update. No uncertain command was rerun. No release or deployment occurred.
