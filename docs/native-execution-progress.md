@@ -222,3 +222,13 @@ Isolated 4.36 paired-build turn `01a1eb99-5553-77e3-b448-8c7ce0aa52a8` now owns 
 approved the two-file registration patch only for that isolated build, not canonical activation. Required evidence:
 fresh allocator positive/non-mimalloc negative controls, rebuilt host/interop/fixture images, all 53 signatures including
 multiplication, ownership checks and actual runtime closure. No 4.36 native execution is assigned before artifact review.
+
+### 4.36 paired compile and migration blocker: 22:27 UTC
+
+The isolated 4.36 fixture compiled; allocator positive and same-header non-mimalloc rejection controls behaved as
+expected. Owner records all 53 fresh signatures/exports, three initializers and nine-image closure. No native executable
+ran. Independent review of the immutable `task-20/paired-436` packet is assigned. Broader configured SDK all-target
+checks fail on 29 core/host tests, examples and benchmarks needing explicit authority migration; linkage and two worker
+adapter executables link. The owner now repairs these targets in isolated composition, without unchecked authority or
+canonical activation, using turn `01a1eb9e-a843-70d8-8c19-e749c2c18171`. Previous lane released at 22:25:36; this new
+bounded compile assignment owns the two-job lane. Active supported canonical SDK remains 4.35.
