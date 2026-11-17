@@ -55,7 +55,7 @@ distinguishes recorded evidence from replacement-service requirements. It is not
 | Writer admission | SDK `4ae59cd` closes ungranted candidate EX and all partial locks before retrying, preserving demand, original deadline and inode checks. This removes a takeover prerequisite, not the recovery gap. |
 | macOS process tokens | Disposable same-boot supplied-token tests cover exec-generation rejection, nonparent signaling and running-orphan termination with a prospective exit observer. Durable discovery, boot binding, late observation and complete-group containment are not established. |
 | Frozen guardian and takeover | Still a qualification gate. Stopped-child controls and pre-worker EPERM failures do not establish actual frozen-guardian recovery. |
-| Formal models | Historical bounded Python results exist; a TLA+/TLC port is in progress. See §14 and the model owner's recorded results; no completed composition or runtime refinement is claimed. |
+| Formal models | Port `a309cc6` replaces abstract Python explorers with TLA+; its owner records 155 required TLC cases with intended results. A larger control case remains incomplete. See §14 for the boundaries; no composition or runtime refinement is claimed. |
 
 The actual-package qualification report and its first permission failures are retained in
 `/private/tmp/lean-service-contract-20261117/spec-update-proposal.md`. The first sandboxed run failed six
@@ -466,11 +466,17 @@ unsupported cases before dependent wiring.
 
 ## 14. Model evidence
 
-The [model directory](../specs/native-execution/README.md) owns current artifacts, port status and reproduction
-commands. The TLA+/TLC port is in progress; do not infer a completed run or equivalence from the existence of files. The
-historical archive records 60 unit tests, 30 reduced late-control graphs of 96–648 states (limit 30,000 each), and five
-broken-handler counterexamples. The combined 300,001-state exploration was incomplete. These slices are neither a
-composition proof nor native recovery qualification. Preserve archive provenance when replacing its Python tools.
+The [model directory](../specs/native-execution/README.md) owns artifacts, reproduction commands and recorded results.
+At port `a309cc6`, its owner records SANY parsing and intended results for all 155 required TLC cases, including exact
+negative-control targets. The extended two-message stage case completed with 802,787 distinct states in 28.793s; the
+larger case with all controls hit its 30s bound and remains **INCOMPLETE**. The earlier Python exploration stopped at
+300,001 states; it is a different incomplete run, not a TLC result. Historical Python tests are not additional TLC or
+runtime cases.
+
+The coarse models retain the earlier supervisor/guardian alias arrangement. They do not model the selected SDK
+registry/token recovery, a third service alias, boot/exec token capture or takeover. Complete-domain acquisition,
+authenticated callbacks, sealed launch gates and observed whole-scope termination remain assumptions. These separate
+checks are neither a composition proof nor native recovery qualification.
 
 Custody refinement requires close-only aliases with no live SH/EX mode conversion. This does not assert every failed
 nonblocking conversion loses its lock; runtime syscall semantics and storage/process assumptions qualify separately.
