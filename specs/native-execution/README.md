@@ -85,3 +85,12 @@ real-process tests complement each other; neither silently supplies the other's 
 callbacks. It is a directly testable reference module, not part of the running server. Its 25 focused tests include 48
 ordered pairs of late controls. The document explains its API, model differences and the launch, authentication, closure
 and persistence facts a future runtime must supply. Run it directly with `rustc`; no server or Lean build is needed.
+
+## Unwired native adapter tests
+
+[The native stage contract tests](stage-runtime-contract.md) connect the reference
+kernel to actual disposable SDK children and a read-lock guardian on macOS. They
+check one-use GO, delayed callbacks, lost delivery and full one-shot generation
+cleanup. They do not exercise current production routing, warm-worker request
+closure or durable restart recovery. The document states the exact process
+arrangement, negative controls and dependency limits of the recorded runs.
