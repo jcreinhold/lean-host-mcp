@@ -1,6 +1,6 @@
 # Native execution progress
 
-Snapshot: 2026-11-17, 20:18 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
+Snapshot: 2026-11-17, 20:23 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
 Requirements remain in [lifecycle §16](native-execution-lifecycle-design.md#16-remaining-implementation-and-acceptance-gates).
 Update this file after reviewed results, ownership changes or build-lane transfers; do not mark a gate complete from a
 session ending. Distinguish source review, executed tests, canonical integration and deployment.
@@ -49,7 +49,7 @@ before removing a scratch tree. Archived model evidence and replay instructions 
   followed by passing Modes/downstream after the sole whitespace correction. Both worktrees are clean; canonical fmt
   remains `81899c2`. A cold Lake plugin race was preserved; Linux remains unqualified.
 - Guardian released the lane after harmless qualification. ABI now owns the two-job lane for documentation/configured
-  compile-fail/configured-version and generated-C signature checks after releasing its successful 4.35 campaign. Seventh source patch admits approved runtime/manifest before loading; review and native cache/bootstrap tests remain pending. Stock policy/custody installation, stale broader test callers and combined guardian validation remain open; real freeze/native ABI gates are unchanged. Guardian native qualification remains blocked on safe containment regardless
+  compile-fail/configured-version and generated-C signature checks after releasing its successful 4.35 campaign. Seventh source patch admits approved runtime/manifest before loading; review and native cache/bootstrap tests remain pending. Eighth patch migrates stale callers; all worker-child targets compile on 4.33-rc1/4.35. Nonregular manifest reads and pre-load allowlist validation need hardening. Existing host/dup owner maps concrete stock policy/custody inputs; combined guardian validation remains open; real freeze/native ABI gates are unchanged. Guardian native qualification remains blocked on safe containment regardless
   of lane availability; source repair continues. A lane grant is not deployment or proof/Mathlib authorization.
 - Semantic 4.36 Lean build/tests passed on an isolated archive of `333c219`; its Rust/runtime qualification still needs
   an immutable SDK. SDK isolated `750846a1c27783fbc7b71c652fe596aa36635b52` removes the two missing string exports coherently; all 91 retained exports pass bounded audits across four inspected Apple Silicon libraries, including 4.36. Independent ABI review confirmed consistency; integration requires audit `e9baea03` followed by removal `750846a1`, not removal alone. Cargo/Lake qualification and runtime/header pairing remain open. These are
