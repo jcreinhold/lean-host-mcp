@@ -209,3 +209,16 @@ identity were preserved. This identifies the diagnostic operation, not the origi
 exact policy rule. Native work is blocked pending an explicit execution-policy decision for one pinned admission-only
 listener/helper handoff. No alternate path, escalation or custody removal was attempted. The owner proceeds with
 source-only 4.36 metadata/signature reconciliation; configured support and release activation remain unqualified.
+
+### Scoped 4.35 success and isolated 4.36 build: 22:21 UTC
+
+Supported per-command approval permitted the unchanged admission probe at 22:15:08–09: six descriptors acquired,
+exit zero, original failed evidence preserved. Separately approved scoped import/kernel execution ran once at
+22:18:06–22:19:46 and returned zero; lane released 22:20:00. It checks the fixed private import/theorem, bounded
+Checked/type assertions, direct-worker exit, inherited-group absence, guardian non-liveness and six writer
+reacquisitions. Exact proposition/epoch/binding equality, detached descendants and guardian reaping remain unasserted.
+
+Isolated 4.36 paired-build turn `01a1eb99-5553-77e3-b448-8c7ce0aa52a8` now owns the two-job lane. Independent review
+approved the two-file registration patch only for that isolated build, not canonical activation. Required evidence:
+fresh allocator positive/non-mimalloc negative controls, rebuilt host/interop/fixture images, all 53 signatures including
+multiplication, ownership checks and actual runtime closure. No 4.36 native execution is assigned before artifact review.
