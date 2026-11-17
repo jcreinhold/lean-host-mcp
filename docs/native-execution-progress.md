@@ -175,3 +175,7 @@ ABI's `task-20/NEXT-ABI-GATES.md` specifies one scoped 4.35 import/theorem check
 The owner is assigned compile-only guarded-entry/prepared-shim wiring and installed olean/elaborator provenance on
 the released two-job lane. Exact artifacts require independent review before that native run. 4.36 needs its own
 paired configured build/signature/image evidence; production provisioning remains a separate explicit decision.
+
+Lean-dup local integration completed at `19fc765ae4b4291b895ec059f8de4f9e5df2f8cd`; coordinator verified clean canonical
+main and the 15-file commit at 21:21 UTC. The exact patches had passed strict Lean/direct-worker/four-fixture/JSONL
+qualification. Rust/SDK/package and remote dependency reproducibility remain pending. No push or publication occurred.
