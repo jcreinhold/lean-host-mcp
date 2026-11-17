@@ -249,3 +249,12 @@ library tests (94), host library tests (156). Owner continues these three target
 review checks snapshot `41304eb5c47f08d47c49f3add7d32ffba0201e1b7dc45beb256aa18b33f907f8` for retained safety and
 test value, including documented CLI-to-embedding changes. Scalar run remains denied before launch pending the
 existing explicit approval question; no retry or canonical change occurred.
+
+### All configured migration targets compile: 23:16 UTC
+
+All 29 formerly failing targets now compile. Configured workspace all-target and four-crate checks exited zero;
+warnings remain, not a strict-quality pass. Lane released 23:15:39. Patch 8 (`383c41fd5034f80db343212beb44439e5afd304e7a80fc82a70cbbeebcad1be7`)
+is under independent review; warning cleanup, formatting and applicable strict Clippy are assigned in turn
+`01a1ebcc-355a-73ca-81d9-ea9ff5fa18f3`. Host unsafe-code prohibition and private Meta constructor remain intact.
+Nonempty trace destinations are rejected. Broader runtime workload records/pre-exec custody, reviewed temporary
+projects and optional-service negative shim are still required. No native test or canonical integration occurred.
