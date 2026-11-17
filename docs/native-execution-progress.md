@@ -1,6 +1,6 @@
 # Native execution progress
 
-Snapshot: 2026-11-17, 20:32 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
+Snapshot: 2026-11-17, 20:41 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
 Requirements remain in [lifecycle §16](native-execution-lifecycle-design.md#16-remaining-implementation-and-acceptance-gates).
 Update this file after reviewed results, ownership changes or build-lane transfers; do not mark a gate complete from a
 session ending. Distinguish source review, executed tests, canonical integration and deployment.
@@ -48,7 +48,7 @@ before removing a scratch tree. Archived model evidence and replay instructions 
 - Formatter released the lane at 19:27:20 UTC with no owned processes. Isolated `ee1c6b6` has a 39/40 full run
   followed by passing Modes/downstream after the sole whitespace correction. Both worktrees are clean; canonical fmt
   remains `81899c2`. A cold Lake plugin race was preserved; Linux remains unqualified.
-- Guardian released the lane after harmless qualification. ABI released the two-job lane at 20:26:30 after ninth-checkpoint all-target checks on 4.33-rc1 and 4.35; source-only fixture-policy preparation is active. Seventh source patch admits approved runtime/manifest before loading; review and native cache/bootstrap tests remain pending. Eighth patch migrates stale callers; all worker-child targets compile on 4.33-rc1/4.35. Ninth patch uses opened regular/nonblocking manifest checks and validates allowlist before load; independent review pending, zero-initializer regressions unrun. Existing host/dup owner maps concrete stock policy/custody inputs; combined guardian validation remains open; real freeze/native ABI gates are unchanged. Guardian native qualification remains blocked on safe containment regardless
+- Guardian released the lane after harmless qualification. ABI released the two-job lane at 20:26:30 after ninth-checkpoint all-target checks on 4.33-rc1 and 4.35; source-only fixture-policy preparation is active. Seventh source patch admits approved runtime/manifest before loading; review and native cache/bootstrap tests remain pending. Eighth patch migrates stale callers; all worker-child targets compile on 4.33-rc1/4.35. Ninth patch uses opened regular/nonblocking manifest checks and validates allowlist before load; independent Unix source review passed, zero-initializer regressions unrun. Local one-shot qualification can use pinned images and cooperating custody without new mounts/accounts; hostile-writer guarantees are excluded. Existing host/dup owner maps concrete stock policy/custody inputs; combined guardian validation remains open; real freeze/native ABI gates are unchanged. Guardian native qualification remains blocked on safe containment regardless
   of lane availability; source repair continues. A lane grant is not deployment or proof/Mathlib authorization.
 - Semantic 4.36 Lean build/tests passed on an isolated archive of `333c219`; its Rust/runtime qualification still needs
   an immutable SDK. SDK isolated `750846a1c27783fbc7b71c652fe596aa36635b52` removes the two missing string exports coherently; all 91 retained exports pass bounded audits across four inspected Apple Silicon libraries, including 4.36. Independent ABI review confirmed consistency; integration requires audit `e9baea03` followed by removal `750846a1`, not removal alone. Cargo/Lake qualification and runtime/header pairing remain open. These are
@@ -82,3 +82,7 @@ time stays unknown. Filesystem times must be rendered with `TZ=UTC`; an mtime is
 At 20:31 the ABI owner reported a draft fixed-fixture policy/sealer/launcher, not a compiled application provider.
 Review must settle pre-exec runtime pairing, retained image lifetime and practical custody without assuming new mounts
 or provisioning authority. Only isolated host-entry composition is assigned; no canonical worker entry changes.
+
+At 20:40:44 the current ABI turn had about nine minutes of observed wall time since admission around 20:32.
+Latest explicit source checkpoint was 20:31:19; new isolated sdk-composition files were present within the preceding
+ten minutes. No active compile was recorded. This is progress evidence, not continuous-compute or completion timing.
