@@ -10,7 +10,7 @@
 )]
 #![allow(
     dead_code,
-    reason = "this target exercises two selected callers; database-only tests cover remaining store operations"
+    reason = "this target exercises native callers; database-only tests cover remaining store operations"
 )]
 #[path = "stage_store_contract/connection.rs"]
 mod connection;
@@ -30,8 +30,8 @@ use store::{
     ResultKnowledge, SavedRequest, Scope,
 };
 
-// Database cut hooks are exercised separately with real helper kills. These two
-// cases inject ONLY delivery loss through the existing native fixture's switches.
+// Commit/crash hooks are exercised in the database-only target. Delivery loss
+// uses fixture switches; SQL rejection below comes from an actual SQLite trigger.
 fn cut(_point: &str) {}
 struct Mapping {
     key: StageKey,
@@ -84,7 +84,23 @@ fn establish(fixture: &Fixture, journal: &mut CallerJournal, store: &mut NativeS
         request,
     }
 }
-fn validate_original(runtime: &Runtime, binding: StageBinding, mapping: &Mapping) -> Result<(), String> {
+#[derive(Debug)]
+enum LiveError {
+    IdentityMismatch,
+    Authorization(kernel::Rejected),
+    Storage(store::Problem),
+}
+impl std::fmt::Display for LiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdentityMismatch => f.write_str("SQL and live task identities differ"),
+            Self::Authorization(error) => write!(f, "local launch rejected: {error:?}"),
+            Self::Storage(error) => error.fmt(f),
+        }
+    }
+}
+
+fn validate_original(runtime: &Runtime, binding: StageBinding, mapping: &Mapping) -> Result<(), LiveError> {
     let sql_key = mapping.sql.key;
     let sql_scope = mapping.sql.scope;
     let expected_key = StageKey::new(
@@ -106,7 +122,7 @@ fn validate_original(runtime: &Runtime, binding: StageBinding, mapping: &Mapping
         || runtime.scope().binding != mapping.scope
         || runtime.stage(mapping.key).map(|stage| stage.binding) != Some(binding)
     {
-        return Err("SQL and live task identities differ; no state changed".into());
+        return Err(LiveError::IdentityMismatch);
     }
     Ok(())
 }
@@ -116,25 +132,27 @@ fn stop_original(runtime: &mut Runtime, binding: StageBinding) {
         runtime.deliver_stop(&stop, false);
     }
 }
+// This error route cannot require a successful database call: it has no store.
+fn storage_failed(runtime: &mut Runtime, binding: StageBinding, error: store::Problem) -> LiveError {
+    stop_original(runtime, binding);
+    LiveError::Storage(error)
+}
 fn start_original(
     runtime: &mut Runtime,
     binding: StageBinding,
     store: &mut NativeStore,
     mapping: &Mapping,
     fault: GoFault,
-) -> Result<Dispatch, String> {
+) -> Result<Dispatch, LiveError> {
     validate_original(runtime, binding, mapping)?;
-    let Some(packet) = runtime
-        .request_start(binding)
-        .map_err(|e| format!("local authorization: {e:?}"))?
-    else {
+    let Some(packet) = runtime.request_start(binding).map_err(LiveError::Authorization)? else {
         return Ok(Dispatch::AlreadyTaken);
     };
     let delivery = match store.consume_launch(mapping.sql, &mapping.request.capability) {
         Ok(Consume::Granted(permit)) => {
             if permit.into_binding() != mapping.sql {
                 stop_original(runtime, binding);
-                return Err("original permit binding differs".into());
+                return Err(LiveError::IdentityMismatch);
             }
             runtime.deliver_launch(&packet, fault)
         }
@@ -142,32 +160,61 @@ fn start_original(
             stop_original(runtime, binding);
             return Ok(Dispatch::NotSent);
         }
-        Err(error) => {
-            stop_original(runtime, binding);
-            return Err(format!("SQL launch permission uncertain: {error}"));
-        }
+        Err(error) => return Err(storage_failed(runtime, binding, error)),
     };
     Ok(delivery)
 }
-fn actual_closed(runtime: &mut Runtime, binding: StageBinding, store: &mut NativeStore, mapping: &Mapping) {
+fn wait_native_closed(runtime: &mut Runtime, binding: StageBinding, mapping: &Mapping) {
     validate_original(runtime, binding, mapping).unwrap();
-    let mut closed = false;
-    fixtures::wait(|| {
+    let started = std::time::Instant::now();
+    loop {
         let report = runtime.poll(PollFault::None);
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         for observation in report.observations {
             runtime.deliver_observation(&observation).unwrap();
         }
-        closed = runtime.scope().closed;
-        closed
-    });
-    assert!(closed);
-    // This records the original private native observations. The row grants no
-    // resource release/admission authority and is not the cleanup mechanism.
+        if runtime.scope().closed {
+            return;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "original native scope stayed open after cleanup request; root_live={}",
+            runtime.native().birth().is_live().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+fn actual_closed(runtime: &mut Runtime, binding: StageBinding, store: &mut NativeStore, mapping: &Mapping) {
+    wait_native_closed(runtime, binding, mapping);
+    // SQL records the completed observation; it is not the cleanup mechanism.
     validate_original(runtime, binding, mapping).unwrap();
     store
         .observe_resource(mapping.sql, &mapping.request.capability, ResourceReport::Closed)
         .unwrap();
+}
+fn persist_result_original(
+    runtime: &mut Runtime,
+    binding: StageBinding,
+    store: &mut NativeStore,
+    mapping: &Mapping,
+    body: &[u8],
+) -> Result<(), LiveError> {
+    validate_original(runtime, binding, mapping)?;
+    match store.observe_result(mapping.sql, &mapping.request.capability, [42; 16], body) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(storage_failed(runtime, binding, error)),
+    }
+}
+fn actual_dummy_result(runtime: &Runtime, mapping: &Mapping) -> Vec<u8> {
+    let actual = std::fs::read(runtime.native().root().join("result-observed.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+    assert_eq!(parsed["value"], 42);
+    assert_eq!(parsed["exit_ok"], true);
+    assert_eq!(
+        runtime.stage(mapping.key).unwrap().result,
+        kernel::Retention::Retained(kernel::ResultId(42))
+    );
+    actual
 }
 fn capture(runtime: &mut Runtime, binding: StageBinding, mapping: &Mapping, kind: ObservedKind) {
     validate_original(runtime, binding, mapping).unwrap();
@@ -337,17 +384,8 @@ fn committed_go_with_lost_reply_reconciles_same_live_child_after_database_reopen
     runtime.native().finish_target();
     capture(&mut runtime, original, &mapping, ObservedKind::Result);
     validate_original(&runtime, original, &mapping).unwrap();
-    let actual = std::fs::read(runtime.native().root().join("result-observed.json")).unwrap();
-    let parsed: serde_json::Value = serde_json::from_slice(&actual).unwrap();
-    assert_eq!(parsed["value"], 42);
-    assert_eq!(parsed["exit_ok"], true);
-    assert_eq!(
-        runtime.stage(mapping.key).unwrap().result,
-        kernel::Retention::Retained(kernel::ResultId(42))
-    );
-    store
-        .observe_result(mapping.sql, &mapping.request.capability, [42; 16], &actual)
-        .unwrap();
+    let actual = actual_dummy_result(&runtime, &mapping);
+    persist_result_original(&mut runtime, original, &mut store, &mapping, &actual).unwrap();
     let result = store.get(mapping.request.key).unwrap().unwrap();
     assert!(matches!(result.result,ResultKnowledge::Retained{body,..} if body==actual));
     assert_eq!(result.resource_report, ResourceReport::Open);
@@ -359,5 +397,157 @@ fn committed_go_with_lost_reply_reconciles_same_live_child_after_database_reopen
     assert_eq!(observed["payload_after_marker"], 0);
     assert_eq!(fixture.root_starts(), 1);
     assert_eq!(fixture.leaf_starts(mapping.key).len(), 1);
+    fixture.assert_no_safety_exit();
+}
+
+const UPDATE_FAILURE: &str = "fixture rejects stage update";
+fn reject_stage_updates(fixture: &Fixture) {
+    let checked =
+        connection::CheckedConnection::open_existing(&fixture.root.join("native.sqlite3"), store::native_schema_valid)
+            .unwrap();
+    // Persistent, committed separately: rollback of the tested UPDATE cannot
+    // remove this trigger. It blocks the final cleanup-report UPDATE too.
+    checked.connection().execute_batch(&format!("CREATE TRIGGER main.fixture_reject_stage_updates BEFORE UPDATE ON stages BEGIN SELECT RAISE(ABORT,'{UPDATE_FAILURE}'); END;")).unwrap();
+}
+fn assert_update_rejected(error: &store::Problem) {
+    match error {
+        store::Problem::Sql(rusqlite::Error::SqliteFailure(code, Some(message))) => {
+            assert_eq!(code.code, rusqlite::ErrorCode::ConstraintViolation);
+            assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+            assert_eq!(message, UPDATE_FAILURE);
+        }
+        other @ (store::Problem::Sql(_) | store::Problem::Connection(_) | store::Problem::Rejected(_)) => {
+            panic!("expected actual SQLite trigger rejection, got {other:?}")
+        }
+    }
+}
+fn assert_storage_update_rejected(error: &LiveError) {
+    match error {
+        LiveError::Storage(error) => assert_update_rejected(error),
+        LiveError::IdentityMismatch | LiveError::Authorization(_) => {
+            panic!("expected SQL operation failure, got {error:?}")
+        }
+    }
+}
+fn assert_failed_writes_after_cleanup(
+    fixture: &Fixture,
+    runtime: &Runtime,
+    store: &mut NativeStore,
+    mapping: &Mapping,
+    before: &store::Snapshot,
+) {
+    assert!(runtime.scope().closed);
+    assert!(!runtime.native().birth().is_live().unwrap());
+    let rejected = store
+        .observe_resource(mapping.sql, &mapping.request.capability, ResourceReport::Closed)
+        .unwrap_err();
+    assert_update_rejected(&rejected);
+    let reopened = NativeStore::open(&fixture.root.join("native.sqlite3")).unwrap();
+    assert_eq!(reopened.get(mapping.request.key).unwrap().as_ref(), Some(before));
+    let journal = CallerJournal::open(&fixture.root.join("caller.sqlite3")).unwrap();
+    assert_eq!(
+        journal.get(&mapping.request.caller).unwrap(),
+        Some(mapping.request.clone())
+    );
+}
+
+#[test]
+fn sql_write_failure_before_go_closes_original_scope_without_persisting_cleanup() {
+    let fixture = Fixture::new();
+    let (mut journal, mut store) = open_stores(&fixture);
+    let mapping = establish(&fixture, &mut journal, &mut store);
+    let mut runtime = Runtime::new(mapping.scope);
+    let original = runtime.prepare(&fixture, mapping.key, &mapping.request.intent).unwrap();
+    store
+        .observe_resource(mapping.sql, &mapping.request.capability, ResourceReport::Open)
+        .unwrap();
+    let contender = Contender::start(runtime.native());
+    reject_stage_updates(&fixture);
+    let before = store.get(mapping.request.key).unwrap().unwrap();
+    let birth = runtime.native().birth().clone();
+    assert!(birth.is_live().unwrap());
+    assert!(!runtime.scope().closed);
+    let error = start_original(&mut runtime, original, &mut store, &mapping, GoFault::None).unwrap_err();
+    assert_storage_update_rejected(&error);
+    assert_eq!(runtime.stage(mapping.key).unwrap().gate, kernel::LaunchGate::Consumed);
+    assert_eq!(
+        start_original(&mut runtime, original, &mut store, &mapping, GoFault::None).unwrap(),
+        Dispatch::AlreadyTaken
+    );
+    assert_eq!(fixture.root_starts(), 1);
+    assert!(fixture.leaf_starts(mapping.key).is_empty());
+    assert_eq!(store.get(mapping.request.key).unwrap().as_ref(), Some(&before));
+    eprintln!(
+        "Launch UPDATE rejected (SQLite 1811); original root live={}; target starts=0; waiting for process cleanup",
+        birth.is_live().unwrap()
+    );
+    wait_native_closed(&mut runtime, original, &mapping);
+    let observed = contender.finish();
+    assert_eq!(observed["group_present"], false);
+    assert_eq!(observed["payload_after_marker"], 0);
+    assert_eq!(runtime.native().birth(), &birth);
+    assert_eq!(fixture.root_starts(), 1);
+    assert!(fixture.leaf_starts(mapping.key).is_empty());
+    assert_failed_writes_after_cleanup(&fixture, &runtime, &mut store, &mapping, &before);
+    assert_eq!(before.gate, Gate::Pending);
+    assert_eq!(before.spawn, None);
+    assert_eq!(before.result, ResultKnowledge::Pending);
+    fixture.assert_no_safety_exit();
+}
+
+#[test]
+fn sql_write_failure_after_result_closes_original_scope_without_persisting_cleanup() {
+    let fixture = Fixture::new();
+    let (mut journal, mut store) = open_stores(&fixture);
+    let mapping = establish(&fixture, &mut journal, &mut store);
+    let mut runtime = Runtime::new(mapping.scope);
+    let original = runtime.prepare(&fixture, mapping.key, &mapping.request.intent).unwrap();
+    store
+        .observe_resource(mapping.sql, &mapping.request.capability, ResourceReport::Open)
+        .unwrap();
+    assert_eq!(
+        start_original(&mut runtime, original, &mut store, &mapping, GoFault::None).unwrap(),
+        Dispatch::Sent
+    );
+    fixtures::wait(|| runtime.native().target_alive());
+    capture(&mut runtime, original, &mapping, ObservedKind::Spawn);
+    store
+        .observe_spawn(mapping.sql, &mapping.request.capability, store::Spawn::Spawned)
+        .unwrap();
+    let contender = Contender::start(runtime.native());
+    runtime.native().finish_target();
+    capture(&mut runtime, original, &mapping, ObservedKind::Result);
+    let actual = actual_dummy_result(&runtime, &mapping);
+    reject_stage_updates(&fixture);
+    let before = store.get(mapping.request.key).unwrap().unwrap();
+    let birth = runtime.native().birth().clone();
+    assert!(birth.is_live().unwrap());
+    assert!(!runtime.scope().closed);
+    let error = persist_result_original(&mut runtime, original, &mut store, &mapping, &actual).unwrap_err();
+    assert_storage_update_rejected(&error);
+    assert_eq!(
+        runtime.stage(mapping.key).unwrap().result,
+        kernel::Retention::Retained(kernel::ResultId(42))
+    );
+    assert_eq!(
+        start_original(&mut runtime, original, &mut store, &mapping, GoFault::None).unwrap(),
+        Dispatch::AlreadyTaken
+    );
+    assert_eq!(store.get(mapping.request.key).unwrap().as_ref(), Some(&before));
+    eprintln!(
+        "Result UPDATE rejected (SQLite 1811); original root live={}; target starts=1; waiting for process cleanup",
+        birth.is_live().unwrap()
+    );
+    wait_native_closed(&mut runtime, original, &mapping);
+    let observed = contender.finish();
+    assert_eq!(observed["group_present"], false);
+    assert_eq!(observed["payload_after_marker"], 0);
+    assert_eq!(runtime.native().birth(), &birth);
+    assert_eq!(fixture.root_starts(), 1);
+    assert_eq!(fixture.leaf_starts(mapping.key).len(), 1);
+    assert_failed_writes_after_cleanup(&fixture, &runtime, &mut store, &mapping, &before);
+    assert_eq!(before.gate, Gate::Consumed);
+    assert_eq!(before.spawn, Some(store::Spawn::Spawned));
+    assert_eq!(before.result, ResultKnowledge::Pending);
     fixture.assert_no_safety_exit();
 }

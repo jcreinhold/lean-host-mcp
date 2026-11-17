@@ -16,7 +16,7 @@ SDK still owns child processes and the guardian; no SQLite API moved into it.
 | `stage_store_contract/connection.rs` | Checked SQLite build, format-before-configuration and connection settings |
 | `stage_store_contract/store.rs` | Separate caller journal and native store |
 | `stage_store_contract/cases.rs`, `cuts.rs` | Contract tests and disposable process-crash pause points |
-| `stage_store_runtime_contract.rs` | Two macOS cases using the existing process fixture and runtime by relative path |
+| `stage_store_runtime_contract.rs` | Four macOS cases using the existing process fixture and runtime by relative path |
 
 The code is private test support. It adds no public library API, production module,
 actor framework or new crate. A Unix-only dev dependency pins `rusqlite 0.40.2`
@@ -100,16 +100,37 @@ before either launch gate changes. Results remain separate from resource closure
 An exclusive-lock contender blocked before cleanup checks for no protected group
 and no later target writes at first acquisition.
 
-Three deliberately broken copies were tested outside the checkout: reissuing a
+Two more cases reject actual SQLite UPDATEs before GO and while saving an
+observed result. A persistent trigger (a rule stored in SQLite) raises error 1811
+for every stage UPDATE. The error route preserves that exact code/message and
+requests native cleanup through a helper with no database argument. The native
+closure check also has no database argument. After group/guardian closure and
+writer acquisition, the attempted SQL closed-report still fails, and fresh
+readers see the unchanged stage record. Cleanup therefore did not require saving
+its status. Before GO, no target starts; after GO, exactly one starts and the
+observed result 42 remains absent from durable result history. Neither case
+replays work or changes the original caller binding.
+
+This is injected SQL statement rejection, not disk-full, failed flush, failed or
+uncertain COMMIT, or cancellation during blocked storage I/O. SQLite ABORT reverses
+the failing statement; these methods made no earlier writes in their transactions,
+and transaction Drop requests rollback. The trigger was committed separately and
+remains active throughout cleanup.
+
+Four deliberately broken copies were tested outside the checkout: reissuing a
 consumed permit, redirecting an old ACK to a newer row, and omitting the SQL/native
-identity check. Each compiled and failed its intended assertion. The last actually
-started a target using the other row's permission. Generated logs, databases and
+identity check, and omitting the shared storage-error cleanup request. Each
+compiled and failed its intended assertion. The identity error actually started
+a target using the other row's permission. Omitting cleanup left both original
+roots alive at the two-second closure deadline; panic cleanup happened afterward,
+not as a passed observation. The blocked contender helpers also timed out in those
+negative cases. No safety expiry supplied a pass. Generated logs, databases and
 copied broken sources are not required to run or maintain the committed tests.
 
 Recorded host-package validation, 2026-11-17: the database target passed 19 tests
-and the native target passed 35 checks, including two actual process cases, 25
+and the native target passed 37 checks, including four actual process cases, 25
 kernel tests, five connection tests and three helper entry points. The targets
-reuse some checks; these are not 54 distinct native fault cases. Focused lint and
+reuse some checks; these are not 56 distinct native fault cases. Focused lint and
 format checks accompany the integration.
 
 ## Run and remaining limits
