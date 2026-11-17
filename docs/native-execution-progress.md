@@ -73,7 +73,7 @@ proves continuous work. Do not estimate active compute time from these fields.
 | Formatter 4.36 | 18:51:03 | Full-suite lane status recorded 19:08; final release 19:27:20. Final Modes 105 s, downstream 24 s. No current build; Linux remains unqualified. |
 | SDK 4.36 audit | 18:50:49 | Isolated removal `750846a1` completed before 19:07 coordinator check. Exact task start/end unknown; waits coherent ABI composition. |
 | Semantic 4.36 | Not rechecked | Exact lane release 18:51:42; Lean build/tests passed. No current build; Rust qualification waits SDK. |
-| Host/dup | Not rechecked | Policy-source mapping turn `01a1eb2d-c0ed-7545-adbc-85358bf63e09` admitted around 20:23; read-only, no lane. Prior qualification plan is not runtime qualification. |
+| Host/dup | Not rechecked | Policy-source mapping turn `01a1eb2d-c0ed-7545-adbc-85358bf63e09` admitted around 20:23 and completed by 20:25; read-only, no lane. It identifies application worker entry plus controlled fixed-fixture approval records; production provisioning is not implemented. Prior qualification plan is not runtime qualification. |
 | TLA/model | Historical session | Completed bounded evidence in the model gate above. No active model run; no inference of implementation proof. |
 
 For subsequent commands, owners record UTC start/end, exact command and snapshot, result, and lane release in their
