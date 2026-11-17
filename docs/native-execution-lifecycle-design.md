@@ -815,7 +815,9 @@ cannot reconstruct them or establish that a command never ran.
   covers process-kill/reopen, same-owner dummy-runtime cases and native cleanup
   after actual SQLite UPDATE rejection. It also checks saving a caller-owned
   inline result before native ACK, including both commit boundaries and SQL
-  rejection. It does not test service death/restart. VFS fault injection,
+  rejection. Two further cuts test actual service death with a healthy guardian
+  and a fresh passive observer, without replacement-service execution or restored
+  native authority. VFS fault injection,
   external assets, OS-crash and power-loss qualification remain unrun.
 
 ### SQLite linked-runtime provenance and WAL-reset compatibility

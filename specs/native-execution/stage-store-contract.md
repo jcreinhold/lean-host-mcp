@@ -18,7 +18,8 @@ SDK still owns child processes and the guardian; no SQLite API moved into it.
 | `stage_store_contract/result_client.rs` | Save the caller copy before acknowledging its original native result |
 | `stage_store_contract/caller_results.rs` | Result identity, two-commit crash cuts and SQL rejection tests |
 | `stage_store_contract/cases.rs`, `cuts.rs` | Contract tests and disposable process-crash pause points |
-| `stage_store_runtime_contract.rs` | Four macOS cases using the existing process fixture and runtime by relative path |
+| `stage_store_runtime_contract.rs` | Six macOS cases using the existing process fixture and runtime by relative path |
+| `stage_store_runtime_contract/service_loss_regressions.rs` | Actual service-death cuts and a fresh passive observer |
 
 The code is private test support. It adds no public library API, production module,
 actor framework or new crate. A Unix-only dev dependency pins `rusqlite 0.40.2`
@@ -162,10 +163,11 @@ the failing statement; these methods made no earlier writes in their transaction
 and transaction Drop requests rollback. The trigger was committed separately and
 remains active throughout cleanup.
 
-Five deliberately broken copies were tested outside the checkout: reissuing a
+Six deliberately broken copies were tested outside the checkout: reissuing a
 consumed permit, redirecting an old ACK to a newer row, omitting the SQL/native
 identity check, omitting the shared storage-error cleanup request, and ACKing
-before committing the caller copy. Each compiled and failed its intended assertion. The identity error actually started
+before committing the caller copy, and replaying a consumed task in a fresh
+observer. Each compiled and failed its intended assertion. The identity error actually started
 a target using the other row's permission. Omitting cleanup left both original
 roots alive at the two-second closure deadline; panic cleanup happened afterward,
 not as a passed observation. The blocked contender helpers also timed out in those
@@ -176,9 +178,10 @@ not a claim of immediate data loss. No safety expiry supplied a pass. Generated
 logs, databases and copied broken sources are not required to run or maintain the committed tests.
 
 Recorded host-package validation, 2026-11-17: the database target passed 26 tests
-and the native target passed 37 checks, including four actual process cases, 25
-kernel tests, five connection tests and three helper entry points. The targets
-reuse some checks; these are not 63 distinct native fault cases. Focused lint and
+and the native target passed 41 checks, including six actual process cases, 25
+kernel tests, five connection tests and five helper entry points. The shared
+process-fixture target also passed 34 checks. These targets reuse checks; their
+sum is not a count of distinct native fault cases. Focused lint and
 format checks accompany the integration.
 
 ## Run and remaining limits
@@ -201,47 +204,75 @@ host-package checks used a disposable snapshot with local SDK `ccdaa4c` and
 semantic-search `1ac78f7` overrides. The committed manifest/lockfile contain no
 local patches. Passing that build does not establish registry-only reproducibility.
 
-Unimplemented or untested: service death/restart and reattachment, warm-worker
-request closure, damaged-database recovery, pruning, backup restore, authenticated
+Unimplemented or untested: replacement-service execution and reattachment,
+warm-worker request closure, damaged-database recovery, pruning, backup restore, authenticated
 observations, external result assets, real disk/sync errors, blocked-I/O
 cancellation, OS crashes and power loss. See the
 [execution-service design](../../docs/native-execution-lifecycle-design.md) for
 those separate requirements. No server deployment or release follows from these
 test-only changes.
 
-## Next service-death boundary: proposal only
+## Service death with a healthy guardian
 
-Stop adding storage features here. The next proposed test kills the disposable
-**service process**, then starts a passive observer. It tests no replay and safe
-cleanup; it does not recover the old process handles or resume work.
+Two macOS cases now SIGKILL the actual disposable service child. Only that service
+owns the runtime, actual worker `Child`, GO sender and private guardian channel.
+The worker's actual child guardian holds the only acknowledged shared artifact
+lock; the worker drops its own copy and the target closes inherited descriptors.
+The outer controller and fresh observer retain no old protective lock, worker
+handle or control channel. Birth and parent-PID markers check this topology; they
+grant no right to signal a saved PID.
 
-Use the already tested SDK topology: service → worker → healthy guardian. Only
-the guardian retains the acknowledged shared artifact lock. The outer controller
-and new observer inherit no protective lock, runtime, worker `Child` or guardian
-control channel. Existing SDK tests cover service death with a healthy guardian;
-this host-store combination has **not** run yet.
+The cuts follow (1) the unused-to-consumed commit, with the GO pipe still open,
+and (2) a written GO with actual target start and heartbeat witnessed, while the
+service saves no spawn or result observation. The actual service `Child` receives
+SIGKILL and its retained parent checks that exit signal. No service destructor
+can perform cleanup. Before GO, service death also closes the pipe: EOF can stop
+that waiting worker. The witnessed-start case tests cleanup of a running target.
 
-Test two cuts: after the unused-to-consumed commit but before GO, then after GO with
-its reply and durable spawn record absent. For the latter cut, a private fixture
-marker must witness an actual target start before killing the service; writing GO
-alone does not ensure the target starts before cleanup. That marker is test
-evidence, not a saved success or resource-closure fact. The new observer reopens
-only the original caller/native IDs and must find `AlreadyConsumed`, never new
-permission. Target-start counts must be zero at the before-GO cut and remain one
-at the witnessed-start cut. A deliberately broken replay branch must make the
-count exceed its bound.
+Before either fault, a separately owned contender proves its first real
+exclusive-lock attempt blocks. After acquisition it inspects the original worker
+and group, checks the SDK's owner-record fence against the held lock's device and
+inode, then marks the payload log and checks for later writes. These are successive
+observations, not an atomic snapshot at acquisition. Both cases observed absent
+worker/group, managed-writer permission and zero later payload bytes. They also
+require successful guardian return and exact guardian death, separately from EX.
 
-An independent exclusive-lock contender must demonstrate it is blocked before
-the fault, then inspect the protected group and worker immediately after its first
-successful acquisition, and check for later payload writes. These observations
-are not an atomic snapshot at acquisition. Require guardian exit and cleanup
-before the safety deadline;
-emergency rescue is a failed observation. Keep the SDK's owner-record check:
-lock acquisition alone can succeed after guardian death while payloads still run.
+After cleanup and release of the contender's EX, a new observer process opens only
+the original caller/native records. It gets `AlreadyConsumed`, creates no runtime
+or worker and leaves the row unchanged: consumed launch, unknown spawn/result,
+resource report still Open. It emits no generation-closed event. The before-GO
+case has zero target starts; the witnessed-start case retains exactly one. This
+observer does not run a replacement execution service or recover its old handles.
 
-A restarted observer cannot recover actual-child authority from a PID or a
-SQLite row. The SDK offers no reopen/adopt-by-record lease. Thus this test must
-not inject a generation-closed event into a new runtime or signal old payloads.
-Missing durable spawn/result facts remain unknown even after separately observed
-resource cleanup. Frozen guardian, missing custody records, simultaneous owner
-loss and general service reattachment require a separate contract decision.
+The external replay control deliberately ignores `AlreadyConsumed` and creates a
+fresh runtime for the same original logical task. It starts a second real root
+and target, then cleans up through that new actual owner. The common start-count
+audit fails with two distinct target PIDs for the same stage. This tests the replay
+oracle against a wrong policy, not an existing production restart implementation.
+
+All passing cases finish before three seconds. Root and target eight-second
+fallbacks remain; the service-death guardian also has an eight-second self-kill
+watchdog. Any fallback invalidates the run. The guardian watchdog can release its
+lock before payload expiry, so it is failed-test rescue, never a recovery policy.
+Markers are best-effort before unconditional self-kill; failed marker writes do
+not suppress rescue. Timers do not bound frozen processes or hung OS operations.
+
+The SDK's existing guardian-loss counterexample remains separate: bare EX can
+succeed while payload writes continue, and its managed owner-record check refuses
+work. This slice calls that check but does not rerun the SDK counterexample or
+reconstruct guardian signal authority from its saved identity.
+
+## Next contract decision
+
+Storage work stops here. These tests cover service death **with a healthy
+guardian**, intact owner records and descendants in the qualified private group.
+They do not establish progress after a frozen last custodian or simultaneous
+service/guardian loss. The SDK offers no reopen/adopt-by-record lease.
+
+Before wiring a replacement service, choose its supported fault scope. Keep the
+healthy-guardian limit, or separately qualify an independent authority that can
+stop old payloads and resolve custody when that guardian cannot act. A SQLite row,
+PID, result expiry or elapsed deadline supplies no such authority. Losing all
+custodians may release the file lock while payloads remain alive; retain the
+owner-record fence. Do not turn an unresolved scope into a closed one to free
+capacity. No stronger recovery contract or new authority is implemented here.

@@ -578,3 +578,6 @@ fn sql_write_failure_after_result_closes_original_scope_without_persisting_clean
     assert_eq!(before.result, ResultKnowledge::Pending);
     fixture.assert_no_safety_exit();
 }
+
+#[path = "stage_store_runtime_contract/service_loss_regressions.rs"]
+mod service_loss;

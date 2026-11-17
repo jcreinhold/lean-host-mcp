@@ -82,6 +82,30 @@ impl Fixture {
             started: Instant::now(),
         }
     }
+    // Borrow only test paths in another process; no TempDir deletion authority,
+    // native Child, custody descriptor or private lifetime channel crosses here.
+    #[allow(
+        dead_code,
+        reason = "shared fixture: only service-loss cases attach from another process"
+    )]
+    pub(crate) fn open_in_helper(root: &Path) -> Self {
+        let root = root.canonicalize().unwrap();
+        assert!(root.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("lean-stage-runtime-")
+        );
+        let project = root.join("project");
+        assert!(project.is_dir());
+        Self {
+            directory: None,
+            root,
+            project,
+            started: Instant::now(),
+        }
+    }
     pub(crate) fn leaf_starts(&self, key: StageKey) -> Vec<Value> {
         let text = fs::read_to_string(self.root.join("leaf-starts.jsonl")).unwrap_or_default();
         text.lines()
@@ -101,7 +125,9 @@ impl Fixture {
             "qualification must precede fixture safety expiry"
         );
         for entry in fs::read_dir(&self.root).unwrap() {
-            assert!(!entry.unwrap().path().join("test-safety-expired").exists());
+            let path = entry.unwrap().path();
+            assert!(!path.join("test-safety-expired").exists());
+            assert!(!path.join("guardian-safety-expired").exists());
         }
     }
 }
@@ -223,9 +249,11 @@ impl NativeStage {
     // Test setup asserts success. A failure never emits target SpawnFailed or a
     // closed observation; its already-installed cleanup owner retains the child.
     pub(crate) fn prepare(fixture: &Fixture, key: StageKey, binding: StageBinding, scope: ScopeBinding) -> Self {
-        let root = fixture
-            .root
-            .join(format!("scope-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+        let root = fixture.root.join(format!(
+            "scope-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&root).unwrap();
         let tag = format!("{key:?}");
         write_json(
@@ -377,9 +405,6 @@ impl NativeStage {
         self.closed = Some(closed.clone());
         Ok(closed.to_vec())
     }
-    pub(crate) fn group_id(&self) -> u32 {
-        self.group.id()
-    }
 }
 impl Drop for NativeStage {
     fn drop(&mut self) {
@@ -428,10 +453,29 @@ fn guardian_helper() {
         return;
     }
     let root = current_root();
+    let worker = rustix::process::getppid().unwrap().as_raw_nonzero().get();
+    let birth = NativeProcessIdentity::capture(std::process::id()).unwrap().unwrap();
+    write_json(
+        &root,
+        "guardian-birth.json",
+        &json!({"birth":birth,"parent_pid":worker}),
+    );
+    if root.parent().unwrap().join("service-death-case").exists() {
+        // Failure-only dummy rescue. This cannot qualify closure: it may release
+        // a loan before payload expiry. No recorded PID grants signal authority.
+        let watched = root.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(8));
+            let _marker = fs::write(watched.join("guardian-safety-expired"), b"not a pass");
+            let _kill = rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL);
+        });
+    }
     if let Err(error) = lean_toolchain::native_guardian::run_guardian_cli() {
         fs::write(root.join("guardian-error"), error.to_string()).unwrap();
         panic!("real guardian failed: {error}");
     }
+    assert!(!group_present(u32::try_from(worker).unwrap()).unwrap());
+    fs::write(root.join("guardian-returned"), b"real guardian drain returned").unwrap();
 }
 #[test]
 fn root_helper() {
@@ -447,7 +491,7 @@ fn root_helper() {
         .append(true)
         .open(base.join("root-starts.jsonl"))
         .unwrap();
-    writeln!(audit, "{}", json!({"pid":std::process::id(),"root":root})).unwrap();
+    writeln!(audit, "{}", json!({"pid":std::process::id(),"parent_pid":rustix::process::getppid().unwrap().as_raw_nonzero().get(),"root":root})).unwrap();
     drop(audit);
     wait(|| root.join("scope-adopted").exists());
     let mut guardian = GuardianHandle::spawn(
@@ -488,7 +532,7 @@ fn root_helper() {
     let watched = root.clone();
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(8));
-        fs::write(watched.join("test-safety-expired"), b"not a pass").expect("record test rescue before acting");
+        let _marker = fs::write(watched.join("test-safety-expired"), b"not a pass");
         let _kill = rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL);
     });
     fs::write(root.join("prepared"), b"actual loan ACK; waiting once for GO").unwrap();
@@ -542,8 +586,13 @@ pub(crate) struct Contender {
 }
 impl Contender {
     pub(crate) fn start(native: &NativeStage) -> Self {
-        let root = native.root.clone();
-        write_json(&root, "contender.json", &json!({"group":native.group_id()}));
+        Self::start_at(native.root(), native.birth())
+    }
+    // Metadata-only startup. The controller never opens a protective lock or
+    // adopts the original worker Child merely to start an independent contender.
+    pub(crate) fn start_at(root: &Path, birth: &NativeProcessIdentity) -> Self {
+        let root = root.to_path_buf();
+        write_json(&root, "contender.json", &json!({"worker":birth}));
         let child = RawChild(Some(
             fixture_command(&root, "fixtures::contender_helper")
                 .stderr(File::create(root.join("contender.stderr")).unwrap())
@@ -583,13 +632,19 @@ fn contender_helper() {
         Err(std::fs::TryLockError::WouldBlock) => false,
         Err(error) => panic!("lock failed: {error}"),
     });
-    let group = u32::try_from(
-        read_json(&root.join("contender.json")).unwrap()["group"]
-            .as_u64()
-            .unwrap(),
+    // These process observations FOLLOW the acquisition, not an atomic snapshot
+    // at that instant. The heartbeat marker also has a scheduling gap.
+    let worker: NativeProcessIdentity =
+        serde_json::from_value(read_json(&root.join("contender.json")).unwrap()["worker"].clone()).unwrap();
+    let present = group_present(worker.process_group).unwrap();
+    let worker_live = worker.is_live().unwrap();
+    let metadata = lock.metadata().unwrap();
+    let managed_writer_ready = lean_toolchain::native_guardian::protected_native_reads_stopped(
+        &root.parent().unwrap().join("owners"),
+        &lean_toolchain::shared_writer::project_lock_path(Path::new(cfg["project"].as_str().unwrap())).unwrap(),
+        (metadata.dev(), metadata.ino()),
     )
     .unwrap();
-    let present = group_present(group).unwrap();
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -597,6 +652,11 @@ fn contender_helper() {
         .unwrap()
         .write_all(b"|EX|")
         .unwrap();
+    write_json(
+        &root,
+        "contender-acquired.json",
+        &json!({"group_present":present,"worker_live":worker_live,"managed_writer_ready":managed_writer_ready}),
+    );
     wait(|| root.join("scope-closed").exists());
     thread::sleep(Duration::from_millis(35));
     let text = fs::read_to_string(root.join("heartbeat")).unwrap();
@@ -604,7 +664,7 @@ fn contender_helper() {
     write_json(
         &root,
         "contender-result.json",
-        &json!({"group_present":present,"payload_after_marker":after}),
+        &json!({"group_present":present,"worker_live":worker_live,"managed_writer_ready":managed_writer_ready,"payload_after_marker":after}),
     );
     drop(lock); // Close-only. Never unlock or change a live lock mode.
 }
