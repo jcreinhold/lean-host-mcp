@@ -188,3 +188,15 @@ guardian/group closure checks and six writer probes. Reported official-prefix co
 and 105 fixture files; this is not itself executed ABI evidence. 4.36 metadata remains unapplied. Formatter's existing
 owner is preparing a finite release-gate plan source-only; no repeated integration or publication is authorized by that
 assignment. The lane is free pending review, not occupied by these source checks.
+
+### Final formatter coverage and admission diagnosis: 22:12 UTC
+
+Formatter finished local final-head coverage at 22:02:38 after starting 21:41:09: build, lint, 52 unit tests and all
+40 suites passed across an interrupted invocation and a four-suite continuation. Temporary fixture edits were restored;
+canonical main is clean. Publication awaits the existing approval question, not another request.
+
+The scoped ABI run failed before startup with unlabelled EPERM at 21:39:39; it supplies no import/theorem evidence.
+The admission-only probe compiled at 22:03:55 and released the lane at 22:04:09. Independent review verified binary
+`c4749564a415fcfcadf5fd37d6c5a2519adfedfae269514a6549bd8ad8dfc040`, helper, SDK and six domains. One diagnostic
+turn `01a1eb90-ca94-70e7-b051-637cad9ada2a` was admitted about 22:11 UTC under original restrictions, without worker,
+guardian or privilege changes. Outcome pending. Any labelled error identifies this invocation, not the original cause.
