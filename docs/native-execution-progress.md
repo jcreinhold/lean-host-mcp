@@ -86,3 +86,28 @@ or provisioning authority. Only isolated host-entry composition is assigned; no 
 At 20:40:44 the current ABI turn had about nine minutes of observed wall time since admission around 20:32.
 Latest explicit source checkpoint was 20:31:19; new isolated sdk-composition files were present within the preceding
 ten minutes. No active compile was recorded. This is progress evidence, not continuous-compute or completion timing.
+
+## Cross-track assignments
+
+Updated 2026-11-17 at 20:44 UTC. This table includes waiting work, not just running sessions. Assignment times are
+coordinator observation windows unless an exact admission time was returned. No completion range is established for
+unfinished integration; use the next evidence checkpoint, not an invented ETA. Callback review plus approximately
+15-minute coordination checks remain in place; twenty minutes without new evidence triggers investigation, not a kill.
+
+| Work item / owner | Assigned UTC | Deliverable / state | Last evidence / blocker | Next checkpoint |
+| --- | --- | --- | --- | --- |
+| ABI and SDK composition / `6afca3dd-61c8-8191-beef-0e1235e410d2` | Current turn around 20:32 | Active isolated policy/harness and integration | SDK composition `16b625ac` combines guardian, ABI and ordered raw audit/removal. Host fixture entry compiled 20:41:01–11; SDK all-targets 20:41:37–42; lane released. Runtime pairing/native tests and production policy remain open. | Reviewed no-load rejection controls, matched one-shot fixture; no unrestricted authority fallback. |
+| Guardian / `6afca2af-3368-8191-9816-a92e53fcd0c4` | Latest commit assignment around 20:01 | Waiting; immutable qualified patch series delivered | SDK `9d13fe6`, host `b8fd321`; harmless evidence reviewed. Real STOP/loan/group recovery unqualified. | Combined ABI composition checks, then separately gated real recovery. |
+| Warm / `6afca23e-b9c8-8191-a3ef-228507da80ec` | Last qualification 19:28:08 | Waiting; paired refusal/unwind candidate qualified in isolation | Released 19:28:22; 26 tests and nine mutation controls. Breaking API/host retirement not integrated. | Compose reviewed API and host retirement without changing prior-stage outcome semantics. |
+| Formatter 4.36 / `6afca213-d120-8191-95ff-74a0d82b80d3` | Resumed around 20:42 | Active integration-readiness assessment, source-only | Candidate `ee1c6b6`; canonical `81899c2` clean. Mac evidence complete within stated scope; Linux unqualified. | Independent source review and exact local merge recommendation; no merge yet. |
+| Formatter independent review / coordinator's `warm_paired_review` | Around 20:43 | Active read-only delta/evidence review | Same candidate; no build lane or edits. | Concrete merge blocker or scoped approval. |
+| Semantic 4.36 / `6afca18f-2580-8191-a605-09e8794b90cc` | Resumed around 20:42 | Active source/pin integration plan, no build | `333c219` Lean build/tests passed; canonical `1ac78f7` clean. Rust/loaded worker waits coherent SDK. | Identify independently integrable changes versus package/runtime dependency. |
+| SDK 4.36 audit / `6afca208-0fdc-8191-a3bf-690b80d430ff` | Earlier time not reconstructed | Waiting; audit/removal delivered | `e9baea03` then `750846a1` now composed by ABI owner. 4.36 header still not approved in configured support. | Paired runtime/header/allocator qualification before support activation. |
+| Host/dup / `6afca1a9-4f1c-8191-a757-cb2c906df0dc` | Policy mapping around 20:23 | Waiting; read-only mapping complete by 20:25 | Canonical host/dup upgrade audit prepared; runtime qualification waits SDK/semantic. | Match immutable family and run isolated worker/install/mixed-version checks. |
+| TLA/model / prior model owner | Historical, unknown exact start | Waiting; bounded model work complete | Earlier model, not current production-recovery proof. | Refine when selected protocol stabilizes; no duplicate Python explorer. |
+| IUT non-Lean documentation / parent coordinator | Current session IDs/times not yet verified here | Status awaiting parent evidence; only non-Lean scope known | No tooling worker may edit Proofs or run Lean/Mathlib. | Parent supplies actual owner/deliverable/evidence; do not infer active work from prior authorization. |
+
+The single substantial build lane serializes CPU/memory-heavy campaigns, not independent source work or reviews.
+Formatter and semantic review now proceed beside ABI. Local integration, publication/tagging, deployment and Proofs
+upgrade are separate outcomes. Proofs requires the matching formatter/SDK family and Mathlib version; its live pins and
+cache remain untouched.
