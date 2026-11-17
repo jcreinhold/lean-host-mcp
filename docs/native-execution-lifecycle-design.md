@@ -1,10 +1,36 @@
 # Native execution lifecycle and self-healing: replacement design
 
-Status: **DESIGN ONLY; proposed, not implemented or qualified.** Written 2026-11-17.
-This document selects a concrete architecture for review. It is not authorization to implement or deploy it.
+Status: **Design with bounded implemented/tested components; no complete service or deployment qualification.**
+Written and reconciled 2026-11-17. The original revision was design-only. Later explicit owner instructions authorized
+design, refinement and implementation; they did not authorize deployment, pushes or proof-input changes. This document
+records decisions and evidence, not independent permission to act. Historical design-only statements below describe
+their original checkpoints, not a cancellation of that later scoped authorization.
 It supplements the historical inventory in `docs/native-lifecycle-evidence.md`; where that document leaves storage
 undecided, the recommendation here is SQLite. Existing source scaffolds are not this design's implementation.
 No proof inputs, installed binaries, live configuration, lock files or historical receipts change with this document.
+
+## Current decision and evidence checkpoint
+
+This checkpoint supersedes conflicting earlier topology/inventory proposals below. Host baseline is `3a310c9`;
+SDK baseline is `4ae59cd`. The preferred recovery direction is **one native SDK operation over its existing owner
+registry**, not another custody database, manifest tree or permanent recovery daemon. The host remains the scheduling
+client; Proofs keeps provenance and acceptance. Existing service → worker → guardian relationships are the measured
+baseline. A proposed service-level architecture is not yet a qualified replacement for that topology.
+
+| Area | Current evidence and boundary |
+| --- | --- |
+| Identity, one-use dispatch, caller result before ACK | Private host store/kernel/runtime contract tests are implemented; no production store/RPC is wired. See [stage-store contract](../specs/native-execution/stage-store-contract.md). |
+| Service death | Actual service death with a healthy guardian and a later passive observer passed scoped tests. The observer does not adopt children or run a replacement service. |
+| Custodian metadata and compute capacity | SDK `120767d` retains a live guardian record after payload closure without occupying a compute slot. The real drain-barrier test is not SIGSTOP recovery. |
+| Writer admission | SDK `4ae59cd` closes ungranted candidate EX and the entire partial set before retrying, retaining demand, the original deadline and inode checks. This removes one takeover prerequisite, not the whole recovery gap. |
+| macOS token signals | Disposable same-boot supplied-token tests cover exec-generation rejection, nonparent signaling and running-orphan termination with a prospectively registered exit observer. They do not establish durable token discovery, boot binding or group containment. |
+| Frozen guardian / takeover | Qualification is ongoing. No actual frozen-guardian recovery or stopped-orphan composition is claimed here. |
+| Formal models | Bounded Python checks exist; TLA+ remains unparsed/TLC-unrun. The combined 300,001-state exploration remains incomplete; separate slices are not a composition proof. |
+
+The reviewed recovery recommendation is retained locally at
+`/private/tmp/lean-recovery-design-20261117/recommendation.md`; the running-orphan primitive's exact evidence and limits
+are in `/private/tmp/lean-orphan-token-20261117/README.md`. These are evidence references, not production dependencies.
+Later experiment results must be reconciled explicitly rather than inferred from a running task.
 
 ## 1. Decision and scope
 
@@ -120,6 +146,11 @@ Its WAL transactions and immutable history tables do not make it the right owner
 
 ## 4. Proposed process architecture
 
+The diagram describes logical responsibilities of the proposed service, not an instruction to add another persistent
+supervisor to the existing SDK. The current measured topology and preferred registry-reusing recovery path are recorded
+in the opening checkpoint and §8. Final mapping of these roles to existing worker/guardian processes, especially writer
+custody, remains an integration decision. The earlier dual-alias alternative is explicitly separated below.
+
 ```text
 Proofs CLI / other client / semantic host
     | typed local RPC; caller-selected durable attempt ID
@@ -179,12 +210,14 @@ The supported managed process contract forbids detach/regroup and undeclared art
 processes and arbitrary daemonizing commands are not contained by this design. Stronger arbitrary-process guarantees
 would require a different OS containment boundary, not another heartbeat or database table.
 
-### Single-failure custody contract and first qualification gate
+### Earlier dual-alias alternative and its qualification obligations
 
-Before building the service/store, qualify a **disposable custody fixture** with two fake commands contending for one
+The earlier dual-alias proposal below is retained as an alternative, not the selected existing-SDK topology. Its
+requirements must be qualified if adopted; successful existing-guardian tests do not qualify it. A **disposable custody
+fixture** uses two fake commands contending for one
 canonical scratch artifact lock. It must log actual write intervals independently of the service and demonstrate no
 overlap across each injected death. No proof worker, production lock or production database is part of this fixture.
-The following is the proposed ownership contract, not a verified property of the current implementation:
+The following is that alternative's ownership contract, not a verified property or an instruction to add another owner:
 
 - After admission, supervisor and guardian both retain aliases of the actual acquired open file descriptions for the
   complete domain union. Transfer uses explicit descriptor passing/inheritance followed by identity/receipt validation;
@@ -211,7 +244,8 @@ supervisor/guardian handshake. Compare owner-only death with surviving descendan
 primitive supplies a safe owner-death boundary, this is preferable because it removes an owner, descriptor transfer and
 mutual heartbeat protocol. Without that primitive it fails the same crucial owner-death case, so fewer processes alone
 is not sufficient. Choose the smallest design whose custody fixture passes; do not build the service around an unproven
-three-process topology. No fixture implementation or execution is authorized by this design-only edit.
+three-process topology. This paragraph originally authorized no fixture execution. Later explicitly authorized scoped experiments are reported
+above; neither that authorization nor their results establish this alternative as the chosen implementation.
 
 ## 5. SQLite decision, paths and schema
 
@@ -287,21 +321,22 @@ input, even if its attempt history was pruned or result is terminal. Remove thos
 closure/recovery establishes the input is no longer in use. Recovery may sweep old temp/orphan files with bounded
 work, but age alone never makes a live scope's staged input an orphan. SQLite FULL does not fsync an unrelated asset automatically.
 
-**Independent minimal custody inventory.** `execution/custody/<scope-uuid>.json` is a small, versioned scope manifest
-separate from SQLite history: store/service generation, canonical domain paths and inodes, boot/process/group identities,
-private owner endpoints and declared alias holders. Publish it atomically with file/directory fsync before any GO;
-update identity transfer before releasing the corresponding launch gate. It contains no command outcomes, runnable
-jobs or general event log. Live authenticated owners and kernel locks remain authoritative. Remove it only after
-resource reconciliation/closure, not result ACK or history retention. Thus a corrupt history DB does not erase the
-only map from live work to affected domains. The inventory is bounded by admitted scopes plus unresolved live scopes,
-not number of historical attempts, and requires explicit size/version/no-symlink limits.
+**Recovery metadata independent of SQLite history: reuse the SDK owner registry.** The required separation remains:
+a corrupt result/history database must not erase the only map of live work to domains and custodians. The preferred
+implementation extends the existing native owner record with trusted boot/token/scope facts and recoverer custody,
+using its short publication/arbitration protocol. Do not add the previously proposed
+`execution/custody/<scope-uuid>.json` tree in parallel. That separate-manifest alternative is not selected.
 
-On SQLite corruption, keep the inventory, query its owners, stop/reconcile affected scopes and preserve the corrupt DB.
-Block only affected domain unions where their identities/custody remain uncertain; unrelated verified domains may
-continue once a new valid store is available. Missing/corrupt inventory cannot be treated as an empty inventory: use
-live owner enumeration and stable lock/identity observations; if these cannot establish the impacted domains, disclose
-that domain isolation is itself unresolved. The inventory is deliberate minimal recovery redundancy, not a second
-execution authority. Its corruption/transfer races must pass the custody fixture before automatic store replacement.
+Keep immutable domain/inode bindings, controlled bootstrap identities and every possible descriptor custodian
+recoverable until closure. SDK `120767d` separates retained custodian metadata from closed-payload compute capacity;
+retained metadata still has a namespace bound. Publish before a new launch or recovery STOP can take effect. Record
+retention is not a second scheduler, a result receipt or permission to signal a saved PID.
+
+On SQLite corruption, preserve the database and existing native registry, reconcile affected scopes through native
+ownership, then decide whether a fresh store can safely accept new IDs. Missing/corrupt registry data is not empty
+custody. The exact corruption/quarantine/restore protocol, legacy-record migration, namespace-pressure behavior and
+safe handling when affected domains cannot be identified still need specification and tests. Keep ordinary dead-scope
+recovery automatic; do not require missing historical outcomes before freeing established-closed resources.
 
 Supervisor reports over its authenticated private channel. If service dies, supervisor stops work instead of maintaining
 an autonomous second journal writer. A bounded final-receipt reconnect may improve evidence after service restart, but
@@ -428,41 +463,50 @@ Do not add a blanket warm-worker eviction that defeats validated caching; demand
 Separate three questions: **did the old command run**, **does matching work still exist**, and **can a new conflicting
 operation safely acquire the current resource**. Unknown historical outcome is not an automatic permanent fence.
 
-Recovery algorithm, per affected domain union:
+Preferred recovery policy, using the existing native registry:
 
-1. Start a new service generation only after obtaining the stable singleton lock; verify canonical artifact paths and
-   inodes. Never unlink an occupied lock file or create a replacement inode to bypass it.
-2. For old nonterminal scopes, query live guardian/supervisor capability channels and practical process identities
-   (boot identity, PID plus birth identity, session/group facts). A reused PID is not the old owner. Absence of a receipt
-   alone is not evidence of a live owner. An OS boot change proves old local processes cannot remain.
-3. If a matching live supervisor/guardian remains, request fail-stop cleanup through it. If unreachable, use only the
-   platform identity-safe stop mechanism; do not signal a recycled PID or unpinned stale group number. Poll with backoff.
-4. Test normal nonblocking lock acquisition for the COMPLETE union, releasing partial acquisitions on conflict. An actual
-   busy kernel lock is evidence of current custody even if metadata is stale. Do not bypass it because a lease expired.
-5. Once relevant identities are absent and the stable union can be acquired, mark old *resource state* recovered with the
-   observations and confidence basis. Admit new work under those held locks. Keep old command outcome unknown if no
-   result witness survived. Never require an unavailable old wait receipt merely to clear a stale logical fence.
-6. If a matching protected process is live despite free artifact locks, stop/reconcile it before conflicting work. EX
-   reacquisition ALONE is insufficient when a payload can close inherited descriptors and continue artifact access.
-   Likewise absence of the supervisor alone does not prove its descendants are gone.
+1. Establish the sole service/recovery owner through the existing short lock/publication protocol. Never hold its
+   registry-wide lock, a database transaction or the whole queue while waiting for process cleanup.
+2. Classify original scope facts, not just elapsed time or missing results. With a verified different boot, or complete
+   same-boot absence of the original payload group, launchers and registered custodians, recheck against publication
+   and retire that scope's resource restriction automatically. Historical outcome stays Unknown. This fully dead branch
+   need not reopen deleted old paths or acquire locks held by unrelated newer work; new work uses normal admission.
+   Numeric PID/PGID reuse must not turn an absent original scope into a permanent reservation.
+3. For an eligible stopped guardian, prefer resuming that existing owner so it can perform its normal drain while
+   retaining custody. Eligibility comes from cancellation/deadline/retirement or confirmed service loss, not a quiet
+   proof. Genuine post-exec token capture, trusted scope admission and boot binding are prerequisites for durable
+   token-based recovery. Supplied-token primitive results alone do not establish them. No raw-PID fallback.
+4. If original payload work survives without a responsive custodian, qualify takeover separately. SDK `4ae59cd` now
+   releases ungranted EX/partial sets while its managed-owner gate refuses work. Reader recovery may then acquire a
+   fresh validated complete SH union without conversion or explicit unlock. Its acquisition path must not deadlock
+   on the waiting writer's demand marker: the exact internal recovery-only demand bypass/admission contract is still
+   unresolved. It must not become a generic reader bypass or allow payload execution under cleanup authority.
+5. An exact token identifies an individual incarnation, not all descendants. The proposed anchored STOP/census/rescan
+   and exact-member termination algorithm is unqualified for concurrent fork/exec, anchor loss and incomplete scans.
+   Publish recovery intent and accepted member identities before STOP; register potential recoverer-held descriptors
+   before acquisition. Two-recoverer arbitration, crash cuts, bounded evidence and a frozen recoverer require an
+   explicit protocol. Do not implement a hidden new custodian while claiming one owner.
+6. Release takeover protection only after the required payload/launcher/custodian closure observations. Bare EX,
+   signal return zero, a result ACK or an absent SQL row is not closure. Preserve the managed-writer owner-record gate.
+   Reader SH takeover does not establish exclusive-writer recovery; an existing EX holder needs its own qualified
+   cleanup contract. Missing old wait/result receipts do not block new work after current resources are established free.
 
-Practical inference is explicitly supported: a boot change, or repeated matching-identity absence plus successful
-canonical union acquisition and no registered protected scope, can establish resource recovery without reconstructing
-historic exit status. Record `recovered_after_owner_loss`, not a fabricated original success/stopped receipt. A fixed
-number of polls is not proof of absence; the platform process/guardian contract defines what is observed.
+Practical inference is supported, not deferred until mathematical certainty. Repeated matching-identity observations,
+trusted membership, a verified boot transition and current native lock facts have distinct roles. Record the evidence
+for `recovered_after_owner_loss`, never fabricate an original success. A stale-token rejection alone does not prove
+scope absence: exec or descendants may remain. A prospective exit watch is not a facility to attach later to an old PID.
 
-For the managed no-detach contract, guardian retains custody independently of the payload and checks registered scope
-closure. Supervisor death therefore initiates cleanup, not immediate lock release. If guardian ALSO dies, the replacement
-must reconcile the surviving group and any registered descendant identities before overlap. Current Mac group pinning
-and Linux post-leader-reap behavior differ: **simultaneous guardian/supervisor death without sufficient surviving
-identity is an unresolved containment case**. Do not claim universal automatic crash recovery until the exact platform
-mechanism and tests establish it. Options must be reviewed: stronger OS containment, a surviving authoritative custody
-owner, or explicitly narrower supported process contract. A timer cannot fill this gap.
+Proposed cleanup attempts have one five-second software budget with bounded backoff and observable pending reasons;
+that does not bound hung kernel calls. Restrict unresolved live/ambiguous scopes to their actual domains. Continue
+unrelated work; never impose a permanent blanket HOLD solely because history is missing. Unkillable work, unavailable
+OS observation or lost membership may still need an explicit scoped limitation/operator action. Simultaneous loss of
+all useful anchors remains a stronger unresolved case, not a reason to leave clearly dead scopes unrecovered.
 
-Operationally, exhaust automated checks and safe cleanup first; report a specific unresolved live/ambiguous scope,
-not a permanent blanket HOLD because a JSON field is missing. Continue unrelated domains. A truly unkillable process,
-blocked kernel observation or unverifiable escaped process may still need operator action. Incomplete evidence is not
-an excuse for indefinite silent retry: status includes cause, last observation, next retry and affected domains.
+The narrow SDK boundary is scope-ID plus eligible trigger → classification/recovery observation, not caller-supplied
+PID/token → signal. Existing native admission/record collection owns resource facts; the host's pending-work loop owns
+retry scheduling. No second queue, cron job or independent SQLite recovery inventory is proposed. macOS private API
+availability/permissions and Linux behavior require separate platform qualification. No stronger recovery mechanism is
+implemented by this document.
 
 ## 9. Proposed file changes and removals
 
@@ -503,8 +547,9 @@ not this redesign and cannot pass by demonstrating only successful commands.
 
 ## 10. Migration and rollback
 
-1. Independently review this design, then qualify disposable dual-owner and direct-owner custody fixtures FIRST.
-   Resolve guardian-only/supervisor-only failure and the platform identity contract before store or production integration.
+1. Reconcile the selected existing-SDK recovery contract and its platform identity/cleanup gates before production
+   wiring. Existing store and healthy-guardian fixtures are bounded evidence, not a reason to restart completed work.
+   Qualify a different dual-owner/direct-owner topology only if that alternative is deliberately selected.
 2. Implement store/protocol and scope machinery behind an off-by-default versioned capability. Model transitions and
    test private fixtures; do not read production history as work to replay.
 3. Route one isolated fixture through the new path, then the complete private acceptance suite. Match host, SDK and
@@ -549,7 +594,7 @@ separate from successful tooling acceptance.
 - Identity/recovery: reused PID, boot change, stale row with free stable lock, busy lock with missing row, replaced inode,
   missing guardian reply, multiple-domain partial acquisition. Show automatic successor progress once matching live
   custody is gone without manufacturing an old result.
-- Storage/control: result fsync/rename/commit/GC crash cuts, custody inventory independent of corrupt SQLite, full disk, SQLite busy/corrupt, service loss during commit, duplicate observations, oversized frames,
+- Storage/control: result fsync/rename/commit/GC crash cuts, existing native registry independent of corrupt SQLite, full disk, SQLite busy/corrupt, service loss during commit, duplicate observations, oversized frames,
   invalid capability, FIFO/symlink inputs, unavailable socket, pruning versus late report. Cleanup must not depend on a
   successful database write.
 - Time: delayed renewals, renewal/expiry race, 60s owner expiry, 30s idle expiry, sleep/resume, wall-clock jumps, quiet long
@@ -571,12 +616,13 @@ is one recoverable owner and no uncertain automatic replay. Durability cannot pr
 before publishing. A timeout cannot force an unkillable process to release a kernel resource. SQLite cannot prevent an
 unmanaged Lake process from writing without the locks. Exact-once external effects are not promised.
 
-Before production implementation, the disposable fixture and independent review must settle: (1) guardian custody and platform-safe group cleanup after
+Before production wiring, the remaining design and independent review must settle: (1) guardian custody and platform-safe group cleanup after
 supervisor death, including simultaneous death; (2) exact process identity/absence evidence used for automatic recovery;
 (3) native semantic actor integration without redundant capacity owners; (4) SQLite corruption recovery and bounded
 retention details; (5) concrete service installation and compatibility scope. The proposal chooses Rust native ownership,
 SQLite, finite deadlines and recovery independent of historical result, but does not label these unresolved mechanisms
-as solved. No code, deployment or proof-worker changes are authorized by this document.
+as solved. Later owner instructions separately authorized scoped design/refinement/implementation. Deployment, pushes
+and proof-worker/input changes remain outside this document's authority.
 
 ## 13. Research-backed validation plan and implementation handoff
 
@@ -726,7 +772,8 @@ its lock. Runtime syscall evidence and platform semantics remain separate gates.
 Documentation clarification, 2026-11-17; no database or installed setting changed.
 The proposed native store already requires WAL and `synchronous=FULL` (§5). This
 is not discovery of a NORMAL-mode bug in an implemented native store: that store
-does not yet exist. The existing Proofs `P/sqlite_store.py` separately sets FULL
+is not yet wired into production. A private test-only SQLite prototype now exists; its scoped evidence is linked in
+the current checkpoint. The existing Proofs `P/sqlite_store.py` separately sets FULL
 on its connections; it is not the new native store and this edit does not alter it.
 
 ### Documented SQLite behavior versus the proposed contract
@@ -855,3 +902,58 @@ The isolated tests query the actual Rust-linked SQLite build and check connectio
 settings on disposable files. They leave the installed server and live databases
 unchanged. Their scoped results do not establish production restart recovery,
 physical flush success or the other unrun storage tests above.
+
+
+## 16. Remaining design decisions versus implementation work
+
+### Decisions/protocol details still to settle
+
+- **Recovery authority and supported failures:** finish the frozen-custodian external cleanup contract, trusted
+  post-exec boot/token admission and prospective-versus-late observation distinction; then decide supported lost-anchor
+  cases. Current primitive/healthy-guardian successes do not qualify a replacement execution service.
+- **Recovery's own lifetime:** define scope-level arbitration, publication before acquisition/STOP, crash-safe recovery
+  ownership and bounded member accounting. Resolve reader-recovery SH versus writer-demand admission without weakening
+  normal fairness; exclusive-writer takeover is separate. Do not add a new permanent controller by accident.
+- **Warm integration and one capacity authority:** map service admission to existing broker/project/generation lifetimes,
+  remove duplicate grant decisions, and define sequential request closure versus whole-generation retirement. The
+  private SQL prototype's one-stage-per-scope-generation constraint is not the complete warm-worker design.
+- **History corruption, retention and assets:** specify bounded registry/store reconciliation and replacement, format
+  migration, pruning under live-scope references and external-asset durable publish/GC. The chosen SQLite/registry split
+  and ordering principles are settled; the complete failure procedures are not.
+- **Installation/cutover:** finalize supported launcher inventory, service packaging/discovery, capability epochs and
+  rollback procedure. §10 already states no dual authority, no unchanged old launcher assumed fenced, and no lock-inode
+  replacement. Concrete installation/deployment is neither completed nor authorized by these local changes.
+
+### Specified requirements, not open-ended architecture questions
+
+The narrow client identity/submit/get/cancel contract, immutable intent, one-use launch consumption, unknown outcome
+without replay, independent resource closure and caller-owned result before ACK are specified and have scoped private
+tests. This is not a request to redesign them. Native service/RPC wiring, authentication, external assets, production
+store use, warm integration, migration and complete acceptance remain implementation/qualification work.
+
+The deterministic activity-updated soft deadline and immutable hard bound in §7 are requirements with configurable
+proposed defaults, not an unanswered request for a learned scheduler. Implementing complete attempt-scoped CPU/fork/exit
+accounting still needs a platform mechanism and tests; unavailable accounting must use the stated hard-bound fallback
+and be reported, not be relabeled complete activity-based updating. Sleep/resume and error paths also need qualification.
+
+Stop adding storage features to postpone custody decisions. The next sequence is the smallest safe frozen-custodian
+qualification, explicit reconciliation of its result into this contract, then narrow service/warm integration. Retain
+independent review and exact-image fault tests. No further topology or storage layer is justified merely by the existence
+of an untested case.
+
+### Ordered implementation and acceptance checklist
+
+Paths below are relative to the named repository. Roles identify responsibility, not additional services. This is a
+sequence of decision/acceptance gates: independent preparation may proceed, but dependent production wiring must not
+assume an unresolved predecessor has passed. New production module placement remains proposed until its interface is
+reviewed; existing test modules are not production implementations.
+
+| Step | Responsible role and exact existing paths | Decision or acceptance gate | Dependencies and current status |
+| --- | --- | --- | --- |
+| 1. Finish frozen-scope and identity contract | SDK recovery: `lean-rs` → `crates/lean-toolchain/src/native_guardian.rs`, `crates/lean-toolchain/src/native_guardian/ownership.rs`; host lifecycle: `lean-host-mcp` → `docs/native-execution-lifecycle-design.md` §§4,8 | Select supported frozen/dead-custodian and lost-anchor cases; specify trusted post-exec token/boot admission. Qualify exact external cleanup before a real guardian STOP, then normal CONT recovery, with independent exit/custody/resource oracles and failure rescue excluded from success. | First gate, unresolved. Supplied-token and running-orphan evidence is narrower. Stopped-child controls reportedly pass; actual guardian setup encountered pre-worker EPERM, not a recovery pass. |
+| 2. Integrate registry recovery and admission | SDK recovery: `lean-rs` → `crates/lean-toolchain/src/native_guardian/ownership.rs`, `crates/lean-toolchain/src/writer_lock.rs`, `crates/lean-toolchain/src/native_guardian/record_lifetime_tests.rs` | Define one scope recovery operation, publication before STOP/acquisition, two-recoverer arbitration and recovery's own crash. Decide recovery SH versus writer-demand admission; test complete-set acquisition, concurrent writer, frozen recoverer and ordinary fully-dead record retirement. No second inventory or controller. | Depends on 1 for affected failure cases. Metadata/capacity separation and candidate EX close-and-retry are implemented; takeover and its complete fault contract are not. |
+| 3. Close warm-worker/one-capacity contract | Host lifecycle with SDK recovery: `lean-host-mcp` → `crates/lean-host-mcp/src/broker.rs`, `crates/lean-host-mcp/src/broker/control.rs`, `crates/lean-host-mcp/src/project.rs`, `crates/lean-host-mcp/tests/project_lifecycle.rs` | Map request, attempt and retained generation to one admission authority. Test sequential requests, cancellation, warm retention/retirement, service loss and replacement without double grants or duplicate launch. Specify which old admission paths are removed. | Contract work can proceed now; recovery-dependent wiring waits for 1–2. One-stage/scope test coverage does not settle generation reuse. |
+| 4. Wire production identity/store/assets/auth | Host lifecycle: `lean-host-mcp` → `crates/lean-host-mcp/src/server.rs`; existing reference tests `crates/lean-host-mcp/tests/stage_store_contract/{store,connection,result_client,caller_results,cuts}.rs` and `crates/lean-host-mcp/tests/stage_store_runtime_contract/service_loss_regressions.rs`; contract `specs/native-execution/stage-store-contract.md` | Review production module placement and authorization boundary, then preserve original identity, consumption-before-GO and caller-save-before-ACK. Decide live-reference retention, corruption/replacement and external-asset publish/GC procedures; test SQL/asset failures and actual replacement-service behavior. | Production modules not yet selected or wired. Depends on 2–3 for scope ownership; existing private store and healthy-guardian/passive-observer tests remain reusable evidence, not restart adoption. |
+| 5. Implement bounded activity/deadline policy | Host lifecycle with SDK recovery: `lean-host-mcp` → `crates/lean-host-mcp/src/config_schema.rs`, `crates/lean-host-mcp/src/config_file.rs`; SDK `lean-rs` → `crates/lean-toolchain/src/native_guardian.rs`; policy here §7 | Implement specified configurable soft/hard bounds; select complete attempt-scoped activity accounting and explicit unavailable-accounting fallback. Test productive long jobs, hung jobs, fork/exit, sleep/resume and blocked I/O without heartbeat-as-progress or hard-bound renewal. | Policy specified; platform accounting and full wiring unqualified. Can develop independently; integrated enforcement depends on settled scope/lifetime in 1–3. |
+| 6. Install/cut over and delete superseded authority | Repo coordinator with host lifecycle: `lean-host-mcp` → `crates/lean-host-mcp/src/main.rs`, `crates/lean-host-mcp/src/runtime_compatibility.rs`, `scripts/prerelease.sh`; migration contract here §10 | Finalize supported launcher inventory, packaging/discovery, capability epochs and rollback. Test old/new compatibility and failure cuts; remove old lifecycle/admission authority rather than leave parallel grants. Preserve lock inodes and live custody throughout migration. | Concrete install plan unresolved; depends on 1–5 acceptance. Local implementation authorization does not authorize deployment or push. |
+| 7. Exact-image mixed workload and proof acceptance | Repo coordinator: `lean-host-mcp` → `crates/lean-host-mcp/tests/smoke_perf.rs`, `crates/lean-host-mcp/tests/kanproofs_eval.rs`, `scripts/memory_stability.py`; proof-repository acceptance entry points must be inventoried before execution | Run reviewed fault suite and real concurrent mixed Lean workloads on the candidate image, then existing proof gates with preserved theorem scope and inputs. Record binary/source hashes, timings, overlap, memory/swap and cleanup/unknown outcomes; distinguish finite acceptance from universal guarantees. | Depends on 6's reviewed candidate and applicable deployment authorization. Prior rollout timings and isolated prototype passes do not qualify this architecture. No proof-source changes are implied. |
