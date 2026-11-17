@@ -717,3 +717,95 @@ custody exists, as well as explicit unlock through an alias. Use close-only
 ownership; the model does not assume a conversion preserves exclusion atomically.
 This assumption does not assert that every failed nonblocking conversion loses
 its lock. Runtime syscall evidence and platform semantics remain separate gates.
+
+## 15. Durable storage failure model and qualification requirements
+
+Documentation clarification, 2026-11-17; no database or installed setting changed.
+The proposed native store already requires WAL and `synchronous=FULL` (§5). This
+is not discovery of a NORMAL-mode bug in an implemented native store: that store
+does not yet exist. The existing Proofs `P/sqlite_store.py` separately sets FULL
+on its connections; it is not the new native store and this edit does not alter it.
+
+### Documented SQLite behavior versus the proposed contract
+
+SQLite documents that committed WAL transactions with NORMAL can be lost after
+an OS crash or power failure, although application crashes do not have that same
+durability exposure. FULL adds a WAL sync for each committed transaction; EXTRA
+adds nothing beyond FULL in WAL mode. On macOS, `fullfsync` defaults off; when
+enabled it requests F_FULLFSYNC for supported sync operations. With fullfsync
+on, checkpoint_fullfsync is redundant. Unknown PRAGMAs may be silently ignored.
+Sources: [synchronous](https://sqlite.org/pragma.html#pragma_synchronous),
+[fullfsync](https://sqlite.org/pragma.html#pragma_fullfsync),
+[checkpoint_fullfsync](https://sqlite.org/pragma.html#pragma_checkpoint_fullfsync).
+
+Proposed connection contract for the native store:
+
+1. Before accepting durable mutations, configure and read back `journal_mode=WAL`,
+   `synchronous=FULL` (2) and foreign keys ON on each relevant connection/schema.
+   Do not assume connection-local settings persist through reopen or pooling.
+2. On supported macOS SQLite/VFS builds, explicitly request/read back fullfsync ON.
+   Do not substitute checkpoint_fullfsync alone for commit synchronization. Record
+   SQLite version, VFS, effective values and filesystem assumptions in qualification.
+3. A missing/mismatched required setting, failed commit or sync error refuses a
+   new durable admission/GO acknowledgment. Return explicit storage failure; never
+   quietly retry under NORMAL/OFF. Failed or lost commit acknowledgment can leave
+   the transaction outcome uncertain: reconcile the original immutable identity,
+   rather than assuming rollback or retrying its payload. Cleanup of existing scopes remains independent
+   of a successful storage write. Configure storage during controlled initialization,
+   not journal-mode transitions on a live operation path.
+4. A PRAGMA value is configuration evidence, not proof that a particular device,
+   filesystem, VFS or storage stack honored durable flush. Document platform limits
+   and any weaker supported storage profile instead of claiming universal durability.
+
+### Three distinct failure classes
+
+- **Service/process crash:** OS and device remain running; kill/reopen tests can
+  check journal replay, original IDs, unacknowledged results and unknown launch
+  outcomes. Surviving native scopes still need custody reconciliation.
+- **OS crash/reboot:** userspace and kernel state disappear. A process-kill test
+  does not simulate dirty kernel buffers being lost. Old local process custody
+  cannot survive a real reboot, but saved outcome/intent may still be incomplete.
+- **Power loss:** additionally exercises device/cache persistence. Neither SIGKILL
+  nor an ordinary VM process restart proves the physical storage flush contract.
+  Never power-cycle Jacob's machine as a test. Any future destructive fault testing
+  needs an isolated disposable environment and the appropriate authorization.
+
+### Database, OS launch and external assets are separate durability domains
+
+Preserve caller job/stage binding and native intent before dispatch. Commit launch
+permission before GO, but do not claim commit and OS spawn are atomic: a committed
+permission may never execute; an executed command may lose its completion report.
+Missing result cannot authorize replay. Successful SQLite commit cannot preserve
+an output file that was not separately flushed or stop a running process.
+
+The §5 asset protocol must use an explicitly qualified platform file-sync helper:
+write bounded temporary asset, flush file contents with the required supported
+macOS full-sync policy where applicable, rename, establish directory-entry
+persistence under the supported filesystem contract, then commit its database
+reference. Qualify directory synchronization separately; do not assume a database
+PRAGMA configures external files or that the same file-sync operation works for
+all directory descriptors. Propagate failures before advertising a durable result.
+The same analysis applies to caller provenance, scope manifests and epoch changes.
+GC durably commits reference removal before deleting unreferenced assets and
+serializes publication/deletion or rechecks under equivalent coordination so a
+concurrent reference or live-scope pin cannot race deletion. It still protects
+inputs needed by live scopes. A hash detects missing/corrupt bytes; it
+cannot reconstruct them or establish that a command never ran.
+
+### Required validation and honest reporting
+
+- Assert effective PRAGMAs on fresh, reopened and pooled connections. Deliberately
+  misconfigure NORMAL/fullfsync and ensure the admission check rejects the profile.
+- Instrument a test VFS/storage adapter to verify sync ordering and inject write,
+  flush, commit, rename and checkpoint failures. Label these simulated storage
+  faults, not actual hardware power-loss experiments.
+- Kill only disposable service processes at each binding/commit/GO/result/ACK cut;
+  reopen and assert original identity retention, no reauthorization, honest unknowns
+  and missing-asset errors. Test WAL recovery before and after checkpoint.
+- Verify external-asset publish/GC ordering independently, including failures after
+  file flush, rename, directory sync and database-reference commit. Cleanup cannot
+  be trapped by the failure of its evidence store.
+- Keep a coverage table separating process-kill tests, VFS fault simulations,
+  OS-crash testing and physical power-loss qualification. Unrun categories stay
+  unrun. No existing custody fixture or pure lifecycle model establishes these
+  storage guarantees; all new native-store durability tests remain NOT RUN.
