@@ -1,959 +1,517 @@
-# Native execution lifecycle and self-healing: replacement design
+# Native execution lifecycle and self-healing
 
-Status: **Design with bounded implemented/tested components; no complete service or deployment qualification.**
-Written and reconciled 2026-11-17. The original revision was design-only. Later explicit owner instructions authorized
-design, refinement and implementation; they did not authorize deployment, pushes or proof-input changes. This document
-records decisions and evidence, not independent permission to act. Historical design-only statements below describe
-their original checkpoints, not a cancellation of that later scoped authorization.
-It supplements the historical inventory in `docs/native-lifecycle-evidence.md`; where that document leaves storage
-undecided, the recommendation here is SQLite. Existing source scaffolds are not this design's implementation.
-No proof inputs, installed binaries, live configuration, lock files or historical receipts change with this document.
+Status, 2026-11-17: **proposed replacement with bounded private tests; no production service or deployment
+qualification.** This contract retains the useful requirements from the superseded lifecycle-evidence draft. Git
+preserves that draft's abandoned storage alternatives and historical inspection state.
 
-## Current decision and evidence checkpoint
+Use this document for identity, execution, custody, recovery and storage requirements. The
+[cutover plan](native-execution-cutover-plan.md) owns the concrete launcher, deletion, installation-fence and rollback
+inventory. [Model and prototype contracts](../specs/native-execution/README.md) own replay instructions and detailed
+test scope. Documents record evidence and obligations; they do not authorize deployment, pushes or proof-input changes.
 
-This checkpoint supersedes conflicting earlier topology/inventory proposals below. Host baseline is `3a310c9`;
-SDK baseline is `4ae59cd`. The preferred recovery direction is **one native SDK operation over its existing owner
-registry**, not another custody database, manifest tree or permanent recovery daemon. The host remains the scheduling
-client; Proofs keeps provenance and acceptance. Existing service → worker → guardian relationships are the measured
-baseline. A proposed service-level architecture is not yet a qualified replacement for that topology.
-
-| Area | Current evidence and boundary |
-| --- | --- |
-| Identity, one-use dispatch, caller result before ACK | Private host store/kernel/runtime contract tests are implemented; no production store/RPC is wired. See [stage-store contract](../specs/native-execution/stage-store-contract.md). |
-| Service death | Actual service death with a healthy guardian and a later passive observer passed scoped tests. The observer does not adopt children or run a replacement service. |
-| Custodian metadata and compute capacity | SDK `120767d` retains a live guardian record after payload closure without occupying a compute slot. The real drain-barrier test is not SIGSTOP recovery. |
-| Writer admission | SDK `4ae59cd` closes ungranted candidate EX and the entire partial set before retrying, retaining demand, the original deadline and inode checks. This removes one takeover prerequisite, not the whole recovery gap. |
-| macOS token signals | Disposable same-boot supplied-token tests cover exec-generation rejection, nonparent signaling and running-orphan termination with a prospectively registered exit observer. They do not establish durable token discovery, boot binding or group containment. |
-| Frozen guardian / takeover | Qualification is ongoing. No actual frozen-guardian recovery or stopped-orphan composition is claimed here. |
-| Formal models | Bounded Python checks exist; TLA+ remains unparsed/TLC-unrun. The combined 300,001-state exploration remains incomplete; separate slices are not a composition proof. |
-
-The reviewed recovery recommendation is retained locally at
-`/private/tmp/lean-recovery-design-20261117/recommendation.md`; the running-orphan primitive's exact evidence and limits
-are in `/private/tmp/lean-orphan-token-20261117/README.md`. These are evidence references, not production dependencies.
-Later experiment results must be reconciled explicitly rather than inferred from a running task.
+- [Scope](#1-decision-and-scope), [evidence](#2-verified-baseline-and-concrete-failures) and
+  [owners](#3-current-owners-and-exact-paths)
+- [Process boundary](#4-proposed-process-architecture), [storage](#5-sqlite-decision-paths-and-schema) and
+  [protocol](#6-protocol-and-state-transitions)
+- [Deadlines](#7-deadlines-inactivity-and-defaults) and [recovery](#8-self-healing-and-pragmatic-resource-recovery)
+- [Acceptance](#11-acceptance-and-fault-matrix), [validation](#13-validation-and-refinement),
+  [model status](#14-model-evidence) and [storage qualification](#15-storage-qualification)
+- [Ordered remaining gates](#16-remaining-implementation-and-acceptance-gates)
 
 ## 1. Decision and scope
 
-Replace fragmented execution lifecycle ownership with a native Rust execution service and a small supervised process
-boundary. Keep Lean semantic project actors, worker/session reuse, canonical artifact locks and tested process-group
-machinery. Do not rewrite Lean, the semantic API, the formatter or proof orchestration wholesale.
+One native Rust execution service owns admission policy, immutable attempt identity, deadlines, status and persistence.
+The SDK owns actual process/resource custody. The host remains the scheduling client; proof repositories retain source
+snapshots, theorem scope and acceptance gates. The service must work without IUT names, layouts or Python registries.
 
-The service owns admission policy, immutable attempt identity, deadlines, status and persistence. A native scope
-supervisor owns actual command children and cleanup. An independently scheduled custody guardian watches that
-supervisor and keeps the artifact exclusion alive until its protected process scope is stopped. This last claim is a
-**design obligation**, not a property already established for all existing writers. A supervisor plus a database alone
-is insufficient.
+Reuse Lean project actors, workers, sessions, artifact locks and qualified process-group machinery. The preferred
+recovery boundary is **one SDK operation over the existing native owner registry**, not another custody database,
+manifest tree or permanent recovery daemon. Mapping the proposed service onto the existing worker/guardian topology
+still needs the containment and warm-integration gates below. Preserve typed `ProjectMessage` dispatch; this work does
+not require an actor-interface rewrite.
 
-Proofs owns source snapshots, theorem scope, proof steps and acceptance gates. It becomes a thin execution client,
-not a process supervisor or a second native scheduler. The service must work for other Lean repositories without
-IUT names, source layouts, theorem policies or Python registry dependencies.
+The client supplies an operation and receives a durable handle/result. Guardian ACKs, descriptor transfer, heartbeats,
+storage transactions and process-group observation stay below that boundary. Native policy must replace old grant and
+expiry authorities rather than add another queue. The design criteria are separation of intent, scheduling, custody,
+observation and recovery, and fewer caller obligations; adding actors or SQLite alone does not establish simplicity.
 
-Success means routine abandoned work recovers automatically, without manual drains or permanent fences caused only
-by a missing historical receipt. It does not mean every interrupted operation has a known outcome. Never silently
-retry an operation that may have run. A newly authorized attempt can proceed once current resources are available,
-even while the old attempt's result remains unknown.
-
-### Design principles and alternatives
-
-Direct local references: `/Users/jcreinhold/Code/papers/logic-and-computation/software-engineering/simple-made-easy/text.md`
-(Rich Hickey, especially the complexity table and who/what/when/where discussion), and
-`/Users/jcreinhold/Code/papers/logic-and-computation/software-engineering/philosophy-of-software-design/`
-(John Ousterhout, chapters 4–8, 10–11, 23–24). These are design criteria, not endorsements of this implementation.
-
-- Separate intent (what), scheduling (when), custody (who currently owns the processes/resources), outcome (what was
-  observed), and recovery (what is available now). An actor is an implementation option, not a simplicity proof;
-  placing everything in one actor can still couple independent concerns.
-- The public module is deep: normal use supplies an operation and gets a durable handle/result. It must not expose
-  guardian ACKs, descriptor loans, process-group polling, heartbeats or storage transactions. Pull these obligations
-  below the boundary. Native internals may have more code while clients understand fewer concepts.
-- Put one policy in one place. Lease expiry, idle release, adaptive default budgets and recovery classification cannot
-  be copied into Python, SDK and host. SQLite replacement must not alter admission or process ownership semantics.
-- Define avoidable errors away: identical CREATE retry recovers its handle; repeated CANCEL is harmless; GET never
-  launches work; absence of an old result never itself holds a current lock. Do not conceal real uncertain outcomes.
-- Compare alternatives by independent authorities, facts crossing layers and client obligations, not line count or
-  familiarity. Reviewers should be able to explain every remaining process and delete each redundant ownership path.
-
-| Alternative | Benefit | Why not selected / tradeoff |
-| --- | --- | --- |
-| Add receipts and timers to current Python/helper layers | Smallest immediate edit; reuses current paths | Leaves multiple lifecycle authorities and callers reconstructing phases; repeats information leakage |
-| One native service directly owns all children, no independent custody guardian | Fewer processes and simplest normal path | Service death can free locks while descendants continue; acceptable only after a stronger OS containment solution, not by assumption |
-| Native service plus minimal independently scheduled custody scope (selected) | Native-only lifecycle policy; clients stop owning helpers; resource custody survives control-plane loss | More internal process mechanics; must prove guardian boundary and delete old controllers, otherwise merely adds a layer |
-| Rewrite semantic workers, formatter, queues and execution together | Freedom to redesign everything | Discards validated mechanisms, increases migration surface, and does not by itself solve crash containment |
-
-The selected design remains provisional at its explicit containment gate. If a simpler qualified OS scope can replace
-both supervisor and guardian, prefer it. Do not defend this process count merely because it was proposed first.
+Success means abandoned work recovers without routine manual drains or a permanent fence caused only by missing history.
+An interrupted outcome may remain unknown. New explicitly authorized work can proceed after current resources are
+established available; the lost result never authorizes automatic payload replay. A topology with fewer owners is
+preferable only if its qualified containment boundary preserves exclusion through owner death.
 
 ## 2. Verified baseline and concrete failures
 
-Inspection baseline: host checkout HEAD `64b5b86dbe7c5feff043a9cc3e889d29578dc718`, SDK baseline
-`0976c61c65e25d2eaa3c62eb44ec7aafc51e5aa7`. Three pre-existing uncommitted host source scaffolds are preserved.
-Historical deployment and acceptance facts below come from recorded artifacts, not a fresh production test today.
+The current recovery review uses SDK `4ae59cd`; earlier inspection used host `64b5b86` and SDK `0976c61`. The table
+distinguishes recorded evidence from replacement-service requirements. It is not a fresh installed-image qualification.
 
-| Historical failure or limitation | Repair/evidence | What replacement must retain or add |
+| Area | Evidence and limit |
+| --- | --- |
+| Identity, one-use dispatch, caller-save-before-ACK | Private kernel/store/runtime contracts exist; no production store, listener or RPC dispatch is wired. |
+| Client authority and bounded reads | Host `ea996dd` adds strict private CREATE/GET/CANCEL/ACK decoding, disabled client START, capability checks, sealed pre-admission cancel and bounded Rust-owned row copies. It does not authenticate native producers or install a service. |
+| Actual host-package checks | Reported at host `d50424f`: 35 database and 41 runtime checks plus focused Clippy, using disposable SDK `4ae59cd` and semantic `1ac78f7` path overrides. These overlapping checks are not 76 distinct native fault cases. Registry-only reproducibility, producer bootstrap and production dispatch remain unqualified. |
+| Service death | Scoped tests kill the actual service while a healthy guardian survives; a later passive observer reads evidence. No replacement service adopts work or regains native authority. |
+| Custodian metadata and compute capacity | SDK `120767d` retains a live guardian record after payload closure without occupying a compute slot. Its drain-barrier test is not SIGSTOP recovery. |
+| Writer admission | SDK `4ae59cd` closes ungranted candidate EX and all partial locks before retrying, preserving demand, original deadline and inode checks. This removes a takeover prerequisite, not the recovery gap. |
+| macOS process tokens | Disposable same-boot supplied-token tests cover exec-generation rejection, nonparent signaling and running-orphan termination with a prospective exit observer. Durable discovery, boot binding, late observation and complete-group containment are not established. |
+| Frozen guardian and takeover | Still a qualification gate. Stopped-child controls and pre-worker EPERM failures do not establish actual frozen-guardian recovery. |
+| Formal models | Historical bounded Python results exist; a TLA+/TLC port is in progress. See §14 and the model owner's recorded results; no completed composition or runtime refinement is claimed. |
+
+The actual-package qualification report and its first permission failures are retained in
+`/private/tmp/lean-service-contract-20261117/spec-update-proposal.md`. The first sandboxed run failed six
+owner-preparation cases before targets spawned; the permitted retry passed 41 runtime checks. The disposable lockfile
+alone used the local overrides. Canonical manifests/lockfile and installed state were unchanged. Detailed private-store
+scope belongs in the [store contract](../specs/native-execution/stage-store-contract.md), whose dated checkpoints must
+be read as dated.
+
+These failures explain the requirements that remain after consolidation:
+
+| Recorded failure | Evidence | Required behavior |
 | --- | --- | --- |
-| Repository queue serialized native work; baseline BGR approximately 598s, 570s waiting | Proofs `135adf6203`, `7b959123c2`; schema-3 migration archived 4,876 native operations | No second queue or durable SQL capacity hold in Proofs |
-| `/var` versus `/private/var` smoke identity mismatch | Host `714fc5e`; initial rollout rollback then corrected deployment, Nov 16 | Canonical domains, inode validation, exact capability discovery |
-| Metadata FIFO could hang | SDK `b55d935`, host `65223a1` | Bounded, regular-file-only metadata access; no blocking special-file reads |
-| Formatter detached children | lean-fmt `d3aaa47`; no-build setup `81899c2` | Managed mode stays inside supervised group; no approximate fallback |
-| Explicit dependency domain incorrectly expanded as another workspace | SDK `328a9d6`, host `d1b7f56` | Preserve primary-workspace versus physical-domain distinction |
-| Warm readers held SH while foreign writer waited for EX | SDK `c6067f2`, host `2a46a5a` | Writer demand and targeted idle-reader retirement, no global drain |
-| Single-domain then multi-domain readers refused during foreign writer demand | Host `e1c8a0f`, SDK `0976c61`, host `5fb7dd8` | One original admission budget; drop the entire partial union before waiting |
-| Later strict call `:122` and lint window overlapped a long BranchStar writer | `/tmp/proofs-07m7-current-admission-diagnosis.json`; writer approximately 302.5s, exited compile failure | Contention is not proof failure; phase-specific dispatch facts and bounded admission |
-| Writer first locked reply unavailable, no durable helper handle in client | `/tmp/lean-writer-admission-identity-assessment.json` | Attempt identity before helper spawn, recoverable lookup independent of reply delivery |
-| Post-ACK reader error cannot distinguish preparation from target launch | `/tmp/proofs-07m7-225-native-assessment.json` | Separate preparation, launch authorization, spawn, outcome and closure |
-| Alive idle writer controller can retain EX indefinitely | Current host `shared_writer.rs:1306–1342`: blocking `input.recv()` after `locked`; command timer starts in `execute_with_launcher` | Idle-custody expiry enforced outside controller; this is a code finding, not a newly reproduced incident |
+| Repository queue serialized native work: roughly 598s total, 570s waiting | Proofs `135adf6203`, `7b959123c2`; schema-3 archive of 4,876 native operations | No second repository queue or SQL capacity hold. |
+| `/var` versus `/private/var`, FIFO metadata, detached formatter children, and physical-domain expansion | Host `714fc5e`, `65223a1`, `d1b7f56`; SDK `b55d935`, `328a9d6`; lean-fmt `d3aaa47`, `81899c2` | Canonical/inode-bound domains, bounded regular-file metadata, managed inherited groups and no approximate fallback. |
+| Warm readers blocked foreign writers; partial multi-domain admission retained locks | SDK `c6067f2`, `0976c61`; host `2a46a5a`, `e1c8a0f`, `5fb7dd8` | Targeted retirement, full partial-set release and one original admission budget. |
+| Strict/lint windows overlapped a roughly 302.5s BranchStar writer that failed compilation | `/tmp/proofs-07m7-current-admission-diagnosis.json` | Contention is not proof failure; report bounded admission and dispatch phases separately. |
+| Lost first writer reply and ambiguous post-ACK reader failure | `/tmp/lean-writer-admission-identity-assessment.json`, `/tmp/proofs-07m7-225-native-assessment.json` | Durable original identity before helper spawn; separate preparation, launch permission, spawn, result and closure. |
+| An alive idle writer controller can retain EX while waiting for input | Inspected `shared_writer.rs` controller loop; exact paths in the cutover inventory | Independently enforced idle-custody expiry. This was a code finding, not a reproduced incident. |
 
-Finite mixed acceptance did genuinely pass: target 44.878s, consumer 45.749s, semantic check 36.965s; axiom payload
-lifetimes overlapped, no new swapouts. Evidence: `/tmp/proofs-v1-final-acceptance.json` and
-`/tmp/proofs-v1-mixed-whole-union-corrected/independent-audit.json`. These are normal-workload observations, not
-qualification of lost-controller, supervisor-crash or all post-ACK lifecycle cases. They cannot justify a universal
-"lifecycle complete" claim. Later failures exposed additional ownership boundaries, not necessarily recurrence of
-the exact same fixed bug. Host `8aeb25ba2756374835ff721c0417739f99709a33` adds pre-dispatch classification but is
-not the proposed lifecycle replacement and does not solve post-ACK evidence or idle custody.
+Prior finite mixed acceptance measured target 44.878s, consumer 45.749s and semantic check 36.965s, with overlapping
+axiom payloads and no new swapouts. Evidence: `/tmp/proofs-v1-final-acceptance.json` and
+`/tmp/proofs-v1-mixed-whole-union-corrected/independent-audit.json`. Those normal-workload observations do not qualify
+lost controllers, frozen custodians or this replacement architecture. Historical proof outcomes and receipts remain
+unchanged.
 
 ## 3. Current owners and exact paths
 
-All paths in this document are on Jacob's Mac unless marked proposed. Root aliases below are explicit and apply to
-all subsequent relative paths:
-
-- `HOST` = `/Users/jcreinhold/Code/lean-host-mcp`
-- `SDK` = `/Users/jcreinhold/Code/lean-rs`
-- `PROOFS` = `/Users/jcreinhold/Code/proofs`
-- `FMT` = `/Users/jcreinhold/Code/lean-fmt`
-- `H` = `HOST/crates/lean-host-mcp/src`
-- `T` = `SDK/crates/lean-toolchain/src`
-- `P` = `PROOFS/scripts/stacks/src/stacks`
-
-| Current code | Current responsibility |
+| Boundary | Existing code and responsibility |
 | --- | --- |
-| `H/broker.rs`, `H/project.rs` | Semantic broker/project actors, warm workers, deadline/cancellation, pool management |
-| `H/tasks.rs`, `H/request_log.rs`, `H/request_journal.rs` | Retained semantic prepare/submit/get/ACK and durable request snapshots |
-| `H/shared_writer.rs` | External writer helper, EX admission, command launch, actual child/group cleanup; read-transfer and metadata proxy modes too |
-| `T/shared_writer.rs` | SDK writer controller; may retain original borrowed EX descriptor aliases |
-| `H/native_reader.rs`, `H/native_reader/control.rs`, `H/native_reader/input.rs` | Reader controller/bootstrap/payload, guardian acceptance, late cleanup |
-| `T/native_guardian.rs`, `T/native_guardian/ownership.rs`, `T/process_group.rs` | Native custody, real-child/group identity, stop/wait and descriptor ownership |
-| `T/shared_reader.rs`, `T/writer_demand.rs`, `H/artifact_reads.rs` | Read domain union, demand protocol, physical resource access |
-| `P/owned_writer.py`, `P/native_reader.py`, `P/native_reader_protocol.py` | Python protocol/controller and actual helper wait ownership |
-| `P/orchestration/managed_lake.py`, `P/orchestration/managed_read.py`, `P/orchestration/compilation.py` | Repo build/read stages and proof-specific validation |
-| `P/native_history.py`, `P/native_protocol.py`, `P/registry.py`, `P/sqlite_store.py` | Repo provenance, source snapshots and semantic history, not native custody authority |
-| `FMT` managed subprocess implementation | Formatter subprocesses inherit managed scope; standalone isolation remains separate |
+| Semantic host | `crates/lean-host-mcp/src/{broker,project}.rs`: project selection, warm sessions, sequential Lean requests and cancellation. `tasks.rs`, `request_log.rs`, `request_journal.rs`: semantic tickets/results, with their existing IDs and ACK meaning. |
+| Native process custody | SDK `crates/lean-toolchain/src/{native_guardian,process_group}.rs` and `native_guardian/ownership.rs`: real scope identity, descriptor holders, stop/wait and resource observation. |
+| External command adapters | Host `shared_writer.rs`, `native_reader.rs` and their submodules; SDK `shared_writer.rs`, `shared_reader.rs`, `writer_demand.rs`: complete-domain admission and helper/process ownership. |
+| Caller provenance and acceptance | The caller retains its original source/job/stage binding and final acceptance checks. It must shed helper lifetime, native capacity and expiry policy. |
 
-Existing semantic journal: `PROOFS/.local/lean-host-mcp/requests`, selected by `--request-journal`.
-It stores atomic JSON snapshots and has an exclusive broker owner lock. Do not let arbitrary helpers write its schema.
-Existing repository database: `PROOFS/.git/stacks-source-reservations/generations/42b7b6a8a0334bca91aac0d23a0bcc75/registry.sqlite3`.
-This generation-specific path is evidence of current storage, not a configuration default for the new service.
-Its WAL transactions and immutable history tables do not make it the right owner for generic native execution.
+The [cutover inventory](native-execution-cutover-plan.md#verified-ownership-and-deletion-targets) identifies the three
+active external helper-owner families and all concrete callers. It also owns exact historical image/configuration
+observations. Existing semantic journals remain separately owned evidence; the new service must not let arbitrary
+helpers write their schema or reinterpret old tickets as native attempts.
 
 ## 4. Proposed process architecture
 
-The diagram describes logical responsibilities of the proposed service, not an instruction to add another persistent
-supervisor to the existing SDK. The current measured topology and preferred registry-reusing recovery path are recorded
-in the opening checkpoint and §8. Final mapping of these roles to existing worker/guardian processes, especially writer
-custody, remains an integration decision. The earlier dual-alias alternative is explicitly separated below.
+The diagram assigns responsibilities; it does not authorize another persistent supervisor beside the existing SDK. Final
+mapping, especially writer custody, remains subject to qualification.
 
 ```text
-Proofs CLI / other client / semantic host
-    | typed local RPC; caller-selected durable attempt ID
+proof client / semantic host
+    | typed local requests; durable original attempt binding
     v
-native execution service (one lifecycle owner, bounded mailbox, SQLite writer)
-    | admit declared complete domains + create attempt scope
+native execution service: admission, deadlines, status, SQLite writer
+    | generation or one-shot scope
     v
-Rust scope supervisor --------- private lifeline ---- custody guardian
-    | actual child handles                           | independent scheduling
-    v                                                | kernel SH/EX custody
-command group / Lean worker -------------------------+ protected scope
+native supervisor -------- private lifeline -------- custody guardian
+    | actual children                             | independent enforcement
+    v                                             | complete SH/EX domain union
+protected inherited process group -----------------+
 ```
 
-Proposed service command: `lean-host-mcp execution-service`. It is independent of a particular MCP transport session
-and must remain available to external build clients when an MCP connection closes. A per-user launchd service on
-macOS starts/restarts it; installation is a later separately approved step. Do not silently start multiple copies.
-Linux service management is a separate platform qualification, not implied by Mac success.
+Proposed command: `lean-host-mcp execution-service`, independent of an MCP connection. A singleton, discovered short
+local socket and per-user service installation are proposed; no installed service is established here. Linux service
+management is separately qualified. The service never executes Lean FFI.
 
-Service ownership: attempt state, bounded pending admission, fairness policy, capacity requests, lease generation,
-SQLite writes. The actor never blocks on child wait, filesystem I/O or lock acquisition. Dedicated bounded I/O and
-supervisor workers return typed observations. Preserve existing semantic project actors; current `project.rs` uses typed `ProjectMessage` dispatch through
-`ProjectActorState::handle_message`. The repository AGENTS description of a closure-channel-only actor is older than
-this inspected code. This design does not authorize gratuitous actor-interface rewrites. New lifecycle protocol uses
-typed Rust enums and immutable status values.
+The service owns one bounded pending-admission policy, proposed capacity 64, and one global grant authority. Conflicting
+requests use FIFO with finite waiting budgets; this is not global fairness over unmanaged processes. Bounded I/O workers
+return observations without blocking the scheduling actor. Move broker grant decisions into that policy while retaining
+project/profile selection and idle-retirement hints. Native slots represent physical occupancy, released only after
+actual closure; they are not another independently configurable permit.
 
-Scope lifetime is explicit: an external one-shot command has an attempt scope; a warm semantic worker has a
-**generation scope** shared by sequential request attempts, never a new supervisor per request. The execution service
-is the sole global capacity/admission policy owner; the existing native guardian-backed slot mechanism represents
-physical occupancy and is released only with actual generation closure. Move broker `worker_slots`/`capacity_admission` grant decisions into this sole service policy; remove the
-old independent grant authority rather than add another queue; broker retains project/profile selection and warm-cache hints. Project actors
-retain their typed-message worker sessions and sequential Lean dispatch, but obtain/release a generation scope via
-the service. An active-request timeout stops that generation if Lean cannot cancel safely; no other active request
-shares it. Idle generations remain eligible for demand retirement. Exact changes to existing pool/slot code require
-an ownership audit before implementation; do not layer a new permit on top of an old independent permit.
+An external command has an attempt scope. A warm worker has one generation scope spanning sequential attempts, not a new
+supervisor per request. Request timeout may require stopping the generation, but request completion alone does not
+retire it. No unrelated active request shares that generation. Preserve session reuse and writer-demand retirement.
 
-Supervisor ownership: command validation, Ready/GO barrier, actual `Child`, group identity, output limits, timeout,
-stop escalation and wait. Guardian ownership: retain declared-domain custody and watch the supervisor lifeline;
-on supervisor loss, stop its registered protected group and retain exclusion until closure. The guardian, not the
-possibly stalled supervisor, enforces expiry: it requires both a current service-issued scope lease and independent
-supervisor liveness messages (10s cadence/60s expiry proposed). EOF triggers immediate stopping; an open but stalled
-channel expires. Heartbeat handling runs outside the busy Lean actor and outside blocking child/storage work. The
-supervisor cannot renew the service authority lease itself, and the service cannot manufacture supervisor liveness.
-No extra general-purpose
-scheduler in the guardian. Capacity and resource custody must be bound to actual protected scope, not client rows.
+The supervisor validates commands, stages inputs, owns the actual child, enforces bounded output and requests stop. The
+independently scheduled guardian retains custody and watches both service authority and supervisor liveness. It cannot
+rely on a possibly frozen supervisor, busy Lean actor, database transaction or congested executor to enforce expiry.
+Neither service authority nor supervisor liveness alone can renew the other. EOF triggers cleanup; a channel remaining
+open without valid renewal expires. Cleanup continues if evidence publication fails.
 
-The service never executes Lean FFI. Existing per-toolchain workers still own Lean runtime and session caches.
-Warm readers keep the current demand-triggered retirement machinery. Independent project operations remain concurrent
-within the configured capacity. Proposed pending-admission bound: 64 attempts; reject overload explicitly.
-Fairness: FIFO among conflicting pending requests with bounded waiting deadlines, not a claim of global FIFO among
-all readers, writers and unmanaged processes. Do not let an endless stream of readers overtake announced writer demand.
+Audit every original, transferred and inherited descriptor holder. Use validated transfers and ACKs before the sender
+drops custody; set CLOEXEC except for deliberately selected descriptors. Shared open-file descriptions require
+**close-only** cleanup: no explicit unlock or SH/EX mode conversion while live custody exists. Independent opens are not
+assumed equivalent to alias transfer. A helper's own alias release, its actual reap and complete protected-group closure
+are distinct observations; none alone certifies external borrowed aliases or surviving descendants.
 
-**Important unresolved implementation gate:** current reader guardians provide useful primitives, but a generic writer
-guardian with safe supervisor-loss cleanup has not been demonstrated. Reuse the custody/group mechanisms only after
-an exact ownership audit and fault tests. Payload inheriting a lock descriptor alone is insufficient: it may close that
-descriptor and continue accessing artifacts. Guardian must retain its own custody while protected work can still run.
-The supported managed process contract forbids detach/regroup and undeclared artifact access. Same-user malicious
-processes and arbitrary daemonizing commands are not contained by this design. Stronger arbitrary-process guarantees
-would require a different OS containment boundary, not another heartbeat or database table.
+Service-only, supervisor-only and guardian-only loss each need a stated surviving authority and closure path.
+Simultaneous loss of every useful anchor, leader loss with descendants, fork/exec races and descriptor-closing payloads
+are separate cases. The superseded dual-alias topology is not selected or qualified. Fewer processes do not fix an
+owner-death lock-release window; any simpler direct owner needs the same independent contention/closure oracle.
 
-### Earlier dual-alias alternative and its qualification obligations
-
-The earlier dual-alias proposal below is retained as an alternative, not the selected existing-SDK topology. Its
-requirements must be qualified if adopted; successful existing-guardian tests do not qualify it. A **disposable custody
-fixture** uses two fake commands contending for one
-canonical scratch artifact lock. It must log actual write intervals independently of the service and demonstrate no
-overlap across each injected death. No proof worker, production lock or production database is part of this fixture.
-The following is that alternative's ownership contract, not a verified property or an instruction to add another owner:
-
-- After admission, supervisor and guardian both retain aliases of the actual acquired open file descriptions for the
-  complete domain union. Transfer uses explicit descriptor passing/inheritance followed by identity/receipt validation;
-  the sender retains custody until receiver ACK. Record every holder. `CLOEXEC` is set by default, cleared only for the
-  selected child descriptors at controlled spawn. Payload descriptor retention is not relied on for exclusion.
-- Neither owner calls `LOCK_UN`/equivalent explicit unlock on a shared open description: one holder could unlock the
-  other holder's protection. Cleanup is close-only; the last alias closes only after protected scope termination.
-  Two independent opens are not assumed equivalent to alias transfer. Qualify actual OS lock semantics on each platform.
-- **Guardian-only death:** supervisor still has custody and its actual child handles. It stops the protected scope,
-  observes closure and releases its aliases; it does not keep serving new stages or release locks merely on guardian EOF.
-- **Supervisor-only death:** guardian still has custody and must stop the registered protected scope. The exact mechanism
-  for retaining safe group/descendant identity after its actual parent dies remains a BLOCKER. A stale PGID or PID plus
-  birth string is not automatically a safe signal capability. Holding locks prevents overlap while that gap is resolved,
-  but permanent inability to clean up does not satisfy the self-healing requirement.
-- **Service-only death:** surviving scope owners stop under lease/lifeline policy while retaining custody. Database
-  availability cannot be required for stop or close. On restart, reconcile scopes rather than silently relaunching them.
-- **Simultaneous owner deaths:** neither dual aliases nor SQLite prove descendant closure. Explicit OS containment or
-  independently surviving authoritative ownership is required for a stronger guarantee. This remains unsupported until
-  qualified, and must not be disguised as a single-failure guarantee.
-
-Design a second disposable fixture for a **direct custody-owner alternative**: a single per-scope Rust process is the
-actual payload parent, holds the locks, receives service requests and enforces deadlines, eliminating a separate
-supervisor/guardian handshake. Compare owner-only death with surviving descendants. If an available OS containment
-primitive supplies a safe owner-death boundary, this is preferable because it removes an owner, descriptor transfer and
-mutual heartbeat protocol. Without that primitive it fails the same crucial owner-death case, so fewer processes alone
-is not sufficient. Choose the smallest design whose custody fixture passes; do not build the service around an unproven
-three-process topology. This paragraph originally authorized no fixture execution. Later explicitly authorized scoped experiments are reported
-above; neither that authorization nor their results establish this alternative as the chosen implementation.
+The supported process contract is cooperating canonical-domain readers/writers and managed inherited groups. Deliberate
+detach/regroup, lock-inode replacement, undeclared writes and arbitrary unmanaged processes remain outside it. macOS
+leader pinning does not qualify Linux signaling after leader reap. A serialized PID/PGID, birth string, token rejection
+or successful signal is not complete scope custody or closure.
 
 ## 5. SQLite decision, paths and schema
 
-Choose SQLite, not a bespoke immutable-file event store. Reasons: one ordered native writer, atomic create/claim/event
-transactions, indexed original-ID lookup, bounded retention and fewer publication/expiry races. SQLite does not solve
-process custody and is not a lock service. Do not adopt the incomplete Python file-codec overlay.
+SQLite is the selected intent/history store: ordered acceptance, atomic claims/events, original-ID lookup and bounded
+retention. It is not the process owner or a lock service. Reuse the SDK native owner registry for recovery facts; do not
+add a second custody manifest tree or SQL recovery scheduler.
 
-Proposed macOS state directory: `/Users/jcreinhold/Library/Application Support/lean-host-mcp/execution/`.
-Generic default uses the platform per-user application-state directory; explicit `--execution-state-dir` overrides it.
-Proposed database: `lifecycle.sqlite3`; same directory has a service singleton `owner.lock` and `assets/<attempt-id>/`.
-Use a short per-user runtime socket path selected and reported by discovery, rather than exceeding Unix socket path
-limits with the application-support directory. Discovery returns full endpoint, store identity and protocol version.
-Directories mode 0700, database/private manifests mode 0600; reject symlink/special-file substitutions. Local socket
-checks same-user peer identity. This is local integrity, not protection against a hostile process running as that user.
+The proposed platform application-state directory contains `lifecycle.sqlite3`, service `owner.lock` and
+`assets/<attempt-id>/`; `--execution-state-dir` would override it. On macOS the proposed default is
+`~/Library/Application Support/lean-host-mcp/execution/`. Discovery reports endpoint, store UUID and protocol; use a
+short runtime socket path. Private directories/files use 0700/0600, reject special-file/symlink substitutions and check
+same-user local peers. This does not protect against hostile same-user processes.
 
-Proposed tables (schema version 1):
+Proposed schema version 1 separates:
 
-- `store_meta`: schema version, randomly generated store UUID, migration version.
-- `service_generations`: generation UUID, boot identity, process identity, start/stop facts.
-- `attempts`: service-issued acceptance epoch plus caller-generated random nonce (composite primary key), immutable canonical intent bytes and digest,
-  operation kind, exact command/input binding, domain manifest, requested budget, creation time and retention class.
-- `attempt_state`: attempt ID, service generation, lease generation, phase, observed status and revision. This is a
-  transactional projection, not authority to free resources.
-- `scopes`: independently allocated scope UUID (primary key), service generation, role, supervisor/guardian/group
-  identity including boot and process birth, declared domains and optional parent scope. A warm generation scope
-  outlives individual request attempts; it is not keyed by an attempt. Identity observations are distinct from custody.
-- `attempt_scopes`: attempt ID, scope UUID, stage ID and association role, with finite request deadline and terminal
-  association status. Multiple sequential attempts can reference one warm generation scope; a request may reference
-  preparation and target scopes. The association does not create an additional owner or capacity permit.
-- `events`: attempt ID, sequence, unique producer-generation/event ID, event kind, bounded payload and observation
-  timestamps. Append-only; retries of the same event ID deduplicate; conflicting same-ID content is rejected.
-- `results`: attempt/stage ID, result kind, bounded inline body or immutable asset digest, publication status.
+- Store metadata and service generations: schema/migration versions, random store UUID, boot and process identity.
+- Immutable attempts: acceptance epoch/nonce, complete intent bytes/digest, exact input/command/domain binding and
+  budget.
+- Attempt state and append-only deduplicated events: transactional observations and revision, not custody authority.
+- Independent scopes and attempt/scope associations: generation, domains, supervisor/guardian identity, stage and finite
+  request deadline. Sequential attempts can share one warm scope without adding capacity permits.
+- Bounded results: inline bytes or immutable digest-bound assets with explicit publication state.
 
-Use foreign keys, WAL, synchronous FULL and one service-owned writer connection. Short transactions; proposed busy
-budget 1 second, charged to the original request budget. Event insertion and state projection update are atomic.
-No helper writes SQL and no UPSERT recreates an expired attempt.
+One service-owned connection writes short transactions; event insertion and state projection update atomically. Validate
+store identity/schema and role before changing persistent settings. Configure and read back WAL, `synchronous=FULL` (2)
+and foreign keys on each relevant fresh/reopened/pooled connection. Proposed busy budget: 1s, charged to the original
+request deadline; it does not bound hung kernel I/O. No helper writes SQL and no UPSERT recreates missing/expired
+attempts.
 
-**Original-job binding precedes CREATE.** Persist the unique binding key `(original job ID, stage key, explicit execution revision)` with immutable
-associated values `(input digest, store UUID, epoch/nonce, capability)` durably in the caller's existing provenance
-store before the first RPC. The input digest is NOT part of the unique key: the same key with a different digest
-must fail, not allocate another attempt. In Proofs, add an `outbound_attempt_bindings` table through `P/native_history.py`/`P/sqlite_store.py`; this is caller
-provenance, not a native work queue, custody record or semantic ticket. Unique binding keys reject mismatched input.
-After caller crash, reload this binding and GET/reconcile the original attempt; never mint a fresh ID merely because
-CREATE or START reply was lost. A new execution revision is an explicit new-work decision. Other clients use the same
-library contract with their durable caller journal; the library hides fsync/transaction details. Generic callers that
-cannot retain an original operation key cannot claim crash-safe resumption. Terminal/expired native history does not
-authorize re-CREATE under a new ID automatically.
+On qualified macOS SQLite/VFS builds, request/read back fullfsync ON. Unknown PRAGMAs may be ignored, and a requested
+sync setting is not proof that a device honored it. NORMAL in WAL permits committed data loss after OS/power failure;
+FULL adds commit synchronization; EXTRA adds no WAL durability beyond FULL. fullfsync and external-directory behavior
+need platform qualification; checkpoint_fullfsync alone is not a substitute. See SQLite's
+[synchronous](https://sqlite.org/pragma.html#pragma_synchronous),
+[fullfsync](https://sqlite.org/pragma.html#pragma_fullfsync) and
+[checkpoint_fullfsync](https://sqlite.org/pragma.html#pragma_checkpoint_fullfsync) contracts.
 
- Creation with the same ID and different intent is an
-error. Discovery supplies the current acceptance epoch. The client library generates and persists both an epoch/nonce
-ID and a random mutation capability before CREATE, sending a capability hash for storage. Thus loss of the CREATE
-reply cannot lose the capability. Repeating CREATE with identical intent and capability recovers the same entry.
-The service rotates the acceptance epoch on a persisted monotonic sequence, normally daily, and on a fresh store;
-missing IDs from closed epochs can never CREATE. Persist the next sequence and closure of the prior epoch atomically
-before advertising a new epoch. Restart reads the committed current epoch; clock rollback cannot reopen an older
-one. Wall time may trigger rotation but never determines epoch identity or reverses closure. A fresh or recovered
-replacement store gets a new random store UUID, so restoring or losing a sequence cannot reuse old global IDs.
-Backup restore must allocate a new store identity before accepting creates; old IDs remain read-only historical references.
-Existing IDs remain GET-able and identical CREATE retries return them even after epoch closure. Retain all deduplication
-rows/tombstones for the current open epoch; prune them only once its creation window closes. This prevents an expired
-ID from being resurrected after tombstone pruning without an indefinitely growing tombstone set. Original IDs retain
-store UUID as well. RUN is not automatically repeated.
+Required settings/commit/sync failure refuses a new durable admission or GO acknowledgment, without silent downgrade. A
+failed/lost commit reply can be ambiguous: reconcile the original immutable ID, never assume rollback or replay its
+payload. Storage initialization is controlled; avoid journal-mode transitions on the live operation path. Existing-scope
+cleanup remains independent of successful SQL writes.
 
-**Result assets and publication ordering.** Write a bounded asset to a private temp file in the destination filesystem;
-fsync its bytes, rename to an immutable digest-bound name, fsync the containing directory, then transactionally commit
-the SQLite result reference/event. Only after commit advertise a durable result. A crash before commit may leave an
-orphan asset; a crash after commit must not leave a knowingly unsynced referenced asset. Hash/length checks detect
-missing/corrupt bytes; report `result_unavailable`, never reconstruct success. GC first commits removal of eligible
-references, then deletes only unreferenced assets after a grace period and directory fsync. Recheck references under
-serialized GC/publication coordination; no concurrent writer can attach an asset being deleted. Staged inputs required by live or unresolved resource scopes are protected by explicit scope references independent
-of result ACK/history expiry. GC must check these references and current scope reconciliation before removing an
-input, even if its attempt history was pruned or result is terminal. Remove those protections only after resource
-closure/recovery establishes the input is no longer in use. Recovery may sweep old temp/orphan files with bounded
-work, but age alone never makes a live scope's staged input an orphan. SQLite FULL does not fsync an unrelated asset automatically.
+### Caller binding and acceptance epochs
 
-**Recovery metadata independent of SQLite history: reuse the SDK owner registry.** The required separation remains:
-a corrupt result/history database must not erase the only map of live work to domains and custodians. The preferred
-implementation extends the existing native owner record with trusted boot/token/scope facts and recoverer custody,
-using its short publication/arbitration protocol. Do not add the previously proposed
-`execution/custody/<scope-uuid>.json` tree in parallel. That separate-manifest alternative is not selected.
+Before the first CREATE RPC, the caller durably saves the unique key **(original job ID, stage key, explicit execution
+revision)** with immutable values **(input digest, store UUID, epoch/nonce, mutation capability)**. The digest is a
+value, not part of the unique key: changed input under the same key must fail. Retain byte-exact argv, environment and
+Unix path encoding, explicit environment-inheritance semantics and complete input bytes or durable objects. A digest
+alone cannot recover an intent. The client library hides persistence mechanics; clients without a durable original
+operation key cannot claim crash-safe resumption.
 
-Keep immutable domain/inode bindings, controlled bootstrap identities and every possible descriptor custodian
-recoverable until closure. SDK `120767d` separates retained custodian metadata from closed-payload compute capacity;
-retained metadata still has a namespace bound. Publish before a new launch or recovery STOP can take effect. Record
-retention is not a second scheduler, a result receipt or permission to signal a saved PID.
+Specify whether the saved environment is the full effective environment or overrides plus declared inherited inputs; do
+not present an overrides-only snapshot as a complete effective environment.
 
-On SQLite corruption, preserve the database and existing native registry, reconcile affected scopes through native
-ownership, then decide whether a fresh store can safely accept new IDs. Missing/corrupt registry data is not empty
-custody. The exact corruption/quarantine/restore protocol, legacy-record migration, namespace-pressure behavior and
-safe handling when affected domains cannot be identified still need specification and tests. Keep ordinary dead-scope
-recovery automatic; do not require missing historical outcomes before freeing established-closed resources.
+The library persists a random mutation capability before CREATE; the native store saves its hash. Identical ID, intent
+and capability retries recover the existing attempt. Conflicts fail. Lost CREATE/START replies cause GET/reconciliation
+of that original binding. A fresh execution revision is explicit new work, never an automatic recovery from expiry.
 
-Supervisor reports over its authenticated private channel. If service dies, supervisor stops work instead of maintaining
-an autonomous second journal writer. A bounded final-receipt reconnect may improve evidence after service restart, but
-failure to publish cannot prolong already-closed resource custody. If all witnesses die before publication, outcome
-remains unknown. A new service reconciles current resources separately.
+Discovery advertises a persisted monotonic acceptance epoch. Proposed rotation is daily and on fresh-store creation;
+wall time may trigger rotation but cannot reopen an epoch. Commit prior closure and the next sequence before advertising
+it. Existing IDs remain readable and identical CREATE retries remain idempotent after closure; missing IDs from closed
+epochs cannot create. Keep deduplication rows/tombstones throughout the open epoch, then prune within bounded retention.
+A controlled restore/replacement allocates a new store UUID before accepting writes. Old IDs remain historical, not
+replayable. Arbitrary unmanaged whole-store rollback is outside this contract.
 
-Retention proposal: terminal attempts 30 days, minimum 24 hours after ACK, oldest eligible first under 1 GiB soft budget;
-large outputs capped per attempt (default 16 MiB stdout plus 16 MiB stderr), immutable assets included in accounting.
-Separate bounded historical evidence from a minimal live-resource registry: unknown/reconciling history ages out
-under the same retention policy without changing resource ownership. Keep only currently live or specifically unresolved
-scope identity/domain facts in `scopes` until reconciliation, not arbitrarily large attempt outputs. Retention may remove
-history while retaining that small scope record; schema references must therefore allow a detached historical summary,
-not a foreign key that traps all events forever. Bound live scope admission by capacity and pending limits. At a genuinely
-full store refuse NEW intents, continue cleanup and bounded status access; missing old evidence alone cannot fill it
-forever. Pruning has a bounded tombstone period and returns `expired`, never `not_started`; no unknown-ID
-lookup implicitly allocates work. Closed acceptance epochs prevent re-creation after tombstone expiry. SQLite corruption triggers automatic diagnosis/quarantine of the store only after
-service ownership is established, preserving the old bytes; starting a fresh generation requires resource reconciliation,
-not inference that the corrupt store held nothing. Exact automated corruption-recovery procedure is an implementation
-review gate, not permission to delete this database now.
+### Assets, retention and independent custody
+
+Publish an external result as: bounded private temp file → qualified file flush → immutable digest-bound rename →
+qualified directory-entry persistence → SQLite reference/event commit → durable advertisement. A DB sync does not flush
+an unrelated asset. Check hash and length; missing/corrupt bytes yield `result_unavailable`, never reconstructed
+success. Qualify macOS full-sync and directory behavior separately rather than assuming one syscall works for every
+descriptor.
+
+GC first durably removes eligible references, then deletes unreferenced assets after a grace period and directory sync.
+Serialize it with publication or recheck under equivalent coordination. Explicit scope references protect inputs needed
+by live/unresolved scopes independently of result ACK and history expiry; age alone does not make them orphaned.
+
+Proposed retention is 30 days, at least 24h after ACK, oldest eligible first under a 1 GiB soft budget. Proposed
+per-attempt output caps are 16 MiB stdout plus 16 MiB stderr, including assets in accounting. These are not installed
+settings. Unknown history can expire without changing custody. Retain only bounded live/unresolved scope facts until
+reconciliation; schema references must permit detached historical summaries instead of trapping all events indefinitely.
+A full store refuses new intents but continues cleanup and bounded status access. Late append/GC cannot recreate pruned
+attempts.
+
+Keep immutable domain/inode bindings, controlled bootstrap identities and every descriptor custodian recoverable in the
+existing native registry until closure. SDK `120767d` separates retained metadata from closed-payload compute capacity;
+the registry still needs a namespace bound. Publish new launch/recovery custody before acquisition or STOP can take
+effect. A retained record is neither permission to signal its saved PID nor an additional scheduling authority.
+
+Corrupt SQLite must not erase the only map of live scope/domain ownership. Preserve old bytes and registry, establish
+sole recovery authority, reconcile native resources, then decide whether a fresh store can accept new IDs. Missing or
+corrupt registry data is not empty custody. Quarantine/restore, legacy migration, unidentified affected domains and
+namespace pressure remain explicit review gates, not permission to delete a live database. Missing old results do not
+block new admission once resources are established free.
+
+### Linked SQLite provenance
+
+The [WAL-reset advisory](https://sqlite.org/wal.html#the_wal_reset_bug) identifies fixes in 3.51.3 and later, with
+backports 3.44.6 and 3.50.7. FULL does not replace that fix. Require a fixed build or verified vendor backport for
+**every** runtime accessing the proposed store, including checkpoint/read/maintenance connections. One logical writer
+does not exclude a concurrent checkpoint connection.
+
+Record runtime `sqlite_version()`, `sqlite_source_id()`, compile options, wrapper version, selected VFS, executable and
+static/system linkage or actual loaded-library provenance. Cargo.lock or an unrelated `sqlite3` executable is not that
+evidence. Compare versions semantically, allow documented backports, recheck packaged images/connection factories and
+exclude unqualified tools from the live store. Disposable stress tests complement verified build provenance; they cannot
+prove this rare race absent. No observed production corruption is claimed here.
 
 ## 6. Protocol and state transitions
 
-Public operations: `discover`, `create`, `start`, `get`, `cancel`, `ack`. The ordinary client library exposes submit/get/cancel and hides create/start sequencing. IDs always carry store UUID, acceptance epoch and attempt nonce. Mutation requires the capability the client
-library generated and persisted before CREATE, never a guessable PID. Logs omit it. Owner renewal is PRIVATE
-service/supervisor-to-guardian control, not public client protocol. Service-generated generation and monotonic renewal sequence
-reject stale/duplicate renewal.
+Public operations are `discover`, `create`, `start`, `get`, `cancel`, `ack`; the ordinary library exposes
+submit/get/cancel and hides sequencing. IDs bind store UUID, acceptance epoch and nonce. Mutation checks the persisted
+capability; logs/diagnostics redact it. Private producer roles and scope/owner/generation/event bindings authenticate
+observations; caller JSON cannot manufacture a native spawn, wait or closure witness. `ea996dd` tests client/private API
+separation, not production producer authentication. Owner renewal is a private monotonic generation-bound control
+operation.
 
-`Created -> Queued -> Admitted -> Preparing -> Ready -> LaunchAuthorized -> Running -> Stopping -> Closed`.
-Any prelaunch state can become sealed `NotStarted`; after authorization but before a spawn witness, execution may be
-`Unknown`. Do not implement this display sequence as one enum that conflates independent facts. Typed status has orthogonal
-components: `execution` (not-authorized/authorized/spawn-observed/unknown), `result` (pending/success/failure/unknown/
-unavailable/expired), `resources` (unadmitted/held/stopping/closed/recovered/uncertain), and owner observations.
-For example `result=unknown, resources=recovered` permits new normal admission; `result=success, resources=held` does
-not permit a conflicting writer. `Closed` describes resource closure, not successful compilation. Independent fields
-track target dispatch, semantic result, command exit, supervisor exit and resource availability. Preparation itself may elaborate Lean.
+The display sequence is:
 
-Commit durable intent before spawn/admission. Register supervisor identity and guardian scope before giving GO.
-Supervisor stages inputs and validates complete domains before Ready. Service records LaunchAuthorized before sending
-GO; supervisor owns the one-use launch gate. SQLite commit and OS spawn are not one atomic transaction; no schema removes that crash window. Repeated START returns current state, never a second payload. Actual spawn
-and wait observations follow. A crash between GO and durable spawn observation remains unknown; at-most-one launch
-within a live attempt is the goal, not exactly-once arbitrary I/O across crashes. Service restart never resends GO for
-an uncertain attempt. New work requires a new explicit attempt.
+```text
+Created → Queued → Admitted → Preparing → Ready → LaunchAuthorized → Running → Stopping → Closed
+```
 
-Before ACK, the caller durably commits the terminal result or a retained immutable result reference, its digest,
-original attempt binding and relevant status into caller provenance. A native-store reference alone is insufficient
-if ACK can make its target eligible for deletion: first copy the result to caller-owned durable storage or obtain an
-explicit independently retained reference. Lost ACK replies are safe to retry against this saved record; a crash
-before that commit must leave the result unacknowledged. ACK releases result-retention obligations only. It cannot
-erase current custody or convert unknown to success.
-Status GET does not renew a lease or reset idle time. Cancel is idempotent and acknowledged as requested before actual
-closure; return terminal closure only after observation or clearly labeled recovery inference.
+Keep orthogonal facts rather than one cross-product enum: execution authorization/spawn/unknown, result
+pending/success/failure/unknown/unavailable/expired, resources unadmitted/held/stopping/closed/recovered/uncertain and
+owner observations. `result=unknown, resources=recovered` permits fresh normal admission;
+`result=success, resources=held` does not permit a conflicting writer. Preparation can elaborate Lean and perform IO;
+its occurrence does not establish target launch or target non-launch.
+
+Persist complete original intent before helper spawn/admission. Register exact helper identity before admission,
+including lock waits; register accepted custody before GO. Validate staged inputs and the complete domain union before
+Ready. Planned domains are not evidence of acquisition. The service durably consumes launch permission before sending
+GO; a private one-use sender/receiver gate prevents a second payload. Repeated START only reports current state. SQLite
+commit and OS spawn are separate: a crash after GO but before durable spawn observation remains unknown, and restart
+never resends uncertain GO.
+
+The sender irreversibly chooses PossibleGO or SealedNoGO. Persist PossibleGO before the first attempted launch byte;
+partial write or ambiguous persistence is unknown. NoDispatch needs SealedNoGO before any GO attempt, or an
+authenticated receiver-sealed NoGO under the exact attempt/stage/generation binding. Missing output, lost reply or
+preparation ACK is not that seal. Cleanup authority permits stop/reap, never a fresh GO. At-most-one launch within an
+attempt does not promise exactly-once arbitrary effects across different explicit attempts.
+
+Record producer role and original scope binding on each observation. Distinguish controller-reported actual wait,
+native-owned successful `Child::wait`, helper alias release, helper reap and protected-group closure. An outer wrapper's
+`started` frame is not final exec/body/semantic evidence. Lost wait authority or failed publication stays unknown.
+
+GET is read-only and bounded by bytes, pages and time. Its cursor binds the original attempt and a consistent
+observation view/version; truncated output is explicitly incomplete. Return complete intent through bounded pages or
+retained objects, with explicit expired/unavailable/corrupt states. GET never creates, launches, signals, ACKs, clears
+custody, resets idle time or rewrites an old result.
+
+Cancel is idempotent: acceptance of a stop request is distinct from observed closure. Before ACK, the caller durably
+saves verified result bytes or an independently retained reference, digest, original binding and relevant status. A
+native-store reference alone is insufficient if ACK makes it eligible for deletion. Retry a lost ACK only against that
+saved record; a crash before saving leaves it unacknowledged. ACK affects result retention, never custody or verdict.
+
+No new claim/launch authorization commits after its expiry. Expiry cannot revoke an already-authorized GO in flight or
+prove cancellation; the bound receiver still enforces original deadline/cancel checks. Late observations cannot revive
+an ID, and result-retention expiry never means stopped, successful or replayable. Publication/GC ordering is atomic
+where specified, independently of OS delivery.
 
 ## 7. Deadlines, inactivity and defaults
 
-All numbers below are **proposed defaults**, not installed settings. They are ordinary configurable policy choices, not a separate broad calibration project.
+All values below are **proposed configurable defaults**, not installed settings.
 
-| Policy | Proposed default | Meaning |
+| Policy | Proposed default | Contract |
 | --- | --- | --- |
-| Service/supervisor-to-guardian renewal | every 10s; expiry 60s | Missing live owner causes fail-stop cleanup, not lock stealing |
-| Admitted idle custody | 30s | No stage starts: close custody. Heartbeats/status do not reset this timer |
-| Admission budget | 5 minutes by default, explicit override allowed | Queue and multi-domain acquisition share the original admission budget; no fresh budget on each retry |
-| Active execution | live activity-updated soft deadline; 30-minute hard maximum | Native policy supplies defaults; explicit finite workload overrides |
-| Stop escalation | TERM, 5s grace, KILL where owned identity permits | Signal sent is not evidence of exit; bounded API response may report cleanup pending |
-| Service restart intensity | 3 abnormal restarts in 60s | Back off and report unhealthy instead of uncontrolled crash loop |
-| Cleanup observation | 1s initial interval, cap 10s | Bounded background retry; affected domains isolated |
+| Service authority and supervisor liveness | Renew every 10s; expire at 60s | Independent guardian enforcement; expiry requests cleanup, not lock stealing. |
+| Admitted idle custody | 30s without an active stage | Polling/heartbeats do not reset idle time. |
+| Admission | 5 minutes | Queue, complete-domain acquisition and retries share the original deadline. |
+| Active work | 10-minute activity-updated soft bound; 30-minute immutable hard bound | Explicit finite workload profiles may override defaults. |
+| Stop | TERM; 5s grace; KILL where identity permits | A sent signal is not exit; API may return cleanup pending. |
+| Service restart intensity | 3 abnormal restarts/60s | Back off and report unhealthy. |
+| Cleanup observation | Start at 1s; cap at 10s | Bounded retry on affected domains. |
 
-Lease renewal proves a responsive owner, not command progress. The service renews only accepted live scopes. One-shot attempts stay within their original maximum lifetime;
-warm generation scopes are renewed while legitimately retained by cache policy and no retirement/stop has begun,
-not given an invented fixed proof lifetime. Their active requests still have finite deadlines. The guardian checks
-both service authority and supervisor liveness independently. Before GO, the service also binds the current request's
-hard deadline and attempt/stage identity to the guardian. Guardian enforcement is independent of heartbeats: a responsive
-service or supervisor cannot keep a hung request alive beyond that deadline. On an active warm-generation request
-expiry, stop the protected generation if cooperative cancellation has not established safe request completion, retain
-custody through closure, and require a fresh generation before dispatching another request. Ordinary renewals cannot
-extend this deadline; a new hard deadline would require a separately specified authorized operation, not a timer reset. The activity policy below may update only a subordinate soft deadline within this immutable hard limit. Losing a transient client/MCP connection does not by itself abandon an accepted job;
-explicit cancellation, finite job deadline and native owner loss do. A client-controlled interactive session would need
-a separate explicit client lease, not inference from conversation activity.
+Bind attempt/stage and hard deadline to the guardian before GO. Heartbeats cannot extend it. If cooperative request
+cancellation cannot establish safe completion, hard expiry stops the warm generation, retains custody through closure
+and requires a fresh generation before another request. Warm idle scope retention follows cache/demand policy rather
+than an invented whole-proof lifetime. Client/MCP disconnect alone does not abandon accepted work; owner loss, explicit
+cancel and finite deadlines do.
 
-**Activity-based automatic updates are a requirement, not silently deferred.** Use a small deterministic policy, not a
-learned scheduler. Separate (a) owner liveness, (b) recent work activity, and (c) immutable maximum runtime. Guardian
-always enforces (c), regardless of either other signal. Values are proposed configurable defaults; testing checks their semantics, not a mandatory statistical justification of every constant.
+Live activity updates are a required deterministic policy, not historical p99 prediction or a learned scheduler:
 
-- Start with a 30-minute hard maximum and a 10-minute soft inactivity deadline. Explicit workload bounds override
-  these defaults. Do not add historical p99 estimation, training samples or automatic future-job budget prediction:
-  those are separate complexity, not required for the live activity updates requested here.
-- During a running operation, sample the known owned process scope every 10 seconds outside the Lean actor. A new
-  authenticated phase/checkpoint sequence, or at least 1 second of aggregate owned CPU-time increase during the last
-  60 seconds, counts as activity. CPU is a pragmatic activity inference, not proof of useful progress. Neither stdout
-  bytes, GET requests, heartbeat packets nor a repeated checkpoint count. CPU accounting is attempt-scoped: establish
-  a baseline at request dispatch, never count previous requests or background prewarming in a shared warm generation.
-  Track authenticated process birth identities and monotonically accumulated CPU deltas for the protected scope,
-  including newly forked descendants and final usage on exit, without double-counting child totals in parent counters.
-  Retain contributions of exited children across subsequent samples. A cumulative scope counter must never decrease
-  or reset merely because the busy child exited or its PID was reused. The platform implementation must specify how
-  it observes fork/exit and obtains final accounting; if it cannot attribute the complete sample to this attempt,
-  CPU activity measurement is `unavailable`, not zero. Missing identity, sampling gaps that lose child accounting,
-  incompatible counters or generation change invalidate the affected sample. Authenticated attempt checkpoints may
-  still supply activity; otherwise fall back to the hard deadline and report unavailable measurement.
-- Activity automatically updates the soft deadline to min(now + 10 minutes, hard maximum). Send a monotonic, attempt-
-  bound update to the guardian; no update revives an already expired/stopping attempt. No database write is required
-  to enforce the current local deadline, though status records the policy/last observation when available.
-- At the soft deadline, absent activity triggers stop as a declared policy timeout, not a proof of deadlock or a proof
-  failure. Quiet CPU-active elaboration continues; spinning CPU may continue only to the hard maximum. Legitimate
-  waiting on slow external I/O can be falsely classified inactive: provide an explicit workload profile that disables
-  this soft rule or lengthens it while retaining a finite hard bound. Observation failure is reported distinctly and
-  falls back to the hard deadline, not fabricated inactivity or indefinite extension.
+- Sample the known owned attempt scope every 10s outside Lean. A new authenticated checkpoint/phase sequence or at least
+  1s aggregate owned CPU increase in the last 60s counts as activity. CPU activity is inference, not useful-progress
+  proof. Stdout, GET, heartbeats and repeated checkpoints do not count.
+- Baseline CPU at request dispatch. Track birth identities, newly forked descendants and final exited-child usage
+  without double-counting child totals. Retain exited contributions; PID reuse, sample loss, incompatible counters or
+  generation change cannot reset the cumulative counter. Do not count prior requests or background prewarming.
+- Incomplete/unattributable accounting is `unavailable`, not zero. Authenticated checkpoints may still count; otherwise
+  report the limitation and fall back to the immutable hard bound.
+- Activity updates only the subordinate soft deadline to `min(now + 10 minutes, hard maximum)`, through monotonic
+  attempt-bound messages. It cannot revive an expired/stopping attempt. Guardian enforcement does not require SQL.
+- Inactivity expiry is an operational timeout, not proof failure or deadlock. Quiet CPU-active work continues; spinning
+  work reaches the hard maximum. Slow external IO can need a profile with longer/disabled soft expiry and a finite hard
+  bound. Observation failure cannot fabricate inactivity or grant indefinite extension.
 
-Compare alternatives: historical durations alone adjust future jobs but do not satisfy live activity-based updates;
-stdout-silence expiry misclassifies quiet Lean work; unbounded heartbeat renewal can retain stuck jobs forever. The
-small soft/hard scheme provides live updating while leaving the hard safety limit unchanged. It is not a general progress
-estimator and its CPU/checkpoint hooks are an implementation qualification requirement. If these cannot be provided,
-report this requirement unimplemented rather than calling the static fallback complete.
-
-Idle custody (30s without an active stage) remains different from active-work inactivity (10m proposed). Neither uses
-conversation activity or client polling. A quiet proof is not automatically dead; the configurable inactivity rule is
-an explicit operational tradeoff and must be tested on representative silent and I/O-heavy workloads.
-Use monotonic timers within a boot. Wall-clock timestamps are diagnostic only. Across restart, conservatively stop
-old active scopes rather than reconstruct a renewable deadline from wall time. Sleep/resume requires qualification:
-on wake, expired owner lease stops work before any new GO; no promise of cleanup while the machine is asleep.
-Do not add a blanket warm-worker eviction that defeats validated caching; demand-triggered retirement remains primary.
+Complete fork/exit accounting, silent/IO-heavy workloads, error paths and sleep/resume remain qualification gates.
+Static hard-bound fallback is not completed activity-based updating. Use monotonic time within a boot; wall time is
+diagnostic. On restart reconcile/stop old scopes rather than reconstructing renewable authority from wall time. After
+wake, expired owner authority stops work before new GO; no cleanup guarantee applies while the machine sleeps.
 
 ## 8. Self-healing and pragmatic resource recovery
 
-Separate three questions: **did the old command run**, **does matching work still exist**, and **can a new conflicting
-operation safely acquire the current resource**. Unknown historical outcome is not an automatic permanent fence.
+Separate whether an old command ran, whether matching work remains and whether new conflicting work can acquire the
+resource. Unknown history alone is not a permanent fence.
 
-Preferred recovery policy, using the existing native registry:
+1. Establish sole recovery ownership through the SDK's short registry publication/arbitration protocol. Do not hold a
+   registry-wide lock, DB transaction or the work queue while waiting for cleanup.
+2. Retire an original scope restriction after a verified boot change or complete same-boot absence of its payload,
+   launchers and custodians, rechecked against concurrent publication. Keep the old outcome unknown. Fully dead scopes
+   need not reopen deleted paths or acquire locks held by unrelated new work; successors use ordinary admission. Numeric
+   PID/PGID reuse cannot reserve resources forever.
+3. For an eligible stopped guardian, prefer resuming its normal drain while custody remains held. Eligibility follows
+   cancel, deadline, retirement or confirmed service loss. Trusted post-exec token capture, scope admission and boot
+   binding are prerequisites; supplied-token tests do not establish durable discovery. No raw-PID fallback.
+4. Qualify takeover separately when payload work survives without a responsive custodian. Reader recovery may acquire a
+   fresh validated complete SH union after candidate EX/partial locks close. Recovery-only admission versus waiting
+   writer demand is unresolved; it must not permit ordinary reader starvation/bypass or payload execution under cleanup
+   authority. Exclusive-writer takeover needs its own contract.
+5. Publish recovery intent/member identities before STOP and register recoverer descriptor custody before acquisition.
+   Exact tokens identify individuals, not descendant sets. Concurrent fork/exec, anchor loss, incomplete census, two
+   recoverers, crash cuts and a frozen recoverer require explicit bounded ownership/arbitration. Do not hide another
+   custodian or permanent controller behind a recovery API.
+6. Release takeover protection only after its required payload/launcher/custodian closure observations. Bare EX, signal
+   return zero, ACK or missing SQL rows do not establish closure. Preserve the managed-writer owner-record gate. Missing
+   old wait/result receipts do not block resources already established free.
 
-1. Establish the sole service/recovery owner through the existing short lock/publication protocol. Never hold its
-   registry-wide lock, a database transaction or the whole queue while waiting for process cleanup.
-2. Classify original scope facts, not just elapsed time or missing results. With a verified different boot, or complete
-   same-boot absence of the original payload group, launchers and registered custodians, recheck against publication
-   and retire that scope's resource restriction automatically. Historical outcome stays Unknown. This fully dead branch
-   need not reopen deleted old paths or acquire locks held by unrelated newer work; new work uses normal admission.
-   Numeric PID/PGID reuse must not turn an absent original scope into a permanent reservation.
-3. For an eligible stopped guardian, prefer resuming that existing owner so it can perform its normal drain while
-   retaining custody. Eligibility comes from cancellation/deadline/retirement or confirmed service loss, not a quiet
-   proof. Genuine post-exec token capture, trusted scope admission and boot binding are prerequisites for durable
-   token-based recovery. Supplied-token primitive results alone do not establish them. No raw-PID fallback.
-4. If original payload work survives without a responsive custodian, qualify takeover separately. SDK `4ae59cd` now
-   releases ungranted EX/partial sets while its managed-owner gate refuses work. Reader recovery may then acquire a
-   fresh validated complete SH union without conversion or explicit unlock. Its acquisition path must not deadlock
-   on the waiting writer's demand marker: the exact internal recovery-only demand bypass/admission contract is still
-   unresolved. It must not become a generic reader bypass or allow payload execution under cleanup authority.
-5. An exact token identifies an individual incarnation, not all descendants. The proposed anchored STOP/census/rescan
-   and exact-member termination algorithm is unqualified for concurrent fork/exec, anchor loss and incomplete scans.
-   Publish recovery intent and accepted member identities before STOP; register potential recoverer-held descriptors
-   before acquisition. Two-recoverer arbitration, crash cuts, bounded evidence and a frozen recoverer require an
-   explicit protocol. Do not implement a hidden new custodian while claiming one owner.
-6. Release takeover protection only after the required payload/launcher/custodian closure observations. Bare EX,
-   signal return zero, a result ACK or an absent SQL row is not closure. Preserve the managed-writer owner-record gate.
-   Reader SH takeover does not establish exclusive-writer recovery; an existing EX holder needs its own qualified
-   cleanup contract. Missing old wait/result receipts do not block new work after current resources are established free.
+Record the evidence behind `recovered_after_owner_loss` without inventing original success. Repeated matching-identity
+observations, trusted membership, boot transitions and lock facts have different roles. Stale-token rejection alone is
+not absence; a prospective exit watch is not late attachment to an old PID. A bounded reconnect may preserve a final
+receipt after service death, but failed publication cannot prolong established-closed custody.
 
-Practical inference is supported, not deferred until mathematical certainty. Repeated matching-identity observations,
-trusted membership, a verified boot transition and current native lock facts have distinct roles. Record the evidence
-for `recovered_after_owner_loss`, never fabricate an original success. A stale-token rejection alone does not prove
-scope absence: exec or descendants may remain. A prospective exit watch is not a facility to attach later to an old PID.
-
-Proposed cleanup attempts have one five-second software budget with bounded backoff and observable pending reasons;
-that does not bound hung kernel calls. Restrict unresolved live/ambiguous scopes to their actual domains. Continue
-unrelated work; never impose a permanent blanket HOLD solely because history is missing. Unkillable work, unavailable
-OS observation or lost membership may still need an explicit scoped limitation/operator action. Simultaneous loss of
-all useful anchors remains a stronger unresolved case, not a reason to leave clearly dead scopes unrecovered.
-
-The narrow SDK boundary is scope-ID plus eligible trigger → classification/recovery observation, not caller-supplied
-PID/token → signal. Existing native admission/record collection owns resource facts; the host's pending-work loop owns
-retry scheduling. No second queue, cron job or independent SQLite recovery inventory is proposed. macOS private API
-availability/permissions and Linux behavior require separate platform qualification. No stronger recovery mechanism is
-implemented by this document.
+Proposed cleanup uses one 5s software budget with bounded backoff and explicit pending reasons, without promising to
+bound hung kernel calls. Restrict unresolved scopes to their actual domains and continue unrelated work. Unkillable
+work, missing OS observation, lost membership and simultaneous anchor loss remain explicit scoped limitations. The SDK
+API is scope-ID plus eligible trigger → recovery observation; the host schedules retries. No second queue, cron or SQL
+recovery inventory. macOS permissions/private APIs and Linux behavior qualify separately.
 
 ## 9. Proposed file changes and removals
 
-New module names below are proposals, not existing implementations.
-
-| Repository/file | Proposed change |
-| --- | --- |
-| `H/execution_service.rs` and `H/execution_service/{actor,protocol,store,recovery}.rs` | Native lifecycle actor, local RPC, SQLite single writer, restart reconciliation |
-| `H/cli/execution_service.rs`; `H/main.rs`; `H/runtime_compatibility.rs` | Explicit service/discovery CLI and matched capability negotiation; replace unfinished discovery scaffolds only after review |
-| `T/execution_scope.rs`; `T/native_guardian.rs`; `T/native_guardian/ownership.rs`; `T/process_group.rs` | One audited supervisor/guardian scope API; real-child custody, stop/wait and safe platform recovery |
-| `T/shared_writer.rs`; `T/shared_reader.rs` | Thin service clients for lifecycle operations; preserve whole-union/demand semantics, eliminate caller-owned helper lifetime after migration |
-| `H/shared_writer.rs`; `H/native_reader.rs`; `H/native_reader/control.rs`; `H/native_reader/input.rs` | Replace independently owned controller loops with common scope implementation; preserve actual launch and input-validation invariants |
-| `H/broker.rs`; `H/project.rs`; `H/artifact_reads.rs` | Integrate common scope identities/admission; retain semantic actor/session/cache design and demand-driven retirement |
-| `H/tasks.rs`; `H/request_log.rs`; `H/request_journal.rs` | Link semantic tickets to native attempts; keep semantic result/ACK meaning; no merge of incompatible IDs |
-| `HOST/crates/lean-host-mcp/Cargo.toml`; `HOST/Cargo.lock` | SQLite is currently a Unix-only test dependency; production store/protocol dependencies remain a separate implementation decision |
-| `P/native_execution.py` (new); `P/native_compatibility.py` | Thin discover/create/start/get/cancel client; persist original IDs on all errors |
-| `P/owned_writer.py`; `P/native_reader.py`; `P/native_reader_protocol.py`; `P/orchestration/managed_lake.py`; `P/orchestration/managed_read.py` | Remove actual native-helper Popen supervision, late daemon waiter, duplicate timeout/classification logic after parity |
-| `P/native_history.py`; `P/native_protocol.py`; `P/registry.py`; `P/sqlite_store.py` | Add durable original-job/stage outbound attempt binding as provenance; preserve source snapshots; no native capacity lease or new execution queue |
-| `P/orchestration/compilation.py`; `PROOFS/docs/development/lean-check-redesign.md` | Preserve proof acceptance/final input gates; track real rollout evidence separately |
-| `FMT` managed subprocess mode | Retain tested inherited-group contract; no unrelated formatter rewrite |
-
-Delete superseded helper protocols and compatibility fallback only when all supported callers migrate. Do not maintain
-old and new authorities indefinitely. Explicitly remove controller-side borrowed EX aliases from the new normal path;
-otherwise helper closure cannot release parent-held custody. Audit every FD transfer and inherited alias before claiming
-this. Existing standalone CLI compatibility may remain a bounded adapter to the service, not a second execution owner.
-
-### Measurable deletion contract
-
-Before implementation, capture a caller/owner inventory and code references. Cutover acceptance requires all of:
-(1) zero native-helper `Popen`/late-wait ownership in migrated Proofs adapters; (2) zero independent broker/global
-capacity-grant authorities outside the execution service; (3) zero normal-path client-owned borrowed EX aliases;
-(4) one native recovery/expiry policy implementation, no Python copies; (5) one compatibility path, with no automatic
-legacy fallback on native error; (6) every preserved wrapper exposes a different useful abstraction or is removed.
-List deleted functions/files and retained exceptions in the rollout report, with static searches plus runtime tests.
-Lines of code may increase inside the deep native module; the measured result must be fewer caller obligations,
-independent authorities and cross-layer lifecycle facts. A release that adds the service but keeps all old owners is
-not this redesign and cannot pass by demonstrating only successful commands.
+The [cutover ownership table](native-execution-cutover-plan.md#verified-ownership-and-deletion-targets) is canonical for
+module/caller changes and deletion counters. New service/protocol/store module placement remains an interface review
+decision; existing test modules are not production implementations. Delete superseded controller and capacity authority
+after parity, preserving useful native mechanisms and historical receipt readers.
 
 ## 10. Migration and rollback
 
-1. Reconcile the selected existing-SDK recovery contract and its platform identity/cleanup gates before production
-   wiring. Existing store and healthy-guardian fixtures are bounded evidence, not a reason to restart completed work.
-   Qualify a different dual-owner/direct-owner topology only if that alternative is deliberately selected.
-2. Implement store/protocol and scope machinery behind an off-by-default versioned capability. Model transitions and
-   test private fixtures; do not read production history as work to replay.
-3. Route one isolated fixture through the new path, then the complete private acceptance suite. Match host, SDK and
-   worker image capabilities. Unsupported combinations refuse before dispatch, with no legacy execution fallback.
-4. Enforce cutover fencing before migration: new launch gates require the current installation/protocol epoch from the
-   sole service incarnation; stale capabilities cannot launch. Pre-change binaries do not understand this epoch, so this
-   check alone cannot fence them. Inventory configured executable paths, stop accepting old client submissions, finish
-   or explicitly stop all known old helpers, and update every supported launcher before enabling new submissions.
-   Keep the SAME canonical lock inodes and common admission semantics throughout. An old binary manually launched
-   later remains an unsupported cooperating external writer (locks still protect where honored), not a falsely fenced
-   client. If any supported launcher can still execute an unfenced old protocol, cutover fails. Do not unlink/rotate
-   artifact locks or rely solely on PATH updates. Single service owner lock plus inventory of old executors is required.
-   Migrate callers in a documented maintenance window: finish or explicitly cancel existing native work, preserve
-   original receipts, verify closure through normal observation. No global unrecorded drain or blind replay.
-5. Deploy matched images only after separate authorization, verify installed hashes and run one newly scoped real
-   workflow. Observe concurrent target/consumer/semantic operations and writer-demand recovery.
-6. Remove obsolete ownership paths after this gate. Historical registry/schema-3 archives and semantic journals remain
-   readable. Old attempts are not imported as runnable jobs; optional read-only evidence references preserve their IDs.
-
-Rollback switches NEW submissions only after new-version scopes close or reconcile; never run two conflicting custody
-systems or downgrade a live SQLite schema in place. Preserve new store and binaries for evidence. A failed migration
-must report which attempts started and their current state, not assume nothing happened.
+Follow the [cutover checklist](native-execution-cutover-plan.md#staged-acceptance-and-deletion-checklist) and
+[rollback contract](native-execution-cutover-plan.md#receipts-and-rollback). They own launcher closure, capability
+epochs, matched images, maintenance and deletion evidence. New checks cannot retroactively fence unchanged binaries;
+preserve canonical lock inodes and current custody throughout. No deployment or push is authorized by this document.
 
 ## 11. Acceptance and fault matrix
 
-The complete integrated-service matrix below remains **NOT RUN**. The
-[scoped store/process tests](../specs/native-execution/stage-store-contract.md)
-cover only the stated prototype cases. Use causal synchronization, not timing-only
-sleeps. Freeze exact binary hashes,
-source revisions, SDK lockfile, OS and fixture. A test with failed setup is NOT RUN, not passed. Keep the proof source claim
-separate from successful tooling acceptance.
+The **complete integrated-service matrix remains NOT RUN**. Private checks cover their named prototype cases only.
+Freeze source/dependency/lockfile revisions, exact image hashes, OS and fixtures; use causal barriers and independent
+oracles. Failed setup is NOT RUN. No test-feature binary silently qualifies a different deployed image.
 
-- State/model tests: durable original job/stage binding across lost CREATE/START replies, immutable intent, mismatched duplicate create, one-use GO, no renewal after expiry, no stale generation
-  mutations, cancellation races, bounded mailbox, transactional event/state updates, retention without resurrection.
-- Real-process launch cuts: before create reply; after helper spawn; before/after admission; after Ready; after durable
-  authorization; after GO but before spawn receipt; payload exits before publication; after ACK. Assert target marker
-  count at most one and preserve unknown where the cut destroys evidence.
-- Self-healing: controller hangs with channel open; service SIGSTOP/crash; supervisor SIGSTOP/crash; guardian crash;
-  simultaneous service/supervisor/guardian loss; leader exits with descendants; descendant closes stdio; descendant
-  closes inherited lock FDs and keeps writing; attempted detach/regroup. Assert no conflicting writer overlap or mark
-  the case an unsupported containment boundary. Never count a timeout response alone as successful cleanup.
-- Identity/recovery: reused PID, boot change, stale row with free stable lock, busy lock with missing row, replaced inode,
-  missing guardian reply, multiple-domain partial acquisition. Show automatic successor progress once matching live
-  custody is gone without manufacturing an old result.
-- Storage/control: result fsync/rename/commit/GC crash cuts, existing native registry independent of corrupt SQLite, full disk, SQLite busy/corrupt, service loss during commit, duplicate observations, oversized frames,
-  invalid capability, FIFO/symlink inputs, unavailable socket, pruning versus late report. Cleanup must not depend on a
-  successful database write.
-- Time: delayed renewals, renewal/expiry race, 60s owner expiry, 30s idle expiry, sleep/resume, wall-clock jumps, quiet long
-  proof within budget, live activity updates bounded by hard deadline, CPU spin, quiet I/O profile, observation failure, TERM-resistant child and KILL escalation. No heartbeat renews maximum lifetime.
-- Migration/deletion: stale supported launcher rejected, old helper quiescence, common unchanged lock inode, singleton service generation, and every deletion-contract counter verified.
-- Existing regressions: physical-domain canonicalization, formatter inherited process group, FIFO metadata, warm reader
-  retirement, foreign writer, whole-union retry, one actual payload after warm-generation replacement.
-- Full workflow: readiness, guarded compilation, metadata, axiom checks, importing consumer, lint, semantic checks,
-  unchanged final complete-input validation; concurrent mixed workload; resource pressure measurement. No source claim
-  closes merely because tooling passes.
+| Area | Required cuts and oracle |
+| --- | --- |
+| Identity and state | Lost CREATE/START replies, immutable-intent conflict, stale epoch/generation/capability, one-use GO, sealed cancel, bounded queues, atomic event/state updates and expiry without resurrection. |
+| Launch | Before helper identity/admission, after wrapper spawn, Ready, durable permission, first/partial GO, spawn/exec/body/result and ACK. At most one target marker; witness loss stays unknown. |
+| Custody | Service/supervisor/guardian crash or freeze, open stalled channel, simultaneous owner loss, leader exit, fork/exec, detached/regrouped or FD/stdio-closing descendants. Assert actual no-overlap and closure or state unsupported containment. |
+| Recovery | Reused PID, boot change, stale row/free lock, busy lock/missing row, replaced inode, partial unions, missing guardian reply and competing/frozen recoverers. Successors progress after established closure without invented old results. |
+| Storage and control | Full/busy/read-only/corrupt store, failed write/sync/commit/rename/checkpoint/GC, duplicate observations, invalid producer/capability, FIFO/symlink/oversized input and unavailable socket. Verify the injected fault occurred; cleanup cannot require successful publication. |
+| Time and activity | Delayed/late renewals, expiry race, idle hold, quiet long work, CPU spin, IO profile, fork/exit accounting, unavailable observation, sleep/resume and TERM-resistant children. No renewal extends hard lifetime. |
+| Regression and workflow | Canonical physical domains, formatter inherited group/no-build behavior, FIFO metadata, warm reader retirement, foreign writer, full-union retry and one payload after generation replacement; readiness/build/metadata/axioms/consumer/lint/semantic/final-input acceptance. |
+| Cutover | Verify the canonical plan's stale-launcher refusal, old-scope quiescence, singleton/epoch and unchanged-inode checks, then each deletion counter. |
 
-Publish a matrix with implemented/reviewed/private-tested/deployed/production-observed columns. Claim completion only
-for the supported platform and process contract whose rows passed. Unsolved cases and skipped tests remain prominent.
+Report implemented, reviewed, private-tested, deployed and production-observed columns separately. Unit/model results do
+not replace exact-image faults. Tooling success does not close a mathematical proof claim or change theorem scope.
 
-## 12. Limits and review decisions
+## 12. Limits
 
-This is deliberately fail-stop, not transparent continuation. A service failure may terminate useful work; the benefit
-is one recoverable owner and no uncertain automatic replay. Durability cannot promise a result when all witnesses die
-before publishing. A timeout cannot force an unkillable process to release a kernel resource. SQLite cannot prevent an
-unmanaged Lake process from writing without the locks. Exact-once external effects are not promised.
+Fail-stop recovery may terminate useful work. No component promises an outcome after every witness dies, exactly-once
+arbitrary IO, forced release by an unkillable process or exclusion of unmanaged writers. Qualify only the supported
+platform/process/storage profile and keep skipped or unresolved cases visible. The remaining mechanisms are the ordered
+gates in §16, not additional rival architecture checklists.
 
-Before production wiring, the remaining design and independent review must settle: (1) guardian custody and platform-safe group cleanup after
-supervisor death, including simultaneous death; (2) exact process identity/absence evidence used for automatic recovery;
-(3) native semantic actor integration without redundant capacity owners; (4) SQLite corruption recovery and bounded
-retention details; (5) concrete service installation and compatibility scope. The proposal chooses Rust native ownership,
-SQLite, finite deadlines and recovery independent of historical result, but does not label these unresolved mechanisms
-as solved. Later owner instructions separately authorized scoped design/refinement/implementation. Deployment, pushes
-and proof-worker/input changes remain outside this document's authority.
+## 13. Validation and refinement
 
-## 13. Research-backed validation plan and implementation handoff
+Give CREATE durable acceptance, START one-use authorization and CANCEL request acceptance distinct linearization points;
+CANCEL is not closure and no point atomically joins SQL and spawn. Use
+[Herlihy and Wing](https://www.cs.columbia.edu/~wing/publications/HerlihyWing90.pdf) for that sequential contract and
+[Lamport](https://lamport.azurewebsites.net/tla/book.html), chapters 3–5, 7–9 and 14, for refinement, time, fairness and
+TLC.
 
-Added 2026-11-17 after primary-source research and independent review. Jacob has now authorized design, review,
-refinement and implementation in new sessions. This document remains a proposed design, not a claim of implementation
-or qualification. That authorization does not waive the containment gates or authorize deployment/pushing. This edit
-adds documentation only. The source-scaffold description in §2 is the historical inspection baseline, not a claim that
-those uncommitted files still exist; cleanup owns the current tree inventory.
+The bounded specification separates OS operations from persistence, with crash cuts between them. Start with two
+attempts/domains, one warm generation, owner failures, aliases, live work, epochs, intent/results and lost replies.
+Check no conflicting work overlap, at-most-one launch, no expired revival, custody through live work and unknown history
+coexisting with recovered resources. Conditional progress requires explicit responsive-actor, OS-observation and
+availability assumptions; never assume a crashed actor runs or an unkillable child exits. Warm requests cannot inherit
+prior CPU activity or renew each other's deadlines.
 
-### Priority 1: specify the public contract and model custody before service implementation
+Map internal steps to §6's orthogonal public facts; include broken early-release/GO-replay variants that must produce
+counterexamples. Record tool/model revision, bounds, explored states, assumptions and traces. Bounded checking is not an
+unbounded proof. Translate counterexamples into executable fixtures. The
+[failure-detector distinction](https://ecommons.cornell.edu/entities/publication/7948ff49-7263-49f8-a29b-d062e7cbb240)
+also applies locally: lease expiry is suspicion triggering cleanup, not proof of death.
 
-Use [Lamport, *Specifying Systems*](https://lamport.azurewebsites.net/tla/book.html), chapters 3–5 and 7
-(specification/refinement), 8 (fairness), 9 (time) and 14 (TLC). The
-[PlusCal introduction](https://lamport.azurewebsites.net/tla/tutorial/intro.html) is an optional notation aid, not a
-second specification to maintain. [Session 9: Liveness](https://lamport.azurewebsites.net/tla/tutorial/session9.html)
-explains why mutual exclusion alone permits a useless system that never makes progress. Require both safety and
-conditional progress. [Herlihy and Wing, *Linearizability*](https://www.cs.columbia.edu/~wing/publications/HerlihyWing90.pdf)
-provides the sequential-operation contract: identify CREATE's durable acceptance point, START's single-use authorization
-point and CANCEL's request-acceptance point. CANCEL acknowledgment is not scope closure. None of these points makes
-SQLite commit and OS spawn atomic.
+Qualify OS assumptions with disposable competing commands, independent write intervals and scope-closure observations.
+Existing macOS leader observation/pinning and guardian checks remain narrow. Candidates such as
+[launchd group cleanup](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5),
+[Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) and
+[pidfds](https://man7.org/linux/man-pages/man2/pidfd_open.2.html) need current platform/permission tests. Identity-safe
+signals do not contain descendants; eventual cleanup does not establish lock retention until exit.
 
-**Required artifact:** a small TLA+ lifecycle/custody specification and checked TLC configurations, proposed location
-`HOST/specs/native-execution/{Lifecycle.tla,Lifecycle.cfg,README.md}`. No such new model is claimed to exist or have run.
-Start bounded: two attempts, two artifact domains, one warm generation, service/supervisor/guardian identities and
-failures, holder/alias sets, protected live work, epochs, durable intent, result knowledge, deadlines and lost replies.
-Separate all OS operations from persistence transitions; include a crash between every meaningful pair. Do not model
-“spawn-and-record” or “kill-and-close” as atomic actions merely to obtain a passing check.
+Use consuming non-Clone launch tokens and explicit descriptor states where helpful, without a giant typestate product.
+[`OwnedFd`](https://doc.rust-lang.org/std/os/fd/struct.OwnedFd.html) ownership does not eliminate kernel aliasing;
+[`Drop`](https://doc.rust-lang.org/nomicon/leaking.html) is not guaranteed. Tokio cancellation/kill requests are
+distinct from [observed child completion](https://docs.rs/tokio/latest/tokio/process/struct.Child.html). Keep
+independent guardian enforcement outside blocking work. [Loom](https://github.com/tokio-rs/loom) can check small
+synchronization races, not real FDs, process groups or fsync. Independent review must challenge assumptions and
+unsupported cases before dependent wiring.
 
-Check these properties explicitly:
+## 14. Model evidence
 
-1. No conflicting protected work overlaps, even after a controller dies and the payload closes inherited descriptors.
-2. An attempt launches at most once; expired attempts and closed epochs cannot be revived by stale messages.
-3. Resource custody is not released while its protected work can still run, under stated platform assumptions.
-4. Unknown historical result can coexist with recovered resources and does not itself consume a capacity slot.
-5. Eligible healthy work eventually runs or receives explicit deadline rejection; abandoned killable scopes eventually
-   release custody. State fairness, eventual OS observation and eventual availability assumptions. Do not assign fairness
-   to crashed actors, or assume unkillable processes eventually exit.
-6. Warm generation reuse cannot let one request renew another request's deadline or inherit prior CPU activity.
+The [model directory](../specs/native-execution/README.md) owns current artifacts, port status and reproduction
+commands. The TLA+/TLC port is in progress; do not infer a completed run or equivalence from the existence of files. The
+historical archive records 60 unit tests, 30 reduced late-control graphs of 96–648 states (limit 30,000 each), and five
+broken-handler counterexamples. The combined 300,001-state exploration was incomplete. These slices are neither a
+composition proof nor native recovery qualification. Preserve archive provenance when replacing its Python tools.
 
-Define a refinement mapping from the internal protocol to §6's orthogonal public execution/result/resource states.
-Internal recovery steps may leave public state unchanged, but cannot invent success or erase uncertainty. Include
-negative variants that deliberately release custody early or resend GO; TLC must find counterexamples, demonstrating
-that the asserted property actually detects the intended failure. Record model revision, tool version, bounds, explored
-states, assumptions, counterexample traces and checked properties. A bounded model check is not an unbounded proof.
+Custody refinement requires close-only aliases with no live SH/EX mode conversion. This does not assert every failed
+nonblocking conversion loses its lock; runtime syscall semantics and storage/process assumptions qualify separately.
 
-The official [TLA+ transaction-commit example, `TwoPhase.tla`](https://github.com/tlaplus/Examples/blob/master/specifications/transaction_commit/TwoPhase.tla)
-is a useful example of concrete protocol versus abstract contract and refinement, not a recommendation to add two-phase
-commit to this service. [Newcombe et al., *How Amazon Web Services Uses Formal Methods*](https://www.amazon.science/publications/how-amazon-web-services-uses-formal-methods)
-provides practical motivation for design checking; convert discovered traces into executable fault fixtures rather than
-treating modeling as a substitute for implementation tests.
+## 15. Storage qualification
 
-[Chandra and Toueg, *Unreliable Failure Detectors for Reliable Distributed Systems*](https://ecommons.cornell.edu/entities/publication/7948ff49-7263-49f8-a29b-d062e7cbb240)
-provides the useful distinction between suspicion and actual failure. Lease expiry triggers cleanup; it is not proof
-of process death. This is conceptual guidance, not a reason to introduce consensus machinery on one machine or keep
-an indefinite evidence-only fence.
+The [private store contract](../specs/native-execution/stage-store-contract.md) and
+[runtime contract](../specs/native-execution/stage-runtime-contract.md) record prototype evidence. Their kill/reopen,
+caller-save-before-ACK, rejected SQLite UPDATE cleanup and healthy-guardian/passive-observer cases do not establish
+replacement-service adoption or production store/RPC use. Client authority tests are separate from producer bootstrap.
+Private schema versions and 64 KiB inline test bounds are not production defaults.
 
-### Priority 2: resolve the OS custody assumptions with disposable competing fixtures
+Keep these failure classes and their evidence separate:
 
-Run the §4 disposable fixture and compare mechanisms BEFORE choosing the full service topology. The model's kernel
-holder/identity rules are assumptions until these platform tests support them. Test guardian-only, supervisor-only and
-simultaneous death, descriptor transfer before/after ACK, payload closing descriptors and stdio, concurrent fork, leader
-exit, and conflicting successor acquisition. Instrument independent write intervals and actual scope closure. A signal
-returning successfully is not the oracle. Record safety and recovery outcomes separately.
+| Class | Required qualification and limit |
+| --- | --- |
+| Process/service death | Disposable kill/reopen at intent, permission, GO, result and ACK; original IDs, no reauthorization, truthful unknown/missing assets and native cleanup. OS/device stay running. |
+| Simulated storage faults | Test VFS/adapter verifies write/flush/commit/rename/checkpoint failures and ordering, effective settings on fresh/reopened/pooled connections, bad-profile rejection and runtime provenance enforcement. Passing stress alone does not qualify WAL-reset safety. |
+| External assets and GC | Independently test file/rename/directory/DB cuts and publication/GC races, including live-scope input pins. SQLite PRAGMAs do not synchronize these assets. |
+| OS crash or reboot | Dirty kernel state loss differs from process kill; boot identity and recovered outcomes require separate evidence. |
+| Physical power loss | Device/cache persistence differs again. SIGKILL or VM-process restart does not prove flush durability. Never power-cycle a user's machine for this test; any future destructive test requires an authorized disposable environment. |
 
-- **macOS existing code:** inspect and retain the exact guarantees in `T/process_group.rs` (leader observation/pinning
-  using `waitid` with `WNOWAIT`) and `T/native_guardian.rs` (`validate_pin`/`kill_payload` and same-session/separate-group
-  assumptions). [Apple's kqueue manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html)
-  describes observation, not process-tree containment or safe signaling authority. It is archived documentation; qualify
-  against the installed supported macOS release.
-- **macOS alternative:** [Apple's published launchd manual](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
-  describes cleanup of the job's remaining PGID unless `AbandonProcessGroup` is enabled. Investigate a launchd-owned
-  direct executor, but verify current behavior and whether private sessions move work outside the relevant PGID.
-  Crucially, eventual group termination after owner death does not prove the absence of a lock-release-before-exit
-  overlap window. The fixture must test that ordering. Do not claim launchd solves artifact custody without it.
-- **Linux alternative:** [kernel cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) offers a candidate
-  per-scope containment boundary: controlled membership before execution, `cgroup.kill`, then `cgroup.events:populated`
-  observation. Prevent new entries after emptiness and prevent managed payload escape. Verify delegation permissions
-  and supported kernel versions. [pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html) and
-  [pidfd_send_signal](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html) improve identity-safe process
-  operations, not descendant containment. Current Linux SDK restraint after leader reaping must not be replaced by
-  a retry loop that signals a possibly reused PGID.
+VFS injection, external assets, OS-crash and physical power-loss qualification remain unrun in the recorded evidence.
+Record SQLite/VFS/filesystem assumptions and weaker supported profiles explicitly rather than claiming universal
+durability. Storage failure cannot trap cleanup, fabricate no-start or erase original identity.
 
-[systemd's killing contract](https://www.freedesktop.org/software/systemd/man/262/systemd.kill.html) and
-[its implementation](https://github.com/systemd/systemd/blob/main/src/core/unit.c) demonstrate the distinction between
-main-process and group cleanup. Borrow `request_stop` versus `observe_scope_empty`, not the entire service manager.
-Likewise [s6-supervise](https://www.skarnet.org/software/s6/s6-supervise.html) and
-[s6 status](https://www.skarnet.org/software/s6/s6-svstat.html) are comparators for a small actual-child owner and explicit
-cleanup-in-progress. They do not prove this application's artifact-lock safety under supervisor failure, and their
-restart behavior must not be copied for commands with unknown outcome.
+## 16. Remaining implementation and acceptance gates
 
-### Priority 3: narrow Rust guarantees, durable protocol and independent review
+Independent preparation can proceed; dependent production wiring cannot assume an unresolved predecessor passed.
+Existing private tests are reusable evidence, not a production implementation.
 
-Only after the model/fixture resolves the supported custody contract should the new sessions implement the narrow
-scope API, service/store and caller migration. Use these sources to make specific implementation obligations explicit:
+| Order | Owner and existing boundary | Remaining gate |
+| --- | --- | --- |
+| 1. Frozen scope and identity | SDK `native_guardian.rs`, `native_guardian/ownership.rs`; host contract §§4,8 | Qualify trusted post-exec token/boot admission, frozen/dead-custodian cleanup, normal CONT drain and supported lost-anchor cases with independent closure/contention oracles. Supplied-token and failed setup evidence is narrower. |
+| 2. Registry recovery and admission | SDK ownership, writer-lock and record-lifetime boundaries | Specify publication before STOP/acquisition, two-recoverer/frozen-recoverer/crash handling, complete SH recovery versus writer demand and exclusive-writer limitations. No second inventory/controller. Depends on 1 for affected cases. |
+| 3. Warm generation and one capacity policy | Host `broker.rs`, `broker/control.rs`, `project.rs` and lifecycle tests | Map attempt/request/generation lifetimes; remove duplicate grants. Test sequential reuse, cancel, retirement, service loss and replacement. One-stage/scope prototypes do not settle warm integration. Recovery-dependent wiring waits for 1–2. |
+| 4. Production store, protocol and authority | Host service registration and private store/runtime reference tests | Review production module placement and producer bootstrap; preserve binding/one-use GO/caller-save-before-ACK. Complete corruption/restore, retention, registry pressure and external-asset procedures. No listener or production dispatch is established. Depends on 2–3. |
+| 5. Live activity and deadlines | Host configuration; SDK guardian | Implement §7's deterministic accounting, unavailable fallback and independent bounds. Qualify fork/exit, silent/IO work and sleep/resume. Policy is specified; complete platform accounting/enforcement is not. |
+| 6. Cutover and deletion | Repository coordinator; canonical cutover plan | Qualify the complete launcher/fence/rollback/deletion inventory after 1–5. Local implementation authorization does not authorize install, deployment or push. |
+| 7. Exact-image workflow and proof gates | Coordinator, host smoke/evaluation harnesses and existing proof acceptance | After applicable authorization, run candidate fault/mixed workflows with exact hashes, overlap, memory/swap and cleanup/unknown evidence. Preserve source/theorem/input gates. Earlier finite acceptance is not qualification of this replacement. |
 
-- [Rust typestate](https://doc.rust-lang.org/embedded-book/static-guarantees/typestate-programming.html): consuming,
-  non-`Clone` launch tokens and custody-transfer states can prevent local reuse. Avoid a giant cross-product typestate
-  for orthogonal outcome/resource states. Types do not prove process survival or cross-process durability.
-- [Rust `OwnedFd`](https://doc.rust-lang.org/std/os/fd/struct.OwnedFd.html): cloned descriptors can share an underlying
-  open file description. Rust ownership of one FD is not exclusive ownership of the kernel lock. Keep alias accounting
-  and close-only rules explicit. [Rustonomicon, Leaking](https://doc.rust-lang.org/nomicon/leaking.html): destructors are
-  not guaranteed to run; `Drop` is best-effort cleanup, not the custody proof.
-- [Tokio shutdown](https://tokio.rs/tokio/topics/shutdown), [`Child`](https://docs.rs/tokio/latest/tokio/process/struct.Child.html)
-  and [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html): cancellation notification is
-  separate from observed task/child completion. Dropped children can continue; a kill request is not a wait result;
-  direct-child exit is not descendant closure. Keep guardian deadline/liveness enforcement independent of busy Lean
-  actors, database work and executor congestion. Bounded dedicated OS/I/O work is not an excuse to hide infinite
-  supervisor loops inside uncancellable blocking tasks.
-- [Loom](https://github.com/tokio-rs/loom): check small Rust synchronization boundaries such as GO-versus-cancel,
-  transfer-ACK/last-alias arbitration and duplicate publication. It does not test real descriptors, SQLite fsync,
-  process groups or power-loss durability. Use model-specific primitives and retain actual process tests.
-- [Temporal's activity crash example](https://docs.temporal.io/activity-definition): completing work then losing the
-  completion report is a real ambiguity even in durable systems. Temporal's retry/idempotency model is not our default.
-  Preserve original identity for control retries; keep unknown outcome and recovered resources separate; do not add
-  a workflow engine or automatic payload replay.
-
-### Review checkpoints, evidence and stopping rules
-
-The simplicity criteria in §1 remain the architectural filter: independent concerns, a deep minimal client API and
-measurable removal of old authorities. Adding a model, SQLite or actors is not itself simplification. Review the model,
-then custody fixtures, then scope API/storage, then migration as separate evidence-bearing checkpoints. Independent
-review should challenge the assumptions and attempt counterexamples rather than merely confirm passing tests.
-
-For each checkpoint record proposed/implemented/reviewed/tested/deployed separately, exact revisions and coverage.
-An unresolved OS counterexample blocks the dependent custody claim; narrow the supported contract or choose another
-mechanism instead of adding a timeout and declaring success. No model or reference above establishes actual Mac safety
-without fixture evidence. No platform's results automatically qualify another platform. This addition ran no TLC,
-Loom, process fixture, build, migration or production test. Implementation in new sessions must preserve the existing
-proof inputs/receipts and separately authorized deployment boundary.
-
-## 14. Compact model integration checkpoint
-
-The reviewed Python model/checker sources and unparsed TLA+ files are now kept in
-[`specs/native-execution`](../specs/native-execution/README.md). Its README records
-the archive hash, replay commands and incomplete/unrun coverage. This integration
-changes no runtime behavior. Sixty recorded tests and reduced graph checks are
-not a completed combined model, TLC run or restart-recovery qualification.
-
-Custody refinement additionally forbids SH/EX lock-mode conversion while live
-custody exists, as well as explicit unlock through an alias. Use close-only
-ownership; the model does not assume a conversion preserves exclusion atomically.
-This assumption does not assert that every failed nonblocking conversion loses
-its lock. Runtime syscall evidence and platform semantics remain separate gates.
-
-## 15. Durable storage failure model and qualification requirements
-
-Documentation clarification, 2026-11-17; no database or installed setting changed.
-The proposed native store already requires WAL and `synchronous=FULL` (§5). This
-is not discovery of a NORMAL-mode bug in an implemented native store: that store
-is not yet wired into production. A private test-only SQLite prototype now exists; its scoped evidence is linked in
-the current checkpoint. The existing Proofs `P/sqlite_store.py` separately sets FULL
-on its connections; it is not the new native store and this edit does not alter it.
-
-### Documented SQLite behavior versus the proposed contract
-
-SQLite documents that committed WAL transactions with NORMAL can be lost after
-an OS crash or power failure, although application crashes do not have that same
-durability exposure. FULL adds a WAL sync for each committed transaction; EXTRA
-adds nothing beyond FULL in WAL mode. On macOS, `fullfsync` defaults off; when
-enabled it requests F_FULLFSYNC for supported sync operations. With fullfsync
-on, checkpoint_fullfsync is redundant. Unknown PRAGMAs may be silently ignored.
-Sources: [synchronous](https://sqlite.org/pragma.html#pragma_synchronous),
-[fullfsync](https://sqlite.org/pragma.html#pragma_fullfsync),
-[checkpoint_fullfsync](https://sqlite.org/pragma.html#pragma_checkpoint_fullfsync).
-
-Proposed connection contract for the native store:
-
-1. Before accepting durable mutations, configure and read back `journal_mode=WAL`,
-   `synchronous=FULL` (2) and foreign keys ON on each relevant connection/schema.
-   Do not assume connection-local settings persist through reopen or pooling.
-2. On supported macOS SQLite/VFS builds, explicitly request/read back fullfsync ON.
-   Do not substitute checkpoint_fullfsync alone for commit synchronization. Record
-   SQLite version, VFS, effective values and filesystem assumptions in qualification.
-3. A missing/mismatched required setting, failed commit or sync error refuses a
-   new durable admission/GO acknowledgment. Return explicit storage failure; never
-   quietly retry under NORMAL/OFF. Failed or lost commit acknowledgment can leave
-   the transaction outcome uncertain: reconcile the original immutable identity,
-   rather than assuming rollback or retrying its payload. Cleanup of existing scopes remains independent
-   of a successful storage write. Configure storage during controlled initialization,
-   not journal-mode transitions on a live operation path.
-4. A PRAGMA value is configuration evidence, not proof that a particular device,
-   filesystem, VFS or storage stack honored durable flush. Document platform limits
-   and any weaker supported storage profile instead of claiming universal durability.
-
-### Three distinct failure classes
-
-- **Service/process crash:** OS and device remain running; kill/reopen tests can
-  check journal replay, original IDs, unacknowledged results and unknown launch
-  outcomes. Surviving native scopes still need custody reconciliation.
-- **OS crash/reboot:** userspace and kernel state disappear. A process-kill test
-  does not simulate dirty kernel buffers being lost. Old local process custody
-  cannot survive a real reboot, but saved outcome/intent may still be incomplete.
-- **Power loss:** additionally exercises device/cache persistence. Neither SIGKILL
-  nor an ordinary VM process restart proves the physical storage flush contract.
-  Never power-cycle Jacob's machine as a test. Any future destructive fault testing
-  needs an isolated disposable environment and the appropriate authorization.
-
-### Database, OS launch and external assets are separate durability domains
-
-Preserve caller job/stage binding and native intent before dispatch. Commit launch
-permission before GO, but do not claim commit and OS spawn are atomic: a committed
-permission may never execute; an executed command may lose its completion report.
-Missing result cannot authorize replay. Successful SQLite commit cannot preserve
-an output file that was not separately flushed or stop a running process.
-
-The §5 asset protocol must use an explicitly qualified platform file-sync helper:
-write bounded temporary asset, flush file contents with the required supported
-macOS full-sync policy where applicable, rename, establish directory-entry
-persistence under the supported filesystem contract, then commit its database
-reference. Qualify directory synchronization separately; do not assume a database
-PRAGMA configures external files or that the same file-sync operation works for
-all directory descriptors. Propagate failures before advertising a durable result.
-The same analysis applies to caller provenance, scope manifests and epoch changes.
-GC durably commits reference removal before deleting unreferenced assets and
-serializes publication/deletion or rechecks under equivalent coordination so a
-concurrent reference or live-scope pin cannot race deletion. It still protects
-inputs needed by live scopes. A hash detects missing/corrupt bytes; it
-cannot reconstruct them or establish that a command never ran.
-
-### Required validation and honest reporting
-
-- Assert effective PRAGMAs on fresh, reopened and pooled connections. Deliberately
-  misconfigure NORMAL/fullfsync and ensure the admission check rejects the profile.
-- Instrument a test VFS/storage adapter to verify sync ordering and inject write,
-  flush, commit, rename and checkpoint failures. Label these simulated storage
-  faults, not actual hardware power-loss experiments.
-- Kill only disposable service processes at each binding/commit/GO/result/ACK cut;
-  reopen and assert original identity retention, no reauthorization, honest unknowns
-  and missing-asset errors. Test WAL recovery before and after checkpoint.
-- Verify external-asset publish/GC ordering independently, including failures after
-  file flush, rename, directory sync and database-reference commit. Cleanup cannot
-  be trapped by the failure of its evidence store.
-- Keep a coverage table separating process-kill tests, VFS fault simulations,
-  OS-crash testing and physical power-loss qualification. Unrun categories stay
-  unrun. No existing custody fixture or pure lifecycle model establishes these
-  storage guarantees. The [test-only store qualification](../specs/native-execution/stage-store-contract.md)
-  covers process-kill/reopen, same-owner dummy-runtime cases and native cleanup
-  after actual SQLite UPDATE rejection. It also checks saving a caller-owned
-  inline result before native ACK, including both commit boundaries and SQL
-  rejection. Two further cuts test actual service death with a healthy guardian
-  and a fresh passive observer, without replacement-service execution or restored
-  native authority. VFS fault injection,
-  external assets, OS-crash and power-loss qualification remain unrun.
-
-### SQLite linked-runtime provenance and WAL-reset compatibility
-
-The [official WAL-reset advisory](https://sqlite.org/wal.html#the_wal_reset_bug)
-identifies a rare corruption race with multiple connections to the same WAL
-file concurrently writing/checkpointing. Fixes include SQLite 3.51.3 and later,
-with specified backports 3.44.6 and 3.50.7. FULL synchronization is not a substitute
-for this fix. This is a future dependency/qualification requirement, not a claim
-of observed corruption or a defect in the current non-SQLite runtime slice.
-
-SQLite is currently a Unix-only development dependency for the
-[test-only store](../specs/native-execution/stage-store-contract.md), not a production
-store dependency. Updating a Proofs Python interpreter does not establish
-which SQLite a future Rust binary, helper, maintenance tool or another interpreter
-actually uses. Before permitting access to the future store:
-
-- Record `sqlite_version()` and `sqlite_source_id()` from EACH accessing runtime,
-  plus executable identity, wrapper crate/package version, compile options and
-  selected VFS. Record bundled/static versus system/dynamic link mode and actual
-  loaded library provenance where applicable; do not infer it from Cargo.lock or
-  the shell's unrelated `sqlite3` executable alone.
-- Require a fixed release or explicitly verified vendor backport in the supported
-  runtime matrix. Do not compare versions lexically or reject documented fixed
-  backports merely because their minor version is lower. Recheck packaged binaries
-  and every new connection factory/tooling entry point after dependency updates.
-- Keep one service-owned writer policy, but enumerate checkpoint/reader/maintenance
-  connections too. One logical writer does not exclude a concurrent checkpoint
-  from another connection. Unqualified external tools must not open the live store.
-- Test runtime provenance enforcement, mismatched linked versions and concurrent
-  write/checkpoint behavior on disposable databases. Stress tests passing alone do
-  not prove absence of this rare race or replace verified fixed-build provenance.
-
-The isolated tests query the actual Rust-linked SQLite build and check connection
-settings on disposable files. They leave the installed server and live databases
-unchanged. Their scoped results do not establish production restart recovery,
-physical flush success or the other unrun storage tests above.
-
-
-## 16. Remaining design decisions versus implementation work
-
-### Decisions/protocol details still to settle
-
-- **Recovery authority and supported failures:** finish the frozen-custodian external cleanup contract, trusted
-  post-exec boot/token admission and prospective-versus-late observation distinction; then decide supported lost-anchor
-  cases. Current primitive/healthy-guardian successes do not qualify a replacement execution service.
-- **Recovery's own lifetime:** define scope-level arbitration, publication before acquisition/STOP, crash-safe recovery
-  ownership and bounded member accounting. Resolve reader-recovery SH versus writer-demand admission without weakening
-  normal fairness; exclusive-writer takeover is separate. Do not add a new permanent controller by accident.
-- **Warm integration and one capacity authority:** map service admission to existing broker/project/generation lifetimes,
-  remove duplicate grant decisions, and define sequential request closure versus whole-generation retirement. The
-  private SQL prototype's one-stage-per-scope-generation constraint is not the complete warm-worker design.
-- **History corruption, retention and assets:** specify bounded registry/store reconciliation and replacement, format
-  migration, pruning under live-scope references and external-asset durable publish/GC. The chosen SQLite/registry split
-  and ordering principles are settled; the complete failure procedures are not.
-- **Installation/cutover:** finalize supported launcher inventory, service packaging/discovery, capability epochs and
-  rollback procedure. §10 already states no dual authority, no unchanged old launcher assumed fenced, and no lock-inode
-  replacement. Concrete installation/deployment is neither completed nor authorized by these local changes.
-
-### Specified requirements, not open-ended architecture questions
-
-The narrow client identity/submit/get/cancel contract, immutable intent, one-use launch consumption, unknown outcome
-without replay, independent resource closure and caller-owned result before ACK are specified and have scoped private
-tests. This is not a request to redesign them. Native service/RPC wiring, authentication, external assets, production
-store use, warm integration, migration and complete acceptance remain implementation/qualification work.
-
-The deterministic activity-updated soft deadline and immutable hard bound in §7 are requirements with configurable
-proposed defaults, not an unanswered request for a learned scheduler. Implementing complete attempt-scoped CPU/fork/exit
-accounting still needs a platform mechanism and tests; unavailable accounting must use the stated hard-bound fallback
-and be reported, not be relabeled complete activity-based updating. Sleep/resume and error paths also need qualification.
-
-Stop adding storage features to postpone custody decisions. The next sequence is the smallest safe frozen-custodian
-qualification, explicit reconciliation of its result into this contract, then narrow service/warm integration. Retain
-independent review and exact-image fault tests. No further topology or storage layer is justified merely by the existence
-of an untested case.
-
-### Ordered implementation and acceptance checklist
-
-Paths below are relative to the named repository. Roles identify responsibility, not additional services. This is a
-sequence of decision/acceptance gates: independent preparation may proceed, but dependent production wiring must not
-assume an unresolved predecessor has passed. New production module placement remains proposed until its interface is
-reviewed; existing test modules are not production implementations.
-
-| Step | Responsible role and exact existing paths | Decision or acceptance gate | Dependencies and current status |
-| --- | --- | --- | --- |
-| 1. Finish frozen-scope and identity contract | SDK recovery: `lean-rs` → `crates/lean-toolchain/src/native_guardian.rs`, `crates/lean-toolchain/src/native_guardian/ownership.rs`; host lifecycle: `lean-host-mcp` → `docs/native-execution-lifecycle-design.md` §§4,8 | Select supported frozen/dead-custodian and lost-anchor cases; specify trusted post-exec token/boot admission. Qualify exact external cleanup before a real guardian STOP, then normal CONT recovery, with independent exit/custody/resource oracles and failure rescue excluded from success. | First gate, unresolved. Supplied-token and running-orphan evidence is narrower. Stopped-child controls reportedly pass; actual guardian setup encountered pre-worker EPERM, not a recovery pass. |
-| 2. Integrate registry recovery and admission | SDK recovery: `lean-rs` → `crates/lean-toolchain/src/native_guardian/ownership.rs`, `crates/lean-toolchain/src/writer_lock.rs`, `crates/lean-toolchain/src/native_guardian/record_lifetime_tests.rs` | Define one scope recovery operation, publication before STOP/acquisition, two-recoverer arbitration and recovery's own crash. Decide recovery SH versus writer-demand admission; test complete-set acquisition, concurrent writer, frozen recoverer and ordinary fully-dead record retirement. No second inventory or controller. | Depends on 1 for affected failure cases. Metadata/capacity separation and candidate EX close-and-retry are implemented; takeover and its complete fault contract are not. |
-| 3. Close warm-worker/one-capacity contract | Host lifecycle with SDK recovery: `lean-host-mcp` → `crates/lean-host-mcp/src/broker.rs`, `crates/lean-host-mcp/src/broker/control.rs`, `crates/lean-host-mcp/src/project.rs`, `crates/lean-host-mcp/tests/project_lifecycle.rs` | Map request, attempt and retained generation to one admission authority. Test sequential requests, cancellation, warm retention/retirement, service loss and replacement without double grants or duplicate launch. Specify which old admission paths are removed. | Contract work can proceed now; recovery-dependent wiring waits for 1–2. One-stage/scope test coverage does not settle generation reuse. |
-| 4. Wire production identity/store/assets/auth | Host lifecycle: `lean-host-mcp` → `crates/lean-host-mcp/src/server.rs`; existing reference tests `crates/lean-host-mcp/tests/stage_store_contract/{store,connection,result_client,caller_results,cuts}.rs` and `crates/lean-host-mcp/tests/stage_store_runtime_contract/service_loss_regressions.rs`; contract `specs/native-execution/stage-store-contract.md` | Review production module placement and authorization boundary, then preserve original identity, consumption-before-GO and caller-save-before-ACK. Decide live-reference retention, corruption/replacement and external-asset publish/GC procedures; test SQL/asset failures and actual replacement-service behavior. | Production modules not yet selected or wired. Depends on 2–3 for scope ownership; existing private store and healthy-guardian/passive-observer tests remain reusable evidence, not restart adoption. |
-| 5. Implement bounded activity/deadline policy | Host lifecycle with SDK recovery: `lean-host-mcp` → `crates/lean-host-mcp/src/config_schema.rs`, `crates/lean-host-mcp/src/config_file.rs`; SDK `lean-rs` → `crates/lean-toolchain/src/native_guardian.rs`; policy here §7 | Implement specified configurable soft/hard bounds; select complete attempt-scoped activity accounting and explicit unavailable-accounting fallback. Test productive long jobs, hung jobs, fork/exit, sleep/resume and blocked I/O without heartbeat-as-progress or hard-bound renewal. | Policy specified; platform accounting and full wiring unqualified. Can develop independently; integrated enforcement depends on settled scope/lifetime in 1–3. |
-| 6. Install/cut over and delete superseded authority | Repo coordinator with host lifecycle: `lean-host-mcp` → `crates/lean-host-mcp/src/main.rs`, `crates/lean-host-mcp/src/runtime_compatibility.rs`, `scripts/prerelease.sh`; migration contract here §10 | Finalize supported launcher inventory, packaging/discovery, capability epochs and rollback. Test old/new compatibility and failure cuts; remove old lifecycle/admission authority rather than leave parallel grants. Preserve lock inodes and live custody throughout migration. | Concrete install plan unresolved; depends on 1–5 acceptance. Local implementation authorization does not authorize deployment or push. |
-| 7. Exact-image mixed workload and proof acceptance | Repo coordinator: `lean-host-mcp` → `crates/lean-host-mcp/tests/smoke_perf.rs`, `crates/lean-host-mcp/tests/kanproofs_eval.rs`, `scripts/memory_stability.py`; proof-repository acceptance entry points must be inventoried before execution | Run reviewed fault suite and real concurrent mixed Lean workloads on the candidate image, then existing proof gates with preserved theorem scope and inputs. Record binary/source hashes, timings, overlap, memory/swap and cleanup/unknown outcomes; distinguish finite acceptance from universal guarantees. | Depends on 6's reviewed candidate and applicable deployment authorization. Prior rollout timings and isolated prototype passes do not qualify this architecture. No proof-source changes are implied. |
+Do not add storage features to postpone custody decisions. Reconcile the smallest qualified recovery contract, then wire
+the narrow service/warm path. If an OS counterexample defeats a claim, narrow support or change the mechanism; a timer,
+database row or additional owner cannot silently turn the failed case into success.

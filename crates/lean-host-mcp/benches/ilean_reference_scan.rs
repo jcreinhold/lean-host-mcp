@@ -3,7 +3,7 @@
 //! `find_references` with `scope = project` answers from the on-disk `.ilean`
 //! reference index rather than the worker, so its cost is entirely file I/O and
 //! JSON parsing. Nothing measured it. The one number on record —
-//! "~565 ms over a 500-module project" (`docs/ilean-reference-index.md:14-16`)
+//! "~565 ms over a 500-module project" (`docs/architecture.md#reference-indices`)
 //! — is a single wall-clock sample from an `#[ignore]`d test, taken on a corpus
 //! about a third the size of a real one, and it is the sole justification for
 //! the reader being serial.

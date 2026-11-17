@@ -13,8 +13,9 @@
 //! 3. `lean --print-prefix`: fall back to whatever `lean` resolves to on
 //!    `PATH` (the developer's default toolchain).
 //!
-//! Only this crate needs the dance; the parent (`lean-host-mcp`) does not
-//! link `libleanshared` and has no `build.rs`.
+//! Only the worker emits Lean runtime rpath/linker directives. The parent
+//! (`lean-host-mcp`) does not link `libleanshared`; its `build.rs` embeds Git
+//! source identity only.
 
 use std::env;
 use std::path::PathBuf;
