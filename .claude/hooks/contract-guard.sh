@@ -9,10 +9,9 @@
 #   1. stdout is the MCP transport (AGENTS.md / main.rs). Stdio is the
 #      default transport and stdout carries JSON-RPC frames; diagnostics go
 #      to stderr via `tracing`. A `println!`/`print!` in library/worker
-#      code corrupts the protocol stream. The repo has ZERO such calls in
-#      src today — keep it that way.
-#   2. The parent never links libleanshared (AGENTS.md "Multi-toolchain
-#      dispatch"). Only crates/lean-host-mcp-worker may depend on the
+#      code corrupts the protocol stream; CLI subcommands are exempt below.
+#   2. The parent never links libleanshared (AGENTS.md "Runtime
+#      boundaries"). Only crates/lean-host-mcp-worker may depend on the
 #      Lean-runtime crates. Adding lean-rs / lean-rs-host / lean-rs-sys /
 #      lean-rs-worker-child to the PARENT manifest silently re-links the
 #      dylib and breaks multi-toolchain dispatch. (lean-rs-worker-parent is

@@ -1,126 +1,92 @@
 # lean-host-mcp
 
-A Model Context Protocol server that gives an AI agent direct access to a Lean 4 project's elaborator and kernel. The
-agent can read proof context, get ranked lemma suggestions, inspect declarations, test tactics, verify declarations, and
-find semantic references without applying source edits automatically.
+A Model Context Protocol server that gives an AI agent access to a Lean 4 project's elaborator and kernel. Agents can
+read proof context, find lemmas, inspect declarations, try tactics, verify declarations, and find semantic references.
+Tools read source and elaborate in memory without applying source edits automatically.
 
-Use only with trusted local clients and projects. Lean commands, tactics, and import initializers can perform IO with
-the server user's privileges. The supervised worker provides crash isolation, not an OS sandbox; a command such as
-`#eval IO.FS.writeFile ...` can write files.
+Lean runs inside a supervised worker child rather than through an external LSP. A wedged tactic, runaway typeclass loop,
+or worker crash is isolated from the server. Each project's `lean-toolchain` pin selects a matching worker, so one
+server can host several Lean toolchains.
 
-It hosts Lean **in-process**: the elaborator and kernel run inside a supervised worker child and are reached as
-in-process calls, not as messages to an external LSP. A wedged tactic or runaway typeclass loop kills the child, and the
-supervisor restarts it instead of taking down the server. That is the difference from `lean-lsp-mcp`. One running
-`lean-host-mcp` can serve projects on different Lean toolchains at once; it reads each project's `lean-toolchain` pin
-and launches the matching pre-built worker.
+Use trusted local clients and projects. Lean commands, tactics, and import initializers can perform IO with the server
+user's privileges. The worker provides crash isolation, not an OS sandbox; `#eval IO.FS.writeFile ...` can write files.
 
-## What it gives an agent
+## Tools
 
-Five semantic tools. Four use a `kind` mode; `lean_verify` takes target groups directly:
+Five semantic tool families cover the proof workflow:
 
-- **`lean_context`** — proof context. Initial mode: `proof_position`.
-- **`lean_trial`** — in-memory experiments. Modes: `proof_step` and `command`.
-- **`lean_verify`** — declaration verification for explicit, file-wide, or module-wide target groups.
-- **`lean_lookup`** — declaration inspection, declaration inventory, proof search, and references. Modes: `declaration`,
-  `declarations`, `proof_search`, and `references`.
-- **`lean_status`** — project/toolchain/config status and current-source file diagnostics. Modes: `project` and
-  `file_diagnostics`.
+| Tool | Modes and purpose |
+| --- | --- |
+| `lean_context` | `proof_position`: goals and local context at a declaration proof position |
+| `lean_lookup` | `declaration`, `declarations`, `proof_search`, `references`: inspect, search, and navigate |
+| `lean_trial` | `proof_step`, `command`: try tactics or Lean commands in memory |
+| `lean_verify` | Verify explicit, file-wide, or module-wide declaration target groups |
+| `lean_status` | `project`, `file_diagnostics`: project status or current-source diagnostics |
 
-`lean_compatibility` with `mode: "pure_v1"` describes compiled expectations without starting Lean. Its default loaded
-mode establishes a project-bound native contract through normal broker admission and an actual host session. It returns
-loaded worker/toolchain/shim facts without executing a target proof. The semantic calls read source and elaborate in
-memory. The separate `lean_runtime` tool observes worker activity or obtains an expiring lease on an idle worker pool,
-keeping warm caches unless retirement is explicitly requested. No tool applies source edits automatically; executed Lean
-code can still perform IO. `lean_request` offers retrievable request IDs, retained final results and cancellation to
-clients without MCP Tasks negotiation. Busy projects wait for admission in FIFO order. The workflow and request/result
-schemas are in [`docs/tool-catalog.md`](docs/tool-catalog.md).
+`lean_compatibility` describes compiled expectations with `mode: "pure_v1"`, or checks an actual worker in the default
+`loaded` mode. `lean_runtime` observes worker activity and leases an idle worker pool. `lean_request` prepares and
+submits retained requests, retrieves results, and requests cancellation without requiring MCP Tasks negotiation.
+
+Semantic responses contain `data`, structured `errors`, and project/session `trust`. Lean-domain failures remain in
+`data`; recoverable runtime failures appear in `errors`. See the [tool catalog](docs/tool-catalog.md) for request and
+response schemas, proof-position selectors, artifact freshness, and the
+[retained request lifecycle](docs/tool-catalog.md#prepared-retained-lifecycle-v3).
 
 ## Quick start
 
+Install the published server, then build a worker for each supported Lean toolchain you use. Worker installation needs
+Rust on `PATH` and the matching Lean toolchain installed through elan:
+
 ```sh
-# 1. Install the server.
 cargo install lean-host-mcp --locked
-
-# 2. Install a worker binary for each Lean toolchain you use. With no flag,
-#    install-worker scans ~/.elan/toolchains and builds any that are missing or
-#    stale; each lands under ~/.local/share/lean-host-mcp/workers/<id>/. The
-#    worker is compiled locally per toolchain (it links libleanshared), so this
-#    needs a Rust toolchain on PATH and the matching Lean toolchain via elan.
-lean-host-mcp install-worker                       # build missing/stale workers
-lean-host-mcp install-worker --toolchain v4.30.0   # or one toolchain
-lean-host-mcp install-worker --list                # see build/runtime/protocol status
-lean-host-mcp install-worker --clean               # remove all workers (e.g. to force a clean rebuild)
-
-# 3. Run it from inside any built Lake project. The toolchain pin comes from
-#    `lean-toolchain`, the project root from `lakefile.{lean,toml}`.
-cd /path/to/your/lake/project
-lake build && lean-host-mcp
+lean-host-mcp install-worker                      # install missing or stale workers
+lean-host-mcp install-worker --toolchain v4.35.0  # install one toolchain
+lean-host-mcp install-worker --list               # inspect build/runtime/protocol status
 ```
 
-Contributors working from a checkout install the same way but with `cargo install --path crates/lean-host-mcp` — from a
-checkout, `install-worker` builds the worker from the workspace source (and `--source-dir` points it at a checkout
-elsewhere). Build per-member, never `cargo build --workspace`, which would link libleanshared into the parent (see
-[docs/operations.md](docs/operations.md)).
+Workers live under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. From a source checkout, install the server with
+`cargo install --path crates/lean-host-mcp --locked`; `install-worker` then builds the worker from that workspace.
+`--source-dir` selects another checkout. Build each workspace member with `-p`; `cargo build --workspace` would link
+`libleanshared` into the parent and break multi-toolchain dispatch. See
+[development commands](docs/operations.md#build-test-lint).
 
-To pin a default project explicitly instead of relying on the working directory:
+Run the server in a built Lake project:
 
 ```sh
-lean-host-mcp --lake-root /path/to/your/lake/project
+cd /path/to/your/lake/project
+lake build
+lean-host-mcp
 ```
+
+The project needs a `lakefile.lean` or `lakefile.toml`, a `lean-toolchain` pin, and built `.olean` files for requested
+imports. The server reads dependency paths from `lake-manifest.json`. Project dependencies follow their usual build or
+precompiled-artifact setup; the host shims and semantic-search runtime are supplied by the server's dependencies.
+Consumer projects do not declare or link those packages. [`fixtures/lean/`](fixtures/lean/README.md) is the test
+example.
 
 ## Connecting an MCP client
 
-For a client that launches the server with a `command` (the common case, including Claude Code), stdio is the default:
+Stdio is the default. Configure a client that launches a command with the installed executable's absolute path:
 
 ```jsonc
 {
   "mcpServers": {
     "lean-host": {
-      "command": "/abs/path/to/lean-host-mcp/target/release/lean-host-mcp"
-      // No args needed when the client launches the server inside the
-      // target Lake project; otherwise pass `--lake-root /abs/path`.
+      "command": "/abs/path/to/lean-host-mcp",
+      "args": ["--lake-root", "/abs/path/to/lake/project"]
     }
   }
 }
 ```
 
-You do **not** need to set `LEAN_SYSROOT` in the client config. The server picks the worker binary for each project from
-its `lean-toolchain` pin and sets `LEAN_SYSROOT` invisibly per spawn, so one server process serves every toolchain you
-have installed a worker for.
+Omit `args` when the client launches the server inside the target Lake project. The server selects each project's worker
+and sets `LEAN_SYSROOT` per spawn; the client needs no toolchain environment override.
 
-## Prerequisite: a built Lake project
-
-A project the server can host needs only two things:
-
-- A `lakefile.lean` or `lakefile.toml`.
-- A successful `lake build`, so the `.olean` files for the modules the tools import exist on the search path. The plain
-  `lake build` with no target is the usual step.
-
-Dependencies need no extra configuration once their own `lake build` has run: the server reads `lake-manifest.json` and
-adds each transitive package's build output to the import search path. For mathlib, `lake exe cache get` pulls
-precompiled oleans; other dependencies follow the equivalent setup. Semantic proof search follows the same
-zero-consumer-setup model through the package-owned `lean-semantic-search-runtime` crate, so consumer projects do not
-declare or import it. `fixtures/lean/` is the demo target the test suite uses, and doubles as a minimal template to
-copy.
-
-## Transports
-
-`lean-host-mcp` serves exactly one transport per process. Stdio is the default (see above). Streamable HTTP is selected
-by `--bind` or `LEAN_HOST_MCP_BIND`:
+For a native local client that connects by URL, start Streamable HTTP:
 
 ```sh
-lean-host-mcp serve --lake-root /path/to/your/lake/project --bind 127.0.0.1:8765
+lean-host-mcp serve --lake-root /path/to/lake/project --bind 127.0.0.1:8765
 ```
-
-HTTP is for native local clients. Every request carrying an `Origin` header is rejected with HTTP 403; browser access is
-not supported. Host validation remains enabled, and binding is restricted to loopback because the server has no built-in
-authentication or TLS.
-
-The default HTTP route is `/mcp`; override it with `--http-path /some-path` or `LEAN_HOST_MCP_HTTP_PATH`. `--http-path`
-requires `--bind`; it never switches transports by itself. HTTP binds are loopback-only (`127.0.0.1` or `::1`): the
-server has no built-in authentication or TLS, so non-loopback addresses are rejected rather than merely discouraged.
-
-A client that accepts a URL connects to the HTTP route directly:
 
 ```jsonc
 {
@@ -132,105 +98,52 @@ A client that accepts a URL connects to the HTTP route directly:
 }
 ```
 
-## Project resolution
+A process serves one transport. `--bind` or `LEAN_HOST_MCP_BIND` selects HTTP; `--http-path` or
+`LEAN_HOST_MCP_HTTP_PATH` changes its default `/mcp` route and requires a bind. HTTP binds are loopback-only
+(`127.0.0.1` or `::1`), with Host validation and no built-in authentication or TLS. Every request with an `Origin`
+header is rejected with HTTP 403; browser access is unsupported.
 
-Every tool call may pass its own `project="/abs/path"` to route that one call to a specific Lake root — useful when a
-single client surveys several projects. A call that omits it resolves the project in this order:
+## Project resolution and configuration
 
-1. `LEAN_HOST_MCP_PROJECT` (or the `--lake-root` flag)
-2. Walk upward from the server's working directory for `lakefile.{toml,lean}`
-3. `primary_project` in the config file (`./lean-host-mcp.toml` or `~/.config/lean-host-mcp/config.toml`)
+A per-call `project: "/abs/path"` selects that call's Lake root. When omitted, resolution follows:
 
-All tunable knobs (the worker's Lean heap budget, pool sizing, transport) can also be set in that config file instead of
-env vars. Run `lean-host-mcp config init` to write a documented starter with every option at its default, then edit it.
-See [Configuration file](docs/operations.md#configuration-file) for discovery and precedence, and
-[Configuration reference](docs/operations.md#configuration-reference) for the full per-knob table. Concurrency is
-`broker.max_workers` worker processes, one in-flight call each. `broker.max_workers_per_project` defaults to one; set it
-to two to allow independent calls in the same project to run together within the global limit.
-`runtime.project_mailbox_capacity` bounds how many calls may wait for one worker before further ones are shed with a
-retryable `busy` status. Metadata-only degraded responses, project-scope `.ilean` reference reads, and warm module-query
-cache hits do not open or queue on a worker.
+1. `--lake-root` or `LEAN_HOST_MCP_PROJECT`.
+2. The nearest `lakefile.lean` or `lakefile.toml` above the server's working directory.
+3. `primary_project` in the discovered configuration file.
 
-## Response Shape
-
-Every public tool returns the same semantic outer shape. `data` is mode-specific; `errors` is a structured issue channel
-for runtime failures and warnings; `trust` is the small project/session identity plus optional artifact facts.
-
-```jsonc
-{
-  "data": { /* mode-specific */ },
-  "errors": [],
-  "trust": {
-    "project_root": "/abs/path",
-    "session_id": "uuid-or-metadata-only",
-    "lean_toolchain": "leanprover/lean4:v4.35.0",
-    "artifacts": [
-      {
-        "artifact": "source",
-        "scope": "file",
-        "status": "edit_fresh",
-        "path": "My/Module.lean"
-      }
-    ]
-  }
-}
-```
-
-Artifact facts use stable tokens: `artifact` is `source`, `olean`, `ilean`, or `worker`; `scope` is `file`, `module`,
-`project`, or `toolchain`; `status` is `edit_fresh`, `build_fresh`, `stale_build`, `missing_build`, `unknown`, or
-`not_applicable`. The `artifacts` array is omitted when no tool has a proof-relevant artifact fact to report. Quiet
-telemetry never removes these trust facts.
-
-The split that matters: **Lean-domain failures** (parse errors, elaboration diagnostics, kernel rejection, meta timeout)
-ride inside `data` — a failed proof is still a successful call. **Recoverable runtime failures** (mailbox or
-project-pool pressure, worker death, session loss) appear in `errors` with a retryable flag and structured details.
-**MCP errors** are reserved for I/O/config failures and unusable Lake projects. By default the semantic response rides
-as JSON text in `content`; `server.response_carrier` (`structured` / `both`) can place it in `structuredContent`
-instead. Tools advertise no `outputSchema` — the Anthropic Messages API drops it, and deep `$defs` break strict clients.
-
-Two proof-agent details are worth calling out:
-
-- An unresolved `lean_context(kind="proof_position")` `after_text` selector returns bounded `proof_boundaries`, each
-  with a copyable follow-up selector such as `{ "kind": "index", "index": 1 }`.
-- `lean_trial(kind="proof_step")` diagnostics label their coordinate space. Candidate-local errors usually report
-  `coordinate_space: "synthetic_buffer"` with a `synthetic_range`; original file ranges appear only as `original_range`
-  when the worker can map them honestly.
-
-## Documentation
-
-- [`docs/tool-catalog.md`](docs/tool-catalog.md) — the semantic tool workflow and the per-mode request/result schema.
-- [`docs/operations.md`](docs/operations.md) — tuning knobs, transport internals, the runtime-error contract, and the
-  test/perf harness.
-- [`docs/architecture.md`](docs/architecture.md) — how the server is built (for contributors).
+Run `lean-host-mcp config init` to create a documented configuration file. The
+[operations guide](docs/operations.md#configuration-file) covers discovery and precedence, pool sizing, deadlines,
+memory budgets, response presentation, and durable request journals. By default a project uses one worker; configuring
+`broker.max_workers_per_project` allows concurrent calls in the same project within the global `broker.max_workers` cap.
 
 ## Versions
 
-`lean-host-mcp` 0.16.8 requires the matching **lean-rs 0.9.10** stack: parent, child, protocol, host runtime and
-`lean-toolchain`, plus **lean-semantic-search 0.7.8**. Worker protocol **13** rejects older workers before requests.
-Install the parent and per-toolchain workers together. Local development uses the complete upstream source graph; these
-versions have not been publicly released as part of this change.
+| Component | Current source requirement |
+| --- | --- |
+| `lean-host-mcp` | 0.16.8 |
+| `lean-rs` stack and `lean-toolchain` | 0.9.10 |
+| `lean-semantic-search` stack | 0.7.8 |
+| Worker protocol | 13 |
+| Supported Lean window | 4.30.0 through 4.35.0 |
 
-The supported Lean window remains `4.30.0 ..= 4.35.0`; the current development validation uses Lean **4.35.0**. A local
-install is not qualification of the full toolchain/platform release matrix.
+Install the parent and workers together; protocol 13 rejects older workers before requests. Registry installations may
+differ from the source requirements shown here. Current development validation uses Lean 4.35.0; a local install does
+not qualify the full toolchain/platform release matrix.
 
-A project brings its own toolchain: the server hosts whatever Lean version the project's `lean-toolchain` pins, as long
-as it falls inside the supported window. The window is read directly from `lean-toolchain::SUPPORTED_TOOLCHAINS` (itself
-sourced from [`lean-rs/lean-toolchain`](https://github.com/jcreinhold/lean-rs/blob/main/lean-toolchain)), never
-duplicated here. A pin outside the window is rejected when the project opens, with a one-line verdict naming the window
-and the nearest supported version, and `install-worker` refuses to build for it.
+The exact supported releases come from `lean_toolchain::SUPPORTED_TOOLCHAINS`, re-exported from
+[`lean-rs-abi`](https://github.com/jcreinhold/lean-rs/blob/main/crates/lean-rs-abi/src/supported.rs). Numbered pins
+outside that table are rejected with the supported window and nearest version; `install-worker` also refuses them.
+Widening support starts in `lean-rs`, followed by dependency and worker updates here.
 
-Widening the window is a `lean-rs` change first, then a version bump here.
+## Documentation
 
-## Durable Retained Requests
-
-New clients use `retained_request_lifecycle_v3`: prepare a bounded server-issued ticket, save its immutable binding,
-then submit that exact ticket once. Capacity returns explicit backpressure; unknown or forgotten tickets never create
-work. Execution disposition, result-preserving cancellation and acknowledgment remain separate from proof verdicts.
-Enable durable result evidence with `--request-journal /path/to/private/request-journal` (or
-`LEAN_HOST_MCP_REQUEST_JOURNAL`), using one directory per broker. Without this option, retention remains process-local.
-Restart never replays work; an interrupted dispatch remains explicitly unknown unless a terminal result was durably
-retained. See the [lifecycle contract](docs/tool-catalog.md#prepared-retained-lifecycle-v3).
+- [Tool catalog](docs/tool-catalog.md): public tool contracts and proof workflow.
+- [Operations](docs/operations.md): configuration, installation, runtime failures, and development checks.
+- [Architecture](docs/architecture.md): contributor boundaries, worker ownership, caching, and artifact custody.
+- [Reference indices](docs/architecture.md#reference-indices): project-scope reference lookup, schema, and performance
+  evidence.
+- [Changelog](CHANGELOG.md): release history.
 
 ## License
 
-MIT OR Apache-2.0. See `LICENSE-MIT`, `LICENSE-APACHE`.
+MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Release lean-host-mcp"
+  short_description: "Prepare and validate a lean-host-mcp release"
+  default_prompt: "Use $release-lean-host-mcp to prepare and validate the next release."
+
+policy:
+  allow_implicit_invocation: false

@@ -301,182 +301,88 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 ### Fixed
 
-- **The Lean heap ceiling aborted workers before the residue budget could recycle them.** `runtime.lean_max_memory_kib`
-  was a fixed 8 GiB, below the 9 GiB floor under the residue budget, so at Mathlib scale the ceiling always fired first
-  — and it does not fire gracefully. Its documented behaviour, "overrun surfaces as an ordinary Lean error in the `ok`
-  payload", is false in this embedding: Lean's allocator signals the overrun by throwing a C++ exception, which cannot
-  unwind through the Rust frame at the shim FFI boundary, so the child aborts with exit status 134 and
-  `fatal runtime error: Rust cannot catch foreign exceptions, aborting`. Observed on a three-file kan-proofs sweep:
-  files one and two answered, file three aborted the child mid-import at 1.7 GiB of residue against a budget that could
-  never be reached. The ceiling's default is now derived — twice the residue budget, because the gap has to cover what
-  the heap counts and the budget does not, which that abort put at 4.4-6.3 GiB — so the clean recycle is always strictly
-  ahead of the abort, and raising the budget carries the ceiling with it. Setting `runtime.lean_max_memory_kib` at or
-  below the budget explicitly is now warned about at startup. The same sweep now completes with zero restarts.
-- **The residue budget could exceed the machine it was sizing for.** Its 9 GiB floor was unconditional, so on any host
-  under about 12 GiB the budget was larger than total RAM and the child grew until the OS killed it — the exact failure
-  the bound exists to prevent. The derived default is now also capped at what is left after one in-flight import, which
-  makes the existing below-floor startup warning reachable on the machines it was written for.
-- **A child abort carried no record of why.** `LeanWorkerRestartReason::ChildAbort` kept only the operation name, and
-  the child's stderr is drained once at reap and retained nowhere else, so a supervisor-absorbed abort — the path behind
-  the read-only verify/proof-state degraded verdict — reported `child_abort operation=…` and nothing more. It now
-  carries the exit status and the child's message, which is what identified the heap-ceiling abort above.
-- **A pooled Lean environment could kill the worker mid-request.** Upstream, `Environment.extensions` is sized once at
-  import and can never grow afterwards, so an environment held across a later import that registers an environment
-  extension — which is what every `initialize` block and every `register_simp_attr` does — is permanently short.
-  Elaborating any `namespace`, `section`, or `open … in` against it panics inside Lean once per out-of-range slot, and
-  the child dies mid-query; the tool call comes back as a degraded batch. Session pooling made this reachable. lean-rs
-  now stamps each imported environment with an extension-registration epoch and drops any held environment whose stamp
-  no longer matches, in the worker child and in `SessionPool` alike. Requires the patched lean-rs; no wire protocol
-  change, no config change, and an import that registers nothing is unaffected. A related fix keeps a staleness eviction
-  from permanently disabling the worker's reuse hint, which would otherwise have made every later session open count
-  against `max_imports` even when it was a pool hit.
-
-- **A worker restart the server could not classify was recorded as planned.** `worker_internal` — the bucket for a
-  restart whose cause this build does not recognise, including any cycling policy a future lean-rs adds — did not count
-  toward `runtime.worker_restart_limit`, so a child cycling repeatedly for an unknown reason never tripped the
-  crash-loop breaker. `diagnosis` already treated the same cause as disrupting a verdict, so the two disagreed. It now
-  counts.
-- **A child abort reported as a restart reason was misclassified.** `LeanWorkerRestartReason::ChildAbort` had no arm in
-  the cause mapping and fell through to `worker_internal`, which (see above) was then treated as planned and
-  non-abnormal. It now maps to `child_abort`, matching how the same event is classified when it arrives as a worker
-  error instead of a restart reason.
+- Derive the Lean heap ceiling from the residue budget: budget plus the larger of that budget and 8 GiB. The former
+  fixed 8 GiB ceiling was below the 9 GiB residue floor, aborting healthy imports before clean recycling. Heap
+  exhaustion throws a C++ exception across the Rust FFI boundary and aborts the child with exit status 134; it is not
+  ordinary Lean-domain data. A three-file kan-proofs sweep aborted on file three at 1.7 GiB of residue; heap allocation
+  outside the residue accounting measured 4.4–6.3 GiB. The same sweep now completes without restarts. Explicit heap
+  limits at or below the residue budget produce a startup warning.
+- Cap the derived residue budget at RAM remaining after one in-flight import. Its unconditional 9 GiB floor could exceed
+  available memory on hosts below about 12 GiB, letting the OS kill the child before recycling.
+- Include the child's exit status and stderr in `ChildAbort` restart evidence; previously only the operation survived
+  supervisor handling.
+- Evict pooled environments when Lean registers a new environment extension. Their fixed-size `extensions` arrays
+  otherwise became too short and panicked during elaboration. Preserve reuse hints after staleness eviction so later
+  pool hits do not count as imports. This requires patched lean-rs; no wire or configuration change.
+- Count unrecognized `worker_internal` restarts toward `runtime.worker_restart_limit`, and map `ChildAbort` restart
+  reasons to `child_abort`. Both paths previously treated abnormal restarts as planned.
 
 ### Changed
 
-- **The supported Lean window floor is now 4.30.0; workers for 4.27.0–4.29.1 are unservable.** lean-rs 0.6.1 dropped
-  those toolchains: their `libleanshared` does not export the `collectAxioms` symbol the mandatory host shim references,
-  so the window claimed support the runtime never had. A project pinned to a dropped toolchain is now rejected at open
-  with the out-of-window verdict, and `install-worker --prune` removes workers already installed for one. Pulled in
-  through the existing `"0.6"` lean-rs requirements; no API change.
-- **`scripts/memory_stability.py` reports import residue, the quantity the recycle policy actually reads.** It reported
-  RSS only, which is an observation and not a policy input, so the harness could not show whether a long-lived server
-  was approaching a recycle. New `peak_import_residue_mib` / `final_import_residue_mib` / `import_residue_budget_mib`
-  summary fields, and a kan-proofs workload (`scripts/memory_stability.kanproofs.json`) alongside the fixture one.
-  Measured over 60 calls on a Mathlib-scale project: 60/60 `ok`, generation unmoved, 0 restarts, residue flat at 1786
-  MiB against a 9216 MiB budget.
-- **The worker recycle bound is denominated in bytes, not in imports.** `WORKER_MAX_IMPORTS = 4` was the server's only
-  reclamation mechanism, and it counted the wrong thing: an import's unreclaimable residue is its *whole closure*
-  (`.olean` compacted regions are position-dependent, so only the first import in a process is memory-mapped and every
-  later one re-copies even already-mapped modules privately). Measured against real per-file headers at Mathlib scale,
-  the first import costs 10–18 MB and each later one 2.0–4.5 GB — so the same count of four imports costs 9.6 GiB on one
-  workload and 16.0 GiB on another. The server now accumulates the bytes the child reports and recycles on
-  `runtime.worker_import_residue_budget_mib`, defaulting to a quarter of system RAM split across `broker.max_projects`
-  and clamped to 9–12 GiB. A `max_imports = 32` backstop remains underneath, reachable only when a child reports
-  zero-valued import statistics. New restart cause `import_residue`; planned, so it does not count toward
-  `runtime.worker_restart_limit` and does not taint a verdict.
-- **The session pool is sized independently of the recycle bound.** New `runtime.worker_session_pool_capacity` (default
-  8) sets how many imported environments one child keeps warm. It was previously tied to the recycle bound, which meant
-  the child's LRU eviction never ran and a `changed_coverage` sweep over more than four files re-imported on every step.
-  A held environment costs about 70 MiB against 2.0–4.5 GB for the import it saves.
-- **Residue cycles are taken while the project is idle where possible.** Above 60% of the budget the project actor waits
-  for its next call with a short timeout instead of blocking indefinitely; on a quiet tick it recycles the worker and
-  re-imports the most recently served profile, so both the spawn and the import land between calls rather than inside
-  one. Reported as the `import_residue_idle` restart cause. The `import_residue_idle : import_residue` ratio is the
-  operational signal: idle dominating means the cost is off the critical path, reactive dominating means the budget is
-  too low for how continuously the workload runs. Contexts without a tokio runtime keep the plain blocking receive.
-- **`runtime.import_residue_bytes` and `runtime.import_residue_limit_bytes`** now ride the telemetry block, so the
-  quantity the policy acts on is observable rather than inferred.
-- **One import per session instead of one per call.** The root cause of the server's memory growth was upstream: the
-  worker child rebuilt its host session on every `OpenHostSession`, so every tool call ran a full `importModules`, and
-  under `loadExts := true` those imported regions are never reclaimable. Child RSS therefore grew with the *number of
-  calls*, not with the workload — measured at ~1.18 GiB per import, 2.9 GiB across eleven repeat opens. lean-rs now
-  reuses a session whose `(project_root, mode, imports, import_profile)` match. Warm `search_for_proof` on the fixture
-  fell from 1.41 s to 1.26 s (−10.3%, p = 0.01) on top of the batching win that preceded it.
-- **One Lean heap budget replaces four resident-memory thresholds.** `runtime.lean_max_memory_kib` (default 8 GiB,
-  `LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB`) is enforced inside the child by `lean_internal_set_max_memory`, so an elaboration
-  that exhausts it fails as ordinary Lean-domain data inside the `ok` payload and the worker keeps serving. Removed:
-  `runtime.worker_rss_post_job_restart_kib`, `runtime.worker_rss_hard_kill_kib`, `runtime.worker_rss_sample_millis`,
-  `runtime.import_switch_rss_soft_kib`, the `invalid RSS config` startup check, and the forced recycle every 64
-  requests. All four measured resident memory, which counts the shared, clean, mmapped `.olean` pages every
-  Mathlib-scale worker maps at startup — so they fired on healthy workers while doing nothing about the growth above.
-  Dropping the hard-kill watchdog also removes the supervisor's polling read loop, which forked `/bin/ps` on macOS every
-  250 ms during an in-flight call. RSS is still sampled once per call for `runtime.rss_kib`; no policy reads it.
-  `[runtime]` goes from 10 knobs to 5.
-- `scripts/rss_threshold_sweep.py` is now `scripts/memory_stability.py`: it replays a workload `--repeats` times against
-  **one** server and reports whether the worker generation advances, rather than sweeping thresholds that no longer
-  exist.
-- **Worker cycling is bounded, and switching import profiles no longer costs a re-import.** Session reuse removes growth
-  with call *count*, but not with import *count*: an environment imported with `loadExts := true` is never reclaimed, so
-  a child that keeps importing keeps growing — unbounded, that ended in an OS `SIGKILL` before call 180. Dropping the
-  outgoing environment before importing the next one does not help, because under `loadExts := true` an import's
-  compacted regions survive the environment that owns them. The worker child therefore parks the outgoing session in a
-  bounded pool and the parent cycles the child on a budget (see the byte-denominated bound above, which replaced this
-  entry's original import *count*). An alternating workload became the same workload as a repeating one: 200 calls over
-  two profiles perform 2 imports and never recycle the worker, where before they cycled roughly every other call. On
-  `benches/worker_roundtrip.rs` an `inspect_declaration` that switches profiles every iteration runs in 2.17 ms against
-  2.36 ms for one that does not — the switch is now a key comparison and a round trip, where it used to be ~787 ms of
-  respawn and re-import. The supervisor's own all-causes restart backstop is raised to clear the planned cycle rate,
-  because its default of 16 per minute counted these planned cycles and, once exhausted, refused to spawn any
-  replacement at all.
-- **`artifacts_rebuilt` now catches a rebuild under any profile the child may still hold, not just the last one.** The
-  check previously skipped whenever the incoming import profile differed from the previous call's, on the grounds that a
-  differing profile re-imports anyway. Under pooling it does not: a profile served several calls ago can be restored
-  without importing, and would be served from `.olean` files rebuilt since. The controller now stamps each profile the
-  child may be holding, bounded by the same `runtime.worker_session_pool_capacity` that sizes the child's pool. Cost is
-  unchanged at one `stat` per import per call.
-- **Opening a worker no longer spends an import proving it can.** Both worker builders opened a session during startup
-  purely as validation. This server hands every real call its own imports, so it passed an empty import set to the
-  builder and never reused the session that open produced — one full import, one pooled session slot, and one of
-  `max_imports`, spent on an environment no call could reach, on every project open and on every per-call semantic
-  child. A builder given no imports now opens no session; one given imports still opens eagerly, since then the session
-  it prepares is the one later calls reuse. Deployment validation is unchanged and still runs up front, because
-  `LeanWorkerHostHandleBuilder::check` — which the server calls when it opens a project — opens a session
-  unconditionally.
-- **Project-scope `lean_lookup(kind = "references")` parses less instead of remembering more.** Over a 1431-module
-  project (76 MB of `.ilean`), a phase split put ~95% of the cost in the JSON parse, so the reader stopped doing the
-  parsing it was throwing away: every document was parsed **twice**, because the `version` probe that looked like a
-  cheap prefix read actually walked the whole file (Lean's `Json` is an `RBNode`, so `Json.compress` sorts the keys and
-  `version` lands last — byte 116,287 of 116,299 in a sampled file); one shared document type served both entry points,
-  so a reference query materialized and discarded the whole `decls` subtree while a declaration outline discarded the
-  whole `references` subtree; and the reference map was built in full and *then* filtered, at ~400k transient
-  allocations corpus-wide. The version gate now runs after a single parse (with the future-version verdict preserved by
-  a re-probe on the failure path only), `references` and `decls` have independent projections, and matching entries are
-  selected during deserialization so allocation is proportional to hits. Whole-project worst case 427 ms → ~120 ms. The
-  reader still holds no cache and no state between calls.
-- A `files`-restricted reference query now reads only the indices that can contribute, instead of scanning the whole
-  project and filtering afterwards: 271 ms → ~0.5 ms for one file. A path the reader cannot invert with certainty —
-  including Lake's mangled filenames, e.g. module `«kan-lint-style»` indexing as `kan-lint-style.ilean` — falls the
-  whole request back to the full walk, so a narrowed answer is never smaller than an unnarrowed one.
+- Raise the supported Lean floor to 4.30.0 with lean-rs 0.6.1. Lean 4.27.0–4.29.1 lacks the mandatory shim's
+  `collectAxioms` symbol; project opening rejects those pins and `install-worker --prune` removes their workers.
+- Replace the four-import recycle limit with accumulated import-residue bytes. Only the first import maps compacted
+  regions; later imports copy their whole closure privately, including overlap. Measured first imports cost 10–18 MB,
+  later imports 2.0–4.5 GB; four imports cost 9.6 GiB in one workload and 16.0 GiB in another.
+  `runtime.worker_import_residue_budget_mib` defaults to a quarter of system RAM divided among `broker.max_projects`,
+  nominally clamped to 9–12 GiB and capped for in-flight import headroom. The `max_imports = 32` backstop applies only
+  when import statistics are zero. `import_residue` is a planned restart and does not taint a verdict.
+- Size the session pool independently with `runtime.worker_session_pool_capacity` (default 8). A held environment costs
+  about 70 MiB versus 2.0–4.5 GB to re-import it. The old coupling recycled the child before LRU eviction could run.
+- Recycle idle projects above 60% of their residue budget and re-import the latest profile between calls. The
+  `import_residue_idle : import_residue` ratio shows how often recycling stays off the request path. Without a tokio
+  runtime, the actor retains its blocking receive loop.
+- Reuse matching worker sessions instead of importing on every call. The former growth measured about 1.18 GiB per
+  import and 2.9 GiB across eleven repeated opens. Warm fixture `search_for_proof` fell from 1.41 s to 1.26 s (−10.3%, p
+  = 0.01).
+- Pool outgoing sessions so switching between warm profiles avoids imports. A 200-call, two-profile workload now
+  performs two imports without recycling; previously it recycled roughly every other call. In `worker_roundtrip`, pooled
+  alternating inspection measured 2.17 ms versus 2.36 ms steady; a switch previously required about 787 ms of
+  respawn/re-import. Raise the supervisor's all-cause restart backstop above the planned cycle rate; its former
+  16-per-minute default could permanently refuse replacements.
+- Remove RSS-based policies: `worker_rss_post_job_restart_kib`, `worker_rss_hard_kill_kib`, `worker_rss_sample_millis`,
+  `import_switch_rss_soft_kib`, their validation and the forced recycle every 64 requests. RSS includes healthy shared
+  `.olean` mappings. The derived Lean heap ceiling is an abort backstop above the residue budget, not a graceful error
+  limit. Removing the hard-kill watchdog also removes macOS `/bin/ps` polling every 250 ms. RSS remains once-per-call
+  telemetry and drives no policy.
+- Track rebuilt artifacts across every profile the child may still hold, bounded by session-pool capacity. Returning to
+  a pooled profile now detects an intervening `.olean` rebuild at the same cost of one `stat` per import per call.
+- Avoid the unused startup session when a worker builder receives no imports. Builders given imports still open eagerly.
+  Deployment validation through `LeanWorkerHostHandleBuilder::check` remains unchanged.
+- Rename `rss_threshold_sweep.py` to `memory_stability.py` and replay workloads against one server. Report residue bytes
+  and limits in telemetry and `peak_import_residue_mib`, `final_import_residue_mib`, `import_residue_budget_mib` in the
+  harness summary. A 60-call Mathlib-scale workload returned 60/60 `ok`, no generation change or restarts, and flat
+  residue at 1786 MiB against a 9216 MiB budget. Add a kan-proofs workload alongside the fixture workload.
+- Reduce project-scope reference parsing: one parse on success, separate declaration/reference projections and filtering
+  during deserialization. In a 1431-module, 76 MB `.ilean` corpus, parsing accounted for about 95% of runtime; the old
+  path parsed twice and allocated about 400,000 transient entries. The version field appeared at byte 116,287 of 116,299
+  in one file, so a supposed prefix probe scanned the whole document. Worst-case scan time fell from 427 ms to about 120
+  ms without a persistent cache. Failed parses still re-probe the version to preserve future-version errors.
+- Read only contributing indices for `files`-restricted reference queries: one-file time fell from 271 ms to about 0.5
+  ms. Uncertain path inversion, including mangled names such as `«kan-lint-style»`, falls back to a full walk.
 
 ### Added
 
-- `benches/worker_roundtrip.rs` gains an `inspect_declaration_alternating_imports` arm, the direct measurement of what
-  an import switch costs.
-- `benches/ilean_reference_scan.rs` measures a project-scope reference query end to end, with a no-hit arm that
-  separates the scan floor from result construction and a narrowed arm. The previous number on record — "~565 ms" — was
-  a single wall-clock sample from an `#[ignore]` test on a corpus a third the size.
-- A reused session's environment is a snapshot taken at import, so a `lake build` that rewrites an imported `.olean`
-  would otherwise keep being answered from the pre-build environment. The controller now stamps the newest `.olean`
-  mtime among a session's imports, re-stamps before each reusing call, and recycles the worker when it advances —
-  reported as `artifacts_rebuilt` in `runtime.call_restart`. One `stat` per import per call; the whole-build-tree scan
-  the obvious alternative implies measured 160–190 ms warm over mathlib4's 8408 `.olean` files.
+- `worker_roundtrip` gains a pooled alternating-import arm. `import_switch` distinguishes steady, pooled alternating and
+  pool-overflow profiles. Its earlier, pre-pooling baseline measured 4.9 ms steady versus 555 ms alternating; those
+  measurements predate the pooled `worker_roundtrip` figures above.
+- `ilean_reference_scan` measures full, no-hit and narrowed project scans. The former approximate 565 ms record was a
+  single ignored-test sample on a corpus one-third the size, rather than a comparable benchmark.
+- Recycle reused sessions when imported `.olean` mtimes advance, reported as `artifacts_rebuilt`. This uses one `stat`
+  per import instead of a whole-tree scan, which measured 160–190 ms warm over Mathlib's 8408 `.olean` files.
 - `lean_status` reports `broker.lean_max_memory_kib`.
-- `benches/cache_hit.rs` measures what a warm `proof_state` on an unmodified file costs — **57.6 µs**, against 21 ms
-  when a one-comment edit changes the content hash and forces the elaboration. Nothing covered this: the existing
-  `module_query_roundtrip` calls the uncached entry point and measures a full 18–20 ms worker round trip.
-- `benches/import_switch.rs` prices an import-profile switch against one resident project: 4.9 ms steady versus 555 ms
-  alternating.
+- `cache_hit` measures warm `proof_state`: 57.6 µs unchanged versus 21 ms after a one-comment edit invalidates the hash.
+  The uncached `module_query_roundtrip` measures an 18–20 ms worker call.
 
 ### Additional fixes
 
-- The project-scope reference scan no longer blocks a tokio worker thread. It is file I/O and JSON parsing from first
-  byte to last, called straight from an `async fn` with no `spawn_blocking`, so on a large project it stalled the
-  runtime for the duration of the scan.
-- `telemetry.verbosity = full` now actually puts the telemetry block on the wire. The semantic boundary dropped it at
-  `quiet` and then discarded it at `full` too, because `SemanticResponse` had no field to carry it — so the documented
-  knob had no observable effect, and every `runtime_*` column in the `smoke_perf` JSONL harness was silently always
-  null. Worker generation, restart history, RSS, and the full import list are observable again under `full`; `quiet`
-  still omits the key entirely.
-- Integration suites that spawn a server now prefer the worker built alongside them over the developer's *installed*
-  worker under `~/Library/Application Support`. Without the pin a suite silently exercised whatever binary was installed
-  last — which invalidated a worker-memory measurement here, because the installed worker predated the session-reuse fix
-  it was supposed to be testing. `stdio_lifecycle` additionally hardcoded `target/debug`, so it resolved nothing at all
-  under `cargo test --release`.
-- `scripts/memory_stability.py` reported every memory and restart fact as `null`. It read the pre-semantic tool names
-  (`inspect_declaration`, `proof_state`, …), looked for the envelope in `structuredContent` when the server's default
-  carrier is `content` text, addressed the old `runtime`/`freshness` layout rather than `telemetry.runtime`/`trust`, and
-  never asked the server for the telemetry block it was trying to read. A run therefore reported "no restarts" when it
-  had measured nothing at all.
+- Run project-scope reference file I/O and JSON parsing outside tokio worker threads.
+- Preserve `telemetry.verbosity = full` through the semantic response boundary; the telemetry block previously vanished
+  at both verbosity levels. Quiet responses still omit it.
+- Server-spawning integration tests select their adjacent built worker instead of an unrelated installed image.
+  `stdio_lifecycle` also resolves release workers correctly instead of hardcoding `target/debug`.
+- Update the memory harness to semantic tool names, both response carriers and `telemetry.runtime`/`trust`, and request
+  full telemetry. It previously reported null memory/restart facts as though it had measured stability.
 
 ## [0.7.0] - 2026-07-24
 

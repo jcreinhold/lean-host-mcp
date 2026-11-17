@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # .claude/hooks/format.sh — PostToolUse formatter (Edit|Write|MultiEdit).
 #
-# Reformats the single file Claude just edited so it always matches CI's
-# fmt gate (`cargo fmt --check`, taplo, mdwright). Reads the hook JSON on
+# Best-effort formatting for the single file Claude just edited, using
+# rustfmt, taplo, prettier, or mdwright. Reads the hook JSON on
 # stdin, dispatches on extension, and ALWAYS exits 0 — formatting must
 # never block or undo an edit. Formatter stderr is suppressed: a file
 # mid-edit may be syntactically incomplete, and a scary rustfmt error is

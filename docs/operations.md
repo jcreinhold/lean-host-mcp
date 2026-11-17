@@ -1,38 +1,35 @@
 # Operations
 
-Operational reference for `lean-host-mcp`: tuning knobs, transport internals, the full runtime-error contract, and the
-test and performance harness. Most users need none of this — start with the [README](../README.md) and the
-[tool catalog](tool-catalog.md). Reach for this page when you are sizing a deployment, debugging a retryable runtime
-issue in `errors`, or working on the server itself.
+Configure and troubleshoot the server here. Start with the [README](../README.md) for installation and client setup; use
+the [tool catalog](tool-catalog.md) for request and response contracts.
+
+- [Configuration](#configuration-file) and [reference table](#configuration-reference)
+- [Artifact freshness](#rebuilt-artifacts) and [memory sizing](#memory-and-import-cycling)
+- [Concurrency and admission](#concurrency-and-admission)
+- [Logging](#request-activity-in-the-terminal) and [worker recycles](#observing-worker-recycles)
+- [Process lifetime](#process-lifetime) and [runtime failures](#runtime-error-contract)
+- [Worker installation](#installing-workers) and [test harnesses](#build-test-lint)
 
 ## Configuration file
 
-Every knob can live in one TOML file instead of a dozen environment variables. Generate a documented starter — every
-option written at its current default, each with a comment explaining it — then edit what you need:
+Generate a commented TOML file with the current defaults:
 
 ```sh
-lean-host-mcp config init          # writes ./lean-host-mcp.toml (project-local)
-lean-host-mcp config init --home   # writes ~/.config/lean-host-mcp/config.toml (per-user)
+lean-host-mcp config init          # ./lean-host-mcp.toml
+lean-host-mcp config init --home   # platform user config directory
 ```
 
-`config init` refuses to overwrite an existing file unless you pass `--force`; `--path FILE` writes somewhere else.
-Discovery at startup:
+`--path FILE` selects another destination. Existing files require `--force` to overwrite.
 
-1. **Project-local** (preferred): the nearest `lean-host-mcp.toml`, found by walking up from the server's working
-   directory (the same upward search as the lakefile).
-2. **Home**: `<config-dir>/lean-host-mcp/config.toml` (e.g. `~/.config/lean-host-mcp/config.toml`;
-   `LEAN_HOST_MCP_CONFIG_DIR` overrides the base dir, used by the test suite).
-
-When both exist they **merge per key**: the home file sets baseline values and the local file overrides only the keys it
-sets. A missing file is fine; a malformed file is logged and ignored. The same startup validation applies whatever the
-source (non-zero guards on every budget and pool size).
+Startup loads `<config-dir>/lean-host-mcp/config.toml`, then overlays the nearest `lean-host-mcp.toml` found by walking
+upward from the server's working directory. Files merge per key, so a local file need only set its overrides.
+`LEAN_HOST_MCP_CONFIG_DIR` replaces the platform config directory. Missing files are ignored; parse failures are logged
+and skipped. A merged value with the wrong type causes the merged file configuration to be ignored.
 
 ## Configuration reference
 
-Every knob, with the environment variable — and, for the transport knobs, the CLI flag — that overrides it. Precedence
-per knob is **CLI flag > env var > file > built-in default**, so an env var still overrides the file and existing
-`LEAN_HOST_MCP_*` setups keep working unchanged. Memory budgets are in KiB and byte caps in bytes; a magnitude in a
-description (e.g. "8 GiB") is for reading, not for setting.
+For each setting, precedence is **CLI flag > environment variable > configuration file > built-in default**. Units are
+shown in the table; GiB figures in descriptions are explanatory, not literal setting values.
 
 <!-- BEGIN GENERATED: do not edit by hand. Regenerate from `config_schema::render_reference_table`; the `operations_md_reference_table_is_in_sync` test fails when this block drifts. -->
 | Key | Type | Default | Override | Description |
@@ -66,10 +63,8 @@ summary shows nonzero `budget_exceeded`, `not_attempted`, or `output_truncated` 
 
 ### Rebuilt artifacts
 
-A worker session's Lean environment is a **snapshot taken at import**. The child reuses a session whose imports match
-the request, so `.olean` files written after that import are invisible to it — a `lake build` in another terminal would
-otherwise keep being answered from the pre-build environment. (Before the worker child learned to reuse sessions it
-re-imported on every call, and that accident is what used to hide this.)
+A worker session's Lean environment is a snapshot taken at import. Reusing that session does not read newer `.olean`
+files, so the server must detect build changes before reusing it.
 
 The server records individual imported `.olean` metadata, including resolved path, size, modification time, and Unix
 file identity/change time. It follows manifest package order, custom `packagesDir`, path dependencies, Git `subDir`, and
@@ -82,91 +77,61 @@ the corresponding imported artifacts. Bundled shims and installed toolchain cont
 inputs. Concurrent builds are not an atomic execution snapshot; changed artifacts prevent result-cache insertion.
 Callers requiring an exact source/build revision must coordinate those inputs.
 
-### Memory
+### Memory and import cycling
 
-`runtime.lean_max_memory_kib` is the only memory *knob*, and it bounds the wrong-quantity problem out of existence.
-Earlier releases carried four *resident*-memory thresholds — an import-switch soft cycle, a post-job recycle, an
-in-flight hard kill, and a forced recycle every 64 requests. Resident memory counts the shared, clean, mmapped `.olean`
-pages a Mathlib-scale worker maps at startup, so those thresholds fired on healthy workers while doing nothing about the
-process that was genuinely growing. One cause of that growth — the worker child re-importing on every call — is fixed at
-the source: a call whose imports match the live session reuses it, so nothing accumulates as long as a client keeps
-asking about the same imports.
+Two quantities govern worker memory:
 
-What remains is a ceiling on the Lean **heap**, enforced inside Lean by `lean_internal_set_max_memory` rather than by
-watching the process from outside. Crossing it is an ordinary elaboration failure inside the tool result: the worker
-keeps running, concurrent calls are unaffected, and the response says which declaration was too expensive. Raise it if a
-legitimately heavy module reports memory exhaustion; lower it to make a runaway tactic fail sooner.
+- `runtime.worker_import_residue_budget_mib` bounds retained import bytes and triggers a clean recycle.
+- `runtime.lean_max_memory_kib` is a Lean heap backstop. Crossing it can abort the entire child: Lean's allocator throws
+  a C++ exception that cannot unwind through the Rust shim frame. It is not reliably a recoverable elaboration error.
 
-### Import cycling
+RSS is telemetry only. It includes clean, shared, memory-mapped `.olean` pages and does not measure unreclaimable
+imports; no server policy restarts, refuses, or recycles a worker on RSS or call count.
 
-Importing is the one thing that still accumulates. A Lean environment imported with `loadExts := true` cannot be
-reclaimed, so every import a child performs is retained until that child exits. The size of that residue is **the
-imported closure, not the delta**: `.olean` compacted regions are position-dependent, so only the *first* import in a
-fresh process gets them memory-mapped, and every later import re-materializes even already-mapped modules as private
-copies. Measured against real per-file headers from a Mathlib-scale project, the first import in a child costs 10–18 MB
-and each later one costs **2.0–4.5 GB** — with the profiles that overlap most costing the *most*, because the shared
-modules are exactly the ones re-copied.
+An environment imported with `loadExts := true` retains its imported regions until the child exits. Only the first
+import in a process memory-maps compacted regions; later imports materialize their full closure as private copies,
+including overlapping modules. On measured Mathlib-scale per-file headers, the first import retained 10–18 MB and each
+later import 2.0–4.5 GB. Four imports cost 9.6 GiB on one workload and 16.0 GiB on another, so an import count does not
+predict the required memory. The parent sums the child's `non_memory_mapped_region_bytes` instead.
 
-The worker child therefore keeps a pool of imported sessions rather than dropping the outgoing one when the imports
-change. Returning to a profile it still holds is a key comparison, not an import: an alternating workload imports once
-per **distinct** profile instead of once per switch. Holding an environment alive rather than dropping it costs about 70
-MiB — 2–4% of the import it saves — because the regions outlive the environment either way. That is what
-`runtime.worker_session_pool_capacity` buys, and why its default is 8: a changed-file sweep touches one profile per
-file, and a pool smaller than the batch re-imports on every step.
+The child keeps up to `runtime.worker_session_pool_capacity` imported sessions (default 8). Returning to a held profile
+restores it without importing. In the same measurements, holding another environment cost about 70 MiB against 2–4 GB
+for the import it saved. Session eviction and residue recycling are separate policies: dropping an environment does not
+reclaim its imported regions. A count backstop of 32 applies only when the child reports unusable zero-valued import
+statistics.
 
-`runtime.worker_import_residue_budget_mib` bounds the rest. The child reports the unreclaimable bytes each import
-retained; the server sums them over the child's lifetime and recycles it when the total crosses the budget. The default
-is derived from the machine — a quarter of system RAM split across `broker.max_projects`, clamped to 9–12 GiB, and never
-more than one child's share of RAM after the import that may be in flight, `RAM / max_projects − 4.5 GiB` — because the
-same *count* of imports costs 9.6 GiB on one workload and 16.0 GiB on another. There is a `max_imports = 32` backstop
-underneath, which exists only to catch a child that reports zero-valued import statistics; it should never fire.
+The default residue budget starts at a quarter of system RAM divided by `broker.max_workers`, clamped to 9–12 GiB. It is
+then capped at one worker's share of RAM minus 4.5 GiB for an import in flight; this affordability cap can put it below
+9 GiB. `broker.max_projects` is the legacy name for the same global worker cap.
 
-Size the pool before the budget. Each resident child can hold its residue budget, one import in flight (up to 4.5 GiB),
-and the heap gap the ceiling allows above the budget (the larger of the budget and 8 GiB) before a recycle wins, so the
-machine must fit `max_projects × (budget + 4.5 GiB + max(budget, 8 GiB))` beside everything else it runs. On a 24 GiB
-machine that is one project with an explicit `worker_import_residue_budget_mib = 4096` and
-`lean_max_memory_kib = 14680064`; the derived default there is the 9 GiB floor with an 18 GiB ceiling, which fits only
-while nothing else runs. The child inherits the daemon's environment, so `LEAN_RS_NUM_THREADS` set on the server process
-bounds the worker's Lean task threads; the default is every core, and each concurrent elaboration task holds its own
-working set.
+The default heap ceiling is **budget + max(budget, 8 GiB)**. At budgets of at least 8 GiB this doubles the budget; at
+smaller budgets the fixed gap preserves room for Lean allocations outside the residue counter. The measured gap was
+4.4–6.3 GiB during an abort under the former fixed 8 GiB ceiling. That ceiling aborted a three-file sweep on file three
+before a 9 GiB residue budget could fire. Set the heap ceiling explicitly only with this ordering in mind; startup warns
+when a configured ceiling is at or below the residue budget.
 
-What this means per workload:
+Size the worker count first. A conservative envelope per worker is `budget + 4.5 GiB + max(budget, 8 GiB)`, alongside
+the rest of the machine's workload. For example, one worker with an explicit 4 GiB residue budget has a derived 12 GiB
+heap ceiling; its conservative envelope is 16.5 GiB. An explicitly fixed budget does not shrink when the worker count
+changes. `LEAN_RS_NUM_THREADS` on the server also bounds inherited Lean task threads; the default uses every core, and
+concurrent elaboration tasks add working sets.
 
-- **A proof loop on one file never recycles.** A call whose imports match the live session reuses it, and a reuse is not
-  an import, so the total does not move however long the loop runs.
-- **Alternating among up to `worker_session_pool_capacity` profiles never recycles either**, for the same reason: a
-  pooled session is restored by key comparison.
-- **A sweep across many files recycles once every `budget / residue-per-import` files** — roughly every 3 files at
-  Mathlib scale, more on a smaller project. This is unavoidable, not a misconfiguration: *k* distinct profiles means *k*
-  imports, and if an import cannot be reclaimed then the process must eventually exit. The recycle itself is cheap; the
-  re-import after it is not, which is why the server tries to do both while you are idle.
+For stable artifacts, the import policy behaves as follows:
 
-Cycles appear in `runtime.restarts_by_cause` under two names. `import_residue` is a reactive cycle, taken on the call
-that would have crossed the budget. `import_residue_idle` is the same cycle taken proactively during a lull, at 60% of
-the budget, followed by a re-import of the most recent profile — so the next call finds a fresh child that is already
-warm. **The ratio between them is the diagnostic**: `import_residue_idle` dominating means the cost is landing between
-your calls, which is the intended state. `import_residue` dominating means the workload never pauses long enough, and
-raising the budget is the lever. Both are planned — neither counts toward `runtime.worker_restart_limit`, neither taints
-a verdict, and the call that triggers a reactive one still answers normally.
+- Repeating one file reuses its session without adding residue.
+- Alternating among profiles still held in the session pool also adds no residue.
+- Sweeping new profiles eventually recycles the child. Frequency depends on each import's measured residue and the
+  budget, rather than the number of tool calls.
 
-The one thing that will *not* help is varying your `imports` lists less: four of the five tools derive imports from the
-file's own header, so the client has no such choice.
+`import_residue` records a reactive recycle on a request. Above 60% of the budget, a quiet tick can instead recycle and
+re-import the most recent profile; this is `import_residue_idle`. A higher idle-to-reactive ratio means more of the
+restart cost lands between calls. Reactive cycles dominate when work never pauses long enough; raising the budget may
+help if the machine has room. Both causes are planned, do not count toward the crash-loop limit, and do not taint a
+completed verdict.
 
-`runtime.lean_max_memory_kib` sits above all of this as a backstop, and its default is derived from the residue budget
-for a reason worth stating: **crossing it kills the child.** Lean's allocator signals a heap-ceiling overrun by throwing
-a C++ exception, which cannot unwind through the Rust frame at the shim boundary, so the process aborts with exit status
-134 — it is not the recoverable Lean error a heartbeat or `maxRecDepth` overrun produces. A ceiling *below* the residue
-budget therefore preempts every clean recycle with an abort: a three-file Mathlib-scale sweep under a fixed 8 GiB
-ceiling answered two files and aborted the child on the third, at 1.7 GiB of residue against a 9 GiB budget that could
-never fire. The default is now twice the budget — the gap has to cover what the heap counts and the budget does not,
-measured at 4.4–6.3 GiB in that abort — so the recycle always wins. Raise it if you want a looser backstop; setting it
-below the budget is warned about at startup and is almost never what you want.
-
-> Earlier releases of this document reported +1 GiB per import and an 11.2 GiB `SIGKILL`. Those figures were resident
-> memory, measured on a fixture whose import sets shared ~99% of their closure. RSS counts clean mapped `.olean` pages
-> that cost nothing to reclaim, and under pressure it *falls* while the unreclaimable total keeps growing — it is
-> anti-correlated with the quantity that matters, not merely inflated. The figures above are physical footprint (macOS
-> `phys_footprint`, Linux `Private_Dirty`) on real project headers.
+Earlier resident-memory measurements (+1 GiB per import and an 11.2 GiB `SIGKILL`) used a fixture whose import profiles
+shared about 99% of their closure. They should not replace the physical-footprint measurements above: under pressure,
+RSS can fall while unreclaimable import bytes keep growing.
 
 ## Concurrency and admission
 
@@ -181,22 +146,28 @@ an idle LRU worker when one becomes available. Active workers are never evicted 
 projects can still execute concurrently. Cancellation removes only its own waiter, and capacity remains reserved until
 worker exit is confirmed.
 
-Each admission wait is bounded by `runtime.request_timeout_millis`, separately from the subsequent worker execution
-budget. Expiry returns `mailbox_admission_timeout` or `project_admission_timeout` without running that queued operation.
-This is not a whole-tool deadline: a tool that submits several worker operations can take longer. Explicit retained
-requests share a 128-record limit; legacy synchronous requests retain their normal transport behavior. Parallel server
-processes remain independent; lower `broker.max_workers` when the machine cannot hold that many workers.
+Worker-capacity admission, mailbox admission, and time waiting in the actor queue share one
+`runtime.request_timeout_millis` deadline. Expiry returns `project_admission_timeout`, `mailbox_admission_timeout`, or
+`queue_wait_timeout` without dispatching that queued operation. Once dispatch begins, the worker execution timeout
+applies separately. This is not a whole-tool deadline: a tool that submits several worker operations can take longer.
+Explicit retained requests share a 128-record limit; synchronous requests retain their normal transport behavior.
+Parallel server processes remain independent; lower `broker.max_workers` when the machine cannot hold that many workers.
 
 Cheap metadata paths never open a worker at all: degraded `needs_build` responses, invalid-request responses, and
 project-scope `.ilean` reference reads answer from the Lake files directly. A repeat module query on an unmodified file
 is answered from the per-project result cache and likewise never enters the mailbox, so a warm call does not queue
 behind in-flight Lean work.
 
-**Semantic search costs a second child, briefly.** `search_for_proof`'s semantic ranking runs in its own worker child,
-separate from the one serving elaboration. It is spawned for the call and released when the call ends, so two children
-are alive only for the duration of a semantic search and the steady-state footprint stays within the configured
-elaboration-worker limit. Keeping that child resident between calls was tried and measured *slower*; the note on
-`open_semantic_capability` in `src/project.rs` records why.
+Semantic proof ranking briefly opens a companion child in addition to the elaboration worker. Include that peak in
+memory planning. The server shuts it down after the call; it does not keep a separate resident ranking pool.
+Measurements in `project.rs::open_semantic_capability` found no significant improvement from keeping it resident.
+
+### Retained request storage
+
+Enable durable request evidence with `--request-journal DIR` or `LEAN_HOST_MCP_REQUEST_JOURNAL`. Use one directory per
+broker. Without it, retention is process-local. Recovered requests preserve evidence and are never replayed
+automatically. See the [retained lifecycle contract](tool-catalog.md#prepared-retained-lifecycle-v3) for ticket binding,
+result retrieval, acknowledgment, capacity, and recovery semantics.
 
 ## Request activity in the terminal
 
@@ -234,8 +205,8 @@ warning and real runtime error/recycle logs remain intact; no memory policy chan
 
 ## Observing worker recycles
 
-Every recycle is logged to **stderr** (stdout stays clean for the stdio transport) and tallied into each tool response's
-`runtime` facts, so you can answer *why* and *how often* a worker recycles without guessing.
+Every recycle is logged to stderr and counted in worker runtime facts. Set `telemetry.verbosity = "full"` to include
+those facts in public responses under `telemetry.runtime`; they are omitted at the default quiet verbosity.
 
 Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `rss_kib`, `limit_kib`, `planned`,
 `restarts_total`. Level tracks the signal, not whether the cycle was planned:
@@ -250,10 +221,11 @@ Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `r
   resolution, and the `job` span.
 
 The server no longer configures any resident-memory threshold, so in practice you see the abnormal causes above,
-`explicit`, `artifacts_rebuilt`, and the two residue causes (see "Import cycling"). `max_imports` should not appear at
-all — it is a backstop for a child that reports no import statistics. `rss_post_job` / `rss_hard_limit_exceeded` and
-`max_requests` stay in the vocabulary because the supervisor still reports them if a future policy asks for them; seeing
-one today means the worker was configured somewhere other than here.
+`explicit`, `artifacts_rebuilt`, and the two residue causes (see
+[memory and import cycling](#memory-and-import-cycling)). `max_imports` should not appear at all — it is a backstop for
+a child that reports no import statistics. `rss_post_job` / `rss_hard_limit_exceeded` and `max_requests` stay in the
+vocabulary because the supervisor still reports them if a future policy asks for them; seeing one today means the worker
+was configured somewhere other than here.
 
 Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for internal runtime detail. Example at default level:
 
@@ -261,11 +233,11 @@ Default level is `info`; set `RUST_LOG=lean_host_mcp=debug` for internal runtime
 INFO worker recycled (imports rebuilt on disk) cause=artifacts_rebuilt worker_generation=2 planned=true restarts_total=1
 ```
 
-The same data reaches the MCP client in `response.runtime`: the final-attempt cause in `call_restart`, the most recent
-in `last_restart`, and the lifetime frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause`
-(omitted when no recycle has happened). `import_residue_bytes` and `import_residue_limit_bytes` report the quantity the
-recycle policy actually reads, so how close a child is to its next cycle is observable rather than inferred. The two
-figures a cycle happened *on* are in the restart event's `reason` string.
+Full telemetry exposes the final-attempt cause in `call_restart`, the most recent in `last_restart`, and the lifetime
+frequency in `restarts_total` plus the per-cause breakdown `restarts_by_cause` (omitted when no recycle has happened).
+`import_residue_bytes` and `import_residue_limit_bytes` report the quantity the recycle policy actually reads, so how
+close a child is to its next cycle is observable rather than inferred. The two figures a cycle happened *on* are in the
+restart event's `reason` string.
 
 If a worker attempt fails and a fresh retry completes, the result remains usable. The response includes a warning about
 the first failure. Full telemetry records `previous_attempt_failure`, `retry_count`, and `final_attempt: "completed"`. A
@@ -316,99 +288,20 @@ not use broad process-name cleanup; identify the exact PID from the registry or 
 
 ## Runtime-error contract
 
-Every public tool returns the same semantic shape (see the [README](../README.md#response-shape)). Recoverable runtime
-and project-controller failures are normal tool responses with `data: null` and a structured issue in `errors`, not
-JSON-RPC errors:
+Recoverable runtime and controller failures return a semantic response with `data: null` and an issue in `errors`. The
+issue has `code: "runtime_unavailable"`, a reason, a `retryable` flag, and structured `details`. Follow that flag and
+any recovery command; not every runtime refusal is retryable. See the [response schema](tool-catalog.md#response-shape)
+for the full shape.
 
-```jsonc
-{
-  "data": null,
-  "errors": [
-    {
-      "code": "runtime_unavailable",
-      "message": "mailbox_admission_timeout",
-      "severity": "error",
-      "retryable": true,
-      "details": {
-        "reason": "mailbox_admission_timeout",
-        "project_root": "/abs/path",
-        "session_id": "uuid",
-        "worker_generation": 3,
-        "worker_restarted": false,
-        "restart_cause": null,
-        "rss_kib": 2097152,
-        "limit_kib": null,
-        "retry_after_millis": null,
-        "restarts_in_window": 1,
-        "window_millis": 60000
-      }
-    }
-  ],
-  "trust": {
-    "project_root": "/abs/path",
-    "session_id": "uuid",
-    "lean_toolchain": "leanprover/lean4:v4.35.0",
-    "artifacts": [
-      {
-        "artifact": "worker",
-        "scope": "toolchain",
-        "status": "unknown",
-        "detail": "worker runtime was unavailable for this request"
-      }
-    ]
-  }
-}
-```
+| Failure | Where it appears |
+| --- | --- |
+| Lean parse/elaboration diagnostics, kernel rejection, meta timeout | `data`; a failed proof is a completed tool call. |
+| Admission timeout, worker death, or session loss | `errors` with `code: "runtime_unavailable"`; retryability depends on the outcome. |
+| Heap-ceiling overrun | May abort the child and enter worker-death recovery; do not assume a Lean diagnostic. |
+| I/O/config errors, internal-invariant violations, unusable Lake project | MCP error. |
 
-Warnings and next actions from operation-level results are warning issues:
-
-```jsonc
-{
-  "code": "warning",
-  "message": "the project may not be fully built...",
-  "severity": "warning",
-  "next_action": "lake build # complete the project environment, then retry"
-}
-```
-
-Which failures land where:
-
-- **Lean-domain failures** — parse errors, elaboration diagnostics, kernel rejection, meta timeout — are part of `data`.
-  A failed proof is a successful tool call.
-- **Retryable runtime failures** — mailbox pressure (`busy`), project-pool pressure, worker death, session loss — are
-  `errors` with `code: "runtime_unavailable"` and `retryable: true`. Exhausting the Lean heap budget is *not* one of
-  these: it is a Lean-domain failure, reported in `data` like any other elaboration error.
-- **MCP errors** are reserved for I/O and config failures, internal-invariant violations, and unusable Lake projects.
-
-## Prompt-stack verification through MCP
-
-The KanProofs `stacks orchestrate` verifier uses the semantic MCP surface by default when a loopback HTTP server is
-available:
-
-```sh
-lean-host-mcp --lake-root /path/to/kan-proofs --bind 127.0.0.1:8765
-
-cd /path/to/kan-proofs
-uv run stacks orchestrate verify /path/to/prompt-workspace --commit <commit>
-```
-
-The verifier does not start or manage the server. Installed workers record their wire-protocol version; compatible
-package upgrades need no rebuild. An incompatible worker returns a non-retryable `runtime_unavailable` issue whose
-`next_action` and `details.recovery_command` are exactly `lean-host-mcp install-worker --auto`. The verifier calls
-`lean_verify` with sorry rejection, axiom reporting, source-digest validation, and the server-side tainted-result retry.
-
-When the server is temporarily unavailable, KanProofs falls back to only the named modules and probes under its Lake
-build lock. The standalone `stacks check --verify` compatibility surface still makes fallback explicit:
-
-```sh
-uv run stacks check /path/to/prompt-workspace --verify \
-  --backend mcp \
-  --mcp-url http://127.0.0.1:8765/mcp \
-  --fallback lake
-```
-
-Without `--fallback lake`, connection failures, missing tools, or runtime-unavailable setup failures are script errors.
-With fallback, the checker reports the fallback and uses the Lake backend for the affected run.
+Warnings also appear in `errors`, with `severity: "warning"` and an optional `next_action`. A completed fresh retry can
+return usable data alongside a warning about its earlier failed attempt.
 
 ### Internal runtime facts
 
@@ -422,14 +315,13 @@ telemetry gate: source snapshots (`source` / `file` / `edit_fresh`), build artif
 
 ## Capability shims and module queries
 
-`lean_context(kind = "proof_position")` is the common proof-agent context call: one request returns compact diagnostics,
-goals, locals, expected type, target declaration, and the surrounding declaration. It depends on the optional bounded
-`lean_rs_host_process_module_query_batch` shim; a worker whose bundled shims lack that capability answers
-`{ "status": "unsupported" }`. No public tool requests or caches whole-file info trees. Successful responses carry
-`query_facts` (worker cache status, output bytes, phase timings), and repeated calls reach the worker snapshot cache, so
-warm behavior is observable.
+`lean_context(kind = "proof_position")` returns compact diagnostics, goals, and locals, with opt-in expected type and
+proof boundaries. It depends on the optional bounded `lean_rs_host_process_module_query_batch` shim; a worker lacking
+that capability answers `{ "status": "unsupported" }`. No public tool requests or caches whole-file info trees. With
+full telemetry, `query_facts` reports worker cache status, output bytes, and phase timings. Repeated calls reach the
+worker snapshot cache, so warm behavior is observable.
 
-Files whose header imports modules the server's open env doesn't have are still processed; missing imports surface as an
+Files whose headers import modules absent from the open environment are still processed; missing imports produce a
 semantic warning issue. Files using Lean 4's module-system header syntax — `module`, `public import`, `import all`, and
 `meta import` — are supported. A header that doesn't parse short-circuits to `header_parse_failed`.
 
@@ -439,9 +331,12 @@ bootstrap failure.
 
 ## Installing workers
 
-`install-worker` always compiles the worker locally, once per Lean toolchain — its `build.rs` bakes an absolute rpath to
-that toolchain's `lib/lean`, so a worker binary can't be shipped prebuilt. What it can vary is where the worker *source*
-comes from, and it decides that itself:
+The target Lake project's requested imports must have built `.olean` files. Any ordinary Lake project can be served; it
+need not copy the [test fixture](../fixtures/lean/README.md), declare host shims, or build its own shared facet for the
+server. The worker uses the shims bundled with `lean-rs-host`.
+
+`install-worker` compiles a worker for each Lean toolchain. Its `build.rs` embeds an absolute rpath to that toolchain's
+`lib/lean`. Source selection is automatic:
 
 - **Registry** (the default for a `cargo install lean-host-mcp` binary): fetch and build the published
   `lean-host-mcp-worker` crate at the server's own version (`cargo install lean-host-mcp-worker --version =<ver>`).
@@ -513,8 +408,8 @@ LEAN_HOST_MCP_SMOKE_PROJECT=/path/to/your/lake/project \
   cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
 ```
 
-The harness deliberately does not claim speedups. Keep its JSONL output with any performance change so later comparisons
-use the same workload, byte accounting, and cold/warm worker behaviour.
+Keep the JSONL output with performance changes so comparisons use the same workload, byte accounting, and cold/warm
+worker behavior.
 
 ### Memory stability
 
@@ -533,7 +428,6 @@ uv run scripts/memory_stability.py \
 ```
 
 Measured on a Mathlib-scale project (kan-proofs, four tools against one file, 15 repeats — 60 calls): **60/60 `ok`,
-generation 1 throughout, 0 restarts, residue 1786 MiB peak and final against a 9216 MiB budget, RSS 5.46 GB.** That is
-the claim the design rests on, on real data rather than the fixture: a workload that repeats one import profile charges
-nothing, because a reused session is not an import. Compare with the recycle behaviour of a *changed-file* sweep, which
-imports once per file and is bounded instead by the residue budget (`tests/kanproofs_eval.rs`).
+generation 1 throughout, 0 restarts, residue 1786 MiB peak and final against a 9216 MiB budget, RSS 5.46 GB.** This
+baseline exercises a repeated import profile; it does not predict the residue growth of a changed-file sweep. The latter
+is bounded by the residue budget and covered by `crates/lean-host-mcp/tests/kanproofs_eval.rs`.

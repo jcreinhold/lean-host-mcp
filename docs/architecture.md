@@ -1,23 +1,21 @@
 # Architecture
 
-> This is a contributor and maintainer document: how the server is built and why. If you want to *use* `lean-host-mcp`,
-> start with the [README](../README.md) and the [tool catalog](tool-catalog.md).
+This contributor reference explains worker ownership, admission, artifact custody, and result validity. Start with the
+[README](../README.md) for setup and the [tool catalog](tool-catalog.md) for public contracts.
 
-`lean-host-mcp` is a thin MCP server over `lean-rs-worker`. The design thesis is a **declaration-centric** public API:
-agents name a declaration and, when needed, a proof position inside it — never cursor coordinates, source spans, byte
-offsets, or replacement ranges. The host translates those names into bounded semantic jobs against a supervised worker
-child without applying source edits automatically, then projects the results into one stable semantic response shape.
-Executed Lean code can perform IO with the server user's privileges; the worker is not an OS sandbox.
+The five semantic tools expose a declaration-oriented proof workflow. The host resolves names and proof-position
+selectors into bounded jobs, sends them to a supervised Lean worker, and projects typed results into the public
+response. Tools do not apply source edits automatically. Executed Lean code can perform IO with the server user's
+privileges; the worker is not an OS sandbox.
 
-The model-facing tools are:
-
-```text
-lean_context -> lean_lookup -> lean_trial -> lean_verify
-                         \-> lean_status
-```
-
-`lean_lookup` owns declaration inspection, proof search, and semantic references. Text grep, Mathlib placement policy,
-raw hover/type queries, and low-level term/meta primitives are not part of the public MCP surface.
+- [Crate layout](#crate-layout) and [transport](#transport-boundary)
+- [Runtime control](#runtime-control) and [worker ownership](#project-and-worker-boundary)
+- [Proof API](#declaration-centric-proof-api), [tool routing](#tool-semantics), and
+  [cache validity](#budgets-and-caching)
+- [Reference indices](#reference-indices)
+- [Lake options](#lake-compilation-options) and [deadlines](#queue-and-execution-deadlines)
+- [Artifact custody](#native-ownership-and-artifact-custody) and
+  [external inputs](#pure-compatibility-and-external-input)
 
 ## Crate Layout
 
@@ -28,11 +26,11 @@ crates/lean-host-mcp/src/
   server.rs         LeanHostService tool registration
   broker.rs         ProjectBroker: LRU pool, idle eviction, per-call routing
   broker/control.rs process-local worker activity snapshots and expiring admission leases
-  project.rs        LeanProject serialized controller for one Lake project
+  project.rs        LeanProject actor: one serialized controller and worker
   tools/            semantic.rs facade; declaration/proof_search/proof_action/position internals
   projections.rs    stable MCP projections from lean-rs worker types
   lake_meta.rs      minimal Lake-project metadata
-  cache.rs          content-hashed LRU over every bounded module query
+  cache.rs          bounded module-query cache with source/options/artifact/generation keys
   envelope.rs       internal operation envelope adapted to { data, errors, trust } at the public boundary
 
 crates/lean-host-mcp-worker/src/
@@ -44,228 +42,146 @@ and send one typed semantic job to the project controller.
 
 ## Transport Boundary
 
-The transport seam is above `LeanHostService`. Stdio and Streamable HTTP both construct the same service over the same
-`ProjectBroker`; neither transport owns Lean sessions, project caches, queueing policy, restart policy, or tool schemas.
-`transport_http.rs` contains the axum and rmcp Streamable HTTP session wiring so HTTP request types do not reach the
-tool, broker, or project-runtime layers.
+Stdio and Streamable HTTP construct the same `LeanHostService` over one `ProjectBroker`. The private binary module
+`transport_http.rs` owns axum/rmcp wiring; HTTP types do not enter the tools, broker, or project runtime. Independent
+HTTP sessions share the broker's worker caps, queues, and lifecycle state. Stdio ends on client EOF; `--bind` selects
+HTTP.
 
-Stdio remains the default process model: one client launches one server and EOF ends the process. `--bind` selects a
-single Streamable HTTP server for that run. HTTP sessions are independent rmcp sessions, but the cloned
-`LeanHostService` values share one broker, so all sessions still obey the same per-project serialized controller,
-bounded project queue, memory budget, and worker lifecycle presentation.
+The SDK handles stateless discovery and per-request capability/version metadata for MCP 2026-07-28, with
+initialize/session support for legacy clients. Both paths use the same service and retained-request registry. HTTP
+rejects every present `Origin` with 403 and validates loopback Host headers. See
+[client setup](../README.md#connecting-an-mcp-client) for transport selection and [operations](operations.md) for
+runtime failure handling.
 
-MCP 2026-07-28 uses the SDK's stateless discovery and per-request capability/version metadata. Legacy clients retain
-initialize/session support. Both paths share the same service and retained-request registry. Protocol guards follow
-[the MCP versioning contract](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning). HTTP is
-native-only: every present `Origin` is rejected with 403, while requests without Origin still require an allowed
-loopback Host. This follows the
-[Streamable HTTP security requirements](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
+Runtime pressure remains in the semantic `errors` channel. Transport/protocol failures use HTTP or MCP errors. The
+semantic facade projects internal `Response<T>` envelopes into `{ data, errors, trust }`; operational tools have their
+own contracts in the [tool catalog](tool-catalog.md). Output carrier selection belongs at the service boundary.
 
-Runtime pressure is not a transport error. Mailbox pressure, project-pool pressure, worker death, session loss, and
-restart recovery continue to surface through the semantic response `errors` channel with structured runtime metadata.
-HTTP status codes are reserved for transport/protocol failures such as invalid headers or bad HTTP paths.
+## Runtime control
 
-Request cancellation reaches the project queue and the worker supervisor. Cancelled queued jobs are skipped before
-opening a Lean session; in-flight cancellation uses the worker layer's token and may recycle that project's worker.
-Cancellation remains bounded by supervisor observation and deadlines, rather than being an instantaneous stop. The
-owning operation waits for its terminal cleanup instead of treating a cancellation acknowledgement as termination.
-Dropping a caller's future also signals cancellation without freeing the worker's capacity early.
+`lean_compatibility(mode = "loaded")` uses the same broker admission, actor mailbox, startup accounting, and worker-slot
+lifecycle as semantic calls. Its actor job opens a checked host session but submits no target proof. The broker owns one
+required host-binding subset per supported compiled-header ABI; loaded actor/generation receipts remain separate from
+that expected contract. Worker-session configuration enforces the subset after every recycle, and semantic trust
+preserves actual receipts independently of telemetry verbosity. This replaces caller-side binary/shim profiles rather
+than adding a second admission queue.
 
-`lean_compatibility` uses the same broker admission, actor mailbox, startup accounting, and worker-slot lifecycle as
-semantic calls. Its actor job opens a checked host session but submits no target proof. The broker owns one required
-host-binding subset per supported compiled-header ABI; loaded actor/generation receipts remain separate from that
-expected contract. Worker-session configuration enforces the subset after every recycle, and semantic trust preserves
-actual receipts independently of telemetry verbosity. This replaces caller-side binary/shim profiles rather than adding
-a second admission queue.
+`lean_runtime` coordinates admission under the broker registry mutex. `acquire` requires an idle pool; `drain` pauses
+new admission while admitted work finishes. Preparation utilities, startup locks, queued jobs, and background
+recycling/prewarming all participate in the activity count. The guard survives caller disconnects and registry removal
+through cleanup, so an evicted controller cannot start new maintenance.
 
-`lean_runtime` is an additional synchronous operational tool, separate from the five semantic job families. Its
-idle-pool lease shares the broker registry mutex with both resident project borrowing and startup-lock acquisition. A
-claim is refused while any caller holds a project, any startup lock is retained, or any actor-owned message remains
-active. Background recycling and prewarming acquire actor activity under that same lock; old controllers cannot start it
-after eviction. Pool activity counts survive registry removal and remain held through cleanup. Once claimed, new worker
-admission is refused until release or monotonic expiry. Idle reaping also pauses, preserving warm caches unless the
-acquirer explicitly requests retirement. Retirement only closes idle actors' mailboxes; the existing worker permits
-still wait for confirmed shutdown. Snapshots and shutdown requests alone do not establish that resources have been
-freed. The token and broker instance identity are process-local, with no cross-process scheduling, priority policy,
-preemption, or persistence. See the [tool catalog](tool-catalog.md#worker-activity-and-admission-leases) for the public
-contract.
-
-Cooperating artifact writers announce process-bound demand on the same canonical physical domains before waiting for
-exclusive artifact custody. The broker checks that handoff gate before borrowing a resident actor or admitting idle
-maintenance. Contention pauses affected new calls within their existing cancellation/deadline budget; admitted calls
-finish normally. A separate 100 ms observation in the existing reaper retires only affected idle, unborrowed actors,
-even when ordinary idle expiry is disabled or a lease preserves warm caches. It does not advance or release that lease.
-Retirement still uses the ordinary process owner, so an acknowledgement never releases capacity or artifact custody
-before actual scope closure. Nonoverlapping actors remain available. Matching uses the actor's retained actual read-domain
-receipts, including frozen dependencies and companions, rather than a newly reduced manifest. A brief competing reader
-gate can also cause conservative backpressure or idle retirement; it is not evidence of a writer identity. The protocol
-does not claim FIFO ordering among multiple writers or defeat OS scheduling/filesystem stalls.
-
-The generic `reader` and `read-proxy` admissions still refuse writer demand before Ready. They can be composed across
-multiple physical domains, so waiting while retaining an earlier shared lock would create a reader/writer cycle.
-A metadata caller holding no other artifact read or write custody may explicitly select
-`read-proxy --single-domain-wait`. This one-domain proxy retries only lock admission under its original absolute
-admission deadline, closes transient gates before waiting, and observes its private FIFO caller on each iteration and
-again before Ready. EOF or deadline expiry emits no Ready. Metadata executes once in the caller after that receipt;
-neither a metadata body nor a target check is retried. SDK multi-domain readiness probes retain the fail-fast default.
-
-Whole-domain admission owns the complete fixed input set. Its opted-in pure helpers report normal exit 75 only for
-typed pre-custody contention (`--report-contention`); every malformed receipt, descriptor, helper failure or uncertain
-cleanup remains a hard error. The SDK verifies successful pre-transfer classification, releases all tentative shared
-locks (including confirmed EOF-proxy helper closure), then waits within the original deadline and cancellation budget.
-It never waits for a later domain while retaining an earlier partial set, and never repeats a payload or metadata body.
-A full-set gate preflight avoids spawning repeated helpers while known writer demand remains; it grants no read
-custody, and the actual nonblocking transfer checks close the following race. Native payload bootstrap and cold worker
-admission finish the full set before guardian acknowledgement. A warm worker's guardian retains earlier generation
-locks, so warm contention uses the existing confirmed pre-body generation cycle instead of waiting behind its own
-custody. Graph, epoch, inheritance and guardian failures after admission are not retried.
-
-The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
-cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
-project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.
+A lease expires on monotonic time and is process-local. Its owner renews or releases it with the returned token; status
+only observes it. `retire_idle` closes idle mailboxes once admitted activity finishes, while worker permits remain held
+until confirmed shutdown. Idle expiry pauses during a lease, but independent artifact-writer demand may retire affected
+caches. Neither a snapshot nor a shutdown request proves resources are free. The lease does not preempt work, reserve
+system RAM, or coordinate unrelated processes. See the
+[public contract](tool-catalog.md#worker-activity-and-admission-leases).
 
 ## Project And Worker Boundary
 
-`ProjectBroker` owns an LRU pool of `Arc<LeanProject>`, keyed by canonical Lake root. It handles idle eviction, manifest
-invalidation, multi-project routing, and coalescing concurrent opens for the same canonical root. `LeanProject` owns a
-dedicated controller thread; that thread is the sole owner of the `lean-rs-worker-parent` host handle, so "exactly one
-owner of the Lean runtime at a time" is a structural fact rather than a lock discipline. It submits one semantic job at
-a time in FIFO order and tracks host presentation facts such as the current worker generation, the last restart reason,
-and the last import profile. A bounded project mailbox admits further callers in FIFO order; admission waits are
-cancellable and deadline-bounded. Cold-project capacity uses a separate FIFO admission queue, so clients do not race
-retries for idle workers. The parent binary never links `libleanshared`; the per-toolchain worker child does.
+`ProjectBroker` owns a bounded LRU pool keyed by canonical Lake root. It resolves projects, invalidates changed
+manifests, coalesces opens, and admits up to `max_workers_per_project` independent actors under the global `max_workers`
+cap. Each `LeanProject` actor has one dedicated controller thread, one host handle, its own cache and restart state, and
+one in-flight job. The parent never links `libleanshared`; the per-toolchain worker child does.
 
-The broker reserves capacity before opening a worker. Opening, resident and retiring project workers all count against
-`broker.max_workers`; a slot is released only after confirmed shutdown. Ordinary workers, semantic companions and
-replacement generations share an actor-owned process tracker. When the actor stops accepting jobs and its scope ends, a
-retirement registry keeps the slot and tracker until every direct child has been reaped. Late exit observation
-automatically restores capacity, including after cleanup-thread creation fails and broker polling retries. An
-unconfirmed exit keeps the slot unavailable. This registry is process-local; it does not reconcile server crashes or
-Lake descendants. Same-project startup is serialized even when a caller disconnects, and rechecks the per-project worker
-limit. Idle LRU workers may be replaced when capacity is full, while a worker borrowed by a caller or processing queued
-work cannot be evicted. Capacity counts project runtimes rather than memory bytes. It does not cover the transient
-semantic-search companion child described below or external Lean processes. Different projects can still run
-concurrently. A project can use several workers when configured, with one in-flight job per worker. Degraded responses
-and pure `.ilean` reads use `project_identity_without_worker` so they can fill semantic trust identity without spawning,
-and a warm module-query cache hit is answered from the project handle without entering the mailbox. A full project queue
-is a structured retryable infrastructure error rather than unbounded memory growth.
+Typed `ProjectMessage` variants carry job metadata and a typed reply channel into the bounded actor mailbox.
+`ProjectActorState::handle_message` runs the selected operation through shared lifecycle handling. Queued admission is
+FIFO, cancellable, and deadline-bounded; a separate FIFO queue admits cold projects. A worker session borrows the
+controller's host handle and stays within synchronous dispatch. It cannot cross `.await` or be shared between tasks.
 
-Worker memory is bounded by retained import bytes, not by watching the process. Above that sits
-`runtime.lean_max_memory_kib`, a Lean *heap* ceiling enforced by `lean_internal_set_max_memory` — a backstop rather than
-a second policy, because crossing it aborts the child: Lean's allocator signals the overrun with a C++ exception that
-cannot unwind through the Rust frame at the shim boundary. Its default is therefore derived from the residue budget
-(doubled) rather than fixed, so the clean recycle always fires first. Nothing restarts on resident memory: RSS counts
-the shared, clean, mmapped `.olean` pages every Mathlib-scale worker maps at startup, which made the four thresholds
-this replaced fire on healthy workers. RSS is still sampled once per call for the `rss_kib` runtime fact; no policy
-reads it.
+The broker reserves a slot before opening a worker. Opening, resident, and retiring actors count against the cap until
+confirmed shutdown. An actor-owned process tracker covers ordinary workers, semantic companions, and replacement
+generations. Once the actor seals, the retirement registry retains its slot until every direct child is reaped. Late
+exit observation restores capacity, including after cleanup-thread creation failure; uncertain cleanup retains the slot.
+This registry is process-local and does not reconcile server crashes or Lake descendants. The cap counts actor runtimes,
+not memory bytes or each transient companion process. External Lean processes are outside it.
 
-What accumulates instead is *imports*. A session whose imports match the live one is reused, so a child's retained state
-no longer scales with call count — but an environment imported with `loadExts := true` is never reclaimed, so it still
-scales with what a child has imported. The unit is bytes, not imports: `.olean` compacted regions are position-dependent
-and each `importModules` gets a fresh `ImportState`, so only the first import in a process is memory-mapped and every
-later one re-materializes its whole closure — including already-mapped modules — as private dirty pages. Measured
-against real per-file headers at Mathlib scale, that is 10–18 MB for the first import and 2.0–4.5 GB for each one after
-it, and five *near-identical* profiles cost more (16.0 GiB) than five unrelated ones (9.6 GiB) because overlap is what
-gets re-copied. The policy restart both worker builders set therefore bounds the residue in the unit the child itself
-reports — `max_import_residue_bytes`, accumulated from `LeanWorkerImportStats::non_memory_mapped_region_bytes`, which
-predicts physical footprint growth with slope 1.09 and R² 0.96. A `max_imports` backstop sits underneath it, high enough
-never to fire except when a child reports zero-valued import statistics.
+Same-project startup stays serialized after caller disconnects and rechecks the per-project limit. The broker can evict
+an idle LRU actor, but cannot evict a borrowed actor or one with queued work. Metadata-only degraded responses and pure
+`.ilean` reads use `project_identity_without_worker`; valid module-query cache hits bypass the actor mailbox. A full
+mailbox returns structured retryable pressure.
 
-Because the residue is unreclaimable either way, the child *keeps* the outgoing environment instead of dropping it when
-the imports change, in a session pool whose capacity is now an independent knob rather than a mirror of the restart
-bound. Returning to a profile it still holds costs a key comparison rather than an import, at a measured ~70 MiB per
-extra live environment against the 2.0–4.5 GB an import costs. A workload that repeats one profile never trips the
-bound, and neither does one alternating among as many profiles as the pool holds; a sweep across more distinct profiles
-than the budget covers recycles, which is physics rather than policy. Cycles that do fire are planned, appear as
-`import_residue` in `call_restart`, and do not consume the abnormal-restart budget — and when the project actor finds
-itself idle above 60% of the budget it takes the same cycle early as `import_residue_idle`, re-importing the most recent
-profile so the spawn and the import both land between calls. Fatal child exits are reported by the worker layer; the
-host maps those structured outcomes once into MCP runtime facts. It does not automatically replay interrupted jobs: Lean
-elaboration and tactics can perform IO, so worker death does not establish replay safety. Responses carry runtime facts
-(`worker_generation`, `worker_restarted`, `retry_count`, `queue_wait_millis`, `call_elapsed_millis`, `call_cpu_millis`,
-`call_restart`, `last_restart`, `final_attempt`, `previous_attempt_failure`) so clients can distinguish Lean-domain
-results from infrastructure recovery and lifecycle history. The two timing fields bracket the call: `queue_wait_millis`
-covers admission delay, `call_elapsed_millis` the worker-call wallclock (queue excluded), and `call_cpu_millis` the
-worker child's own CPU delta — contention-immune, and the figure the `output.slow_call_warning_millis` (default 10 s)
-per-call refactoring warning keys on. The server reports these facts and the client decides policy; the single exception
-is opt-in: `retry_tainted_non_positive` on trial/verify requests asks the server to apply one specific policy itself —
-re-issuing a non-positive verdict once when the runtime was recycled mid-call — and the retry is still surfaced through
-the same `retry_count` fact rather than hidden.
+### Import memory and session reuse
 
-The controller keeps an earlier failed attempt separate from the final attempt. A completed retry returns its result
-with a warning naming the earlier failure. A restart during the final attempt still invalidates the result; an unknown
-or interrupted retry never becomes cacheable merely because the retry started. The warning remains visible when runtime
-telemetry is off.
+`max_import_residue_bytes` is the policy that cleanly recycles a child. `runtime.lean_max_memory_kib` is a separate Lean
+heap backstop: crossing it during allocation can throw a C++ exception through the Rust FFI frame and abort the child
+with exit status 134. It is derived as `budget + max(budget, 8 GiB)`, converted to KiB. A fixed 8 GiB ceiling previously
+sat below the 9 GiB residue floor and aborted file three of a kan-proofs sweep before a clean recycle could run. The 8
+GiB minimum headroom covers the measured 4.4–6.3 GiB gap between residue and Lean heap; doubling handles larger budgets.
+When overriding the heap ceiling, preserve headroom above the residue budget.
 
-Each semantic tool opens a worker session with imports derived from the source header or explicit request. The worker
-child answers a matching open from its live session, or from one it has pooled, rather than importing again — so a
-session outlives the call that opened it and survives calls under other import profiles. Each such environment is a
-snapshot taken at *its own* import, so a child holding several holds several snapshots of differing age. The controller
-mirrors the pool: it stamps the newest `.olean` mtime among the incoming profile's imports before each call, against the
-stamp it recorded the last time that same profile ran, and cycles the worker when the stamp advances —
-`artifacts_rebuilt` in `runtime.call_restart`. That recycle is pre-job, so the call is still answered by a live worker.
-Lean-domain failures such as parse errors, elaboration diagnostics, missing imports, unsupported shim exports, failed
-proof snippets, and sorry policy failures are structured tool data. Recoverable runtime failures are semantic `errors`
-with `code: "runtime_unavailable"`. MCP errors are reserved for I/O/config failures, internal invariants, and unusable
-Lake projects.
+RSS is observation only. It includes clean shared `.olean` mappings and can fall while private retained memory grows.
+The child reuses matching imports, so retained state no longer grows per call. Imports still accumulate: `importModules`
+with `loadExts := true` retains its environment regions, and only the first import maps compacted regions. Later imports
+materialize their whole closure as private copies, including overlap.
 
-The core capabilities the worker exercises across that boundary are the `lean_rs_host_*` symbols (34 mandatory, 13
-optional) that ship inside `lean-rs-host` as a vendored Lake package. The semantic proof-search lane uses the same
-zero-consumer-setup shape through the package-owned `lean-semantic-search-runtime` crate. `lean-host-mcp` chooses the
-host cache root and toolchain/sysroot, but the runtime crate owns the `LeanSemanticSearch` source payload, provenance,
-materialization, and Lake build. Consumer projects never declare, link, or import the semantic-search package.
+Measurements on real per-file kan-proofs headers explain the byte budget:
+
+- The first import used 10–18 MB; later imports used 2.0–4.5 GB each.
+- Four imports cost 9.60 GiB on one profile sample and 16.00 GiB on another.
+- Accumulated `LeanWorkerImportStats::non_memory_mapped_region_bytes` predicted physical footprint growth with slope
+  1.09 and R² 0.96. Import count, compacted bytes, and RSS did not provide the same signal.
+- Retaining a warm environment cost about 70 MiB, compared with 2.0–4.5 GB to import again.
+
+The session pool therefore retains outgoing environments, with capacity independent of the residue budget (default eight
+profiles). Returning to a held profile avoids an import. `max_imports` remains a 32-import backstop for unusable
+zero-valued statistics. Planned `import_residue` cycles do not consume the actor's abnormal-restart budget; the
+supervisor has a separate all-causes restart backstop.
+
+Above 60% of the residue budget, a quiet actor can cycle as `import_residue_idle` after a two-second grace. It prewarms
+the latest profile only if recently served (within one minute), and cycles at most once per quiet period. The
+`import_residue_idle : import_residue` ratio measures how much restart cost lands between requests.
+
+A pooled environment is a snapshot from its import. Before reuse, the controller compares exact metadata for each named
+`.olean` in that profile: resolved path, size, mtime, and Unix file identity/change time. Removal, backdating,
+replacement, or unreadable metadata invalidate a previously held profile. A pre-job `artifacts_rebuilt` recycle is not
+execution taint. Actual artifact read epochs independently invalidate a generation after a cooperating writer changes
+transitive inputs; named-import stamps alone cannot detect every failed partial build.
+
+Worker death never authorizes replay: Lean elaboration and tactics may perform IO. The opt-in
+`retry_tainted_non_positive` policy allows one retry of a non-positive trial/verification verdict after a mid-call
+recycle. Earlier failure evidence stays separate from the final attempt. A completed retry retains a visible warning; a
+tainted or interrupted final attempt remains unusable and uncacheable. Runtime facts and timing interpretation are
+listed in [operations](operations.md#internal-runtime-facts).
+
+The worker loads the bundled `lean_rs_host_*` shim capabilities from `lean-rs-host`. The source-backed proof-search lane
+uses `lean-semantic-search-runtime`, which owns its Lean payload, provenance, materialization, and build. The host
+selects cache roots and toolchain/sysroot. Consumers do not declare, link, or import either support package.
 
 ### Toolchain-Readiness Gate
 
-Before the broker spawns a child for a newly-resolved project, `WorkerBinary::resolve_ready_for` (in `toolchain.rs`)
-folds every toolchain-version-drift situation into one `Readiness` verdict. It hides five independently-volatile
-decisions behind a single call: the supported window (read directly from `lean_toolchain::SUPPORTED_TOOLCHAINS` — the
-host never duplicates the list), the elan layout, the worker install layout, the header-digest provenance check, and the
-recorded runtime smoke result. The verdicts:
+`WorkerBinary::resolve_ready_for` checks the supported table, elan/worker layout, recorded header digest, wire protocol,
+and runtime smoke result before spawn. Project discovery first checks the lakefile and manifest, so readiness tests need
+a real pinned Lake root.
 
-- `Unsupported` — a numbered pin outside `floor ..= head`. Short-circuits before any filesystem probe (the bogus
-  toolchain is usually not installed), so the caller gets the window message, not a buried "elan not installed" error.
-  The accompanying `nearest` is the genuinely closest supported version (smallest component-wise version distance, ties
-  resolved toward the newer release), not merely the window floor.
-- `Stale` — the toolchain's `lean.h` no longer matches the digest recorded when the worker was built (an rc republished
-  under the same id, a rebuilt toolchain). Caught before spawn with a rebuild command, instead of the cryptic runtime
-  `"incompatible header"` olean crash.
-- `Unusable` — the worker built and its header digest matches, but it failed its post-build runtime smoke test: the
-  toolchain's `libleanshared` is ABI-incompatible with this lean-rs build and crashes when it loads Lean. A matching
-  header digest is necessary but **not** sufficient for ABI compatibility, so the recorded smoke result is the sound
-  signal. Caught before spawn, instead of a per-call `runtime_unavailable` SIGSEGV loop.
-- `NotInstalled` / `ToolchainNotInstalled` — the worker binary, or the elan toolchain itself, is absent.
-- `UnknownPin` — a `nightly-*` or otherwise non-`vX.Y.Z` pin: allowed, but the host cannot vouch for it.
-- `Ready` — spawn, optionally carrying a soft `note` (e.g. a worker installed by an older host with no provenance
-  record, or with a sidecar but no smoke record).
+| Verdict | Meaning |
+| --- | --- |
+| `Unsupported` | Numbered pin absent from the supported table; returned before filesystem probes, with the nearest supported version (ties prefer newer) |
+| `ToolchainNotInstalled` / `NotInstalled` | Missing elan toolchain or worker binary |
+| `Stale` | Current `lean.h` differs from the recorded build digest |
+| `Incompatible` | Recorded worker wire protocol differs from this parent |
+| `Unusable` | Recorded post-install runtime smoke failed despite a matching header |
+| `UnknownPin` | Installed non-numbered pin, allowed with an advisory |
+| `Ready` | May spawn, with an advisory if provenance or runtime smoke evidence is missing |
 
-`project.rs` maps the hard verdicts to one typed `ServerError::BadProject` sentence carrying the corrective command;
-`UnknownPin` and the soft `Ready` note ride along as project-lifetime advisories that `LeanProject::freshness` attaches
-and the semantic facade drains into warning issues. Those advisories are also carried on `WorkerUnavailable`, so a
-worker that dies mid-call surfaces them in `errors` rather than dropping them exactly when a suspect worker is most
-worth flagging. `install-worker` consults only the pure `ToolchainId::window_verdict` *before* its multi-minute build,
-refusing an out-of-window pin and warning on an unknown one. The digest is hashed once on the cold open/resolve path;
-the warm broker-reuse path (manifest-hash + health check) never re-hashes.
-
-The hard verdicts are pre-spawn JSON-RPC `BadProject` errors; project-discovery checks fire first, in order: lakefile
-presence → `lake-manifest.json` → window/readiness gate → elan/worker presence. (A directory with no lakefile is
-rejected as "not a Lake project" before the window gate runs, so exercising `Unsupported` needs a real pinned Lake
-project, not an arbitrary directory.)
+Header drift takes precedence over protocol mismatch, which precedes failed smoke. Hard verdicts refuse before spawn
+with corrective actions. Protocol mismatch maps to `IncompatibleWorker` and `install-worker --auto`; the other hard
+verdicts map to `BadProject`. Advisories survive runtime failure and are projected into public warning issues.
+Installation checks the pure supported-window verdict before building. Resident actor selection uses metadata and
+health, while source-option resolution also rechecks worker readiness, including the current header digest.
 
 ### Worker Provenance Sidecar
 
-`install-worker` writes a private `worker.json` next to each installed binary recording the toolchain id, the full
-`lean.h` SHA-256 the worker was built against, the `lean_toolchain::LEAN_VERSION` of the build, whether that digest
-matched the supported window at build time, and the post-build **smoke** outcome. The smoke test spawns the
-freshly-built worker once and runs the cheapest faithful exercise of the FFI boundary — open a session importing `Init`
-and inspect `Nat.add_zero` — so an ABI-incompatible worker is caught at install (over the multi-minute build) rather
-than at every call. A smoke failure records `smoke: failed` and makes `install-worker` exit non-zero; the binary stays
-installed (so `--list` shows it and the gate refuses it with a precise reason) rather than being silently removed. The
-readiness gate re-hashes the toolchain's current `lean.h` and compares (a mismatch is `Stale`), then consults the smoke
-record (a failure is `Unusable`); a missing sidecar or a sidecar without a smoke record (older host) degrades to a soft
-warning rather than an error. `install-worker --list` surfaces three axes per worker: a `support` column (`supported` /
-`unsupported` / `unknown`), a `build` column (header-drift — `fresh` / `stale` / `unknown`), and a `runtime` column (the
-recorded smoke result — `runs` / `crashed` / `untested`).
+`install-worker` writes `worker.json` beside the installed binary: toolchain id, full `lean.h` SHA-256, build-time Lean
+version, host version, worker protocol, digest support at build time, and runtime smoke outcome. Host version is
+informational; protocol determines wire compatibility. A legacy sidecar without protocol information leaves the worker
+handshake authoritative.
+
+The smoke test opens a worker session importing `Init` and inspects `Nat.add_zero`. Failure exits installation nonzero
+but retains the binary and failed record so `--list` and readiness can explain the problem. Missing provenance or smoke
+evidence produces an advisory rather than an automatic refusal. `install-worker --list` reports independent support,
+header/build, runtime, and protocol columns; a digest match alone does not establish runtime ABI compatibility.
 
 ## Declaration-Centric Proof API
 
@@ -288,82 +204,134 @@ overlay insertion, and diagnostic-locality classification stay below the worker 
 
 ## Tool Semantics
 
-`tools::semantic` is the public facade. It exposes five MCP tools and routes each `kind` mode to the existing typed
-operation modules:
+`tools::semantic` owns the five semantic tool families and the public trust projection. The
+[tool catalog](tool-catalog.md) is authoritative for modes and request/result schemas. Internal operation modules retain
+narrow names such as `proof_state`, `inspect_declaration`, and `try_proof_step`; these are not MCP registrations.
 
-- `lean_context(kind = "proof_position")` returns the current goals, locals, expected type, diagnostics, cache status,
-  and timing facts for one declaration proof position.
-- `lean_trial(kind = "proof_step")` tries tactic fragments at the selected proof position in an in-memory overlay. It
-  reports per-candidate status, diagnostics, resulting goals, and the resolved declaration/proof-position summary. It
-  never writes source files.
-- `lean_trial(kind = "command")` runs bounded Lean command text such as `#check` or `#print axioms`, either under
-  explicit imports or after a current file source snapshot. Info messages become rendered output; warnings and errors
-  stay in diagnostics.
-- `lean_verify` elaborates in-memory source snapshots and checks explicit, file-wide, or module-wide declaration target
-  groups under the requested sorry/axiom policy. Policy failures are normal results. All MCP handlers wrap the operation
-  with token-gated progress notifications, including 15-second heartbeats, so transport visibility remains observational
-  and does not enter the job or worker layers.
-- `lean_lookup(kind = "declaration")` inspects one declaration by name. Optional `file` input derives local imports so
-  project declarations can resolve. Rendered fields are capped before crossing the worker boundary.
-- `lean_lookup(kind = "declarations")` lists declarations for a file or module. Source files use the edit-fresh worker
-  declaration-outline selector; module requests fall back to the existing `.ilean` reader only when the source file is
-  unavailable, reporting build-fresh or stale build artifact facts.
-- `lean_lookup(kind = "proof_search")` builds a small target profile from proof context or explicit goal/type text, then
-  tries a private source-backed `lean-semantic-search` lane before falling back to bounded lean-rs declaration search.
-- `lean_lookup(kind = "references")` runs semantic reference lookup for a fully-qualified name in file or bounded
-  project scope. File scope elaborates one anchor file through the worker; project scope reads Lean's on-disk `.ilean`
-  reference index and does not open a worker.
-- `lean_status(kind = "project")` reports cheap project/toolchain/config status from Lake metadata and broker config. It
-  accepts `include: ["toolchain", "worker", "artifacts"]`, derives only cheap filesystem facts, and does not run `lake`
-  or open a worker.
-- `lean_status(kind = "file_diagnostics")` elaborates the current source snapshot for one file and returns bounded
-  diagnostics with edit-fresh source trust. It is not a replacement for `lake build`, `lake exe lint`, or project
-  linters.
+The facade routes through shared plumbing:
 
-The semantic facade also owns the public trust block. Operation modules may attach typed artifact rows for
-proof-relevant freshness: source snapshots (`source` / `file` / `edit_fresh`), built Lean artifacts (`olean` or `ilean`
-with `build_fresh`, `stale_build`, or `missing_build`), and worker/toolchain availability (`worker` / `toolchain` /
-`unknown` or `not_applicable`). Runtime counters, cache timings, and import lists remain telemetry; quiet mode drops
-telemetry but never drops trust artifacts.
+- `position.rs`: proof context, command trials, file diagnostics, and references.
+- `declaration.rs` and `declaration_inventory.rs`: individual inspection and file/module outlines.
+- `proof_search.rs`: source-backed semantic retrieval with bounded lean-rs declaration-search fallback.
+- `proof_action.rs`: proof-step trials and declaration verification.
 
-The rejected alternative was a single GraphQL-like `lean_query` tool with nested selections. It would make tool
-registration smaller, but it pushes mode discovery and validation into one large request grammar. The five-tool facade
-is clearer for agents: each tool name is a job family, and `kind` selects one stable mode inside that family.
-
-The internal operation names remain in source because they describe narrower implementation jobs. They are not public
-MCP registrations.
+Project-scope references read `.ilean` indexes without a worker. Source-backed modes elaborate current snapshots; module
+inventories can supplement or fall back to built indexes. These paths attach typed artifact freshness facts to `trust`.
+Quiet presentation removes telemetry, while retaining proof-relevant trust and warnings. Transport progress
+notifications, including token-gated heartbeats, stay outside worker operations.
 
 ## Scope Boundary
 
-The surface stays declaration-centric on purpose: every public tool answers a proof-work question about a named
-declaration, and lower-level Lean primitives stay private. Capabilities deliberately kept below the boundary, and the
-proof-work tool that subsumes each, include:
-
-- low-level term/meta operations (`elaborate`, `kernel_check`, `infer_type`, `whnf`, `is_def_eq`) — composed inside
-  `lean_trial(kind = "proof_step")`, `lean_trial(kind = "command")`, and `lean_verify`;
-- LSP-shaped declaration queries (`hover_by_name`, `type_of_name`, raw `search_declarations`) — folded into
-  `lean_lookup(kind = "declaration")` and `lean_lookup(kind = "proof_search")`;
-- raw module-query access (`lean_query`) — driven internally by `lean_context(kind = "proof_position")`,
-  `lean_trial(kind = "command")`, and `lean_status(kind = "file_diagnostics")`;
-- text search and placement policy (`source_search`, `project_scan`, `mathlib_placement`);
-- split reference aliases (`references_in_file`, `references_in_project`) — unified under
-  `lean_lookup(kind = "references")`.
-
-When one of these is needed to implement a deeper tool, keep it private and compose it inside the host or worker. A need
-to expose it directly is treated as evidence that a better proof-work abstraction is missing.
+The public proof workflow uses declaration names and proof-position selectors. Low-level elaboration, kernel checks,
+term/meta operations, raw cursor queries, and raw module-query access remain private components of that workflow. Text
+grep and Mathlib placement policy are outside this server. File and project references share one public mode.
+Operational status, compatibility, and lifecycle tools have separate contracts; they are not declaration queries.
 
 ## Budgets And Caching
 
-Worker APIs enforce per-field and total output budgets before IPC. The host adds hard caps for candidate lists,
-reference fanout, and response shape. The worker owns module snapshot reuse and reports cache status, output bytes, and
-phase timings for declaration-context queries. The host keeps a bounded content-hash LRU in front of every module query,
-single-file and batched alike, so a repeat query on an unmodified file never enters a project's mailbox. The content
-hash *is* the invalidation: an edited file produces a different key, so the cache carries no TTL. Only module queries
-are cached — a name lookup, proof attempt, or verification would key on a name whose meaning changes whenever any
-`.olean` in the closure is rebuilt, with no hash in the key to notice.
+Worker APIs cap rendered fields and total output before IPC. The host adds candidate and reference-fanout caps. Public
+queries do not request whole info trees or unbounded project scans, so query shape controls frame size.
 
-Frame size is controlled by query shape, not transport tuning: no public tool requests a whole info tree, bulk rendered
-types, or unbounded source/project scans.
+`ModuleQueryCache` stores bounded file-keyed outcomes for single and batched queries. A key includes source bytes,
+query/selector shape and output budgets, session/freshness imports, elaboration options, exact named-import artifact
+metadata, and worker generation. There is no TTL. Import stamps are sampled under complete cooperating read custody
+before lookup and after execution; changed artifacts or final execution taint prevent insertion. Unknown query variants
+bypass caching. This depends on Lake propagating dependency changes to named imports rather than scanning their whole
+transitive closure on every lookup.
+
+A valid hit bypasses the actor mailbox, but source option discovery still runs. Name-only inspection/search, proof
+attempts, and verification are not cached: their meaning depends on an imported environment and execution policy that
+cannot be identified by source content alone. The worker separately owns bounded module snapshot reuse.
+
+## Reference indices
+
+The private parent module [`ilean.rs`](../crates/lean-host-mcp/src/ilean.rs) reads built reference and declaration
+indices without a Lean worker. Project reference lookup and declaration inventory consume its two query functions.
+
+### Reader boundary
+
+`lake build` writes one `.ilean` per module under `<project>/.lake/build/lib/lean/`. Each index records definition and
+usage sites within that module's source. Project-scope `lean_lookup(kind="references")` reads these indices instead of
+re-elaborating every source file; the former worker scan took about 3 s/file, or 27 minutes for 500 modules.
+
+`references_to` and `declarations_in_module` use `serde_json` and `walkdir`, adding no Lean linkage or worker
+capability. Raw JSON types and path mapping stay private.
+
+Both functions acquire shared artifact-read custody before opening an index. Reference scans return `Unavailable`
+without reading when custody cannot be established, `NotBuilt` when the build directory is absent, or `Present` after a
+scan. Declaration queries distinguish unavailable custody, an absent project build tree, an absent/unreadable module
+index, and a parsed index. Callers translate these outcomes into public statuses, warnings, and artifact trust facts.
+
+`ReferenceIndex` carries hits, parsed/skipped module counts, and `stale_sources`. An unreadable, malformed, unsupported,
+or uncovered individual index is skipped and counted. Staleness checks compare source/index mtimes only for modules that
+contributed hits; missing metadata is treated as not stale. This is a limited build-freshness observation, not an exact
+source-content binding. `ReferenceLocation` carries the source file, definition/reference kind, and 0-based LSP
+coordinates.
+
+A `files` restriction narrows reads only when every source path maps unambiguously to an existing index. Paths outside
+the project, dotted components, non-`.lean` extensions, and missing computed indices trigger a full walk. The caller
+still filters the returned hits to the requested files, so uncertain filename mapping cannot silently omit a match. The
+recursive walk covers the project's build directory, excluding dependency indices under `.lake/packages/`.
+
+### Scan performance evidence
+
+Measurements from `benches/ilean_reference_scan.rs` over a 1431-module project (76 MB of `.ilean`), using `Fin` as the
+hot name with 9095 hits before the result cap:
+
+| Query | Before | After |
+| --- | --- | --- |
+| Whole project, hot name | 427 ms | ~120 ms |
+| Whole project, no hits | 478 ms | ~136 ms |
+| One requested file | 271 ms | ~0.5 ms |
+
+A phase split on the same corpus measured `stat` at 0.010 s, reads at 0.066 s, and parsing at 1.32 s: about 95% of the
+original cost was parsing. The reader therefore parses once, projects `references` and `decls` separately, filters
+reference-map entries during deserialization, and narrows index reads for file-restricted queries. Allocation scales
+with matching entries rather than all ~400k entries in that corpus. It retains no cache between calls.
+
+The scan remains serial and runs under `spawn_blocking` to keep file I/O and parsing off tokio workers. Serial order
+also keeps the user-visible stale-source warning order stable. Revisit parallelism if a real whole-project scan exceeds
+about one second. These figures are historical measurements, not checks rerun during this documentation cleanup.
+
+### Supported v5 schema
+
+The original on-disk verification used Lean v4.31.0-rc1's `Lean/Data/Lsp/Internal.lean` (`RefIdent`, `RefInfo`,
+`ModuleRefs`) and `Lean/Server/References.lean` (`Ilean`, `Ilean.load`). The reader accepts only version `5`.
+
+Each module is one JSON object:
+
+```jsonc
+{ "version": 5,
+  "module": "Demo.Foo.Bar",
+  "directImports": [ ["Std.Data.List", false, true, false] ],   // ignored
+  "references": {
+    // Keys are compressed-JSON RefIdent objects, not flat arrays.
+    "{\"c\":{\"m\":\"Demo.A\",\"n\":\"Demo.A.foo\"}}": {          // const: defining module, name
+      "definition": [3, 4, 3, 7],                                // range; null is allowed
+      "usages": [ [5, 2, 5, 5, "Demo.B.bar"], [6, 8, 6, 11] ]     // optional fifth parent-declaration name
+    },
+    "{\"f\":{\"m\":\"Demo.B\",\"i\":\"x\"}}": {}               // local variable: ignored
+  },
+  "decls": { "Demo.A.foo": [3,4,3,7, 3,4,3,7] }                  // declaration range ++ selection range
+}
+```
+
+For a requested name `N`, reference parsing keeps constant keys with `n == N`, emits a non-null `definition` as `def`
+and each usage as `ref`, and resolves all locations against that index's module source (`Demo.A` becomes
+`<root>/Demo/A.lean`). Definition and usage ranges accept four coordinates plus an optional fifth parent-declaration
+string. Declaration ranges require exactly eight coordinates.
+
+In the measured corpus, `references` occupied about 97% of bytes and `decls` about 3%. Separate projections skip the
+unneeded subtree, so a valid JSON document with an unexpected `decls` shape does not break reference lookup, and the
+reverse holds for declaration lookup.
+
+The version gate runs after parsing and discards the entire document for any version other than `5`. Lean's compressed
+JSON sorts object keys, placing `version` last: in one sample it began at byte 116,287 of 116,299. A preliminary version
+probe would therefore scan nearly every byte twice. Only a parse failure triggers a second, version-only probe, which
+can still classify an unfamiliar future shape as `UnsupportedVersion` rather than malformed JSON.
+
+Tests in `ilean.rs` cover version-last objects, future versions with unreadable shapes, independent projections,
+narrowing/fallback behavior, exact array arities, and stale-source reporting.
 
 ## Lake compilation options
 
@@ -397,15 +365,16 @@ requests owned group cleanup. Configuration errors return no proof verdict and n
 
 ## Queue and execution deadlines
 
-`runtime.request_timeout_millis` now also limits time waiting for dispatch, including mailbox admission and waiting
-behind earlier requests. The existing worker operation timeouts remain separate; they do not bound the whole request
-across setup, multiple operations, and retries. It starts when the project creates the message, not while opening the
-project.
+`runtime.request_timeout_millis` supplies a deadline from broker project acquisition through opening, mailbox admission,
+and waiting behind earlier requests. The same absolute deadline follows the job into the actor. Source-option resolution
+before project acquisition has its own budget. Worker operation timeouts remain separate; they do not bound the whole
+request across preparation, multiple operations, and retries.
 
 An expired queued request returns `queue_wait_timeout` and cannot run later. The actor and caller share one atomic
 start-or-expire decision. Expired messages stay in the bounded mailbox until the actor removes them; they do not reach
 Lean. Once dispatch starts, the existing worker operation limits apply. Cancellation of a running request waits for the
-worker's cleanup reply. Neither cancellation nor expiry counts as a successful proof check.
+worker's cleanup reply. Dropping the caller future also signals cancellation; actor-owned cleanup retains capacity until
+completion. Neither cancellation nor expiry counts as a successful proof check.
 
 Before source-backed actor calls, the broker keeps metadata/options preparation and project admission within one private
 boundary. Only typed `project_admission_timeout` or `request_cancelled` errors returned from that boundary record a
@@ -422,6 +391,40 @@ actor quota in the canonical private ownership registry. A native guardian owns 
 and retains the complete set of shared artifact descriptors. It acknowledges durable custody before a worker loads a
 library, runs an initializer, imports a module, or executes a submitted body. Cooperating writers acquire the same
 canonical domains exclusively and check ownership fences before dispatch.
+
+Cooperating artifact writers announce process-bound demand on the same canonical physical domains before waiting for
+exclusive artifact custody. The broker checks that handoff gate before borrowing a resident actor or admitting idle
+maintenance. Contention pauses affected new calls within their existing cancellation/deadline budget; admitted calls
+finish normally. A separate 100 ms observation in the existing reaper retires only affected idle, unborrowed actors,
+even when ordinary idle expiry is disabled or a lease preserves warm caches. It does not advance or release that lease.
+Retirement still uses the ordinary process owner, so an acknowledgement never releases capacity or artifact custody
+before actual scope closure. Nonoverlapping actors remain available. Matching uses the actor's retained actual
+read-domain receipts, including frozen dependencies and companions, rather than a newly reduced manifest. A brief
+competing reader gate can also cause conservative backpressure or idle retirement; it is not evidence of a writer
+identity. The protocol does not claim FIFO ordering among multiple writers or defeat OS scheduling/filesystem stalls.
+
+The generic `reader` and `read-proxy` admissions still refuse writer demand before Ready. They can be composed across
+multiple physical domains, so waiting while retaining an earlier shared lock would create a reader/writer cycle. A
+metadata caller holding no other artifact read or write custody may explicitly select `read-proxy --single-domain-wait`.
+This one-domain proxy retries only lock admission under its original absolute admission deadline, closes transient gates
+before waiting, and observes its private FIFO caller on each iteration and again before Ready. EOF or deadline expiry
+emits no Ready. Metadata executes once in the caller after that receipt; neither a metadata body nor a target check is
+retried. SDK multi-domain readiness probes retain the fail-fast default.
+
+Whole-domain admission owns the complete fixed input set. Its opted-in pure helpers report normal exit 75 only for typed
+pre-custody contention (`--report-contention`); every malformed receipt, descriptor, helper failure or uncertain cleanup
+remains a hard error. The SDK verifies successful pre-transfer classification, releases all tentative shared locks
+(including confirmed EOF-proxy helper closure), then waits within the original deadline and cancellation budget. It
+never waits for a later domain while retaining an earlier partial set, and never repeats a payload or metadata body. A
+full-set gate preflight avoids spawning repeated helpers while known writer demand remains; it grants no read custody,
+and the actual nonblocking transfer checks close the following race. Native payload bootstrap and cold worker admission
+finish the full set before guardian acknowledgement. A warm worker's guardian retains earlier generation locks, so warm
+contention uses the existing confirmed pre-body generation cycle instead of waiting behind its own custody. Graph,
+epoch, inheritance and guardian failures after admission are not retried.
+
+The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
+cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
+project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.
 
 The parent first asks the worker's runtime-free readiness entry for an exact prepared manifest snapshot. A warm probe
 only reads under shared custody. A cold preparation uses the existing owned drain before acquiring an opening lock or

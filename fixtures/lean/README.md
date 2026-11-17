@@ -1,45 +1,34 @@
-# `LeanRsFixture`
+# Lean test fixture
 
-Self-contained Lake package the `lean-host-mcp` end-to-end tests load. Doubles as a minimum-viable template: copy the
-layout, rename the package and library, and the host server can serve it.
+`LeanRsFixture` is the Lake package used by the server's opt-in integration and performance tests. Its modules cover ABI
+values, handles, capabilities, source ranges, declaration queries, proof actions, and proof search. The umbrella module
+lists the current cases.
 
-## What's here
+## Build and test
 
-```
-lakefile.lean         Lake DSL declaring the `lean_rs_fixture` package
-                      and the `LeanRsFixture` lean_lib (shared facet on)
-lean-toolchain        pins the Lean toolchain used to build and serve
-LeanRsFixture.lean    Lake umbrella module for the fixture library
-LeanRsFixture/        one submodule per ABI category covered by the
-                      tests (Scalars, Strings, Containers, Effects,
-                      Evidence, Capability, SourceRanges)
-```
-
-The submodules each declare a few `@[export]`-style symbols against one Lean ABI shape (scalars, strings, containers,
-effects, evidence, capability state, source-range corner cases). The host's e2e suite opens this project, asks for
-declarations and diagnostics, and verifies the wire-shape contract.
-
-## Build
+With the pinned Lean toolchain installed:
 
 ```sh
 cd fixtures/lean
 lake build
 ```
 
-Artifacts land under `.lake/build/`:
+The package is `lean_rs_fixture`; its library and umbrella module are `LeanRsFixture`. Compiled imports land under
+`.lake/build/lib/lean/`. The lakefile also builds a shared facet for direct library-loading tests; the MCP server uses
+imported `.olean` files and the host shims bundled with `lean-rs-host`.
 
-- `.lake/build/lib/liblean__rs__fixture_LeanRsFixture.{dylib,so}`: the shared library the host worker `dlopen`s.
-- `.lake/build/lib/lean/LeanRsFixture/*.olean` and `.lake/build/lib/lean/LeanRsFixture.olean`: per-submodule oleans the
-  worker walks for declarations and source ranges.
+From the repository root, install the matching worker and run the opt-in server tests:
 
-Lake mangles each underscore in the package name to a double underscore in emitted symbol and filename strings, so the
-module initializer is `initialize_lean__rs__fixture_LeanRsFixture`.
+```sh
+lean-host-mcp install-worker --toolchain "$(cat fixtures/lean/lean-toolchain)"
+LEAN_HOST_MCP_TEST_FIXTURE="$PWD/fixtures/lean" \
+  cargo test -p lean-host-mcp --test e2e -- --ignored
+```
 
-## Using as a template
+For a worker built in this checkout, set `LEAN_HOST_MCP_WORKERS_DIR` to its build directory. When testing a non-default
+Lean toolchain, set `LEAN_SYSROOT` for the entire Rust build-and-test invocation so the compiled header fingerprint
+matches the worker. See [development guidance](../../AGENTS.md) and
+[operations](../../docs/operations.md#installing-workers).
 
-Rename `package «lean_rs_fixture»` and `lean_lib «LeanRsFixture»` in `lakefile.lean`; rename the matching directory and
-umbrella module. Tool calls pass their own `imports`; the server does not import the umbrella automatically. Keep
-`defaultFacets := #[LeanLib.sharedFacet]` on the `lean_lib` if you need a shared facet for other tooling.
-
-Pointed at by the e2e tests via `LEAN_HOST_MCP_TEST_FIXTURE` (defaults `lean_rs_fixture` / `LeanRsFixture` for the
-package and library names; override with `LEAN_HOST_MCP_TEST_PACKAGE` and `LEAN_HOST_MCP_TEST_LIBRARY`).
+Consumer projects need their own lakefile, `lean-toolchain`, and built imports. They do not need to copy this fixture,
+use a shared facet, or declare the host shim package.

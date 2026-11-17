@@ -4,9 +4,9 @@
 The script starts one stdio MCP server, replays a caller-provided sequence of
 public MCP tool calls `--repeats` times against it, and emits JSONL records with
 runtime-envelope memory/restart facts. The question it answers is whether a
-long-lived server grows or recycles with *call count*: watch
-`final_worker_generation` (it should stay at the value the first call reported)
-and `call_restart_count` (it should stay 0) across increasing `--repeats`.
+long-lived server accumulates memory with repeated calls. Compare
+`final_worker_generation`, `call_restart_count`, and residue across increasing
+`--repeats`; new import profiles can legitimately trigger residue-budget cycles.
 
 It replaces a sweep over four resident-memory thresholds, which no longer exist.
 Worker memory is bounded by retained import bytes
@@ -24,9 +24,10 @@ Workload schema:
 {
   "calls": [
     {
-      "label": "proof_state_main",
-      "tool": "proof_state",
+      "label": "proof_position_main",
+      "tool": "lean_context",
       "arguments": {
+        "kind": "proof_position",
         "file": "${PROJECT_ROOT}/MyProject/Main.lean",
         "declaration": "MyProject.mainTheorem"
       }

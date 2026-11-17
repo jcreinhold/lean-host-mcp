@@ -1,12 +1,15 @@
 # Tool Catalog
 
-`lean-host-mcp` exposes five semantic Lean tools. Four tools use a `kind` field to select a mode inside that job family:
-`lean_context`, `lean_trial`, `lean_lookup`, and `lean_status`. `lean_verify` takes target groups directly. The surface
-is intentionally small: it gives an agent proof context, in-memory experiments, verification, semantic lookup, and cheap
-status without exposing raw Lean worker primitives.
+Five semantic tools cover proof context, trials, lookup, verification, and status. `lean_context`, `lean_trial`,
+`lean_lookup`, and `lean_status` select a mode with `kind`; `lean_verify` takes target groups directly. Operational
+coordination uses `lean_compatibility`, `lean_request`, and `lean_runtime`.
 
-The separate operational tool `lean_runtime` observes worker activity and coordinates an idle worker pool. It does not
-evaluate Lean or establish any proof or source-freshness claim.
+- Semantic tools: [context](#lean_context), [trial](#lean_trial), [verification](#lean_verify), [lookup](#lean_lookup),
+  [status](#lean_status).
+- Shared contracts: [response shape](#response-shape), [output carrier](#output-carrier),
+  [request synonyms](#request-synonyms), [proof workflow](#proof-workflow).
+- Coordination: [native compatibility](#native-compatibility), [retained requests](#prepared-retained-lifecycle-v3),
+  [worker activity and admission leases](#worker-activity-and-admission-leases).
 
 ```text
 lean_context -> lean_lookup -> lean_trial -> lean_verify
@@ -47,6 +50,10 @@ Save the contract and instance with the prepared request. Semantic responses car
 result; a later broker instance does not rewrite the old request's identity. Retained recovery uses the original ticket
 rather than submitting again. `lean_runtime(action=status)` remains a non-mutating advisory snapshot and never opens a
 worker.
+
+`lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and helper
+configuration without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded handshake.
+A client requiring pure discovery must not remove the mode or fall back to loaded discovery after an error.
 
 ## Tool Roles
 
@@ -192,7 +199,7 @@ and retrieve the same retained ticket after a lost response.
 
 ## Worker Activity And Admission Leases
 
-`lean_runtime` is always synchronous, including for task-aware clients. It has four actions:
+`lean_runtime` is always synchronous, including for task-aware clients. It has five actions:
 
 Every response includes `build` with package `version`, full Git `revision`, and build-time `dirty` state. Missing Git
 metadata (for example, an exported source archive) is reported as null, never guessed from the runtime checkout. A Git
@@ -249,12 +256,12 @@ controller that has been removed from the resident registry.
 
 By default acquire keeps workers and their warm caches across ordinary idle-reaper ticks. Independent artifact-writer
 demand can still retire an affected idle generation after admitted work finishes; the lease continues to fence MCP
-admission and is neither advanced nor released by that handoff. For a caller that actually
-needs their memory, explicitly set `retire_idle: true` on acquire. `retirement_requested` counts shutdown requests; it
-does not acknowledge child exit. Wait for `pool.workers_stopped: true`, under the same live lease, before relying on
-released worker capacity. An occupied slot may represent a starting, resident, retiring, or uncertain worker; uncertain
-shutdown continues to count and must not be treated as freed memory. Poll no faster than once per second while waiting,
-and renew the lease if needed.
+admission and is neither advanced nor released by that handoff. For a caller that actually needs their memory,
+explicitly set `retire_idle: true` on acquire. `retirement_requested` counts shutdown requests; it does not acknowledge
+child exit. Wait for `pool.workers_stopped: true`, under the same live lease, before relying on released worker
+capacity. An occupied slot may represent a starting, resident, retiring, or uncertain worker; uncertain shutdown
+continues to count and must not be treated as freed memory. Poll no faster than once per second while waiting, and renew
+the lease if needed.
 
 The lease covers only this server's worker admission. It does not reserve RAM, stop other programs, coordinate another
 server process, bind results to a source revision, or replace a caller's build/output locks. The caller chooses when to
@@ -266,7 +273,7 @@ independent work or wait for the existing owner; do not kill the active worker.
 
 ## Response Shape
 
-All public tools return the semantic response baseline:
+The five semantic tools return this response baseline:
 
 ```jsonc
 {
@@ -294,17 +301,18 @@ All public tools return the semantic response baseline:
 - `scope`: `file`, `module`, `project`, `toolchain`
 - `status`: `edit_fresh`, `build_fresh`, `stale_build`, `missing_build`, `unknown`, `not_applicable`
 
-Rows may also carry `path`, `module`, `detail`, and `next_action`. Paths are rendered project-relative when the file is
-inside the resolved Lake root, and absolute only for files outside that root. Source-overlay tools and source-backed
-declaration inventory report the source file snapshot as `source` / `file` / `edit_fresh`; project reference lookup and
-index-backed declaration inventory report `.ilean` build freshness or missing/stale build state; `needs_build`
-degradations report missing `.olean` artifacts. Duplicate trust rows are collapsed while preserving first occurrence
-order. Runtime counters, cache timings, and import lists remain telemetry, not trust.
+Rows may also carry `path`, `module`, `detail`, `next_action`, and a source `content_sha256`. Paths are rendered
+project-relative when the file is inside the resolved Lake root, and absolute only for files outside that root.
+Source-overlay tools and source-backed declaration inventory report the source file snapshot as `source` / `file` /
+`edit_fresh`; project reference lookup and index-backed declaration inventory report `.ilean` build freshness or
+missing/stale build state; `needs_build` degradations report missing `.olean` artifacts. Duplicate trust rows are
+collapsed while preserving first occurrence order. Runtime counters, cache timings, and import lists remain telemetry,
+not trust.
 
 Lean-domain outcomes remain data. A failed tactic, a rejected declaration, an ambiguous name, or a `needs_build` verdict
-is not an MCP transport error. Infrastructure failures that the client can retry, such as project mailbox pressure or
-restart-loop exhaustion, appear in `errors` with structured details. Warnings and next actions from the underlying
-implementation are also carried as warning issues in `errors`.
+is not an MCP transport error. Infrastructure failures appear in `errors` with structured details and a `retryable`
+flag; follow that flag, since restart-loop exhaustion and compatibility refusals require recovery. Warnings and next
+actions also appear as warning issues in `errors`.
 
 ### Call timing and the slow-call warning
 
@@ -336,120 +344,9 @@ LEAN_HOST_MCP_RESPONSE_CARRIER=structured lean-host-mcp --lake-root /path/to/pro
 
 Use `LEAN_HOST_MCP_RESPONSE_CARRIER=both` to mirror the same JSON into both `content` and `structuredContent`.
 
-## Common Workflows
+## Request Synonyms
 
-### Inspect Project Status
-
-```json
-{
-  "name": "lean_status",
-  "arguments": {
-    "kind": "project",
-    "include": ["toolchain", "worker", "artifacts"]
-  }
-}
-```
-
-When artifact freshness is `unknown`, `lean_status` has only checked cheap filesystem facts. Run
-`lean_lookup(kind="references")`, `lean_lookup(kind="declarations")`, or `lake build` to establish freshness for a
-specific semantic task.
-
-### Get Diagnostics For A File
-
-```json
-{
-  "name": "lean_status",
-  "arguments": {
-    "kind": "file_diagnostics",
-    "file": "LeanRsFixture/ProofActions.lean"
-  }
-}
-```
-
-### Query Declarations By Name Or Inventory
-
-Inspect one known declaration:
-
-```json
-{
-  "name": "lean_lookup",
-  "arguments": {
-    "kind": "declaration",
-    "name": "Nat.add_zero",
-    "imports": ["Init"]
-  }
-}
-```
-
-List declarations in a module:
-
-```json
-{
-  "name": "lean_lookup",
-  "arguments": {
-    "kind": "declarations",
-    "target": { "kind": "module", "module": "LeanRsFixture.ProofAgent" },
-    "limit": 200
-  }
-}
-```
-
-List declarations in a file:
-
-```json
-{
-  "name": "lean_lookup",
-  "arguments": {
-    "kind": "declarations",
-    "target": { "kind": "file", "path": "LeanRsFixture/ProofAgent.lean" },
-    "limit": 200
-  }
-}
-```
-
-For prefix-style browsing, use the file or module inventory call and filter the returned declaration names on the
-client.
-
-### Inspect Proof State At A Position
-
-```json
-{
-  "name": "lean_context",
-  "arguments": {
-    "kind": "proof_position",
-    "file": "LeanRsFixture/ProofActions.lean",
-    "declaration": "LeanRsFixture.ProofActions.stepTheorem",
-    "proof_position": { "kind": "default" }
-  }
-}
-```
-
-### Verify One Declaration With Axiom Reporting
-
-The old user-facing phrase `verify_declaration` maps to `lean_verify` with one explicit target group:
-
-```json
-{
-  "name": "lean_verify",
-  "arguments": {
-    "targets": [
-      {
-        "kind": "explicit",
-        "file": "LeanRsFixture/ProofActions.lean",
-        "declarations": ["LeanRsFixture.ProofActions.closedTheorem"]
-      }
-    ],
-    "allow_sorry": false,
-    "report_axioms": true
-  }
-}
-```
-
-### Request Synonyms
-
-Requests are decoded forgivingly. The recurring synonyms agents write are mapped onto the canonical schema before typed
-decoding, so the first call succeeds; the canonical shapes below remain the documented ones, and responses never use the
-synonyms.
+The decoder maps these aliases to the canonical request shapes before typed decoding. Responses use canonical names.
 
 - Modes: `lean_lookup` `signature`/`print`/`decl` → `declaration`; `inventory`/`outline` → `declarations`; `lean_trial`
   `tactic`/`step` → `proof_step`, `snippet`/`eval`/`check` → `command`; `lean_context` `goal`/`state` →
@@ -465,7 +362,9 @@ synonyms.
 - A `kind` that names another tool's job (`search`, `file`, `verify`, …) is still rejected, with the error naming the
   tool and mode to call instead.
 
-## Proof Workflow
+## Common Workflows
+
+### Proof workflow
 
 1. Call `lean_context` with `kind: "proof_position"` to read the current proof goals, locals, and diagnostics for a
    declaration position. Add `include_boundaries: true` when you need the boundary list to pick a selector, and
@@ -474,8 +373,8 @@ synonyms.
 3. Call `lean_lookup` with `kind: "declaration"` to inspect a promising declaration's statement, docstring, attributes,
    and flags.
 4. Call `lean_trial` with `kind: "proof_step"` to try one or more tactics in memory without editing the file. The trial
-   envelope is self-contained: it carries `entry_goals` and `locals` for the resolved position, so iterating proof steps
-   does not require a `lean_context` round-trip before each trial.
+   batch at `data.result` carries `entry_goals` and `locals` for the resolved position, so each trial supplies the
+   context for the next step.
 5. Call `lean_verify` with an explicit target group to verify the target declaration.
 
 Use `lean_lookup` with `kind: "references"` when the task is semantic reference discovery rather than proof search. Use
@@ -528,35 +427,19 @@ optional proof-position selector:
 }
 ```
 
-**Breaking change (context trim).** The response no longer echoes `declaration_name` or `namespace_name` — the caller
-already named the declaration in the request. Two heavier payload fields are now opt-in flags on the request, both
-defaulting to `false`:
+The response omits echoed declaration and namespace names. Two fields are opt-in, both defaulting to `false`:
 
 - `include_boundaries: true` returns the `proof_boundaries` navigation list (and `proof_boundaries_truncated`). Request
   it once per declaration to pick a position selector.
 - `include_expected_type: true` returns the goal's `expected_type`.
 
-The intended loop: call `lean_context` with `include_boundaries: true` once per declaration to navigate, then drive
-every step with self-contained `lean_trial(kind="proof_step")` calls (which carry their own `entry_goals` and `locals`),
-instead of re-reading context at each step.
-
 When `proof_position` is omitted, the default is the pristine entry goal: the state before any tactic runs. This is the
 same position where a default `lean_trial(kind="proof_step")` snippet is spliced.
 
-Other selectors are:
-
-```json
-{ "kind": "index", "index": 0 }
-```
-
-for the state after the first tactic, and:
-
-```json
-{ "kind": "after_text", "text": "skip", "occurrence": 0 }
-```
-
-for a worker-recognized proof-state boundary matching a source fragment. Not every substring is a boundary; inspect the
-returned `goals_before` and `goals_after` to determine the exact state available at the match.
+An `index` selector chooses a recorded tactic boundary (`index: 0` is after the first tactic). `after_text` chooses a
+worker-recognized boundary matching a source fragment. Not every substring is a boundary; inspect `goals_before` and
+`goals_after` to determine the state available at the match. [Selector shapes](#tagged-request-shapes) are shared with
+trials and proof search.
 
 If an `after_text` selector does not resolve, the result stays a normal Lean-domain response and — when
 `include_boundaries` is set — includes valid `proof_boundaries`:
@@ -610,8 +493,8 @@ Retry with the returned selector:
 }
 ```
 
-The `data` payload is the proof context result previously produced internally by the proof-position operation: status,
-diagnostics, goals, locals, expected type, truncation, and any `needs_build` or ambiguity facts.
+The `data` payload contains status, diagnostics, goals, locals, requested optional fields, truncation, and any
+`needs_build` or ambiguity facts.
 
 ## `lean_trial`
 
@@ -640,9 +523,9 @@ Use `snippets` to try a bounded list independently:
 }
 ```
 
-The worker attempts candidates in request order and returns at most 16 ordered rows. `candidate_limit` records that cap,
-`candidates_truncated` is true when more candidates were requested than could be represented, and `summary` gives the
-batch counts:
+The worker attempts candidates independently in request order and returns at most 16 rows. The batch is at
+`data.result`; `candidate_limit` records the cap, `candidates_truncated` marks omitted candidates, and `summary` gives
+the counts. An abridged batch:
 
 ```json
 {
@@ -669,32 +552,25 @@ batch counts:
 
 Candidate status is one of `closed`, `progressed`, `failed`, `timeout`, `budget_exceeded`, `not_attempted`, or
 `unsupported`. A batch is partial when some rows timed out, exceeded the total output budget, were skipped after that
-budget was exhausted, or had truncated output. In that case the envelope also includes warnings/next actions suggesting
-a smaller batch, a single-candidate retry, or a larger `output.max_total_bytes` budget.
+budget was exhausted, or had truncated output. Warning issues in `errors` suggest a smaller batch, a single-candidate
+retry, or a larger `output.max_total_bytes` budget.
 
-The envelope also carries `entry_goals` and `locals`: the goal state and local hypotheses at the resolved proof position
-before any candidate was spliced — the same values `lean_context(kind="proof_position")` reports as `goals_before` and
-`locals` at that position. They are rendered once per batch and shared by every candidate row, and both are omitted from
-the JSON when empty (a degraded or unresolvable entry state yields empty arrays, never an error). A trial loop therefore
-no longer needs a `lean_context` call before each step: read the context once to navigate, then drive subsequent steps
-from the trial envelopes alone.
+`data.result.entry_goals` and `locals` describe the resolved position before candidates run, matching the context tool's
+`goals_before` and `locals`. They are rendered once for the batch and omitted when empty or unavailable.
 
 `retry_tainted_non_positive` (default `false`) opts into one server-side retry: when the worker was recycled mid-call
 and the batch is non-positive (no candidate `closed` or `progressed`), the server re-issues the attempt once and returns
 the retry's rows instead of the suspect ones. If the retry is also tainted and non-positive, the response keeps the
 usual execution-taint warning and the retry decision returns to the client. At most one retry per call; it is surfaced
-through `runtime.retry_count`. With the flag unset the behavior is unchanged: the server reports the taint and the
-client decides.
+through `telemetry.runtime.retry_count` with full telemetry. With the flag unset the behavior is unchanged: the server
+reports the taint and the client decides.
 
-Proof-step diagnostics label their coordinate space. Candidate-local diagnostics usually point into the synthetic trial
-buffer, so use `synthetic_range` for display and do not treat it as an editable file range unless `original_range` is
-also present:
+Candidate diagnostics label their coordinate space. Use `synthetic_range` for a trial-buffer location; treat it as an
+editable file range only when `original_range` is also present.
 
-Across all candidate statuses, the first error-severity diagnostic in `diagnostics` is a reliable failure signal: a
-`closed` candidate's `diagnostics` and `downstream_diagnostics` carry only non-error advisory notes (warnings and info).
-Error-severity entries a closed candidate produced after closing its goal — for example the original downstream tactics
-reporting "no goals" — are moved, never deleted, into the advisory `post_closure_diagnostics` field, which is omitted
-from the JSON when empty and appears only on `closed` candidates.
+An error-severity entry in `diagnostics` signals candidate failure. A `closed` candidate keeps warnings/info there and
+in `downstream_diagnostics`; errors produced after closure, such as downstream tactics reporting "no goals", move to
+advisory `post_closure_diagnostics`. That field appears only on closed candidates and is omitted when empty.
 
 ```json
 {
@@ -715,9 +591,6 @@ from the JSON when empty and appears only on `closed` candidates.
 ```
 
 ### `kind: "command"`
-
-The trial does not apply source edits automatically. It is not an OS sandbox: commands, tactics, and import initializers
-can perform IO with the server user's privileges. Only run trusted Lean code.
 
 Runs bounded Lean command text as an in-memory trial. Use it for import-context snippets such as `#check` and
 `#print axioms`; it is not a replacement for project-wide shell workflows.
@@ -752,12 +625,11 @@ Verifies declarations in memory. Targets can be explicit declaration lists, ever
 declaration in a module. The server reads Lean source and calls Lean's elaborator/kernel through the worker; it does not
 run `lake build`.
 
-By-name targets resolve every surface declaration form the elaborator knows: multi-clause equation `def`s and theorems,
-`where`-structure defs, `structure`/`class` commands, and anonymous `instance`s (under their generated `inst…` names —
-discover them via `lean_lookup(kind="declarations")`). A `not_found` verdict means the name is genuinely absent from the
-file, never that the declaration uses one of these forms.
+By-name targets support multi-clause equation definitions and theorems, `where`-structure definitions,
+`structure`/`class` commands, and anonymous instances under generated `inst…` names. Discover generated names with
+`lean_lookup(kind="declarations")`. Inspect `not_found` suggestions or inventory the file to resolve a missing name.
 
-Single declaration:
+### Verify One Declaration With Axiom Reporting
 
 ```json
 {
@@ -796,66 +668,64 @@ Mixed target groups:
 }
 ```
 
-The response is a compact batch:
+The `data` payload contains a summary and result rows. For one verified declaration with `report_axioms: false`:
 
 ```json
 {
-  "summary": {
-    "requested": 4,
-    "verified": 3,
-    "failed": 1,
-    "needs_build": 0,
-    "unknown_coverage": 1
-  },
+  "summary": { "requested": 1, "verified": 1, "failed": 0, "needs_build": 0 },
   "results": [
     {
       "id": "group_1:LeanRsFixture.ProofActions.closedTheorem",
       "file": "LeanRsFixture/ProofActions.lean",
       "declaration": "LeanRsFixture.ProofActions.closedTheorem",
-      "reason": "hunk_overlaps_body",
       "verification_status": "verified",
-      "facts": {}
-    }
-  ],
-  "coverage": {
-    "unknown": [
-      {
-        "file": "LeanRsFixture/ProofActions.lean",
-        "reason": "hunk_outside_declaration",
-        "next_action": "verify the whole file or run lake build and retry"
+      "facts": {
+        "diagnostics": { "diagnostics": [] },
+        "unresolved_goals": [],
+        "contains_sorry": false,
+        "contains_admit": false,
+        "contains_sorry_ax": false,
+        "axioms": [],
+        "axioms_available": false,
+        "facts_trustworthy": true
       }
-    ],
-    "deleted_files": [],
-    "renamed_files": []
-  }
+    }
+  ]
 }
 ```
 
 `verification_status` uses the same vocabulary as the declaration-verification projection: `verified`, `has_sorry`,
 `has_unresolved_goals`, `has_diagnostics`, `not_found`, `ambiguous`, `needs_build`, `timeout`, `budget_exceeded`,
-`worker_recycled`, or `unsupported`. `requested` counts expanded targets before host-side caps; `truncated` is true when
-declaration inventory or verification output was capped. `file_all` and source-backed `module_all` use the current
-source snapshot and report the same project-relative file paths in rows. If a module has no source file, `module_all`
-may use the `.ilean` declaration inventory, with typed artifact freshness facts in `trust`. Every source-backed trust
-fact includes `content_sha256`, the SHA-256 of the exact bytes used by the call.
+`worker_recycled`, `header_parse_failed`, or `unsupported`. `summary.requested` counts expanded targets before host-side
+caps; `summary.truncated` is true when declaration inventory or verification output was capped. `file_all` and
+source-backed `module_all` use the current source snapshot and report the same project-relative file paths in rows. If a
+module has no source file, `module_all` may use the `.ilean` declaration inventory, with typed artifact freshness facts
+in `trust`. Every source-backed trust fact includes `content_sha256`, the SHA-256 of the exact bytes used by the call.
 
-`detail` defaults to `"compact"`, which keeps the row-level declaration name, file, status, reason, diagnostics,
-sorry/admit facts, axiom facts, and trustworthiness flags, but omits repeated target-span and ambiguous-candidate span
-blocks. Use `"detail": "full"` when you need those source spans in each row.
+`detail` defaults to `"compact"`, which keeps declaration names, files, statuses, diagnostics, sorry/admit facts, axiom
+facts, and trustworthiness flags, but omits target and ambiguous-candidate span blocks. Use `"detail": "full"` when you
+need those source spans in each row.
 
 `retry_tainted_non_positive` (default `false`) opts into one server-side retry per target-group batch: when the worker
 was recycled mid-call and the batch comes back non-positive (any row that would be relabeled `worker_recycled`), the
 server re-issues that batch once. `verified` rows are never retried — verification is monotone. If the retry is also
 tainted and non-positive, the rows are relabeled to `worker_recycled` with the usual warning, exactly as with the flag
-unset. At most one retry per batch; it is surfaced through `runtime.retry_count`.
+unset. At most one retry per batch; it is surfaced through `telemetry.runtime.retry_count` with full telemetry.
 
-A `not_found` row for an explicit target carries, in `facts.candidates` (with `"detail": "full"`) and in a response
-warning, the file's declarations whose short name matches the requested one across namespaces and case — the usual cause
-is a namespace or capitalization slip, and the warning names the intended declaration so the next call can use it.
-Mapping a git diff to declarations is the caller's job; the stacks verifier does it from `git diff` and passes explicit
-groups.
+A `not_found` row for an explicit target may carry declarations with matching short names across namespaces and case in
+`facts.candidates` (with `"detail": "full"`) and a warning. Mapping a Git diff to explicit target groups is the caller's
+job; the server returns no diff-coverage object.
+
+Check `facts_trustworthy` before interpreting absence of sorry or unresolved goals. An empty `axioms` list means no
+reported dependencies only when `axioms_available` is true; the flag is false when reporting was not requested or could
+not be computed.
 
 ## `lean_lookup`
+
+Artifact-backed declaration inventory and reference queries report `unavailable` when shared read custody cannot be
+established. They do not reinterpret a busy or unconfirmed writer as an empty index or a missing build. Retry after the
+current writer finishes. Custody describes a consistent artifact read; source/index freshness and exact content binding
+remain separate trust facts.
 
 ### `kind: "declaration"`
 
@@ -875,10 +745,8 @@ raw elaborated term.
 
 ### `kind: "declarations"`
 
-Lists declarations in one source file or module. This is declaration inventory, so it is a semantic lookup mode rather
-than a separate public tool.
-
-File targets read the current source snapshot and use the worker declaration outline selector:
+Lists declarations in one source file or module. File targets use the current source snapshot and the worker's
+declaration outline, supplementing missing names from a fresh matching `.ilean` when available:
 
 ```json
 {
@@ -899,11 +767,11 @@ exists:
 }
 ```
 
-If a module source file is unavailable but a matching `.ilean` exists, the mode returns build-fresh index rows instead.
-Index rows know the declaration range and name/selection range but not the declaration kind or body span, so `kind` and
-`body_span` are omitted. If neither source nor index is available, the result status is `missing_build` or `not_found`,
-never an empty successful list. `limit` defaults to 200 and is capped at 1000; truncation keeps a deterministic prefix
-and sets `truncated: true`.
+If module source is unavailable, the mode falls back to a matching `.ilean` and reports its build-freshness facts in
+`trust`. Index rows have declaration and name/selection ranges but omit `kind` and `body_span`. A missing file target
+returns `not_found`; an unavailable module index returns `missing_build`. Shared artifact custody failure returns
+`unavailable`, as described at the start of this section. `limit` defaults to 200 and is capped at 1000; truncation
+keeps a deterministic prefix and sets `truncated: true`.
 
 ### `kind: "proof_search"`
 
@@ -949,7 +817,9 @@ worker session id plus a `source` / `file` / `edit_fresh` trust fact:
 }
 ```
 
-Project scope reads the on-disk `.ilean` reference index and does not open a worker:
+Project scope reads the on-disk `.ilean` reference index without opening a worker (see
+[reader architecture](architecture.md#reference-indices)). `files` restricts where references occur; omit it to scan all
+project indices. Results reflect the last build, with stale contributing sources reported in `trust` and warnings:
 
 ```json
 {
@@ -1009,31 +879,6 @@ surfaces Lean diagnostics and linter messages produced while elaborating the fil
 The result includes `diagnostics` and the header `imports` used for the worker session, with a source `edit_fresh` trust
 fact for the file snapshot.
 
-If the worker crashes or times out during this call, the response has `status: "runtime_unavailable"` and
-`result: null`, not an empty successful diagnostics list. Interrupted results are never cached; retrying runs the check
-again. Planned worker recycling before a successful check does not invalidate its result.
-
-## Maintainer Migration Table
-
-The old public tools are no longer registered. Existing implementation code is still reused internally behind the
-semantic modes.
-
-| Old public tool | New public tool and mode |
-| --- | --- |
-| `proof_state` | `lean_context`, `kind: "proof_position"` |
-| `try_proof_step` | `lean_trial`, `kind: "proof_step"` |
-| `verify_declaration` | `lean_verify` with one `kind: "explicit"` target group |
-| `inspect_declaration` | `lean_lookup`, `kind: "declaration"` |
-| `search_for_proof` | `lean_lookup`, `kind: "proof_search"` |
-| `find_references` | `lean_lookup`, `kind: "references"` |
-
-Do not re-add compatibility aliases for the old names.
-
-Artifact-backed declaration inventory and reference queries report `unavailable` when shared read custody cannot be
-established. They do not reinterpret a busy or unconfirmed writer as an empty index or a missing build. Retry after the
-current writer finishes. Custody describes a consistent artifact read; source/index freshness and exact content binding
-remain separate trust facts.
-
-`lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and helper
-configuration without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded handshake.
-A client requiring pure discovery must not remove the mode or fall back to loaded discovery after an error.
+A worker crash or timeout returns `data: null` and an `errors` issue with `code: "runtime_unavailable"`, with MCP
+`isError: true`. Interrupted results are not cached. Planned recycling before a successful check does not invalidate its
+result.

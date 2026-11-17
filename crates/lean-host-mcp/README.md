@@ -1,35 +1,46 @@
 # lean-host-mcp
 
-A Model Context Protocol (MCP) server that gives an AI agent direct, read-only access to a Lean 4 project's elaborator
-and kernel. The agent can read the goal state at any point in a proof, get ranked lemma suggestions, test tactics, and
-check whether a declaration type-checks — without editing a file.
+A Model Context Protocol server for Lean 4 proof context, lemma search, declaration inspection, tactic trials, and
+kernel verification. Lean runs inside a supervised worker child, separate from the server process. One server can host
+projects pinned to different Lean toolchains.
 
-Lean runs **in-process**, inside a supervised worker child, reached as in-process calls rather than messages to an
-external LSP. A wedged tactic or runaway typeclass loop kills the child and the supervisor restarts it instead of taking
-down the server. One running server can serve projects on different Lean toolchains at once.
-
-## Install
+## Install and run
 
 ```sh
-cargo install lean-host-mcp                # the server
-lean-host-mcp install-worker               # build a worker for each installed Lean toolchain
-cd /path/to/your/lake/project && lake build
-lean-host-mcp                              # serve over stdio from inside the project
+cargo install lean-host-mcp --locked
+lean-host-mcp install-worker
+cd /path/to/your/lake/project
+lake build
+lean-host-mcp
 ```
 
-`install-worker` compiles a per-toolchain worker (it links `libleanshared`, so it is built locally, not shipped as a
-binary). It needs a Rust toolchain on `PATH` and the matching Lean toolchain installed via elan.
+Worker installation requires Rust on `PATH` and the project's Lean toolchain installed through elan. It builds a worker
+for each missing or stale supported toolchain. Stdio is the default transport; `--bind 127.0.0.1:8765` selects loopback
+Streamable HTTP at `/mcp`. Use `--lake-root /path/to/project` when the server starts outside the project.
 
 ## Tools
 
-`proof_state`, `search_for_proof`, `inspect_declaration`, `try_proof_step`, `verify_declaration`, and `find_references`.
-Every call is non-mutating.
+| Tool | Purpose |
+| --- | --- |
+| `lean_context` | Proof goals, locals, and position context. |
+| `lean_trial` | In-memory proof-step and command experiments. |
+| `lean_verify` | Declaration verification for explicit, file, or module targets. |
+| `lean_lookup` | Declaration inspection, inventory, proof search, and references. |
+| `lean_status` | Project/toolchain status and file diagnostics. |
+| `lean_compatibility` | Compiled requirements or actual loaded-worker compatibility evidence. |
+| `lean_runtime` | Worker activity and expiring idle-pool leases. |
+| `lean_request` | Retained requests, result retrieval, and cancellation without MCP Tasks negotiation. |
+
+Tools do not apply source edits automatically. Lean commands, tactics, and import initializers can perform IO with the
+server user's privileges. Use trusted local clients and projects; the worker provides crash isolation, not an OS
+sandbox.
 
 ## Documentation
 
-Full setup, the per-tool request/result schema, the response-envelope contract, tuning knobs, and the architecture
-write-up live in the [repository](https://github.com/jcreinhold/lean-host-mcp): see `README.md`, `docs/tool-catalog.md`,
-and `docs/operations.md`.
+See [setup and client configuration](https://github.com/jcreinhold/lean-host-mcp/blob/main/README.md),
+[tool contracts](https://github.com/jcreinhold/lean-host-mcp/blob/main/docs/tool-catalog.md),
+[operations](https://github.com/jcreinhold/lean-host-mcp/blob/main/docs/operations.md), and
+[architecture](https://github.com/jcreinhold/lean-host-mcp/blob/main/docs/architecture.md).
 
 ## License
 
