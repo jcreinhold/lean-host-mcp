@@ -4,6 +4,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 use std::{fmt, path::Path};
 
+// This decoder is a private no-dispatch contract, not a production RPC server.
+#[path = "store/boundary.rs"]
+pub(crate) mod boundary;
+
 const CALLER_ROLE: i64 = 0x4c53_434a;
 const NATIVE_ROLE: i64 = 0x4c53_4e53;
 const LIMIT: usize = 65_536;
@@ -75,6 +79,8 @@ pub(crate) enum Reject {
     ConflictingCallerResult,
     ResultUnavailable,
     InvalidResult,
+    LaunchSealed,
+    DispatchDisabled,
 }
 type Answer<T> = Result<T, Problem>;
 fn reject<T>(why: Reject) -> Answer<T> {
@@ -93,8 +99,32 @@ fn bounded(value: &[u8]) -> Answer<()> {
 fn digest(value: &[u8]) -> Vec<u8> {
     Sha256::digest(value).to_vec()
 }
-fn id(bytes: Vec<u8>) -> rusqlite::Result<Id> {
-    bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
+// Check borrowed SQLite bytes before any Rust-owned BLOB allocation. SQLite's
+// own page/value buffers are outside this contract's allocation guarantee.
+fn blob<'row>(row: &'row rusqlite::Row<'_>, column: usize) -> rusqlite::Result<&'row [u8]> {
+    match row.get_ref(column)? {
+        rusqlite::types::ValueRef::Blob(bytes) => {
+            if bytes.len() <= LIMIT {
+                Ok(bytes)
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        }
+        rusqlite::types::ValueRef::Null
+        | rusqlite::types::ValueRef::Integer(_)
+        | rusqlite::types::ValueRef::Real(_)
+        | rusqlite::types::ValueRef::Text(_) => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+fn fixed<const N: usize>(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<[u8; N]> {
+    blob(row, column)?.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
+}
+fn optional_fixed<const N: usize>(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Option<[u8; N]>> {
+    if row.get_ref(column)? == rusqlite::types::ValueRef::Null {
+        Ok(None)
+    } else {
+        fixed(row, column).map(Some)
+    }
 }
 fn positive(n: i64) -> rusqlite::Result<u64> {
     u64::try_from(n).map_err(|_| rusqlite::Error::InvalidQuery)
@@ -106,7 +136,8 @@ pub(crate) struct CallerKey {
     pub(crate) stage: u64,
     pub(crate) revision: u64,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NativeKey {
     pub(crate) store: Id,
     pub(crate) epoch: u64,
@@ -258,12 +289,12 @@ pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     }
     drop(db.prepare("SELECT epoch,nonce,stage,intent,cap_hash,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages LIMIT 0")?);
     drop(db.prepare("SELECT scope,generation,owner FROM scope_heads LIMIT 0")?);
-    let meta: Option<(Vec<u8>, i64)> = db
+    let meta: Option<(Id, i64)> = db
         .query_row("SELECT store,epoch FROM meta WHERE singleton=1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((fixed(r, 0)?, r.get(1)?))
         })
         .optional()?;
-    Ok(meta.is_some_and(|(store, epoch)| store.len() == 16 && epoch > 0))
+    Ok(meta.is_some_and(|(_, epoch)| epoch > 0))
 }
 
 pub(crate) struct CallerJournal {
@@ -412,7 +443,7 @@ impl CallerJournal {
 }
 fn caller_get(db: &Connection, key: &CallerKey) -> Answer<Option<SavedRequest>> {
     Ok(db.query_row("SELECT store,epoch,nonce,native_stage,intent,capability FROM bindings WHERE job=?1 AND stage=?2 AND revision=?3",params![key.job,number(key.stage)?,number(key.revision)?],|row| {
-        Ok(SavedRequest{caller:key.clone(),key:NativeKey{store:id(row.get(0)?)?,epoch:positive(row.get(1)?)?,nonce:id(row.get(2)?)?,stage:positive(row.get(3)?)?},intent:row.get(4)?,capability:Capability(row.get::<_,Vec<u8>>(5)?.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?)})
+        Ok(SavedRequest{caller:key.clone(),key:NativeKey{store:fixed(row,0)?,epoch:positive(row.get(1)?)?,nonce:fixed(row,2)?,stage:positive(row.get(3)?)?},intent:blob(row,4)?.to_vec(),capability:Capability(fixed(row,5)?)})
     }).optional()?)
 }
 
@@ -436,7 +467,7 @@ fn result_parts(source: &Snapshot) -> Answer<(Id, &[u8], Option<&[u8]>)> {
 }
 fn caller_result_get(db: &Connection, key: &CallerKey) -> Answer<Option<CallerResult>> {
     let saved=db.query_row("SELECT b.store,b.epoch,b.nonce,b.native_stage,r.scope,r.generation,r.owner,r.result_id,r.result_hash,r.body FROM accepted_results r JOIN bindings b USING(job,stage,revision) WHERE r.job=?1 AND r.stage=?2 AND r.revision=?3",params![key.job,number(key.stage)?,number(key.revision)?],|r|{
-        Ok(CallerResult{caller:key.clone(),binding:Binding{key:NativeKey{store:id(r.get(0)?)?,epoch:positive(r.get(1)?)?,nonce:id(r.get(2)?)?,stage:positive(r.get(3)?)?},scope:Scope{id:id(r.get(4)?)?,generation:positive(r.get(5)?)?,owner:id(r.get(6)?)?}},result:id(r.get(7)?)?,hash:r.get(8)?,body:r.get(9)?})
+        Ok(CallerResult{caller:key.clone(),binding:Binding{key:NativeKey{store:fixed(r,0)?,epoch:positive(r.get(1)?)?,nonce:fixed(r,2)?,stage:positive(r.get(3)?)?},scope:Scope{id:fixed(r,4)?,generation:positive(r.get(5)?)?,owner:fixed(r,6)?}},result:fixed(r,7)?,hash:fixed::<32>(r,8)?.to_vec(),body:blob(r,9)?.to_vec()})
     }).optional()?;
     if saved
         .as_ref()
@@ -475,9 +506,9 @@ impl NativeStore {
     }
     pub(crate) fn open(path: &Path) -> Answer<Self> {
         let db = CheckedConnection::open_existing(path, native_schema_valid)?;
-        let store = id(db
+        let store = db
             .connection()
-            .query_row("SELECT store FROM meta WHERE singleton=1", [], |r| r.get(0))?)?;
+            .query_row("SELECT store FROM meta WHERE singleton=1", [], |r| fixed(r, 0))?;
         Ok(Self { db, store })
     }
     pub(crate) fn identity(&self) -> Id {
@@ -497,43 +528,53 @@ impl NativeStore {
             reject(Reject::WrongStore)
         }
     }
+    // Trusted fixture inspection only; untrusted GET uses boundary::decode/client.
     pub(crate) fn get(&self, key: NativeKey) -> Answer<Option<Snapshot>> {
         self.checked_key(key)?;
         read_stage(self.db.connection(), key)
     }
     pub(crate) fn create(&mut self, saved: &SavedRequest) -> Answer<Snapshot> {
-        self.checked_key(saved.key)?;
-        bounded(&saved.intent)?;
+        self.create_intent(saved.key, &saved.capability, &saved.intent)
+    }
+    fn create_intent(&mut self, key: NativeKey, capability: &Capability, intent: &[u8]) -> Answer<Snapshot> {
+        self.checked_key(key)?;
+        bounded(intent)?;
         self.db.check_profile()?;
         let tx = self
             .db
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(previous) = read_stage(&tx, saved.key)? {
-            if previous.intent != saved.intent {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3)",
+            params![number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?],
+            |row| row.get(0),
+        )?;
+        if exists {
+            authenticate(&tx, key, capability)?;
+            let previous = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
+            if previous.intent != intent {
                 return reject(Reject::IntentChanged);
             }
-            authenticate(&tx, saved.key, &saved.capability)?;
             return Ok(previous);
         }
         let epoch: u64 = positive(tx.query_row("SELECT epoch FROM meta WHERE singleton=1", [], |r| r.get(0))?)?;
-        if saved.key.epoch < epoch {
+        if key.epoch < epoch {
             return reject(Reject::ClosedEpoch);
         }
-        if saved.key.epoch > epoch {
+        if key.epoch > epoch {
             return reject(Reject::FutureEpoch);
         }
         tx.execute(
             "INSERT INTO stages(epoch,nonce,stage,intent,cap_hash) VALUES(?1,?2,?3,?4,?5)",
             params![
-                number(saved.key.epoch)?,
-                saved.key.nonce.as_slice(),
-                number(saved.key.stage)?,
-                saved.intent,
-                digest(&saved.capability.0)
+                number(key.epoch)?,
+                key.nonce.as_slice(),
+                number(key.stage)?,
+                intent,
+                digest(&capability.0)
             ],
         )?;
-        let snapshot = read_stage(&tx, saved.key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
+        let snapshot = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
         commit(tx, "native-create")?;
         Ok(snapshot)
     }
@@ -552,6 +593,9 @@ impl NativeStore {
             } else {
                 reject(Reject::ScopeAlreadyBound)
             };
+        }
+        if old.gate == Gate::Sealed {
+            return reject(Reject::LaunchSealed);
         }
         let highest: Option<i64> = tx
             .query_row(
@@ -592,12 +636,12 @@ impl NativeStore {
             Gate::Sealed => return Ok(Consume::Sealed),
             Gate::Pending => {}
         }
-        let current: (i64, Vec<u8>) = tx.query_row(
+        let current: (i64, Id) = tx.query_row(
             "SELECT generation,owner FROM scope_heads WHERE scope=?1",
             [binding.scope.id.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, fixed(r, 1)?)),
         )?;
-        if current != (number(binding.scope.generation)?, binding.scope.owner.to_vec()) {
+        if current != (number(binding.scope.generation)?, binding.scope.owner) {
             return reject(Reject::StaleGeneration);
         }
         let changed = tx.execute(
@@ -615,23 +659,43 @@ impl NativeStore {
         Ok(Consume::Granted(LaunchPermit { binding }))
     }
     pub(crate) fn cancel(&mut self, binding: Binding, capability: &Capability) -> Answer<()> {
-        self.mutate_bound(binding, capability, |tx, old| {
-            let gate = if old.gate == Gate::Pending {
-                2
-            } else {
-                gate_code(old.gate)
-            };
-            tx.execute(
-                "UPDATE stages SET gate=?1,stop_requested=1 WHERE epoch=?2 AND nonce=?3 AND stage=?4",
-                params![
-                    gate,
-                    number(binding.key.epoch)?,
-                    binding.key.nonce.as_slice(),
-                    number(binding.key.stage)?
-                ],
-            )?;
-            Ok(())
-        })
+        self.cancel_original(binding.key, capability, Some(binding.scope))
+            .map(|_| ())
+    }
+    fn cancel_original(
+        &mut self,
+        key: NativeKey,
+        capability: &Capability,
+        expected: Option<Scope>,
+    ) -> Answer<Snapshot> {
+        self.checked_key(key)?;
+        self.db.check_profile()?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authenticate(&tx, key, capability)?;
+        let old = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
+        if expected.is_some_and(|scope| old.scope != Some(scope)) {
+            return reject(Reject::WrongScope);
+        }
+        let gate = if old.gate == Gate::Pending {
+            Gate::Sealed
+        } else {
+            old.gate
+        };
+        tx.execute(
+            "UPDATE stages SET gate=?1,stop_requested=1 WHERE epoch=?2 AND nonce=?3 AND stage=?4",
+            params![
+                gate_code(gate),
+                number(key.epoch)?,
+                key.nonce.as_slice(),
+                number(key.stage)?
+            ],
+        )?;
+        let snapshot = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
+        tx.commit()?;
+        Ok(snapshot)
     }
     // Trusted internal observer: capability checks do NOT authenticate a producer.
     pub(crate) fn observe_resource(
@@ -807,16 +871,16 @@ fn report_code(report: ResourceReport) -> i64 {
     }
 }
 fn authenticate(db: &Connection, key: NativeKey, capability: &Capability) -> Answer<()> {
-    let hash: Option<Vec<u8>> = db
+    let hash: Option<[u8; 32]> = db
         .query_row(
             "SELECT cap_hash FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",
             params![number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?],
-            |r| r.get(0),
+            |r| fixed(r, 0),
         )
         .optional()?;
     match hash {
         None => reject(Reject::UnknownStage),
-        Some(hash) if hash != digest(&capability.0) => reject(Reject::CapabilityDenied),
+        Some(hash) if hash.as_slice() != digest(&capability.0) => reject(Reject::CapabilityDenied),
         Some(_) => Ok(()),
     }
 }
@@ -829,19 +893,45 @@ fn bound_stage(db: &Connection, binding: Binding, capability: &Capability) -> An
     Ok(old)
 }
 fn read_stage(db: &Connection, key: NativeKey) -> Answer<Option<Snapshot>> {
-    Ok(db.query_row("SELECT intent,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",params![number(key.epoch)?,key.nonce.as_slice(),number(key.stage)?],|r| {
-        let scope=if let Some(bytes)=r.get::<_,Option<Vec<u8>>>(1)? {Some(Scope{id:id(bytes)?,generation:positive(r.get(2)?)?,owner:id(r.get(3)?)?})}else{None};
+    let snapshot = db.query_row("SELECT intent,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",params![number(key.epoch)?,key.nonce.as_slice(),number(key.stage)?],|r| {
+        let scope = match (optional_fixed(r,1)?,r.get::<_,Option<i64>>(2)?,optional_fixed(r,3)?) {
+            (None,None,None) => None,
+            (Some(id),Some(generation),Some(owner)) => Some(Scope{id,generation:positive(generation)?,owner}),
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        };
         let gate=match r.get::<_,i64>(4)? {0=>Gate::Pending,1=>Gate::Consumed,2=>Gate::Sealed,_=>return Err(rusqlite::Error::InvalidQuery)};
         let spawn=match r.get::<_,Option<i64>>(5)? {None=>None,Some(1)=>Some(Spawn::Spawned),Some(2)=>Some(Spawn::Failed),_=>return Err(rusqlite::Error::InvalidQuery)};
+        let stop_requested=match r.get::<_,i64>(6)? {0=>false,1=>true,_=>return Err(rusqlite::Error::InvalidQuery)};
         let resource_report=match r.get::<_,i64>(7)? {0=>ResourceReport::None,1=>ResourceReport::Open,2=>ResourceReport::Stopping,3=>ResourceReport::Closed,_=>return Err(rusqlite::Error::InvalidQuery)};
         let result=match r.get::<_,i64>(8)? {
-            0=>ResultKnowledge::Pending,
+            0 if (9..=11).all(|column| r.get_ref(column).is_ok_and(|value| value==rusqlite::types::ValueRef::Null)) => ResultKnowledge::Pending,
             kind @ 1..=3=>{
-                let id=id(r.get(9)?)?;let hash=r.get(10)?;
-                match kind {1=>ResultKnowledge::Retained{id,hash,body:r.get(11)?},2=>ResultKnowledge::Acknowledged{id,hash,body:r.get(11)?},_=>ResultKnowledge::Expired{id,hash}}
+                let id=fixed(r,9)?; let hash=fixed::<32>(r,10)?.to_vec();
+                match kind {
+                    1=>ResultKnowledge::Retained{id,hash,body:blob(r,11)?.to_vec()},
+                    2=>ResultKnowledge::Acknowledged{id,hash,body:blob(r,11)?.to_vec()},
+                    _ if r.get_ref(11)? == rusqlite::types::ValueRef::Null => ResultKnowledge::Expired{id,hash},
+                    _=>return Err(rusqlite::Error::InvalidQuery),
+                }
             }
             _=>return Err(rusqlite::Error::InvalidQuery),
         };
-        Ok(Snapshot{key,intent:r.get(0)?,scope,gate,spawn,stop_requested:r.get(6)?,resource_report,result})
-    }).optional()?)
+        if (scope.is_none() && (gate==Gate::Consumed || spawn.is_some() || resource_report!=ResourceReport::None || result!=ResultKnowledge::Pending))
+            || (spawn.is_some() && gate!=Gate::Consumed)
+            || (gate==Gate::Pending && (stop_requested || resource_report>=ResourceReport::Stopping)) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok(Snapshot{key,intent:blob(r,0)?.to_vec(),scope,gate,spawn,stop_requested,resource_report,result})
+    }).optional()?;
+    if let Some(snapshot) = &snapshot {
+        match snapshot.result {
+            ResultKnowledge::Pending => {}
+            ResultKnowledge::Retained { .. }
+            | ResultKnowledge::Acknowledged { .. }
+            | ResultKnowledge::Expired { .. } => {
+                result_parts(snapshot)?;
+            }
+        }
+    }
+    Ok(snapshot)
 }

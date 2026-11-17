@@ -787,3 +787,6 @@ fn rejected_delete_mode_databases_keep_their_schema_and_journal_mode() {
 
 #[path = "caller_results.rs"]
 mod caller_results;
+
+#[path = "boundary_cases.rs"]
+mod boundary_cases;
