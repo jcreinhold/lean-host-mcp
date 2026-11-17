@@ -1,6 +1,6 @@
 # Native execution progress
 
-Snapshot: 2026-11-17, 19:12 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
+Snapshot: 2026-11-17, 19:09 UTC. Maintainer: tooling coordinator. This is the current gate ledger, not a second design.
 Requirements remain in [lifecycle §16](native-execution-lifecycle-design.md#16-remaining-implementation-and-acceptance-gates).
 Update this file after reviewed results, ownership changes or build-lane transfers; do not mark a gate complete from a
 session ending. Distinguish source review, executed tests, canonical integration and deployment.
@@ -45,7 +45,7 @@ before removing a scratch tree. Archived model evidence and replay instructions 
 ## Build lane and immediate sequence
 
 - One substantial build lane, at most two jobs. Warm released it at 18:54:08 UTC after sequential qualification.
-- Formatter now has the lane. ABI, guardian and warm repairs/reviews proceed without substantial builds.
+- Formatter now has the lane; its 19:08 status records full `lake test -- --all --jobs 1` at isolated `4f59119`, with two Lean threads. Focused extraction and server-only invalidation are reported passed; the aggregate run is still active. ABI, guardian and warm repairs/reviews proceed without substantial builds.
 - Next ready short campaign is warm unwind qualification, then ABI crate checks. Guardian native qualification remains
   blocked on safe containment regardless of lane availability; source repair continues. A lane grant is not permission to deploy or run proof/Mathlib builds.
 - Semantic 4.36 Lean build/tests passed on an isolated archive of `333c219`; its Rust/runtime qualification still needs
