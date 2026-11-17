@@ -1,105 +1,104 @@
-# Bounded native lifecycle models
+# Native execution models
 
-Design-validation artifacts, not production execution code. Integrated 2026-11-17. The Python checkers model a proposed
-protocol. **TLA+ is unparsed and TLC has not run.** No Rust runtime refinement proof, restart-recovery guarantee or OS
-custody qualification follows from this directory.
+TLA+ is the source of the abstract concurrency models. TLC explores their finite
+cases and checks the stated properties. The small Python runner only invokes TLC;
+it has no model, graph search or scheduling rules.
 
-## Provenance and scope
+These models check proposed protocols, not the running service. Native process,
+Rust and SQLite tests remain separate. A model assumes that an OS observation or
+stop operation works; it cannot establish that capability.
 
-The Python and TLA+ sources are copied unchanged from the independently reviewed final package:
-`~/.local/share/lean-lifecycle-evidence/model-20261117-lock-contract.tar.gz`. SHA256:
-`316239c3315042885af1d36e68777e8de635069f057acacc8ec6c00a8c1c1b1e`. That local evidence archive retains README, HANDOFF,
-review, environment hashes, full traces and run outputs. It is not needed to run these sources; it is needed to audit
-the original recorded execution. Large generated results, scratch process fixtures, binaries and caches are deliberately
-not committed.
+## Run a check
 
-Recorded package validation: 60 unit tests passed, with independent rerun. Thirty reduced late-control graphs (96–648
-states, limit 30,000 each) passed; five deliberately broken handlers produced counterexamples. The larger combined run
-remains **INCOMPLETE at 300,001 states**. Reduced checks do not replace it. The checkers report a reached state limit as
-incomplete, not success.
+Use Java 21 and the official `tla2tools.jar` from
+[TLA+ v1.7.4](https://github.com/tlaplus/tlaplus/releases/tag/v1.7.4).
+The tested tools are Homebrew OpenJDK 21.0.13 and TLC 2.19.
+No Toolbox GUI or Python packages are needed.
 
-| Sources | Purpose |
+From this directory:
+
+```sh
+uv run --no-project python check.py --list
+uv run --no-project python check.py --case dual-one-fault
+uv run --no-project python check.py --case cross-unsent
+uv run --no-project python check.py
+```
+
+The last command runs all **155 required cases**, one at a time. Defaults are one
+TLC worker, a 512 MiB Java heap limit and 30 seconds per case. `--timeout SECONDS`
+changes the time limit. Repeat `--case NAME` to select several cases.
+
+The runner uses `JAVA`, or Homebrew's Java 21 executable, then `java` from PATH.
+It uses `TLA_TOOLS_JAR`, or `~/.local/share/tlaplus/1.7.4/tla2tools.jar`.
+For another installation:
+
+```sh
+export JAVA=/path/to/java
+export TLA_TOOLS_JAR=/path/to/tla2tools.jar
+```
+
+The runner does not install tools or change global settings. It creates temporary
+TLC inputs and removes them afterward. It stores nothing in the checkout.
+To retain a run, add `--output /path/to/results`: this writes only `summary.json`
+and a combined `tlc.log`, including exact configurations and input hashes, with
+no visited-state cache. Reusing that output directory replaces those two files.
+
+Two larger stage cases need `--extended`:
+
+```sh
+uv run --no-project python check.py --extended --case stage-two-extra
+uv run --no-project python check.py --extended --case stage-two-extra-controls
+```
+
+A timeout reports **INCOMPLETE**; a parse, runtime or launch failure reports
+**ERROR**. Both exit unsuccessfully. Neither counts an explored prefix as a pass.
+The runner accepts an expected invariant
+failure only when TLC names the exact configured predicate. `MATCHED` can mean
+an expected failure or a reachability witness; it does not mean the bad protocol
+is safe. A witness case checks the negation of a target so TLC supplies a trace
+that reaches it.
+
+## Models and cases
+
+| Source | Scope |
 | --- | --- |
-| `check_model.py` | Coarse custody, dispatch, crash and closure transitions; graph/fairness checks |
-| `check_frozen.py`, `check_owner_outages.py` | Frozen owners, retained aliases and conditional recovery |
-| `check_stages.py` | Immutable job/stage identity; authorization, GO, spawn and late messages |
-| `check_atomic_cuts.py`, `check_cross_boundary.py` | Reduced crash/replacement cuts and broken-handler controls |
-| `check_more_deliveries.py` | Larger combined exploration; retained incomplete limit |
-| `check_late_controls.py` | Two late-control deliveries, stage/generation identity and negative controls |
-| `test_*.py` | Checker/model regressions; not native-runtime tests |
-| `Lifecycle.tla`, `Lifecycle.cfg` | Unparsed accompanying specification; not checked equivalent to all Python refinements |
+| `Lifecycle.tla` | Two jobs/domains, lock holders, launch, descendants, crashes and conditional cleanup |
+| `LifecycleScenarios.tla` | Frozen owners, original-parent authority, first-scope versus all-job closure, three broken protocols and concurrency witnesses |
+| `Stages.tla` | Two immutable stages, duplicate/delayed messages, separate authorization/send/consume/spawn, cancellation, results and late callbacks |
+| `CrossBoundary.tla` | Pending old GO, lost/frozen owner, explicit closure evidence and replacement generation |
+| `DeadlinePolicy.tla` | Bounded hard/soft deadline policy, activity renewal, quiet events and missing samples |
 
-## Replay without generating files in the checkout
+`cases.json` holds each model's defaults and named overrides. Constants contain
+TLA+ expressions. The runner generates configurations from those records; there
+is no second set of checked-in `.cfg` files. It disables TLC's deadlock check
+because completed models may make no further state change. The lifecycle cases
+still check their named eventual-closure properties.
 
-Run the focused tests from this directory:
+## Checked scope and remaining gaps
 
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
-  test_model.py test_stages.py test_cross_boundary.py test_late_controls.py
-```
+At the 2026-11-17 checkpoint, SANY parsed these sources and the 155 required TLC
+cases produced their intended result, including exact negative-control targets.
+The two-message stage case completed with **802,787 distinct states** in 28.793
+seconds. The larger case including all controls hit its 30-second limit and
+remains **INCOMPLETE**. The earlier Python run that reached 300,001 states was a
+different exploration; it also remains incomplete, not a TLC result.
 
-The exploration scripts write their named JSON outputs in the working directory. For full exploration copy this
-directory to a disposable workspace and run there:
+The old 60 Python test methods are not 60 TLC tests or runtime checks. The TLA+
+models replace the abstract Python explorers. Identity-store requirements moved
+to the real Rust/SQLite contract tests; those suites and the macOS fault tests
+remain. See [the native contract](stage-runtime-contract.md) and
+[the saved-task contract](stage-store-contract.md).
 
-```sh
-work=$(mktemp -d)
-cp specs/native-execution/*.py specs/native-execution/*.tla specs/native-execution/*.cfg "$work/"
-(cd "$work" && PYTHONDONTWRITEBYTECODE=1 python3 check_late_controls.py)
-```
+The coarse models retain the earlier supervisor/guardian alias arrangement.
+They do **not** model the selected SDK registry/token recovery plan, a retained
+third service descriptor, boot/exec token capture or takeover. Full-domain lock
+acquisition, sealed launch gates, observed whole-scope termination, authenticated
+callbacks and release of the relevant descriptors remain explicit assumptions.
+Fairness assumes responsive actors eventually take specified actions; it does
+not assume a frozen owner resumes or an arbitrary child exits.
 
-The second example assumes the repository root as starting directory. Run other `check_*.py` scripts in that same
-disposable directory as needed. Preserve failures and incomplete results. No script starts Lean/native jobs or tests
-real SQLite.
-
-## Explicit assumptions and omissions
-
-- Complete-domain acquisition is abstracted as one grant. Actual partial-lock acquisition/release and fairness against
-  external writers require runtime tests.
-- Custody aliases refer to an acquired open file description. **Close-only: no explicit unlock and no SH↔EX mode
-  conversion while live custody exists.** Unlock through an alias can affect all aliases; conversion is not assumed
-  atomic and may release prior custody. This is a runtime refinement assumption, not a modeled flock syscall or a claim
-  that every failed conversion loses its lock.
-- Crash, frozen-owner and cleanup transitions are different. Cleanup authority must come from actual retained
-  child/qualified OS custody, never a serialized PID alone. Fair progress assumes the stated responsive actors and
-  available termination/ observation; it does not cover unkillable or detached children.
-- A service's third retained EX alias and original-parent guardian-stop authority were measured in separate disposable
-  Rust topologies. They are NOT composed into the old two-alias model. A frozen service can itself retain the final
-  alias.
-- Pending/consumed GO can survive service loss before spawn. Missing result or no currently observed payload is not
-  enough to authorize replacement. No replay of uncertain payloads; explicit new stages must retain different immutable
-  IDs.
-- Every runtime completion/cancel/cleanup callback must carry and validate its original attempt/stage ID, scope
-  generation and bound owner identity before mutating active state. Old ACK/results affect only their own history. These
-  are obligations for implementation, not evidence that current runtime does so.
-- Storage failure, real descriptor transfer, OS signaling, actual callback code, new START/GO traffic composed with all
-  late controls, and all owner failures combined with those controls remain outside completed validation.
-
-The evolving service-death custody experiments are intentionally not claimed as completed by this integration. Reconcile
-their final exact topology and evidence before adopting a production contract. See
-[the design](../../docs/native-execution-lifecycle-design.md), especially §§4, 8, 11 and 13. Formal models and
-real-process tests complement each other; neither silently supplies the other's assumptions.
-
-## Unwired Rust state kernel
-
-[The Rust stage kernel](stage-kernel.md) checks immutable stage bindings, one-use launch effects and isolation of old
-callbacks. It is a directly testable reference module, not part of the running server. Its 25 focused tests include 48
-ordered pairs of late controls. The document explains its API, model differences and the launch, authentication, closure
-and persistence facts a future runtime must supply. Run it directly with `rustc`; no server or Lean build is needed.
-
-## Unwired native adapter tests
-
-[The native stage contract tests](stage-runtime-contract.md) connect the reference
-kernel to actual disposable SDK children and a read-lock guardian on macOS. They
-check one-use GO, delayed callbacks, lost delivery and full one-shot generation
-cleanup. They do not exercise current production routing, warm-worker request
-closure or durable restart recovery. The document states the exact process
-arrangement, negative controls and dependency limits of the recorded runs.
-
-## Unwired SQLite store tests
-
-[The saved-task contract tests](stage-store-contract.md) keep caller bindings and
-native history in separate SQLite files. They check one-use committed launch
-permission, stale callbacks, process-kill/reopen boundaries and two cases with
-the existing dummy runtime. SQLite is a Unix-only test dependency; no server
-route uses this component. Reopening keeps the same live native owner and does
-not establish service-restart recovery or power-loss durability.
+The separate models do not constitute a proof of their combined implementation.
+Deadline-policy checks establish neither real clock behavior nor process exit.
+The current-stage callback, persistence, OS and service-integration obligations
+still require the real implementation tests described in
+[the design](../../docs/native-execution-lifecycle-design.md).

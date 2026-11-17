@@ -70,21 +70,19 @@ delivery, SQLite correctness or completion of the execution-service redesign.
 
 ## Model relationship and review
 
-The tests translate the failure cases in `check_stages.py` and `check_late_controls.py`: failed-spawn replay,
+The tests exercise failure cases also checked in `Stages.tla`: failed-spawn replay,
 owner/generation mismatch, changed intent, rebinding after replacement, old cancellation of new work, result-as-idle,
 ACK of another result, and old cleanup of another stage/generation.
 
-Two deliberate differences from the bounded Python stage model:
-
-1. The Rust kernel accepts matching historical result/ACK/spawn facts after generation replacement while isolating
-   current work. The Python model rejects envelopes against the replaced current generation.
-2. Retention records result identity and ACK/expiry state. A duplicate late result cannot restore it. The Python model
-   has a simpler retained bit.
+The Rust kernel accepts matching historical result/ACK/spawn facts after replacement while isolating current work.
+Retention preserves result identity and ACK/expiry state; a late duplicate cannot restore removed bytes.
+The TLA+ stage model checks historical result/ACK isolation and one-use gates, but it does not cover every Rust API
+or prove that the implementation follows the complete model.
 
 The Rust tests include 48 ordered pairs of old controls across pending, running and replacement cases. They deliberately
-give old/new stages the same result ID. They are targeted regressions, not exhaustive exploration or a proof that the
-Rust code refines the complete model. The larger composed Python check remains incomplete as recorded in the spec
-README. Independent agents reviewed the API, implementation and observations boundary before commit.
+give old/new stages the same result ID. These are targeted regressions, not exhaustive exploration. The larger combined
+TLC check remains incomplete as recorded in the spec README. Independent agents reviewed the API, implementation and
+observations boundary before commit.
 
 Recorded validation, 2026-11-17: all 25 Rust tests passed, including 48 ordered late-control pairs. Six deliberately
 broken copies compiled outside the checkout and each failed its targeted regression: wrong-stage stop, old result

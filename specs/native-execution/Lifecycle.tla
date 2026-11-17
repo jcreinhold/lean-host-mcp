@@ -1,9 +1,9 @@
 --------------------------- MODULE Lifecycle ---------------------------
 EXTENDS Naturals, FiniteSets, TLC
 
-\* NOT YET PARSED OR CHECKED BY TLC: no Java runtime/TLC is installed locally.
-\* Companion to check_model.py. This specification omits negative-control
-\* mutations; it makes the same whole-scope cleanup/union-lock assumptions.
+\* Checked with SANY/TLC under the named bounded configurations.
+\* Earlier two-alias abstraction: native closure and complete-union grants
+\* remain assumptions; the selected registry/token recovery is not modeled.
 CONSTANTS DualOwner, MaxFaults, GuardianCanStop, ExternalContainment,
           SameDomain, ReadRead, AllowFreeze, ServiceCanStopFrozenOwner,
           ExternalCanStopFrozenOwner, FreezeService, FreezeGuardian
