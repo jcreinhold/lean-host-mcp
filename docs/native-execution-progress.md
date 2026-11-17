@@ -165,3 +165,13 @@ reacquisitions. No retry/forced termination occurred; post-run helper/runtime ha
 was 21:15:16. This is cooperative pinned 4.35 fixture evidence, not imports/theorems, process-group closure, stock
 providers, 4.36 or production qualification. Dup strict rerun now owns the lane in turn
 `01a1eb5d-d62f-7224-ac96-a8484f65f6fb`; ABI prepares the next finite gate plan source-only.
+
+### Integration and next ABI gate: 21:20 UTC
+
+Independent review cleared the exact lean-dup source-pin and warning patches after strict Darwin arm64 tests.
+Canonical integration is assigned to its existing owner, turn `01a1eb61-c37b-77d2-9700-7f5b9498016c`; it is not yet
+reported complete. Rust fallback toolchain changes too; packaged installer and remote/Rust/SDK qualification stay open.
+ABI's `task-20/NEXT-ABI-GATES.md` specifies one scoped 4.35 import/theorem check, not another multiplication run.
+The owner is assigned compile-only guarded-entry/prepared-shim wiring and installed olean/elaborator provenance on
+the released two-job lane. Exact artifacts require independent review before that native run. 4.36 needs its own
+paired configured build/signature/image evidence; production provisioning remains a separate explicit decision.
