@@ -232,3 +232,11 @@ checks fail on 29 core/host tests, examples and benchmarks needing explicit auth
 adapter executables link. The owner now repairs these targets in isolated composition, without unchecked authority or
 canonical activation, using turn `01a1eb9e-a843-70d8-8c19-e749c2c18171`. Previous lane released at 22:25:36; this new
 bounded compile assignment owns the two-job lane. Active supported canonical SDK remains 4.35.
+
+### Migration progress and denied scalar run: 22:41 UTC
+
+The 4.36 scalar run was denied by automated per-command review at 22:28:48 before launch. No retry occurred; owner
+resumed independent source migration. Root is resolving the exact authorization blocker. Compilation now passes for
+four host examples, core profiling/examples/benchmark, three callback tests and four host fixture tests. The broader
+all-target inventory still failed at 22:39:46; residual count is requested. No native target execution is established.
+The owner remains active on the single two-job lane, with concrete compile evidence within the preceding two minutes.
