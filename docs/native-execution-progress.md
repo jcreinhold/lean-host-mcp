@@ -57,3 +57,25 @@ before removing a scratch tree. Archived model evidence and replay instructions 
 
 Coordinator checks completion callbacks first and checks active lanes about every ten minutes. Twenty minutes without
 new evidence triggers a specific progress/current-command query, not an automatic kill or duplicate session.
+
+## Timing and last evidence
+
+As observed on 2026-11-17 at 20:25 UTC. Session attachment is metadata, **not execution start**. The supported
+thread reader reports turn/status but no dependable turn-start time. Times below are explicit lane records, coordinator
+observation windows, or UTC file modification times (labelled mtime). Neither an open session nor elapsed wall time
+proves continuous work. Do not estimate active compute time from these fields.
+
+| Track | Session attached (UTC, where checked) | Current step and last evidence (UTC) |
+| --- | --- | --- |
+| ABI | 18:58:39 | Current turn `01a1eb2d-b0b5-731a-b7fb-514d4c909a38` admitted around 20:23; exact start unknown. Eighth 4.35 all-target log mtime 20:21:51, final incremental Cargo duration 1.62 s. Prior completion observed 20:22; new ingress repairs/compile lane active. |
+| Guardian | 18:53:37 | Qualification finished by 19:59; immutable isolated commits reported by 20:03. No active build; waiting coordinated composition. |
+| Warm | 18:51:44 | Revised campaign explicitly claimed lane 19:28:08 and released 19:28:22 (14 s lane occupancy, not summed CPU time). 26 positives before/after, nine mutation controls. Waiting joint integration. |
+| Formatter 4.36 | 18:51:03 | Full-suite lane status recorded 19:08; final release 19:27:20. Final Modes 105 s, downstream 24 s. No current build; Linux remains unqualified. |
+| SDK 4.36 audit | 18:50:49 | Isolated removal `750846a1` completed before 19:07 coordinator check. Exact task start/end unknown; waits coherent ABI composition. |
+| Semantic 4.36 | Not rechecked | Exact lane release 18:51:42; Lean build/tests passed. No current build; Rust qualification waits SDK. |
+| Host/dup | Not rechecked | Policy-source mapping turn `01a1eb2d-c0ed-7545-adbc-85358bf63e09` admitted around 20:23; read-only, no lane. Prior qualification plan is not runtime qualification. |
+| TLA/model | Historical session | Completed bounded evidence in the model gate above. No active model run; no inference of implementation proof. |
+
+For subsequent commands, owners record UTC start/end, exact command and snapshot, result, and lane release in their
+existing lane/handoff file. The coordinator records the last verified checkpoint and next dependency here. A missing
+time stays unknown. Filesystem times must be rendered with `TZ=UTC`; an mtime is only the last recorded file write.
