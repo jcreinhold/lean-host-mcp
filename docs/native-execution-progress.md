@@ -125,3 +125,15 @@ release/signatures/consumers; no builds, fetch, cache or source changes. The own
 - Host/dup completed an applicable source-pin patch against `a1189fb`: six Lean toolchains and CLI default to 4.36, both Lake semantic pins to `c30d8b3`. Static checks passed; no compile or canonical change. Lean-only checks wait for the lane; Rust/package checks wait for the coherent SDK family.
 - Native Mathlib audit completed at 20:53:33, after 4m54s, per IUT coordinator. Four source-inspected candidates, no compiled theorem claim. Proofs remains clean at `bc2c4ca264`; no active IUT task.
 - Mac briefly disconnected and was confirmed connected and reattached before this update. No uncertain command was rerun. No release or deployment occurred.
+
+### Qualification handoff: 21:02 UTC
+
+Warm released the lane at 21:01:50 after 27 receipt tests (four new regressions) and strict host Clippy. The revised
+private adapter patch is `07c1fb273ad894967c89aec0efd5f9dd51fc0fd0f13419053939be88fe9ef17b`; independent joint review
+is requested. Tests cover body/seal/shutdown outcome separation, framed 0/1/2/2 counts, queued exclusion and retained
+companion capacity. They do not qualify authenticated GO or durable native custody; canonical activation is disabled.
+
+ABI provisioning resolved the reference worker's nine-image closure, but that binary predates the fixture policy and
+cannot authorize a positive run. The source-only supervisor/driver now has independent review assigned. ABI receives
+the released two-job lane for compile-only supervisor and actual fixture-feature binary/manifests. Native execution
+still requires review of these exact identities, load commands and allocator provenance. No positive ABI test has run.
