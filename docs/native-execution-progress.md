@@ -147,3 +147,12 @@ released and assigned to host/dup turn `01a1eb59-da7f-7693-a990-d6db443f936e` fo
 not unqualified SDK/Rust execution. ABI review proceeds independently and waits for the lane before any approved run.
 Warm's revised private checkpoint passed independent review: its retirement failure is injected, and successful framed
 cases use the post-arm seam. It does not establish authenticated GO, production shutdown precedence or native custody.
+
+### Native run and strict-build repairs: 21:15 UTC
+
+Dup released the lane at 21:13:21. Ordinary four-fixture builds and duplicate-key JSONL recovery passed on 4.36;
+strict builds exposed a deprecated import and two unused binders. The reviewed minimal repair replaces the import in
+both worker copies and renames only unused fixture binders; strict rerun is pending. ABI turn
+`01a1eb5c-48c3-7349-b34b-a83face71dd6` owns the lane for exactly one independently approved native fixture run.
+All 91 artifact hashes and corrected actual-child ownership were independently reviewed. Execution result remains
+pending; no production, group-closure, theorem or 4.36 ABI claim follows from this bounded fixture.
