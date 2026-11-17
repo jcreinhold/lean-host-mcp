@@ -200,3 +200,12 @@ The admission-only probe compiled at 22:03:55 and released the lane at 22:04:09.
 `c4749564a415fcfcadf5fd37d6c5a2519adfedfae269514a6549bd8ad8dfc040`, helper, SDK and six domains. One diagnostic
 turn `01a1eb90-ca94-70e7-b051-637cad9ada2a` was admitted about 22:11 UTC under original restrictions, without worker,
 guardian or privilege changes. Outcome pending. Any labelled error identifies this invocation, not the original cause.
+
+### Admission permission boundary: 22:14 UTC
+
+The single diagnostic ran 22:11:52–53, exited one and specifically reported `UnixListener::bind` EPERM for reader
+`fd.sock` after creating its private temporary directory. No worker/guardian started; original evidence and demand-lock
+identity were preserved. This identifies the diagnostic operation, not the original unlabelled qualifier cause or an
+exact policy rule. Native work is blocked pending an explicit execution-policy decision for one pinned admission-only
+listener/helper handoff. No alternate path, escalation or custody removal was attempted. The owner proceeds with
+source-only 4.36 metadata/signature reconciliation; configured support and release activation remain unqualified.
