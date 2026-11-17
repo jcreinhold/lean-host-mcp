@@ -477,7 +477,7 @@ New module names below are proposals, not existing implementations.
 | `H/shared_writer.rs`; `H/native_reader.rs`; `H/native_reader/control.rs`; `H/native_reader/input.rs` | Replace independently owned controller loops with common scope implementation; preserve actual launch and input-validation invariants |
 | `H/broker.rs`; `H/project.rs`; `H/artifact_reads.rs` | Integrate common scope identities/admission; retain semantic actor/session/cache design and demand-driven retirement |
 | `H/tasks.rs`; `H/request_log.rs`; `H/request_journal.rs` | Link semantic tickets to native attempts; keep semantic result/ACK meaning; no merge of incompatible IDs |
-| `HOST/crates/lean-host-mcp/Cargo.toml`; `HOST/Cargo.lock` | Select reviewed SQLite dependency and protocol dependencies during implementation; no dependency added now |
+| `HOST/crates/lean-host-mcp/Cargo.toml`; `HOST/Cargo.lock` | SQLite is currently a Unix-only test dependency; production store/protocol dependencies remain a separate implementation decision |
 | `P/native_execution.py` (new); `P/native_compatibility.py` | Thin discover/create/start/get/cancel client; persist original IDs on all errors |
 | `P/owned_writer.py`; `P/native_reader.py`; `P/native_reader_protocol.py`; `P/orchestration/managed_lake.py`; `P/orchestration/managed_read.py` | Remove actual native-helper Popen supervision, late daemon waiter, duplicate timeout/classification logic after parity |
 | `P/native_history.py`; `P/native_protocol.py`; `P/registry.py`; `P/sqlite_store.py` | Add durable original-job/stage outbound attempt binding as provenance; preserve source snapshots; no native capacity lease or new execution queue |
@@ -530,7 +530,10 @@ must report which attempts started and their current state, not assume nothing h
 
 ## 11. Acceptance and fault matrix
 
-All new-design cases below are **NOT RUN**. Use causal synchronization, not timing-only sleeps. Freeze exact binary hashes,
+The complete integrated-service matrix below remains **NOT RUN**. The
+[scoped store/process tests](../specs/native-execution/stage-store-contract.md)
+cover only the stated prototype cases. Use causal synchronization, not timing-only
+sleeps. Freeze exact binary hashes,
 source revisions, SDK lockfile, OS and fixture. A test with failed setup is NOT RUN, not passed. Keep the proof source claim
 separate from successful tooling acceptance.
 
@@ -808,7 +811,9 @@ cannot reconstruct them or establish that a command never ran.
 - Keep a coverage table separating process-kill tests, VFS fault simulations,
   OS-crash testing and physical power-loss qualification. Unrun categories stay
   unrun. No existing custody fixture or pure lifecycle model establishes these
-  storage guarantees; all new native-store durability tests remain NOT RUN.
+  storage guarantees. The [test-only store qualification](../specs/native-execution/stage-store-contract.md)
+  covers process-kill/reopen and same-owner dummy-runtime cases. VFS fault injection,
+  external assets, OS-crash and power-loss qualification remain unrun.
 
 ### SQLite linked-runtime provenance and WAL-reset compatibility
 
@@ -819,8 +824,9 @@ with specified backports 3.44.6 and 3.50.7. FULL synchronization is not a substi
 for this fix. This is a future dependency/qualification requirement, not a claim
 of observed corruption or a defect in the current non-SQLite runtime slice.
 
-At this inspection the host Cargo manifests/lockfile contain no SQLite dependency
-for the proposed store. Updating a Proofs Python interpreter does not establish
+SQLite is currently a Unix-only development dependency for the
+[test-only store](../specs/native-execution/stage-store-contract.md), not a production
+store dependency. Updating a Proofs Python interpreter does not establish
 which SQLite a future Rust binary, helper, maintenance tool or another interpreter
 actually uses. Before permitting access to the future store:
 
@@ -840,5 +846,7 @@ actually uses. Before permitting access to the future store:
   write/checkpoint behavior on disposable databases. Stress tests passing alone do
   not prove absence of this rare race or replace verified fixed-build provenance.
 
-No SQLite upgrade, live database access or runtime configuration change occurred
-for this documentation check. Planned native-store tests remain unrun.
+The isolated tests query the actual Rust-linked SQLite build and check connection
+settings on disposable files. They leave the installed server and live databases
+unchanged. Their scoped results do not establish production restart recovery,
+physical flush success or the other unrun storage tests above.

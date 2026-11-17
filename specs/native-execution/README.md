@@ -94,3 +94,12 @@ check one-use GO, delayed callbacks, lost delivery and full one-shot generation
 cleanup. They do not exercise current production routing, warm-worker request
 closure or durable restart recovery. The document states the exact process
 arrangement, negative controls and dependency limits of the recorded runs.
+
+## Unwired SQLite store tests
+
+[The saved-task contract tests](stage-store-contract.md) keep caller bindings and
+native history in separate SQLite files. They check one-use committed launch
+permission, stale callbacks, process-kill/reopen boundaries and two cases with
+the existing dummy runtime. SQLite is a Unix-only test dependency; no server
+route uses this component. Reopening keeps the same live native owner and does
+not establish service-restart recovery or power-loss durability.
