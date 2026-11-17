@@ -142,6 +142,7 @@ fn create_retry_never_resets_consumption_results_or_closed_epoch_history() {
         .unwrap();
     store.expire(binding, &request.capability, [42; 16]).unwrap();
     let old = store.get(request.key).unwrap().unwrap();
+    assert_eq!(store.create(&request).unwrap(), old);
     assert_eq!(store.rotate_epoch(1).unwrap(), 2);
     assert_eq!(store.create(&request).unwrap(), old);
     let mut changed = request.clone();
