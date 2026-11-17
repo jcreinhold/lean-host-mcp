@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
 # scripts/prerelease.sh — run every pre-release gate locally.
 #
-# This is the local mirror of `.github/workflows/ci.yml`'s `check` job
-# (fmt, clippy, rustdoc, build, test) PLUS the invariants CI does not enforce but
-# the repo already configures: the parent-binary link-set assertion
-# (AGENTS.md "Multi-toolchain dispatch"), taplo/mdwright format checks
-# (taplo.toml / .mdwright.toml / npx prettier), cargo-deny (deny.toml), and cargo-shear.
-# Passing locally is the fast feedback loop before a release tag.
+# Mirrors CI's Rust checks, parent-binary link-set assertion and cargo-deny.
+# Adds local taplo/prettier formatting, mdwright linting and cargo-shear.
+# See AGENTS.md "Build and validation" for the per-member build invariant.
 #
-# Unlike its sibling repos, CI here does NOT set RUSTFLAGS=-D warnings
-# globally — only clippy and rustdoc are `-D warnings`. We stay faithful to that.
+# Like CI, only clippy and rustdoc use -D warnings; RUSTFLAGS is not set globally.
 #
 # All gates are attempted even if an earlier one fails; the run ends with
 # a pass/fail/skip summary and a non-zero exit if anything failed. Optional
@@ -18,7 +14,7 @@
 #
 # Usage:
 #   scripts/prerelease.sh            # all gates
-#   scripts/prerelease.sh --quick    # skip the slow/network gates (cargo-deny)
+#   scripts/prerelease.sh --quick    # skip cargo-deny for iteration
 #   scripts/prerelease.sh --help
 
 set -euo pipefail
@@ -136,10 +132,10 @@ run_gate "cargo doc -p lean-host-mcp --no-deps (-D warnings)" \
 run_gate "cargo doc -p lean-host-mcp-worker --no-deps (-D warnings)" \
 	env RUSTDOCFLAGS="-D warnings" cargo doc -p lean-host-mcp-worker --no-deps
 
-# Build and test PER-MEMBER, never workspace-wide. A `--workspace` /
-# `--all-targets` build unifies the `lean-rs-sys` feature set across the
+# Build and test PER-MEMBER. A build selecting both workspace members
+# unifies the `lean-rs-sys` feature set across the
 # parent and worker crates, silently re-linking `libleanshared` into the
-# parent (AGENTS.md "Always build per-member"). That both violates the
+# parent (AGENTS.md "Build and validation"). That both violates the
 # parent ⊥ libleanshared invariant and makes the parent's own test binary
 # unrunnable — it references `@rpath/libleanshared.dylib` with no rpath to
 # find it. Scoping to `-p` keeps the parent on `lean-rs-sys` metadata-only,
@@ -188,7 +184,7 @@ gate_link_invariant() {
 }
 run_gate "parent ⊥ libleanshared (release link-set)" gate_link_invariant
 
-# -- Format checks beyond rustfmt (configured, not in CI) -------------------
+# -- Local formatting and Markdown lint checks (beyond CI) ------------------
 
 if command -v taplo >/dev/null 2>&1; then
 	run_gate "taplo fmt --check" taplo fmt --check
@@ -216,7 +212,7 @@ else
 	skip_gate "prettier --check (npx not installed)"
 fi
 
-# -- Dependency hygiene (configured, not in CI) -----------------------------
+# -- Dependency hygiene (cargo-deny also runs in CI; shear is local) ---------
 
 if [[ "$QUICK" == 1 ]]; then
 	skip_gate "cargo deny check (--quick)"

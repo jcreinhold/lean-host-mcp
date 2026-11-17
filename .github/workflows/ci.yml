@@ -60,10 +60,10 @@ jobs:
         run: |
           cargo doc -p lean-host-mcp --no-deps
           cargo doc -p lean-host-mcp-worker --no-deps
-      # Build and test PER-MEMBER, never workspace-wide: a `--all-targets`
-      # workspace build unifies the lean-rs-sys feature set across the parent and
+      # Build and test PER-MEMBER: selecting both members in one build
+      # unifies the lean-rs-sys feature set across the parent and
       # worker, silently re-linking libleanshared into the parent (AGENTS.md
-      # "Always build per-member"). That also makes the parent's own test binary
+      # "Build and validation"). That also makes the parent's own test binary
       # unrunnable — it would reference @rpath/libleanshared.dylib with no rpath.
       - name: build (parent)
         run: cargo build -p lean-host-mcp --all-targets

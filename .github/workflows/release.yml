@@ -14,14 +14,13 @@ name: Release
 # `CARGO_REGISTRY_TOKEN` must be set in the repository secrets before the first
 # tag push — a scoped publish token from <https://crates.io/settings/tokens>.
 #
-# Two-crate split drives the job layout. Only the `verify` gate installs Lean:
-# it builds and tests both crates per-member, asserts the parent ⊥ libleanshared
-# link invariant, and verify-builds both publish tarballs (`cargo publish
-# --dry-run`). The `publish` job is therefore Lean-free — it uploads both crates
-# with `--no-verify`, relying on that gate. This is necessary, not just an
-# optimization: the worker links libleanshared, and even the parent's verify
-# build pulls lean-rs-sys, whose build script requires a Lean toolchain. A
-# Lean-free publish must skip verification; the gate already performed it.
+# Only `verify` installs Lean. It builds both members separately, tests the
+# parent, asserts parent ⊥ libleanshared and checks packaged file lists. The
+# parent's publish dry run verifies its package build; the worker's dry run
+# uses --no-verify, so its packaged build is not verified.
+# The Lean-free `publish` job uploads both with --no-verify: the worker links
+# libleanshared and even the parent's verification pulls lean-rs-sys, whose
+# build script needs a Lean toolchain. It relies on the earlier checks.
 
 on:
   push:
@@ -119,8 +118,8 @@ jobs:
           cargo doc -p lean-host-mcp --no-deps
           cargo doc -p lean-host-mcp-worker --no-deps
 
-      # Build and test PER-MEMBER, never workspace-wide: a `--all-targets`
-      # workspace build unifies the lean-rs-sys feature set across the parent and
+      # Build and test PER-MEMBER: selecting both members in one build
+      # unifies the lean-rs-sys feature set across the parent and
       # worker, silently re-linking libleanshared into the parent.
       - name: build (parent)
         run: cargo build -p lean-host-mcp --all-targets
@@ -205,8 +204,9 @@ jobs:
           # resolves a not-yet-published worker. Both publish with --no-verify:
           # the verify build pulls lean-rs-sys (and, for the worker, links
           # libleanshared), which demands a Lean toolchain this Lean-free job
-          # does not have. The `verify` gate already built, tested, and dry-run
-          # verified both tarballs.
+          # does not have. The `verify` gate built both members, tested the parent,
+          # checked package contents and verified the parent's packaged build.
+          # The worker's packaged verification build remains skipped.
           publish_one lean-host-mcp-worker --no-verify
           publish_one lean-host-mcp --no-verify
 
