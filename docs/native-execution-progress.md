@@ -156,3 +156,12 @@ both worker copies and renames only unused fixture binders; strict rerun is pend
 `01a1eb5c-48c3-7349-b34b-a83face71dd6` owns the lane for exactly one independently approved native fixture run.
 All 91 artifact hashes and corrected actual-child ownership were independently reviewed. Execution result remains
 pending; no production, group-closure, theorem or 4.36 ABI claim follows from this bounded fixture.
+
+### First native fixture result: 21:16 UTC
+
+The approved supervisor ran once at 21:14:57–21:15:00 and returned zero, independently read from `one-positive.exit`.
+Its successful path requires 6×7=42, termination acknowledgement, directly owned worker exit and all five writer
+reacquisitions. No retry/forced termination occurred; post-run helper/runtime hashes matched. Explicit lane release
+was 21:15:16. This is cooperative pinned 4.35 fixture evidence, not imports/theorems, process-group closure, stock
+providers, 4.36 or production qualification. Dup strict rerun now owns the lane in turn
+`01a1eb5d-d62f-7224-ac96-a8484f65f6fb`; ABI prepares the next finite gate plan source-only.
