@@ -275,3 +275,13 @@ termination acknowledgement, direct-child reap and five writer reacquisitions. L
 remain preserved. These are narrow fixture results, not broad 4.36 imports/kernel or production qualification.
 Next work is isolated paired safety-source integration with warm ownership reconciliation; registration stays distinct,
 exact-tree static gates must rerun, and production authority policy remains explicit. No canonical activation/release.
+
+### Paired actor and policy checks: 00:12 UTC, November 18
+
+Paired host `44e96533` and SDK `1ff65153` passed two cleanup and 27 actor receipt tests plus formatting/strict Clippy.
+Independent re-review confirms original-timeout receipt preservation and live replacement capacity retention; controlled
+fake-child evidence is not authenticated GO/native custody. The policy harness passed three tests at 00:10:31–37,
+verified four source hashes and system-only linkage. Its modules remain unwired.
+Provisioning turn `01a1ebfe-a4a8-7329-a3ce-f243f61fb804` now owns the two-job lane for isolated safe opener/installer
+receipt and activation failure tests. ABI turn `01a1ebfe-bdc5-7096-a406-0aaff4c2c0d0` prepares worker custody contract
+source-only, avoiding installer-file overlap. No live install, production activation or new native workload is assigned.
