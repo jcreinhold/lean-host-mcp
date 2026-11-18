@@ -102,9 +102,9 @@ old supervisor's authority.
 
 ## Run a check
 
-The host configuration consumes `lean-rs` commit `21cd9f5887223862ef6952aef35c0a7cce45300a`,
+The host configuration consumes `lean-rs` commit `ba5efb906b8855392b2d5b2a5074bb3497c7e290`,
 `specs/worker-custody/WorkerCustody.tla` (SHA-256
-`f1852903f4b35d044d2c5e75555c4f12b430313871ba56c1a49bb9a67d7aa6b5`). The runner finds a sibling
+`9ede3b6952a12baddbad63f0838ab0b5daf29d0899cf8306cb505088f8df8554`). The runner finds a sibling
 `lean-rs` checkout or accepts `LEAN_RS_WORKER_CUSTODY` pointing to the exact file. It checks the digest
 before passing those bytes to TLC. Historical-only runs require no SDK checkout.
 
@@ -157,6 +157,22 @@ failure only when TLC names the exact configured predicate. `MATCHED` can mean
 an expected failure or a reachability witness; it does not mean the bad protocol
 is safe. A witness case checks the negation of a target so TLC supplies a trace
 that reaches it.
+
+## SDK pin compatibility at ba5efb9
+
+Compared with `21cd9f5`, the SDK adds two negative-control actions to `Next`. Each requires its own distinct
+`Mode`. The first returns the durable Preparing reservation after possible spawn while the group and guardian
+remain present. The second returns tracker capacity after direct-child exit while the guardian remains present.
+Both guards are false in the host's good mode. SDK inputs, outputs and good-mode transitions used by the host
+are unchanged. The previously recorded identity check below retains its original revision.
+
+Seven focused host cases matched with TLC 2.19 and one worker. Identity exhausted 228 distinct states (564
+generated), warm reuse exhausted 234 (577 generated), and combined faults exhausted 211,968 (1,221,970 generated).
+Wrong ordinal and wrong generation each violated `SafeCommands`; stale reply violated `ReplyIdentity`; stale closure
+violated `ClosureIdentity`. Each control stopped at its expected first violation. The host inputs were `Stages.tla`
+SHA-256 `c9a0515722cdd3d32ef0d5fb2563179a3321cd7478f2ce566bf8a271742af177` and `cases.json` SHA-256
+`e59d02fcffccc9fef773dfb283cdb9cf4126ff0c1917b9c679b3d9bb4a4f8aff`. This run covers the model interface
+under its existing provenance and fairness assumptions. Native custody and release qualification remain open.
 
 ## Identity-interface check
 

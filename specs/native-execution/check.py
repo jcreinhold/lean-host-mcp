@@ -111,7 +111,7 @@ def main():
         if not sdk_path.is_file():
             parser.error("Set LEAN_RS_WORKER_CUSTODY to the pinned SDK module (see README)")
         sdk = sdk_path.read_bytes()
-        if hashlib.sha256(sdk).hexdigest() != "f1852903f4b35d044d2c5e75555c4f12b430313871ba56c1a49bb9a67d7aa6b5":
+        if hashlib.sha256(sdk).hexdigest() != "9ede3b6952a12baddbad63f0838ab0b5daf29d0899cf8306cb505088f8df8554":
             parser.error("Set LEAN_RS_WORKER_CUSTODY to the reviewed SDK module (see README)")
         model_bytes["WorkerCustody"] = sdk
     jar_bytes = jar.read_bytes()
