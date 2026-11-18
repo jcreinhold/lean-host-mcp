@@ -389,3 +389,19 @@ Interactive continuation remains source design: existing Rust Child/control sequ
 value, watchdog must not start a second guardian, pre-ACKed reads must not be reacquired against pending writer demand,
 and one absolute startup deadline must span bootstrap/adoption. Existing ABI owner continues a narrowly typed Unix
 handoff and harmless framed-worker plan; finite test success does not qualify that unfinished mode.
+
+### Continuation and recipe wiring checkpoint: 01:10 UTC, November 18
+
+SDK `1c45c6dd` passed worker-parent all-target checking and six isolated continuation tests with system-only linkage;
+lane released 01:08:27. Single wire clock, bounded ACKs, explicit retain sequence and receiver CLOEXEC corrections are
+implemented. Production adoption remains disconnected: generation custody across exec, pre-concurrency receipt and
+exclusive child reaping need real launch wiring. No worker/guardian process ran in these tests.
+
+Provisioning has bounded operator checkout recipe selection and specific unsupported selection errors. The selected
+audit index is digest-checked; decoding/binding it into transaction inputs and the guarded fixed smoke driver remain
+unfinished. Turn `01a1ec33-9901-7078-ba30-411450b2c4c4` owns pure tests/compile; ABI turn
+`01a1ec33-abb9-70e8-aff4-4b3ece79914c` owns source-only actual launch wiring. Public install remains stopped before mutation.
+
+Twelve mutually owner-cleared incremental caches (2.78 GiB) moved recoverably to
+`~/.Trash/lean-incremental-20261118-0104` at 01:05:16; no binary/source/evidence removed. This does not reclaim disk space
+while Trash is retained. Build hold ended; current targets are reused rather than copied per revision.
