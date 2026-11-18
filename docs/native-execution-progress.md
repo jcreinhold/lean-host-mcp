@@ -285,3 +285,27 @@ verified four source hashes and system-only linkage. Its modules remain unwired.
 Provisioning turn `01a1ebfe-a4a8-7329-a3ce-f243f61fb804` now owns the two-job lane for isolated safe opener/installer
 receipt and activation failure tests. ABI turn `01a1ebfe-bdc5-7096-a406-0aaff4c2c0d0` prepares worker custody contract
 source-only, avoiding installer-file overlap. No live install, production activation or new native workload is assigned.
+
+### Worker ingress and generation transaction: 00:20 UTC, November 18
+
+ABI owner `6afca3dd-61c8-8191-beef-0e1235e410d2` completed turn `01a1ec03-7871-7331-bcdc-6b98a7eaeee5`:
+SDK `3d93d5d17e01747262bc989bc061278531fd9898` and host `aa921357eb4c3c480e3ce054c8d7b442b1ccbf91`
+pass targeted strict Clippy, formatting and SDK worker documentation. The feature-gated 4.35 worker compiled/linked
+(SHA-256 `00b94d2e5ad7e2a3cb847740060bf24ca9f4167652caa69f5b89fd3b27b8b6a1`); two comparison contract tests
+passed in a libSystem-only test binary. Evidence: `task-20/safety-pair/worker-ingress/compiled.sha256` and
+`task-20/safety-pair/ingress-contract-{run,link}.log` under the existing November 17 Codex task directory.
+No worker or guardian launched. Lane release: 00:18:58 UTC.
+
+Independent source review verifies actual guardian-acknowledged readers precede every anchor open/reuse. Refusal can
+already retain guardian aliases and update metadata, so it is not cleanup evidence. Exact non-UTF8 path identity and
+separate guardian-executable provenance need explicit treatment before general production use. ABI follow-up
+`01a1ec06-4dcf-708b-8650-d6f41c0c5006` was admitted around 00:20 UTC for source-only disposition, not another build.
+
+Provisioning owner `6afca1a9-4f1c-8191-a757-cb2c906df0dc` prepared generation transaction patch
+`acc6aeba8df7b9927af487ce3679a963e85552990ff4318a2b62ca61c697ec20` at
+`task-15/host-native-policy-generation.patch`. Its previous safe-opener/policy harness passed five tests at 00:12:12–31.
+The new transaction test is not yet executed: turn `01a1ec06-3b68-71d0-b2e6-077c586bf400` was admitted around 00:20 UTC
+on the released two-job lane to compile/run actual temporary-directory staging/receipt/smoke/selector failure tests.
+Admission is not a measured command start. Independent read-only review runs in parallel. Real installer and runtime
+resolver wiring, protected receipts, actual writer/reader custody and scope-specific native smoke remain unfinished.
+Old generations must remain available, and post-rename directory-sync failure is uncertain, not proof of rollback.
