@@ -70,7 +70,7 @@ delivery, SQLite correctness or completion of the execution-service redesign.
 
 ## Model relationship and review
 
-The tests exercise failure cases also checked in `Stages.tla`: failed-spawn replay,
+The tests exercise failure cases also checked in `HistoricalStages.tla`: failed-spawn replay,
 owner/generation mismatch, changed intent, rebinding after replacement, old cancellation of new work, result-as-idle,
 ACK of another result, and old cleanup of another stage/generation.
 

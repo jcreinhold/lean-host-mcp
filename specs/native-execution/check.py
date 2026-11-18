@@ -71,24 +71,30 @@ def run_case(java, jar, work, case, cfg, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", help="Run all cases for one module")
     parser.add_argument("--case", action="append", help="Run a named case; repeat to select several")
     parser.add_argument("--extended", action="store_true", help="Include the two larger stage explorations")
     parser.add_argument("--list", action="store_true", help="List cases without starting Java")
-    parser.add_argument("--timeout", type=float, default=30, help="Seconds per case (default: 30)")
+    parser.add_argument("--timeout", type=float, help="Override per-case seconds (default: 30, 180 for host-faults)")
     parser.add_argument("--output", type=Path, help="Save summary.json and the combined tlc.log in this directory")
     args = parser.parse_args()
     catalog_bytes = (ROOT / "cases.json").read_bytes()
     catalog = json.loads(catalog_bytes)
+    if args.model and args.model not in catalog["models"]:
+        parser.error("Unknown model: " + args.model)
+    if args.model and args.case:
+        parser.error("Select a model or named cases")
+    cases = [c for c in catalog["cases"] if not args.model or c["model"] == args.model]
     if args.list:
-        for case in catalog["cases"]:
+        for case in cases:
             print(case["name"], case["expect"], case.get("invariant", ""), "[extended]" if case.get("extended") else "")
         return 0
-    if args.timeout <= 0:
+    if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
     names = {case["name"] for case in catalog["cases"]}
     if set(args.case or []) - names:
         parser.error("Unknown case: " + ", ".join(sorted(set(args.case) - names)))
-    selected = [c for c in catalog["cases"] if not args.case or c["name"] in args.case]
+    selected = [c for c in cases if not args.case or c["name"] in args.case]
     if args.case and not args.extended and any(c.get("extended") for c in selected):
         parser.error("The selected larger exploration needs --extended")
     selected = [c for c in selected if args.extended or not c.get("extended")]
@@ -99,6 +105,15 @@ def main():
         parser.error("Set TLA_TOOLS_JAR to the official tla2tools.jar")
     jar = jar.resolve()
     model_bytes = {name: (ROOT / (name + ".tla")).read_bytes() for name in catalog["models"]}
+    if any(case["model"] == "Stages" for case in selected):
+        sdk_path = Path(os.environ.get("LEAN_RS_WORKER_CUSTODY",
+            ROOT.parents[2] / "lean-rs/specs/worker-custody/WorkerCustody.tla"))
+        if not sdk_path.is_file():
+            parser.error("Set LEAN_RS_WORKER_CUSTODY to the pinned SDK module (see README)")
+        sdk = sdk_path.read_bytes()
+        if hashlib.sha256(sdk).hexdigest() != "f1852903f4b35d044d2c5e75555c4f12b430313871ba56c1a49bb9a67d7aa6b5":
+            parser.error("Set LEAN_RS_WORKER_CUSTODY to the reviewed SDK module (see README)")
+        model_bytes["WorkerCustody"] = sdk
     jar_bytes = jar.read_bytes()
     hashes = {"cases.json": hashlib.sha256(catalog_bytes).hexdigest()}
     hashes.update({name + ".tla": hashlib.sha256(data).hexdigest() for name, data in model_bytes.items()})
@@ -116,7 +131,9 @@ def main():
             jar.write_bytes(jar_bytes)
             for case in selected:
                 cfg = configuration(catalog["models"][case["model"]], case)
-                row, log = run_case(java, jar, work, case, cfg, args.timeout)
+                timeout = args.timeout or case.get("timeout_seconds", 30)
+                row, log = run_case(java, jar, work, case, cfg, timeout)
+                row["timeout_seconds"] = timeout
                 rows.append(row)
                 status = "MATCHED" if row["matched"] else row["observed"] if row["observed"] in {"INCOMPLETE", "ERROR"} else "UNEXPECTED"
                 print(f"{case['name']}: {status} ({row['observed']}, {row['seconds']:.3f}s)", flush=True)
@@ -130,7 +147,7 @@ def main():
             output_log.close()
         if args.output:
             summary = {"input_sha256": hashes, "jar_sha256": hashlib.sha256(jar_bytes).hexdigest(),
-                       "workers": 1, "heap_limit_mib": 512, "timeout_seconds": args.timeout, "cases": rows}
+                       "workers": 1, "heap_limit_mib": 512, "timeout_seconds": args.timeout or 30, "cases": rows}
             (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if all(row["matched"] for row in rows) else 1
 
