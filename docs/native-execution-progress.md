@@ -405,3 +405,15 @@ unfinished. Turn `01a1ec33-9901-7078-ba30-411450b2c4c4` owns pure tests/compile;
 Twelve mutually owner-cleared incremental caches (2.78 GiB) moved recoverably to
 `~/.Trash/lean-incremental-20261118-0104` at 01:05:16; no binary/source/evidence removed. This does not reclaim disk space
 while Trash is retained. Build hold ended; current targets are reused rather than copied per revision.
+
+### Installer handoff and cleanup qualification: 01:23 UTC, November 18
+
+Cleanup patch passed 40 installer tests, including independently reviewed symlink rejection, historical generation-ID
+reservation and busy-generation preservation; stage EX spans directory syncs. No real artifact removal occurred.
+Lane released 01:21:23. Cumulative source handoff: `task-15/host-installer-abi-handoff.md`, with exact patch/base/hashes.
+Public install awaits the real admitted-handle entry, then fixed theorem success, graceful exit zero and custody closure.
+
+ABI owns the two-job lane and actual continuation/entry wiring. Independent review found continued first-open errors
+after admission validation, authority checking or anchor creation still returned to the loop; a latch prevents another
+open but does not provide prompt retirement. Terminal cleanup preserving the primary error is assigned before activation.
+Installer owner is waiting on that concrete entry, not running another scaffolding task. No production or Lean run.
