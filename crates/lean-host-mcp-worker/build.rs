@@ -51,12 +51,19 @@ fn main() -> Result<(), String> {
 }
 
 fn explicit_prefix(prefix: PathBuf, target_os: &str) -> Result<PathBuf, String> {
-    let shared = if target_os == "macos" { "libleanshared.dylib" } else { "libleanshared.so" };
+    let shared = if target_os == "macos" {
+        "libleanshared.dylib"
+    } else {
+        "libleanshared.so"
+    };
     if !prefix.is_absolute()
         || !prefix.join("include/lean/lean.h").is_file()
         || !prefix.join("lib/lean").join(shared).is_file()
     {
-        return Err(format!("LEAN_SYSROOT does not name an absolute complete Lean prefix: {}", prefix.display()));
+        return Err(format!(
+            "LEAN_SYSROOT does not name an absolute complete Lean prefix: {}",
+            prefix.display()
+        ));
     }
     Ok(prefix)
 }
