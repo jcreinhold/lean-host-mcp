@@ -373,3 +373,19 @@ selector accessor and wrong-digest/zero-start tamper test. Composition remains u
 bounded compile lane for an agreed combined snapshot; ABI turn `01a1ec14-fb82-70fb-a3ed-a1a418b8777d` handles required
 release expectation, bootstrap loader environment and mutable dependency custody source boundaries. No fixture run,
 ordinary interactive startup qualification, public installer activation or deployment is established.
+
+### Approved Lean-free runtime checks: 00:46 UTC, November 18
+
+Exact `9916a317` composed fixture binaries passed separately approved commands: lifecycle at 00:45:41 (one test,
+0.26 s) and tamper at 00:45:56–57 (one test, 1.37 s). Logs independently read under
+`task-15/custody-final.ZOPWZX/{lifecycle-run.pEa3ko,tamper-run.m0kvgN}/test.log`.
+Lifecycle asserts post-controller-loss generation exclusion and captured guardian/group retirement, preserving the
+old selector and both byte strings. Tamper asserts verifier-specific rejection, zero payload starts and closed scope.
+Lifecycle scratch remains preserved. An extra process census was sandbox-blocked, so closure evidence is the test's
+identity/group observations, not an independent census. Rust executables are system-linked; lifecycle uses Homebrew
+Python, and private SDK IPC also uses /tmp. No Lean or installed production worker was exercised. Lane released 00:46:03.
+
+Interactive continuation remains source design: existing Rust Child/control sequence does not survive exec as a Rust
+value, watchdog must not start a second guardian, pre-ACKed reads must not be reacquired against pending writer demand,
+and one absolute startup deadline must span bootstrap/adoption. Existing ABI owner continues a narrowly typed Unix
+handoff and harmless framed-worker plan; finite test success does not qualify that unfinished mode.
