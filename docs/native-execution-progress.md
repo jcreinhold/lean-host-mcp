@@ -1,5 +1,14 @@
 # Native execution progress
 
+## Active release status: 2026-11-18 16:26 UTC
+
+Current user priority is **lean-rs 4.36 release only**; other repository work requires separate explicit direction and cannot compete with the SDK lane. SDK sole writer remains `6afca3dd-61c8-8191-beef-0e1235e410d2`, active turn `01a1ef77-c78c-715f-85c4-522769a86f54`, admitted around 16:22 UTC (about four minutes elapsed at this observation, not continuous compiler time). Canonical main is `860b960` with uncommitted functional CI/template fixes; formatting commit is separate.
+
+- Done: merged library check and 14-negative/one-positive trybuild; remote compile-fail and Miri passed at `c8f6af33`. Controlled protocol13 Init/theorem and scalar-refusal checks on `b0bbee95` each reported graceful actual child exit0 at 16:07. Those receipts do not establish independent guardian/group closure or arbitrary installed CLI support.
+- Latest local logs: focused host Clippy completed in 2.89s; initial all-template-target build completed in 15.53s. Current template worker-policy repair is not yet qualified. A later build-script run aborted because dyld could not locate `@rpath/libleanshared.dylib`; this is an observed loader failure, not an ASan memory-error finding.
+- Actual process snapshot at 16:26:34 UTC: Cargo PID99973 executing `cargo build --locked --offline --jobs 2 --manifest-path templates/shipped-lean-crate/Cargo.toml --bins --examples`, elapsed zero seconds, plus its rustc child. No unrelated compiler observed. Free disk approximately31GiB; 25GiB reserve applies. Capacity confirmed zed-kan never started.
+- Remaining: finish correct package-owned template worker authority/loader path, verify intended positive worker example and loader regressions, review/commit functional fixes, push exact candidate, require successful fresh Clippy/ASan/other CI and prerelease gates before publishing. Previous passing jobs do not qualify newer dirty bytes. Original failed logs retained under `task-20/upgrade-only-sdk.lg129tvr/controlled-v13/`. No release ETA inferred from session elapsed time.
+
 ## Current priority and checkpoints: 2026-11-18 13:51 UTC
 
 The active plan is **4.36 upgrade first**, then lifecycle redesign. Major overhaul implementation and new test/build scheduling are paused after safe checkpoints while the minimal compatibility split is finalized. Preserve all patches; do not revert or discard work. ABI owner6afca3dd owns minimal SDK compatibility/safety ancestry; installer6afca1a9 owns isolated upgrade-only host route analysis. Semantic/dup remain with lean_version; formatter is already complete. Recovery/deadline/service/caller owners are paused, not silently abandoned. Already-running focused compilation may finish safely; no new suites.
@@ -797,3 +806,25 @@ Required focused acceptance, owned with SDK-1/SDK-3 and host integration (planne
 
 Use existing loader regressions and focused host import tests; exact test placement follows the chosen SDK mechanism.
 This addendum requires no new service, custody authority, fixture campaign or native execution now.
+
+
+## Live status verification: 2026-11-18 15:56 UTC
+
+- Canonical SDK main is `b0bbee957dcda64ab9e5c68a180a858ac088d3b4`; live origin/main matched at 15:55. Protocol 13 remains unqualified. The allocated shim build actually started: PID 81249 was running `lake build LeanRsHostShims` at 15:55:43, elapsed 8 seconds. Next: inspect shim, build matched worker/parent, then guarded scalar-refusal and Init/runtime-version/roots/epochs/termination checks. Do not reuse protocol 12 receipts.
+- Formatter local smoke passed 15:42:21–15:43:05, exit 0, exact CLI `lean-fmt 4.36.0 (Lean 4.36.0)`. Canonical main and local original-version tag select `3a6694b5`. Hosted release run 44339011050 is in progress: verify-tag passed; Linux x64, macOS15 and Linux ARM gates started 15:44:12–15 and were still running at 15:55:43 (about 12 minutes). Stable publication is not yet verified. Existing -fmt.1 remains separate historical release evidence.
+- Dup protocol13 composition resolved 631 packages with exact private paths; seven static gates remain unexecuted. Last owner checkpoint 15:51:07. Needs review/allocation and genuine registry qualification later. Host's last composition checkpoint is 15:03:06; stable-input/application-authority integration remains open, not an active runtime test.
+- Overhaul remains paused/checkpointed. No additional suites or native operations were launched by this status check.
+- Mac snapshot 15:55:35: 32.11 GiB free, 52% memory free. No numeric elapsed-time estimates were available for these current tasks, so no estimate overrun is asserted. Hosted release elapsed above is actual wall time, not a forecast. Keep the 25 GiB reserve and existing sole compiler lane.
+
+
+## Lean-rs release status verification: 2026-11-18 16:12 UTC
+
+Jacob's current priority is lean-rs 4.36 release and branch cleanup; other repo work is not restarted by status checks. Canonical SDK is clean at f0871350ff96c9ea78f47db5104cbba8747444cd (CI/toolchain and native safety test repair).
+
+Actual protocol13 evidence now exists: host trybuild exited0 at16:06:27.245–28.079; smaller worker link exited0 at16:06:28.115–28.829; focused loader check exited0 at16:06:54.648–57.865. Native Init receipt exited0 at16:07:25.613–33.519; scalar-refusal receipt exited0 at16:07:43.432–45.895. These are bounded controlled tests, not unrestricted mutable-project qualification.
+
+Hosted f087135 gates are not green: CI44343648421 failed Ubuntu4.36 strict all-target Clippy; Sanitizer44343648408 failed loader_regressions with `failed to initiate panic, error 3`/SIGABRT. Compile-fail44343648527 remained in progress at16:11. Next step is precise CI diagnosis and repair, not publication. No version tag/release is inferred from pushed main.
+
+Formatter issue fixes are active separately: owner reproduced issue1 leading-dot application spacing and prepared a normalization fix for issue4; isolated patch bb8d44c8cd3a5580353ae88afdcc8e52e834be530e0e560d561100de498ead0c awaits review/build. Windows regression still requires Windows. Canonical formatter unchanged at3a6694b5. No formatter compilation launched by this check.
+
+Mac16:10:56:31.53GiB free; no Cargo/rustc visible on subsequent check. No current numeric task estimates were found, so no estimate-overrun claim. Native commands above took0.7–7.9seconds; hosted failures occurred about2minutes after16:08:07 dispatch. Main blockers are actual CI failures, remaining release qualification and branch cleanup, not another merge of the already integrated SDK.
