@@ -432,3 +432,29 @@ the under-custody verifier, canonical containment and complete import closure ar
 snapshot is not a controlled committed build. Build scripts/toolchain dependencies require explicit trust/binding.
 Public build/install remains disabled. Mac check 01:42:08: 57% memory free, load 2.99/2.67/2.74, 31 GiB disk free.
 No further large cold build without capacity preflight; one qualification target, no automatic duplicate retry.
+
+### Controlled-build integration checkpoint: 02:06 UTC, November 18
+
+Pinned SDK `d7643c9d` / host harness `3404c4b3` passed the actual Lean-free cross-exec happy case
+at 01:49:22–25 and wrong-grant case at 01:50:11–13. Both reported confirmed closure without intervention;
+project/generation writer reacquisition passed. The negative started the worker and refused before handshake,
+not before process start. Evidence is under `task-20/safety-pair/worker-ingress/framed-compile/` and retained
+`/private/tmp/cross-exec-4mgmKd` / `cross-exec-A2EnM0`. These results do not qualify newer source or real Lean.
+
+Provisioning passed 15 pure artifact-handoff tests at 01:52:21–28; synthetic receipts do not qualify native
+handoff. It composed installer/runtime source once in `task-15/controlled-build-composition.5LwQUV/host`,
+base `3404c4b3`, recording input and composed hashes alongside it. No composed build or native run occurred.
+Independent review found a caller that built then errored, dropping its returned artifact: installation must
+fail before spawning until live artifact ownership reaches activation. The provisioning owner is correcting it.
+
+ABI v2 source removes the arbitrary command callback and adds acknowledged-loan Init inventory verification.
+Its mandatory graph check currently rejects the Lean-free framed fixture. Distinct independently selected
+operation verification is being corrected; production verification must not acquire a fixture bypass.
+Queued-writer/uncertain-retirement regression, combined compilation, stock policy and activation remain open.
+
+Active owners: ABI `6afca3dd-61c8-8191-beef-0e1235e410d2`, turn `01a1ec66-d5e2-7263-bab8-472f914f9f0d`;
+provisioning `6afca1a9-4f1c-8191-a757-cb2c906df0dc`, turn `01a1ec66-c49d-7228-b43d-aa8e85aa5b33`.
+Both turns were admitted during this checkpoint; they own runtime and installer files respectively. Independent
+source review continues. Lane was idle at the source handoff, with 29.9 GiB reported free. Maintain a 25 GiB
+reserve, reuse the existing target, and require fresh capacity/growth preflight before compilation. No production
+installation, Proofs/Mathlib build or cache deletion occurred.
