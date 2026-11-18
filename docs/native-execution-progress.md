@@ -552,3 +552,31 @@ qualification, controlled-build reproducibility, Lean 4.36 qualification or publ
 preserved. Independent result review is underway. ABI turn `01a1ed0e-44b3-70be-86c5-95a053fa4a02` and provisioning
 turn `01a1ed0e-5a68-73f6-975e-9b73873412c4` were admitted to concrete source integration and next-gate preparation,
 with SDK/runtime and installer ownership separate; no further native execution or public activation was assigned.
+
+### Private 4.36 runtime and integration checkpoint: 06:12 UTC, November 18
+
+The isolated installer accepted the 4.35 positive at 05:27:00–05:27:21 and rejected the crossed-manifest case
+at 05:28:30–05:28:51. Independent review verified the exact pre-ACK refusal, observed owner closure, and unchanged
+original selector, receipt and staged-worker bytes. These are sequential isolated cases, not concurrent production
+registry qualification.
+
+The 4.36 shims built at 05:50:41–05:51:02 and passed independent static selection. Controller
+`bfae7e09fe2178beb2a4ff3c57d9516f8cd9833cede54107cec7223681a45cb6` and worker
+`1fa9975bcc1603dae7393747c980fc192fe75b7b1c48b53f2cb621c15a48cded` were independently selected against
+archive-matched off-elan inputs. The private Init invocation began at 06:08:02; generation-fmlBAp was reported
+at 06:08:21. Its diagnostic records the typed theorem, worker exit zero and confirmed closure without intervention.
+Receipt, policy, selector and staged bytes agree; later recorded process identities were absent. Independent source
+review confirms generation output occurs after successful selector-parent synchronization. Thus the private application
+transaction and worker runtime succeeded. The zsh wrapper then failed on read-only variable `status`, losing the
+controller OS exit status and exact finish time. Do not record the overall command as exit zero. Evidence is preserved
+without replay. A replacement wrapper passed harmless exit-0, exit-37 and overwrite-refusal checks.
+
+Evidence root: `task-15/stock-init-protected-adapter.oRkagk/stock-436-pair.1ezJiz/`. Immutable private SDK source
+archive `sdk-436-stock-source.tar`, SHA-256 `a36e8880acc1a0b4edc6792a66d3e884e5da816f2b8f472de372fcdd3a6adcd6`,
+is handed to downstream isolated testing; it is not a registry or canonical release.
+
+The actual main/semantic broker remains under integration. Combined source compiled and focused cancellation,
+expiry, manifest, path-containment, selected-environment and project-issuer tests passed; controlled actor tests
+are not the full installed guardian route. ABI owns the concrete project issuer and framed-route packet; provisioning
+owns ancestry-aware installer/adapter integration. Protected project closure, full tracked launch and replacement,
+canonical gates and release remain unfinished. No public activation or Proofs/Mathlib build is claimed.
