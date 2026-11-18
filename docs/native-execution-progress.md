@@ -309,3 +309,18 @@ on the released two-job lane to compile/run actual temporary-directory staging/r
 Admission is not a measured command start. Independent read-only review runs in parallel. Real installer and runtime
 resolver wiring, protected receipts, actual writer/reader custody and scope-specific native smoke remain unfinished.
 Old generations must remain available, and post-rename directory-sync failure is uncertain, not proof of rollback.
+
+### Selector uncertainty and exact roots: 00:21 UTC, November 18
+
+Provisioning completed six transaction tests and then seven with patch
+`ac4736d1fde84f0094c02499e7d22fb473a7af838966b96abd89234d5159d26f`; actual command interval was
+00:20:00–00:20:35 UTC, lane released. Injected directory-sync failure followed a real selector rename; new selection
+and both generations' bytes were observed, not crash durability. Evidence: `task-15/host-policy-source/policy-harness/generation-run.log`.
+Independent review requires protected-selector selection (pre-smoke receipt existence is insufficient) and completing
+parent sync during writer-held reconciliation. Turn `01a1ec07-8213-717a-b171-10eaf32913a0` now owns the small nonnative
+lane for a typed uncertain-activation result and reconciliation tests; actual installer wiring remains next.
+
+SDK `21892a4fc073de61e2dc6c3f585d4b80e719ad7c` validates the full root union as UTF-8 before either acquisition path,
+with a new regression for invalid byte sequences colliding under lossy rendering. Formatting/diff checks pass;
+regression compilation/execution is queued, not passed. Independent review is active. Launcher contract now separately
+requires guardian executable/closure verification and custody; writer-helper equality cannot supply that evidence.
