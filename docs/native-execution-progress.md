@@ -516,3 +516,12 @@ capacity preflight. ABI owner `6afca3dd-61c8-8191-beef-0e1235e410d2`, turn
 is assigned separately. Admission is not measured command start. Next gates: reviewed composition and pure tests,
 new controller identity and matching worker, then a newly reviewed qualification packet. No native rerun is admitted
 by this checkpoint. Public installation, Lean 4.36 runtime support and Proofs integration remain unqualified.
+
+At 04:36:03–04:36:04, all five final exact Lean-free diagnostic tests passed. Independent source review
+verified the final composed hashes and corrections: final stderr polling, preserved first interruption reason,
+bounded report-error fallback, and accepted-result/report-write-failure behavior. Late stderr overflow now
+intentionally stops acceptance even with exit zero. Evidence: `task-15/stock-init-smoke-diagnostics.mXHGxw/`.
+The revised controller built once at 04:37:14–04:37:27, digest
+`74cc0da1e2997a95ef25ecb8f81edeb4bd41ae88e8e89e350cc7170bd2c69961`. Owner-recorded static inspection is
+system-only with no RPATH or enabled features; independent artifact selection is in progress before matching-worker
+build. Disk finished at 49.33 GiB free and the lane was released. Neither candidate nor native qualification ran.
