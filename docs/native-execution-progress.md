@@ -525,3 +525,20 @@ The revised controller built once at 04:37:14–04:37:27, digest
 `74cc0da1e2997a95ef25ecb8f81edeb4bd41ae88e8e89e350cc7170bd2c69961`. Owner-recorded static inspection is
 system-only with no RPATH or enabled features; independent artifact selection is in progress before matching-worker
 build. Disk finished at 49.33 GiB free and the lane was released. Neither candidate nor native qualification ran.
+
+### Domain correspondence correction: 05:05 UTC, November 18
+
+The diagnostic qualification ran once at 04:54:59–04:55:16 and failed with child exit 1:
+`install smoke selection differs`. Its retained generation-NPtLZw report confirms startup and scope closure,
+without intervention or output truncation. The theorem operation was not evaluated and no selector was published.
+Both owners identified the exact mismatch: the worker omitted the selected Lean sysroot from its project-domain
+request, while the controller and guardian receipt included it. No installer or controller change was required.
+
+Reviewed worker patch `6364bf5ffe4bb299b475f50e476cc1f3b274006ad0d4ae04c4d01acd4850dce4` binds the selected
+absolute sysroot to the launch value; exact authenticated request comparison and all-domain custody checks remain.
+The extracted production-helper regression passed at 05:00:25–05:00:26. It tests domain correspondence, not guardian
+refusal. The corrected worker built in 21.18 seconds, SHA-256
+`5613508f01292700179cae533cce1fedd3724df306cfe6db25945c895eaf0ef9`, with unchanged controller pin and empty
+features. Fresh audit `f1eef2d0adcc5ff3a86f953eb65afb7ea6b2d5387a57fab979d4807be18ee011` is under independent
+selection before exact-command approval. Evidence is in `task-15/stock-init-domain-correspondence.E24IXs/`.
+Both failed generations remain frozen. No successful native Init qualification or public installation is claimed.
