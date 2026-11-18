@@ -357,3 +357,19 @@ Both were admitted around 00:26 UTC, not evidence of completed commands. One sta
 coordinate install, launch, clean and prune; launch custody lasts through actual retirement. Smoke must not deadlock
 by requesting overlapping SH while its installer holds EX. Restart reconciliation and supported operation boundaries
 remain explicit qualification gates; no production install or new native execution has occurred.
+
+### Two-domain source and compile checkpoint: 00:36 UTC, November 18
+
+Reviewed direction uses stable selector custody plus immutable generation custody, reusing existing SH guardian
+loans rather than inventing EX transfer. Normal launch samples the selector, releases that read, acquires the complete
+union and rechecks before payload; smoke selects the known staged generation without taking selector SH. This avoids
+the installer EX/smoke SH deadlock only once the actual handoff is implemented. Bootstrap trust remains separate.
+
+Host `1e7b847f` finite pre-exec hook and SDK `21892a4f` compiled with regression `bbf3b4cf`; parent/test link only
+libSystem/libiconv. Nine warnings, no execution; lane released 00:34:51. Evidence: `task-15/custody-compile.dbI7Mf`.
+Hardened regression now separates lock errors, observes non-zombie identities and explicit controller reap, and
+preserves scratch on every outcome; it is uncompiled/unrun and under review. Source-only host `ac075f9a` adds shared
+selector accessor and wrong-digest/zero-start tamper test. Composition remains uncompiled. Provisioning owns one
+bounded compile lane for an agreed combined snapshot; ABI turn `01a1ec14-fb82-70fb-a3ed-a1a418b8777d` handles required
+release expectation, bootstrap loader environment and mutable dependency custody source boundaries. No fixture run,
+ordinary interactive startup qualification, public installer activation or deployment is established.
