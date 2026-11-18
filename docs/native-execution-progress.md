@@ -340,3 +340,20 @@ comparing reuse of existing installation provenance and canonical lock mechanism
 infrastructure. Ordinary/companion launch through `native_worker_child` and separate installer smoke both need the
 chosen handoff; general explicitly authorized projects remain supported. Process-restart smoke-success evidence is
 not supplied by the in-memory reconciliation token or a pre-smoke receipt.
+
+### Local deployment decision and wiring: 00:26 UTC, November 18
+
+Receipt-binding correction passed seven pure tests at 00:24:25–26 and independent review: reconciliation now binds
+the exact original receipt location and digest, not just the generation pathname. The typed token proves trusted
+callback success in that process, not arbitrary native smoke or post-crash success.
+
+Coordinator accepted the cooperating same-user deployment model: reuse operator-selected release recipe or explicit
+reviewed local checkout/runtime, existing installer/configuration and canonical locking. Verify output contracts and
+closure against selected inputs; output hashes alone do not approve arbitrary code. Project admission remains separate.
+This is not a hostile same-user security boundary and introduces no signing service or privileged deployment identity.
+Provisioning turn `01a1ec0b-44c2-722c-b043-85be28fedebf` owns private installer wiring and bounded pure-test lane;
+ABI turn `01a1ec0b-5d91-77a4-95f8-a10eeaa104d9` prepares ordinary/companion launcher handoff source-only.
+Both were admitted around 00:26 UTC, not evidence of completed commands. One stable domain outside generations must
+coordinate install, launch, clean and prune; launch custody lasts through actual retirement. Smoke must not deadlock
+by requesting overlapping SH while its installer holds EX. Restart reconciliation and supported operation boundaries
+remain explicit qualification gates; no production install or new native execution has occurred.
