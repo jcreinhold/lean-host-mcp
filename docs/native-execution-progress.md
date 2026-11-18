@@ -417,3 +417,18 @@ ABI owns the two-job lane and actual continuation/entry wiring. Independent revi
 after admission validation, authority checking or anchor creation still returned to the loop; a latch prevents another
 open but does not provide prompt retirement. Terminal cleanup preserving the primary error is assigned before activation.
 Installer owner is waiting on that concrete entry, not running another scaffolding task. No production or Lean run.
+
+### Actual exec wiring and remaining qualification: 01:42 UTC, November 18
+
+SDK `d7643c9d` / host `d2c89d35` wire the guardian-issued endpoint across exec and concrete staged smoke operation.
+Configured targets and seven isolated tests pass; framed worker/bootstrap compile with system-only linkage, but have
+not run together. ABI turn `01a1ec4d-b807-725a-8bd0-c88f03bd963a` was admitted around 01:37:59 (UUID timestamp),
+preparing the existing-supervisor harness with independent roots, one guardian/handshake, PID continuity and retirement.
+This is elapsed assignment time, not measured compute time.
+
+Provisioning turn `01a1ec51-2588-777f-bbd8-b69d5bea6b8c` was admitted around 01:41:43 for committed-source staging and
+custody wiring. Controlled-input patch remains source-only: review found approved Init file hashes must survive into
+the under-custody verifier, canonical containment and complete import closure are required, and a caller-provided
+snapshot is not a controlled committed build. Build scripts/toolchain dependencies require explicit trust/binding.
+Public build/install remains disabled. Mac check 01:42:08: 57% memory free, load 2.99/2.67/2.74, 31 GiB disk free.
+No further large cold build without capacity preflight; one qualification target, no automatic duplicate retry.
