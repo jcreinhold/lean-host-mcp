@@ -476,7 +476,7 @@ fn install_one(id: &ToolchainId, source: &WorkerSource) -> anyhow::Result<PathBu
     // Build the worker (local checkout or published crate — `build_worker`
     // hides which). `staged` owns the temp dir for the registry build, so it
     // must stay alive until the binary has been relocated below.
-    let staged = build_worker(source, id)?;
+    let staged = build_worker(source, id, &elan_dir)?;
 
     let dest_dir = WorkerBinary::install_root().join(id.as_str());
     fs::create_dir_all(&dest_dir)?;
@@ -629,23 +629,30 @@ fn local_worker_binary(workspace: &Path, target_dir: Option<&OsStr>) -> anyhow::
     Ok(target.join("release").join(WORKER_FILE_NAME))
 }
 
+fn worker_cargo(id: &ToolchainId, sysroot: &Path) -> Command {
+    let mut cargo = Command::new("cargo");
+    cargo
+        .env("LEAN_HOST_MCP_TARGET_TOOLCHAIN", id.as_str())
+        .env("LEAN_SYSROOT", sysroot);
+    cargo
+}
+
 /// Build a worker binary for `id` with the matching toolchain rpath baked in,
 /// returning its path (and, for the registry build, the temp-dir guard that
 /// must outlive the relocate). This is the only place the two source strategies
 /// diverge.
-fn build_worker(source: &WorkerSource, id: &ToolchainId) -> anyhow::Result<StagedWorker> {
+fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path) -> anyhow::Result<StagedWorker> {
     match source {
         WorkerSource::LocalWorkspace(workspace) => {
             let target_dir = std::env::var_os("CARGO_TARGET_DIR");
             let built = local_worker_binary(workspace, target_dir.as_deref())?;
             println!("==> building lean-host-mcp-worker for {id} (workspace source)");
-            let status = Command::new("cargo")
+            let status = worker_cargo(id, sysroot)
                 .arg("build")
                 .arg("--release")
                 .arg("-p")
                 .arg(WORKER_FILE_NAME)
                 .current_dir(workspace)
-                .env("LEAN_HOST_MCP_TARGET_TOOLCHAIN", id.as_str())
                 .status()?;
             if !status.success() {
                 return Err(anyhow::anyhow!(
@@ -669,7 +676,7 @@ fn build_worker(source: &WorkerSource, id: &ToolchainId) -> anyhow::Result<Stage
             let version = env!("CARGO_PKG_VERSION");
             println!("==> installing lean-host-mcp-worker {version} for {id} (crates.io)");
             let tmp = tempfile::tempdir()?;
-            let status = Command::new("cargo")
+            let status = worker_cargo(id, sysroot)
                 .arg("install")
                 .arg(WORKER_FILE_NAME)
                 .arg("--version")
@@ -679,7 +686,6 @@ fn build_worker(source: &WorkerSource, id: &ToolchainId) -> anyhow::Result<Stage
                 .arg("--root")
                 .arg(tmp.path())
                 .arg("--locked")
-                .env("LEAN_HOST_MCP_TARGET_TOOLCHAIN", id.as_str())
                 .status()?;
             if !status.success() {
                 return Err(anyhow::anyhow!(
@@ -826,6 +832,21 @@ mod tests {
         std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("binary stub");
         let tid = ToolchainId::parse(id).expect("parse id");
         WorkerSidecar::record(&dir, &tid, digest.to_owned(), crate::smoke::SmokeOutcome::Passed).expect("sidecar");
+    }
+
+    #[test]
+    fn worker_cargo_sets_selected_prefix_and_toolchain() {
+        use std::{ffi::OsStr, path::Path};
+
+        let id = ToolchainId::parse("v4.36.0").expect("toolchain");
+        let prefix = Path::new("/private/selected-lean");
+        let cargo = super::worker_cargo(&id, prefix);
+        let env: std::collections::HashMap<_, _> = cargo.get_envs().collect();
+        assert_eq!(env.get(OsStr::new("LEAN_SYSROOT")), Some(&Some(prefix.as_os_str())));
+        assert_eq!(
+            env.get(OsStr::new("LEAN_HOST_MCP_TARGET_TOOLCHAIN")),
+            Some(&Some(OsStr::new("v4.36.0")))
+        );
     }
 
     #[test]
