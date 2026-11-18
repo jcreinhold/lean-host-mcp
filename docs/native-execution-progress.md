@@ -458,3 +458,28 @@ Both turns were admitted during this checkpoint; they own runtime and installer 
 source review continues. Lane was idle at the source handoff, with 29.9 GiB reported free. Maintain a 25 GiB
 reserve, reuse the existing target, and require fresh capacity/growth preflight before compilation. No production
 installation, Proofs/Mathlib build or cache deletion occurred.
+
+### Qualification correction checkpoint: 02:43 UTC, November 18
+
+The composed host library passed checking at 02:12:58–02:13:03. Promotion fixture binaries linked at
+02:24:40–02:25:08; independently verified hashes and system-only load commands are in
+`task-15/controlled-build-composition.5LwQUV/promotion-artifacts.sha256` and `promotion-load-commands.txt`.
+The positive fixture then FAILED once at 02:27:15–02:27:41, exit 101, before guardian ACK. No negative ran.
+Evidence remains in `selections/queued-writer/test.log`; this is not a custody or promotion pass.
+
+Source diagnosis: a private operation marker failed generic canonical-executable validation before helper spawn;
+the contender timeout hid that refusal. A correction uses the canonical helper plus a reserved argument, retains
+validation and reports both outcomes. Independent review additionally requires wrong-executable/reserved-marker
+rejection. ABI turn `01a1ec88-19ea-72bc-a39c-bbcfe52f32be` owns that addendum. Provisioning has rechecked
+source/selections and is waiting, not compiling. A fresh rebuilt/pinned fixture is required; never replay the failed
+case blindly. The read-only census found no fixture-matching process or socket directory but captured no guardian
+birth/group identity, so it does not establish the failed invocation's retirement.
+
+Separate stock Init patches now explicitly compare project-prepared manifest path/bytes and image identities to
+release-audited evidence before ACK. The release-side companion populates the snapshot from already verified bytes.
+These remain source-only. Actual transitive loader closure, ordered imports under custody, independent controller
+pin and private activation qualification remain gates; public installer still refuses before spawning.
+
+Owner-cleared old cache cleanup was performed by the capacity coordinator, preserving active target and evidence.
+Latest provisioning disk check: 56.08 GiB free; retain the 25 GiB reserve. Formatter's separate bounded lane has
+released. No production installation or Proofs/Mathlib build occurred.
