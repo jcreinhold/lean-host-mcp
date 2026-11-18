@@ -266,3 +266,12 @@ comparison; host all-target, strict Clippy and formatting pass. Patch `b175b7785
 is under review. Nine apparently Rust-only cases actually link 4.36 libleanshared before test entry and were NOT run.
 A single representative 4.35 host-test provisioner has only placeholder/static evidence. Exact compile-only artifacts
 and custody reuse are being prepared; no new native execution, permission bypass or canonical activation is assigned.
+
+### Approved native results: 23:59 UTC
+
+Both separately approved runs passed once. The 4.35 declaration-kind supervisor ran 23:55:23–23:57:30; actual transcript
+shows one test passed, 77 filtered, body 16.08 s. The 4.36 scalar supervisor ran 23:58:44–47 and exited zero after 42,
+termination acknowledgement, direct-child reap and five writer reacquisitions. Lane released 23:59:05. Prior denials
+remain preserved. These are narrow fixture results, not broad 4.36 imports/kernel or production qualification.
+Next work is isolated paired safety-source integration with warm ownership reconciliation; registration stays distinct,
+exact-tree static gates must rerun, and production authority policy remains explicit. No canonical activation/release.
