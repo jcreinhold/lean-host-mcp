@@ -67,6 +67,9 @@
         "SafeCommands",
         "SafeStore",
         "ImmutableBinding",
+        "BoundToSdk",
+        "ReplyIdentity",
+        "ClosureIdentity",
         "SafeSuccessor",
         "AdoptionPrecedesRunning",
         "RunningPrecedesAck",
@@ -153,6 +156,11 @@
     }
   },
   "cases": [
+    {"name": "host-identity", "model": "Stages", "expect": "pass", "constants": {"Fault": "\"identity\""}, "properties": ["Spec", "CompanionCompleted", "SuccessorProgress", "OtherProgress"]},
+    {"name": "host-ignore-generation", "model": "Stages", "expect": "invariant", "invariant": "SafeCommands", "properties": [], "invariants": ["SafeCommands"], "constants": {"Fault": "\"identity\"", "Mutation": "\"ignore-generation\""}},
+    {"name": "host-accept-stale-reply", "model": "Stages", "expect": "invariant", "invariant": "ReplyIdentity", "properties": [], "invariants": ["ReplyIdentity"], "constants": {"Fault": "\"identity\"", "Mutation": "\"accept-stale-reply\""}},
+    {"name": "host-accept-stale-closure", "model": "Stages", "expect": "invariant", "invariant": "ClosureIdentity", "properties": [], "invariants": ["ClosureIdentity"], "constants": {"Fault": "\"identity\"", "Mutation": "\"accept-stale-closure\""}},
+
     {"name": "host-late-command", "model": "Stages", "expect": "pass", "constants": {"Fault": "\"late\""}},
     {"name": "host-wrong-command", "model": "Stages", "expect": "invariant", "invariant": "SafeCommands", "properties": [], "invariants": ["SafeCommands"], "constants": {"Fault": "\"late\"", "Mutation": "\"current-endpoint\""}},
     {"name": "host-partial-rollback", "model": "Stages", "constants": {"Fault": "\"explore\""}, "invariants": ["NoPartialRollback"], "properties": [], "expect": "invariant", "invariant": "NoPartialRollback", "witness": true},

@@ -16,13 +16,30 @@ cleanup and return use the SDK actions themselves. Positive composition configur
 the same input module. The other modules preserve historical traces and focused policy tests. They do not define
 additional ways for the host to establish closure.
 
-**Authenticated interface assumption.** The composition runs in one state space. Guards can see SDK facts such as
-`phase`, `supervisorAlive` and `rootPresent`; visibility in TLC grants no such access to a host client. For a real
-transition, the responsible component must obtain an authentic observation bound to the exact scope, generation and
-owner. The receiver checks execution authority, the SDK certifies custody and retirement, and the host authenticates
-the producer and binding of a command reply before accepting its contents. An absent, stale or unverifiable report
-leaves the corresponding fact unknown. The model assumes this translation from observations to actions. It does
-not model a wire authenticator, prove a status API supplies the evidence, or authorize reading OS state as a substitute.
+**Identity across the host/SDK interface.** At reservation the host binds the saved operation to the modeled SDK
+instance's scope, generation and owner. For each send it records the caller request key, native ID, command ordinal
+and bound instance. The worker compares the received key to the command expected on its own instance. A running
+command may emit one reply carrying its producer key and payload outcome. The host compares that key to its saved
+send before interpreting the response. The first validated companion reply enables the second command; only the
+second valid reply can supply ranked success. A closure receipt instead names the *worker generation*, since both
+commands share that lifetime. The host accepts it against the reservation to release its domain holds. The SDK
+returns its own capacity through its existing retirement rule.
+
+The identity case includes authentic delayed evidence from one retired generation with the same scope and owner
+names. Its reply belongs to a different original request; its closure belongs to the retired reservation. The case
+also offers a current command misaddressed to that old generation. The live SDK instance contributes a closure
+receipt only upon certified closure (including certified no-spawn). `ReplyIdentity` checks the accepted key and
+payload against a reply actually emitted by the live command. `ClosureIdentity` checks that accepted cleanup
+evidence belongs to the bound, closed instance after SDK capacity return.
+
+**Trust assumption.** The adapter must obtain command responses and custody observations from the authentic
+producer, preserve their originating binding through delivery and recovery, and keep generation identities unique
+across reuse. The model represents those channels by their sets of possible producer outputs. Emitted replies remain eligible for delivery while the command awaits its reply. Arbitrary transport loss is outside
+this finite case. A stale authentic output can reach the matcher. A forged output relabeled as current is outside the model. The old generation is
+represented by its historical evidence; its process lifetime and the durable allocation of generation numbers
+are outside this check. The reservation step pairs a host binding with an SDK instance in one abstract transition.
+An implementation must establish that association across persistence and startup crash cuts. No new SDK wire field
+is required by this model. Host visibility of SDK internals in TLC does not establish an authentic native observation.
 
 The unit of custody is one physical worker generation. The unit of retry is one durable job, logical stage and
 explicit execution revision. A command ordinal identifies a message in that stage. Its immutable endpoint is the
@@ -31,7 +48,7 @@ belongs to creation of a lifetime; subsequent commands bind to that existing lif
 original request and producer, even after later work has begun. In the late-command case, `LateDelivery` offers command 1’s key to command 2’s
 slot in the same generation. The correct guard disables that transition. There is no modeled receive-and-reject
 event, reply or rejection counter. In the mutant, the transition is enabled and `SafeCommands` catches execution at
-the wrong endpoint. Delayed messages across generations are covered separately by the historical cases.
+the wrong endpoint. The identity cases exercise a previous generation; the historical cases retain broader duplicate and late-message coverage.
 
 | Boundary | Host obligation and observable outcome |
 | --- | --- |
@@ -77,7 +94,7 @@ old supervisor's authority.
   descriptor, a missing result or guardian death cannot certify whole-group closure. The SDK supplies trusted
   generation and process-birth evidence, an adopted cleanup owner, private groups without escaped descendants,
   shared-descriptor semantics and serialized durable publication. OS evidence and independent review remain required.
-- The bounded successor is admission and completion of a conflicting writer. Multiple live generation identifiers,
+- The bounded successor is admission and completion of a conflicting writer. Multiple simultaneously live instances,
   arbitrary duplicate frames, late ACK/expiry, frozen owners and full deadline arithmetic retain focused coverage in
   the historical modules. The healthy warm pair abstracts the two caller journals to a saved-first-result bit. This
   check does not establish refinement of the Rust server, crash-durable OS observations, multi-generation recovery
@@ -141,9 +158,26 @@ an expected failure or a reachability witness; it does not mean the bad protocol
 is safe. A witness case checks the negation of a target so TLC supplies a trace
 that reaches it.
 
-## Composed check at SDK 21cd9f5
+## Identity-interface check
 
-All 16 configured host cases produced their specified outcomes with TLC 2.19, Java 21, one worker and a 512 MiB heap
+On SDK `21cd9f5`, the positive `host-identity` case generated 564 states and exhausted 228 distinct states.
+Its temporal property requires both exact companion replies, saved and acknowledged success, and acceptance of
+the current generation's closure. The three controls failed the intended invariant:
+
+| Weakened check | Observed violation |
+| --- | --- |
+| Compare command request, ordinal, scope and owner while omitting generation | `SafeCommands` caught execution of the misaddressed declaration command. |
+| Accept a reply by ordinal | `ReplyIdentity` caught an old declaration reply assigned to the current declaration command. |
+| Release host domains by scope and owner | `ClosureIdentity` caught acceptance of a retired generation's closure while the new reservation was still charged. |
+
+All nine targeted cases matched their expected outcomes. The warm path exhausted 234 distinct states; the combined
+fault case generated 1,221,970 and exhausted 211,968 distinct states. The three retained witnesses reached a lost
+validated reply, an invalid second reply with cleanup failure, and known success while cleanup still held capacity.
+The earlier required-suite receipt applies to the previous revision.
+
+## Initial composed check at host 69f39a6 and SDK 21cd9f5
+
+At that revision all 16 configured host cases produced their specified outcomes with TLC 2.19, Java 21, one worker and a 512 MiB heap
 limit. Five exhausted the graph without a violation. The combined fault case generated **958,386** states and found
 **169,248 distinct**, with an empty queue. Healthy companion and warm cases found 216 and 222 distinct states.
 Five deliberate protocol mutations hit their named invariants. Six witnesses reached the requested cuts.

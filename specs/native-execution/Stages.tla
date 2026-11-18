@@ -7,10 +7,25 @@ Commands == {1, 2}
 Faults == Fault = "explore"
 Original == <<1,1,1>>   \* job, logical stage, explicit revision
 NativeId == <<"store",1,"nonce">>   \* store identity, submission window, nonce
-Scope == <<"worker",1,"owner">>
-CommandKey(i) == <<IF Profile="warm" THEN <<i,1,1>> ELSE Original, i, Scope>>
+Scope == <<"worker",2,"owner">>
+PreviousScope == <<"worker",1,"owner">>
+RequestKey(i) == IF Profile="warm" /\ i=2
+                 THEN <<<<2,1,1>>, <<"store",1,"next-nonce">>>>
+                 ELSE <<Original, NativeId>>
+KeyAt(i,scope) == <<RequestKey(i), i, scope>>
+CommandKey(i) == KeyAt(i,Scope)
+Expected(i) == LET request == IF Profile="warm" /\ i=2 THEN RequestKey(2)
+                             ELSE <<h.binding[1],h.binding[2]>>
+               IN <<request,i,h.bound>>
+SameOwner(a,b) == a[1]=b[1] /\ a[3]=b[3]
+SameCommandWithoutGeneration(a,b) == a[1]=b[1] /\ a[2]=b[2] /\ SameOwner(a[3],b[3])
+\* The old producer completed a different immutable request on the same worker
+\* and owner names. Only its delayed evidence is in scope, not its physical lifetime.
+OldReply == << << << <<0,1,1>>, <<"store",1,"old-nonce">> >>, 2, PreviousScope >>, TRUE >>
 HostInit == Init /\ h = [
-  binding |-> <<>>, retry |-> "none", buffered |-> "none", submitted |-> FALSE,
+  bound |-> <<>>, sentKey |-> [i \in Commands |-> <<>>],
+  emitted |-> {}, acceptedReply |-> [i \in Commands |-> <<>>],
+  closure |-> <<>>, binding |-> <<>>, retry |-> "none", buffered |-> "none", submitted |-> FALSE,
   accepted |-> FALSE, rolledBackPartial |-> FALSE, domains |-> 0, permit |-> "unused",
   online |-> TRUE, crashed |-> FALSE, refused |-> FALSE, cancelled |-> FALSE, fenced |-> FALSE,
   wrongFrame |-> FALSE, readAdmitted |-> FALSE, warmSaved |-> FALSE, cmd |-> [i \in Commands |-> "idle"], starts |-> [i \in Commands |-> 0],
@@ -26,7 +41,7 @@ Retry(intent) == HostOnly(Fault="retry" /\ h.online /\ h.submitted /\ h.retry="n
 \* GET and subsequent equal retries read the saved binding and disposition (stuttering).
 AcquireDomain == HostOnly(h.accepted /\ h.online /\ ~h.cancelled /\ ~h.refused /\ ~h.fenced
   /\ phase="idle" /\ h.domains<2 /\ h'=[h EXCEPT !.domains=@+1])
-ReserveScope == h.online /\ h.domains=2 /\ ~h.cancelled /\ ~h.refused /\ ~h.fenced /\ SdkOnly(Reserve)
+ReserveScope == h.online /\ h.domains=2 /\ ~h.cancelled /\ ~h.refused /\ ~h.fenced /\ Reserve /\ h'=[h EXCEPT !.bound=Scope]
 ConsumePermit == HostOnly(h.online /\ ~h.crashed /\ phase="reserved" /\ h.permit="unused"
   /\ ~h.cancelled /\ ~h.refused /\ ~h.fenced /\ h'=[h EXCEPT !.permit="authorized"])
 SendLaunch == HostOnly(h.online /\ ~h.crashed /\ h.permit="authorized" /\ ~h.cancelled /\ ~h.refused /\ ~h.fenced
@@ -49,17 +64,23 @@ ReadyFor(i) == phase="running" /\ supervisorAlive /\ ~h.fenced /\ ~h.cancelled
   /\ h.online /\ ~h.crashed /\ ((startupAcked /\ h.readAdmitted) \/ Mutation="early-command")
   /\ (i=1 \/ (h.cmd[1]="valid" /\ (Profile="companion" \/ h.warmSaved)))
 Send(i) == HostOnly(ReadyFor(i) /\ h.cmd[i]="idle"
-  /\ h'=[h EXCEPT !.cmd[i]="sent"])
+  /\ h'=[h EXCEPT !.cmd[i]="sent", !.sentKey[i]=Expected(i)])
 Deliver(i,frame) == HostOnly(rootPresent /\ phase="running" /\ supervisorAlive /\ ~h.fenced
-  /\ h.cmd[i]="sent" /\ (frame=CommandKey(i) \/ Mutation="current-endpoint")
-  /\ h'=[h EXCEPT !.cmd[i]="running", !.starts[i]=@+1, !.wrongFrame=(frame/=CommandKey(i))])
-Execute(i) == Deliver(i,CommandKey(i))
+  /\ h.cmd[i]="sent" /\ (frame=CommandKey(i) \/ Mutation="current-endpoint"
+                       \/ (Mutation="ignore-generation" /\ SameCommandWithoutGeneration(frame,CommandKey(i))))
+  /\ h'=[h EXCEPT !.cmd[i]="running", !.starts[i]=@+1, !.wrongFrame=(frame/=h.sentKey[i] \/ frame/=CommandKey(i))])
+Execute(i) == Deliver(i,h.sentKey[i])
 LateDelivery == Fault="late" /\ Deliver(2,CommandKey(1))
-Reply(i,valid) == HostOnly(rootPresent /\ h.online /\ phase="running" /\ h.cmd[i]="running"
-  /\ (valid \/ Faults) /\ h.primary="none"
-  /\ h'=[h EXCEPT !.cmd[i]=IF valid THEN "valid" ELSE "invalid",
-     !.buffered=IF ~valid THEN IF i=1 THEN "invalid-first" ELSE "invalid-second"
+EmitReply(i,valid) == LET reply == <<CommandKey(i),valid>> IN
+  HostOnly(rootPresent /\ phase="running" /\ h.cmd[i]="running" /\ (valid \/ Faults)
+    /\ ~(\E r \in h.emitted: r[1]=CommandKey(i))
+    /\ h'=[h EXCEPT !.emitted=@ \cup {reply}])
+ReceiveReply(i,r) == HostOnly(h.online /\ h.cmd[i]="running" /\ h.primary="none"
+  /\ (r[1]=h.sentKey[i] \/ (Mutation="accept-stale-reply" /\ r[1][2]=i))
+  /\ h'=[h EXCEPT !.acceptedReply[i]=r[1], !.cmd[i]=IF r[2] THEN "valid" ELSE "invalid",
+     !.buffered=IF ~r[2] THEN IF i=1 THEN "invalid-first" ELSE "invalid-second"
                ELSE IF i=2 THEN "success" ELSE @])
+AuthenticReplies == h.emitted \cup (IF Fault="identity" THEN {OldReply} ELSE {})
 Publish == HostOnly(h.online /\ h.buffered/="none" /\ h.primary="none"
   /\ h'=[h EXCEPT !.primary=h.buffered, !.buffered="none"])
 Cancel == HostOnly(Faults /\ h.accepted /\ h.online /\ ~h.cancelled /\ h.primary="none"
@@ -81,7 +102,11 @@ StopScope == supervisorAlive /\ (h.fenced \/ h.primary/="none") /\ SdkOnly(Reque
 CleanupError == HostOnly(Faults /\ phase="stopping" /\ ~h.cleanupError
   /\ h'=[h EXCEPT !.cleanupError=TRUE,
      !.primary=IF Mutation="overwrite-primary" /\ @/="none" THEN "cleanup-error" ELSE @])
-ReleaseDomains == HostOnly(phase="closed" /\ h.domains>0 /\ h'=[h EXCEPT !.domains=0])
+ClosureReceipts == (IF phase="closed" THEN {Scope} ELSE {})
+                   \cup (IF Fault="identity" THEN {PreviousScope} ELSE {})
+ReleaseDomains == \E receipt \in ClosureReceipts:
+  HostOnly(h.online /\ h.bound/= <<>> /\ h.domains>0 /\ (receipt=h.bound \/ (Mutation="accept-stale-closure" /\ SameOwner(receipt,h.bound)))
+    /\ h'=[h EXCEPT !.closure=receipt, !.domains=0])
 UnusedReleased == h.fenced /\ phase="idle" /\ h.domains=0
 AdmitSuccessor == h.online /\ h.domains=0 /\ h.successor="queued"
   /\ (IF UnusedReleased THEN UNCHANGED vars ELSE WriterAcquire)
@@ -99,15 +124,24 @@ Main == Submit \/ Accept \/ AcquireDomain \/ ReserveScope \/ ConsumePermit \/ Se
   \/ ReceiveLaunch \/ NativeLaunch \/ SaveWarm \/ LoadReads \/ Boot \/ StopScope \/ Maintenance
   \/ Publish \/ SetDisposition \/ SaveCopy \/ AckCopy \/ ReleaseDomains \/ AdmitSuccessor \/ FinishSuccessor
   \/ Fence \/ Rollback \/ Recover
-  \/ (\E i \in Commands: Send(i) \/ Execute(i) \/ Reply(i,TRUE))
-HostNext == LateDelivery \/ RefuseSecondDomain \/ NativeLaunchFails \/ (\E intent \in {"intent-a","intent-b"}: Retry(intent)) \/ Main \/ Other \/ Loss \/ Cancel \/ CrashCaller \/ CleanupError
-  \/ (\E i \in Commands: Reply(i,FALSE))
+  \/ (\E i \in Commands: Send(i) \/ Execute(i) \/ EmitReply(i,TRUE) \/ (\E r \in AuthenticReplies: ReceiveReply(i,r)))
+HostNext == (Fault="identity" /\ Deliver(2,KeyAt(2,PreviousScope))) \/ LateDelivery
+  \/ RefuseSecondDomain \/ NativeLaunchFails \/ (\E intent \in {"intent-a","intent-b"}: Retry(intent))
+  \/ Main \/ Other \/ Loss \/ Cancel \/ CrashCaller \/ CleanupError
+  \/ (\E i \in Commands: EmitReply(i,FALSE))
 HostSpec == HostInit /\ [][HostNext]_hv /\ WF_hv(Main) /\ WF_hv(Other)
 \* Main has finitely many non-stuttering transitions. Faults are bounded and never fair.
 SafeCommands == ~h.wrongFrame /\ (\A i \in Commands: h.starts[i]<=1 /\ (h.starts[i]>0 => (startupAcked /\ h.readAdmitted)))
   /\ (h.starts[2]>0 => h.cmd[1]="valid")
   /\ ((Profile="warm" /\ h.starts[2]>0) => h.warmSaved)
   /\ (h.primary="success" => h.cmd[2]="valid")
+ReplyIdentity == \A i \in Commands: h.acceptedReply[i] /= <<>> =>
+  /\ h.acceptedReply[i]=Expected(i) /\ h.acceptedReply[i]=h.sentKey[i]
+  /\ <<h.acceptedReply[i],h.cmd[i]="valid">> \in h.emitted
+ClosureIdentity == h.closure /= <<>> => h.closure=h.bound /\ phase="closed" /\ ~capacityReserved
+BoundToSdk == h.bound /= <<>> => h.bound=Scope /\ h.binding[1]=Original /\ h.binding[2]=NativeId
+CompanionCompleted == <> (h.primary="success" /\ h.ack /\ h.closure=Scope
+  /\ h.acceptedReply[1]=Expected(1) /\ h.acceptedReply[2]=Expected(2))
 ImmutableBinding == h.submitted => h.binding= <<Original,NativeId,"intent-a">>
 SafeStore == (h.ack => h.copied/="none") /\ (h.copied/="none" => h.copied=h.primary)
   /\ h.primary/="cleanup-error"
