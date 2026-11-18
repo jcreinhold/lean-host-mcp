@@ -483,3 +483,36 @@ pin and private activation qualification remain gates; public installer still re
 Owner-cleared old cache cleanup was performed by the capacity coordinator, preserving active target and evidence.
 Latest provisioning disk check: 56.08 GiB free; retain the 25 GiB reserve. Formatter's separate bounded lane has
 released. No production installation or Proofs/Mathlib build occurred.
+
+### Private Init failure and diagnostic correction: 04:33 UTC, November 18
+
+The corrected controlled-build fixture passed its positive case at 02:46:56–57 and injected-unwind negative
+at 02:48:58–59. These are bounded fixture results, not actual failed OS retirement or stock Lean qualification.
+Evidence remains in `task-15/controlled-build-composition.5LwQUV/`.
+
+Private stock Init uses separately reviewed prebuilt provenance, not a claim of reproducible Cargo output.
+The reviewed controller digest is `5110db7051a5cb6fbe3d67e2c64b8d860941ca9156f0569845d7945e4da58435`;
+its matching worker is `4cbc140fc31eab72b0eb92c2172a858e2637e83db5dbbcca95a05b218e4e42f2`.
+Fresh shim-owned canonical Lean 4.35 runpaths passed static loader review. Static closure is not runtime success.
+
+The first real private Init qualification FAILED once at 04:26:18–04:26:37, exit 1, with
+`guarded install smoke did not complete and retire cleanly`. No active selector was published. Evidence is in
+`task-15/shim-own-runpath.ZdDYpQ/private-init-qualification.sgIft3/`, including the independently selected audit
+`c37312105ec9a2bea54939c08ff262183c47022a908b5f3bc721658b49e86611`. The controller discarded the detailed
+supervisor result and child streams, so the failed lifecycle predicate cannot be reconstructed. Empty controller
+stdout is not evidence about worker stdout or typed declaration evaluation. Later absence of recorded processes
+is not proof that retirement was confirmed during the invocation. Preserve the failed generation; do not replay it.
+
+Two diagnostic patches are prepared but not yet compiled or tested: provisioning report persistence
+`a0ea941071d6aedff7f1950475fcf4f9325184346a0088d4439d45f66327b798` and runtime capture preservation
+`3a749cc79d942d7395ab707e4590883e88a685ee2aec7e1f2bef090762f6d6ed`. Reports are bounded, create-new and
+mode 0600; overflow/cleanup-expiry capture retains bounded tails and nullable unknown fields. Report-write failure
+does not change the original acceptance decision, so qualification must separately require the diagnostic report.
+
+Provisioning owner `6afca1a9-4f1c-8191-a757-cb2c906df0dc`, turn `01a1eced-26a4-72b2-b8e5-bd785d853e75`,
+was admitted during this checkpoint to compose once and run pure tests in the existing warm two-job lane after
+capacity preflight. ABI owner `6afca3dd-61c8-8191-beef-0e1235e410d2`, turn
+`01a1eced-367d-7360-ac5f-fc97b387d3a0`, reviews composition without duplicate builds. Independent source review
+is assigned separately. Admission is not measured command start. Next gates: reviewed composition and pure tests,
+new controller identity and matching worker, then a newly reviewed qualification packet. No native rerun is admitted
+by this checkpoint. Public installation, Lean 4.36 runtime support and Proofs integration remain unqualified.
