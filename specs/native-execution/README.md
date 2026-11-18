@@ -101,4 +101,4 @@ The separate models do not constitute a proof of their combined implementation.
 Deadline-policy checks establish neither real clock behavior nor process exit.
 The current-stage callback, persistence, OS and service-integration obligations
 still require the real implementation tests described in
-[the design](../../docs/native-execution-lifecycle-design.md).
+[the design](https://github.com/jcreinhold/proofs/blob/main/docs/projects/lean-tooling/design/native-execution-lifecycle.md).

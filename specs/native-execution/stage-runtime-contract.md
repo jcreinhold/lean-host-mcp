@@ -126,5 +126,5 @@ immutable attempt/stage-to-scope binding and consumed launch identity, then
 reconcile the original work without repeating it after a lost reply or restart.
 A database commit and process creation are not one atomic action. This prototype
 supplies no durable protocol for that boundary. The
-[service design](../../docs/native-execution-lifecycle-design.md) tracks those
+[service design](https://github.com/jcreinhold/proofs/blob/main/docs/projects/lean-tooling/design/native-execution-lifecycle.md) tracks those
 separate obligations.

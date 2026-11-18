@@ -213,7 +213,7 @@ not establish registry-only reproducibility.
 Unimplemented or untested: replacement-service execution and reattachment, warm-worker request closure, damaged-database
 recovery, pruning, backup restore, authenticated observations, external result assets, real disk/sync errors,
 blocked-I/O cancellation, OS crashes and power loss. See the
-[execution-service design](../../docs/native-execution-lifecycle-design.md) for those separate requirements. No server
+[execution-service design](https://github.com/jcreinhold/proofs/blob/main/docs/projects/lean-tooling/design/native-execution-lifecycle.md) for those separate requirements. No server
 deployment or release follows from these test-only changes.
 
 ## Service death with a healthy guardian
