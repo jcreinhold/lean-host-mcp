@@ -542,3 +542,13 @@ refusal. The corrected worker built in 21.18 seconds, SHA-256
 features. Fresh audit `f1eef2d0adcc5ff3a86f953eb65afb7ea6b2d5387a57fab979d4807be18ee011` is under independent
 selection before exact-command approval. Evidence is in `task-15/stock-init-domain-correspondence.E24IXs/`.
 Both failed generations remain frozen. No successful native Init qualification or public installation is claimed.
+
+At 05:06:18–05:06:36, the independently selected corrected private Lean 4.35 Init qualification PASSED once,
+exit zero. `private-corrected-init.8Acld3/run/receipts/generation-4zGW8y.smoke-diagnostic.json` records accepted
+`Nat.add_zero`, kind theorem, untruncated statement `∀ (n : Nat), n + 0 = n`, confirmed closure and no intervention.
+Private selector, protected receipt and staged worker digest agree. The reconciliation census found no recorded
+worker/guardian PID or process group. This is private declaration inspection, not a kernel recheck, general-project
+qualification, controlled-build reproducibility, Lean 4.36 qualification or public deployment. All prior failures remain
+preserved. Independent result review is underway. ABI turn `01a1ed0e-44b3-70be-86c5-95a053fa4a02` and provisioning
+turn `01a1ed0e-5a68-73f6-975e-9b73873412c4` were admitted to concrete source integration and next-gate preparation,
+with SDK/runtime and installer ownership separate; no further native execution or public activation was assigned.
