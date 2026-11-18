@@ -1,7 +1,7 @@
 use crate::kernel::{Event, Kernel, Rejected, ResultId, ScopeBinding, SpawnFact, StageBinding, StageKey};
 use lean_rs_worker_parent::{LeanWorkerNativeScope, LeanWorkerNativeScopeLease};
 use lean_toolchain::native_guardian::{GuardianHandle, GuardianReadLoan, NativeProcessIdentity, NativeReadDomain};
-use lean_toolchain::process_group::{OwnedCommandGroup, group_present};
+use lean_toolchain::process_group::group_present;
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -141,8 +141,7 @@ impl Drop for Fixture {
     }
 }
 
-// Raw spawn is guarded before any fallible identity/handshake work. Root cannot
-// spawn even its guardian until actual Child adoption is acknowledged.
+// Own the fixture target and observer helpers on every early return.
 struct RawChild(Option<Child>);
 impl Drop for RawChild {
     fn drop(&mut self) {
@@ -228,8 +227,7 @@ pub(crate) struct NativeStage {
     scope: ScopeBinding,
     root: PathBuf,
     birth: NativeProcessIdentity,
-    group: OwnedCommandGroup,
-    lease: Option<LeanWorkerNativeScopeLease>,
+    lease: LeanWorkerNativeScopeLease,
     go: Option<ChildStdin>,
     closed: Option<[Observation; 2]>,
 }
@@ -276,42 +274,26 @@ impl NativeStage {
         command
             .stdin(Stdio::piped())
             .stderr(File::create(root.join("root.stderr")).unwrap());
-        lifetime.configure(&mut command);
-        let mut raw = RawChild(Some(command.spawn().unwrap()));
-        let pid = raw.0.as_ref().unwrap().id();
-        let mut birth = None;
-        wait(|| {
-            birth = NativeProcessIdentity::capture(pid)
-                .unwrap()
-                .filter(|id| id.pid == id.session && id.pid == id.process_group);
-            birth.is_some()
-        });
-        let birth = birth.unwrap();
-        let group = match OwnedCommandGroup::adopt_private_session(raw.0.take().unwrap(), &birth) {
-            Ok(group) => group,
-            Err((error, child)) => {
-                raw.0 = Some(child);
-                panic!("could not adopt dummy child: {error}");
-            }
-        };
+        let mut lease = lifetime.spawn(&mut command, WAIT).unwrap();
+        let birth = lease.owner().unwrap().clone();
+        assert_eq!(
+            NativeProcessIdentity::capture(birth.pid).unwrap().as_ref(),
+            Some(&birth)
+        );
+        let go = Some(lease.take_stdin().expect("one target GO pipe"));
         let mut native = Self {
             key,
             binding,
             scope,
             root,
             birth,
-            group,
-            lease: None,
-            go: None,
+            lease,
+            go,
             closed: None,
         };
-        native.go = native.group.take_stdin();
-        assert!(native.go.is_some());
-        fs::write(native.root.join("scope-adopted"), b"actual child owned").unwrap();
-        native.lease = Some(lifetime.accept(pid, WAIT).unwrap());
-        assert_eq!(native.lease.as_ref().unwrap().owner(), &native.birth);
-        native.lease.as_mut().unwrap().acknowledge().unwrap();
+        native.lease.acknowledge().unwrap();
         wait(|| native.root.join("prepared").exists());
+        assert!(!native.root.join("body-started.json").exists());
         native
     }
     pub(crate) fn send_go(&mut self, fault: GoFault) -> Dispatch {
@@ -332,7 +314,7 @@ impl NativeStage {
     }
     pub(crate) fn request_stop(&mut self) -> io::Result<()> {
         drop(self.go.take()); // no pending launcher survives stopping
-        self.group.request_stop()
+        self.lease.kill()
     }
     pub(crate) fn heartbeat(&self) -> u64 {
         fs::metadata(self.root.join("heartbeat")).map_or(0, |m| m.len())
@@ -387,15 +369,11 @@ impl NativeStage {
         }
         // This is the SDK's complete owned-group observation, not direct-child
         // exit or a new census of an obsolete numeric PGID after reaping.
-        if self.group.try_wait()?.is_none() {
+        if self.lease.try_wait()?.is_none() {
             return Ok(Vec::new());
         }
         drop(self.go.take());
-        let lease = self
-            .lease
-            .as_ref()
-            .ok_or_else(|| io::Error::other("guardian binding unavailable; closure uncertain"))?;
-        if lease.guardian_alive()? {
+        if !self.lease.custody_closed()? {
             return Ok(Vec::new());
         }
         let closed = [
@@ -412,7 +390,7 @@ impl Drop for NativeStage {
             return;
         }
         drop(self.go.take());
-        let _stop = self.group.request_stop();
+        let _stop = self.lease.kill();
         let started = Instant::now();
         while started.elapsed() < WAIT {
             if self.closed_observations().is_ok_and(|events| !events.is_empty()) {
@@ -493,7 +471,7 @@ fn root_helper() {
         .unwrap();
     writeln!(audit, "{}", json!({"pid":std::process::id(),"parent_pid":rustix::process::getppid().unwrap().as_raw_nonzero().get(),"root":root})).unwrap();
     drop(audit);
-    wait(|| root.join("scope-adopted").exists());
+    // HELLO precedes parent ACK; the distinct stdin gate still owns target launch.
     let mut guardian = GuardianHandle::spawn(
         &root.join("guardian"),
         &PathBuf::from(std::env::var_os("LEAN_RS_WORKER_PARENT_SOCKET").unwrap()),
