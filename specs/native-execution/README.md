@@ -16,12 +16,22 @@ cleanup and return use the SDK actions themselves. Positive composition configur
 the same input module. The other modules preserve historical traces and focused policy tests. They do not define
 additional ways for the host to establish closure.
 
+**Authenticated interface assumption.** The composition runs in one state space. Guards can see SDK facts such as
+`phase`, `supervisorAlive` and `rootPresent`; visibility in TLC grants no such access to a host client. For a real
+transition, the responsible component must obtain an authentic observation bound to the exact scope, generation and
+owner. The receiver checks execution authority, the SDK certifies custody and retirement, and the host authenticates
+the producer and binding of a command reply before accepting its contents. An absent, stale or unverifiable report
+leaves the corresponding fact unknown. The model assumes this translation from observations to actions. It does
+not model a wire authenticator, prove a status API supplies the evidence, or authorize reading OS state as a substitute.
+
 The unit of custody is one physical worker generation. The unit of retry is one durable job, logical stage and
 explicit execution revision. A command ordinal identifies a message in that stage. Its immutable endpoint is the
 original scope, generation and owner. A warm generation can execute successive calls. The unique generation head
 belongs to creation of a lifetime; subsequent commands bind to that existing lifetime. Results identify their
-original request and producer, even after later work has begun. The late-command control delivers the first command’s key to the second
-command slot. Endpoint validation must reject it even though the same worker is waiting for a command.
+original request and producer, even after later work has begun. In the late-command case, `LateDelivery` offers command 1’s key to command 2’s
+slot in the same generation. The correct guard disables that transition. There is no modeled receive-and-reject
+event, reply or rejection counter. In the mutant, the transition is enabled and `SafeCommands` catches execution at
+the wrong endpoint. Delayed messages across generations are covered separately by the historical cases.
 
 | Boundary | Host obligation and observable outcome |
 | --- | --- |
@@ -35,8 +45,13 @@ command slot. Endpoint validation must reject it even though the same worker is 
 
 **Fairness and bounds.** One original binding, two commands, one custody generation, two ordered domain acquisitions,
 at most one caller crash, one independent ready request and one conflicting successor. Healthy cases assume responsive
-storage, delivery and execution, valid replies, no cancellation, no deadline expiry and a stable owner. Weak fairness
-applies to the host's finite forward actions and to disjoint work separately. The fault case permits caller and SDK
+storage, delivery and execution, valid replies, no cancellation, no deadline expiry and a stable owner. `WF_hv(Main)` applies to the disjunction of forward actions:
+when that disjunction stays enabled, some forward action must eventually change state. It provides no separate
+fairness promise to a particular store, command, cleanup or admission action. In this bounded model forward paths
+contain finitely many state changes, so an endless stream of other forward work cannot starve a continuously
+enabled step. `WF_hv(Other)` independently schedules the disjoint request on its assumed ready worker and spare slot.
+The checked progress properties rely on those bounds; a scheduler with recurring arrivals or retries needs its own
+fairness argument. The fault case permits caller and SDK
 supervisor loss independently, delayed execution, guardian/root/group loss, invalid responses, cleanup failure and
 cancellation. Faults and natural process exit have no fairness obligation. Recovery may return unknown. Physical
 cleanup progress depends on a surviving responsive authority, authentic exact-generation observations and durable
@@ -135,7 +150,7 @@ Five deliberate protocol mutations hit their named invariants. Six witnesses rea
 
 | Outcome | What the check distinguishes |
 | --- | --- |
-| Positive | Healthy companion success and ACK, two warm commands, exact-key retry, stale first-command delivery ignored, and combined fault safety/progress. |
+| Positive | Healthy companion success and ACK, two warm commands, exact-key retry, stale first-command delivery disabled by the endpoint guard, and combined fault safety/progress. |
 | Negative | Early command or wrong command endpoint violates `SafeCommands`; changed-intent rebinding violates `ImmutableBinding`; early ACK or cleanup overwriting the primary violates `SafeStore`. |
 | Witness | Partial acquisition rollback, lost validated reply before durable save, invalid second response with cleanup error, success while cleanup holds capacity, cancellation between commands, disjoint completion with orphan custody fenced. |
 
