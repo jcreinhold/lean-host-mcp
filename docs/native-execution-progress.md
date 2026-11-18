@@ -324,3 +324,19 @@ SDK `21892a4fc073de61e2dc6c3f585d4b80e719ad7c` validates the full root union as 
 with a new regression for invalid byte sequences colliding under lossy rendering. Formatting/diff checks pass;
 regression compilation/execution is queued, not passed. Independent review is active. Launcher contract now separately
 requires guardian executable/closure verification and custody; writer-helper equality cannot supply that evidence.
+
+### Integration prerequisites corrected: 00:24 UTC, November 18
+
+Exact-root production-validator regression passed at 00:23:07–08 with libSystem-only linkage; targeted strict Clippy
+and formatting passed, lane released 00:23:19. Evidence is `task-20/safety-pair/worker-ingress/root-identity.exmD6W/transcript`.
+Provisioning reconciliation patch `6f2dc05a0dde0346aeb1e742b67721e12c89f20a03fd35ada6c57732d9b35eae` passed seven
+pure tests at 00:21:44–46, but review found its typed token must also bind original receipt location and digest.
+Correction and negative tests are assigned to turn `01a1ec09-d541-73b8-b0ea-300b7fe44380`, now using the released lane.
+
+Inspection corrected an earlier assumption: current `install_one` has no per-toolchain writer acquisition, and
+adjacent overwriteable `worker.json` is not independent release approval or a protected selector. Actual wiring
+therefore remains blocked on a concrete minimal trust/coordination decision, not just compilation. The owner is
+comparing reuse of existing installation provenance and canonical lock mechanisms, without assuming novel security
+infrastructure. Ordinary/companion launch through `native_worker_child` and separate installer smoke both need the
+chosen handoff; general explicitly authorized projects remain supported. Process-restart smoke-success evidence is
+not supplied by the in-memory reconciliation token or a pre-smoke receipt.
