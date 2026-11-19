@@ -38,7 +38,9 @@ HostInit == Init /\ h = [
   goDeliveries |-> 0, pendingTargets |-> 0, targetStarts |-> 0, goReplayedAfterStart |-> FALSE,
   startsAtFence |-> 0, racedStart |-> FALSE, fencedRunnable |-> FALSE,
   hostPermitTaken |-> FALSE, hostPermitReturns |-> 0, actorSealed |-> FALSE,
-  hostClosure |-> <<>>, staleSeen |-> FALSE, duplicateSeen |-> FALSE]
+  hostClosure |-> <<>>, staleSeen |-> FALSE, duplicateSeen |-> FALSE,
+  deadline |-> [tick |-> 0, arm |-> "idle", armedKey |-> <<>>, finishedKey |-> <<>>,
+    sentAt |-> <<>>, frozen |-> FALSE, paused |-> FALSE, expired |-> FALSE]]
 HostOnly(change) == change /\ UNCHANGED vars
 SdkOnly(action) == action /\ UNCHANGED h
 Submit == HostOnly(~h.submitted /\ h.online /\ h'=[h EXCEPT !.submitted=TRUE, !.binding= <<Original,NativeId,"intent-a">>])
@@ -111,8 +113,8 @@ ReadyFor(i) == phase="running" /\ supervisorAlive /\ ~h.fenced /\ ~h.cancelled
   /\ ~RecoveryRace /\ ~h.actorSealed
   /\ h.online /\ ~h.crashed /\ ((startupAcked /\ h.readAdmitted) \/ Mutation="early-command")
   /\ (i=1 \/ (h.cmd[1]="valid" /\ (Profile="companion" \/ h.warmSaved)))
-Send(i) == HostOnly(ReadyFor(i) /\ h.cmd[i]="idle"
-  /\ h'=[h EXCEPT !.cmd[i]="sent", !.sentKey[i]=Expected(i)])
+Sent(i) == [h EXCEPT !.cmd[i]="sent", !.sentKey[i]=Expected(i)]
+Send(i) == HostOnly(ReadyFor(i) /\ h.cmd[i]="idle" /\ h'=Sent(i))
 Deliver(i,frame) == HostOnly(rootPresent /\ phase="running" /\ supervisorAlive /\ ~h.fenced
   /\ h.cmd[i]="sent" /\ (frame=CommandKey(i) \/ Mutation="current-endpoint"
                        \/ (Mutation="ignore-generation" /\ SameCommandWithoutGeneration(frame,CommandKey(i))))
@@ -256,4 +258,82 @@ NoStaleWithOpenScope == ~(h.staleSeen /\ phase="running" /\ capacityReserved /\ 
 NoSdkReturnBeforeHost == ~(ConfirmedHostClosure /\ capacityReturns=1 /\ HostPermitHeld /\ ~h.actorSealed)
 NoHostReturnWithoutAck == ~(h.duplicateSeen /\ h.hostPermitReturns=1 /\ h.copied="success" /\ ~h.ack)
 NoHostReturnAfterNoStart == ~(h.hostPermitReturns=1 /\ h.fenced /\ ~runningDurable /\ capacityReturns=1)
+
+\* Opt-in projection: command 1 only warms the single generation. Command 2
+\* has one immutable deadline on a shared logical clock. No guardian loss,
+\* rearming, new lease transfer, or second attempt is modeled.
+HardTick == 2
+WarmPrelude == Submit \/ Accept \/ AcquireDomain \/ ReserveScope \/ ConsumePermit
+  \/ SendLaunch \/ ReceiveLaunch \/ NativeLaunch \/ LoadReads \/ Boot
+  \/ Send(1) \/ Execute(1) \/ EmitReply(1,TRUE)
+  \/ (\E r \in h.emitted: ReceiveReply(1,r)) \/ SaveWarm
+DeadlineArm == HostOnly(ReadyFor(2) /\ h.warmSaved /\ guardianPresent
+  /\ h.deadline.arm="idle" /\ h.deadline.tick<HardTick
+  /\ h'=[h EXCEPT !.deadline.arm="armed", !.deadline.armedKey=CommandKey(2)])
+DeadlineAck(key) == HostOnly(h.deadline.arm="armed" /\ phase="running"
+  /\ key=h.deadline.armedKey /\ h.deadline.tick<HardTick
+  /\ h'=[h EXCEPT !.deadline.arm="acked"])
+\* An ambiguous ACK seals the whole generation, not just this command ID.
+\* The guardian still owns the arm and must drain at the original deadline.
+DeadlineLoseAck == HostOnly(phase="running" /\ h.deadline.arm="armed"
+  /\ h'=[h EXCEPT !.deadline.arm="lost", !.actorSealed=TRUE])
+DeadlineTick == HostOnly(h.warmSaved /\ h.deadline.tick<HardTick
+  /\ h'=[h EXCEPT !.deadline.tick=@+1])
+DeadlineFirstByte == HostOnly(ReadyFor(2) /\ h.cmd[2]="idle"
+  /\ (h.deadline.arm="acked" \/ (Mutation="byte-without-ack" /\ h.deadline.arm="armed"))
+  /\ (h.deadline.tick<HardTick \/ Mutation="byte-after-deadline")
+  /\ h'=[Sent(2) EXCEPT !.deadline.sentAt= <<h.deadline.arm,h.deadline.tick>>])
+\* Delivery may follow the clock edge if the first byte was already sent,
+\* but not after RequestStop fences the running scope.
+PauseDeadlineParent == HostOnly(phase="running" /\ h.cmd[2]="running"
+  /\ h.deadline.arm="acked" /\ ~h.deadline.paused /\ supervisorAlive
+  /\ h'=[h EXCEPT !.deadline.frozen=TRUE, !.deadline.paused=TRUE])
+DeadlineFinish(key) == HostOnly(~h.deadline.frozen /\ phase="running"
+  /\ h.deadline.arm="acked" /\ h.deadline.tick<HardTick
+  /\ h.acceptedReply[2]=CommandKey(2)
+  /\ (key=h.deadline.armedKey \/ Mutation="stale-finish")
+  /\ h'=[h EXCEPT !.deadline.arm="finished", !.deadline.finishedKey=key])
+GuardianDeadlineStop == guardianPresent /\ h.deadline.tick=HardTick
+  /\ h.deadline.arm \in {"armed","acked","lost"}
+  /\ (~h.deadline.frozen \/ Mutation/="parent-required-for-stop")
+  /\ RequestStop /\ h'=[h EXCEPT !.deadline.expired=TRUE, !.actorSealed=TRUE]
+GuardianDeadlineDrain == h.deadline.expired /\ guardianPresent /\ SdkOnly(CleanupGroup)
+\* This grants no authority to report closure while the parent is paused.
+\* Model eventual resume separately, then require the actual custody relation
+\* for each absence observation and the single return of capacity.
+ResumeDeadlineParent == HostOnly(h.deadline.frozen /\ h.deadline.expired /\ ~groupPresent
+  /\ h'=[h EXCEPT !.deadline.frozen=FALSE])
+ObserveDeadlineClosure == ~h.deadline.frozen /\ h.deadline.expired
+  /\ (SdkOnly(GuardianExitsAfterGroup \/ ObserveGroupAbsent \/ ObserveGuardianAbsent \/ Retire)
+      \/ ReleaseDomains)
+DeadlineControlKeys == {CommandKey(2),KeyAt(2,PreviousScope),CommandKey(1)}
+DeadlineNext == WarmPrelude \/ DeadlineArm \/ DeadlineLoseAck
+  \/ (\E key \in DeadlineControlKeys: DeadlineAck(key) \/ DeadlineFinish(key))
+  \/ DeadlineTick \/ DeadlineFirstByte \/ Execute(2) \/ EmitReply(2,TRUE) \/ PauseDeadlineParent
+  \/ (~h.deadline.frozen /\ h.deadline.tick<HardTick /\ phase="running"
+      /\ (\E r \in h.emitted: ReceiveReply(2,r)))
+  \/ (h.deadline.arm="finished" /\ Publish)
+  \/ GuardianDeadlineStop \/ GuardianDeadlineDrain \/ ResumeDeadlineParent \/ ObserveDeadlineClosure
+DeadlineSpec == HostInit /\ [][DeadlineNext]_hv
+  /\ WF_hv(DeadlineTick) /\ WF_hv(GuardianDeadlineStop) /\ WF_hv(GuardianDeadlineDrain)
+  /\ WF_hv(ResumeDeadlineParent) /\ WF_hv(ObserveDeadlineClosure)
+DeadlineByteOrder ==
+  /\ (h.cmd[2]/="idle") = (h.deadline.sentAt /= <<>>)
+  /\ (h.deadline.sentAt /= <<>> =>
+      h.deadline.sentAt[1]="acked" /\ h.deadline.sentAt[2]<HardTick
+      /\ h.deadline.armedKey=h.sentKey[2])
+DeadlineFinishIdentity == h.deadline.arm="finished" =>
+  h.deadline.finishedKey=CommandKey(2) /\ h.acceptedReply[2]=CommandKey(2)
+DeadlineLostAckSealed == h.deadline.arm="lost" =>
+  h.actorSealed /\ h.deadline.sentAt= <<>> /\ h.starts[2]=0 /\ h.primary="none"
+DeadlineClosureEvidence ==
+  /\ (h.deadline.frozen => h.closure= <<>> /\ capacityReserved /\ capacityReturns=0)
+  /\ (phase="closed" => h.deadline.expired /\ ~groupPresent /\ ~guardianPresent
+      /\ aliases={} /\ ~ofdLocked /\ groupObservation="absent" /\ guardianObservation="absent"
+      /\ ~capacityReserved /\ capacityReturns=1)
+FrozenGuardianStops == h.deadline.frozen ~> (h.deadline.expired /\ ~groupPresent)
+FrozenGuardianRetires == h.deadline.paused ~> (h.closure=Scope /\ capacityReturns=1)
+LostAckRetires == (h.deadline.arm="lost") ~> (h.closure=Scope /\ capacityReturns=1)
+NoFrozenDrain == ~(h.deadline.frozen /\ h.deadline.expired /\ ~groupPresent)
+NoLostAckRetirement == ~(h.deadline.arm="lost" /\ h.closure=Scope /\ capacityReturns=1)
 =============================================================================

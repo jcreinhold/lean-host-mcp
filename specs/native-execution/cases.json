@@ -507,6 +507,111 @@
       "expect": "pass",
       "constants": { "Profile": "\"warm\"" }
     },
+    {
+      "name": "host-deadline-warm",
+      "model": "Stages",
+      "specification": "DeadlineSpec",
+      "extended": true,
+      "expect": "pass",
+      "constants": { "Profile": "\"warm\"" },
+      "invariants": [
+        "TypeOK",
+        "SafeCommands",
+        "ReplyIdentity",
+        "ClosureIdentity",
+        "NoEarlyCapacityReturn",
+        "CapacityReturnsOnce",
+        "DeadlineByteOrder",
+        "DeadlineFinishIdentity",
+        "DeadlineLostAckSealed",
+        "DeadlineClosureEvidence"
+      ],
+      "properties": [
+        "Spec",
+        "FrozenGuardianStops",
+        "FrozenGuardianRetires",
+        "LostAckRetires"
+      ]
+    },
+    {
+      "name": "host-deadline-no-ack",
+      "model": "Stages",
+      "specification": "DeadlineSpec",
+      "extended": true,
+      "expect": "invariant",
+      "constants": { "Profile": "\"warm\"", "Mutation": "\"byte-without-ack\"" },
+      "invariants": ["DeadlineByteOrder"],
+      "properties": [],
+      "invariant": "DeadlineByteOrder"
+    },
+    {
+      "name": "host-deadline-equal-tick",
+      "model": "Stages",
+      "specification": "DeadlineSpec",
+      "extended": true,
+      "expect": "invariant",
+      "constants": { "Profile": "\"warm\"", "Mutation": "\"byte-after-deadline\"" },
+      "invariants": ["DeadlineByteOrder"],
+      "properties": [],
+      "invariant": "DeadlineByteOrder"
+    },
+    {
+      "name": "host-deadline-stale-finish",
+      "model": "Stages",
+      "specification": "DeadlineSpec",
+      "extended": true,
+      "expect": "invariant",
+      "constants": { "Profile": "\"warm\"", "Mutation": "\"stale-finish\"" },
+      "invariants": ["DeadlineFinishIdentity"],
+      "properties": [],
+      "invariant": "DeadlineFinishIdentity"
+    },
+    {
+      "name": "host-deadline-needs-parent",
+      "model": "Stages",
+      "specification": "DeadlineSpec",
+      "extended": true,
+      "expect": "liveness",
+      "constants": { "Profile": "\"warm\"", "Mutation": "\"parent-required-for-stop\"" },
+      "invariants": [
+        "TypeOK",
+        "SafeCommands",
+        "ReplyIdentity",
+        "ClosureIdentity",
+        "NoEarlyCapacityReturn",
+        "CapacityReturnsOnce",
+        "DeadlineByteOrder",
+        "DeadlineFinishIdentity",
+        "DeadlineLostAckSealed",
+        "DeadlineClosureEvidence"
+      ],
+      "properties": ["FrozenGuardianStops"]
+    },
+    {
+      "name": "host-deadline-frozen-witness",
+      "model": "Stages",
+      "specification": "DeadlineSpec",
+      "extended": true,
+      "expect": "invariant",
+      "constants": { "Profile": "\"warm\"" },
+      "invariants": ["NoFrozenDrain"],
+      "properties": [],
+      "invariant": "NoFrozenDrain",
+      "witness": true
+    },
+    {
+      "name": "host-deadline-lost-ack-witness",
+      "model": "Stages",
+      "specification": "DeadlineSpec",
+      "extended": true,
+      "expect": "invariant",
+      "constants": { "Profile": "\"warm\"" },
+      "invariants": ["NoLostAckRetirement"],
+      "properties": [],
+      "invariant": "NoLostAckRetirement",
+      "witness": true
+    },
+
     { "name": "host-healthy", "model": "Stages", "expect": "pass" },
     {
       "name": "host-faults",
