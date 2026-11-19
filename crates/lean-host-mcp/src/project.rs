@@ -3509,6 +3509,7 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
     if config.prepared_host_artifacts.is_none() {
         return Ok(
             LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
+                .checked_native_loader_environment()
                 .shared_writer_executable(writer.executable)
                 .shared_artifact_reads(true),
         );
@@ -3519,6 +3520,7 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
         ));
     }
     let mut child = LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
+        .checked_native_loader_environment()
         .shared_writer_executable(writer.executable.clone())
         .native_guardian(writer.executable)
         .lifetime_directory(writer.ownership_registry)

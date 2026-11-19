@@ -479,7 +479,8 @@ impl ChildOwner<Child> {
     }
 }
 impl ChildOwner<MeasuredChild> {
-    fn spawn_measured(command: Command) -> io::Result<Self> {
+    fn spawn_measured(mut command: Command) -> io::Result<Self> {
+        lean_rs_worker_parent::inherit_checked_native_loader_environment(&mut command)?;
         Self::spawn_with(|| MeasuredChild::spawn(command), None)
     }
 }
@@ -778,6 +779,7 @@ fn run_internal(
         command.env(STDIN_ENV, serde_json::to_string(staged).map_err(io::Error::other)?);
     }
     command.env("LEAN_RS_WORKER_GUARDIAN_EXECUTABLE", &helper.executable);
+    lean_rs_worker_parent::inherit_checked_native_loader_environment(&mut command)?;
     let mut child = ChildOwner::spawn(command, keepalive.take())?;
     *spawned = true;
     let mut output = Capture::new(

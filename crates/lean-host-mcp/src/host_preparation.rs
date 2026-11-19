@@ -225,7 +225,9 @@ impl Drop for Pending {
     }
 }
 
-fn start(command: Command, timeout: Duration, mode: Mode) -> Result<Pending, PreparationFailure> {
+fn start(mut command: Command, timeout: Duration, mode: Mode) -> Result<Pending, PreparationFailure> {
+    lean_rs_worker_parent::inherit_checked_native_loader_environment(&mut command)
+        .map_err(PreparationFailure::no_spawn)?;
     if timeout.is_zero() {
         return Err(PreparationFailure::no_spawn(
             "host preparation needs a positive timeout",

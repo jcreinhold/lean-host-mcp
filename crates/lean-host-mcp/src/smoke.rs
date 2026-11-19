@@ -167,6 +167,7 @@ fn probe_with_writer(
     // An install smoke owns a temporary unscoped generation; it must never
     // invent a broker capacity limit or share an unrelated actor's slot.
     let child = LeanWorkerChild::for_toolchain(worker_path, lean_sysroot)
+        .checked_native_loader_environment()
         .shared_writer_executable(writer.executable.clone())
         .native_guardian(writer.executable)
         .lifetime_directory(writer.ownership_registry)
@@ -363,6 +364,7 @@ mod tests {
             .expect("compiled matching ABI expectation");
         let tracker = LeanWorkerProcessTracker::new();
         let child = LeanWorkerChild::for_toolchain(&worker, &sysroot)
+            .checked_native_loader_environment()
             .shared_writer_executable(helper.clone())
             .native_guardian(helper.clone())
             .lifetime_directory(&registry)
