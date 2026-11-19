@@ -17,7 +17,6 @@ import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
 import queue
 import re
 import signal
@@ -28,6 +27,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 
 LIMIT = 20.0
 CAPACITY = 4
@@ -40,7 +40,7 @@ DEVELOPMENT_PROVENANCE_WARNING = (
 
 
 def utc():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return datetime.datetime.now(datetime.UTC).isoformat()
 
 
 def require(condition, detail):
@@ -285,7 +285,7 @@ class Writer:
                     self.frames.put(RuntimeError("bounded writer frame invalid"))
                     break
                 self.frames.put(json.loads(line))
-        except BaseException as error:
+        except (OSError, ValueError) as error:
             self.frames.put(error)
         finally:
             self.frames.put(None)
@@ -432,8 +432,24 @@ class Harness:
             if future.set_running_or_notify_cancel():
                 try:
                     future.set_result(function())
-                except BaseException as error:
+                except (
+                    AssertionError,
+                    AttributeError,
+                    http.client.HTTPException,
+                    LookupError,
+                    OSError,
+                    RuntimeError,
+                    StopIteration,
+                    subprocess.SubprocessError,
+                    TypeError,
+                    ValueError,
+                ) as error:
                     future.set_exception(error)
+                except BaseException as error:
+                    # Unblock result waiters without suppressing thread termination.
+                    future.set_exception(error)
+                    raise
+
         thread = threading.Thread(target=invoke, daemon=True)
         try:
             thread.start()
@@ -462,7 +478,7 @@ class Harness:
             barrier.wait(timeout=LIMIT)
             try:
                 result = subprocess.run(command, env=self.env, stdin=subprocess.DEVNULL,
-                                        capture_output=True, timeout=15)
+                                        capture_output=True, timeout=15, check=False)
             except subprocess.TimeoutExpired as error:
                 (self.root / f"reader-{ordinal}.stdout").write_bytes(error.output or b"")
                 (self.root / f"reader-{ordinal}.stderr").write_bytes(error.stderr or b"")
@@ -595,7 +611,12 @@ class Harness:
         for writer in self.writers:
             try:
                 writer.close()
-            except BaseException as error:
+            except (
+                AssertionError,
+                OSError,
+                subprocess.TimeoutExpired,
+                ValueError,
+            ) as error:
                 errors.append(repr(error))
         _, pending = concurrent.futures.wait(self.futures, timeout=45)
         retained_pending = False
@@ -617,7 +638,16 @@ class Harness:
                         retained_pending = True
                         break
                     time.sleep(0.1)
-            except BaseException as error:
+            except (
+                AssertionError,
+                AttributeError,
+                http.client.HTTPException,
+                LookupError,
+                OSError,
+                StopIteration,
+                TypeError,
+                ValueError,
+            ) as error:
                 retained_pending = True
                 errors.append("retained cleanup observation: " + repr(error))
         if pending or retained_pending:
@@ -660,7 +690,15 @@ class Harness:
                 return all(not row["physical_scope_present"] for row in observations)
             try:
                 wait_for(private_scopes_closed, "private native groups did not stop", timeout=5)
-            except BaseException as error:
+            except (
+                AssertionError,
+                AttributeError,
+                LookupError,
+                OSError,
+                subprocess.SubprocessError,
+                TypeError,
+                ValueError,
+            ) as error:
                 errors.append("private scope observation: " + repr(error))
             self.evidence.update(cleanup_native_scopes=observations)
         if self.server_log is not None:

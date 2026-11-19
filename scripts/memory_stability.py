@@ -141,7 +141,7 @@ def load_workload(path: Path, project_root: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for index, call in enumerate(expanded):
         if not isinstance(call, dict):
-            raise ValueError(f"call {index} must be an object")
+            raise TypeError(f"call {index} must be an object")
         label = call.get("label")
         tool = call.get("tool") or call.get("tool_name")
         arguments = call.get("arguments")
@@ -150,7 +150,7 @@ def load_workload(path: Path, project_root: Path) -> list[dict[str, Any]]:
         if not isinstance(tool, str) or not tool:
             raise ValueError(f"call {label} needs a non-empty string tool")
         if not isinstance(arguments, dict):
-            raise ValueError(f"call {label} needs an object arguments field")
+            raise TypeError(f"call {label} needs an object arguments field")
         out.append({"label": label, "tool": tool, "arguments": arguments})
     return out
 
