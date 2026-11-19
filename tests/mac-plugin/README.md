@@ -26,22 +26,34 @@ to this directory. Use a trusted build environment and one Cargo job. Keep the
 private release, toolchain, shim trees, input files and helper stable while
 reviewing and running. The following are separate producer and consumer steps.
 
-1. Provision the sealed release and prepared shim descriptor using the SDK's
-   original guarded application preparation and sealer. The metadata-only SDK CLI
-   selects 9457921, whose host shim predates plugin import. The test adapter
-   selects 7fe48a56, requires the plugin export, and skips the metadata worker. It needs its independently reviewed metadata
-   source archive, approved bootstrap writer, and stock Lean 4.36.0 release.
-   Those are external inputs. The SDK checks their hashes and creates the
-   release lock, checked manifests and native image inventory in a private
-   directory. Its bootstrap writer has its own fixed digest. A newly built host
-   parent cannot substitute for that input. Keep the printed deployment path
-   and use its `release` and `app/deployment.json` below.
+1. Build the normal parent helper first with the reviewed stock Lean release.
+   The helper source is host commit `bba2ec8cd886107840741b427595c17e9ccc8141`
+   (guarded startup and loader policy). The private candidate retains it under
+   `refs/heads/fixtures/mac-plugin-guarded-helper-v1`. The source repository
+   supplied below must advertise that commit or a descendant. Keep the selected
+   scratch manifest outside the checkout until its clean revision is verified.
 
    ```sh
-   python3 -B "$TEST/provision.py" --sdk "$SDK" --packet "$PACKET" --writer "$BOOTSTRAP_WRITER" --lean-release "$STOCK_RELEASE" --scratch "$DEPLOYMENT" --target "$TARGET"
+   git clone --no-hardlinks "$HOST_REPOSITORY" "$FRESH_HOST"
+   git -C "$FRESH_HOST" checkout --detach bba2ec8cd886107840741b427595c17e9ccc8141
+   python3 "$TEST/select-helper-graph.py" "$FRESH_HOST" "$SDK" "$SEMANTIC" > "$FRESH_HOST.selected.toml"
+   mv "$FRESH_HOST.selected.toml" "$FRESH_HOST/Cargo.toml"
+   (cd "$FRESH_HOST" && LEAN_SYSROOT="$STOCK_RELEASE" CARGO_TARGET_DIR="$TARGET" CARGO_INCREMENTAL=0 cargo build --offline -j1 -p lean-host-mcp --bin lean-host-mcp)
    ```
 
-2. Build the two checked-in module sources in separate directories. The
+2. Independently review the resulting local helper and select its SHA-256.
+   Provisioning stages those verified bytes privately. Regression takes its
+   helper from that same deployment and checks the same approved digest.
+   The SDK owns the ten application files at `fixtures/metadata-qualification/app`.
+   Supply its Git repository and full reviewed fixture commit separately from
+   the 7fe48a56 runtime checkout. The adapter verifies the subtree identity,
+   exports its original file bytes and requires the plugin-capable host shim.
+
+   ```sh
+   python3 -B "$TEST/provision.py" --sdk "$SDK" --fixture-repo "$FIXTURE_SDK_REPO" --fixture-commit "$FIXTURE_SDK_COMMIT" --writer "$TARGET/debug/lean-host-mcp" --writer-sha256 "$REVIEWED_HELPER" --lean-release "$STOCK_RELEASE" --scratch "$DEPLOYMENT" --target "$TARGET"
+   ```
+
+3. Build the two checked-in module sources in separate directories. The
    regression replaces only the .olean, so only the selected variant needs a
    dylib. Review the source, compiler/release identity, exported
    `_initialize_QualifiedPlugin`, every load command and its resolved libraries,
@@ -52,20 +64,6 @@ reviewing and running. The following are separate producer and consumer steps.
    ```sh
    sh "$TEST/build-inputs.sh" "$DEPLOYMENT/release" "$FRESH_INPUTS"
    /usr/bin/otool -l "$FRESH_INPUTS/selected/libQualifiedPlugin.dylib"
-   ```
-
-3. Build the normal parent helper from a disposable checkout containing the
-   reviewed guarded-spawn and loader changes. The test-only commit alone
-   cannot supply this binary. Capture the source revision before selecting
-   its private graph. Use an existing build target; monitor the free-space
-   floor during compilation.
-
-   ```sh
-   git clone --no-hardlinks "$HOST_REPOSITORY" "$FRESH_HOST"
-   git -C "$FRESH_HOST" checkout --detach "$REVIEWED_HOST_COMMIT"
-   python3 "$TEST/select-helper-graph.py" "$FRESH_HOST" "$SDK" "$SEMANTIC" > "$FRESH_HOST/Cargo.toml.selected"
-   mv "$FRESH_HOST/Cargo.toml.selected" "$FRESH_HOST/Cargo.toml"
-   (cd "$FRESH_HOST" && LEAN_SYSROOT="$DEPLOYMENT/release" CARGO_TARGET_DIR="$TARGET" CARGO_INCREMENTAL=0 cargo build --offline -j1 -p lean-host-mcp --bin lean-host-mcp)
    ```
 
 4. Independently review the **local** sealed record (including shim/release
@@ -80,7 +78,7 @@ reviewing and running. The following are separate producer and consumer steps.
      --deployment "$DEPLOYMENT/app/deployment.json" --deployment-sha256 "$REVIEWED_DEPLOYMENT" \
      --selected "$FRESH_INPUTS/selected" --module-sha256 "$REVIEWED_MODULE" --plugin-sha256 "$REVIEWED_PLUGIN" \
      --alternate "$FRESH_INPUTS/alternate/QualifiedPlugin.olean" --alternate-sha256 "$REVIEWED_ALTERNATE" \
-     --helper "$TARGET/debug/lean-host-mcp" --helper-sha256 "$REVIEWED_HELPER"
+     --helper-sha256 "$REVIEWED_HELPER"
    ```
 
 The SDK supplies worker protocol, artifact locks, writer/guardian dispatch,

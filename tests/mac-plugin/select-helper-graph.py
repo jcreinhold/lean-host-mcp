@@ -8,6 +8,7 @@ from pathlib import Path
 
 host, sdk, semantic = (Path(value).resolve(strict=True) for value in sys.argv[1:])
 for repo, commit in [
+    (host, "bba2ec8cd886107840741b427595c17e9ccc8141"),
     (sdk, "7fe48a56a3091e05e99a024e3f5f524732a82ed6"),
     (semantic, "fc03e559a8f25d6b1b510aadb10b7c3809d39c91"),
 ]:

@@ -70,7 +70,6 @@ def main():
         "deployment",
         "selected",
         "alternate",
-        "helper",
         "scratch",
         "target",
     ):
@@ -87,7 +86,9 @@ def main():
         )
     ):
         raise RuntimeError("requires Darwin and the clean pinned SDK checkout")
-    helper_bytes = verified(a.helper, a.helper_sha256)
+    helper_bytes = verified(
+        a.deployment.parent.parent / "lean-host-mcp", a.helper_sha256
+    )
     rec = json.loads(verified(a.deployment, a.deployment_sha256))
     replacement = verified(a.alternate, a.alternate_sha256)
     if not a.target.is_dir() or shutil.disk_usage(a.target).free < 26 * 2**30:

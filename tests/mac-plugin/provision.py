@@ -1,10 +1,11 @@
-"""Run the SDK packet's guarded prepare/seal against the plugin-capable SDK."""
+"""Run the SDK application's guarded prepare/seal against the plugin-capable SDK."""
 
 import argparse
 import importlib.util
 import io
 import json
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -13,11 +14,33 @@ from pathlib import Path
 
 from run import SDK, bounded_run, verified
 
+FIXTURE_PATH = "fixtures/metadata-qualification/app"
+FIXTURE_TREE = "ee1bf0cecda10560c7b58b33ea679188f87fea9c"
+
+
+def fixture_tree(repo, revision):
+    if not re.fullmatch("[0-9a-f]{40}", revision):
+        raise ValueError("expected a full reviewed SDK fixture commit")
+    git = ["git", "-C", str(repo)]
+    if (
+        subprocess.check_output(git + ["cat-file", "-t", revision], text=True).strip()
+        != "commit"
+    ):
+        raise ValueError("expected SDK fixture commit")
+    tree = subprocess.check_output(
+        git + ["rev-parse", "--verify", f"{revision}:{FIXTURE_PATH}"], text=True
+    ).strip()
+    if tree != FIXTURE_TREE:
+        raise ValueError("SDK fixture subtree differs from the reviewed application")
+    return git
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for key in ("sdk", "packet", "writer", "lean-release", "scratch", "target"):
+    for key in ("sdk", "fixture-repo", "writer", "lean-release", "scratch", "target"):
         parser.add_argument("--" + key, required=True, type=lambda p: Path(p).resolve())
+    parser.add_argument("--fixture-commit", required=True)
+    parser.add_argument("--writer-sha256", required=True)
     a = parser.parse_args()
     if (sys.platform, platform.machine()) != ("darwin", "arm64"):
         raise ValueError("requires an arm64 Mac")
@@ -31,8 +54,8 @@ def main():
     )
     supplier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(supplier)
-    packet_bytes = verified(a.packet, supplier.PACKET)
-    writer_bytes = verified(a.writer, supplier.WRITER)
+    fixture_git = fixture_tree(a.fixture_repo, a.fixture_commit)
+    writer_bytes = verified(a.writer, a.writer_sha256)
     for name, digest in {
         "bin/lean": "a4c5d3dfc1672faf014e59bd17724035259ff0d22a4ffbdf5a75e142f564817e",
         "bin/lake": "a0e516de0ba03a26cb90c80f06666022ef9de3f0943f8b26e9b902d229b43ebe",
@@ -47,12 +70,20 @@ def main():
     writer.write_bytes(writer_bytes)
     writer.chmod(0o500)
     del writer_bytes
-    with tarfile.open(fileobj=io.BytesIO(packet_bytes)) as packet:
-        packet.extractall(
-            root,
-            members=[m for m in packet if m.name.startswith("./app/")],
-            filter="data",
+    app = root / "app"
+    app.mkdir()
+    entries = subprocess.check_output(fixture_git + ["ls-tree", "-rz", FIXTURE_TREE])
+    for entry in entries.rstrip(b"\0").split(b"\0"):
+        header, filename = entry.split(b"\t", 1)
+        mode, kind, blob = header.decode("ascii").split()
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise ValueError("expected only ordinary fixture source files")
+        target = app / filename.decode("utf-8")
+        target.parent.mkdir(exist_ok=True, parents=True)
+        target.write_bytes(
+            subprocess.check_output(fixture_git + ["cat-file", "blob", blob])
         )
+        target.chmod(int(mode, 8) & 0o777)
     sdk = root / "sdk"
     sdk.mkdir()
     archive = subprocess.check_output(git + ["archive", SDK])
@@ -62,7 +93,6 @@ def main():
         ["/bin/cp", "-cR", a.lean_release, root / "release"], root, {}, root, a.target
     )
     (root / "owners").mkdir(mode=0o700)
-    app = root / "app"
     project = app / "lean"
     project.mkdir()
     fixture = sdk / "fixtures/interop-shims"
