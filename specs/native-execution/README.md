@@ -32,6 +32,27 @@ receipt only upon certified closure (including certified no-spawn). `ReplyIdenti
 payload against a reply actually emitted by the live command. `ClosureIdentity` checks that accepted cleanup
 evidence belongs to the bound, closed instance after SDK capacity return.
 
+**Active recovery.** Two contenders each try to claim the durable binding while the old launcher is still live.
+Only an exact match for the request, intent, native ID, scope, generation and owner can win. A second exact
+contender gets busy. Changed intent and stale scope are refused. Winning seals unused GO authority and permits
+requesting a fence. The claim leaves an already issued GO with the old launcher. The receiver fence arbitrates
+against that GO and target start. The bounded case reaches both orders after both contenders have tried.
+It delivers the same GO twice and counts target starts inside the SDK scope separately from GO redemption and
+SDK bootstrap. Removing receiver deduplication allows two target starts despite the single SDK spawn. This
+case tests a live, responsive old authority and one durable request under two contenders and two deliveries.
+It assumes durable arbitration and a receiver that enforces the fence. Unavailable authority or evidence can
+leave execution uncertain. The model grants recovery no right to signal a PID or issue another GO.
+
+**Host actor permit.** One warm actor holds one host permit and binds one custody scope. It saves the result
+of one request and starts a second request on that generation while still charged. It returns the permit after
+sealing admission and accepting authenticated closure for its bound scope. A serialized fence and certified
+no-start can also settle the scope. Stale closure and redelivery of an accepted receipt release nothing.
+The SDK slot can return before the host permit. Return can proceed with result ACK outstanding. The positive
+case checks return progress once matching closure and sealing are both true. Broken rules allow return upon
+request completion, on stale evidence, and more than once. Production retirement must settle every scope that
+an actor could still use. This case tracks one bound scope and checks neither enumeration of multiple scopes
+nor recovery of the real host permit ledger from disk.
+
 **Trust assumption.** The adapter must obtain command responses and custody observations from the authentic
 producer, preserve their originating binding through delivery and recovery, and keep generation identities unique
 across reuse. The model represents those channels by their sets of possible producer outputs. Emitted replies remain eligible for delivery while the command awaits its reply. Arbitrary transport loss is outside
@@ -53,11 +74,11 @@ the wrong endpoint. The identity cases exercise a previous generation; the histo
 | Boundary | Host obligation and observable outcome |
 | --- | --- |
 | Submit and admit | Save the caller binding before native CREATE. Equal retry reads the original identity. Changed intent is refused. Acquire the two modeled domains in order. On refusal of the second, fence the old authority and release the acquired prefix. Domain counts represent prefixes of this fixed order. |
-| Bootstrap | Reserve custody before any process spawn. Persist one-use authorization before sending GO. Its receiver consumes once before spawn. A crash between these steps can lose a reply or leave an old GO deliverable. A recovered caller can query and request a fence, never issue a second GO on the same revision. An affirmative no-spawn rollback requires the live receiver to serialize sealing against consumption and spawn. |
+| Bootstrap | Reserve custody before any process spawn. Persist one-use authorization before sending GO. Its receiver consumes once before spawn and drops duplicate GO. A crash between these steps can lose a reply or leave an old GO deliverable. An authenticated recovery owner can query and request a fence on the original revision, with no new launch authorization. An affirmative no-spawn rollback requires the live receiver to serialize sealing against consumption and spawn. |
 | Load and run | Physical spawn starts bootstrap. Only startup ACK after authenticated identities, durable bootstrap identity, adoption of the cleanup lease and durable Running publication, followed by protected-read admission, enables command send. An outstanding send may win the race with a subsequent cancel until the receiver fence takes effect. |
 | Warm or companion | In the warm profile two serial commands span a saved first completion on the same generation. An ordinary completed call leaves the worker available for reuse until a distinct retirement. In the companion profile one request opens one capability session. Goal features must validate before sending declaration features. A valid second reply enables ranking. An invalid reply at either ordinal is the primary failure. |
 | Save and ACK | Reply validation, durable publication, caller copy and ACK are separate transitions. Caller loss can discard a validated but unpublished result. A committed result remains available for same-key reconciliation. An unknown execution disposition is a status report and cannot be copied or ACKed as a semantic result. Result bytes/digests, authenticated GET, expiry and tombstones are detailed in the store contract. The finite composition represents payloads by distinct outcome tags. |
-| Stop and recover | Cancellation, deadline and loss can request a stop. A deadline calculation supplies no closure evidence. A responsive exact owner can fence messages. Otherwise reconcile durable facts, surface uncertainty and retain disputed capacity. Before durable Running, retirement needs a durable group-closure receipt from the guardian or adopted cleanup owner plus authenticated guardian absence. For durable Running it needs authenticated group and guardian absence. A dead Preparing owner alone cannot release capacity after possible spawn. Host actor admission also requires the old spawning authority sealed and all relevant generations settled. |
+| Stop and recover | Cancellation, deadline and loss can request a stop. A deadline calculation supplies no closure evidence. A responsive exact owner can fence messages. Otherwise reconcile durable facts, surface uncertainty and retain disputed capacity. Before durable Running, retirement needs a durable group-closure receipt from the guardian or adopted cleanup owner plus authenticated guardian absence. For durable Running it needs authenticated group and guardian absence. A dead Preparing owner alone cannot release capacity after possible spawn. Return a host actor permit once the old spawning authority is sealed and all relevant generations are settled. |
 | Schedule | A conflicting writer waits for release of the old domain prefix and SDK admission. An unspent, fenced request that never reserved can roll back without a worker certificate. A disjoint request has its own ready worker, domain and spare slot. Its completion is explicitly scheduled. |
 
 **Fairness and bounds.** One original binding, two commands, one custody generation, two ordered domain acquisitions,
