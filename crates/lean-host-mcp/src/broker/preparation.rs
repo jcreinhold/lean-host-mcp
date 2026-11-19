@@ -196,7 +196,7 @@ async fn run_helper(
     mode: HelperMode,
     lease: Option<&PreparationLease<'_>>,
 ) -> Result<Option<LeanWorkerPreparedHostArtifacts>> {
-    let budget = remaining(root, deadline, cancellation)?;
+    remaining(root, deadline, cancellation)?;
     if let Some(lease) = lease {
         lease.renew(root)?;
     }
@@ -205,10 +205,18 @@ async fn run_helper(
     let worker = worker.to_path_buf();
     let sysroot = sysroot.to_path_buf();
     let writer = writer.to_path_buf();
-    let file_label = root.to_string_lossy().into_owned();
+    let helper_root = root.to_owned();
     // Keep evidence on the blocking owner, including after a dropped await.
     let operation = cancellation.begin_operation();
     let mut task = tokio::task::spawn_blocking(move || {
+        // The blocking pool can queue this closure after the async admission check.
+        let budget = match remaining(&helper_root, deadline, &cancellation) {
+            Ok(budget) => budget,
+            Err(error) => {
+                operation.not_started();
+                return Err(error);
+            }
+        };
         let result = match mode {
             HelperMode::Ready => crate::host_preparation::probe_ready(&worker, &sysroot, &writer, budget, &|| {
                 cancellation.is_cancelled()
@@ -232,7 +240,7 @@ async fn run_helper(
                     operation.unknown();
                 }
                 let target_check = TargetCheckNotStarted {
-                    file_label,
+                    file_label: helper_root.to_string_lossy().into_owned(),
                     stage: mode.stage().into(),
                     disposition: "not_started".into(),
                 };

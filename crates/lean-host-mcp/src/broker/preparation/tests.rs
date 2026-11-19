@@ -347,3 +347,77 @@ async fn metadata_failure_before_any_helper_remains_provably_unstarted() {
     assert_eq!(evidence.pending, 0);
     assert_eq!(evidence.returned, 0);
 }
+
+#[test]
+fn readiness_queued_past_admission_deadline_never_starts_helper() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("ready"), "already prepared").unwrap();
+        for cancel in [false, true] {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let (entered, occupied) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            occupied.await.unwrap();
+            let request = tokio_util::sync::CancellationToken::new();
+            let (result, evidence) = crate::cancellation::with_cancellation_evidence(&request, async {
+                use std::future::{Future as _, poll_fn};
+                use std::task::Poll;
+
+                let cancellation = CallCancellation::current();
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+                let probe = run_helper(
+                    &fixture.root,
+                    &fixture.worker,
+                    &fixture.sysroot,
+                    &fixture.writer,
+                    deadline,
+                    &cancellation,
+                    HelperMode::Ready,
+                    None,
+                );
+                tokio::pin!(probe);
+                // With no drain lease, the only pending await in run_helper is the
+                // already-submitted blocking task. An entry-time refusal is Ready.
+                poll_fn(|cx| {
+                    assert!(
+                        probe.as_mut().poll(cx).is_pending(),
+                        "probe did not reach the blocking queue"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                tokio::time::sleep_until(deadline).await;
+                if cancel {
+                    cancellation.cancel();
+                }
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                probe.await
+            })
+            .await;
+            let expected = if cancel {
+                "request_cancelled"
+            } else {
+                "project_admission_timeout"
+            };
+            assert!(matches!(result, Err(ServerError::WorkerUnavailable(info)) if info.reason == expected));
+            assert_eq!(evidence.not_started, 1);
+            assert_eq!(evidence.pending, 0);
+            assert_eq!(evidence.returned, 0);
+            assert_eq!(evidence.stopped, 0);
+            assert!(!evidence.uncertain);
+            assert!(
+                !fixture.root.join("events").exists(),
+                "no readiness command reached the fixture"
+            );
+        }
+    });
+}
