@@ -26,9 +26,10 @@ to this directory. Use a trusted build environment and one Cargo job. Keep the
 private release, toolchain, shim trees, input files and helper stable while
 reviewing and running. The following are separate producer and consumer steps.
 
-1. Build the normal parent helper first with the reviewed stock Lean release.
+1. Select the previously reviewed matched parent helper if available. For a
+   fresh build, use the reviewed stock Lean release and the following steps.
    The helper source is host commit `bba2ec8cd886107840741b427595c17e9ccc8141`
-   (guarded startup and loader policy). The private candidate retains it under
+   (guarded startup and loader policy). The canonical local host repository retains it under
    `refs/heads/fixtures/mac-plugin-guarded-helper-v1`. The source repository
    supplied below must advertise that commit or a descendant. Keep the selected
    scratch manifest outside the checkout until its clean revision is verified.
@@ -45,12 +46,13 @@ reviewing and running. The following are separate producer and consumer steps.
    Provisioning stages those verified bytes privately. Regression takes its
    helper from that same deployment and checks the same approved digest.
    The SDK owns the ten application files at `fixtures/metadata-qualification/app`.
-   Supply its Git repository and full reviewed fixture commit separately from
-   the 7fe48a56 runtime checkout. The adapter verifies the subtree identity,
+   Supply the SDK repository containing commit
+   `a091e4a9427040c5741c8f84f9508fa8b7aed665` separately from the 7fe48a56
+   runtime checkout. The adapter verifies the subtree identity,
    exports its original file bytes and requires the plugin-capable host shim.
 
    ```sh
-   python3 -B "$TEST/provision.py" --sdk "$SDK" --fixture-repo "$FIXTURE_SDK_REPO" --fixture-commit "$FIXTURE_SDK_COMMIT" --writer "$TARGET/debug/lean-host-mcp" --writer-sha256 "$REVIEWED_HELPER" --lean-release "$STOCK_RELEASE" --scratch "$DEPLOYMENT" --target "$TARGET"
+   python3 -B "$TEST/provision.py" --sdk "$SDK" --fixture-repo "$FIXTURE_SDK_REPO" --writer "$TARGET/debug/lean-host-mcp" --writer-sha256 "$REVIEWED_HELPER" --lean-release "$STOCK_RELEASE" --scratch "$DEPLOYMENT" --target "$TARGET"
    ```
 
 3. Build the two checked-in module sources in separate directories. The

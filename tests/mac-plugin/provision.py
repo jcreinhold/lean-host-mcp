@@ -5,7 +5,6 @@ import importlib.util
 import io
 import json
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -14,21 +13,15 @@ from pathlib import Path
 
 from run import SDK, bounded_run, verified
 
+FIXTURE_COMMIT = "a091e4a9427040c5741c8f84f9508fa8b7aed665"
 FIXTURE_PATH = "fixtures/metadata-qualification/app"
 FIXTURE_TREE = "ee1bf0cecda10560c7b58b33ea679188f87fea9c"
 
 
-def fixture_tree(repo, revision):
-    if not re.fullmatch("[0-9a-f]{40}", revision):
-        raise ValueError("expected a full reviewed SDK fixture commit")
+def fixture_tree(repo):
     git = ["git", "-C", str(repo)]
-    if (
-        subprocess.check_output(git + ["cat-file", "-t", revision], text=True).strip()
-        != "commit"
-    ):
-        raise ValueError("expected SDK fixture commit")
     tree = subprocess.check_output(
-        git + ["rev-parse", "--verify", f"{revision}:{FIXTURE_PATH}"], text=True
+        git + ["rev-parse", "--verify", f"{FIXTURE_COMMIT}:{FIXTURE_PATH}"], text=True
     ).strip()
     if tree != FIXTURE_TREE:
         raise ValueError("SDK fixture subtree differs from the reviewed application")
@@ -39,7 +32,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ("sdk", "fixture-repo", "writer", "lean-release", "scratch", "target"):
         parser.add_argument("--" + key, required=True, type=lambda p: Path(p).resolve())
-    parser.add_argument("--fixture-commit", required=True)
     parser.add_argument("--writer-sha256", required=True)
     a = parser.parse_args()
     if (sys.platform, platform.machine()) != ("darwin", "arm64"):
@@ -54,7 +46,7 @@ def main():
     )
     supplier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(supplier)
-    fixture_git = fixture_tree(a.fixture_repo, a.fixture_commit)
+    fixture_git = fixture_tree(a.fixture_repo)
     writer_bytes = verified(a.writer, a.writer_sha256)
     for name, digest in {
         "bin/lean": "a4c5d3dfc1672faf014e59bd17724035259ff0d22a4ffbdf5a75e142f564817e",
