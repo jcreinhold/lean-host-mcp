@@ -22,9 +22,7 @@
         "ClosedMeansStopped",
         "NoFalseSuccess"
       ],
-      "properties": [
-        "EventuallyClosed"
-      ]
+      "properties": ["EventuallyClosed"]
     },
     "LifecycleScenarios": {
       "specification": "ScenarioSpec",
@@ -50,9 +48,7 @@
         "ClosedMeansStopped",
         "NoFalseSuccess"
       ],
-      "properties": [
-        "FirstScopeClosed"
-      ]
+      "properties": ["FirstScopeClosed"]
     },
     "Stages": {
       "specification": "HostSpec",
@@ -156,205 +152,1982 @@
     }
   },
   "cases": [
-    {"name": "host-recovery-race", "model": "Stages", "expect": "pass", "constants": {"Fault": "\"recovery\""}, "properties": ["Spec"], "invariants": ["TypeOK", "SafeCommands", "SafeStore", "ImmutableBinding", "BoundToSdk", "ReplyIdentity", "ClosureIdentity", "SafeSuccessor", "AdoptionPrecedesRunning", "RunningPrecedesAck", "NoEarlyCapacityReturn", "CapacityReturnsOnce", "WriterExclusion", "UniqueRecoveryOwner", "ExactRecoveryBinding", "AtMostOneTarget", "FencedTargetCount", "NoFalseNoStart"]},
-    {"name": "host-recovery-fence-first", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\""}, "properties": [], "invariants": ["NoFenceFirst"], "invariant": "NoFenceFirst", "witness": true},
-    {"name": "host-recovery-target-first", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\""}, "properties": [], "invariants": ["NoTargetFirst"], "invariant": "NoTargetFirst", "witness": true},
-    {"name": "host-recovery-refused-proposals", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\""}, "properties": [], "invariants": ["NoRejectedRecovery"], "invariant": "NoRejectedRecovery", "witness": true},
-    {"name": "host-recovery-duplicate-go", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\""}, "properties": [], "invariants": ["NoSafeDuplicateGo"], "invariant": "NoSafeDuplicateGo", "witness": true},
-    {"name": "host-recovery-unused-go-sealed", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\""}, "properties": [], "invariants": ["NoUnusedGoSealed"], "invariant": "NoUnusedGoSealed", "witness": true},
-    {"name": "host-recovery-two-winners", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\"", "Mutation": "\"two-recovery-owners\""}, "properties": [], "invariants": ["UniqueRecoveryOwner"], "invariant": "UniqueRecoveryOwner"},
-    {"name": "host-recovery-wrong-binding", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\"", "Mutation": "\"accept-wrong-recovery\""}, "properties": [], "invariants": ["ExactRecoveryBinding"], "invariant": "ExactRecoveryBinding"},
-    {"name": "host-recovery-repeat-target", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"recovery\"", "Mutation": "\"repeat-go\""}, "properties": [], "invariants": ["AtMostOneTarget"], "invariant": "AtMostOneTarget"},
+    {
+      "name": "host-recovery-race",
+      "model": "Stages",
+      "expect": "pass",
+      "constants": { "Fault": "\"recovery\"" },
+      "properties": ["Spec"],
+      "invariants": [
+        "TypeOK",
+        "SafeCommands",
+        "SafeStore",
+        "ImmutableBinding",
+        "BoundToSdk",
+        "ReplyIdentity",
+        "ClosureIdentity",
+        "SafeSuccessor",
+        "AdoptionPrecedesRunning",
+        "RunningPrecedesAck",
+        "NoEarlyCapacityReturn",
+        "CapacityReturnsOnce",
+        "WriterExclusion",
+        "UniqueRecoveryOwner",
+        "ExactRecoveryBinding",
+        "AtMostOneTarget",
+        "FencedTargetCount",
+        "NoFalseNoStart"
+      ]
+    },
+    {
+      "name": "host-recovery-fence-first",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"recovery\"" },
+      "properties": [],
+      "invariants": ["NoFenceFirst"],
+      "invariant": "NoFenceFirst",
+      "witness": true
+    },
+    {
+      "name": "host-recovery-target-first",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"recovery\"" },
+      "properties": [],
+      "invariants": ["NoTargetFirst"],
+      "invariant": "NoTargetFirst",
+      "witness": true
+    },
+    {
+      "name": "host-recovery-refused-proposals",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"recovery\"" },
+      "properties": [],
+      "invariants": ["NoRejectedRecovery"],
+      "invariant": "NoRejectedRecovery",
+      "witness": true
+    },
+    {
+      "name": "host-recovery-duplicate-go",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"recovery\"" },
+      "properties": [],
+      "invariants": ["NoSafeDuplicateGo"],
+      "invariant": "NoSafeDuplicateGo",
+      "witness": true
+    },
+    {
+      "name": "host-recovery-unused-go-sealed",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"recovery\"" },
+      "properties": [],
+      "invariants": ["NoUnusedGoSealed"],
+      "invariant": "NoUnusedGoSealed",
+      "witness": true
+    },
+    {
+      "name": "host-recovery-two-winners",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": {
+        "Fault": "\"recovery\"",
+        "Mutation": "\"two-recovery-owners\""
+      },
+      "properties": [],
+      "invariants": ["UniqueRecoveryOwner"],
+      "invariant": "UniqueRecoveryOwner"
+    },
+    {
+      "name": "host-recovery-wrong-binding",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": {
+        "Fault": "\"recovery\"",
+        "Mutation": "\"accept-wrong-recovery\""
+      },
+      "properties": [],
+      "invariants": ["ExactRecoveryBinding"],
+      "invariant": "ExactRecoveryBinding"
+    },
+    {
+      "name": "host-recovery-repeat-target",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"recovery\"", "Mutation": "\"repeat-go\"" },
+      "properties": [],
+      "invariants": ["AtMostOneTarget"],
+      "invariant": "AtMostOneTarget"
+    },
 
-    {"name": "host-actor-permit", "model": "Stages", "expect": "pass", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\""}, "properties": ["Spec", "HostPermitProgress", "SuccessorProgress", "OtherProgress"], "invariants": ["TypeOK", "SafeCommands", "SafeStore", "ImmutableBinding", "BoundToSdk", "ReplyIdentity", "ClosureIdentity", "SafeSuccessor", "AdoptionPrecedesRunning", "RunningPrecedesAck", "NoEarlyCapacityReturn", "CapacityReturnsOnce", "WriterExclusion", "HostPermitSafe", "HostPermitReturnsOnce"]},
-    {"name": "host-actor-warm-reuse", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\""}, "properties": [], "invariants": ["NoChargedWarmReuse"], "invariant": "NoChargedWarmReuse", "witness": true},
-    {"name": "host-actor-stale-receipt", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\""}, "properties": [], "invariants": ["NoStaleWithOpenScope"], "invariant": "NoStaleWithOpenScope", "witness": true},
-    {"name": "host-actor-sdk-slot-only", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\""}, "properties": [], "invariants": ["NoSdkReturnBeforeHost"], "invariant": "NoSdkReturnBeforeHost", "witness": true},
-    {"name": "host-actor-return-without-ack", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\""}, "properties": [], "invariants": ["NoHostReturnWithoutAck"], "invariant": "NoHostReturnWithoutAck", "witness": true},
-    {"name": "host-actor-certified-no-start", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\""}, "properties": [], "invariants": ["NoHostReturnAfterNoStart"], "invariant": "NoHostReturnAfterNoStart", "witness": true},
-    {"name": "host-actor-return-on-request", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\"", "Mutation": "\"return-on-request\""}, "properties": [], "invariants": ["HostPermitSafe"], "invariant": "HostPermitSafe"},
-    {"name": "host-actor-return-on-stale", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\"", "Mutation": "\"return-stale\""}, "properties": [], "invariants": ["HostPermitSafe"], "invariant": "HostPermitSafe"},
-    {"name": "host-actor-return-twice", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"host-permit\"", "Profile": "\"warm\"", "Mutation": "\"return-host-twice\""}, "properties": [], "invariants": ["HostPermitReturnsOnce"], "invariant": "HostPermitReturnsOnce"},
+    {
+      "name": "host-actor-permit",
+      "model": "Stages",
+      "expect": "pass",
+      "constants": { "Fault": "\"host-permit\"", "Profile": "\"warm\"" },
+      "properties": [
+        "Spec",
+        "HostPermitProgress",
+        "SuccessorProgress",
+        "OtherProgress"
+      ],
+      "invariants": [
+        "TypeOK",
+        "SafeCommands",
+        "SafeStore",
+        "ImmutableBinding",
+        "BoundToSdk",
+        "ReplyIdentity",
+        "ClosureIdentity",
+        "SafeSuccessor",
+        "AdoptionPrecedesRunning",
+        "RunningPrecedesAck",
+        "NoEarlyCapacityReturn",
+        "CapacityReturnsOnce",
+        "WriterExclusion",
+        "HostPermitSafe",
+        "HostPermitReturnsOnce"
+      ]
+    },
+    {
+      "name": "host-actor-warm-reuse",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"host-permit\"", "Profile": "\"warm\"" },
+      "properties": [],
+      "invariants": ["NoChargedWarmReuse"],
+      "invariant": "NoChargedWarmReuse",
+      "witness": true
+    },
+    {
+      "name": "host-actor-stale-receipt",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"host-permit\"", "Profile": "\"warm\"" },
+      "properties": [],
+      "invariants": ["NoStaleWithOpenScope"],
+      "invariant": "NoStaleWithOpenScope",
+      "witness": true
+    },
+    {
+      "name": "host-actor-sdk-slot-only",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"host-permit\"", "Profile": "\"warm\"" },
+      "properties": [],
+      "invariants": ["NoSdkReturnBeforeHost"],
+      "invariant": "NoSdkReturnBeforeHost",
+      "witness": true
+    },
+    {
+      "name": "host-actor-return-without-ack",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"host-permit\"", "Profile": "\"warm\"" },
+      "properties": [],
+      "invariants": ["NoHostReturnWithoutAck"],
+      "invariant": "NoHostReturnWithoutAck",
+      "witness": true
+    },
+    {
+      "name": "host-actor-certified-no-start",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"host-permit\"", "Profile": "\"warm\"" },
+      "properties": [],
+      "invariants": ["NoHostReturnAfterNoStart"],
+      "invariant": "NoHostReturnAfterNoStart",
+      "witness": true
+    },
+    {
+      "name": "host-actor-return-on-request",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": {
+        "Fault": "\"host-permit\"",
+        "Profile": "\"warm\"",
+        "Mutation": "\"return-on-request\""
+      },
+      "properties": [],
+      "invariants": ["HostPermitSafe"],
+      "invariant": "HostPermitSafe"
+    },
+    {
+      "name": "host-actor-return-on-stale",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": {
+        "Fault": "\"host-permit\"",
+        "Profile": "\"warm\"",
+        "Mutation": "\"return-stale\""
+      },
+      "properties": [],
+      "invariants": ["HostPermitSafe"],
+      "invariant": "HostPermitSafe"
+    },
+    {
+      "name": "host-actor-return-twice",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": {
+        "Fault": "\"host-permit\"",
+        "Profile": "\"warm\"",
+        "Mutation": "\"return-host-twice\""
+      },
+      "properties": [],
+      "invariants": ["HostPermitReturnsOnce"],
+      "invariant": "HostPermitReturnsOnce"
+    },
 
-    {"name": "host-identity", "model": "Stages", "expect": "pass", "constants": {"Fault": "\"identity\""}, "properties": ["Spec", "CompanionCompleted", "SuccessorProgress", "OtherProgress"]},
-    {"name": "host-ignore-generation", "model": "Stages", "expect": "invariant", "invariant": "SafeCommands", "properties": [], "invariants": ["SafeCommands"], "constants": {"Fault": "\"identity\"", "Mutation": "\"ignore-generation\""}},
-    {"name": "host-accept-stale-reply", "model": "Stages", "expect": "invariant", "invariant": "ReplyIdentity", "properties": [], "invariants": ["ReplyIdentity"], "constants": {"Fault": "\"identity\"", "Mutation": "\"accept-stale-reply\""}},
-    {"name": "host-accept-stale-closure", "model": "Stages", "expect": "invariant", "invariant": "ClosureIdentity", "properties": [], "invariants": ["ClosureIdentity"], "constants": {"Fault": "\"identity\"", "Mutation": "\"accept-stale-closure\""}},
+    {
+      "name": "host-identity",
+      "model": "Stages",
+      "expect": "pass",
+      "constants": { "Fault": "\"identity\"" },
+      "properties": [
+        "Spec",
+        "CompanionCompleted",
+        "SuccessorProgress",
+        "OtherProgress"
+      ]
+    },
+    {
+      "name": "host-ignore-generation",
+      "model": "Stages",
+      "expect": "invariant",
+      "invariant": "SafeCommands",
+      "properties": [],
+      "invariants": ["SafeCommands"],
+      "constants": {
+        "Fault": "\"identity\"",
+        "Mutation": "\"ignore-generation\""
+      }
+    },
+    {
+      "name": "host-accept-stale-reply",
+      "model": "Stages",
+      "expect": "invariant",
+      "invariant": "ReplyIdentity",
+      "properties": [],
+      "invariants": ["ReplyIdentity"],
+      "constants": {
+        "Fault": "\"identity\"",
+        "Mutation": "\"accept-stale-reply\""
+      }
+    },
+    {
+      "name": "host-accept-stale-closure",
+      "model": "Stages",
+      "expect": "invariant",
+      "invariant": "ClosureIdentity",
+      "properties": [],
+      "invariants": ["ClosureIdentity"],
+      "constants": {
+        "Fault": "\"identity\"",
+        "Mutation": "\"accept-stale-closure\""
+      }
+    },
 
-    {"name": "host-late-command", "model": "Stages", "expect": "pass", "constants": {"Fault": "\"late\""}},
-    {"name": "host-wrong-command", "model": "Stages", "expect": "invariant", "invariant": "SafeCommands", "properties": [], "invariants": ["SafeCommands"], "constants": {"Fault": "\"late\"", "Mutation": "\"current-endpoint\""}},
-    {"name": "host-partial-rollback", "model": "Stages", "constants": {"Fault": "\"explore\""}, "invariants": ["NoPartialRollback"], "properties": [], "expect": "invariant", "invariant": "NoPartialRollback", "witness": true},
-    {"name": "host-retry", "model": "Stages", "constants": {"Fault": "\"retry\""}, "expect": "pass"},
-    {"name": "host-rebind", "model": "Stages", "constants": {"Fault": "\"retry\"", "Mutation": "\"rebind\""}, "expect": "invariant", "invariants": ["ImmutableBinding"], "properties": [], "invariant": "ImmutableBinding"},
-    {"name": "host-early-ack", "model": "Stages", "constants": {"Fault": "\"healthy\"", "Mutation": "\"early-ack\""}, "expect": "invariant", "invariants": ["SafeStore"], "properties": [], "invariant": "SafeStore"},
-    {"name": "host-lost-validated", "model": "Stages", "constants": {"Fault": "\"explore\""}, "expect": "invariant", "invariants": ["NoLostValidatedResult"], "properties": [], "invariant": "NoLostValidatedResult", "witness": true},
-    {"name": "host-invalid-and-cleanup", "model": "Stages", "constants": {"Fault": "\"explore\""}, "expect": "invariant", "invariants": ["NoInvalidSecondWithCleanupError"], "properties": [], "invariant": "NoInvalidSecondWithCleanupError", "witness": true},
+    {
+      "name": "host-late-command",
+      "model": "Stages",
+      "expect": "pass",
+      "constants": { "Fault": "\"late\"" }
+    },
+    {
+      "name": "host-wrong-command",
+      "model": "Stages",
+      "expect": "invariant",
+      "invariant": "SafeCommands",
+      "properties": [],
+      "invariants": ["SafeCommands"],
+      "constants": { "Fault": "\"late\"", "Mutation": "\"current-endpoint\"" }
+    },
+    {
+      "name": "host-partial-rollback",
+      "model": "Stages",
+      "constants": { "Fault": "\"explore\"" },
+      "invariants": ["NoPartialRollback"],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "NoPartialRollback",
+      "witness": true
+    },
+    {
+      "name": "host-retry",
+      "model": "Stages",
+      "constants": { "Fault": "\"retry\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "host-rebind",
+      "model": "Stages",
+      "constants": { "Fault": "\"retry\"", "Mutation": "\"rebind\"" },
+      "expect": "invariant",
+      "invariants": ["ImmutableBinding"],
+      "properties": [],
+      "invariant": "ImmutableBinding"
+    },
+    {
+      "name": "host-early-ack",
+      "model": "Stages",
+      "constants": { "Fault": "\"healthy\"", "Mutation": "\"early-ack\"" },
+      "expect": "invariant",
+      "invariants": ["SafeStore"],
+      "properties": [],
+      "invariant": "SafeStore"
+    },
+    {
+      "name": "host-lost-validated",
+      "model": "Stages",
+      "constants": { "Fault": "\"explore\"" },
+      "expect": "invariant",
+      "invariants": ["NoLostValidatedResult"],
+      "properties": [],
+      "invariant": "NoLostValidatedResult",
+      "witness": true
+    },
+    {
+      "name": "host-invalid-and-cleanup",
+      "model": "Stages",
+      "constants": { "Fault": "\"explore\"" },
+      "expect": "invariant",
+      "invariants": ["NoInvalidSecondWithCleanupError"],
+      "properties": [],
+      "invariant": "NoInvalidSecondWithCleanupError",
+      "witness": true
+    },
 
-    {"name": "host-warm", "model": "Stages", "expect": "pass", "constants": {"Profile": "\"warm\""}},
-    {"name": "host-healthy", "model": "Stages", "expect": "pass"},
-    {"name": "host-faults", "timeout_seconds": 180, "model": "Stages", "expect": "pass", "constants": {"Fault": "\"explore\""}, "properties": ["Spec", "SuccessorProgress", "OtherProgress", "RecoverProgress", "CleanupProgress"]},
-    {"name": "host-early", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"explore\"", "Mutation": "\"early-command\""}, "invariants": ["SafeCommands"], "properties": [], "invariant": "SafeCommands"},
-    {"name": "host-overwrite", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"explore\"", "Mutation": "\"overwrite-primary\""}, "invariants": ["SafeStore"], "properties": [], "invariant": "SafeStore"},
-    {"name": "host-result-pending", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"explore\"", "Mutation": "\"none\""}, "invariants": ["NoResultPendingCleanup"], "properties": [], "invariant": "NoResultPendingCleanup", "witness": true},
-    {"name": "host-cancel-between", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"explore\"", "Mutation": "\"none\""}, "invariants": ["NoBetweenCommandsCancel"], "properties": [], "invariant": "NoBetweenCommandsCancel", "witness": true},
-    {"name": "host-unknown-disjoint", "model": "Stages", "expect": "invariant", "constants": {"Fault": "\"explore\"", "Mutation": "\"none\""}, "invariants": ["NoDisjointWhileUnknown"], "properties": [], "invariant": "NoDisjointWhileUnknown", "witness": true},
+    {
+      "name": "host-warm",
+      "model": "Stages",
+      "expect": "pass",
+      "constants": { "Profile": "\"warm\"" }
+    },
+    { "name": "host-healthy", "model": "Stages", "expect": "pass" },
+    {
+      "name": "host-faults",
+      "timeout_seconds": 180,
+      "model": "Stages",
+      "expect": "pass",
+      "constants": { "Fault": "\"explore\"" },
+      "properties": [
+        "Spec",
+        "SuccessorProgress",
+        "OtherProgress",
+        "RecoverProgress",
+        "CleanupProgress"
+      ]
+    },
+    {
+      "name": "host-early",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"explore\"", "Mutation": "\"early-command\"" },
+      "invariants": ["SafeCommands"],
+      "properties": [],
+      "invariant": "SafeCommands"
+    },
+    {
+      "name": "host-overwrite",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": {
+        "Fault": "\"explore\"",
+        "Mutation": "\"overwrite-primary\""
+      },
+      "invariants": ["SafeStore"],
+      "properties": [],
+      "invariant": "SafeStore"
+    },
+    {
+      "name": "host-result-pending",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"explore\"", "Mutation": "\"none\"" },
+      "invariants": ["NoResultPendingCleanup"],
+      "properties": [],
+      "invariant": "NoResultPendingCleanup",
+      "witness": true
+    },
+    {
+      "name": "host-cancel-between",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"explore\"", "Mutation": "\"none\"" },
+      "invariants": ["NoBetweenCommandsCancel"],
+      "properties": [],
+      "invariant": "NoBetweenCommandsCancel",
+      "witness": true
+    },
+    {
+      "name": "host-unknown-disjoint",
+      "model": "Stages",
+      "expect": "invariant",
+      "constants": { "Fault": "\"explore\"", "Mutation": "\"none\"" },
+      "invariants": ["NoDisjointWhileUnknown"],
+      "properties": [],
+      "invariant": "NoDisjointWhileUnknown",
+      "witness": true
+    },
 
-    {"name": "dual-one-fault","model": "Lifecycle","expect": "pass"},
-    {"name": "dual-disjoint","model": "Lifecycle","constants": {"SameDomain": "FALSE"},"expect": "pass"},
-    {"name": "dual-readers","model": "Lifecycle","constants": {"ReadRead": "TRUE"},"expect": "pass"},
-    {"name": "dual-two-fault-unsafe","model": "Lifecycle","constants": {"MaxFaults": "2"},"expect": "invariant","invariant": "NoConflictingPayloadAccess"},
-    {"name": "dual-two-fault-containment-assumed","model": "Lifecycle","constants": {"MaxFaults": "2","ExternalContainment": "TRUE"},"expect": "pass"},
-    {"name": "direct-unsafe","model": "Lifecycle","constants": {"DualOwner": "FALSE"},"expect": "invariant","invariant": "NoConflictingPayloadAccess"},
-    {"name": "direct-containment-assumed","model": "Lifecycle","constants": {"DualOwner": "FALSE","ExternalContainment": "TRUE"},"expect": "pass"},
-    {"name": "guardian-cannot-stop","model": "Lifecycle","constants": {"GuardianCanStop": "FALSE"},"expect": "liveness"},
-    {"name": "direct-unsafe-liveness","model": "Lifecycle","constants": {"DualOwner": "FALSE"},"invariants": ["TypeOK","AtMostOneLaunch","ClosedMeansStopped","NoFalseSuccess"],"expect": "liveness","purpose": "Check eventual closure independently; conflicting-access invariant intentionally omitted here, not claimed to pass"},
-    {"name": "frozen-sup-no-authority","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-sup\""},"expect": "liveness"},
-    {"name": "frozen-sup-original-parent-assumed","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","ServiceCanStopFrozenOwner": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-sup\""},"expect": "pass"},
-    {"name": "dead-service-frozen-sup-original-parent-lost","model": "LifecycleScenarios","constants": {"MaxFaults": "2","AllowFreeze": "TRUE","ServiceCanStopFrozenOwner": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"dead-service-frozen-sup\""},"expect": "liveness"},
-    {"name": "dead-service-frozen-sup-external-authority-assumed","model": "LifecycleScenarios","constants": {"MaxFaults": "2","AllowFreeze": "TRUE","ExternalCanStopFrozenOwner": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"dead-service-frozen-sup\""},"expect": "pass"},
-    {"name": "frozen-service-responsive-owners","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-service\""},"expect": "pass"},
-    {"name": "frozen-guardian-no-authority","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-guardian\""},"expect": "liveness"},
-    {"name": "frozen-guardian-service-stops-supervisor-only","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","ServiceCanStopFrozenOwner": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-guardian\""},"expect": "liveness"},
-    {"name": "frozen-guardian-external-authority-assumed","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","ExternalCanStopFrozenOwner": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-guardian\""},"expect": "pass"},
-    {"name": "frozen-service-and-sup","model": "LifecycleScenarios","constants": {"MaxFaults": "2","AllowFreeze": "TRUE","ServiceCanStopFrozenOwner": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-service-and-sup\""},"expect": "liveness"},
-    {"name": "service-restart-responsive-owner","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"dead-service\""},"expect": "pass"},
-    {"name": "service-restart-frozen-owner","model": "LifecycleScenarios","constants": {"MaxFaults": "2","AllowFreeze": "TRUE","ServiceCanStopFrozenOwner": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"dead-service-frozen-sup\""},"expect": "liveness"},
-    {"name": "sup-gone-frozen-guardian","model": "LifecycleScenarios","constants": {"MaxFaults": "2","AllowFreeze": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"sup-gone-frozen-guardian\""},"expect": "liveness"},
-    {"name": "frozen-service-all-jobs","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","FreezeService": "TRUE","FreezeGuardian": "TRUE","Scenario": "\"frozen-service\""},"properties": ["EventuallyClosed"],"expect": "liveness"},
-    {"name": "mutant-free-lock","model": "LifecycleScenarios","constants": {"MaxFaults": "2","Mutation": "\"free-lock\""},"invariants": ["ClosedMeansStopped","TypeOK","NoConflictingPayloadAccess","AtMostOneLaunch","NoFalseSuccess"],"properties": [],"expect": "invariant","invariant": "ClosedMeansStopped"},
-    {"name": "mutant-leader-release","model": "LifecycleScenarios","constants": {"Mutation": "\"leader-release\""},"invariants": ["ClosedMeansStopped","TypeOK","NoConflictingPayloadAccess","AtMostOneLaunch","NoFalseSuccess"],"properties": [],"expect": "invariant","invariant": "ClosedMeansStopped"},
-    {"name": "mutant-replay","model": "LifecycleScenarios","constants": {"Mutation": "\"replay\""},"invariants": ["AtMostOneLaunch","TypeOK","NoConflictingPayloadAccess","ClosedMeansStopped","NoFalseSuccess"],"properties": [],"expect": "invariant","invariant": "AtMostOneLaunch"},
-    {"name": "witness-disjoint-concurrency","model": "LifecycleScenarios","constants": {"SameDomain": "FALSE"},"invariants": ["NoConcurrentPayload","TypeOK","NoConflictingPayloadAccess","AtMostOneLaunch","ClosedMeansStopped","NoFalseSuccess"],"properties": [],"expect": "invariant","invariant": "NoConcurrentPayload","witness": true},
-    {"name": "witness-reader-concurrency","model": "LifecycleScenarios","constants": {"ReadRead": "TRUE"},"invariants": ["NoConcurrentPayload","TypeOK","NoConflictingPayloadAccess","AtMostOneLaunch","ClosedMeansStopped","NoFalseSuccess"],"properties": [],"expect": "invariant","invariant": "NoConcurrentPayload","witness": true},
-    {"name": "witness-frozen-alias-after-payload","model": "LifecycleScenarios","constants": {"AllowFreeze": "TRUE","Scenario": "\"frozen-sup\""},"invariants": ["NoFrozenSupervisorAliasAfterPayload","TypeOK","NoConflictingPayloadAccess","AtMostOneLaunch","ClosedMeansStopped","NoFalseSuccess"],"properties": [],"expect": "invariant","invariant": "NoFrozenSupervisorAliasAfterPayload","witness": true},
-    {"name": "stage-smoke","model": "HistoricalStages","expect": "pass"},
-    {"name": "stage-one-extra","model": "HistoricalStages","constants": {"MaxRedeliveries": "1"},"expect": "pass"},
-    {"name": "stage-one-extra-controls","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Controls": "TRUE"},"expect": "pass"},
-    {"name": "stage-two-extra","model": "HistoricalStages","constants": {"MaxRedeliveries": "2"},"expect": "pass","extended": true},
-    {"name": "stage-two-extra-controls","model": "HistoricalStages","constants": {"MaxRedeliveries": "2","Controls": "TRUE"},"expect": "pass","extended": true},
-    {"name": "cut-Bound","model": "HistoricalStages","constants": {"Scenario": "\"Bound\""},"expect": "pass"},
-    {"name": "cut-CrashBeforeSend","model": "HistoricalStages","constants": {"Scenario": "\"CrashBeforeSend\""},"expect": "pass"},
-    {"name": "cut-CrashAfterSend","model": "HistoricalStages","constants": {"Scenario": "\"CrashAfterSend\""},"expect": "pass"},
-    {"name": "cut-CrashAfterConsume","model": "HistoricalStages","constants": {"Scenario": "\"CrashAfterConsume\""},"expect": "pass"},
-    {"name": "cut-WrongGoIntent","model": "HistoricalStages","constants": {"Scenario": "\"WrongGoIntent\""},"expect": "pass"},
-    {"name": "bad-ForgetGate","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"ForgetGate\""},"invariants": ["OneConsumedGatePerSpawnAttempt"],"expect": "invariant","invariant": "OneConsumedGatePerSpawnAttempt"},
-    {"name": "bad-ReopenFailedGate","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"ReopenFailedGate\""},"invariants": ["OneConsumedGatePerSpawnAttempt"],"expect": "invariant","invariant": "OneConsumedGatePerSpawnAttempt"},
-    {"name": "bad-Rebind","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"Rebind\""},"invariants": ["UniqueStageAuthorization"],"expect": "invariant","invariant": "UniqueStageAuthorization"},
-    {"name": "bad-IgnoreOwner","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"IgnoreOwner\""},"invariants": ["CorrectLaunchBinding"],"expect": "invariant","invariant": "CorrectLaunchBinding"},
-    {"name": "bad-IgnoreGeneration","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"IgnoreGeneration\""},"invariants": ["CorrectLaunchBinding"],"expect": "invariant","invariant": "CorrectLaunchBinding"},
-    {"name": "bad-CancelCurrent","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Controls": "TRUE","Mutant": "\"CancelCurrent\""},"invariants": ["OldCancelIsolated"],"expect": "invariant","invariant": "OldCancelIsolated"},
-    {"name": "bad-ResultIdle","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Controls": "TRUE","Mutant": "\"ResultIdle\""},"invariants": ["IdleMeansNoActive"],"expect": "invariant","invariant": "IdleMeansNoActive"},
-    {"name": "bad-AcceptChangedStart","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"AcceptChangedStart\""},"invariants": ["ChangedStartIntentRejected"],"expect": "invariant","invariant": "ChangedStartIntentRejected"},
-    {"name": "bad-ClosureInventsResult","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"ClosureInventsResult\""},"invariants": ["KnownResultWasPublished"],"expect": "invariant","invariant": "KnownResultWasPublished"},
-    {"name": "bad-Rebind-actual-duplicate","model": "HistoricalStages","constants": {"MaxRedeliveries": "1","Mutant": "\"Rebind\""},"invariants": ["NoActualDuplicateLaunch"],"expect": "invariant","invariant": "NoActualDuplicateLaunch","witness": true},
-    {"name": "bad-IgnoreIntent","model": "HistoricalStages","constants": {"Scenario": "\"WrongGoIntent\"","Mutant": "\"IgnoreIntent\""},"invariants": ["CorrectLaunchBinding"],"expect": "invariant","invariant": "CorrectLaunchBinding"},
-    {"name": "coverage-both-stages-run","model": "HistoricalStages","constants": {"MaxRedeliveries": "1"},"invariants": ["NoBothStagesRan"],"expect": "invariant","invariant": "NoBothStagesRan","witness": true},
-    {"name": "coverage-closed-without-result","model": "HistoricalStages","constants": {"MaxRedeliveries": "1"},"invariants": ["NoClosedStageWithoutResult"],"expect": "invariant","invariant": "NoClosedStageWithoutResult","witness": true},
-    {"name": "late-LatePending-2-2","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\""},"expect": "pass"},
-    {"name": "coverage-late-LatePending-2-2","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\""},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-4-4","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "4","LateKindB": "4"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-4-4","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "4","LateKindB": "4"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-3-3","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "3","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-3-3","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "3","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-5-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "5","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-5-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "5","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-2-4","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindB": "4"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-2-4","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindB": "4"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-2-3","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-2-3","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-2-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-2-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-4-3","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "4","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-4-3","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "4","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-4-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "4","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-4-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "4","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LatePending-3-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "3","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LatePending-3-5","model": "HistoricalStages","constants": {"Scenario": "\"LatePending\"","LateKindA": "3","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-2-2","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\""},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-2-2","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\""},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-4-4","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "4"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-4-4","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "4"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-3-3","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-3-3","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-5-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "5","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-5-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "5","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-2-4","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindB": "4"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-2-4","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindB": "4"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-2-3","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-2-3","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-2-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-2-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-4-3","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-4-3","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-4-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-4-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateRunning-3-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateRunning-3-5","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-2-2","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\""},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-2-2","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\""},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-4-4","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "4","LateKindB": "4"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-4-4","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "4","LateKindB": "4"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-3-3","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "3","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-3-3","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "3","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-5-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "5","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-5-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "5","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-2-4","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindB": "4"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-2-4","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindB": "4"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-2-3","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-2-3","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-2-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-2-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-4-3","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "4","LateKindB": "3"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-4-3","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "4","LateKindB": "3"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-4-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "4","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-4-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "4","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "late-LateReplaced-3-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "3","LateKindB": "5"},"expect": "pass"},
-    {"name": "coverage-late-LateReplaced-3-5","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "3","LateKindB": "5"},"invariants": ["NoTwoReceived"],"expect": "invariant","invariant": "NoTwoReceived","witness": true},
-    {"name": "coverage-context-2-active","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\""},"invariants": ["NoLateReceiveWhileSecondActive"],"expect": "invariant","invariant": "NoLateReceiveWhileSecondActive","witness": true},
-    {"name": "coverage-context-2-restart","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\""},"invariants": ["NoLateReceiveAfterRestart"],"expect": "invariant","invariant": "NoLateReceiveAfterRestart","witness": true},
-    {"name": "coverage-context-2-replacement","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\""},"invariants": ["NoLateReceiveAfterReplacement"],"expect": "invariant","invariant": "NoLateReceiveAfterReplacement","witness": true},
-    {"name": "coverage-context-4-active","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "4"},"invariants": ["NoLateReceiveWhileSecondActive"],"expect": "invariant","invariant": "NoLateReceiveWhileSecondActive","witness": true},
-    {"name": "coverage-context-4-restart","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "4"},"invariants": ["NoLateReceiveAfterRestart"],"expect": "invariant","invariant": "NoLateReceiveAfterRestart","witness": true},
-    {"name": "coverage-context-4-replacement","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "4"},"invariants": ["NoLateReceiveAfterReplacement"],"expect": "invariant","invariant": "NoLateReceiveAfterReplacement","witness": true},
-    {"name": "coverage-context-3-active","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "3"},"invariants": ["NoLateReceiveWhileSecondActive"],"expect": "invariant","invariant": "NoLateReceiveWhileSecondActive","witness": true},
-    {"name": "coverage-context-3-restart","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "3"},"invariants": ["NoLateReceiveAfterRestart"],"expect": "invariant","invariant": "NoLateReceiveAfterRestart","witness": true},
-    {"name": "coverage-context-3-replacement","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "3"},"invariants": ["NoLateReceiveAfterReplacement"],"expect": "invariant","invariant": "NoLateReceiveAfterReplacement","witness": true},
-    {"name": "coverage-context-5-active","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "5","LateKindB": "5"},"invariants": ["NoLateReceiveWhileSecondActive"],"expect": "invariant","invariant": "NoLateReceiveWhileSecondActive","witness": true},
-    {"name": "coverage-context-5-restart","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "5","LateKindB": "5"},"invariants": ["NoLateReceiveAfterRestart"],"expect": "invariant","invariant": "NoLateReceiveAfterRestart","witness": true},
-    {"name": "coverage-context-5-replacement","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "5","LateKindB": "5"},"invariants": ["NoLateReceiveAfterReplacement"],"expect": "invariant","invariant": "NoLateReceiveAfterReplacement","witness": true},
-    {"name": "coverage-cleanup-received","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "5","LateKindB": "5"},"invariants": ["NoCleanupReceived"],"expect": "invariant","invariant": "NoCleanupReceived","witness": true},
-    {"name": "bad-late-CancelCurrent","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","Mutant": "\"CancelCurrent\""},"invariants": ["OldCancelIsolated"],"expect": "invariant","invariant": "OldCancelIsolated"},
-    {"name": "bad-late-ResultIdle","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "3","LateKindB": "3","Mutant": "\"ResultIdle\""},"invariants": ["IdleMeansNoActive"],"expect": "invariant","invariant": "IdleMeansNoActive"},
-    {"name": "bad-late-AckCurrent","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "4","LateKindB": "4","Mutant": "\"AckCurrent\""},"invariants": ["OldAckIsolated"],"expect": "invariant","invariant": "OldAckIsolated"},
-    {"name": "bad-late-CallbackCurrent","model": "HistoricalStages","constants": {"Scenario": "\"LateRunning\"","LateKindA": "5","LateKindB": "5","Mutant": "\"CallbackCurrent\""},"invariants": ["OldCleanupIsolated"],"expect": "invariant","invariant": "OldCleanupIsolated"},
-    {"name": "bad-late-CallbackGeneration","model": "HistoricalStages","constants": {"Scenario": "\"LateReplaced\"","LateKindA": "5","LateKindB": "5","Mutant": "\"CallbackGeneration\""},"invariants": ["OldCleanupIsolated"],"expect": "invariant","invariant": "OldCleanupIsolated"},
-    {"name": "cross-unsent","model": "CrossBoundary","expect": "pass"},
-    {"name": "cross-frozen-inflight","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-inflight\""},"expect": "pass"},
-    {"name": "cross-frozen-pending-restart","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-pending-restart\""},"expect": "pass"},
-    {"name": "cross-lost-owner-payload","model": "CrossBoundary","constants": {"InitialCase": "\"lost-owner-payload\""},"expect": "pass"},
-    {"name": "cross-bug-missing-receipt","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-inflight\"","Mutation": "\"missing-receipt\""},"expect": "invariant","invariant": "MissingReceiptOrNoPayloadIsNotClosure","purpose": "Missing receipt permits replacement before closure"},
-    {"name": "cross-bug-no-payload","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-pending-restart\"","Mutation": "\"no-payload\""},"expect": "invariant","invariant": "MissingReceiptOrNoPayloadIsNotClosure","purpose": "No payload omits a still-live pending launch gate"},
-    {"name": "cross-bug-reauthorize","model": "CrossBoundary","constants": {"InitialCase": "\"lost-owner-payload\"","Mutation": "\"reauthorize\""},"expect": "invariant","invariant": "ImmutableStageCannotBeReauthorized","purpose": "Original stage identity cannot be authorized again"},
-    {"name": "cross-bug-old-generation","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-inflight\"","Mutation": "\"accept-old-generation\""},"expect": "invariant","invariant": "OldGenerationGoCannotAuthorizeReplacement","purpose": "Replacement may not consume old-generation GO"},
-    {"name": "cross-frozen-inflight-no-resume","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-inflight\"","AllowExternalResume": "FALSE"},"invariants": ["TypeOK","NoMissingOutputNewStage"],"expect": "pass","purpose": "No new-stage running witness without resuming frozen original owner"},
-    {"name": "cross-frozen-pending-no-resume","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-pending-restart\"","AllowExternalResume": "FALSE"},"invariants": ["TypeOK","NoMissingOutputNewStage"],"expect": "pass","purpose": "No new-stage running witness with a frozen pending gate"},
-    {"name": "cross-lost-owner-new-stage-witness","model": "CrossBoundary","constants": {"InitialCase": "\"lost-owner-payload\"","AllowExternalResume": "FALSE"},"invariants": ["TypeOK","NoMissingOutputNewStage"],"expect": "invariant","invariant": "NoMissingOutputNewStage","purpose": "Witness: explicit new stage can run after actual closure despite missing result","witness": true},
-    {"name": "cross-actual-duplicate-launch-witness","model": "CrossBoundary","constants": {"InitialCase": "\"lost-owner-payload\"","AllowExternalResume": "FALSE","Mutation": "\"reauthorize\""},"invariants": ["TypeOK","AtMostOneLaunchOfOriginalStage"],"expect": "invariant","invariant": "AtMostOneLaunchOfOriginalStage","purpose": "Continue past reauthorization marker to two actual launches of original stage","witness": true},
-    {"name": "cross-unit-frozen-pending-alias-witness","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-pending-stop\""},"invariants": ["TypeOK","NoFrozenPendingAliasWitness"],"expect": "invariant","invariant": "NoFrozenPendingAliasWitness","purpose": "Unit1 witness: guardian closes its alias, frozen supervisor retains gate and alias","witness": true},
-    {"name": "cross-unit-free-lock-pending","model": "CrossBoundary","constants": {"InitialCase": "\"free-lock-pending\""},"expect": "pass","purpose": "Unit2: a free lock does not seal a live pending launch gate"},
-    {"name": "cross-unit-closed-missing-witness","model": "CrossBoundary","constants": {"InitialCase": "\"closed-missing-result\""},"invariants": ["TypeOK","NoMissingOutputNewStage"],"expect": "invariant","invariant": "NoMissingOutputNewStage","purpose": "Unit3 witness: missing result does not block an explicit new stage after closure","witness": true},
-    {"name": "cross-unit-no-closure-observation","model": "CrossBoundary","constants": {"InitialCase": "\"closed-no-observation\"","ClosureObservationAvailable": "FALSE"},"invariants": ["TypeOK","NoReplacement"],"expect": "pass","purpose": "Unit4: physically closed alone does not invent an unavailable closure observation"},
-    {"name": "cross-unit-late-original-go-witness","model": "CrossBoundary","constants": {"InitialCase": "\"restart-inflight\""},"invariants": ["TypeOK","NoOldStageLaunch"],"expect": "invariant","invariant": "NoOldStageLaunch","purpose": "Unit5 witness: already-sent GO can launch at old owner after service restart","witness": true},
-    {"name": "cross-unit-old-go-rejected-witness","model": "CrossBoundary","constants": {"InitialCase": "\"replacement-old-go\""},"invariants": ["TypeOK","NoRejectedOldGoWitness"],"expect": "invariant","invariant": "NoRejectedOldGoWitness","purpose": "Unit6 witness: replacement rejects old GO without assigning new stage","witness": true},
-    {"name": "cross-unit-frozen-service-loss","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-pending-service-lost\"","AllowExternalResume": "FALSE"},"invariants": ["TypeOK","NoReplacement"],"expect": "pass","purpose": "Unit7: restart cannot automatically resume the frozen old owner"},
-    {"name": "cross-child-stop-original-witness","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-pending-original-service\"","ActualChildStop": "TRUE","AllowExternalResume": "FALSE"},"invariants": ["TypeOK","NoMissingOutputNewStage"],"expect": "invariant","invariant": "NoMissingOutputNewStage","purpose": "Conditional witness: responsive original service has assumed actual-Child stop","witness": true},
-    {"name": "cross-child-stop-not-restored","model": "CrossBoundary","constants": {"InitialCase": "\"frozen-pending-restart\"","ActualChildStop": "TRUE","AllowExternalResume": "FALSE"},"invariants": ["TypeOK","NoReplacement"],"expect": "pass","purpose": "A fresh service does not acquire original actual-Child authority from a PID"},
-    {"name": "deadline-none","model": "DeadlinePolicy","expect": "pass"},
-    {"name": "deadline-extend-hard","model": "DeadlinePolicy","constants": {"Bug": "\"extend-hard\""},"expect": "invariant","invariant": "FixedHardDeadline"},
-    {"name": "deadline-uncapped-soft","model": "DeadlinePolicy","constants": {"Bug": "\"uncapped-soft\""},"expect": "invariant","invariant": "SoftWithinHard"},
-    {"name": "deadline-heartbeat-renews","model": "DeadlinePolicy","constants": {"Bug": "\"heartbeat-renews\""},"expect": "invariant","invariant": "QuietEventsDoNotRenew"},
-    {"name": "deadline-revive-after-expiry","model": "DeadlinePolicy","constants": {"Bug": "\"revive-after-expiry\""},"expect": "invariant","invariant": "ExpiryWins"},
-    {"name": "deadline-missing-is-idle","model": "DeadlinePolicy","constants": {"Bug": "\"missing-is-idle\""},"expect": "invariant","invariant": "MissingSampleIsNotInactivity"},
-    {"name": "deadline-missing-bypasses-hard","model": "DeadlinePolicy","constants": {"Bug": "\"missing-bypasses-hard\""},"expect": "invariant","invariant": "ExpiryWins"}
+    { "name": "dual-one-fault", "model": "Lifecycle", "expect": "pass" },
+    {
+      "name": "dual-disjoint",
+      "model": "Lifecycle",
+      "constants": { "SameDomain": "FALSE" },
+      "expect": "pass"
+    },
+    {
+      "name": "dual-readers",
+      "model": "Lifecycle",
+      "constants": { "ReadRead": "TRUE" },
+      "expect": "pass"
+    },
+    {
+      "name": "dual-two-fault-unsafe",
+      "model": "Lifecycle",
+      "constants": { "MaxFaults": "2" },
+      "expect": "invariant",
+      "invariant": "NoConflictingPayloadAccess"
+    },
+    {
+      "name": "dual-two-fault-containment-assumed",
+      "model": "Lifecycle",
+      "constants": { "MaxFaults": "2", "ExternalContainment": "TRUE" },
+      "expect": "pass"
+    },
+    {
+      "name": "direct-unsafe",
+      "model": "Lifecycle",
+      "constants": { "DualOwner": "FALSE" },
+      "expect": "invariant",
+      "invariant": "NoConflictingPayloadAccess"
+    },
+    {
+      "name": "direct-containment-assumed",
+      "model": "Lifecycle",
+      "constants": { "DualOwner": "FALSE", "ExternalContainment": "TRUE" },
+      "expect": "pass"
+    },
+    {
+      "name": "guardian-cannot-stop",
+      "model": "Lifecycle",
+      "constants": { "GuardianCanStop": "FALSE" },
+      "expect": "liveness"
+    },
+    {
+      "name": "direct-unsafe-liveness",
+      "model": "Lifecycle",
+      "constants": { "DualOwner": "FALSE" },
+      "invariants": [
+        "TypeOK",
+        "AtMostOneLaunch",
+        "ClosedMeansStopped",
+        "NoFalseSuccess"
+      ],
+      "expect": "liveness",
+      "purpose": "Check eventual closure independently; conflicting-access invariant intentionally omitted here, not claimed to pass"
+    },
+    {
+      "name": "frozen-sup-no-authority",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-sup\""
+      },
+      "expect": "liveness"
+    },
+    {
+      "name": "frozen-sup-original-parent-assumed",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "ServiceCanStopFrozenOwner": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-sup\""
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "dead-service-frozen-sup-original-parent-lost",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "MaxFaults": "2",
+        "AllowFreeze": "TRUE",
+        "ServiceCanStopFrozenOwner": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"dead-service-frozen-sup\""
+      },
+      "expect": "liveness"
+    },
+    {
+      "name": "dead-service-frozen-sup-external-authority-assumed",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "MaxFaults": "2",
+        "AllowFreeze": "TRUE",
+        "ExternalCanStopFrozenOwner": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"dead-service-frozen-sup\""
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "frozen-service-responsive-owners",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-service\""
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "frozen-guardian-no-authority",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-guardian\""
+      },
+      "expect": "liveness"
+    },
+    {
+      "name": "frozen-guardian-service-stops-supervisor-only",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "ServiceCanStopFrozenOwner": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-guardian\""
+      },
+      "expect": "liveness"
+    },
+    {
+      "name": "frozen-guardian-external-authority-assumed",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "ExternalCanStopFrozenOwner": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-guardian\""
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "frozen-service-and-sup",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "MaxFaults": "2",
+        "AllowFreeze": "TRUE",
+        "ServiceCanStopFrozenOwner": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-service-and-sup\""
+      },
+      "expect": "liveness"
+    },
+    {
+      "name": "service-restart-responsive-owner",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"dead-service\""
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "service-restart-frozen-owner",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "MaxFaults": "2",
+        "AllowFreeze": "TRUE",
+        "ServiceCanStopFrozenOwner": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"dead-service-frozen-sup\""
+      },
+      "expect": "liveness"
+    },
+    {
+      "name": "sup-gone-frozen-guardian",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "MaxFaults": "2",
+        "AllowFreeze": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"sup-gone-frozen-guardian\""
+      },
+      "expect": "liveness"
+    },
+    {
+      "name": "frozen-service-all-jobs",
+      "model": "LifecycleScenarios",
+      "constants": {
+        "AllowFreeze": "TRUE",
+        "FreezeService": "TRUE",
+        "FreezeGuardian": "TRUE",
+        "Scenario": "\"frozen-service\""
+      },
+      "properties": ["EventuallyClosed"],
+      "expect": "liveness"
+    },
+    {
+      "name": "mutant-free-lock",
+      "model": "LifecycleScenarios",
+      "constants": { "MaxFaults": "2", "Mutation": "\"free-lock\"" },
+      "invariants": [
+        "ClosedMeansStopped",
+        "TypeOK",
+        "NoConflictingPayloadAccess",
+        "AtMostOneLaunch",
+        "NoFalseSuccess"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "ClosedMeansStopped"
+    },
+    {
+      "name": "mutant-leader-release",
+      "model": "LifecycleScenarios",
+      "constants": { "Mutation": "\"leader-release\"" },
+      "invariants": [
+        "ClosedMeansStopped",
+        "TypeOK",
+        "NoConflictingPayloadAccess",
+        "AtMostOneLaunch",
+        "NoFalseSuccess"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "ClosedMeansStopped"
+    },
+    {
+      "name": "mutant-replay",
+      "model": "LifecycleScenarios",
+      "constants": { "Mutation": "\"replay\"" },
+      "invariants": [
+        "AtMostOneLaunch",
+        "TypeOK",
+        "NoConflictingPayloadAccess",
+        "ClosedMeansStopped",
+        "NoFalseSuccess"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "AtMostOneLaunch"
+    },
+    {
+      "name": "witness-disjoint-concurrency",
+      "model": "LifecycleScenarios",
+      "constants": { "SameDomain": "FALSE" },
+      "invariants": [
+        "NoConcurrentPayload",
+        "TypeOK",
+        "NoConflictingPayloadAccess",
+        "AtMostOneLaunch",
+        "ClosedMeansStopped",
+        "NoFalseSuccess"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "NoConcurrentPayload",
+      "witness": true
+    },
+    {
+      "name": "witness-reader-concurrency",
+      "model": "LifecycleScenarios",
+      "constants": { "ReadRead": "TRUE" },
+      "invariants": [
+        "NoConcurrentPayload",
+        "TypeOK",
+        "NoConflictingPayloadAccess",
+        "AtMostOneLaunch",
+        "ClosedMeansStopped",
+        "NoFalseSuccess"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "NoConcurrentPayload",
+      "witness": true
+    },
+    {
+      "name": "witness-frozen-alias-after-payload",
+      "model": "LifecycleScenarios",
+      "constants": { "AllowFreeze": "TRUE", "Scenario": "\"frozen-sup\"" },
+      "invariants": [
+        "NoFrozenSupervisorAliasAfterPayload",
+        "TypeOK",
+        "NoConflictingPayloadAccess",
+        "AtMostOneLaunch",
+        "ClosedMeansStopped",
+        "NoFalseSuccess"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "NoFrozenSupervisorAliasAfterPayload",
+      "witness": true
+    },
+    { "name": "stage-smoke", "model": "HistoricalStages", "expect": "pass" },
+    {
+      "name": "stage-one-extra",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1" },
+      "expect": "pass"
+    },
+    {
+      "name": "stage-one-extra-controls",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1", "Controls": "TRUE" },
+      "expect": "pass"
+    },
+    {
+      "name": "stage-two-extra",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "2" },
+      "expect": "pass",
+      "extended": true
+    },
+    {
+      "name": "stage-two-extra-controls",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "2", "Controls": "TRUE" },
+      "expect": "pass",
+      "extended": true
+    },
+    {
+      "name": "cut-Bound",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"Bound\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "cut-CrashBeforeSend",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"CrashBeforeSend\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "cut-CrashAfterSend",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"CrashAfterSend\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "cut-CrashAfterConsume",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"CrashAfterConsume\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "cut-WrongGoIntent",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"WrongGoIntent\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "bad-ForgetGate",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1", "Mutant": "\"ForgetGate\"" },
+      "invariants": ["OneConsumedGatePerSpawnAttempt"],
+      "expect": "invariant",
+      "invariant": "OneConsumedGatePerSpawnAttempt"
+    },
+    {
+      "name": "bad-ReopenFailedGate",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1", "Mutant": "\"ReopenFailedGate\"" },
+      "invariants": ["OneConsumedGatePerSpawnAttempt"],
+      "expect": "invariant",
+      "invariant": "OneConsumedGatePerSpawnAttempt"
+    },
+    {
+      "name": "bad-Rebind",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1", "Mutant": "\"Rebind\"" },
+      "invariants": ["UniqueStageAuthorization"],
+      "expect": "invariant",
+      "invariant": "UniqueStageAuthorization"
+    },
+    {
+      "name": "bad-IgnoreOwner",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1", "Mutant": "\"IgnoreOwner\"" },
+      "invariants": ["CorrectLaunchBinding"],
+      "expect": "invariant",
+      "invariant": "CorrectLaunchBinding"
+    },
+    {
+      "name": "bad-IgnoreGeneration",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1", "Mutant": "\"IgnoreGeneration\"" },
+      "invariants": ["CorrectLaunchBinding"],
+      "expect": "invariant",
+      "invariant": "CorrectLaunchBinding"
+    },
+    {
+      "name": "bad-CancelCurrent",
+      "model": "HistoricalStages",
+      "constants": {
+        "MaxRedeliveries": "1",
+        "Controls": "TRUE",
+        "Mutant": "\"CancelCurrent\""
+      },
+      "invariants": ["OldCancelIsolated"],
+      "expect": "invariant",
+      "invariant": "OldCancelIsolated"
+    },
+    {
+      "name": "bad-ResultIdle",
+      "model": "HistoricalStages",
+      "constants": {
+        "MaxRedeliveries": "1",
+        "Controls": "TRUE",
+        "Mutant": "\"ResultIdle\""
+      },
+      "invariants": ["IdleMeansNoActive"],
+      "expect": "invariant",
+      "invariant": "IdleMeansNoActive"
+    },
+    {
+      "name": "bad-AcceptChangedStart",
+      "model": "HistoricalStages",
+      "constants": {
+        "MaxRedeliveries": "1",
+        "Mutant": "\"AcceptChangedStart\""
+      },
+      "invariants": ["ChangedStartIntentRejected"],
+      "expect": "invariant",
+      "invariant": "ChangedStartIntentRejected"
+    },
+    {
+      "name": "bad-ClosureInventsResult",
+      "model": "HistoricalStages",
+      "constants": {
+        "MaxRedeliveries": "1",
+        "Mutant": "\"ClosureInventsResult\""
+      },
+      "invariants": ["KnownResultWasPublished"],
+      "expect": "invariant",
+      "invariant": "KnownResultWasPublished"
+    },
+    {
+      "name": "bad-Rebind-actual-duplicate",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1", "Mutant": "\"Rebind\"" },
+      "invariants": ["NoActualDuplicateLaunch"],
+      "expect": "invariant",
+      "invariant": "NoActualDuplicateLaunch",
+      "witness": true
+    },
+    {
+      "name": "bad-IgnoreIntent",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"WrongGoIntent\"",
+        "Mutant": "\"IgnoreIntent\""
+      },
+      "invariants": ["CorrectLaunchBinding"],
+      "expect": "invariant",
+      "invariant": "CorrectLaunchBinding"
+    },
+    {
+      "name": "coverage-both-stages-run",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1" },
+      "invariants": ["NoBothStagesRan"],
+      "expect": "invariant",
+      "invariant": "NoBothStagesRan",
+      "witness": true
+    },
+    {
+      "name": "coverage-closed-without-result",
+      "model": "HistoricalStages",
+      "constants": { "MaxRedeliveries": "1" },
+      "invariants": ["NoClosedStageWithoutResult"],
+      "expect": "invariant",
+      "invariant": "NoClosedStageWithoutResult",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-2-2",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-2-2",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-4-4",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-4-4",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-3-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-3-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-5-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-5-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-2-4",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"", "LateKindB": "4" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-2-4",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"", "LateKindB": "4" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-2-3",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"", "LateKindB": "3" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-2-3",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"", "LateKindB": "3" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-2-5",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"", "LateKindB": "5" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-2-5",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LatePending\"", "LateKindB": "5" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-4-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "4",
+        "LateKindB": "3"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-4-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "4",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-4-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "4",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-4-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "4",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LatePending-3-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "3",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LatePending-3-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LatePending\"",
+        "LateKindA": "3",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-2-2",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-2-2",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-4-4",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-4-4",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-3-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-3-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-5-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-5-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-2-4",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"", "LateKindB": "4" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-2-4",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"", "LateKindB": "4" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-2-3",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"", "LateKindB": "3" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-2-3",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"", "LateKindB": "3" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-2-5",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"", "LateKindB": "5" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-2-5",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"", "LateKindB": "5" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-4-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "3"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-4-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-4-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-4-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateRunning-3-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateRunning-3-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-2-2",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-2-2",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-4-4",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-4-4",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-3-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-3-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-5-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-5-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-2-4",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"", "LateKindB": "4" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-2-4",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"", "LateKindB": "4" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-2-3",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"", "LateKindB": "3" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-2-3",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"", "LateKindB": "3" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-2-5",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"", "LateKindB": "5" },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-2-5",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateReplaced\"", "LateKindB": "5" },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-4-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "4",
+        "LateKindB": "3"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-4-3",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "4",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-4-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "4",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-4-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "4",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "late-LateReplaced-3-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "3",
+        "LateKindB": "5"
+      },
+      "expect": "pass"
+    },
+    {
+      "name": "coverage-late-LateReplaced-3-5",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "3",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoTwoReceived"],
+      "expect": "invariant",
+      "invariant": "NoTwoReceived",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-2-active",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"" },
+      "invariants": ["NoLateReceiveWhileSecondActive"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveWhileSecondActive",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-2-restart",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"" },
+      "invariants": ["NoLateReceiveAfterRestart"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterRestart",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-2-replacement",
+      "model": "HistoricalStages",
+      "constants": { "Scenario": "\"LateRunning\"" },
+      "invariants": ["NoLateReceiveAfterReplacement"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterReplacement",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-4-active",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "invariants": ["NoLateReceiveWhileSecondActive"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveWhileSecondActive",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-4-restart",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "invariants": ["NoLateReceiveAfterRestart"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterRestart",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-4-replacement",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "4"
+      },
+      "invariants": ["NoLateReceiveAfterReplacement"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterReplacement",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-3-active",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoLateReceiveWhileSecondActive"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveWhileSecondActive",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-3-restart",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoLateReceiveAfterRestart"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterRestart",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-3-replacement",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "3"
+      },
+      "invariants": ["NoLateReceiveAfterReplacement"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterReplacement",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-5-active",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoLateReceiveWhileSecondActive"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveWhileSecondActive",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-5-restart",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoLateReceiveAfterRestart"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterRestart",
+      "witness": true
+    },
+    {
+      "name": "coverage-context-5-replacement",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoLateReceiveAfterReplacement"],
+      "expect": "invariant",
+      "invariant": "NoLateReceiveAfterReplacement",
+      "witness": true
+    },
+    {
+      "name": "coverage-cleanup-received",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "5",
+        "LateKindB": "5"
+      },
+      "invariants": ["NoCleanupReceived"],
+      "expect": "invariant",
+      "invariant": "NoCleanupReceived",
+      "witness": true
+    },
+    {
+      "name": "bad-late-CancelCurrent",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "Mutant": "\"CancelCurrent\""
+      },
+      "invariants": ["OldCancelIsolated"],
+      "expect": "invariant",
+      "invariant": "OldCancelIsolated"
+    },
+    {
+      "name": "bad-late-ResultIdle",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "3",
+        "LateKindB": "3",
+        "Mutant": "\"ResultIdle\""
+      },
+      "invariants": ["IdleMeansNoActive"],
+      "expect": "invariant",
+      "invariant": "IdleMeansNoActive"
+    },
+    {
+      "name": "bad-late-AckCurrent",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "4",
+        "LateKindB": "4",
+        "Mutant": "\"AckCurrent\""
+      },
+      "invariants": ["OldAckIsolated"],
+      "expect": "invariant",
+      "invariant": "OldAckIsolated"
+    },
+    {
+      "name": "bad-late-CallbackCurrent",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateRunning\"",
+        "LateKindA": "5",
+        "LateKindB": "5",
+        "Mutant": "\"CallbackCurrent\""
+      },
+      "invariants": ["OldCleanupIsolated"],
+      "expect": "invariant",
+      "invariant": "OldCleanupIsolated"
+    },
+    {
+      "name": "bad-late-CallbackGeneration",
+      "model": "HistoricalStages",
+      "constants": {
+        "Scenario": "\"LateReplaced\"",
+        "LateKindA": "5",
+        "LateKindB": "5",
+        "Mutant": "\"CallbackGeneration\""
+      },
+      "invariants": ["OldCleanupIsolated"],
+      "expect": "invariant",
+      "invariant": "OldCleanupIsolated"
+    },
+    { "name": "cross-unsent", "model": "CrossBoundary", "expect": "pass" },
+    {
+      "name": "cross-frozen-inflight",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"frozen-inflight\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "cross-frozen-pending-restart",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"frozen-pending-restart\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "cross-lost-owner-payload",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"lost-owner-payload\"" },
+      "expect": "pass"
+    },
+    {
+      "name": "cross-bug-missing-receipt",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-inflight\"",
+        "Mutation": "\"missing-receipt\""
+      },
+      "expect": "invariant",
+      "invariant": "MissingReceiptOrNoPayloadIsNotClosure",
+      "purpose": "Missing receipt permits replacement before closure"
+    },
+    {
+      "name": "cross-bug-no-payload",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-pending-restart\"",
+        "Mutation": "\"no-payload\""
+      },
+      "expect": "invariant",
+      "invariant": "MissingReceiptOrNoPayloadIsNotClosure",
+      "purpose": "No payload omits a still-live pending launch gate"
+    },
+    {
+      "name": "cross-bug-reauthorize",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"lost-owner-payload\"",
+        "Mutation": "\"reauthorize\""
+      },
+      "expect": "invariant",
+      "invariant": "ImmutableStageCannotBeReauthorized",
+      "purpose": "Original stage identity cannot be authorized again"
+    },
+    {
+      "name": "cross-bug-old-generation",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-inflight\"",
+        "Mutation": "\"accept-old-generation\""
+      },
+      "expect": "invariant",
+      "invariant": "OldGenerationGoCannotAuthorizeReplacement",
+      "purpose": "Replacement may not consume old-generation GO"
+    },
+    {
+      "name": "cross-frozen-inflight-no-resume",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-inflight\"",
+        "AllowExternalResume": "FALSE"
+      },
+      "invariants": ["TypeOK", "NoMissingOutputNewStage"],
+      "expect": "pass",
+      "purpose": "No new-stage running witness without resuming frozen original owner"
+    },
+    {
+      "name": "cross-frozen-pending-no-resume",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-pending-restart\"",
+        "AllowExternalResume": "FALSE"
+      },
+      "invariants": ["TypeOK", "NoMissingOutputNewStage"],
+      "expect": "pass",
+      "purpose": "No new-stage running witness with a frozen pending gate"
+    },
+    {
+      "name": "cross-lost-owner-new-stage-witness",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"lost-owner-payload\"",
+        "AllowExternalResume": "FALSE"
+      },
+      "invariants": ["TypeOK", "NoMissingOutputNewStage"],
+      "expect": "invariant",
+      "invariant": "NoMissingOutputNewStage",
+      "purpose": "Witness: explicit new stage can run after actual closure despite missing result",
+      "witness": true
+    },
+    {
+      "name": "cross-actual-duplicate-launch-witness",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"lost-owner-payload\"",
+        "AllowExternalResume": "FALSE",
+        "Mutation": "\"reauthorize\""
+      },
+      "invariants": ["TypeOK", "AtMostOneLaunchOfOriginalStage"],
+      "expect": "invariant",
+      "invariant": "AtMostOneLaunchOfOriginalStage",
+      "purpose": "Continue past reauthorization marker to two actual launches of original stage",
+      "witness": true
+    },
+    {
+      "name": "cross-unit-frozen-pending-alias-witness",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"frozen-pending-stop\"" },
+      "invariants": ["TypeOK", "NoFrozenPendingAliasWitness"],
+      "expect": "invariant",
+      "invariant": "NoFrozenPendingAliasWitness",
+      "purpose": "Unit1 witness: guardian closes its alias, frozen supervisor retains gate and alias",
+      "witness": true
+    },
+    {
+      "name": "cross-unit-free-lock-pending",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"free-lock-pending\"" },
+      "expect": "pass",
+      "purpose": "Unit2: a free lock does not seal a live pending launch gate"
+    },
+    {
+      "name": "cross-unit-closed-missing-witness",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"closed-missing-result\"" },
+      "invariants": ["TypeOK", "NoMissingOutputNewStage"],
+      "expect": "invariant",
+      "invariant": "NoMissingOutputNewStage",
+      "purpose": "Unit3 witness: missing result does not block an explicit new stage after closure",
+      "witness": true
+    },
+    {
+      "name": "cross-unit-no-closure-observation",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"closed-no-observation\"",
+        "ClosureObservationAvailable": "FALSE"
+      },
+      "invariants": ["TypeOK", "NoReplacement"],
+      "expect": "pass",
+      "purpose": "Unit4: physically closed alone does not invent an unavailable closure observation"
+    },
+    {
+      "name": "cross-unit-late-original-go-witness",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"restart-inflight\"" },
+      "invariants": ["TypeOK", "NoOldStageLaunch"],
+      "expect": "invariant",
+      "invariant": "NoOldStageLaunch",
+      "purpose": "Unit5 witness: already-sent GO can launch at old owner after service restart",
+      "witness": true
+    },
+    {
+      "name": "cross-unit-old-go-rejected-witness",
+      "model": "CrossBoundary",
+      "constants": { "InitialCase": "\"replacement-old-go\"" },
+      "invariants": ["TypeOK", "NoRejectedOldGoWitness"],
+      "expect": "invariant",
+      "invariant": "NoRejectedOldGoWitness",
+      "purpose": "Unit6 witness: replacement rejects old GO without assigning new stage",
+      "witness": true
+    },
+    {
+      "name": "cross-unit-frozen-service-loss",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-pending-service-lost\"",
+        "AllowExternalResume": "FALSE"
+      },
+      "invariants": ["TypeOK", "NoReplacement"],
+      "expect": "pass",
+      "purpose": "Unit7: restart cannot automatically resume the frozen old owner"
+    },
+    {
+      "name": "cross-child-stop-original-witness",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-pending-original-service\"",
+        "ActualChildStop": "TRUE",
+        "AllowExternalResume": "FALSE"
+      },
+      "invariants": ["TypeOK", "NoMissingOutputNewStage"],
+      "expect": "invariant",
+      "invariant": "NoMissingOutputNewStage",
+      "purpose": "Conditional witness: responsive original service has assumed actual-Child stop",
+      "witness": true
+    },
+    {
+      "name": "cross-child-stop-not-restored",
+      "model": "CrossBoundary",
+      "constants": {
+        "InitialCase": "\"frozen-pending-restart\"",
+        "ActualChildStop": "TRUE",
+        "AllowExternalResume": "FALSE"
+      },
+      "invariants": ["TypeOK", "NoReplacement"],
+      "expect": "pass",
+      "purpose": "A fresh service does not acquire original actual-Child authority from a PID"
+    },
+    { "name": "deadline-none", "model": "DeadlinePolicy", "expect": "pass" },
+    {
+      "name": "deadline-extend-hard",
+      "model": "DeadlinePolicy",
+      "constants": { "Bug": "\"extend-hard\"" },
+      "expect": "invariant",
+      "invariant": "FixedHardDeadline"
+    },
+    {
+      "name": "deadline-uncapped-soft",
+      "model": "DeadlinePolicy",
+      "constants": { "Bug": "\"uncapped-soft\"" },
+      "expect": "invariant",
+      "invariant": "SoftWithinHard"
+    },
+    {
+      "name": "deadline-heartbeat-renews",
+      "model": "DeadlinePolicy",
+      "constants": { "Bug": "\"heartbeat-renews\"" },
+      "expect": "invariant",
+      "invariant": "QuietEventsDoNotRenew"
+    },
+    {
+      "name": "deadline-revive-after-expiry",
+      "model": "DeadlinePolicy",
+      "constants": { "Bug": "\"revive-after-expiry\"" },
+      "expect": "invariant",
+      "invariant": "ExpiryWins"
+    },
+    {
+      "name": "deadline-missing-is-idle",
+      "model": "DeadlinePolicy",
+      "constants": { "Bug": "\"missing-is-idle\"" },
+      "expect": "invariant",
+      "invariant": "MissingSampleIsNotInactivity"
+    },
+    {
+      "name": "deadline-missing-bypasses-hard",
+      "model": "DeadlinePolicy",
+      "constants": { "Bug": "\"missing-bypasses-hard\"" },
+      "expect": "invariant",
+      "invariant": "ExpiryWins"
+    }
   ]
 }
