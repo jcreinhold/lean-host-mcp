@@ -37,16 +37,12 @@ toolchain and export its `LEAN_SYSROOT` for the full invocation as described in 
 Check packaging explicitly:
 
 ```sh
-cargo package --list -p lean-host-mcp
-cargo package --list -p lean-host-mcp-worker
-cargo publish --dry-run -p lean-host-mcp
-cargo publish --dry-run --no-verify -p lean-host-mcp-worker
+cargo package --workspace --locked
 ```
 
-The parent package must contain its crate-local README; the worker package must contain `Cargo.lock` for downstream
-`install --locked`. The worker dry run skips its Lean-linking package verification build. The release workflow builds
-the workspace members and verifies the parent package, but also skips the worker package verification build. Report
-skipped checks accurately.
+Cargo verifies each packaged member with access to the archives of selected workspace dependencies.
+Check the parent archive for its crate-local README and the worker archive for Cargo.lock, as Verify does.
+External SDK and semantic dependencies must resolve from the configured registry.
 
 Confirm `CARGO_REGISTRY_TOKEN` is configured for the workflow without printing its value. A manual workflow run with
 `dry_run: true` rehearses verification and packaging without publishing. Present the exact release commit, matching

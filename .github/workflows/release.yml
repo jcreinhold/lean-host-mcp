@@ -14,13 +14,9 @@ name: Release
 # `CARGO_REGISTRY_TOKEN` must be set in the repository secrets before the first
 # tag push — a scoped publish token from <https://crates.io/settings/tokens>.
 #
-# Only `verify` installs Lean. It builds both members separately, tests the
-# parent, asserts parent ⊥ libleanshared and checks packaged file lists. The
-# parent's publish dry run verifies its package build; the worker's dry run
-# uses --no-verify, so its packaged build is not verified.
-# The Lean-free `publish` job uploads both with --no-verify: the worker links
-# libleanshared and even the parent's verification pulls lean-rs-sys, whose
-# build script needs a Lean toolchain. It relies on the earlier checks.
+# Verify builds the checkout members separately, then packages the workspace
+# together so Cargo verifies each archive with access to its packaged siblings.
+# Publish reuses that gate and needs neither Lean nor a token for a rehearsal.
 
 on:
   push:
@@ -42,7 +38,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write # softprops/action-gh-release creates the GitHub Release.
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       # Development may patch an unpublished worker fix, but a release must
       # resolve the same published sources that downstream users receive.
@@ -139,29 +137,38 @@ jobs:
             exit 1
           fi
 
-      - name: Packaging sanity
+      - name: Verify workspace packages and installer inputs
         run: |
           set -euo pipefail
-          # The parent's crates.io page is blank without a crate-local README;
-          # `cargo install --locked` fails for users if the worker omits its
-          # packaged Cargo.lock.
-          cargo package --list -p lean-host-mcp | grep -qx 'README.md' \
-            || { echo "::error::parent crate would publish without README.md"; exit 1; }
-          cargo package --list -p lean-host-mcp-worker | grep -qx 'Cargo.lock' \
-            || { echo "::error::worker crate omits Cargo.lock; --locked installs would fail"; exit 1; }
+          cargo package --workspace --locked
+          python3 - <<'PYTHON'
+          import json
+          import pathlib
+          import subprocess
+          import tarfile
 
-      - name: Publish dry-run
-        run: |
-          set -euo pipefail
-          cargo publish -p lean-host-mcp-worker --no-verify --dry-run
-          cargo publish -p lean-host-mcp --dry-run
+          metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]))
+          archives = pathlib.Path(metadata["target_directory"]) / "package"
+          inputs = {"lean-host-mcp": "README.md", "lean-host-mcp-worker": "Cargo.lock"}
+          for name, required in inputs.items():
+              package = next(p for p in metadata["packages"] if p["name"] == name)
+              stem = f"{name}-{package['version']}"
+              with tarfile.open(archives / f"{stem}.crate", "r:gz") as archive:
+                  if not archive.getmember(f"{stem}/{required}").isfile():
+                      raise SystemExit(f"{stem}: expected packaged file {required}")
+          PYTHON
 
   publish:
     name: Publish
+    permissions:
+      contents: write # Create the GitHub Release after publication.
     needs: verify
+    if: inputs.dry_run != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -177,7 +184,6 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Publish to crates.io (worker first, idempotent)
-        if: inputs.dry_run != true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -191,12 +197,14 @@ jobs:
             crate="$1"; shift
             # crates.io returns 200 for an existing version, 404 otherwise. A
             # User-Agent is required or the API returns 403.
-            if curl -sf -o /dev/null \
-                 -H "User-Agent: lean-host-mcp-release (github.com/jcreinhold/lean-host-mcp)" \
-                 "https://crates.io/api/v1/crates/$crate/$version"; then
-              echo "✓ $crate@$version already on crates.io — skipping"
-              return 0
-            fi
+            status=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "User-Agent: lean-host-mcp-release (github.com/jcreinhold/lean-host-mcp)" \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            case "$status" in
+              200) echo "$crate@$version already published"; return 0 ;;
+              404) ;;
+              *) echo "::error::Could not check $crate@$version (HTTP $status)"; return 1 ;;
+            esac
             echo "→ publishing $crate@$version"
             cargo publish -p "$crate" "$@"
           }
@@ -205,18 +213,9 @@ jobs:
           # the verify build pulls lean-rs-sys (and, for the worker, links
           # libleanshared), which demands a Lean toolchain this Lean-free job
           # does not have. The `verify` gate built both members, tested the parent,
-          # checked package contents and verified the parent's packaged build.
-          # The worker's packaged verification build remains skipped.
+          # verified both packaged crates with their installer inputs.
           publish_one lean-host-mcp-worker --no-verify
           publish_one lean-host-mcp --no-verify
-
-      - name: Publish dry-run (no upload)
-        if: inputs.dry_run == true
-        run: |
-          set -euo pipefail
-          # --no-verify on both: this job has no Lean toolchain (see header).
-          cargo publish -p lean-host-mcp-worker --no-verify --dry-run
-          cargo publish -p lean-host-mcp --no-verify --dry-run
 
       - name: Extract CHANGELOG section for this release
         if: inputs.dry_run != true && github.event_name == 'push'
