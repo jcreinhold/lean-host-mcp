@@ -14,7 +14,7 @@ pub(super) fn prepare(
     lean_toolchain::shared_writer::SharedWriter,
 )> {
     fs::create_dir(destination)?;
-    for row in include_str!("shim-inputs-0.10.1.txt").lines() {
+    for row in include_str!("shim-inputs-0.10.2.txt").lines() {
         let (hash, name) = row.split_once(' ').context("invalid packaged shim inventory")?;
         let path = source.join("shims").join(name);
         ensure!(
@@ -27,10 +27,7 @@ pub(super) fn prepare(
             use std::fmt::Write as _;
             write!(actual, "{byte:02x}")?;
         }
-        // SDK fb98113 changes only this Lean source in the inventoried shim inputs.
-        let setup_shim = name == "lean-rs-host-shims/LeanRsHostShims/InfoTree.lean"
-            && actual == "f6e5aa7d41520e906b9251a634fe0195a26bf1ff30dccf1b9f567ac0cb7aa591";
-        ensure!(actual == hash || setup_shim, "published shim input changed: {name}");
+        ensure!(actual == hash, "published shim input changed: {name}");
         let output = destination.join(name);
         fs::create_dir_all(output.parent().context("missing source directory")?)?;
         fs::write(output, bytes)?;
@@ -135,7 +132,7 @@ pub(super) fn bind(
         .collect();
     // Bind every compiled package module, including split olean data if emitted.
     // Package order in the search path is part of the installation contract.
-    for row in include_str!("shim-inputs-0.10.1.txt").lines() {
+    for row in include_str!("shim-inputs-0.10.2.txt").lines() {
         let (_, name) = row.split_once(' ').context("invalid packaged shim inventory")?;
         let (package, file) = name.split_once('/').context("missing shim package")?;
         let Some(module) = file.strip_suffix(".lean").filter(|name| *name != "lakefile") else {

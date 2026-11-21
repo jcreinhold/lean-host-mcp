@@ -568,10 +568,10 @@ fn install_one(
                     p.file_name()
                         .and_then(|s| s.to_str())
                         .is_some_and(|s| s.starts_with("index.crates.io-"))
-                        && p.join("lean-rs-host-0.10.1/shims").is_dir()
+                        && p.join("lean-rs-host-0.10.2/shims").is_dir()
                 })
-                .ok_or_else(|| anyhow::anyhow!("provide --shim-source for published lean-rs-host 0.10.1"))?;
-            package.join("lean-rs-host-0.10.1").canonicalize()?
+                .ok_or_else(|| anyhow::anyhow!("provide --shim-source for published lean-rs-host 0.10.2"))?;
+            package.join("lean-rs-host-0.10.2").canonicalize()?
         }
     };
     let writer = match &args.standalone_writer {

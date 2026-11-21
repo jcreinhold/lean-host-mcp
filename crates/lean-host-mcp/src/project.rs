@@ -3614,18 +3614,6 @@ fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
 
 /// One explicit owner namespace and actor slot for ordinary and companion
 /// generations. Prepared storage facts never substitute for loaded checks.
-// SDK b32e706a supplies the inherent method. Older releases must refuse a selected
-// generation before launch; they cannot deliver authenticated parent startup input.
-#[allow(dead_code, reason = "the matching SDK supplies the inherent method")]
-trait MissingApplicationInput {
-    fn application_launch_input(self, _: &str) -> std::io::Result<LeanWorkerChild>;
-}
-impl MissingApplicationInput for LeanWorkerChild {
-    fn application_launch_input(self, _: &str) -> std::io::Result<LeanWorkerChild> {
-        Err(std::io::Error::other("SDK lacks explicit application launch input"))
-    }
-}
-
 fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerChild> {
     let writer = crate::shared_writer::contract()?;
     // Unit actor tests use a framed Python child that never loads Lean. The

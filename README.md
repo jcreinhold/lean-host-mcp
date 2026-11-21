@@ -121,13 +121,13 @@ memory budgets, response presentation, and durable request journals. By default 
 | Component | Current source requirement |
 | --- | --- |
 | `lean-host-mcp` | 0.16.8 |
-| `lean-rs` stack and `lean-toolchain` | 0.10.1 |
+| `lean-rs` stack and `lean-toolchain` | 0.10.2 |
 | `lean-semantic-search` stack | 0.7.9 |
 | Worker protocol | 13 |
-| Supported Lean window | 4.30.0 through 4.35.0 |
+| Supported Lean window | 4.30.0 through 4.36.0 |
 
 Install the parent and workers together; protocol 13 rejects older workers before requests. Registry installations may
-differ from the source requirements shown here. Current development validation uses Lean 4.35.0; a local install does
+differ from the source requirements shown here. The development fixture uses Lean 4.36.0; a local install does
 not qualify the full toolchain/platform release matrix.
 
 The exact supported releases come from `lean_toolchain::SUPPORTED_TOOLCHAINS`, re-exported from

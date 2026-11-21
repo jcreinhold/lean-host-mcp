@@ -16,8 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 lean-rs-worker-child.workspace = true
-lean-rs = "0.10.1"
-lean-rs-host = "0.10.1"
+lean-rs = "0.10.2"
+lean-rs-host = "0.10.2"
 lean-rs-worker-protocol.workspace = true
 lean-toolchain.workspace = true
 serde = { version = "1", features = ["derive"] }

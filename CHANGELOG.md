@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Adopt published lean-rs 0.10.2 and use Lean 4.36.0 for the release fixture.
+
 - Verify current project files in a supervised Lean process using the selected Lake module setup. Check
   project inputs again when transferring them from writer to reader custody. A missing or changed input
   prevents verification.
