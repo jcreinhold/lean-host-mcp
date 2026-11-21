@@ -122,7 +122,7 @@ memory budgets, response presentation, and durable request journals. By default 
 | --- | --- |
 | `lean-host-mcp` | 0.16.8 |
 | `lean-rs` stack and `lean-toolchain` | 0.10.1 |
-| `lean-semantic-search` stack | 0.7.8 |
+| `lean-semantic-search` stack | 0.7.9 |
 | Worker protocol | 13 |
 | Supported Lean window | 4.30.0 through 4.35.0 |
 

@@ -36,14 +36,6 @@ impl ProjectBroker {
             let (setup, mut reader, activity) = self
                 .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
                 .await?;
-            // The released 0.7.8 payload predates the Lean-only setup entry point.
-            if lean_semantic_search_runtime::RUNTIME_SOURCE_DIGEST
-                == "cd1dc009159d1d466f845840f837d5fc9478a92562e383031af6124d3d10ce3a"
-            {
-                return Err(invalid(
-                    "semantic runtime 0.7.8 cannot elaborate a goal with the selected Lake ModuleSetup",
-                ));
-            }
             reader.roots = crate::lake_meta::artifact_roots(&root);
             if reader.roots.iter().any(|p| !reader.custody.covers_artifact_root(p)) {
                 return Err(invalid("semantic declaration root outside held project domains"));

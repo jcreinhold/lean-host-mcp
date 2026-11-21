@@ -14,8 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Verify current project files in a supervised Lean process using the selected Lake module setup. Check
   project inputs again when transferring them from writer to reader custody. A missing or changed input
   prevents verification.
-- Use the same setup checks for ordinary file-backed proof search. Semantic runtime 0.7.8 reports an
-  explicit error when it cannot honor that setup. Prepared-generation search remains available.
+- Use semantic runtime 0.7.9 to elaborate file-backed search goals with the selected Lake module setup.
 - Bind native workers, build helpers and external readers to one supervised process scope and canonical artifact-lock
   union. Preserve confirmed stop evidence through timeout and replacement failures; recover capacity after actual
   cleanup without replaying Lean commands.

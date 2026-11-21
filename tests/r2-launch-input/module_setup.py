@@ -162,12 +162,11 @@ for label, plugin in [("project", True), ("omitted", False)]:
     verdict = row(probe(project))
     print(label, verdict["verification_status"])
     if plugin:
-        unavailable = probe(project, search=True)
-        assert (
-            "cannot elaborate a goal with the selected Lake ModuleSetup"
-            in unavailable["error"]["message"]
-        ), unavailable
-        assert "result" not in unavailable
+        reply = probe(project, search=True)
+        assert "error" not in reply, reply
+        search = json.loads(reply["result"]["content"][0]["text"])
+        assert not search["errors"], search
+        assert "candidates" in search["data"], search
         assert verdict["verification_status"] == "verified", verdict
     else:
         assert verdict[

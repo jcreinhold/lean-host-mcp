@@ -448,7 +448,7 @@ To verify a file in an already-built project, start the stdio server with `lean-
 
 The server runs the selected toolchain's `lake --no-build --no-cache setup-file <file>` under the project writer and checks the current source using that file's options, imports, plugins and dynamic libraries. Keep the project's existing compiled artifacts available. Missing setup inputs produce an error. This route requires the setup-aware verification shim and takes no `--prepared-generation` argument.
 
-Use `--prepared-generation` only for the separately prepared worker-import path. Ordinary file-backed proof search also needs a semantic runtime that honors the selected Lake setup. With semantic 0.7.8, `lean_lookup` with `kind="proof_search"` refuses that setup; search using an explicitly prepared generation retains its existing behavior.
+Use `--prepared-generation` only for the separately prepared worker-import path. Ordinary file-backed `lean_lookup` with `kind="proof_search"` uses the selected file’s Lake setup for goal elaboration.
 
 The optional CLI-only `--verification-approval verify-batch-v1:<sha256>` records one verification policy digest for the operator-selected canonical project at startup. The digest binds independently reviewed source and batch options, the installed generation and its ordered import domains. There is no project-local or per-request setter. SDK 0.10.1 does not forward this input to the installed worker; recording it enables no native source operation.
 
