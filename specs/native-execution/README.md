@@ -65,10 +65,12 @@ result. Progress requires settlement when exact evidence and either the
 bound scratch or a durable cleanup mark remain valid. Scratch missing
 before intent leaves the charge open.
 
-The cases assume authentic scope and closure facts. An unlocked descriptor,
-an operator acknowledgment, a reboot, or a missing PID gives no such fact
-in the model. Real OS observations, durable handoff and SQLite behavior,
-and matched installation and rollback have separate acceptance checks.
+One transition represents acquiring the whole ordered lock set. The model
+allows one interruption during cleanup. Exact old closure is an authenticated
+input to TLC. An unlocked descriptor, an operator acknowledgment, a reboot,
+or a missing PID supplies no such input. Real tests must check lock acquisition
+and OS closure evidence. Durable handoff, SQLite behavior, and matched
+installation and rollback have separate acceptance checks.
 
 **Host actor permit.** One warm actor holds one host permit and binds one custody scope. It saves the result
 of one request and starts a second request on that generation while still charged. It returns the permit after

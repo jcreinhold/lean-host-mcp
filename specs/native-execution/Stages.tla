@@ -366,7 +366,8 @@ WriterDigest(input) == <<"handoff-digest", input>>
 WriterReservation == [turn |-> "turn-a", owner |-> WriterOwner, registry |-> "registry-a",
   digest |-> WriterDigest(OriginalHandoff), locks |-> WriterLockUnion,
   scratch |-> <<"scratch-a", "device-a", "inode-c">>]
-WriterEvidence == {WriterReservation,
+ReversedWriterEvidence == [WriterReservation EXCEPT !.locks= <<WriterLockUnion[2],WriterLockUnion[1]>>]
+WriterEvidence == {WriterReservation, ReversedWriterEvidence,
   [WriterReservation EXCEPT !.owner=PreviousWriterOwner],
   [WriterReservation EXCEPT !.digest=WriterDigest([OriginalHandoff EXCEPT !.audit="audit-b"])],
   [WriterReservation EXCEPT !.locks= <<WriterLockUnion[1]>>],
@@ -464,6 +465,7 @@ ClaimWriterCleanup(evidence) == HostOnly(Writer.interrupted /\ ~Writer.oldLocks 
       \/ (Mutation="writer-unknown-is-idle" /\ Writer.phase \in {"starting","running","partial-idle"}))
   /\ (evidence=WriterReservation
       \/ (Mutation="writer-partial-union" /\ evidence.locks= <<WriterLockUnion[1]>>)
+      \/ (Mutation="writer-reversed-union" /\ evidence=ReversedWriterEvidence)
       \/ (Mutation="writer-stale-owner" /\ evidence.owner=PreviousWriterOwner)
       \/ (Mutation="writer-stale-digest" /\ evidence.digest/=WriterReservation.digest)
       \/ (Mutation="writer-wrong-scratch" /\ evidence.scratch/=WriterReservation.scratch))

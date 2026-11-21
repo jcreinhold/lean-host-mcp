@@ -1362,6 +1362,20 @@
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
+    {
+      "name": "host-writer-operator-reversed-union",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator\"",
+        "Mutation": "\"writer-reversed-union\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterCleanupSafe"],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
 
     { "name": "host-healthy", "model": "Stages", "expect": "pass" },
     {
