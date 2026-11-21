@@ -88,6 +88,10 @@ pub struct InstallWorkerArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Installation root containing per-toolchain generations. Applies to installs and listing.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["clean", "prune"])]
+    pub workers_dir: Option<PathBuf>,
+
     /// Extracted lean-rs-host package containing the pinned published shim sources.
     #[arg(long)]
     pub shim_source: Option<PathBuf>,
@@ -111,8 +115,9 @@ pub struct InstallWorkerArgs {
 /// a non-zero exit-code-equivalent error when any auto install fails.
 pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     check_arg_combination(args)?;
+    let root = args.workers_dir.clone().unwrap_or_else(WorkerBinary::install_root);
     if args.list {
-        return run_list();
+        return run_list(&root);
     }
     if args.prune {
         return run_prune();
@@ -128,10 +133,10 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
         // `check_arg_combination` ruled out `--toolchain --auto`, so this is a
         // single-toolchain install (always overwrites — no freshness check).
         let id = ToolchainId::parse(raw)?;
-        install_one(&id, &source, args)?;
+        install_one(&root, &id, &source, args)?;
         return Ok(());
     }
-    run_auto(&source, args)
+    run_auto(&root, &source, args)
 }
 
 /// Validate the `--toolchain` target modifier against the chosen action. The
@@ -160,14 +165,13 @@ fn check_arg_combination(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_list() -> anyhow::Result<()> {
-    let root = WorkerBinary::install_root();
+fn run_list(root: &Path) -> anyhow::Result<()> {
     if !root.is_dir() {
         println!("(no workers installed under {})", root.display());
         return Ok(());
     }
     let mut rows: Vec<ListRow> = Vec::new();
-    for entry in fs::read_dir(&root)? {
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
         let id_path = entry.path();
         if !id_path.is_dir() {
@@ -254,7 +258,7 @@ struct ListRow {
     sort_key: (u8, (u32, u32, u32, u8, u32), String),
 }
 
-fn run_auto(source: &WorkerSource, args: &InstallWorkerArgs) -> anyhow::Result<()> {
+fn run_auto(root: &Path, source: &WorkerSource, args: &InstallWorkerArgs) -> anyhow::Result<()> {
     let force = args.force;
     let toolchains = discover_elan_toolchains()?;
     if toolchains.is_empty() {
@@ -263,12 +267,12 @@ fn run_auto(source: &WorkerSource, args: &InstallWorkerArgs) -> anyhow::Result<(
     }
     let mut failed = false;
     for id in toolchains {
-        match auto_decision(&id, force) {
+        match auto_decision(root, &id, force) {
             AutoDecision::SkipUnsupported => println!("{id}: skipped (outside supported window)"),
             AutoDecision::SkipCurrent => {
                 println!("{id}: current; skipping (use --force to rebuild)");
             }
-            AutoDecision::Install(reason) => match install_one(&id, source, args) {
+            AutoDecision::Install(reason) => match install_one(root, &id, source, args) {
                 Ok(_) => println!("{id}: installed ({reason})"),
                 Err(err) => {
                     eprintln!("{id}: failed: {err}");
@@ -295,11 +299,11 @@ enum AutoDecision {
     SkipUnsupported,
 }
 
-fn auto_decision(id: &ToolchainId, force: bool) -> AutoDecision {
+fn auto_decision(root: &Path, id: &ToolchainId, force: bool) -> AutoDecision {
     if matches!(id.window_verdict(), WindowVerdict::OutOfWindow { .. }) {
         return AutoDecision::SkipUnsupported;
     }
-    match worker_freshness(id) {
+    match worker_freshness_in(root, id) {
         Freshness::Absent => AutoDecision::Install("new"),
         Freshness::Stale(reason) => AutoDecision::Install(reason),
         Freshness::Current => {
@@ -312,19 +316,13 @@ fn auto_decision(id: &ToolchainId, force: bool) -> AutoDecision {
     }
 }
 
-/// Whether the worker already installed under [`WorkerBinary::install_root`] for
+/// Whether the worker already installed under the selected root for
 /// `id` is current, stale, or absent. Mirrors the runtime open-gate's provenance
-/// checks ([`WorkerBinary::resolve_ready_with_override`]) but reads the install
-/// root directly — `install-worker` always writes there, regardless of the
-/// `LEAN_HOST_MCP_WORKERS_DIR` override the runtime path honors.
+/// checks ([`WorkerBinary::resolve_ready_with_override`]).
 enum Freshness {
     Absent,
     Current,
     Stale(&'static str),
-}
-
-fn worker_freshness(id: &ToolchainId) -> Freshness {
-    worker_freshness_in(&WorkerBinary::install_root(), id)
 }
 
 /// Freshness against an explicit `root`. Split out of [`worker_freshness`] so
@@ -461,7 +459,12 @@ fn prune_reason(name: &str, install_dir: &Path) -> Option<&'static str> {
     None
 }
 
-fn install_one(id: &ToolchainId, source: &WorkerSource, args: &InstallWorkerArgs) -> anyhow::Result<PathBuf> {
+fn install_one(
+    root: &Path,
+    id: &ToolchainId,
+    source: &WorkerSource,
+    args: &InstallWorkerArgs,
+) -> anyhow::Result<PathBuf> {
     // Classify against the supported window *before* the multi-minute build —
     // an out-of-window worker would only fail lean-rs-sys's header-digest
     // check minutes later.
@@ -485,7 +488,7 @@ fn install_one(id: &ToolchainId, source: &WorkerSource, args: &InstallWorkerArgs
     // crate's build.rs to point at it.
     let elan_dir = id.elan_dir()?;
 
-    let dest_dir = WorkerBinary::install_root().join(id.as_str());
+    let dest_dir = root.join(id.as_str());
     let registry_source = match &args.shim_source {
         Some(path) => path.canonicalize()?,
         None => {
