@@ -85,11 +85,8 @@ enum DoctorCommand {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    /// Default Lake project for tool calls that don't specify one.
-    /// Equivalent to `LEAN_HOST_MCP_PROJECT`. May be omitted; the server
-    /// will resolve from the invocation cwd's nearest lakefile, then from
-    /// `~/.config/lean-host-mcp/config.toml`. Per-call `project="..."`
-    /// arguments always win.
+    /// Select and approve the primary Lake project for native calls (also LEAN_HOST_MCP_PROJECT).
+    /// A per-call project can select this root. Discovery alone cannot approve a native project.
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
 
@@ -98,7 +95,7 @@ struct ServeArgs {
     #[arg(long)]
     verification_approval: Option<String>,
 
-    /// Exact prepared generation JSON selected by the operator for the primary project.
+    /// Optional generation JSON for prepared worker imports. Ordinary file verification uses Lake setup-file.
     #[arg(long)]
     prepared_generation: Option<String>,
 

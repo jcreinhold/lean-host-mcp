@@ -206,7 +206,7 @@ jobs:
               *) echo "::error::Could not check $crate@$version (HTTP $status)"; return 1 ;;
             esac
             echo "→ publishing $crate@$version"
-            cargo publish -p "$crate" "$@"
+            cargo publish --locked -p "$crate" "$@"
           }
           # Worker first: a user must never install a parent whose install-worker
           # resolves a not-yet-published worker. Both publish with --no-verify:
