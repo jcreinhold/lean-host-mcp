@@ -70,7 +70,7 @@ jobs:
       - name: build (worker)
         run: cargo build -p lean-host-mcp-worker --all-targets
       - name: test (parent)
-        run: cargo test -p lean-host-mcp --all-targets
+        run: scripts/test-installed-stdio.sh --all-targets
       # The parent must NOT link libleanshared. Built as a separate per-member
       # release invocation so the worker's feature set never unifies in.
       - name: parent ⊥ libleanshared

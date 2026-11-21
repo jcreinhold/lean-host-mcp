@@ -381,7 +381,8 @@ smoke failure is also a hard refusal with an actionable reinstall command.
 cargo build -p lean-host-mcp                          # parent only
 cargo build -p lean-host-mcp-worker                   # worker only (links libleanshared)
 cargo clippy --workspace --all-targets -- -D warnings # safe; clippy doesn't link
-cargo test -p lean-host-mcp                           # unit tests; no Lean fixture required
+cargo test -p lean-host-mcp --lib                     # unit tests; no Lean fixture required
+scripts/test-installed-stdio.sh --all-targets         # includes installed-worker EOF and exit
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
     cargo test -p lean-host-mcp --test e2e -- --ignored   # opt-in end-to-end
 ```

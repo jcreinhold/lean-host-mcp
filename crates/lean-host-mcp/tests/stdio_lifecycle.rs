@@ -7,8 +7,6 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
-mod support;
-
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -52,14 +50,11 @@ async fn stdio_shutdown_on_stdin_eof_exits_parent() {
 
 #[tokio::test]
 async fn stdio_shutdown_after_tool_call_exits_worker_child() {
-    let Some(worker) = built_worker_binary() else {
-        eprintln!("skipping worker-child lifecycle check: no worker built in this profile");
-        return;
-    };
-    assert!(worker.is_file(), "built worker path must exist: {}", worker.display());
-
+    let project = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_PROJECT")
+        .map(PathBuf::from)
+        .expect("run scripts/test-installed-stdio.sh to provision the private worker");
     let registry = tempfile::tempdir().expect("temp registry");
-    let mut server = StdioServer::start(&fixture_root(), registry.path());
+    let mut server = StdioServer::start(&project, registry.path());
     server.initialize().await;
     let response = server
         .request_allow_error(
@@ -69,17 +64,55 @@ async fn stdio_shutdown_after_tool_call_exits_worker_child() {
                 "arguments": {
                     "kind": "declaration",
                     "name": "Nat.add_zero",
-                    "imports": ["LeanRsFixture.Handles"]
+                    "imports": ["Init"]
                 }
             }),
         )
         .await;
 
+    assert!(
+        response.get("error").is_none(),
+        "installed worker lookup failed: {response}"
+    );
+    let result: Value = serde_json::from_str(
+        response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .expect("tool envelope"),
+    )
+    .expect("semantic JSON response");
+    assert_eq!(result.get("errors"), Some(&json!([])));
+    assert_eq!(result.pointer("/data/status"), Some(&json!("found")));
+    assert_eq!(result.pointer("/data/declaration/name"), Some(&json!("Nat.add_zero")));
     let worker_pids = wait_for_child_pids(server.pid()).await;
     assert!(
         !worker_pids.is_empty(),
         "tool call should leave a direct worker child for exact-PID shutdown assertion; response: {response:?}"
     );
+
+    let worker = project
+        .parent()
+        .expect("installed generation")
+        .join("lean-host-mcp-worker");
+    for pid in &worker_pids {
+        #[cfg(target_os = "linux")]
+        let executable = std::fs::read_link(format!("/proc/{pid}/exe")).expect("inspect worker executable");
+        #[cfg(target_os = "macos")]
+        let executable = {
+            let process = std::process::Command::new("ps")
+                .args(["-ww", "-o", "comm=", "-p", &pid.to_string()])
+                .output()
+                .expect("inspect worker executable");
+            assert!(process.status.success());
+            PathBuf::from(
+                String::from_utf8(process.stdout)
+                    .expect("worker executable path")
+                    .trim(),
+            )
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(executable, worker.canonicalize().expect("installed worker"));
+    }
 
     server.close_stdin_and_wait().await;
     for pid in worker_pids {
@@ -149,12 +182,14 @@ struct StdioServer {
 
 impl StdioServer {
     fn start(project_root: &Path, registry: &Path) -> Self {
-        let config_dir = tempfile::tempdir()
-            .expect("temp config dir")
-            .keep()
-            .canonicalize()
-            .expect("canonical private config directory");
+        let config_dir = registry.join("config");
+        std::fs::create_dir(&config_dir).expect("private server config directory");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+        // Cargo injects its test library search path. Start the installed app with
+        // the ordinary loader environment so it uses its verified Elan rpath.
+        for key in ["DYLD_FALLBACK_LIBRARY_PATH", "LD_LIBRARY_PATH"] {
+            command.env_remove(key);
+        }
         command
             .arg("--lake-root")
             .arg(project_root)
@@ -165,7 +200,7 @@ impl StdioServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(dir) = built_workers_dir() {
+        if let Some(dir) = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR") {
             command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
         }
         let mut child = command.spawn().expect("spawn lean-host-mcp stdio server");
@@ -342,16 +377,6 @@ fn fixture_root() -> PathBuf {
         .parent()
         .expect("workspace has repository parent")
         .join("fixtures/lean")
-}
-
-/// Hardcoding `target/debug` resolved to a stale or missing worker whenever the
-/// suite was built in another profile; derive it from the binary under test.
-fn built_workers_dir() -> Option<PathBuf> {
-    support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp"))
-}
-
-fn built_worker_binary() -> Option<PathBuf> {
-    built_workers_dir().map(|dir| dir.join("lean-host-mcp-worker"))
 }
 
 #[cfg(unix)]

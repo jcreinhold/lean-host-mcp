@@ -149,7 +149,7 @@ run_gate "cargo build -p lean-host-mcp-worker --all-targets" \
 # The worker crate has no tests of its own (a 2-line entry point); the worker
 # build gate above is its coverage. Test the parent per-member.
 run_gate "cargo test -p lean-host-mcp --all-targets" \
-	cargo test -p lean-host-mcp --all-targets
+	scripts/test-installed-stdio.sh --all-targets
 
 # -- Key invariant: the parent must NOT link libleanshared ------------------
 #

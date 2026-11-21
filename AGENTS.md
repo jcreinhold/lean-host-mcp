@@ -18,11 +18,12 @@ cargo build -p lean-host-mcp
 cargo build -p lean-host-mcp-worker
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p lean-host-mcp
+cargo test -p lean-host-mcp --lib
+scripts/test-installed-stdio.sh --all-targets
 cargo test -p lean-host-mcp --test http_transport
 ```
 
-The parent tests need no Lean fixture. Opt-in e2e tests require built fixture `.olean` files and a matching worker:
+The parent library tests need no Lean fixture. The all-target runner provisions a disposable installed worker for the stdio EOF check. Opt-in e2e tests require built fixture `.olean` files and a matching worker:
 
 ```sh
 LEAN_HOST_MCP_WORKERS_DIR=$PWD/target/release \
