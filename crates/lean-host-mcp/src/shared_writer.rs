@@ -156,6 +156,31 @@ struct Record {
     process: Option<ProcessIdentity>,
 }
 
+#[derive(Clone, Copy)]
+enum OwnerRecordUse {
+    Predecessor,
+    EmbeddedLaunch,
+}
+
+#[derive(Deserialize)]
+enum SdkIdlePhase {
+    #[serde(rename = "idle")]
+    Idle,
+}
+
+// SDK settlement preserves the project lock's exact Idle record. Decode
+// that shape only for passive admission. An embedded launch still requires
+// the embedded writer's own committed process record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SdkIdleRecord {
+    version: u32,
+    owner: Owner,
+    process: (),
+    storage_turn: String,
+    command_phase: SdkIdlePhase,
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -239,7 +264,7 @@ fn persist_all(file: &mut File, loans: &[File], record: &Record) -> io::Result<(
     Ok(())
 }
 
-fn owner(file: &mut File) -> io::Result<Option<Record>> {
+fn owner(file: &mut File, use_for: OwnerRecordUse) -> io::Result<Option<Record>> {
     file.rewind()?;
     let mut bytes = Vec::new();
     file.take(4097).read_to_end(&mut bytes)?;
@@ -251,7 +276,32 @@ fn owner(file: &mut File) -> io::Result<Option<Record>> {
         // precedes any command; never launch after a failed metadata commit.
         return Ok(None);
     }
-    let record: Record = serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+    decode_owner(&bytes, use_for).map(Some)
+}
+
+fn decode_owner(bytes: &[u8], use_for: OwnerRecordUse) -> io::Result<Record> {
+    let record: Record = match serde_json::from_slice(bytes) {
+        Ok(record) => record,
+        Err(error) if matches!(use_for, OwnerRecordUse::EmbeddedLaunch) => return Err(invalid(error.to_string())),
+        Err(_) => {
+            let SdkIdleRecord {
+                version,
+                owner,
+                process: (),
+                storage_turn,
+                command_phase: SdkIdlePhase::Idle,
+            } = serde_json::from_slice(bytes)
+                .map_err(|error| invalid(format!("invalid embedded or SDK Idle owner record: {error}")))?;
+            if storage_turn.len() != 32 || !storage_turn.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(invalid("SDK Idle record has no exact storage turn"));
+            }
+            Record {
+                version,
+                owner,
+                process: None,
+            }
+        }
+    };
     let identity = &record.owner;
     if record.version != PROTOCOL
         || identity.version != PROTOCOL
@@ -270,7 +320,7 @@ fn owner(file: &mut File) -> io::Result<Option<Record>> {
     {
         return Err(invalid("writer stage has no exact process group identity"));
     }
-    Ok(Some(record))
+    Ok(record)
 }
 
 fn canonical(path: &Path) -> io::Result<()> {
@@ -420,7 +470,7 @@ fn acquire_while_until(
         {
             return Err(invalid("writer lock inode or canonical identity changed"));
         }
-        let previous = owner(&mut file)?;
+        let previous = owner(&mut file, OwnerRecordUse::Predecessor)?;
         if !lean_toolchain::shared_writer::previous_writer_stopped(&file)?
             || (!shared
                 && !lean_toolchain::native_guardian::protected_native_reads_stopped(
@@ -798,7 +848,8 @@ pub fn run_exec() -> io::Result<()> {
             .ok_or_else(|| invalid("writer lock binding missing"))?,
     );
     let mut check = OpenOptions::new().read(true).write(true).open(lock_path)?;
-    let committed = owner(&mut check)?.ok_or_else(|| invalid("writer launch ownership is not committed"))?;
+    let committed = owner(&mut check, OwnerRecordUse::EmbeddedLaunch)?
+        .ok_or_else(|| invalid("writer launch ownership is not committed"))?;
     let process = committed
         .process
         .as_ref()
@@ -1525,14 +1576,61 @@ mod tests {
         assert!(duration(0.0).is_err());
         let mut file = tempfile::tempfile().expect("fixture");
         file.write_all(b"{}\n").expect("fixture");
-        assert!(owner(&mut file).is_err());
+        assert!(owner(&mut file, OwnerRecordUse::EmbeddedLaunch).is_err());
+    }
+
+    #[test]
+    fn sdk_predecessor_requires_exact_idle_and_does_not_authorize_embedded_launch() {
+        let idle = json!({
+            "version": 1,
+            "owner": {"version": 1, "pid": 1, "start": "prior-owner", "session": 1},
+            "process": null,
+            "storage_turn": "0".repeat(32),
+            "command_phase": "idle"
+        });
+        let decode =
+            |value: &Value, use_for| decode_owner(&serde_json::to_vec(value).expect("fixture owner record"), use_for);
+        let prior = decode(&idle, OwnerRecordUse::Predecessor).expect("exact SDK Idle predecessor");
+        assert_eq!(prior.owner.start, "prior-owner");
+        assert!(decode(&idle, OwnerRecordUse::EmbeddedLaunch).is_err());
+
+        for (key, value) in [
+            ("process", None),
+            ("process", Some(json!({}))),
+            ("storage_turn", None),
+            ("storage_turn", Some(json!("not-a-turn"))),
+            ("command_phase", Some(json!("starting"))),
+            ("unknown", Some(json!(true))),
+        ] {
+            let mut invalid = idle.clone();
+            let record = invalid.as_object_mut().expect("fixture owner object");
+            if let Some(value) = value {
+                record.insert(key.to_owned(), value);
+            } else {
+                record.remove(key);
+            }
+            assert!(decode(&invalid, OwnerRecordUse::Predecessor).is_err(), "{invalid}");
+        }
+
+        let mut running = idle;
+        let record = running.as_object_mut().expect("fixture owner object");
+        record.insert("command_phase".to_owned(), json!("running"));
+        record.insert(
+            "process".to_owned(),
+            json!({"pid": 2, "process_group": 2, "session": 1, "start": "child", "start_new_session": false}),
+        );
+        assert!(decode(&running, OwnerRecordUse::Predecessor).is_err());
     }
 
     #[test]
     fn torn_prelaunch_record_is_not_committed() {
         let mut file = tempfile::tempfile().expect("fixture");
         file.write_all(b"{\"version\":1").expect("fixture");
-        assert!(owner(&mut file).expect("uncommitted").is_none());
+        assert!(
+            owner(&mut file, OwnerRecordUse::EmbeddedLaunch)
+                .expect("uncommitted")
+                .is_none()
+        );
     }
 }
 

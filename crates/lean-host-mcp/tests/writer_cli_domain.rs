@@ -365,18 +365,23 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
             .arg("2")
             .env(REGISTRY_ENV, &registry)
             .env("TMPDIR", &scratch)
+            .env_remove("LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER")
             .env_remove("LEAN_HOST_MCP_WRITER_LOCK_LOANS");
         command
     };
-
-    // Save a decodable predecessor for the reserve-before-owner-publication
-    // cut. Otherwise the embedded writer's old record parser would refuse
-    // the SDK phase fields before exercising the storage admission fence.
-    let mut prior = OwnedHelper::spawn(&mut host(&fixture.root, &fixture.domain));
-    assert_eq!(prior.frame()["state"], "locked");
-    prior.close_input();
-    assert!(prior.finish().status.success());
-    let prior_owner = fs::read(&fixture.domain).expect("saved prior owner");
+    let write_marker = |project: &Path, lock: &Path, marker: &Path| {
+        let mut writer = OwnedHelper::spawn(&mut host(project, lock));
+        assert_eq!(writer.frame()["state"], "locked");
+        writer.send(&marker_command(marker));
+        assert_eq!(writer.frame()["state"], "started");
+        let stopped = writer.frame();
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["owned_work_stopped"], true);
+        assert_eq!(stopped["exit_code"], 0);
+        writer.close_input();
+        assert!(writer.finish().status.success());
+        assert_eq!(fs::read(marker).expect("writer payload ran"), b"dispatched");
+    };
 
     let roots: Vec<_> = [
         ("project", &fixture.root),
@@ -391,7 +396,7 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     .collect();
     let digest = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
     let request = json!({
-        "version":1,"floor_bytes":0,"budget_bytes":1048576,"command_only":true,
+        "version":1,"floor_bytes":0,"budget_bytes":1_048_576,"command_only":true,
         "handoff_sha256":digest,"roots":roots,
     });
     let mut command = Command::new(&standalone);
@@ -419,6 +424,10 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     let charge = registry.join(".writer-storage-v1").join(turn);
     let charged = fs::read(&charge).expect("real retained charge");
     let extended_owner = fs::read(&fixture.domain).expect("exact original owner");
+    let owner_record: Value = serde_json::from_slice(&extended_owner).expect("genuine SDK owner record");
+    assert_eq!(owner_record["storage_turn"], turn);
+    assert_eq!(owner_record["command_phase"], "idle");
+    assert_eq!(owner_record.get("process"), Some(&Value::Null));
     let registry_identity = fs::metadata(&registry).expect("exact registry");
     let registry_args = [
         "--registry",
@@ -456,18 +465,6 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
         serde_json::from_slice::<Value>(&charged).expect("valid charge")["handoff_sha256"],
         digest
     );
-    {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&fixture.domain)
-            .expect("same inode");
-        file.try_lock().expect("all original process locks closed");
-        file.set_len(0).expect("restore test-only predecessor");
-        file.write_all(&prior_owner).expect("write predecessor bytes");
-        file.sync_all().expect("sync fixture interruption cut");
-    }
-
     let marker = root.join("dispatched");
     let overlap = OwnedHelper::spawn(&mut host(&fixture.root, &fixture.domain));
     let blocked = overlap.finish();
@@ -477,39 +474,20 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
         "{blocked:?}"
     );
     assert!(!marker.exists());
-    assert_eq!(fs::read(&fixture.domain).expect("owner record retained"), prior_owner);
+    assert_eq!(
+        fs::read(&fixture.domain).expect("owner record retained"),
+        extended_owner
+    );
     assert_eq!(fs::read(&charge).expect("charge retained"), charged);
     assert_eq!(fs::read(asset.join("handoff.json")).expect("scratch retained"), b"{}");
 
     let domain = project_lock_path(&disjoint).expect("disjoint lock domain");
-    let mut separate = OwnedHelper::spawn(&mut host(&disjoint, &domain));
-    assert_eq!(separate.frame()["state"], "locked");
-    separate.send(&marker_command(&marker));
-    assert_eq!(separate.frame()["state"], "started");
-    let stopped = separate.frame();
-    assert_eq!(stopped["state"], "stopped");
-    assert_eq!(stopped["owned_work_stopped"], true);
-    assert_eq!(stopped["exit_code"], 0);
-    separate.close_input();
-    assert!(separate.finish().status.success());
-    assert_eq!(fs::read(&marker).expect("disjoint payload ran"), b"dispatched");
+    write_marker(&disjoint, &domain, &marker);
     assert_eq!(fs::read(&charge).expect("disjoint admission retained charge"), charged);
     assert_eq!(
         fs::read(&fixture.domain).expect("unrelated owner unchanged"),
-        prior_owner
+        extended_owner
     );
-    // Restore the actual record to undo only the deliberate fixture cut.
-    {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&fixture.domain)
-            .expect("same inode");
-        file.try_lock().expect("no overlapping work admitted");
-        file.set_len(0).expect("restore actual test owner");
-        file.write_all(&extended_owner).expect("restore exact owner bytes");
-        file.sync_all().expect("sync fixture restoration");
-    }
     let recovered = Command::new(&standalone)
         .args(["writer-storage", "recover"])
         .args(registry_args)
@@ -538,11 +516,50 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     );
     let allowed = rollback(true).output().expect("check legitimately settled rollback");
     assert!(allowed.status.success(), "{allowed:?}");
+    assert_eq!(
+        fs::read(&fixture.domain).expect("settlement preserves the genuine SDK Idle record"),
+        extended_owner
+    );
     let saved_registry = root.join("unavailable-owners");
     fs::rename(&registry, &saved_registry).expect("make disposable registry unavailable");
     let unavailable = rollback(true).output().expect("check unavailable registry");
     assert!(!unavailable.status.success());
     fs::rename(&saved_registry, &registry).expect("restore disposable registry");
+
+    let fifo = scratch.join("rollback-reader.fifo");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .expect("create private rollback reader control")
+            .success()
+    );
+    let control = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("keep reader alive");
+    let mut reader = OwnedHelper::spawn(
+        Command::new(executable())
+            .arg("read-proxy")
+            .arg(&fixture.root)
+            .arg(&fixture.domain)
+            .args(["2", "settled-turn-epoch"])
+            .arg(&fifo)
+            .env(REGISTRY_ENV, &registry),
+    );
+    let receipt = reader.frame();
+    assert_eq!(receipt["state"], "read_ready");
+    let epoch: Value =
+        serde_json::from_str(receipt["epoch"].as_str().expect("owner epoch")).expect("valid owner epoch");
+    assert_eq!(epoch, owner_record["owner"]);
+    drop(control);
+    assert!(reader.finish().status.success());
+
+    // Roll back to a matched host with source handoffs disabled. The 0.16.10
+    // and 0.16.11 embedded parsers reject this genuine settled SDK record.
+    write_marker(&fixture.root, &fixture.domain, &root.join("rollback-dispatched"));
 }
 
 #[test]
