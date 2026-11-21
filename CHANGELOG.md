@@ -9,10 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.8] - 2026-11-21
+
 ### Changed
 
 - Adopt published lean-rs 0.10.2 and use Lean 4.36.0 for the release fixture.
-
 - Verify current project files in a supervised Lean process using the selected Lake module setup. Check
   project inputs again when transferring them from writer to reader custody. A missing or changed input
   prevents verification.
@@ -665,7 +666,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.5...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.8...HEAD
+[0.16.8]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.7...v0.16.8
 [0.16.5]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.2...v0.16.3

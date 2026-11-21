@@ -158,7 +158,7 @@ run_gate "cargo test -p lean-host-mcp --all-targets" \
 # would silently re-link the dylib). Then assert with the platform linker.
 gate_link_invariant() {
 	cargo build --release -p lean-host-mcp
-	local bin="target/release/lean-host-mcp"
+	local bin="${CARGO_TARGET_DIR:-target}/release/lean-host-mcp"
 	[[ -x "$bin" ]] || {
 		log_err "expected release binary not found: $bin"
 		return 1
