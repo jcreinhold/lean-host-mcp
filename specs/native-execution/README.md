@@ -71,10 +71,19 @@ a surviving caller write. The other writer profiles keep their existing paths.
 The rollout case lets the caller negotiate with the standalone helper while
 the supported embedded launcher still lacks the charge fence. Admission also
 requires an observed drain and exact agreement across the two supported launchers.
-Rollback to an unaware writer requires observed runtime quiescence and settlement
-of the extended charge. Drain and agreement are trusted inputs that stay valid
-through the switch for the named supported launcher set. Process discovery and
-pin enforcement outside that scope require separate evidence.
+The caller can retain a captured approval while the operator revokes or replaces
+it. The model checks the presented generation in the same committed transition
+that creates the charge. A committed revocation disables admission before
+reporting whether the retained charge makes the registry busy. This disable
+uses the same abstract admission lock as publication. A busy response leaves
+the charge in place and approval disabled. Explicit reapproval issues a distinct
+generation, which lets a fresh request publish while the old approval stays stale.
+
+Rollback to an unaware writer requires observed runtime quiescence, disabled
+approval and a successful drain check after any extended charge settles. Drain
+and agreement are trusted inputs for the named supported launchers. Real tests
+must establish filesystem publication, lock ordering and confirmed disable.
+Process discovery and pin enforcement outside that scope require separate evidence.
 
 Automatic recovery requires a command-only turn with durable idle records.
 An older caller-owned turn needs an independently authenticated fact that

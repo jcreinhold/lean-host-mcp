@@ -778,6 +778,76 @@
       "witness": true
     },
     {
+      "name": "host-writer-rollout-revoked-approval",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\"",
+        "Mutation": "\"writer-reserve-revoked\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterRolloutApprovalSafe"],
+      "properties": [],
+      "invariant": "WriterRolloutApprovalSafe"
+    },
+    {
+      "name": "host-writer-rollout-superseded-approval",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\"",
+        "Mutation": "\"writer-reserve-superseded\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterRolloutApprovalSafe"],
+      "properties": [],
+      "invariant": "WriterRolloutApprovalSafe"
+    },
+    {
+      "name": "host-writer-rollout-busy-revoke-enables",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\"",
+        "Mutation": "\"writer-busy-revoke-enabled\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterRolloutRevocationSafe"],
+      "properties": [],
+      "invariant": "WriterRolloutRevocationSafe"
+    },
+    {
+      "name": "host-writer-rollout-busy-revocation",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoBusyWriterRevocation"],
+      "properties": [],
+      "invariant": "NoBusyWriterRevocation",
+      "witness": true
+    },
+    {
+      "name": "host-writer-rollout-reapproved-publication",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoReapprovedWriterPublication"],
+      "properties": [],
+      "invariant": "NoReapprovedWriterPublication",
+      "witness": true
+    },
+    {
       "name": "host-writer-rollout-negotiate-only",
       "model": "Stages",
       "specification": "WriterSpec",

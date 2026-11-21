@@ -46,7 +46,9 @@ HostInit == Init /\ h = [
     stage |-> "none", stageDigest |-> <<>>, stageAck |-> <<>>,
     helperWrite |-> FALSE, callerWrite |-> FALSE,
     rollout |-> [negotiated |-> FALSE, agreed |-> {"standalone"}, drained |-> FALSE,
-      selected |-> "older", rollbackDrained |-> FALSE],
+      selected |-> "older", rollbackDrained |-> FALSE,
+      generation |-> 0, enabled |-> FALSE, captured |-> {}, publication |-> <<>>,
+      revocation |-> "none"],
     result |-> "none", resultAtLoss |-> "none", outcome |-> "none",
     attestation |-> <<>>, operatorAck |-> <<>>,
     scratch |-> FALSE, cleanup |-> "none", intentBound |-> FALSE, evidence |-> <<>>,
@@ -360,6 +362,8 @@ SupportedWriterLaunchers == {"standalone","embedded"}
 WriterRolloutReady == WriterRollout.negotiated /\ WriterRollout.drained
   /\ WriterRollout.agreed=SupportedWriterLaunchers
 ExtendedWriterCharge == WriterRolloutCase /\ Writer.phase/="new" /\ Writer.settlements=0
+EnabledWriterGeneration == IF WriterRollout.enabled THEN WriterRollout.generation ELSE 0
+WriterApprovalRequests == IF WriterRolloutCase THEN WriterRollout.captured ELSE {0}
 OriginalHandoff == [source |-> Original, store |-> NativeId, file |-> "store-file-a",
   manifest |-> "manifest-a", audit |-> "audit-a", notices |-> "notices-a"]
 WriterInputs == {OriginalHandoff,
@@ -408,11 +412,18 @@ CaptureWriterHandoff == HostOnly(Writer.handoff= <<>>
 \* Invalidation can retain every original identifier (edit and restore).
 InvalidateWriterInput == HostOnly(Writer.handoff/= <<>> /\ Writer.checked= <<>> /\ Writer.valid
   /\ h'=[h EXCEPT !.writer.valid=FALSE])
-ReserveWriter == HostOnly(Writer.phase="new" /\ Writer.handoff=OriginalHandoff
+WriterReadyToReserve == Writer.phase="new" /\ Writer.handoff=OriginalHandoff
   /\ h.closure=Scope /\ h.domains=0
-  /\ (~WriterRolloutCase \/ WriterRollout.selected="extended")
+\* Approval comparison and charge publication share the registry admission lock.
+ReserveWriter(requested) == HostOnly(WriterReadyToReserve
+  /\ (~WriterRolloutCase \/ (WriterRollout.selected="extended"
+      /\ (requested=EnabledWriterGeneration
+          \/ (Mutation="writer-reserve-revoked" /\ ~WriterRollout.enabled)
+          \/ (Mutation="writer-reserve-superseded" /\ WriterRollout.enabled))))
   /\ h'=[h EXCEPT !.writer.phase="idle", !.writer.scratch=TRUE, !.writer.oldLocks=TRUE,
-     !.writer.admittedHandoff=WriterReservation])
+     !.writer.admittedHandoff=WriterReservation,
+     !.writer.rollout.publication=IF WriterRolloutCase THEN <<requested,EnabledWriterGeneration>> ELSE @,
+     !.writer.rollout.rollbackDrained=FALSE])
 ValidWriterInput(input) == WriterDigest(input)=Writer.admittedHandoff.digest /\ Writer.valid
 
 \* The admission receipt and durable Idle precede staging. Only the helper
@@ -489,17 +500,33 @@ ObserveWriterLauncherAgreement == HostOnly(WriterRolloutCase /\ WriterRollout.se
   /\ h'=[h EXCEPT !.writer.rollout.agreed=SupportedWriterLaunchers])
 ObserveWriterSwitchDrain == HostOnly(WriterRolloutCase /\ WriterRollout.selected="older" /\ ~WriterRollout.drained
   /\ h'=[h EXCEPT !.writer.rollout.drained=TRUE])
-SelectExtendedWriter == HostOnly(WriterRolloutCase /\ WriterRollout.selected="older"
+PublishWriterApproval == HostOnly(WriterRolloutCase /\ WriterRollout.selected/="rolled-back"
+  /\ ~WriterRollout.enabled /\ WriterRollout.generation<2
   /\ (WriterRolloutReady
       \/ (Mutation="writer-negotiate-only" /\ WriterRollout.negotiated /\ WriterRollout.drained))
-  /\ h'=[h EXCEPT !.writer.rollout.selected="extended"])
+  /\ h'=[h EXCEPT !.writer.rollout.selected="extended", !.writer.rollout.generation=@+1,
+     !.writer.rollout.enabled=TRUE, !.writer.rollout.revocation="none", !.writer.rollout.rollbackDrained=FALSE])
+CaptureWriterApproval == HostOnly(WriterRolloutCase /\ Writer.phase="new" /\ WriterRollout.enabled
+  /\ WriterRollout.generation \notin WriterRollout.captured
+  /\ h'=[h EXCEPT !.writer.rollout.captured=@ \cup {WriterRollout.generation}])
+\* Revocation commits disable under the same lock, including a busy result.
+\* A later scan may confirm an empty ledger without changing captured tokens.
+WriterRevocationResult == IF ExtendedWriterCharge THEN "busy" ELSE "clear"
+RevokeWriterApproval == HostOnly(WriterRolloutCase /\ WriterRollout.selected="extended"
+  /\ (WriterRollout.enabled \/ WriterRollout.revocation/=WriterRevocationResult)
+  /\ h'=[h EXCEPT !.writer.rollout.revocation=WriterRevocationResult,
+     !.writer.rollout.enabled=IF Mutation="writer-busy-revoke-enabled" /\ ExtendedWriterCharge THEN @ ELSE FALSE])
 \* Supported-launcher quiescence and ledger settlement are separate observations.
 ObserveWriterRollbackDrain == HostOnly(WriterRolloutCase /\ WriterRollout.selected="extended"
-  /\ Writer.interrupted /\ ~Writer.oldLocks /\ ~WriterMayWrite /\ ~WriterRollout.rollbackDrained
+  /\ ~WriterRollout.enabled
+  /\ (Writer.phase="new" \/ (Writer.interrupted /\ ~Writer.oldLocks /\ ~WriterMayWrite))
+  /\ ~WriterRollout.rollbackDrained
   /\ h'=[h EXCEPT !.writer.rollout.rollbackDrained=TRUE])
 SelectUnawareWriter == HostOnly(WriterRolloutCase /\ WriterRollout.selected="extended"
+  /\ ~WriterRollout.enabled
   /\ (WriterRollout.rollbackDrained \/ Mutation="writer-rollback-without-drain")
-  /\ (~ExtendedWriterCharge \/ Mutation="writer-rollback-unsettled")
+  /\ ((WriterRollout.revocation="clear" /\ ~ExtendedWriterCharge)
+      \/ (Mutation="writer-rollback-unsettled" /\ WriterRollout.revocation="busy" /\ ExtendedWriterCharge))
   /\ h'=[h EXCEPT !.writer.rollout.selected="rolled-back"])
 
 \* An independently authenticated fact for this exact turn certifies that
@@ -558,9 +585,11 @@ WriterOverlap == (Writer.settlements=1
   \/ (Mutation="writer-overlap-early" /\ Writer.interrupted /\ ~Writer.oldLocks /\ WriterMayWrite))
   /\ AdmitSuccessor
 WriterOther == Writer.interrupted /\ (Mutation/="writer-global-fence" \/ Writer.settlements=1) /\ Other
-WriterFlow == WriterReader \/ CaptureWriterHandoff \/ ReserveWriter
-  \/ NegotiateWriterRollout \/ ObserveWriterLauncherAgreement \/ ObserveWriterSwitchDrain \/ SelectExtendedWriter
-  \/ ObserveWriterRollbackDrain \/ SelectUnawareWriter
+WriterFlow == WriterReader \/ CaptureWriterHandoff
+  \/ (\E requested \in WriterApprovalRequests: ReserveWriter(requested))
+  \/ NegotiateWriterRollout \/ ObserveWriterLauncherAgreement \/ ObserveWriterSwitchDrain
+  \/ PublishWriterApproval \/ CaptureWriterApproval \/ RevokeWriterApproval \/ ObserveWriterRollbackDrain
+  \/ SelectUnawareWriter
   \/ (\E input \in WriterInputs: BeginHelperStaging(input)) \/ CommitHelperStaging \/ AcknowledgeHelperStaging
   \/ (\E input \in WriterInputs: ValidateWriterInput(input))
   \/ ArmWriter \/ RunWriter \/ PublishWriterIdle \/ SaveWriterResult
@@ -587,8 +616,12 @@ WriterStageSafe ==
 WriterStageSettlesClosed ==
   (HelperOwnedTurn /\ Writer.settlements>0) => ~Writer.helperWrite /\ ~Writer.callerWrite
 WriterRolloutAdmissionSafe == (WriterRolloutCase /\ Writer.phase/="new") => WriterRolloutReady
+WriterRolloutApprovalSafe == (WriterRolloutCase /\ Writer.phase/="new") =>
+  WriterRollout.publication \in {<<1,1>>,<<2,2>>}
+WriterRolloutRevocationSafe == (WriterRolloutCase /\ WriterRollout.revocation/="none") => ~WriterRollout.enabled
 WriterRolloutRollbackSafe == (WriterRolloutCase /\ WriterRollout.selected="rolled-back") =>
-  WriterRollout.rollbackDrained /\ ~ExtendedWriterCharge
+  WriterRollout.rollbackDrained /\ ~WriterRollout.enabled
+  /\ WriterRollout.revocation="clear" /\ ~ExtendedWriterCharge
 WriterNoReplay == Writer.starts<=1
 WriterOperatorSafe ==
   /\ (Writer.operatorAck/= <<>> => OperatorCase /\ Writer.interrupted /\ ExactOperatorAck)
@@ -608,7 +641,7 @@ WriterUnverifiableFenced == ~ExactWriterEvidenceAvailable =>
   Writer.settlements=0 /\ h.successor="queued"
 WriterSafety == WriterHandoffSafe /\ WriterStageSafe /\ WriterStageSettlesClosed /\ WriterNoReplay /\ WriterCleanupSafe
   /\ WriterSettlesOnce /\ WriterOutcomeStable /\ WriterOverlapSafe /\ WriterUnverifiableFenced /\ WriterOperatorSafe
-  /\ WriterRolloutAdmissionSafe /\ WriterRolloutRollbackSafe
+  /\ WriterRolloutAdmissionSafe /\ WriterRolloutApprovalSafe /\ WriterRolloutRevocationSafe /\ WriterRolloutRollbackSafe
 WriterRecoveryProgress ==
   [] ((WriterRecoveryAuthorized /\ ~Writer.oldLocks /\ WriterRecoveryInputs)
       => (([] WriterRecoveryInputs) => <> (Writer.settlements=1)))
@@ -639,11 +672,15 @@ NoHelperStageInvalidSourceRetirement ==
     /\ Writer.result="none" /\ Writer.settlements=1)
 NoMixedWriterNegotiation ==
   ~(WriterRollout.negotiated /\ WriterRollout.drained /\ WriterRollout.agreed/=SupportedWriterLaunchers
-    /\ WriterRollout.selected="older" /\ Writer.phase="new"
-    /\ Writer.handoff=OriginalHandoff /\ h.closure=Scope /\ h.domains=0)
+    /\ WriterRollout.selected="older" /\ WriterReadyToReserve)
 NoDrainedWriterRollback ==
   ~(WriterRollout.selected="rolled-back" /\ WriterRollout.rollbackDrained /\ Writer.settlements=1
     /\ Writer.outcome="unknown")
+NoBusyWriterRevocation ==
+  ~(ExtendedWriterCharge /\ WriterRollout.revocation="busy" /\ ~WriterRollout.enabled
+    /\ WriterRollout.publication= <<1,1>>)
+NoReapprovedWriterPublication ==
+  ~(WriterRollout.publication= <<2,2>> /\ 1 \in WriterRollout.captured)
 OperatorFenceExercised == ~Writer.oldLocks /\ h.unrelated="done"
 NoOperatorAckOnlyDisjoint == ~(ExactOperatorAck /\ Writer.attestation= <<>> /\ OperatorFenceExercised)
 NoOperatorStaleDisjoint == ~(ExactOperatorAck /\ Writer.attestation=StaleWriterTurnKey /\ OperatorFenceExercised)
