@@ -2492,6 +2492,24 @@ impl ProjectActorState {
             let actual = self.handle.host_runtime_metadata().ok_or_else(|| {
                 ServerError::BadProject("actual host runtime metadata missing after completed native call".into())
             })?;
+            if let Some(input) = &self.config.prepared_generation {
+                #[derive(serde::Deserialize)]
+                struct Generation {
+                    plan: RootPlan,
+                }
+                #[derive(serde::Deserialize)]
+                struct RootPlan {
+                    roots: Vec<String>,
+                }
+                let generation: Generation =
+                    serde_json::from_str(input).map_err(|err| ServerError::BadProject(err.to_string()))?;
+                if actual.effective_import_roots.as_ref() != Some(&generation.plan.roots) {
+                    self.config.healthy.store(false, Ordering::Release);
+                    return Err(ServerError::BadProject(
+                        "opened worker import order differs from prepared generation".into(),
+                    ));
+                }
+            }
             let proposed =
                 crate::runtime_compatibility::contract_from_loaded(actual).map_err(ServerError::BadProject)?;
             let (instance, contract) = self

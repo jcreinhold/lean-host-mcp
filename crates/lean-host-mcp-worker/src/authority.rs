@@ -37,6 +37,7 @@ struct Deployment {
 pub(super) struct Installed {
     record: Deployment,
     launch_input: Option<String>,
+    held_project: std::sync::OnceLock<lean_host_mcp_worker::prepared_project::PreparedProject>,
     project: PathBuf,
     guards: Vec<fs::File>,
 }
@@ -205,6 +206,7 @@ impl Installed {
         }
         Ok(Self {
             launch_input,
+            held_project: std::sync::OnceLock::new(),
             record,
             project,
             guards,
@@ -264,7 +266,7 @@ impl WorkerAuthority for Installed {
     }
     #[allow(
         unsafe_code,
-        reason = "the installer-owned empty project and both held shim roots cannot shadow the builtin import"
+        reason = "the installed application retains the approved import generation and checks the exact import profile"
     )]
     fn imports<'c>(
         &self,
@@ -277,7 +279,10 @@ impl WorkerAuthority for Installed {
             use lean_host_mcp_worker::prepared_project::PreparedGeneration;
             let generation: PreparedGeneration = serde_json::from_str(input).map_err(|_| deny())?;
             let ordered = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
-            let _held = PreparedGeneration::verify_before_import(
+            if options != HostImportOptions::default() {
+                return Err(deny());
+            }
+            let held = PreparedGeneration::verify_before_import(
                 input,
                 generation.project(),
                 &self.record.sysroot.join("lib/lean"),
@@ -286,9 +291,13 @@ impl WorkerAuthority for Installed {
                 &names,
             )
             .map_err(|e| lean_rs::error::host_internal(format!("prepared generation refused before import: {e}")))?;
-            return Err(lean_rs::error::host_internal(
-                "prepared generation checked; project imports remain closed",
-            ));
+            self.held_project.get_or_init(|| held);
+            // SAFETY: the operator selects a trusted fresh-build record at server startup.
+            // The matched launcher replaces inherited input. The verified digest covers the
+            // approved plugin-free modules and their resolved dependencies, and this authority
+            // retains the project and shim read guards for the worker lifetime. The operator
+            // keeps the selected Elan runtime installed. Only default import options reach here.
+            return Ok(unsafe { cap.import_scope_with_options(paths, names, options) });
         }
         let expected = std::iter::once(self.project.join(".lake/build/lib/lean"))
             .chain(self.record.prepared.shim_search_paths.iter().map(PathBuf::from))
@@ -310,6 +319,16 @@ impl WorkerAuthority for Installed {
         // SAFETY: the retained application guards cover all earlier roots in exact order; Init
         // resolves to the trusted official runtime, with no project or shim Init namespace.
         Ok(unsafe { cap.import_scope_with_options(paths, names, options) })
+    }
+    fn validate_source_context(&self, _: &WorkerSourceContext<'_, '_>, observed: Option<&[String]>) -> LeanResult<()> {
+        if self.launch_input.is_some() {
+            self.held_project
+                .get()
+                .ok_or_else(deny)?
+                .check_observed(observed)
+                .map_err(|e| lean_rs::error::host_internal(e.to_string()))?;
+        }
+        Ok(())
     }
     fn project(
         &self,

@@ -89,7 +89,7 @@ impl PreparedProject {
 
 /// Closed build selection, supplied by the operator/preparer, never extracted from a theorem request.
 /// Each local module belongs to one SDK writer domain and uses the default Lake output layout.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportPlan {
     project: PathBuf,
@@ -145,7 +145,7 @@ impl ImportPlan {
             return Err(invalid());
         }
         let mut hash = Sha256::new();
-        hash.update(serde_json::to_vec(&("prepared-project-v1", self))?);
+        hash.update(serde_json::to_vec(&("fresh-built-project-v2", self))?);
         for (name, domain) in &self.modules {
             let selected = lean_toolchain::olean_candidate(&self.roots, name, |p| fs::metadata(p))
                 .map_err(io::Error::other)?
@@ -221,11 +221,47 @@ impl ImportPlan {
         }
         Ok(())
     }
-    /// Capture only after a successful fresh build with independently selected, plugin-free sources.
-    /// The caller supplies the complete local graph, including transitive modules. Capture while the *same* writer still holds all local build domains after successful preparation.
-    pub fn finish(self, writer: &mut lean_toolchain::shared_writer::SharedWriter) -> io::Result<PreparedGeneration> {
+    /// Build the selected plugin-free default-layout project from clean output domains
+    /// and capture the result before releasing the same writer.
+    pub fn build_generation(
+        self,
+        writer: &mut lean_toolchain::shared_writer::SharedWriter,
+    ) -> io::Result<PreparedGeneration> {
         if writer.project_root() != self.project || !writer.covers_project(&self.project)? {
             return Err(invalid());
+        }
+        let (target, domain) = self.modules.first().ok_or_else(invalid)?;
+        if domain != &self.project || !target.bytes().all(|b| b.is_ascii_alphanumeric()) || target.is_empty() {
+            return Err(invalid());
+        }
+        for domain in project_artifact_roots(&self.project)? {
+            if !writer.write_roots().contains(&domain) {
+                return Err(invalid());
+            }
+            match fs::symlink_metadata(domain.join(".lake/build")) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "prepared build requires absent output trees",
+                    ));
+                }
+            }
+        }
+        let lake = self
+            .release
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(invalid)?
+            .join("bin/lake");
+        let mut cmd = std::process::Command::new(lake);
+        cmd.current_dir(&self.project)
+            .env("LAKE_ARTIFACT_CACHE", "false")
+            .args(["--no-cache", "build", target]);
+        let built = writer.run(&cmd, std::time::Duration::from_secs(90))?;
+        if !built.status.success() {
+            return Err(io::Error::other(String::from_utf8_lossy(&built.stderr).into_owned()));
         }
         let identity = self.identity(writer.write_roots())?;
         self.check_edges(writer)?;
@@ -415,23 +451,31 @@ fn build_path_dependency() -> io::Result<()> {
         &project,
         Duration::from_secs(10),
     )?;
-    let mut command = Command::new(&lake);
-    command.args(["--no-cache", "build", "Root"]).current_dir(&project);
-    let built = writer.run(&command, Duration::from_secs(90))?;
-    if !built.status.success() {
-        return Err(io::Error::other(String::from_utf8_lossy(&built.stderr).into_owned()));
-    }
     let release = lake
         .parent()
         .and_then(Path::parent)
         .ok_or_else(invalid)?
         .join("lib/lean");
-    let roots = vec![
-        dep.join(".lake/build/lib/lean"),
-        project.join(".lake/build/lib/lean"),
-        release.clone(),
-        release.clone(),
-    ];
+    let installed = std::env::var_os("TEST_INSTALLED_SIDECAR");
+    let roots = if let Some(ref path) = installed {
+        let sidecar: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        let mut roots = vec![project.join(".lake/build/lib/lean"), dep.join(".lake/build/lib/lean")];
+        for root in sidecar["deployment"]["prepared"]["shim_search_paths"]
+            .as_array()
+            .ok_or_else(invalid)?
+        {
+            roots.push(PathBuf::from(root.as_str().ok_or_else(invalid)?));
+        }
+        roots.push(release.clone());
+        roots
+    } else {
+        vec![
+            dep.join(".lake/build/lib/lean"),
+            project.join(".lake/build/lib/lean"),
+            release.clone(),
+            release.clone(),
+        ]
+    };
     let plan = ImportPlan::new(
         project.clone(),
         roots,
@@ -444,47 +488,27 @@ fn build_path_dependency() -> io::Result<()> {
         plan.release.clone(),
         vec![("Root".into(), project.clone())],
     );
-    assert!(matches!(incomplete.finish(&mut writer), Err(e) if e.to_string().contains("unapproved source import")));
-    let generation = plan.finish(&mut writer)?;
-    fs::write(base.join("launch-input"), generation.launch_input()?)?;
+    let stale = dep.join(".lake/build/lib/lean/Dep.olean");
+    fs::create_dir_all(stale.parent().ok_or_else(invalid)?)?;
+    fs::write(&stale, b"untrusted stale fixture leaf")?;
+    assert!(matches!(plan.clone().build_generation(&mut writer), Err(e) if e.kind()==io::ErrorKind::AlreadyExists));
+    assert!(!project.join(".lake/build").exists());
+    fs::remove_file(&stale)?;
+    for dir in ["lib/lean", "lib", ""] {
+        fs::remove_dir(dep.join(".lake/build").join(dir))?;
+    }
+    let generation = plan.build_generation(&mut writer)?;
+    assert!(
+        matches!(incomplete.check_edges(&mut writer), Err(e) if e.to_string().contains("unapproved source import"))
+    );
+    let output = if installed.is_some() {
+        "installed-input"
+    } else {
+        "launch-input"
+    };
+    fs::write(base.join(output), generation.launch_input()?)?;
     drop(writer);
     Ok(())
-}
-
-#[test]
-#[ignore = "requires the installed disposable worker and existing path-dependency project"]
-fn prepare_installed_generation() -> io::Result<()> {
-    use lean_toolchain::shared_writer::SharedWriter;
-    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/r2-prepared-project")
-        .canonicalize()?;
-    let project = base.join("project");
-    let dep = project.join("deps/dep");
-    let sidecar = fs::read(std::env::var_os("TEST_INSTALLED_SIDECAR").ok_or_else(invalid)?)?;
-    let sidecar: serde_json::Value = serde_json::from_slice(&sidecar)?;
-    let deployment = &sidecar["deployment"];
-    let release = Path::new(deployment["sysroot"].as_str().ok_or_else(invalid)?).join("lib/lean");
-    let mut roots = vec![project.join(".lake/build/lib/lean"), dep.join(".lake/build/lib/lean")];
-    for root in deployment["prepared"]["shim_search_paths"]
-        .as_array()
-        .ok_or_else(invalid)?
-    {
-        roots.push(PathBuf::from(root.as_str().ok_or_else(invalid)?));
-    }
-    roots.push(release.clone());
-    let mut writer = SharedWriter::open(
-        &base.join("tools/bin/lean-rs-writer"),
-        &project,
-        std::time::Duration::from_secs(10),
-    )?;
-    let plan = ImportPlan::new(
-        project.clone(),
-        roots,
-        release,
-        vec![("Root".into(), project), ("Dep".into(), dep)],
-    );
-    let record = plan.finish(&mut writer)?.launch_input()?;
-    fs::write(base.join("installed-input"), record)
 }
 
 #[test]
