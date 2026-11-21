@@ -885,14 +885,13 @@ impl Capture {
     }
 
     fn read_available(&mut self) -> io::Result<bool> {
-        if self.overflowed {
-            return Ok(true);
-        }
         let mut buffer = [0_u8; 4096];
         // Bound each poll even under continuous output or interrupt delivery.
+        // After overflow, keep draining without retaining more bytes while the
+        // existing owner requests stop and observes closure.
         for _ in 0..32 {
             match rustix::io::read(&self.descriptor, &mut buffer) {
-                Ok(0) => return Ok(false),
+                Ok(0) => return Ok(self.overflowed),
                 Ok(count) => {
                     let keep = count.min(CAPTURE_BYTES.saturating_sub(self.bytes.len()));
                     self.bytes.extend_from_slice(
@@ -900,17 +899,19 @@ impl Capture {
                             .get(..keep)
                             .ok_or_else(|| invalid("capture read count invalid"))?,
                     );
-                    if keep < count {
+                    if keep < count && !self.overflowed {
                         self.overflowed = true;
+                        // Report the first overflow before another read can fail.
+                        // Later polls still drain and discard within the budget.
                         return Ok(true);
                     }
                 }
-                Err(error) if error == rustix::io::Errno::AGAIN => return Ok(false),
+                Err(error) if error == rustix::io::Errno::AGAIN => return Ok(self.overflowed),
                 Err(error) if error == rustix::io::Errno::INTR => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(false)
+        Ok(self.overflowed)
     }
 
     fn text(&self) -> String {
@@ -1322,6 +1323,62 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_reports_first_overflow_then_keeps_draining_without_growing_prefix() {
+        let (read, write) = pipe().expect("test pipe");
+        fcntl_setfl(&read, fcntl_getfl(&read).expect("read flags") | OFlags::NONBLOCK).expect("nonblocking reader");
+        fcntl_setfl(&write, fcntl_getfl(&write).expect("write flags") | OFlags::NONBLOCK).expect("nonblocking writer");
+        let mut capture = Capture {
+            descriptor: read,
+            bytes: Vec::new(),
+            overflowed: false,
+        };
+        let chunk = [b'x'; 1024];
+        // Every poll must consume the next chunk even after overflow. A reader
+        // that merely returns its overflow flag leaves these bytes in the pipe.
+        for index in 0..256 {
+            assert_eq!(rustix::io::write(&write, &chunk).expect("write chunk"), chunk.len());
+            assert_eq!(capture.read_available().expect("drain chunk"), index >= 64);
+            if index == 64 {
+                assert!(
+                    capture.overflowed,
+                    "the first excess chunk reports overflow immediately"
+                );
+                assert_eq!(capture.bytes.len(), CAPTURE_BYTES);
+            }
+            // Includes the first transition and every later poll: no queued
+            // chunk may survive just because the overflow flag is already set.
+            let mut leftover = [0; 1];
+            assert_eq!(
+                rustix::io::read(&capture.descriptor, &mut leftover),
+                Err(rustix::io::Errno::AGAIN)
+            );
+            assert_eq!(capture.bytes.len(), ((index + 1) * chunk.len()).min(CAPTURE_BYTES));
+        }
+        assert!(capture.bytes.iter().all(|byte| *byte == b'x'));
+        drop(write);
+        assert!(capture.read_available().expect("overflow remains visible at EOF"));
+    }
+
+    #[test]
+    fn capture_exact_limit_is_not_overflow() {
+        let (read, write) = pipe().expect("test pipe");
+        fcntl_setfl(&read, fcntl_getfl(&read).expect("read flags") | OFlags::NONBLOCK).expect("nonblocking reader");
+        let mut capture = Capture {
+            descriptor: read,
+            bytes: Vec::new(),
+            overflowed: false,
+        };
+        let chunk = [b'a'; 1024];
+        for _ in 0..64 {
+            assert_eq!(rustix::io::write(&write, &chunk).expect("write chunk"), chunk.len());
+            assert!(!capture.read_available().expect("drain exact prefix"));
+        }
+        drop(write);
+        assert!(!capture.read_available().expect("exact prefix EOF"));
+        assert_eq!(capture.bytes.len(), CAPTURE_BYTES);
+    }
 
     fn process_identity() -> ProcessIdentity {
         ProcessIdentity {
