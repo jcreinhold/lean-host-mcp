@@ -93,6 +93,11 @@ struct ServeArgs {
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
 
+    /// Operator-reviewed verify-batch-v1 digest for this primary project.
+    /// Records startup policy only; the released worker keeps native source grants closed.
+    #[arg(long)]
+    verification_approval: Option<String>,
+
     /// Directory for durable epoch-bound request results. One broker per directory;
     /// old requests are recovered as evidence, never replayed.
     #[arg(long, env = "LEAN_HOST_MCP_REQUEST_JOURNAL")]
@@ -264,7 +269,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let max_projects = max_workers; // Legacy internal name; the limit counts worker processes.
     let approved = env_default.clone().or(home_primary);
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?
-        .with_operator_primary(approved.as_deref())?;
+        .with_operator_primary(approved.as_deref())?
+        .with_verification_input(args.verification_approval)?;
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -544,6 +550,44 @@ mod tests {
             assert!(output.contains("transport error"));
             assert!(output.contains("request summary"));
         }
+    }
+
+    #[test]
+    fn verification_approval_is_bound_to_explicit_startup_and_primary() {
+        let tree = tempfile::tempdir().expect("test project");
+        let project = tree.path().canonicalize().expect("canonical project");
+        let digest = format!("verify-batch-v1:{}", "ab".repeat(32));
+        std::fs::write(
+            project.join("lean-host-mcp.toml"),
+            format!("verification_approval = '{digest}'"),
+        )
+        .expect("local settings");
+        let cli = Cli::parse_from(["lean-host-mcp"]);
+        assert!(cli.serve.verification_approval.is_none());
+        let (config, _) = ConfigFile::load_for_server(&project);
+        let runtime = ProjectRuntimeConfig::from_env_with_file(&config.runtime, 1)
+            .expect("runtime")
+            .with_operator_primary(Some(&project))
+            .expect("select project");
+        assert!(runtime.verification_input_for(&project).is_none());
+        let explicit = Cli::parse_from(["lean-host-mcp", "--verification-approval", &digest]);
+        let selected = runtime
+            .with_verification_input(explicit.serve.verification_approval)
+            .expect("startup input");
+        assert_eq!(selected.verification_input_for(&project), Some(digest.as_str()));
+        assert!(selected.verification_input_for(&project.join("other")).is_none());
+        assert!(
+            selected
+                .with_operator_primary(None)
+                .expect("clear selection")
+                .verification_input_for(&project)
+                .is_none()
+        );
+        assert!(
+            ProjectRuntimeConfig::default()
+                .with_verification_input(Some(digest))
+                .is_err()
+        );
     }
 
     #[test]

@@ -67,13 +67,67 @@ fn hash(p: &Path) -> io::Result<[u8; 32]> {
     Ok(h.finalize().into())
 }
 impl Approval {
+    // A versioned, length-delimited JSON tuple binds the existing typed preflight
+    // without transporting source text or inventing a persistent approval file.
+    fn launch_input(&self, operator_project: &Path) -> io::Result<String> {
+        canonical(operator_project)?;
+        if operator_project != self.project {
+            return Err(refusal());
+        }
+        let [entry] = self.batch.targets.as_slice() else {
+            return Err(refusal());
+        };
+        let Target::Name { name } = &entry.target else {
+            return Err(refusal());
+        };
+        let source = Sha256::digest(self.batch.source.as_bytes());
+        let opts = &self.options;
+        let bytes = serde_json::to_vec(&(
+            "lean-host-mcp/verify-batch/1",
+            &self.project,
+            &self.generation,
+            self.worker_hash,
+            self.sidecar_hash,
+            &self.roots,
+            source.as_slice(),
+            (
+                &entry.id,
+                name,
+                matches!(
+                    self.batch.sorry_policy,
+                    lean_rs::host_bridge::module_requests::SorryPolicy::Deny
+                ),
+                self.batch.report_axioms,
+                self.batch.budgets.per_field_bytes,
+                self.batch.budgets.total_bytes,
+            ),
+            (
+                &opts.file,
+                &opts.namespace,
+                &opts.options_json,
+                opts.heartbeats,
+                opts.diagnostic_bytes,
+            ),
+        ))?;
+        use std::fmt::Write as _;
+        let mut input = String::from("verify-batch-v1:");
+        for byte in Sha256::digest(bytes) {
+            write!(&mut input, "{byte:02x}").map_err(io::Error::other)?;
+        }
+        Ok(input)
+    }
+
     fn check(
         &self,
+        launch_input: Option<&str>,
         worker: &Path,
         batch: &Batch,
         options: &HostSourceOptions,
         observed: Option<&[PathBuf]>,
     ) -> io::Result<Vec<File>> {
+        if launch_input != Some(self.launch_input(&self.project)?.as_str()) {
+            return Err(refusal());
+        }
         let [entry] = self.batch.targets.as_slice() else {
             return Err(refusal());
         };
@@ -127,6 +181,10 @@ impl Approval {
 
 #[test]
 fn independent_batch_approval() -> io::Result<()> {
+    check_handoff(|explicit| Ok(explicit.to_owned()))
+}
+
+pub(super) fn check_handoff(deliver: impl FnOnce(&str) -> io::Result<String>) -> io::Result<()> {
     use lean_rs::host_bridge::module_requests::{DeclarationVerificationBatchItem, SorryPolicy};
     let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -178,7 +236,18 @@ fn independent_batch_approval() -> io::Result<()> {
         options: options.clone(),
         roots: roots.iter().map(|p| (p.clone(), p.clone())).collect(),
     };
-    let check = |b: &Batch, o: &HostSourceOptions, r: Option<&[PathBuf]>| policy.check(&worker, b, o, r);
+    let selected = policy.launch_input(&project)?;
+    let launch_input = deliver(&selected)?;
+    assert_eq!(launch_input, selected);
+    assert!(policy.launch_input(&release).is_err());
+    assert!(policy.check(None, &worker, &batch, &options, Some(&roots)).is_err());
+    assert!(
+        policy
+            .check(Some("verify-batch-v1:stale"), &worker, &batch, &options, Some(&roots))
+            .is_err()
+    );
+    let check =
+        |b: &Batch, o: &HostSourceOptions, r: Option<&[PathBuf]>| policy.check(Some(&launch_input), &worker, b, o, r);
     let guards = check(&batch, &options, Some(&roots))?;
     let lock = File::open(lean_toolchain::shared_writer::project_lock_path(&project)?)?;
     assert!(lock.try_lock().is_err());
@@ -228,7 +297,11 @@ fn independent_batch_approval() -> io::Result<()> {
     File::create_new(release_lock)?;
     let alternate = scratch.join("same-worker-bytes");
     fs::copy(&worker, &alternate)?;
-    assert!(policy.check(&alternate, &batch, &options, Some(&roots)).is_err());
+    assert!(
+        policy
+            .check(Some(&launch_input), &alternate, &batch, &options, Some(&roots))
+            .is_err()
+    );
     drop(check(&batch, &options, Some(&roots))?);
     fs::write(sidecar, b"different generation record")?;
     assert!(check(&batch, &options, Some(&roots)).is_err());

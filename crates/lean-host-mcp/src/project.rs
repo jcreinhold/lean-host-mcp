@@ -282,6 +282,7 @@ const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectRuntimeConfig {
     operator_primary: Option<PathBuf>,
+    verification_input: Option<String>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -315,7 +316,40 @@ impl ProjectRuntimeConfig {
     /// Returns an error if the selected directory cannot be resolved.
     pub fn with_operator_primary(mut self, root: Option<&Path>) -> std::io::Result<Self> {
         self.operator_primary = root.map(Path::canonicalize).transpose()?;
+        self.verification_input = None;
         Ok(self)
+    }
+
+    /// Attach operator-selected startup data to this exact primary root. This alone enables no operation.
+    ///
+    /// # Errors
+    ///
+    /// An approval requires a selected project and a versioned lowercase SHA-256 digest.
+    pub fn with_verification_input(mut self, value: Option<String>) -> std::io::Result<Self> {
+        if let Some(value) = &value {
+            let digest = value.strip_prefix("verify-batch-v1:").unwrap_or("");
+            if self.operator_primary.is_none()
+                || digest.len() != 64
+                || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "verification approval requires an operator-selected root and verify-batch-v1 SHA-256",
+                ));
+            }
+        }
+        self.verification_input = value;
+        Ok(self)
+    }
+
+    /// Immutable launch data for the selected canonical project. Worker grants are independent.
+    #[must_use]
+    pub fn verification_input_for(&self, canonical_root: &Path) -> Option<&str> {
+        if self.operator_primary.as_deref() == Some(canonical_root) {
+            self.verification_input.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Defaults for a broker that keeps up to `max_projects` worker children
@@ -331,6 +365,7 @@ impl ProjectRuntimeConfig {
         let import_residue_budget_bytes = default_import_residue_budget_bytes(max_projects);
         Self {
             operator_primary: None,
+            verification_input: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -591,6 +626,7 @@ fn parse_runtime_config(
     .saturating_mul(1024 * 1024);
     let config = ProjectRuntimeConfig {
         operator_primary: None,
+        verification_input: None,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),
