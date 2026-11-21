@@ -361,6 +361,8 @@ The provenance sidecar records the worker wire-protocol version independently of
   `worker.json`. Use `--shim-source DIR` or `--standalone-writer PATH` for explicit inputs. After the builtin
   `Nat.add_zero` inspection and successful shutdown it atomically updates `current-generation`. Existing workers
   retain their original paths. Installs without a selector continue to use the legacy directory.
+  The installed shims and their compiled Lean imports run without the source checkout or Cargo source cache.
+  To use a different worker root, reinstall there. The SDK manifest records absolute paths for its generation.
 - `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
   `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
 - `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are

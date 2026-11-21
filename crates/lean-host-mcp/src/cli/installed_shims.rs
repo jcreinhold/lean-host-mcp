@@ -350,20 +350,31 @@ mod tests {
         };
         let slot = env_path("R2_CANDIDATE")?;
         let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
-        let candidate = super::super::install_worker::prepare_generation(
-            &slot,
-            &id,
-            &id.elan_dir()?.canonicalize()?,
-            &env_path("R2_SHIM_SOURCE")?,
-            &env_path("R2_WRITER")?,
-            |dir| {
-                fs::copy(env_path("R2_WORKER")?, dir.join(crate::toolchain::WORKER_FILE_NAME))?;
-                Ok(())
-            },
-        )?;
+        let prepare = || {
+            super::super::install_worker::prepare_generation(
+                &slot,
+                &id,
+                &id.elan_dir()?.canonicalize()?,
+                &env_path("R2_SHIM_SOURCE")?,
+                &env_path("R2_WRITER")?,
+                |dir| {
+                    fs::copy(env_path("R2_WORKER")?, dir.join(crate::toolchain::WORKER_FILE_NAME))?;
+                    Ok(())
+                },
+            )
+        };
+        let previous = prepare()?;
+        let selector = slot.join("current-generation");
+        let prior = previous
+            .file_name()
+            .context("missing generation name")?
+            .as_encoded_bytes();
+        use std::io::Write as _;
+        fs::File::create_new(&selector)?.write_all(prior)?;
+        let candidate = prepare()?;
         ensure!(
-            !slot.join("current-generation").exists(),
-            "qualification unexpectedly activated a worker"
+            fs::read(&selector)? == prior,
+            "preparation changed the selected generation"
         );
         let worker = candidate.join(crate::toolchain::WORKER_FILE_NAME);
         let sidecar = candidate.join("worker.json");
@@ -384,6 +395,44 @@ mod tests {
             );
             Ok(())
         };
+        let relative = Path::new(
+            value
+                .pointer("/deployment/prepared/shim_manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .context("missing sidecar manifest path")?,
+        );
+        ensure!(
+            relative.is_relative(),
+            "sidecar must locate the installed manifest relatively"
+        );
+        let ready = std::process::Command::new(&worker)
+            .current_dir(&previous)
+            .arg("--lean-rs-ready-host-artifacts")
+            .output()?;
+        ensure!(ready.status.success(), "installed worker readiness failed");
+        let prepared: LeanWorkerPreparedHostArtifacts = serde_json::from_slice(&ready.stdout)?;
+        ensure!(
+            Path::new(&prepared.shim_manifest_path) == candidate.join(relative),
+            "worker resolved the manifest outside its own generation"
+        );
+        let support =
+            Path::new(prepared.shim_search_paths.first().context("missing interop root")?).join("LeanRsInterop.olean");
+        ensure!(
+            support.canonicalize()? == support && support.starts_with(&candidate),
+            "unexpected support path"
+        );
+        let original_support = fs::read(&support)?;
+        fs::remove_file(&support)?;
+        let missing = refuse("NotFound");
+        fs::write(&support, b"substituted test module")?;
+        let substituted = refuse("installed file digest mismatch");
+        fs::write(&support, original_support)?;
+        missing?;
+        substituted?;
+        ensure!(
+            fs::read(&selector)? == prior,
+            "refused candidate replaced the selected generation"
+        );
         *value
             .pointer_mut("/deployment/worker_sha256")
             .context("worker digest")? = serde_json::Value::String("0".repeat(64));
