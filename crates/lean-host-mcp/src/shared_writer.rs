@@ -1304,6 +1304,7 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
         admission_closed.get()
     };
     let borrowed = inherited.is_some();
+    let admission = duration(args.admission)?;
     // This guard coordinates admission only. Artifact EX aliases and process
     // fences still prevent readers after helper death or uncertain cleanup.
     let (locks, _demand) = if let Some(locks) = inherited {
@@ -1313,12 +1314,13 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
         // Inherited custody may also include source-entry locks. Only physical
         // artifact domains participate in native reader demand coordination.
         let paths = workspace_domains(&workspaces)?;
-        let demand = WriterDemand::announce(&paths, duration(args.admission)?, &cancelled)?;
+        let demand = WriterDemand::announce(&paths, admission, &cancelled)?;
         (locks, demand)
     } else {
-        lock_workspaces(&workspaces, &args.lock, duration(args.admission)?, &cancelled)?
+        lock_workspaces(&workspaces, &args.lock, admission, &cancelled)?
     };
     validate_workspace_custody(&workspaces, &locks)?;
+    lean_toolchain::native_guardian::writer_storage::ensure_no_writer_storage_charge(&locks, admission)?;
     let receipt = if borrowed {
         lean_toolchain::shared_writer::writer_lock_receipt(&locks)?
     } else {

@@ -337,6 +337,136 @@ fn cli_writer_succeeds(fixture: &Fixture) {
 }
 
 #[test]
+#[ignore = "requires the matched standalone SDK writer with staged handoff support"]
+fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    const REGISTRY_ENV: &str = lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV;
+    let fixture = Fixture::new();
+    let root = fixture.root.parent().expect("private fixture parent");
+    let registry = root.join("owners");
+    let scratch = root.join("scratch");
+    let disjoint = root.join("Disjoint");
+    for dir in [&registry, &scratch, &disjoint] {
+        fs::create_dir(dir).expect("private fixture directory");
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("private fixture permissions");
+    }
+    let standalone = PathBuf::from(
+        std::env::var_os("LEAN_HOST_MCP_MATCHED_SDK_WRITER").expect("set canonical matched standalone SDK writer"),
+    );
+    assert_eq!(standalone.canonicalize().expect("matched SDK writer"), standalone);
+
+    let host = |project: &Path, lock: &Path| {
+        let mut command = Command::new(executable());
+        command
+            .arg("writer")
+            .arg(project)
+            .arg(lock)
+            .arg("2")
+            .env(REGISTRY_ENV, &registry)
+            .env("TMPDIR", &scratch)
+            .env_remove("LEAN_HOST_MCP_WRITER_LOCK_LOANS");
+        command
+    };
+
+    // Save a decodable predecessor for the reserve-before-owner-publication
+    // cut. Otherwise the embedded writer's old record parser would refuse
+    // the SDK phase fields before exercising the storage admission fence.
+    let mut prior = OwnedHelper::spawn(&mut host(&fixture.root, &fixture.domain));
+    assert_eq!(prior.frame()["state"], "locked");
+    prior.close_input();
+    assert!(prior.finish().status.success());
+    let prior_owner = fs::read(&fixture.domain).expect("saved prior owner");
+
+    let roots: Vec<_> = [
+        ("project", &fixture.root),
+        ("registry", &registry),
+        ("scratch_parent", &scratch),
+    ]
+    .into_iter()
+    .map(|(role, path)| {
+        let metadata = fs::metadata(path).expect("exact storage root");
+        json!({"role":role,"path":path,"device":metadata.dev(),"inode":metadata.ino()})
+    })
+    .collect();
+    let digest = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+    let request = json!({
+        "version":1,"floor_bytes":0,"budget_bytes":1048576,"command_only":true,
+        "handoff_sha256":digest,"roots":roots,
+    });
+    let mut command = Command::new(standalone);
+    command
+        .arg("writer")
+        .arg(&fixture.root)
+        .arg(&fixture.domain)
+        .args(["2", "--storage-request", &request.to_string()])
+        .env(REGISTRY_ENV, &registry)
+        .env_remove("LEAN_HOST_MCP_WRITER_LOCK_LOANS");
+    let mut old = OwnedHelper::spawn(&mut command);
+    let ready = old.frame();
+    assert_eq!(ready["state"], "locked");
+    assert_eq!(ready["handoff"]["handoff_sha256"], digest);
+    let turn = ready["handoff"]["turn"].as_str().expect("extended storage turn");
+    old.send(&json!({"action":"stage_handoff","turn":turn,"data_hex":"7b7d"}));
+    assert_eq!(old.frame()["state"], "handoff_staged");
+    old.close_input();
+    assert!(
+        !old.finish().status.success(),
+        "EOF must retain the unclosed storage turn"
+    );
+
+    let asset = Path::new(ready["asset_dir"].as_str().expect("bound scratch"));
+    let charge = registry.join(".writer-storage-v1").join(turn);
+    let charged = fs::read(&charge).expect("real retained charge");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&charged).expect("valid charge")["handoff_sha256"],
+        digest
+    );
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture.domain)
+            .expect("same inode");
+        file.try_lock().expect("all original process locks closed");
+        file.set_len(0).expect("restore test-only predecessor");
+        file.write_all(&prior_owner).expect("write predecessor bytes");
+        file.sync_all().expect("sync fixture interruption cut");
+    }
+
+    let marker = root.join("dispatched");
+    let overlap = OwnedHelper::spawn(&mut host(&fixture.root, &fixture.domain));
+    let blocked = overlap.finish();
+    assert!(!blocked.status.success() && blocked.stdout.is_empty(), "{blocked:?}");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("prior writer storage custody remains open"),
+        "{blocked:?}"
+    );
+    assert!(!marker.exists());
+    assert_eq!(fs::read(&fixture.domain).expect("owner record retained"), prior_owner);
+    assert_eq!(fs::read(&charge).expect("charge retained"), charged);
+    assert_eq!(fs::read(asset.join("handoff.json")).expect("scratch retained"), b"{}");
+
+    let domain = project_lock_path(&disjoint).expect("disjoint lock domain");
+    let mut separate = OwnedHelper::spawn(&mut host(&disjoint, &domain));
+    assert_eq!(separate.frame()["state"], "locked");
+    separate.send(&marker_command(&marker));
+    assert_eq!(separate.frame()["state"], "started");
+    let stopped = separate.frame();
+    assert_eq!(stopped["state"], "stopped");
+    assert_eq!(stopped["owned_work_stopped"], true);
+    assert_eq!(stopped["exit_code"], 0);
+    separate.close_input();
+    assert!(separate.finish().status.success());
+    assert_eq!(fs::read(&marker).expect("disjoint payload ran"), b"dispatched");
+    assert_eq!(fs::read(&charge).expect("disjoint admission retained charge"), charged);
+    assert_eq!(
+        fs::read(&fixture.domain).expect("unrelated owner unchanged"),
+        prior_owner
+    );
+}
+
+#[test]
 #[serial]
 fn alternate_cli_domains_are_rejected_before_ack_or_go_while_canonical_ex_is_held() {
     let fixture = Fixture::new();
