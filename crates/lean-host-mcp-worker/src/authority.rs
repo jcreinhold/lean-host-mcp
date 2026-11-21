@@ -36,6 +36,7 @@ struct Deployment {
 }
 pub(super) struct Installed {
     record: Deployment,
+    launch_input: Option<String>,
     project: PathBuf,
     guards: Vec<fs::File>,
 }
@@ -193,7 +194,17 @@ impl Installed {
                 }
             }
         }
+        let launch_input = std::env::var_os("LEAN_RS_WORKER_APPLICATION_INPUT")
+            .map(|s| {
+                s.into_string()
+                    .map_err(|_| invalid("invalid prepared generation encoding"))
+            })
+            .transpose()?;
+        if launch_input.as_ref().is_some_and(|s| s.len() > 4096) {
+            return Err(invalid("oversized prepared generation"));
+        }
         Ok(Self {
+            launch_input,
             record,
             project,
             guards,
@@ -262,6 +273,23 @@ impl WorkerAuthority for Installed {
         names: Vec<String>,
         options: HostImportOptions,
     ) -> LeanResult<TrustedHostImports<'static, 'c>> {
+        if let Some(input) = &self.launch_input {
+            use lean_host_mcp_worker::prepared_project::PreparedGeneration;
+            let generation: PreparedGeneration = serde_json::from_str(input).map_err(|_| deny())?;
+            let ordered = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+            let _held = PreparedGeneration::verify_before_import(
+                input,
+                generation.project(),
+                &self.record.sysroot.join("lib/lean"),
+                &expected_roots(&self.record).collect::<Vec<_>>(),
+                &ordered,
+                &names,
+            )
+            .map_err(|e| lean_rs::error::host_internal(format!("prepared generation refused before import: {e}")))?;
+            return Err(lean_rs::error::host_internal(
+                "prepared generation checked; project imports remain closed",
+            ));
+        }
         let expected = std::iter::once(self.project.join(".lake/build/lib/lean"))
             .chain(self.record.prepared.shim_search_paths.iter().map(PathBuf::from))
             .collect::<Vec<_>>();

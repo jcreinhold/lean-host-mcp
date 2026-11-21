@@ -98,6 +98,10 @@ struct ServeArgs {
     #[arg(long)]
     verification_approval: Option<String>,
 
+    /// Exact prepared generation JSON selected by the operator for the primary project.
+    #[arg(long)]
+    prepared_generation: Option<String>,
+
     /// Directory for durable epoch-bound request results. One broker per directory;
     /// old requests are recovered as evidence, never replayed.
     #[arg(long, env = "LEAN_HOST_MCP_REQUEST_JOURNAL")]
@@ -270,7 +274,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let approved = env_default.clone().or(home_primary);
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?
         .with_operator_primary(approved.as_deref())?
-        .with_verification_input(args.verification_approval)?;
+        .with_verification_input(args.verification_approval)?
+        .with_prepared_generation(args.prepared_generation)?;
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());

@@ -283,6 +283,7 @@ const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 pub struct ProjectRuntimeConfig {
     operator_primary: Option<PathBuf>,
     verification_input: Option<String>,
+    prepared_generation: Option<String>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -317,6 +318,7 @@ impl ProjectRuntimeConfig {
     pub fn with_operator_primary(mut self, root: Option<&Path>) -> std::io::Result<Self> {
         self.operator_primary = root.map(Path::canonicalize).transpose()?;
         self.verification_input = None;
+        self.prepared_generation = None;
         Ok(self)
     }
 
@@ -339,6 +341,29 @@ impl ProjectRuntimeConfig {
             }
         }
         self.verification_input = value;
+        Ok(self)
+    }
+
+    /// Bind a producer's bounded record to the operator-selected primary at server startup.
+    ///
+    /// # Errors
+    /// Refuses a record selected for any other project.
+    pub fn with_prepared_generation(mut self, input: Option<String>) -> std::io::Result<Self> {
+        if let Some(text) = &input {
+            let invalid = || std::io::Error::other("invalid prepared generation for primary project");
+            if text.len() > 4096 {
+                return Err(invalid());
+            }
+            let value: serde_json::Value = serde_json::from_str(text)?;
+            let root = value
+                .pointer("/plan/project")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            if self.operator_primary.as_deref() != Some(Path::new(root)) {
+                return Err(invalid());
+            }
+        }
+        self.prepared_generation = input;
         Ok(self)
     }
 
@@ -366,6 +391,7 @@ impl ProjectRuntimeConfig {
         Self {
             operator_primary: None,
             verification_input: None,
+            prepared_generation: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -627,6 +653,7 @@ fn parse_runtime_config(
     let config = ProjectRuntimeConfig {
         operator_primary: None,
         verification_input: None,
+        prepared_generation: None,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),
@@ -1776,6 +1803,7 @@ impl Drop for LeanProject {
 
 #[derive(Clone)]
 struct ActorConfig {
+    prepared_generation: Option<String>,
     maintenance: crate::broker::MaintenanceAccess,
     lake_root: PathBuf,
     manifest_hash: String,
@@ -1910,6 +1938,10 @@ impl ActorConfig {
         let config = Self {
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: meta.canonical_root.clone(),
+            prepared_generation: runtime_config
+                .prepared_generation
+                .clone()
+                .filter(|_| runtime_config.operator_primary.as_ref() == Some(&meta.canonical_root)),
             manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
             worker_path,
@@ -3560,6 +3592,18 @@ fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
 
 /// One explicit owner namespace and actor slot for ordinary and companion
 /// generations. Prepared storage facts never substitute for loaded checks.
+// SDK b32e706a supplies the inherent method. Older releases must refuse a selected
+// generation before launch; they cannot deliver authenticated parent startup input.
+#[allow(dead_code, reason = "the matching SDK supplies the inherent method")]
+trait MissingApplicationInput {
+    fn application_launch_input(self, _: &str) -> std::io::Result<LeanWorkerChild>;
+}
+impl MissingApplicationInput for LeanWorkerChild {
+    fn application_launch_input(self, _: &str) -> std::io::Result<LeanWorkerChild> {
+        Err(std::io::Error::other("SDK lacks explicit application launch input"))
+    }
+}
+
 fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerChild> {
     let writer = crate::shared_writer::contract()?;
     // Unit actor tests use a framed Python child that never loads Lean. The
@@ -3585,6 +3629,13 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
         .shared_artifact_reads(true);
     if let Some(artifacts) = &config.prepared_host_artifacts {
         child = child.prepared_host_artifacts(artifacts.clone());
+    }
+    if scope == "main"
+        && let Some(input) = &config.prepared_generation
+    {
+        child = child
+            .application_launch_input(input)
+            .map_err(|e| ServerError::BadProject(e.to_string()))?;
     }
     Ok(child)
 }
@@ -4293,6 +4344,7 @@ mod tests {
             import_residue_limit_bytes: None,
         }));
         let mut config = ActorConfig {
+            prepared_generation: None,
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: tmp.path().join("consumer"),
             manifest_hash: "sha256-test".to_owned(),
