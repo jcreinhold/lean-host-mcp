@@ -68,6 +68,7 @@ use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
 mod control;
+mod module_setup;
 mod preparation;
 mod semantic_file;
 mod verify_file;

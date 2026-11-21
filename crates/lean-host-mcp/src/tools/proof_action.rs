@@ -701,15 +701,21 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
         };
         let file_label = prepared.file_label.clone();
         let issue = |request: LeanWorkerDeclarationVerificationBatchRequest| {
-            let scoped = source_fact
-                .is_some()
-                .then(|| ctx.broker.prepared_generation())
-                .flatten();
+            let file_backed = source_fact.is_some();
+            let scoped = file_backed.then(|| ctx.broker.prepared_generation()).flatten();
             let hint = hint.clone();
             let imports = prepared.imports.clone();
             let session = session_imports(imports.clone());
             let options = elab_options(&file_label, ctx.config.output.heartbeat_limit);
             async move {
+                if file_backed && scoped.is_none() {
+                    ctx.broker
+                        .prepare_file_setup(&hint, &options.file_label, &request.source)
+                        .await?;
+                    return Err(crate::error::ServerError::BadProject(
+                        "Lake module setup staged; installed verification shim lacks setup-aware elaboration".into(),
+                    ));
+                }
                 if let Some(selection) = scoped {
                     ctx.broker
                         .verify_file(hint, session, imports, request, options, selection)
