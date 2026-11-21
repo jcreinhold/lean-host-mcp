@@ -173,6 +173,42 @@ def row(reply):
     return envelope["data"]["results"][0]
 
 
+def check_reader_frames(project):
+    driver = b / "ReaderFrame.lean"
+    driver.write_text("""import LeanRsFixture.ProofSearchFacts
+
+def main (args : List String) : IO Unit := do
+  IO.eprintln (String.ofList (List.replicate 4096 'w'))
+  if args == ["large"] then
+    IO.println (String.ofList (List.replicate 256 'x'))
+  else
+    IO.println (LeanRsFixture.ProofSearchFacts.cast 42)
+""")
+    try:
+        for large in (False, True):
+            result = s.run(
+                [parent, "native-reader", "--stdout-result-frame", "--project-root", project,
+                 "--capacity-limit", "1", "--timeout-millis", "15000", "--max-output-bytes", "64",
+                 "--", release / "bin/lean", "--run", driver, *(["large"] if large else [])],
+                cwd=project, env={**env, "LEAN_PATH": str(project / ".lake/build/lib/lean")},
+                capture_output=True, timeout=30,
+            )
+            assert result.stdout.endswith(b"\n") and result.stdout.count(b"\n") == 1, result.stderr
+            frame = json.loads(result.stdout)
+            assert frame["target_started"] is True and frame["scope_closed"] is True, frame
+            assert frame["exit_code"] == 0 and frame["stderr"] == "w" * 64, frame
+            assert any(d["project_root"] == str(project) for d in frame["protected_domains"]), frame
+            assert frame["output_truncated"] is large, frame
+            if large:
+                assert result.returncode == 1 and frame["state"] == "stopped", frame
+                assert frame["detail"] == "required payload stdout exceeds capture limit", frame
+            else:
+                assert result.returncode == 0 and frame["state"] == "completed", frame
+                assert frame["stdout"] == "42\n" and frame["detail"] == "payload stderr diagnostic clipped", frame
+    finally:
+        driver.unlink()
+
+
 for label, plugin in [("project", True), ("omitted", False)]:
     project = b / label
     if not args.already_built:
@@ -182,6 +218,7 @@ for label, plugin in [("project", True), ("omitted", False)]:
     before = inventory(project)
     proof = probe(project)
     if plugin:
+        check_reader_frames(project)
         lookup = probe(project, search=True)
         for tool, response in [("lean_verify", proof), ("lean_lookup", lookup)]:
             if "error" in response:
