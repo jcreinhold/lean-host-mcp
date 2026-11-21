@@ -69,6 +69,7 @@ use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResu
 
 mod control;
 mod preparation;
+mod verify_file;
 mod writer_handoff;
 pub(crate) use control::MaintenanceAccess;
 pub use control::{
@@ -808,6 +809,10 @@ impl ProjectBroker {
         out.freshness.elaboration_options = Some(option_facts);
         drop(project);
         Ok(out)
+    }
+
+    pub(crate) fn prepared_generation(&self) -> Option<&str> {
+        self.runtime_config.prepared_generation()
     }
 
     /// Verify several declarations in one source snapshot through the project runtime.

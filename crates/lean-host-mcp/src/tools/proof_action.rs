@@ -701,13 +701,25 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
         };
         let file_label = prepared.file_label.clone();
         let issue = |request: LeanWorkerDeclarationVerificationBatchRequest| {
-            ctx.broker.verify_declaration_batch(
-                hint.clone(),
-                session_imports(prepared.imports.clone()),
-                prepared.imports.clone(),
-                request,
-                elab_options(&file_label, ctx.config.output.heartbeat_limit),
-            )
+            let scoped = source_fact
+                .is_some()
+                .then(|| ctx.broker.prepared_generation())
+                .flatten();
+            let hint = hint.clone();
+            let imports = prepared.imports.clone();
+            let session = session_imports(imports.clone());
+            let options = elab_options(&file_label, ctx.config.output.heartbeat_limit);
+            async move {
+                if let Some(selection) = scoped {
+                    ctx.broker
+                        .verify_file(hint, session, imports, request, options, selection)
+                        .await
+                } else {
+                    ctx.broker
+                        .verify_declaration_batch(hint, session, imports, request, options)
+                        .await
+                }
+            }
         };
         let mut outcome = classify_missing_olean(issue(request.clone()).await)?;
         // Opt-in one-shot retry per batch: a batch that comes back tainted and

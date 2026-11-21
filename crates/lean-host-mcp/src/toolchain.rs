@@ -657,7 +657,21 @@ pub(crate) struct InstalledRuntime {
     pub(crate) files: std::collections::BTreeMap<PathBuf, String>,
 }
 
+/// Non-builtin modules used to bootstrap the installed one-shot batch verifier.
+pub const VERIFIER_MODULES: &[&str] = &[
+    "LeanRsHostShims.InfoTree",
+    "LeanRsHostShims.Elaboration",
+    "LeanRsHostShims.Environment",
+    "LeanRsInterop.Callback",
+    "LeanRsInterop.Callback.String",
+    "LeanRsInterop.Callback.Tick",
+];
+
 impl WorkerSidecar {
+    pub(crate) fn into_runtime(self) -> Option<InstalledRuntime> {
+        self.deployment?.runtime
+    }
+
     /// Write `<install_dir>/worker.json` recording `header_digest`, the host's
     /// build-time context, and the post-build `smoke` outcome. Overwrites any
     /// existing record.

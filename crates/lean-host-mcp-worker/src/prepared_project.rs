@@ -103,6 +103,8 @@ pub struct ImportPlan {
 pub struct PreparedGeneration {
     plan: ImportPlan,
     identity: [u8; 32],
+    #[serde(default)]
+    products: Vec<Vec<Option<String>>>,
 }
 
 fn file_hash(path: &Path) -> io::Result<[u8; 32]> {
@@ -265,7 +267,36 @@ impl ImportPlan {
         }
         let identity = self.identity(writer.write_roots())?;
         self.check_edges(writer)?;
-        Ok(PreparedGeneration { plan: self, identity })
+        let products = self
+            .modules
+            .iter()
+            .map(|(name, domain)| {
+                let base = domain.join(".lake/build/lib/lean").join(name);
+                ["olean", "olean.server", "olean.private", "ir.sig", "ir"]
+                    .into_iter()
+                    .map(|ext| {
+                        let path = base.with_extension(ext);
+                        match fs::symlink_metadata(&path) {
+                            Ok(_) => {
+                                use std::fmt::Write as _;
+                                let mut digest = String::with_capacity(64);
+                                for byte in file_hash(&path)? {
+                                    write!(digest, "{byte:02x}").map_err(io::Error::other)?;
+                                }
+                                Ok(Some(digest))
+                            }
+                            Err(e) if ext != "olean" && e.kind() == io::ErrorKind::NotFound => Ok(None),
+                            Err(e) => Err(e),
+                        }
+                    })
+                    .collect::<io::Result<Vec<_>>>()
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(PreparedGeneration {
+            plan: self,
+            identity,
+            products,
+        })
     }
 }
 impl PreparedGeneration {

@@ -625,6 +625,10 @@ Verifies declarations in memory. Targets can be explicit declaration lists, ever
 declaration in a module. The server reads Lean source and calls Lean's elaborator/kernel through the worker; it does not
 run `lake build`.
 
+For an explicitly selected prepared project, file-backed verification stages the current source and checks it in a
+supervised one-shot Lean process against the prepared imports. A compiled declaration lookup can still succeed after
+an edit breaks the proof. Use file-backed verification to check that edit.
+
 By-name targets support multi-clause equation definitions and theorems, `where`-structure definitions,
 `structure`/`class` commands, and anonymous instances under generated `inst…` names. Discover generated names with
 `lean_lookup(kind="declarations")`. Inspect `not_found` suggestions or inventory the file to resolve a missing name.

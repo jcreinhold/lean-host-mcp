@@ -367,6 +367,10 @@ impl ProjectRuntimeConfig {
         Ok(self)
     }
 
+    pub(crate) fn prepared_generation(&self) -> Option<&str> {
+        self.prepared_generation.as_deref()
+    }
+
     /// Immutable launch data for the selected canonical project. Worker grants are independent.
     #[must_use]
     pub fn verification_input_for(&self, canonical_root: &Path) -> Option<&str> {

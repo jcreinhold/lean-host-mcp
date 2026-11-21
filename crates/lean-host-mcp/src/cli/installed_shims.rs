@@ -125,6 +125,20 @@ pub(super) fn bind(
             paths.push(file.canonicalize()?);
         }
     }
+    let search: Vec<_> = prepared
+        .shim_search_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    for module in crate::toolchain::VERIFIER_MODULES {
+        let artifact = lean_toolchain::olean_candidate(&search, module, |path| fs::metadata(path))?
+            .context("verification driver shim module missing")?;
+        ensure!(
+            artifact.canonicalize()? == artifact,
+            "aliased verification driver module"
+        );
+        paths.push(artifact);
+    }
     let files = paths
         .into_iter()
         .map(|p| Ok((p.clone(), super::install_worker::sha256_prefix(&p, 64)?)))

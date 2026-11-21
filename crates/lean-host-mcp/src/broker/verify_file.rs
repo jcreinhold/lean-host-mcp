@@ -1,0 +1,227 @@
+//! One-shot checks of current source against the operator-selected build products.
+use super::{
+    BrokerCall, Duration, LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
+    LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError,
+    freshness_from_meta,
+};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::{fs, io};
+
+#[derive(Deserialize)]
+struct Selection {
+    plan: Plan,
+    products: Vec<Vec<Option<String>>>,
+}
+#[derive(Deserialize)]
+struct Plan {
+    project: PathBuf,
+    roots: Vec<PathBuf>,
+    release: PathBuf,
+    modules: Vec<(String, PathBuf)>,
+}
+
+fn invalid(message: impl std::fmt::Display) -> ServerError {
+    ServerError::BadProject(message.to_string())
+}
+fn verify_hash(path: &Path, expected: &str) -> Result<()> {
+    if path.canonicalize()? != path || !fs::symlink_metadata(path)?.is_file() {
+        return Err(invalid("noncanonical prepared file"));
+    }
+    let mut h = Sha256::new();
+    use std::io::Read as _;
+    let mut f = fs::File::open(path)?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let count = f.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        h.update(buf.get(..count).ok_or_else(|| invalid("invalid read count"))?);
+    }
+
+    use std::fmt::Write as _;
+    let mut actual = String::with_capacity(64);
+    for byte in h.finalize() {
+        write!(actual, "{byte:02x}").map_err(invalid)?;
+    }
+    if actual != expected {
+        return Err(invalid("prepared verification artifact changed"));
+    }
+    Ok(())
+}
+
+impl ProjectBroker {
+    pub(crate) async fn verify_file(
+        &self,
+        hint: ProjectHint,
+        imports: Vec<String>,
+        freshness: Vec<String>,
+        request: LeanWorkerDeclarationVerificationBatchRequest,
+        options: LeanWorkerElabOptions,
+        input: &str,
+    ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
+        use lean_rs_worker_protocol::types::{
+            LeanWorkerDeclarationVerificationTarget as Target, LeanWorkerSorryPolicy,
+        };
+        let root = self.native_root(&hint)?;
+        let meta = self.meta(&root)?;
+        let selection: Selection = serde_json::from_str(input).map_err(invalid)?;
+        let plan = selection.plan;
+        let file = Path::new(&options.file_label);
+        if plan.project != root
+            || !file.starts_with(&root)
+            || file.canonicalize()? != file
+            || file.extension().and_then(|x| x.to_str()) != Some("lean")
+        {
+            return Err(invalid("unapproved verification path"));
+        }
+        let options = self.resolve_options(&meta, options).await?;
+        let activity = self.preparation_activity(&root).await?;
+        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(&root).map_err(invalid)?;
+        let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
+        let generation = worker.parent().ok_or_else(|| invalid("missing worker generation"))?;
+        let installed = crate::toolchain::WorkerSidecar::load(generation)
+            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+            .ok_or_else(|| invalid("missing installed shim deployment"))?;
+        let domains: Vec<_> = installed.prepared.artifact_roots.iter().map(PathBuf::from).collect();
+        let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&domains)?;
+        if installed.sysroot != sysroot
+            || plan.release != sysroot.join("lib/lean")
+            || selection.products.len() != plan.modules.len()
+        {
+            return Err(invalid("incomplete prepared import selection"));
+        }
+        for (path, hash) in &installed.files {
+            verify_hash(path, hash)?;
+        }
+        let shims: Vec<_> = installed.prepared.shim_search_paths.iter().map(PathBuf::from).collect();
+        for module in crate::toolchain::VERIFIER_MODULES {
+            let path = lean_toolchain::olean_candidate(&shims, module, |path| fs::metadata(path))
+                .map_err(invalid)?
+                .ok_or_else(|| invalid("missing verification driver shim module"))?;
+            if !installed.files.contains_key(&path) {
+                return Err(invalid(
+                    "installed generation lacks verification driver module identity",
+                ));
+            }
+        }
+        let project_domains = lean_toolchain::shared_writer::project_artifact_roots(&root)?;
+        let mut expected: Vec<_> = project_domains.iter().map(|p| p.join(".lake/build/lib/lean")).collect();
+        expected.extend(shims.clone());
+        expected.push(plan.release.clone());
+        let mut ordered = plan.roots.clone();
+        ordered.sort();
+        expected.sort();
+        if ordered != expected {
+            return Err(invalid("prepared roots differ from installed domains"));
+        }
+        if lean_toolchain::olean_candidate(&plan.roots, "Init", |p| fs::metadata(p)).map_err(invalid)?
+            != Some(plan.release.join("Init.olean"))
+        {
+            return Err(invalid("prepared roots shadow builtin Init"));
+        }
+        for ((name, domain), parts) in plan.modules.iter().zip(&selection.products) {
+            let base = domain.join(".lake/build/lib/lean").join(name);
+            if !project_domains.contains(domain)
+                || parts.len() != 5
+                || parts.first().and_then(Option::as_ref).is_none()
+                || lean_toolchain::olean_candidate(&plan.roots, name, |p| fs::metadata(p)).map_err(invalid)?
+                    != Some(base.with_extension("olean"))
+            {
+                return Err(invalid("prepared module resolution changed"));
+            }
+            for (ext, hash) in ["olean", "olean.server", "olean.private", "ir.sig", "ir"]
+                .into_iter()
+                .zip(parts)
+            {
+                let path = base.with_extension(ext);
+                if let Some(hash) = hash {
+                    verify_hash(&path, hash)?;
+                } else if !matches!(fs::symlink_metadata(path),Err(e) if e.kind()==io::ErrorKind::NotFound) {
+                    return Err(invalid("unapproved prepared module part"));
+                }
+            }
+        }
+        if imports
+            .iter()
+            .any(|n| n != "Init" && !plan.modules.iter().any(|(name, _)| name == n))
+        {
+            return Err(invalid("unsupported import outside prepared project"));
+        }
+        let targets = request
+            .targets
+            .iter()
+            .map(|t| match &t.target {
+                Target::Name { name } => Ok(serde_json::json!({"id":t.id,"name":name})),
+                Target::Span { .. } => Err(invalid("expected named declaration")),
+                _ => Err(invalid("unsupported verification target")),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let facts = crate::envelope::ElaborationOptions::from_worker(&options);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "source": request.source, "file": options.file_label,
+            "roots": plan.roots, "imports": imports, "targets": targets,
+            "allowSorry": matches!(request.sorry_policy, LeanWorkerSorryPolicy::Allow),
+            "reportAxioms": request.report_axioms,
+            "perFieldBytes": request.budgets.per_field_bytes,
+            "totalBytes": request.budgets.total_bytes,
+            "namespaceContext": options.namespace_context,
+            "optionsJson": lean_toolchain::lean_options_json(&options.lean_options),
+            "heartbeats": options.heartbeat_limit,
+            "diagnosticBytes": options.diagnostic_byte_limit,
+        }))
+        .map_err(invalid)?;
+        let bytes = crate::lake_options::discovery_output(
+            root.clone(),
+            Duration::from_millis(self.request_timeout_millis()),
+            self.config.max_projects.get(),
+            custody,
+            None,
+            Some(Box::new((activity, shim_guards))),
+            move |assets| {
+                let driver = assets.join("VerifyBatch.lean");
+                fs::write(&driver, include_bytes!("../lake/VerifyBatch.lean"))?;
+                let data = assets.join("request.json");
+                fs::write(&data, body)?;
+                Ok(crate::native_reader::NativeReaderProgram {
+                    command: vec![
+                        sysroot.join("bin/lean").into_os_string(),
+                        "--run".into(),
+                        driver.into_os_string(),
+                        data.into_os_string(),
+                    ],
+                    environment: vec![
+                        (
+                            "LEAN_PATH".into(),
+                            std::env::join_paths(shims).map_err(io::Error::other)?,
+                        ),
+                        ("LEAN_SYSROOT".into(), sysroot.into_os_string()),
+                    ],
+                    cwd: assets.into(),
+                    artifact_roots: domains,
+                })
+            },
+        )
+        .await
+        .map_err(|e| e.error)?;
+        let value = serde_json::from_slice(&bytes).map_err(invalid)?;
+        if let LeanWorkerDeclarationVerificationBatchResult::Ok { results, .. }
+        | LeanWorkerDeclarationVerificationBatchResult::MissingImports { results, .. } = &value
+            && (results.len() != request.targets.len()
+                || results
+                    .iter()
+                    .zip(&request.targets)
+                    .any(|(row, target)| row.id != target.id || row.target != target.target))
+        {
+            return Err(invalid("verification verdict does not match requested targets"));
+        }
+        let mut freshness = freshness_from_meta(&meta, freshness);
+        freshness.elaboration_options = Some(facts);
+        Ok(BrokerCall {
+            value,
+            runtime: RuntimeFacts::default(),
+            freshness,
+        })
+    }
+}

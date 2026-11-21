@@ -31,8 +31,8 @@ struct ModuleOptions {
 
 /// Preserve process evidence until the preparation operation records its outcome.
 #[derive(Debug)]
-struct PreparationFailure {
-    error: ServerError,
+pub(crate) struct PreparationFailure {
+    pub(crate) error: ServerError,
     disposition: WriterDisposition,
 }
 
@@ -254,7 +254,7 @@ async fn resolve_inner(
 
 /// Cancellation signals the owner rather than dropping its process evidence.
 /// The same deadline covers preparation, native admission, and command delivery.
-async fn discovery_output(
+pub(crate) async fn discovery_output(
     root: PathBuf,
     timeout: Duration,
     capacity_limit: usize,
@@ -329,7 +329,7 @@ fn discovery_metadata(reader: crate::native_reader::NativeReaderResult) -> Prepa
     Err(PreparationFailure {
         disposition,
         error: bad_project(format!(
-            "could not resolve Lake compilation options (no proof check ran): state={} {}{}{}",
+            "native reader did not return a complete result: state={} {}{}{}",
             reader.state,
             reader.detail.unwrap_or_default(),
             reader.stdout,
