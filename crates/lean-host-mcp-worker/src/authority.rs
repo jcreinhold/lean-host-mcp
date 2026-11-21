@@ -34,6 +34,38 @@ struct Deployment {
     prepared: LeanWorkerPreparedHostArtifacts,
     files: BTreeMap<PathBuf, String>,
 }
+impl Deployment {
+    fn resolve_generation(&mut self, dir: &Path) -> io::Result<()> {
+        let resolve = |path: &Path| {
+            if !path.starts_with("shims") || path.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+                return Err(invalid("invalid installed generation-relative path"));
+            }
+            Ok(dir.join(path))
+        };
+        let expand = |path: &str| -> io::Result<String> {
+            resolve(Path::new(path))?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| invalid("invalid installed path encoding"))
+        };
+        let p = &mut self.prepared;
+        p.shim_manifest_path = expand(&p.shim_manifest_path)?;
+        for path in p.artifact_roots.iter_mut().chain(&mut p.shim_search_paths) {
+            *path = expand(path)?;
+        }
+        self.files = std::mem::take(&mut self.files)
+            .into_iter()
+            .map(|(path, hash)| {
+                if path.starts_with(&self.sysroot) {
+                    Ok((path, hash))
+                } else {
+                    Ok((resolve(&path)?, hash))
+                }
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(())
+    }
+}
 pub(super) struct Installed {
     record: Deployment,
     launch_input: Option<String>,
@@ -86,7 +118,8 @@ impl Installed {
         if bytes.len() > 1024 * 1024 {
             return Err(invalid("oversized installed sidecar"));
         }
-        let record = serde_json::from_slice::<Sidecar>(&bytes)?.deployment;
+        let mut record = serde_json::from_slice::<Sidecar>(&bytes)?.deployment;
+        record.resolve_generation(dir)?;
         if digest(&worker)? != record.worker_sha256 {
             return Err(invalid("installed worker digest mismatch"));
         }

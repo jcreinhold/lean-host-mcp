@@ -133,14 +133,40 @@ pub(super) fn bind(
         .iter()
         .map(std::path::PathBuf::from)
         .collect();
-    for module in crate::toolchain::VERIFIER_MODULES {
-        let artifact = lean_toolchain::olean_candidate(&search, module, |path| fs::metadata(path))?
-            .context("verification driver shim module missing")?;
+    // Bind every compiled package module, including split olean data if emitted.
+    // Package order in the search path is part of the installation contract.
+    for row in include_str!("shim-inputs-0.10.1.txt").lines() {
+        let (_, name) = row.split_once(' ').context("invalid packaged shim inventory")?;
+        let (package, file) = name.split_once('/').context("missing shim package")?;
+        let Some(module) = file.strip_suffix(".lean").filter(|name| *name != "lakefile") else {
+            continue;
+        };
+        let root = match package {
+            "lean-rs-interop-shims" => search.first(),
+            "lean-rs-host-shims" => search.get(1),
+            _ => None,
+        }
+        .context("missing installed module root")?;
+        let leaf = root.join(module).with_extension("olean");
         ensure!(
-            artifact.canonicalize()? == artifact,
-            "aliased verification driver module"
+            leaf.canonicalize()? == leaf && leaf.is_file(),
+            "invalid installed module {module}"
         );
-        paths.push(artifact);
+        paths.push(leaf.clone());
+        for suffix in ["olean.private", "olean.server", "ir"] {
+            let companion = leaf.with_extension(suffix);
+            match fs::symlink_metadata(&companion) {
+                Ok(meta) => {
+                    ensure!(
+                        meta.is_file() && companion.canonicalize()? == companion,
+                        "invalid installed module companion"
+                    );
+                    paths.push(companion);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     let files = paths
         .into_iter()
@@ -155,11 +181,14 @@ pub(super) fn bind(
             64,
         )?),
     );
-    record.bind_runtime(InstalledRuntime {
+    let mut runtime = InstalledRuntime {
         sysroot: sysroot.into(),
         prepared,
         files,
-    })?;
+    };
+    runtime.map_generation_paths(|path| Ok(path.strip_prefix(candidate).map_err(std::io::Error::other)?.to_owned()))?;
+    // The SDK manifest was generated in this final directory. Preserve its exact bytes.
+    record.bind_runtime(runtime)?;
     record.write(candidate)?;
     Ok(record)
 }
@@ -197,6 +226,12 @@ pub(super) fn probe(
         None,
         None,
     );
+    #[cfg(all(test, target_os = "macos"))]
+    let images = if std::env::var_os("R2_GENERATION").is_some() {
+        tests::check_loaded_images(candidate, &worker)
+    } else {
+        Ok(())
+    };
     let cleanup = handle.try_shutdown();
     ensure!(
         tracker.active_processes() == 0,
@@ -204,6 +239,8 @@ pub(super) fn probe(
     );
     let result = result?;
     cleanup?;
+    #[cfg(all(test, target_os = "macos"))]
+    images?;
     ensure!(
         matches!(result,LeanWorkerDeclarationInspectionResult::Found{declaration} if declaration.name=="Nat.add_zero"),
         "missing actual declaration"
@@ -229,10 +266,13 @@ pub(super) fn qualify(
         "expected a fresh candidate containing only its worker executable"
     );
     let (prepared, custody) = prepare(source, &candidate.join("shims"), sysroot, writer)?;
-    let mut record = bind(candidate, id, sysroot, prepared.clone())?;
+    let mut record = bind(candidate, id, sysroot, prepared)?;
     // Keep both exclusive domains through the installer's image inventory and sidecar publication.
     drop(custody);
-    probe(candidate, id, sysroot, prepared)?;
+    let snapshot = crate::toolchain::WorkerSidecar::load(candidate)
+        .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+        .context("unreadable installed snapshot")?;
+    probe(candidate, id, sysroot, snapshot.prepared)?;
     record.complete(
         &super::install_worker::sha256_prefix(&candidate.join(crate::toolchain::WORKER_FILE_NAME), 64)?,
         crate::smoke::SmokeOutcome::Passed,
@@ -244,6 +284,62 @@ pub(super) fn qualify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    pub(super) fn check_loaded_images(candidate: &Path, worker: &Path) -> Result<()> {
+        let children = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-P", &std::process::id().to_string()])
+            .output()?;
+        ensure!(children.status.success(), "no worker child for map inspection");
+        let pids = std::str::from_utf8(&children.stdout)?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(",");
+        let maps = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-a", "-p", &pids, "-d", "txt", "-Fn"])
+            .output()?;
+        ensure!(maps.status.success(), "worker mapping inspection failed");
+        let text = std::str::from_utf8(&maps.stdout)?;
+        let mapped: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix('n'))
+            .map(Path::new)
+            .collect();
+        ensure!(mapped.contains(&worker), "installed executable missing from child maps");
+        for package in ["host__shims", "interop__shims"] {
+            let images: Vec<_> = mapped
+                .iter()
+                .filter(|p| {
+                    p.extension().is_some_and(|e| e == "dylib")
+                        && p.file_name().is_some_and(|n| n.to_string_lossy().contains(package))
+                })
+                .collect();
+            ensure!(
+                images.len() == 1 && images[0].starts_with(candidate.join("shims")),
+                "unexpected mapped {package} image: {images:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run inside a child-only sandbox denying checkout and Cargo source reads"]
+    fn isolated_installed_init() -> Result<()> {
+        for var in ["R2_HOST_CANARY", "R2_SDK_CANARY", "R2_CARGO_CANARY"] {
+            let path = std::env::var_os(var).context(var)?;
+            ensure!(
+                fs::File::open(path).is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied),
+                "expected sandbox denial for {var}"
+            );
+        }
+        let generation = std::path::PathBuf::from(std::env::var_os("R2_GENERATION").context("missing generation")?);
+        let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
+        let runtime = crate::toolchain::WorkerSidecar::load(&generation)
+            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+            .context("missing installed runtime")?;
+        probe(&generation, &id, &id.elan_dir()?.canonicalize()?, runtime.prepared)
+    }
+
     #[test]
     #[ignore = "requires fresh candidate and matched published inputs"]
     fn installed_init_candidate_and_refusals() -> Result<()> {

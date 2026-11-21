@@ -657,6 +657,38 @@ pub(crate) struct InstalledRuntime {
     pub(crate) files: std::collections::BTreeMap<PathBuf, String>,
 }
 
+impl InstalledRuntime {
+    /// Convert between installed paths and SDK inputs at the generation boundary.
+    pub(crate) fn map_generation_paths(
+        &mut self,
+        map: impl Fn(&Path) -> std::io::Result<PathBuf>,
+    ) -> std::io::Result<()> {
+        let string = |value: &mut String| -> std::io::Result<()> {
+            *value = map(Path::new(value))?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| std::io::Error::other("non-UTF8 shim path"))?;
+            Ok(())
+        };
+        let p = &mut self.prepared;
+        string(&mut p.shim_manifest_path)?;
+        for path in p.shim_search_paths.iter_mut().chain(&mut p.artifact_roots) {
+            string(path)?;
+        }
+        self.files = std::mem::take(&mut self.files)
+            .into_iter()
+            .map(|(path, hash)| {
+                if path.starts_with(&self.sysroot) {
+                    Ok((path, hash))
+                } else {
+                    Ok((map(&path)?, hash))
+                }
+            })
+            .collect::<std::io::Result<_>>()?;
+        Ok(())
+    }
+}
+
 /// Non-builtin modules used to bootstrap the installed one-shot batch verifier.
 pub const VERIFIER_MODULES: &[&str] = &[
     "LeanRsHostShims.InfoTree",
@@ -732,7 +764,22 @@ impl WorkerSidecar {
     /// an older host left no record, which is unknown provenance, not an error.
     pub(crate) fn load(install_dir: &Path) -> Option<Self> {
         let bytes = std::fs::read(install_dir.join(SIDECAR_FILE_NAME)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let mut record: Self = serde_json::from_slice(&bytes).ok()?;
+        if let Some(runtime) = record.deployment.as_mut().and_then(|d| d.runtime.as_mut()) {
+            if Path::new(&runtime.prepared.shim_manifest_path).is_relative() {
+                runtime
+                    .map_generation_paths(|path| {
+                        if !path.starts_with("shims")
+                            || path.components().any(|c| !matches!(c, std::path::Component::Normal(_)))
+                        {
+                            return Err(std::io::Error::other("invalid generation-relative path"));
+                        }
+                        Ok(install_dir.join(path))
+                    })
+                    .ok()?;
+            }
+        }
+        Some(record)
     }
 
     /// Whether the recorded build-time digest still matches the toolchain.
