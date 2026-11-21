@@ -18,10 +18,23 @@ impl ProjectBroker {
         imports: Vec<String>,
         freshness: Vec<String>,
         request: SemanticProofSearchRequest,
-        input: &str,
+        input: Option<&str>,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
         let root = self.native_root(&hint)?;
         let meta = self.meta(&root)?;
+        let Some(input) = input else {
+            let file = request
+                .goal
+                .file_label
+                .as_deref()
+                .ok_or_else(|| invalid("missing semantic source file"))?;
+            let (_setup, _reader, _activity) = self
+                .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
+                .await?;
+            return Err(invalid(
+                "semantic runtime 0.7.8 cannot elaborate a goal with the selected Lake ModuleSetup",
+            ));
+        };
         let activity = self.preparation_activity(&root).await?;
         let mut selected = imports;
         selected.extend(request.candidate_modules.iter().cloned());

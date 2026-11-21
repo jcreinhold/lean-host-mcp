@@ -1,8 +1,8 @@
 //! Proof-agent declaration retrieval.
 //!
 //! `search_for_proof` is an intent-shaped orchestration over existing
-//! bounded primitives: declaration context comes from `proof_state`, candidate
-//! generation comes from lean-rs declaration search v2, and ranking stays
+//! bounded primitives: file-backed goal features come from the supervised Lean
+//! frontend, explicit goal text uses declaration search, and ranking stays
 //! local and deterministic. It deliberately does not render declarations.
 
 // Tool handlers consume owned requests so worker calls can cross async
@@ -29,7 +29,7 @@ use crate::projections::{
     project_declaration_search,
 };
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
-use crate::tools::position::{ProofPositionSelector, ProofStateRequest, ProofStateResult};
+use crate::tools::position::ProofPositionSelector;
 use crate::tools::source_input::module_name_for_file;
 use crate::tools::{ToolContext, session_imports};
 
@@ -184,20 +184,10 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let mode = req.mode.unwrap_or_default();
     let full = ctx.config.verbosity.is_full();
     let project = req.project.clone();
-    let mut profile = target_profile(ctx, req, limit).await?;
+    let mut profile = target_profile(ctx, req, limit)?;
     let mut warnings = std::mem::take(&mut profile.warnings);
     let searches = plan_searches(&profile, mode);
-    let semantic = match run_semantic_search(ctx, project.clone(), &profile).await {
-        Ok(value) => value,
-        Err(err) if ctx.broker.prepared_generation().is_some() && profile.semantic.is_some() => return Err(err),
-        Err(err) => {
-            warnings.push(format!(
-                "semantic proof search unavailable; used fallback declaration search: {}",
-                semantic_error_summary(&err)
-            ));
-            None
-        }
-    };
+    let semantic = run_semantic_search(ctx, project.clone(), &profile).await?;
 
     if searches.is_empty() {
         if semantic.is_none() {
@@ -268,7 +258,7 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     Ok(Response::ok(result, identity.freshness).with_runtime(runtime))
 }
 
-async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -> Result<TargetProfile> {
+fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -> Result<TargetProfile> {
     let explicit_text = [req.goal.as_deref(), req.type_text.as_deref()]
         .into_iter()
         .flatten()
@@ -281,170 +271,26 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: us
         req.declaration.clone().filter(|value| !value.trim().is_empty()),
     ) {
         let hint = ProjectHint::from_request(req.project.clone());
-        let meta = ctx.broker.resolve_meta(&hint)?;
-        if ctx.broker.prepared_generation().is_some() {
-            let input = crate::tools::source_input::read_query_file(&meta.canonical_root, &file)?;
-            let mut imports = input.imports.clone();
-            for module in &req.imports {
-                if !imports.contains(module) {
-                    imports.push(module.clone());
-                }
-            }
-            let semantic = semantic_request_for_source(
-                &meta.canonical_root,
-                &input,
-                &declaration,
-                &req.proof_position,
-                None,
-                &imports,
-                limit,
-            )
-            .ok_or_else(|| ServerError::BadProject("cannot select semantic source module".into()))?;
-            return Ok(profile_from_text(
-                explicit_text,
-                None,
-                imports,
-                "semantic_frontend".into(),
-                None,
-                Vec::new(),
-                Some(semantic),
-            ));
-        }
-        // `proof_state_internal` reads the file to elaborate it and hands the
-        // same `QueryFile` back, so the semantic ranking below scores exactly
-        // the bytes that produced the goal state.
-        let crate::tools::position::ProofStateInternal {
-            response: proof_response,
-            namespace: namespace_name,
-            source: source_input,
-        } = crate::tools::position::proof_state_internal(
-            ctx,
-            ProofStateRequest {
-                file: file.clone(),
-                declaration: declaration.clone(),
-                proof_position: req.proof_position.clone(),
-                // Proof search ranks against the expected type, so it opts in;
-                // it never reads the boundary list.
-                include_boundaries: false,
-                include_expected_type: true,
-                project: req.project.clone(),
-            },
-        )
-        .await?;
-        let imports = if proof_response.imports().is_empty() {
-            req.imports.clone()
-        } else {
-            proof_response.imports().to_vec()
-        };
-        let Some(proof_result) = proof_response.result else {
-            return Ok(profile_from_text(
-                explicit_text,
-                None,
-                imports,
-                "runtime_unavailable_degraded_to_explicit_text".to_owned(),
-                None,
-                vec!["proof-state runtime was unavailable; used explicit goal/type text".to_owned()],
-                None,
-            ));
-        };
-        match proof_result {
-            ProofStateResult::Context {
-                goals_before,
-                goals_after,
-                locals,
-                expected_type,
-                query_facts,
-                unavailable,
-                budget_exceeded,
-                ..
-            } => {
-                let mut pieces = Vec::new();
-                pieces.extend(goals_before);
-                pieces.extend(goals_after);
-                if let Some(expected) = expected_type {
-                    pieces.push(expected.value);
-                }
-                for local in locals {
-                    pieces.push(local.type_str.value);
-                }
-                if !explicit_text.is_empty() {
-                    pieces.push(explicit_text);
-                }
-                let mut warnings = Vec::new();
-                warnings.extend(
-                    unavailable
-                        .into_iter()
-                        .map(|item| format!("proof-state selector unavailable: {}: {}", item.id, item.message)),
-                );
-                warnings.extend(
-                    budget_exceeded
-                        .into_iter()
-                        .map(|item| format!("proof-state selector budget exceeded: {}: {}", item.id, item.message)),
-                );
-                let semantic = semantic_request_for_source(
-                    &meta.canonical_root,
-                    &source_input,
-                    &declaration,
-                    &req.proof_position,
-                    namespace_name.clone(),
-                    &imports,
-                    limit,
-                );
-                return Ok(profile_from_text(
-                    pieces.join("\n"),
-                    namespace_name,
-                    imports,
-                    "context".to_owned(),
-                    query_facts.map(|facts| facts.cache_status.to_owned()),
-                    warnings,
-                    semantic,
-                ));
-            }
-            ProofStateResult::HeaderParseFailed { .. } => {
-                if !explicit_text.is_empty() {
-                    return Ok(profile_from_text(
-                        explicit_text,
-                        None,
-                        req.imports,
-                        "header_parse_failed_degraded_to_explicit_text".to_owned(),
-                        None,
-                        vec!["proof-state header parse failed; used explicit goal/type text".to_owned()],
-                        None,
-                    ));
-                }
-                return Ok(profile_from_text(
-                    String::new(),
-                    None,
-                    req.imports,
-                    "header_parse_failed".to_owned(),
-                    None,
-                    vec!["proof-state header parse failed and no explicit goal/type text was supplied".to_owned()],
-                    None,
-                ));
-            }
-            ProofStateResult::Unsupported => {
-                if !explicit_text.is_empty() {
-                    return Ok(profile_from_text(
-                        explicit_text,
-                        None,
-                        req.imports,
-                        "unsupported_degraded_to_explicit_text".to_owned(),
-                        None,
-                        vec!["proof-state unsupported; used explicit goal/type text".to_owned()],
-                        None,
-                    ));
-                }
-                return Ok(profile_from_text(
-                    String::new(),
-                    None,
-                    req.imports,
-                    "unsupported".to_owned(),
-                    None,
-                    vec!["proof-state unsupported and no explicit goal/type text was supplied".to_owned()],
-                    None,
-                ));
+        let root = ctx.broker.native_root(&hint)?;
+        let input = crate::tools::source_input::read_query_file(&root, &file)?;
+        let mut imports = input.imports.clone();
+        for module in &req.imports {
+            if !imports.contains(module) {
+                imports.push(module.clone());
             }
         }
+        let semantic =
+            semantic_request_for_source(&root, &input, &declaration, &req.proof_position, None, &imports, limit)
+                .ok_or_else(|| ServerError::BadProject("cannot select semantic source module".into()))?;
+        return Ok(profile_from_text(
+            explicit_text,
+            None,
+            imports,
+            "semantic_frontend".into(),
+            None,
+            Vec::new(),
+            Some(semantic),
+        ));
     }
 
     Ok(profile_from_text(
@@ -576,21 +422,6 @@ async fn run_semantic_search(
         )
         .await?;
     Ok(Some(call))
-}
-
-fn semantic_error_summary(err: &ServerError) -> String {
-    let text = err.to_string();
-    if text.contains("semantic runtime build failed") || text.contains("semantic capability open failed") {
-        return "semantic runtime failed for this toolchain".to_owned();
-    }
-    if text.contains(".olean")
-        || text.contains("object file")
-        || text.contains("unknown module")
-        || text.contains("missing imports")
-    {
-        return "consumer project imports are not built; run lake build for the active Lake project".to_owned();
-    }
-    "semantic capability command failed".to_owned()
 }
 
 fn plan_searches(profile: &TargetProfile, mode: ProofSearchMode) -> Vec<PlannedSearch> {

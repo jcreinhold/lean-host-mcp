@@ -408,28 +408,6 @@ enum BatchProjection {
 /// Returns `ServerError::Io` when the file cannot be read and
 /// `ServerError::Lean` for worker infrastructure failures.
 pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Response<ProofStateResult>> {
-    Ok(proof_state_internal(ctx, req).await?.response)
-}
-
-/// [`proof_state`] plus the two things an internal reader needs and the public
-/// response deliberately withholds.
-pub(crate) struct ProofStateInternal {
-    /// Exactly what [`proof_state`] returns.
-    pub response: Response<ProofStateResult>,
-    /// Worker-reported namespace of the resolved declaration. Not public
-    /// because it echoes what the caller already named, but a reader that
-    /// qualifies names against the live environment needs the worker's
-    /// resolution rather than the request's possibly file-local string.
-    pub namespace: Option<String>,
-    /// The source file this call elaborated. Handed back rather than left for
-    /// the caller to read again: it is the same path, the same bytes, and the
-    /// same header scan, and a second read is also a second chance to disagree
-    /// with the elaboration that produced `response`.
-    pub source: QueryFile,
-}
-
-/// The internal form of [`proof_state`]. See [`ProofStateInternal`].
-pub(crate) async fn proof_state_internal(ctx: &ToolContext, req: ProofStateRequest) -> Result<ProofStateInternal> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let source = read_query_file(&meta.canonical_root, &req.file)?;
@@ -458,11 +436,7 @@ pub(crate) async fn proof_state_internal(ctx: &ToolContext, req: ProofStateReque
             // Forward the file's real header imports so the degraded envelope's
             // `freshness.imports` matches the success path.
             let response = proof_state_needs_build_response(ctx, hint, source.imports.clone(), err)?;
-            return Ok(ProofStateInternal {
-                response,
-                namespace: None,
-                source,
-            });
+            return Ok(response);
         }
     };
     let freshness = run.freshness.clone();
@@ -482,7 +456,6 @@ pub(crate) async fn proof_state_internal(ctx: &ToolContext, req: ProofStateReque
                 truncated: false,
             };
             let mut goals_before = Vec::new();
-            let mut namespace_name = None;
             let mut goals_after = Vec::new();
             let mut locals = Vec::new();
             let mut expected_type = None;
@@ -505,7 +478,6 @@ pub(crate) async fn proof_state_internal(ctx: &ToolContext, req: ProofStateReque
                             ProofStateProjection::State { info } => {
                                 let info = *info;
                                 goals_before = info.goals_before;
-                                namespace_name = Some(info.namespace_name);
                                 goals_after = info.goals_after;
                                 locals = info.locals;
                                 // Skip the projection, not just the
@@ -602,34 +574,24 @@ pub(crate) async fn proof_state_internal(ctx: &ToolContext, req: ProofStateReque
                 Some(event) => crate::diagnosis::warn_execution_taint(response, event),
                 None => response,
             };
-            Ok(ProofStateInternal {
-                response: warn_session_missing_imports(response, &missing_imports),
-                namespace: namespace_name,
-                source,
-            })
+            Ok(warn_session_missing_imports(response, &missing_imports))
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
             let block = diagnostics_block(diagnostics);
-            Ok(ProofStateInternal {
-                response: Response::ok(
-                    ProofStateResult::HeaderParseFailed {
-                        summary: block.summary,
-                        diagnostics: block.diagnostics,
-                        truncated: block.truncated,
-                        query_facts: ctx.config.verbosity.is_full().then(|| project_query_facts(facts)),
-                    },
-                    freshness,
-                )
-                .with_runtime(run.runtime),
-                namespace: None,
-                source,
-            })
+            Ok(Response::ok(
+                ProofStateResult::HeaderParseFailed {
+                    summary: block.summary,
+                    diagnostics: block.diagnostics,
+                    truncated: block.truncated,
+                    query_facts: ctx.config.verbosity.is_full().then(|| project_query_facts(facts)),
+                },
+                freshness,
+            )
+            .with_runtime(run.runtime))
         }
-        BatchQueryRun::Unsupported => Ok(ProofStateInternal {
-            response: Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime),
-            namespace: None,
-            source,
-        }),
+        BatchQueryRun::Unsupported => {
+            Ok(Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime))
+        }
     }
 }
 

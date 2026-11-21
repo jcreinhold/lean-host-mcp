@@ -70,7 +70,7 @@ def inventory(p):
     }
 
 
-def probe(p):
+def probe(p, *, search=False):
     proc = s.Popen(
         [
             r / "target/debug/lean-host-mcp",
@@ -109,6 +109,17 @@ def probe(p):
             ),
         )
         rpc(None, "notifications/initialized", {})
+        if search:
+            return rpc(
+                2,
+                "tools/call",
+                dict(
+                    name="lean_lookup",
+                    arguments=dict(
+                        kind="proof_search", file="Demo.lean", declaration="demo"
+                    ),
+                ),
+            )
         return rpc(
             2,
             "tools/call",
@@ -151,6 +162,12 @@ for label, plugin in [("project", True), ("omitted", False)]:
     verdict = row(probe(project))
     print(label, verdict["verification_status"])
     if plugin:
+        unavailable = probe(project, search=True)
+        assert (
+            "cannot elaborate a goal with the selected Lake ModuleSetup"
+            in unavailable["error"]["message"]
+        ), unavailable
+        assert "result" not in unavailable
         assert verdict["verification_status"] == "verified", verdict
     else:
         assert verdict[

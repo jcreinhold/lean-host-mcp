@@ -126,7 +126,7 @@ impl ProjectBroker {
         })
     }
 
-    fn installed_reader(root: &Path, meta: &crate::lake_meta::LakeProjectMeta) -> Result<PreparedReader> {
+    pub(super) fn installed_reader(root: &Path, meta: &crate::lake_meta::LakeProjectMeta) -> Result<PreparedReader> {
         let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root).map_err(invalid)?;
         let (worker, sysroot, _) = crate::project::resolve_worker(meta)?;
         let generation = worker.parent().ok_or_else(|| invalid("missing worker generation"))?;
@@ -182,19 +182,22 @@ impl ProjectBroker {
         {
             return Err(invalid("unapproved verification path"));
         }
-        let setup = if input.is_none() {
-            Some(
-                self.prepare_file_setup(&hint, &options.file_label, &request.source)
-                    .await?,
-            )
+        let (options, reader, setup, activity) = if let Some(selection) = input {
+            let options = self.resolve_options(&meta, options).await?;
+            let activity = self.preparation_activity(&root).await?;
+            let reader = Self::prepared_reader(&root, &meta, selection, &imports)?;
+            (options, reader, None, activity)
         } else {
-            None
+            let (setup, reader, activity) = self
+                .file_reader_with_setup(&hint, &meta, &options.file_label, &request.source)
+                .await?;
+            (
+                options.lean_options(setup.options.clone()),
+                reader,
+                Some(setup),
+                activity,
+            )
         };
-        let options = match &setup {
-            Some(setup) => options.lean_options(setup.options.clone()),
-            None => self.resolve_options(&meta, options).await?,
-        };
-        let activity = self.preparation_activity(&root).await?;
         let PreparedReader {
             custody,
             sysroot,
@@ -202,16 +205,7 @@ impl ProjectBroker {
             domains,
             shim_guards,
             roots,
-        } = match input {
-            Some(selection) => Self::prepared_reader(&root, &meta, selection, &imports)?,
-            None => Self::installed_reader(&root, &meta)?,
-        };
-        if let Some(setup) = &setup {
-            setup.check(&root, &sysroot, &custody)?;
-            if fs::read(file)? != request.source.as_bytes() {
-                return Err(invalid("verification source changed during transfer"));
-            }
-        }
+        } = reader;
         let targets = request
             .targets
             .iter()

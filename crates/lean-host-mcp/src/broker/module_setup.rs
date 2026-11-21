@@ -162,7 +162,32 @@ fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, fil
 }
 
 impl ProjectBroker {
-    pub(super) async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
+    pub(super) async fn file_reader_with_setup(
+        &self,
+        hint: &ProjectHint,
+        meta: &crate::lake_meta::LakeProjectMeta,
+        file: &str,
+        source: &str,
+    ) -> Result<(
+        StagedSetup,
+        super::verify_file::PreparedReader,
+        super::control::PreparationActivityGuard,
+    )> {
+        let root = self.native_root(hint)?;
+        if root != meta.canonical_root {
+            return Err(ServerError::BadProject("project selection changed".into()));
+        }
+        let setup = self.prepare_file_setup(hint, file, source).await?;
+        let activity = self.preparation_activity(&root).await?;
+        let reader = Self::installed_reader(&root, meta)?;
+        setup.check(&root, &reader.sysroot, &reader.custody)?;
+        if fs::read(file)? != source.as_bytes() {
+            return Err(ServerError::BadProject("source changed during setup transfer".into()));
+        }
+        Ok((setup, reader, activity))
+    }
+
+    async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
         let root = self.native_root(hint)?;
         let activity = self.preparation_activity(&root).await?;
         let timeout = Duration::from_millis(self.request_timeout_millis());

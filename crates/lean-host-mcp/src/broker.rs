@@ -756,9 +756,15 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
-        if let Some(selection) = self.prepared_generation() {
+        if request.goal.file_label.is_some() || self.prepared_generation().is_some() {
             return self
-                .semantic_file(hint, session_imports, freshness_imports, request, selection)
+                .semantic_file(
+                    hint,
+                    session_imports,
+                    freshness_imports,
+                    request,
+                    self.prepared_generation(),
+                )
                 .await;
         }
         let (project, admission_deadline) = self.project_for(hint).await?;
@@ -971,7 +977,7 @@ impl ProjectBroker {
         .await
     }
 
-    fn native_root(&self, hint: &ProjectHint) -> Result<PathBuf> {
+    pub(crate) fn native_root(&self, hint: &ProjectHint) -> Result<PathBuf> {
         let root = self.resolve(hint)?;
         self.runtime_config.require_operator_primary(&root)?;
         Ok(root)
