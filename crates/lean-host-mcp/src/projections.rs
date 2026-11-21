@@ -416,10 +416,8 @@ pub struct DeclarationVerificationFacts {
     pub axioms: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub axioms_truncated: bool,
-    /// `false` when the axiom dependency set could not be computed (target
-    /// unresolved, or `report_axioms` not requested): an empty `axioms` then
-    /// means "not computed", not "no axioms". `true` with empty `axioms` is a
-    /// genuine no-nontrivial-axioms result.
+    /// Whether the axiom dependency set was computed. An empty `axioms` list
+    /// is complete only when this flag is true and `axioms_truncated` is false.
     pub axioms_available: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,

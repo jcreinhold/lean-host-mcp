@@ -168,7 +168,7 @@ impl ProjectBroker {
         freshness: Vec<String>,
         request: LeanWorkerDeclarationVerificationBatchRequest,
         options: LeanWorkerElabOptions,
-        input: Option<&str>,
+        detail: crate::tools::proof_action::LeanVerifyDetail,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
         use lean_rs_worker_protocol::types::{
             LeanWorkerDeclarationVerificationTarget as Target, LeanWorkerSorryPolicy,
@@ -182,7 +182,7 @@ impl ProjectBroker {
         {
             return Err(invalid("unapproved verification path"));
         }
-        let (options, reader, setup, activity) = if let Some(selection) = input {
+        let (options, reader, setup, activity) = if let Some(selection) = self.prepared_generation() {
             let options = self.resolve_options(&meta, options).await?;
             let activity = self.preparation_activity(&root).await?;
             let reader = Self::prepared_reader(&root, &meta, selection, &imports)?;
@@ -238,13 +238,23 @@ impl ProjectBroker {
             Some(Box::new((activity, shim_guards))),
             move |assets| {
                 let driver = assets.join("VerifyBatch.lean");
-                let entry = if let Some(setup) = setup {
+                let (selection, entry) = if let Some(setup) = setup {
                     fs::write(assets.join("module.setup.json"), setup.bytes)?;
-                    include_str!("../lake/VerifySetup.lean")
+                    use crate::tools::proof_action::LeanVerifyDetail;
+                    let selection = match detail {
+                        LeanVerifyDetail::Compact => {
+                            "private abbrev verifySetup := verifyDeclarationBatchCompactWithSetup\n"
+                        }
+                        LeanVerifyDetail::Full => "private abbrev verifySetup := verifyDeclarationBatchWithSetup\n",
+                    };
+                    (selection, include_str!("../lake/VerifySetup.lean"))
                 } else {
-                    include_str!("../lake/VerifyBatch.lean")
+                    ("", include_str!("../lake/VerifyBatch.lean"))
                 };
-                fs::write(&driver, [include_str!("../lake/VerifyCommon.lean"), entry].concat())?;
+                fs::write(
+                    &driver,
+                    [include_str!("../lake/VerifyCommon.lean"), selection, entry].concat(),
+                )?;
                 let data = assets.join("request.json");
                 fs::write(&data, body)?;
                 Ok(crate::native_reader::NativeReaderProgram {

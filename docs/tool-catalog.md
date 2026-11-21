@@ -701,14 +701,16 @@ The `data` payload contains a summary and result rows. For one verified declarat
 `verification_status` uses the same vocabulary as the declaration-verification projection: `verified`, `has_sorry`,
 `has_unresolved_goals`, `has_diagnostics`, `not_found`, `ambiguous`, `needs_build`, `timeout`, `budget_exceeded`,
 `worker_recycled`, `header_parse_failed`, or `unsupported`. `summary.requested` counts expanded targets before host-side
-caps; `summary.truncated` is true when declaration inventory or verification output was capped. `file_all` and
+caps. `summary.truncated` is true when declaration inventory or target expansion was capped. `file_all` and
 source-backed `module_all` use the current source snapshot and report the same project-relative file paths in rows. If a
 module has no source file, `module_all` may use the `.ilean` declaration inventory, with typed artifact freshness facts
 in `trust`. Every source-backed trust fact includes `content_sha256`, the SHA-256 of the exact bytes used by the call.
 
-`detail` defaults to `"compact"`, which keeps declaration names, files, statuses, diagnostics, sorry/admit facts, axiom
-facts, and trustworthiness flags, but omits target and ambiguous-candidate span blocks. Use `"detail": "full"` when you
-need those source spans in each row.
+`detail` defaults to `"compact"`, which keeps declaration names, files, statuses, bounded diagnostics and goal text,
+sorry/admit facts, axiom facts, and trustworthiness flags. It omits target and ambiguous-candidate span blocks.
+For ordinary file-backed verification, diagnostics that exceed the compact row budget may be skipped while later
+diagnostics are retained. `facts.output_truncated` identifies partial display evidence. Use `"detail": "full"` when you
+need source spans in each row.
 
 `retry_tainted_non_positive` (default `false`) opts into one server-side retry per target-group batch: when the worker
 was recycled mid-call and the batch comes back non-positive (any row that would be relabeled `worker_recycled`), the
@@ -720,9 +722,9 @@ A `not_found` row for an explicit target may carry declarations with matching sh
 `facts.candidates` (with `"detail": "full"`) and a warning. Mapping a Git diff to explicit target groups is the caller's
 job; the server returns no diff-coverage object.
 
-Check `facts_trustworthy` before interpreting absence of sorry or unresolved goals. An empty `axioms` list means no
-reported dependencies only when `axioms_available` is true; the flag is false when reporting was not requested or could
-not be computed.
+Check `facts_trustworthy` before interpreting absence of sorry or unresolved goals. An empty `axioms` list establishes
+that no dependencies were found only when `axioms_available` is true and `axioms_truncated` is false.
+`axioms_available` is false when reporting was not requested or the axiom set could not be computed.
 
 ## `lean_lookup`
 

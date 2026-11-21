@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.11] - 2026-11-21
+
+### Fixed
+
+- Compact file verification uses the lean-rs 0.10.3 compact verdict and reports whether axiom data is available or truncated.
+- Registry worker installation stages Cargo output separately from the selected worker generation.
+
 ## [0.16.10] - 2026-11-21
 
 ### Fixed
@@ -681,7 +688,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.10...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.11...HEAD
+[0.16.11]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.10...v0.16.11
 [0.16.10]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.9...v0.16.10
 [0.16.9]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.8...v0.16.9
 [0.16.8]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.7...v0.16.8

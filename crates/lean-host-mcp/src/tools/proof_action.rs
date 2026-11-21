@@ -702,7 +702,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
         let file_label = prepared.file_label.clone();
         let issue = |request: LeanWorkerDeclarationVerificationBatchRequest| {
             let file_backed = source_fact.is_some();
-            let scoped = file_backed.then(|| ctx.broker.prepared_generation()).flatten();
+            let detail = req.detail;
             let hint = hint.clone();
             let imports = prepared.imports.clone();
             let session = session_imports(imports.clone());
@@ -710,7 +710,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
             async move {
                 if file_backed {
                     ctx.broker
-                        .verify_file(hint, session, imports, request, options, scoped)
+                        .verify_file(hint, session, imports, request, options, detail)
                         .await
                 } else {
                     ctx.broker
@@ -1521,9 +1521,7 @@ fn verification_not_found_similar(result: &DeclarationVerificationResult) -> Vec
 
 /// When `report_axioms` was requested but the worker could not compute the
 /// axiom set (`axioms_available == false`), the empty `axioms` list means "not
-/// computed", not "no axioms". Say so. A genuine empty set
-/// (`axioms_available == true`) needs no caveat — the false-positive is defined
-/// out of existence.
+/// computed". The `axioms_truncated` flag separately describes incomplete lists.
 fn axiom_unavailable_warning(result: &DeclarationVerificationResult, report_axioms: bool) -> Option<String> {
     if !report_axioms {
         return None;
