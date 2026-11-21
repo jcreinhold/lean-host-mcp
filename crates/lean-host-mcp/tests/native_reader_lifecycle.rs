@@ -87,9 +87,15 @@ impl Fixture {
         }
     }
     fn command(&self, timeout_millis: u64) -> Command {
+        self.reader_command(timeout_millis, false)
+    }
+    fn reader_command(&self, timeout_millis: u64, stdout_frame: bool) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+        command.arg("native-reader");
+        if stdout_frame {
+            command.arg("--stdout-result-frame");
+        }
         command
-            .arg("native-reader")
             .arg("--project-root")
             .arg(&self.project)
             .arg("--capacity-limit")
@@ -379,6 +385,41 @@ os._exit(0)
     assert_eq!(result["scope_closed"], true);
     wait_for(|| rustix::process::test_kill_process(payload).is_err());
     assert!(Fixture::lock(&fixture.project).try_lock().is_ok());
+}
+
+#[test]
+fn frame_requires_complete_stdout_but_accepts_clipped_diagnostics() {
+    for (frame, overflow_stdout, expected) in [
+        (false, false, "stopped"),
+        (true, false, "completed"),
+        (true, true, "stopped"),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(
+            &fixture.executable,
+            "#!/bin/sh\nprintf '%0100d' 0 >&2\nprintf '%s' \"$RESULT\"\n",
+        )
+        .unwrap();
+        let mut command = fixture.reader_command(3000, frame);
+        let output = if overflow_stdout {
+            "x".repeat(65)
+        } else {
+            "valid".into()
+        };
+        command.env("RESULT", &output);
+        let (status, result) = OwnedChild::spawn(command).finish();
+        assert_eq!(status.success(), expected == "completed");
+        assert_eq!(result["state"], expected);
+        assert_eq!(result["scope_closed"], true);
+        assert_eq!(result["output_truncated"], expected != "completed");
+        assert_eq!(result["stderr"].as_str().unwrap().len(), 64);
+        if expected == "completed" {
+            assert_eq!(result["stdout"], output);
+            assert_eq!(result["detail"], "payload stderr diagnostic clipped");
+        } else if overflow_stdout {
+            assert_eq!(result["detail"], "required payload stdout exceeds capture limit");
+        }
+    }
 }
 
 #[test]

@@ -213,6 +213,7 @@ impl ExpectedContract {
                 "generation_bound_worker_stop_v1".into(),
                 "capacity_until_reaped_v1".into(),
                 "worker_owned_shared_artifact_reads_v1".into(),
+                "native_reader_stdout_frame_v1".into(),
             ],
             required_host_bindings,
             enforcement: "every-host-session-before-body-commands".into(),
@@ -540,7 +541,7 @@ mod tests {
     fn digest_matches_the_python_client_fixed_tuple_encoding() -> Result<(), String> {
         assert_eq!(
             contract()?.digest().map_err(|error| error.to_string())?,
-            "720e51c8731185d7996ef2ae67e8c08f16a4ddb3c1d29bc85c856740ab36b76a"
+            "ba1ea759ffda92968c02756ff178e1445a9dd814a9b33f21ba6f6b6193ea3b0c"
         );
         Ok(())
     }

@@ -65,6 +65,9 @@ pub struct NativeReaderArgs {
     /// Private already-nonblocking read pipe; any byte or EOF requests cancellation.
     #[arg(long, value_parser = clap::value_parser!(i32).range(3..))]
     cancel_fd: Option<i32>,
+    /// Require complete payload stdout, allowing a clipped stderr diagnostic.
+    #[arg(long)]
+    stdout_result_frame: bool,
     #[arg(long, default_value_t = OUTPUT_LIMIT)]
     max_output_bytes: usize,
     #[arg(last = true, required = true)]
@@ -150,6 +153,7 @@ pub(crate) fn run_program_with_contract(
             capacity_limit: u16::try_from(capacity_limit).map_err(io::Error::other)?,
             stdin: false,
             cancel_fd: None,
+            stdout_result_frame: false,
             max_output_bytes: OUTPUT_LIMIT,
             command: program.command.clone(),
         };
@@ -352,6 +356,9 @@ impl NativeReaderArgs {
             .arg(self.max_output_bytes.to_string());
         for root in &self.artifact_root {
             command.arg("--artifact-root").arg(root);
+        }
+        if self.stdout_result_frame {
+            command.arg("--stdout-result-frame");
         }
         if self.stdin {
             command.arg("--stdin");
@@ -857,8 +864,18 @@ fn run_internal(
         if native.lease()?.custody_closed()? {
             native.closed = true;
             let _inputs = native.lease()?.cleanup_inputs();
-            if let Err(error) = output.poll() {
-                interrupted.get_or_insert_with(|| format!("native result capture failed after scope closure: {error}"));
+            match output.poll() {
+                Ok(eof)
+                    if args.stdout_result_frame
+                        && (!eof || output.bytes.last() != Some(&b'\n') || !status.is_some_and(|s| s.success())) =>
+                {
+                    interrupted.get_or_insert_with(|| "native result frame or bootstrap exit incomplete".into());
+                }
+                Err(error) => {
+                    interrupted
+                        .get_or_insert_with(|| format!("native result capture failed after scope closure: {error}"));
+                }
+                Ok(_) => {}
             }
             let payload = if output.truncated {
                 None
@@ -1072,7 +1089,7 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
         command.env_remove(name);
     }
     #[cfg(not(target_os = "linux"))]
-    measure_payload(command, args.max_output_bytes, deadline, &mut payload)?;
+    measure_payload(command, args, deadline, &mut payload)?;
     #[cfg(target_os = "linux")]
     {
         let mut report = wait_for_payload_report(command, deadline)?;
@@ -1147,7 +1164,7 @@ pub fn run_waiter(args: &NativeReaderArgs) -> io::Result<()> {
     };
     measure_payload(
         payload_command(args)?,
-        args.max_output_bytes,
+        args,
         until(Duration::from_millis(args.timeout_millis))?,
         &mut payload,
     )?;
@@ -1156,7 +1173,7 @@ pub fn run_waiter(args: &NativeReaderArgs) -> io::Result<()> {
 
 fn measure_payload(
     mut command: Command,
-    limit: usize,
+    args: &NativeReaderArgs,
     deadline: Instant,
     payload: &mut PayloadResult,
 ) -> io::Result<()> {
@@ -1170,25 +1187,29 @@ fn measure_payload(
                     .get()?
                     .take_stdout()
                     .ok_or_else(|| invalid("payload stdout missing"))?,
-                limit,
+                args.max_output_bytes,
             )?;
             let mut diagnostics = Capture::new(
                 child
                     .get()?
                     .take_stderr()
                     .ok_or_else(|| invalid("payload stderr missing"))?,
-                limit,
+                args.max_output_bytes,
             )?;
             loop {
                 output.poll()?;
                 diagnostics.poll()?;
                 if let Some(status) = child.get()?.try_wait()? {
-                    output.poll()?;
+                    let stdout_closed = output.poll()?;
                     diagnostics.poll()?;
                     payload.exit_code = status.code();
                     payload.exit_status = Some(status.to_string());
                     payload.payload_usage = child.get()?.usage().and_then(PayloadUsage::from_waited);
                     payload.intervened = !payload_has_no_survivors()?;
+                    if args.stdout_result_frame && !stdout_closed {
+                        payload.output_truncated = true;
+                        payload.detail = Some("payload stdout incomplete at exit".into());
+                    }
                     if payload.intervened {
                         payload.detail = Some("payload descendant still present at verdict; no usable result".into());
                     }
@@ -1199,7 +1220,14 @@ fn measure_payload(
             }
             payload.stdout = output.text();
             payload.stderr = diagnostics.text();
-            payload.output_truncated = output.truncated || diagnostics.truncated;
+            payload.output_truncated |= output.truncated || (!args.stdout_result_frame && diagnostics.truncated);
+            if args.stdout_result_frame && payload.detail.is_none() {
+                if output.truncated {
+                    payload.detail = Some("required payload stdout exceeds capture limit".into());
+                } else if diagnostics.truncated {
+                    payload.detail = Some("payload stderr diagnostic clipped".into());
+                }
+            }
         }
     }
     Ok(())
