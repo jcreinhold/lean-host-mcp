@@ -1888,7 +1888,9 @@ mod tests {
                 },
                 1,
             )
-            .unwrap();
+            .unwrap()
+            .with_operator_primary(Some(&root))
+            .expect("approve the private admission fixture");
             assert_eq!(runtime.request_timeout_millis(), timeout_millis);
             let broker = crate::broker::ProjectBroker::new_with_runtime_config(
                 crate::broker::BrokerConfig {

@@ -386,7 +386,9 @@ impl ActorHarness {
             max_workers_per_project: NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         };
-        let mut runtime_config = ProjectRuntimeConfig::default();
+        let mut runtime_config = ProjectRuntimeConfig::default()
+            .with_operator_primary(Some(root.path()))
+            .expect("approve the private actor fixture");
         if let Some(timeout) = admission_timeout {
             runtime_config.request_timeout_millis = millis_u64(timeout);
         }

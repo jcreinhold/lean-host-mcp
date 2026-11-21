@@ -329,7 +329,7 @@ fn discovery_metadata(reader: crate::native_reader::NativeReaderResult) -> Prepa
     Err(PreparationFailure {
         disposition,
         error: bad_project(format!(
-            "native reader did not return a complete result: state={} {}{}{}",
+            "native reader did not return a complete result; no proof check ran: state={} {}{}{}",
             reader.state,
             reader.detail.unwrap_or_default(),
             reader.stdout,
