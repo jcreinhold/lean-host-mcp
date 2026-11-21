@@ -862,10 +862,27 @@ fn barrier_closed(barrier: &rustix::fd::OwnedFd) -> io::Result<bool> {
 // every byte needs JSON's longest six-byte escape. No log tempfile can grow.
 const CAPTURE_BYTES: usize = 64 * 1024;
 
+// The required setup is temporary input for the broker. Only its digest crosses the control frame.
+pub(crate) const MODULE_SETUP_LIMIT: usize = 16 * 1024 * 1024;
+pub(crate) const MODULE_SETUP_ENV: &str = "LEAN_HOST_MCP_CAPTURE_MODULE_SETUP";
+pub(crate) const MODULE_SETUP_FILE: &str = "module-setup.json";
+
+pub(crate) fn module_setup_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 struct Capture {
     descriptor: rustix::fd::OwnedFd,
     bytes: Vec<u8>,
     overflowed: bool,
+    limit: usize,
+    eof: bool,
 }
 
 impl Capture {
@@ -879,6 +896,8 @@ impl Capture {
                 descriptor: read,
                 bytes: Vec::new(),
                 overflowed: false,
+                limit: CAPTURE_BYTES,
+                eof: false,
             },
             Stdio::from(write),
         ))
@@ -891,9 +910,12 @@ impl Capture {
         // existing owner requests stop and observes closure.
         for _ in 0..32 {
             match rustix::io::read(&self.descriptor, &mut buffer) {
-                Ok(0) => return Ok(self.overflowed),
+                Ok(0) => {
+                    self.eof = true;
+                    return Ok(self.overflowed);
+                }
                 Ok(count) => {
-                    let keep = count.min(CAPTURE_BYTES.saturating_sub(self.bytes.len()));
+                    let keep = count.min(self.limit.saturating_sub(self.bytes.len()));
                     self.bytes.extend_from_slice(
                         buffer
                             .get(..keep)
@@ -916,6 +938,27 @@ impl Capture {
 
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+fn poll_output(stdout: &mut Capture, stderr: &mut Capture, module_setup: bool, reason: &mut Option<String>) {
+    for (capture, required) in [(stdout, true), (stderr, !module_setup)] {
+        match capture.read_available() {
+            Ok(true) if required => {
+                reason.get_or_insert_with(|| {
+                    if module_setup {
+                        "Lake module setup exceeds 16 MiB"
+                    } else {
+                        "writer captured output limit exceeded"
+                    }
+                    .to_owned()
+                });
+            }
+            Err(error) => {
+                reason.get_or_insert_with(|| format!("writer output read failed: {error}"));
+            }
+            Ok(_) => {}
+        }
     }
 }
 
@@ -976,19 +1019,6 @@ fn write_launch(
 
 const DESCENDANT_EXIT_GRACE: Duration = Duration::from_millis(100);
 
-fn execute(
-    message: &Value,
-    root: &Path,
-    lock_path: &Path,
-    file: &mut File,
-    loans: &[File],
-    record: &Owner,
-    input: &Receiver<io::Result<Value>>,
-) -> io::Result<bool> {
-    let launcher = std::env::current_exe()?;
-    execute_with_launcher(message, root, lock_path, file, loans, record, input, &launcher, send)
-}
-
 #[allow(
     clippy::too_many_arguments,
     reason = "private lifecycle seam keeps actual process and lock custody testable"
@@ -1002,6 +1032,7 @@ fn execute_with_launcher(
     record: &Owner,
     input: &Receiver<io::Result<Value>>,
     launcher: &Path,
+    setup_path: Option<&Path>,
     mut emit: impl FnMut(&Value) -> io::Result<()>,
 ) -> io::Result<bool> {
     canonical(root)?;
@@ -1016,6 +1047,9 @@ fn execute_with_launcher(
         .ok_or_else(|| invalid("writer timeout is too large"))?;
     let (mut stdout, child_stdout) = Capture::pipe()?;
     let (mut stderr, child_stderr) = Capture::pipe()?;
+    if setup_path.is_some() {
+        stdout.limit = MODULE_SETUP_LIMIT;
+    }
     let (barrier, inherited) = pipe()?;
     fcntl_setfd(&barrier, FdFlags::CLOEXEC)?;
     fcntl_setfl(&barrier, fcntl_getfl(&barrier)? | OFlags::NONBLOCK)?;
@@ -1090,17 +1124,7 @@ fn execute_with_launcher(
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        for capture in [&mut stdout, &mut stderr] {
-            match capture.read_available() {
-                Ok(true) => {
-                    reason.get_or_insert_with(|| "writer captured output limit exceeded".to_owned());
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    reason.get_or_insert_with(|| format!("writer output read failed: {error}"));
-                }
-            }
-        }
+        poll_output(&mut stdout, &mut stderr, setup_path.is_some(), &mut reason);
         let status = match group.try_wait() {
             Ok(status) => status,
             Err(error) => {
@@ -1152,18 +1176,34 @@ fn execute_with_launcher(
                 if let Err(error) = &cleared {
                     reason.get_or_insert_with(|| format!("writer closed but ownership record cleanup failed: {error}"));
                 }
-                for capture in [&mut stdout, &mut stderr] {
-                    match capture.read_available() {
-                        Ok(true) => {
-                            reason.get_or_insert_with(|| "writer captured output limit exceeded".to_owned());
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            reason.get_or_insert_with(|| format!("writer final output read failed: {error}"));
-                        }
+                poll_output(&mut stdout, &mut stderr, setup_path.is_some(), &mut reason);
+                // With the group closed, drain buffered required bytes to EOF. An
+                // open empty pipe or an excess byte refuses publication.
+                while setup_path.is_some() && reason.is_none() && !stdout.eof {
+                    let before = stdout.bytes.len();
+                    poll_output(&mut stdout, &mut stderr, true, &mut reason);
+                    if stdout.bytes.len() == before {
+                        break;
                     }
                 }
-                let captured_stdout = stdout.text();
+                let captured_stdout = if let Some(path) = setup_path {
+                    if !stdout.eof {
+                        reason.get_or_insert_with(|| "incomplete Lake module setup stdout".into());
+                    }
+                    if status.success() && reason.is_none() && !group.intervened() {
+                        match File::create_new(path).and_then(|mut output| output.write_all(&stdout.bytes)) {
+                            Ok(()) => module_setup_digest(&stdout.bytes),
+                            Err(error) => {
+                                reason.get_or_insert_with(|| format!("could not stage Lake module setup: {error}"));
+                                String::new()
+                            }
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    stdout.text()
+                };
                 let captured_stderr = stderr.text();
                 let unavailable = reason.is_some() || group.intervened();
                 // Physical closure is a distinct terminal fact even when the
@@ -1300,7 +1340,20 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                             return Err(invalid("native artifact readers remain unresolved before GO"));
                         }
                     }
-                    if !execute(&message, &args.root, &args.lock, &mut file, &loans, &record, &input)? {
+                    let setup_path = (field(field(&message, "env"), MODULE_SETUP_ENV).as_str() == Some("1"))
+                        .then(|| asset_dir.join(MODULE_SETUP_FILE));
+                    if !execute_with_launcher(
+                        &message,
+                        &args.root,
+                        &args.lock,
+                        &mut file,
+                        &loans,
+                        &record,
+                        &input,
+                        &std::env::current_exe()?,
+                        setup_path.as_deref(),
+                        send,
+                    )? {
                         break;
                     }
                 }
@@ -1333,6 +1386,8 @@ mod tests {
             descriptor: read,
             bytes: Vec::new(),
             overflowed: false,
+            limit: CAPTURE_BYTES,
+            eof: false,
         };
         let chunk = [b'x'; 1024];
         // Every poll must consume the next chunk even after overflow. A reader
@@ -1369,6 +1424,8 @@ mod tests {
             descriptor: read,
             bytes: Vec::new(),
             overflowed: false,
+            limit: CAPTURE_BYTES,
+            eof: false,
         };
         let chunk = [b'a'; 1024];
         for _ in 0..64 {

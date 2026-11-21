@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs, io,
+    io::Read as _,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -91,14 +92,20 @@ impl StagedSetup {
     }
 }
 
-fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, file: &Path) -> io::Result<StagedSetup> {
-    if bytes.len() > 1024 * 1024 {
+fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
+    if bytes.len() > crate::shared_writer::MODULE_SETUP_LIMIT {
         return Err(invalid("Lake module setup exceeds capture limit"));
     }
-    let setup: ModuleSetup = serde_json::from_slice(&bytes)?;
+    let setup: ModuleSetup =
+        serde_json::from_slice(bytes).map_err(|error| invalid(&format!("invalid Lake module setup: {error}")))?;
     if setup.name.is_empty() {
         return Err(invalid("missing Lake module name"));
     }
+    Ok(setup)
+}
+
+fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, file: &Path) -> io::Result<StagedSetup> {
+    let setup = parse_setup(&bytes)?;
     // These fields pass through byte-for-byte. Only Lake/Lean interprets them.
     let release_lib = sysroot.join("lib");
     let mut inputs = BTreeMap::new();
@@ -221,7 +228,8 @@ impl ProjectBroker {
                 .args(["--no-build", "--no-cache", "setup-file"])
                 .arg(&file)
                 .env("LAKE_CACHE_DIR", writer.asset_dir())
-                .env("LAKE_ARTIFACT_CACHE", "false");
+                .env("LAKE_ARTIFACT_CACHE", "false")
+                .env(crate::shared_writer::MODULE_SETUP_ENV, "1");
             let result = writer.run_cancellable(&command, timeout.saturating_sub(started.elapsed()), &|| {
                 cancel.is_cancelled()
             })?;
@@ -232,7 +240,31 @@ impl ProjectBroker {
                     String::from_utf8_lossy(&result.stderr)
                 )));
             }
-            Ok(stage(result.stdout, &writer, &sysroot, &root, &file)?)
+            let path = writer.asset_dir().join(crate::shared_writer::MODULE_SETUP_FILE);
+            let staged = fs::File::from(
+                rustix::fs::open(
+                    &path,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(io::Error::from)?,
+            );
+            let meta = staged.metadata()?;
+            let limit = crate::shared_writer::MODULE_SETUP_LIMIT as u64;
+            if !meta.is_file() || meta.len() > limit {
+                return Err(invalid("invalid Lake module setup staging file").into());
+            }
+            let mut bytes = Vec::new();
+            staged.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+            if bytes.len() > crate::shared_writer::MODULE_SETUP_LIMIT
+                || crate::shared_writer::module_setup_digest(&bytes).as_bytes() != result.stdout
+            {
+                return Err(invalid("Lake module setup exceeds limit or differs from writer receipt").into());
+            }
+            Ok(stage(bytes, &writer, &sysroot, &root, &file)?)
         })
         .await;
         on_drop.disarm();
@@ -243,6 +275,12 @@ impl ProjectBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_parser_requires_complete_bounded_typed_json() {
+        assert!(parse_setup(br#"{"name":"M"}"#).is_err());
+        assert!(parse_setup(br#"{"name":"M""#).is_err());
+    }
 
     #[test]
     fn reader_refuses_replaced_artifact_even_with_identical_bytes() -> io::Result<()> {

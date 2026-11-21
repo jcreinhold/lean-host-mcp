@@ -33,6 +33,11 @@ for name in ['primary.lock', 'loan.lock']:
         sys.exit(121)
 with (root / 'body').open('a') as log:
     log.write('once\n')
+if mode.startswith('setup-'):
+    os.write(2, b'd' * 131072)
+    size = 1400000 if mode == 'setup-large' else 16 * 1024 * 1024 + 1
+    sys.stdout.buffer.write(b' ' * size + b'{}')
+    sys.exit(0)
 print('actual stdout', flush=True)
 print('actual stderr', file=sys.stderr, flush=True)
 if mode == 'clean':
@@ -140,6 +145,11 @@ impl Fixture {
             &self.record,
             input,
             &self.launcher,
+            message["setup"]
+                .as_bool()
+                .unwrap_or(false)
+                .then(|| self.root.join(MODULE_SETUP_FILE))
+                .as_deref(),
             emit,
         )
     }
@@ -243,6 +253,42 @@ fn assert_no_result(frames: &[Value]) {
     assert_eq!(terminal["owned_work_stopped"], true);
     assert!(terminal["exit_code"].as_i64().is_some());
     assert!(terminal["process"]["pid"].as_u64().is_some());
+}
+
+#[test]
+fn setup_stdout_stays_out_of_control_frame_until_closed() {
+    for large in [true, false] {
+        let mut fixture = Fixture::new(if large { "setup-large" } else { "setup-oversize" });
+        let (_sender, input) = mpsc::channel();
+        let mut frames = Vec::new();
+        let mut request = message(45.0);
+        request["setup"] = json!(true);
+        assert_eq!(
+            fixture
+                .run(&request, &input, |frame| {
+                    frames.push(frame.clone());
+                    Ok(())
+                })
+                .unwrap(),
+            large
+        );
+        let path = fixture.root.join(MODULE_SETUP_FILE);
+        let terminal = frames.last().unwrap();
+        assert_eq!(terminal["owned_work_stopped"], true);
+        if large {
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(bytes.len(), 1_400_002);
+            assert!(bytes[..1_400_000].iter().all(|&b| b == b' '));
+            assert_eq!(&bytes[1_400_000..], b"{}");
+            assert_eq!(terminal["stdout"], module_setup_digest(&bytes));
+            assert_eq!(terminal["stderr"].as_str().unwrap().len(), CAPTURE_BYTES);
+        } else {
+            assert!(!path.exists());
+            assert_no_result(&frames);
+            assert_eq!(terminal["reason"], "Lake module setup exceeds 16 MiB");
+        }
+        fixture.assert_closed(&frames);
+    }
 }
 
 #[test]
