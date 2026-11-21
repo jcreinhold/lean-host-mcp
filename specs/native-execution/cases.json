@@ -539,7 +539,10 @@
       "specification": "DeadlineSpec",
       "extended": true,
       "expect": "invariant",
-      "constants": { "Profile": "\"warm\"", "Mutation": "\"byte-without-ack\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Mutation": "\"byte-without-ack\""
+      },
       "invariants": ["DeadlineByteOrder"],
       "properties": [],
       "invariant": "DeadlineByteOrder"
@@ -550,7 +553,10 @@
       "specification": "DeadlineSpec",
       "extended": true,
       "expect": "invariant",
-      "constants": { "Profile": "\"warm\"", "Mutation": "\"byte-after-deadline\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Mutation": "\"byte-after-deadline\""
+      },
       "invariants": ["DeadlineByteOrder"],
       "properties": [],
       "invariant": "DeadlineByteOrder"
@@ -572,7 +578,10 @@
       "specification": "DeadlineSpec",
       "extended": true,
       "expect": "liveness",
-      "constants": { "Profile": "\"warm\"", "Mutation": "\"parent-required-for-stop\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Mutation": "\"parent-required-for-stop\""
+      },
       "invariants": [
         "TypeOK",
         "SafeCommands",
