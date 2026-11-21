@@ -337,7 +337,7 @@ fn cli_writer_succeeds(fixture: &Fixture) {
 }
 
 #[test]
-#[ignore = "requires the matched standalone SDK writer with staged handoff support"]
+#[ignore = "requires the matched standalone SDK writer with approval and scratch identity"]
 fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work() {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -355,6 +355,31 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
         std::env::var_os("LEAN_HOST_MCP_MATCHED_SDK_WRITER").expect("set canonical matched standalone SDK writer"),
     );
     assert_eq!(standalone.canonicalize().expect("matched SDK writer"), standalone);
+    let registry_identity = fs::metadata(&registry).expect("exact registry");
+    let registry_args = [
+        "--registry",
+        registry.to_str().expect("fixture path"),
+        "--registry-device",
+        &registry_identity.dev().to_string(),
+        "--registry-inode",
+        &registry_identity.ino().to_string(),
+    ];
+    let sdk_storage = |action: &str| {
+        let mut command = Command::new(&standalone);
+        command
+            .args(["writer-storage", action])
+            .args(registry_args)
+            .env(REGISTRY_ENV, &registry);
+        command
+    };
+    let approved = sdk_storage("approve-handoff")
+        .output()
+        .expect("approve the fixture registry");
+    assert!(approved.status.success(), "{approved:?}");
+    let approval: Value = serde_json::from_slice(&approved.stdout).expect("SDK approval response");
+    let generation = approval["approval_generation"]
+        .as_str()
+        .expect("issued approval generation");
 
     let host = |project: &Path, lock: &Path| {
         let mut command = Command::new(executable());
@@ -397,7 +422,7 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     let digest = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
     let request = json!({
         "version":1,"floor_bytes":0,"budget_bytes":1_048_576,"command_only":true,
-        "handoff_sha256":digest,"roots":roots,
+        "handoff_sha256":digest,"approval_generation":generation,"roots":roots,
     });
     let mut command = Command::new(&standalone);
     command
@@ -428,15 +453,13 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     assert_eq!(owner_record["storage_turn"], turn);
     assert_eq!(owner_record["command_phase"], "idle");
     assert_eq!(owner_record.get("process"), Some(&Value::Null));
-    let registry_identity = fs::metadata(&registry).expect("exact registry");
-    let registry_args = [
-        "--registry",
-        registry.to_str().expect("fixture path"),
-        "--registry-device",
-        &registry_identity.dev().to_string(),
-        "--registry-inode",
-        &registry_identity.ino().to_string(),
-    ];
+    assert_eq!(
+        owner_record["scratch_identity"]
+            .as_str()
+            .expect("SDK scratch digest")
+            .len(),
+        64
+    );
     let rollback = |confirmed: bool| {
         let mut check = Command::new(executable());
         check
@@ -488,15 +511,16 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
         fs::read(&fixture.domain).expect("unrelated owner unchanged"),
         extended_owner
     );
-    let recovered = Command::new(&standalone)
-        .args(["writer-storage", "recover"])
-        .args(registry_args)
+    let recovered = sdk_storage("recover")
         .args(["--turn", turn, "--acknowledge-unknown-result"])
-        .env(REGISTRY_ENV, &registry)
         .output()
         .expect("settle using the actual SDK recovery command");
     assert!(recovered.status.success(), "{recovered:?}");
     assert!(!charge.exists() && !asset.exists());
+    let disabled = sdk_storage("revoke-handoff")
+        .output()
+        .expect("revoke the fixture approval");
+    assert!(disabled.status.success(), "{disabled:?}");
     assert!(!rollback(false).output().expect("unconfirmed drain").status.success());
     assert!(
         !rollback(true)
@@ -557,8 +581,8 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     drop(control);
     assert!(reader.finish().status.success());
 
-    // Roll back to a matched host with source handoffs disabled. The 0.16.10
-    // and 0.16.11 embedded parsers reject this genuine settled SDK record.
+    // Roll back to a matched host with source handoffs disabled. The ordinary
+    // 0.16.12 source at 6da1fc4 predates the SDK scratch digest in this record.
     write_marker(&fixture.root, &fixture.domain, &root.join("rollback-dispatched"));
 }
 

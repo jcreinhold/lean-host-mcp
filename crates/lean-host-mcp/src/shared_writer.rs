@@ -179,6 +179,27 @@ struct SdkIdleRecord {
     process: (),
     storage_turn: String,
     command_phase: SdkIdlePhase,
+    #[serde(
+        rename = "scratch_identity",
+        default,
+        deserialize_with = "check_scratch_identity_shape"
+    )]
+    _scratch_identity: (),
+}
+
+fn check_scratch_identity_shape<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    let digest = String::deserialize(deserializer)?;
+    // The SDK verifies the original scratch binding during settlement.
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(serde::de::Error::custom(
+            "expected a 64-digit lowercase scratch identity",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -290,6 +311,7 @@ fn decode_owner(bytes: &[u8], use_for: OwnerRecordUse) -> io::Result<Record> {
                 process: (),
                 storage_turn,
                 command_phase: SdkIdlePhase::Idle,
+                _scratch_identity: (),
             } = serde_json::from_slice(bytes)
                 .map_err(|error| invalid(format!("invalid embedded or SDK Idle owner record: {error}")))?;
             if storage_turn.len() != 32 || !storage_turn.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1593,6 +1615,13 @@ mod tests {
         let prior = decode(&idle, OwnerRecordUse::Predecessor).expect("exact SDK Idle predecessor");
         assert_eq!(prior.owner.start, "prior-owner");
         assert!(decode(&idle, OwnerRecordUse::EmbeddedLaunch).is_err());
+        let mut bound = idle.clone();
+        bound
+            .as_object_mut()
+            .expect("fixture owner object")
+            .insert("scratch_identity".to_owned(), json!("a1".repeat(32)));
+        assert!(decode(&bound, OwnerRecordUse::Predecessor).is_ok());
+        assert!(decode(&bound, OwnerRecordUse::EmbeddedLaunch).is_err());
 
         for (key, value) in [
             ("process", None),
@@ -1600,6 +1629,12 @@ mod tests {
             ("storage_turn", None),
             ("storage_turn", Some(json!("not-a-turn"))),
             ("command_phase", Some(json!("starting"))),
+            ("scratch_identity", Some(Value::Null)),
+            ("scratch_identity", Some(json!([1, 2]))),
+            ("scratch_identity", Some(json!("a".repeat(63)))),
+            ("scratch_identity", Some(json!("a".repeat(65)))),
+            ("scratch_identity", Some(json!("A".repeat(64)))),
+            ("scratch_identity", Some(json!("g".repeat(64)))),
             ("unknown", Some(json!(true))),
         ] {
             let mut invalid = idle.clone();
@@ -1612,7 +1647,7 @@ mod tests {
             assert!(decode(&invalid, OwnerRecordUse::Predecessor).is_err(), "{invalid}");
         }
 
-        let mut running = idle;
+        let mut running = bound;
         let record = running.as_object_mut().expect("fixture owner object");
         record.insert("command_phase".to_owned(), json!("running"));
         record.insert(
