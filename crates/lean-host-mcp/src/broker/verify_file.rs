@@ -51,35 +51,29 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) struct PreparedReader {
+    pub(super) custody: crate::artifact_reads::ArtifactReadGuard,
+    pub(super) sysroot: PathBuf,
+    pub(super) shims: Vec<PathBuf>,
+    pub(super) domains: Vec<PathBuf>,
+    pub(super) shim_guards: lean_toolchain::shared_writer::LocalArtifactRead,
+    pub(super) roots: Vec<PathBuf>,
+}
+
 impl ProjectBroker {
-    pub(crate) async fn verify_file(
-        &self,
-        hint: ProjectHint,
-        imports: Vec<String>,
-        freshness: Vec<String>,
-        request: LeanWorkerDeclarationVerificationBatchRequest,
-        options: LeanWorkerElabOptions,
+    pub(super) fn prepared_reader(
+        root: &Path,
+        meta: &crate::lake_meta::LakeProjectMeta,
         input: &str,
-    ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
-        use lean_rs_worker_protocol::types::{
-            LeanWorkerDeclarationVerificationTarget as Target, LeanWorkerSorryPolicy,
-        };
-        let root = self.native_root(&hint)?;
-        let meta = self.meta(&root)?;
+        imports: &[String],
+    ) -> Result<PreparedReader> {
         let selection: Selection = serde_json::from_str(input).map_err(invalid)?;
         let plan = selection.plan;
-        let file = Path::new(&options.file_label);
-        if plan.project != root
-            || !file.starts_with(&root)
-            || file.canonicalize()? != file
-            || file.extension().and_then(|x| x.to_str()) != Some("lean")
-        {
-            return Err(invalid("unapproved verification path"));
+        if plan.project != root {
+            return Err(invalid("unexpected prepared project"));
         }
-        let options = self.resolve_options(&meta, options).await?;
-        let activity = self.preparation_activity(&root).await?;
-        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(&root).map_err(invalid)?;
-        let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
+        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root).map_err(invalid)?;
+        let (worker, sysroot, _) = crate::project::resolve_worker(meta)?;
         let generation = worker.parent().ok_or_else(|| invalid("missing worker generation"))?;
         let installed = crate::toolchain::WorkerSidecar::load(generation)
             .and_then(crate::toolchain::WorkerSidecar::into_runtime)
@@ -106,7 +100,7 @@ impl ProjectBroker {
                 ));
             }
         }
-        let project_domains = lean_toolchain::shared_writer::project_artifact_roots(&root)?;
+        let project_domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
         let mut expected: Vec<_> = project_domains.iter().map(|p| p.join(".lake/build/lib/lean")).collect();
         expected.extend(shims.clone());
         expected.push(plan.release.clone());
@@ -122,7 +116,7 @@ impl ProjectBroker {
             return Err(invalid("prepared roots shadow builtin Init"));
         }
         for ((name, domain), parts) in plan.modules.iter().zip(&selection.products) {
-            let base = domain.join(".lake/build/lib/lean").join(name);
+            let base = domain.join(".lake/build/lib/lean").join(name.replace('.', "/"));
             if !project_domains.contains(domain)
                 || parts.len() != 5
                 || parts.first().and_then(Option::as_ref).is_none()
@@ -149,6 +143,46 @@ impl ProjectBroker {
         {
             return Err(invalid("unsupported import outside prepared project"));
         }
+        Ok(PreparedReader {
+            custody,
+            sysroot,
+            shims,
+            domains,
+            shim_guards,
+            roots: plan.roots,
+        })
+    }
+    pub(crate) async fn verify_file(
+        &self,
+        hint: ProjectHint,
+        imports: Vec<String>,
+        freshness: Vec<String>,
+        request: LeanWorkerDeclarationVerificationBatchRequest,
+        options: LeanWorkerElabOptions,
+        input: &str,
+    ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
+        use lean_rs_worker_protocol::types::{
+            LeanWorkerDeclarationVerificationTarget as Target, LeanWorkerSorryPolicy,
+        };
+        let root = self.native_root(&hint)?;
+        let meta = self.meta(&root)?;
+        let file = Path::new(&options.file_label);
+        if !file.starts_with(&root)
+            || file.canonicalize()? != file
+            || file.extension().and_then(|x| x.to_str()) != Some("lean")
+        {
+            return Err(invalid("unapproved verification path"));
+        }
+        let options = self.resolve_options(&meta, options).await?;
+        let activity = self.preparation_activity(&root).await?;
+        let PreparedReader {
+            custody,
+            sysroot,
+            shims,
+            domains,
+            shim_guards,
+            roots,
+        } = Self::prepared_reader(&root, &meta, input, &imports)?;
         let targets = request
             .targets
             .iter()
@@ -161,7 +195,7 @@ impl ProjectBroker {
         let facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let body = serde_json::to_vec(&serde_json::json!({
             "source": request.source, "file": options.file_label,
-            "roots": plan.roots, "imports": imports, "targets": targets,
+            "roots": roots, "imports": imports, "targets": targets,
             "allowSorry": matches!(request.sorry_policy, LeanWorkerSorryPolicy::Allow),
             "reportAxioms": request.report_axioms,
             "perFieldBytes": request.budgets.per_field_bytes,

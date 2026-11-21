@@ -69,6 +69,7 @@ use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResu
 
 mod control;
 mod preparation;
+mod semantic_file;
 mod verify_file;
 mod writer_handoff;
 pub(crate) use control::MaintenanceAccess;
@@ -754,6 +755,11 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
+        if let Some(selection) = self.prepared_generation() {
+            return self
+                .semantic_file(hint, session_imports, freshness_imports, request, selection)
+                .await;
+        }
         let (project, admission_deadline) = self.project_for(hint).await?;
         let call = project
             .semantic_proof_search(session_imports, request, admission_deadline)

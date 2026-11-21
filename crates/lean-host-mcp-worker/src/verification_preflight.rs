@@ -170,7 +170,7 @@ impl Approval {
         }
         let mut bytes = Vec::new();
         regular(path)?
-            .take(batch.source.len() as u64 + 1)
+            .take((batch.source.len() as u64).saturating_add(1))
             .read_to_end(&mut bytes)?;
         if bytes != batch.source.as_bytes() {
             return Err(refusal());
@@ -217,7 +217,7 @@ pub(super) fn check_handoff(deliver: impl FnOnce(&str) -> io::Result<String>) ->
         }],
         sorry_policy: SorryPolicy::Deny,
         report_axioms: true,
-        budgets: Default::default(),
+        budgets: lean_rs::host_bridge::module_requests::ModuleQueryOutputBudgets::default(),
     };
     let options = HostSourceOptions {
         file: file.display().to_string(),
@@ -260,7 +260,7 @@ pub(super) fn check_handoff(deliver: impl FnOnce(&str) -> io::Result<String>) ->
     swapped.reverse();
     assert!(check(&batch, &options, Some(&swapped)).is_err());
     let mut opt = options.clone();
-    opt.heartbeats += 1;
+    opt.heartbeats = opt.heartbeats.saturating_add(1);
     assert!(check(&batch, &opt, Some(&roots)).is_err());
     let mut changed = batch.clone();
     changed.source.push_str("-- changed\n");

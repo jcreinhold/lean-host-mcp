@@ -3736,7 +3736,7 @@ static SEMANTIC_RUNTIMES: std::sync::LazyLock<
 /// diagnostic string alone cannot distinguish no result from uncertain cleanup.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
-struct SemanticRuntimeFailure {
+pub(crate) struct SemanticRuntimeFailure {
     message: String,
     writer: Option<lean_toolchain::shared_writer::WriterFailure>,
 }
@@ -3778,7 +3778,7 @@ impl SemanticRuntimeFailure {
 }
 
 /// Memoized supervised semantic runtime build; failures are never cached.
-fn semantic_runtime(
+pub(crate) fn semantic_runtime(
     toolchain_label: &str,
     lean_sysroot: &Path,
     cancellation: &CallCancellation,
@@ -3820,6 +3820,17 @@ fn semantic_runtime(
 }
 
 fn semantic_runtime_cache_root() -> Result<PathBuf> {
+    // This changes only the destination of the released runtime builder. It
+    // still checks the package inputs and uses the same supervised writer.
+    if let Some(dir) = std::env::var_os("LEAN_HOST_MCP_SEMANTIC_CACHE_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.canonicalize()? != dir || !dir.is_dir() {
+            return Err(ServerError::BadProject(
+                "expected canonical semantic cache directory".into(),
+            ));
+        }
+        return Ok(dir);
+    }
     let cache_dir =
         dirs::cache_dir().ok_or_else(|| ServerError::Internal("could not resolve user cache directory".to_owned()))?;
     Ok(cache_dir.join("lean-host-mcp").join("semantic-runtimes"))

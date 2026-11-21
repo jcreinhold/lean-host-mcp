@@ -189,6 +189,7 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let searches = plan_searches(&profile, mode);
     let semantic = match run_semantic_search(ctx, project.clone(), &profile).await {
         Ok(value) => value,
+        Err(err) if ctx.broker.prepared_generation().is_some() && profile.semantic.is_some() => return Err(err),
         Err(err) => {
             warnings.push(format!(
                 "semantic proof search unavailable; used fallback declaration search: {}",
@@ -281,6 +282,34 @@ async fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: us
     ) {
         let hint = ProjectHint::from_request(req.project.clone());
         let meta = ctx.broker.resolve_meta(&hint)?;
+        if ctx.broker.prepared_generation().is_some() {
+            let input = crate::tools::source_input::read_query_file(&meta.canonical_root, &file)?;
+            let mut imports = input.imports.clone();
+            for module in &req.imports {
+                if !imports.contains(module) {
+                    imports.push(module.clone());
+                }
+            }
+            let semantic = semantic_request_for_source(
+                &meta.canonical_root,
+                &input,
+                &declaration,
+                &req.proof_position,
+                None,
+                &imports,
+                limit,
+            )
+            .ok_or_else(|| ServerError::BadProject("cannot select semantic source module".into()))?;
+            return Ok(profile_from_text(
+                explicit_text,
+                None,
+                imports,
+                "semantic_frontend".into(),
+                None,
+                Vec::new(),
+                Some(semantic),
+            ));
+        }
         // `proof_state_internal` reads the file to elaborate it and hands the
         // same `QueryFile` back, so the semantic ranking below scores exactly
         // the bytes that produced the goal state.
@@ -880,7 +909,8 @@ fn rank_results(
     // Mutually exclusive with the head-only warning by construction.
     if !candidates.is_empty()
         && candidates.iter().all(|candidate| {
-            !candidate.match_reason.contains("conclusion_head")
+            !candidate.match_reason.contains("semantic:")
+                && !candidate.match_reason.contains("conclusion_head")
                 && !candidate.match_reason.contains("required_constants")
         })
     {

@@ -14,7 +14,7 @@ use lean_semantic_search_contract::{
     SEMANTIC_FEATURE_VERSION,
 };
 use lean_semantic_search_retrieval::{Anchor, SemanticIndex, retrieve_across};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, ServerError};
 use crate::projections::SourceRange;
@@ -56,6 +56,64 @@ struct DeclarationFeatureCommandRequest {
     declaration_ids: Vec<String>,
 }
 
+impl SemanticProofSearchRequest {
+    fn declarations(&self) -> DeclarationFeatureCommandRequest {
+        DeclarationFeatureCommandRequest {
+            modules: self
+                .candidate_modules
+                .iter()
+                .map(|module| ModuleSpec {
+                    module: module.clone(),
+                    origin: Some("lean-host-mcp".to_owned()),
+                    source_root: None,
+                })
+                .collect(),
+            declaration_ids: Vec::new(),
+        }
+    }
+
+    pub(crate) fn reader_input(&self, roots: &[std::path::PathBuf]) -> Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct Input<'a> {
+            roots: &'a [std::path::PathBuf],
+            goal: &'a ProofGoalFeatureRequest,
+            declarations: DeclarationFeatureCommandRequest,
+        }
+        let body = serde_json::to_vec(&Input {
+            roots,
+            goal: &self.goal,
+            declarations: self.declarations(),
+        })
+        .map_err(|e| ServerError::BadProject(e.to_string()))?;
+        if body.len() > 16 * 1024 * 1024 {
+            return Err(ServerError::BadProject(
+                "semantic feature request exceeds adapter bound".into(),
+            ));
+        }
+        Ok(body)
+    }
+
+    pub(crate) fn reader_result(&self, bytes: &[u8]) -> Result<SemanticProofSearchResult> {
+        #[derive(Deserialize)]
+        struct Output {
+            goal: ProofGoalResponse,
+            declarations: DeclarationResponse,
+        }
+        let out: Output = serde_json::from_slice(bytes)
+            .map_err(|e| ServerError::Internal(format!("invalid semantic feature verdict: {e}")))?;
+        validate_response(
+            &out.goal,
+            lean_semantic_search_capability::PROOF_GOAL_FEATURES_COMMAND,
+            PROOF_GOAL_FEATURE_COMMAND_VERSION,
+        )?;
+        validate_response(
+            &out.declarations,
+            lean_semantic_search_capability::DECLARATION_FEATURES_COMMAND,
+            DECLARATION_FEATURE_COMMAND_VERSION,
+        )?;
+        Ok(rank_semantic_rows(&out.goal, &out.declarations, self.limit))
+    }
+}
 /// Run source-backed semantic proof search in one manifest-backed worker session.
 ///
 /// # Errors
@@ -83,18 +141,7 @@ pub(crate) fn run_semantic_proof_search(
         PROOF_GOAL_FEATURE_COMMAND_VERSION,
     )?;
 
-    let declaration_request = DeclarationFeatureCommandRequest {
-        modules: request
-            .candidate_modules
-            .iter()
-            .map(|module| ModuleSpec {
-                module: module.clone(),
-                origin: Some("lean-host-mcp".to_owned()),
-                source_root: None,
-            })
-            .collect(),
-        declaration_ids: Vec::new(),
-    };
+    let declaration_request = request.declarations();
     let declaration_response = session
         .run_json_command(&declaration_command, &declaration_request, Some(cancellation), None)
         .map_err(crate::error::map_worker_err)?;

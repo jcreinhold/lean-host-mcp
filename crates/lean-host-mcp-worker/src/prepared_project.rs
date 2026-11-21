@@ -13,6 +13,13 @@ pub struct PreparedProject {
     guards: LocalArtifactRead,
     ordered: Vec<(PathBuf, File)>,
 }
+fn valid_module(name: &str) -> bool {
+    name.split('.').all(|part| {
+        part.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -23,6 +30,9 @@ impl PreparedProject {
     // The approval supplies the order. The SDK manifest graph independently supplies
     // the lock domains. Installed shim locks remain owned by Installed, and Elan
     // replacement is excluded for the lifetime of the job.
+    ///
+    /// # Errors
+    /// Refuses unavailable custody, noncanonical roots, or a different domain set.
     pub fn capture(
         project: &Path,
         order: &[PathBuf],
@@ -66,6 +76,9 @@ impl PreparedProject {
             ordered,
         })
     }
+    ///
+    /// # Errors
+    /// Refuses absent observations, changed directory identities, or a different root order.
     pub fn check_observed(&self, observed: Option<&[String]>) -> io::Result<()> {
         let roots = observed.ok_or_else(invalid)?;
         self.guards.validate()?;
@@ -152,14 +165,18 @@ impl ImportPlan {
             let selected = lean_toolchain::olean_candidate(&self.roots, name, |p| fs::metadata(p))
                 .map_err(io::Error::other)?
                 .ok_or_else(invalid)?;
-            if !domains.contains(domain) || name.contains('.') {
+            if !domains.contains(domain) || !valid_module(name) {
                 return Err(invalid());
             }
-            let expected = domain.join(".lake/build/lib/lean").join(name).with_extension("olean");
+            let expected = domain
+                .join(".lake/build/lib/lean")
+                .join(name.replace('.', "/"))
+                .with_extension("olean");
             if selected != expected {
                 return Err(invalid());
             }
-            hash.update(file_hash(&domain.join(name).with_extension("lean"))?);
+            let file = domain.join(name.replace('.', "/")).with_extension("lean");
+            hash.update(file_hash(&file)?);
             hash.update(file_hash(&selected)?);
             for suffix in ["olean.server", "olean.private", "ir.sig", "ir"] {
                 let part = selected.with_extension(suffix);
@@ -196,7 +213,12 @@ impl ImportPlan {
         let local: Vec<_> = self
             .modules
             .iter()
-            .map(|(name, domain)| domain.join(".lake/build/lib/lean").join(name).with_extension("olean"))
+            .map(|(name, domain)| {
+                domain
+                    .join(".lake/build/lib/lean")
+                    .join(name.replace('.', "/"))
+                    .with_extension("olean")
+            })
             .collect();
         let search =
             std::env::join_paths(self.roots.iter().filter(|path| *path != &self.release)).map_err(io::Error::other)?;
@@ -205,7 +227,7 @@ impl ImportPlan {
             cmd.current_dir(&self.project)
                 .env("LEAN_PATH", &search)
                 .arg("--deps")
-                .arg(domain.join(name).with_extension("lean"));
+                .arg(domain.join(name.replace('.', "/")).with_extension("lean"));
             let out = writer.run(&cmd, Duration::from_secs(30))?;
             if !out.status.success() {
                 return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned()));
@@ -225,6 +247,9 @@ impl ImportPlan {
     }
     /// Build the selected plugin-free default-layout project from clean output domains
     /// and capture the result before releasing the same writer.
+    ///
+    /// # Errors
+    /// Refuses existing outputs, failed guarded preparation, or unexpected imports.
     pub fn build_generation(
         self,
         writer: &mut lean_toolchain::shared_writer::SharedWriter,
@@ -233,7 +258,7 @@ impl ImportPlan {
             return Err(invalid());
         }
         let (target, domain) = self.modules.first().ok_or_else(invalid)?;
-        if domain != &self.project || !target.bytes().all(|b| b.is_ascii_alphanumeric()) || target.is_empty() {
+        if domain != &self.project || !valid_module(target) {
             return Err(invalid());
         }
         for domain in project_artifact_roots(&self.project)? {
@@ -260,7 +285,7 @@ impl ImportPlan {
         let mut cmd = std::process::Command::new(lake);
         cmd.current_dir(&self.project)
             .env("LAKE_ARTIFACT_CACHE", "false")
-            .args(["--no-cache", "build", target]);
+            .args(["--no-cache", "build", &format!("+{target}")]);
         let built = writer.run(&cmd, std::time::Duration::from_secs(90))?;
         if !built.status.success() {
             return Err(io::Error::other(String::from_utf8_lossy(&built.stderr).into_owned()));
@@ -271,7 +296,7 @@ impl ImportPlan {
             .modules
             .iter()
             .map(|(name, domain)| {
-                let base = domain.join(".lake/build/lib/lean").join(name);
+                let base = domain.join(".lake/build/lib/lean").join(name.replace('.', "/"));
                 ["olean", "olean.server", "olean.private", "ir.sig", "ir"]
                     .into_iter()
                     .map(|ext| {
@@ -306,6 +331,9 @@ impl PreparedGeneration {
     }
 
     /// Bounded launch data for an explicitly selected generation. Contains no module bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the record cannot be encoded within the launch bound.
     pub fn launch_input(&self) -> io::Result<String> {
         let input = serde_json::to_string(self)?;
         if input.len() > 4096 {
@@ -315,6 +343,9 @@ impl PreparedGeneration {
     }
     /// Re-resolve under reader custody before any native import. Caller supplies the separately
     /// selected project, known release and installed shim roots. Keep the result through use.
+    ///
+    /// # Errors
+    /// Refuses unselected modules, incomplete custody, or changed prepared products.
     pub fn verify_before_import(
         input: &str,
         project: &Path,
@@ -365,13 +396,13 @@ fn path_dependency_custody_and_observation() -> io::Result<()> {
     let main_root = project.join(".lake/build/lib/lean");
     assert!(dep_root.join("Dep.olean").is_file() && main_root.join("Root.olean").is_file());
     let builtin = release.join("lib/lean");
-    let order = vec![dep_root.clone(), main_root.clone(), builtin.clone(), builtin.clone()];
+    let search = [dep_root.clone(), main_root.clone()];
+    let order = [dep_root.clone(), main_root.clone(), builtin.clone(), builtin.clone()];
     let input = fs::read_to_string(base.join("launch-input"))?;
     let names = vec![String::from("Root")];
-    let verify = || PreparedGeneration::verify_before_import(&input, &project, &builtin, &[], &order[..2], &names);
+    let verify = || PreparedGeneration::verify_before_import(&input, &project, &builtin, &[], &search, &names);
     assert!(
-        PreparedGeneration::verify_before_import(&input, &project, &builtin, &[], &order[..2], &["Other".into()])
-            .is_err()
+        PreparedGeneration::verify_before_import(&input, &project, &builtin, &[], &search, &["Other".into()]).is_err()
     );
     assert!(
         PreparedGeneration::verify_before_import(
@@ -379,7 +410,7 @@ fn path_dependency_custody_and_observation() -> io::Result<()> {
             &project,
             &builtin,
             &[],
-            &[main_root.clone(), dep_root.clone()],
+            &[main_root, dep_root.clone()],
             &names
         )
         .is_err()
@@ -412,12 +443,12 @@ fn path_dependency_custody_and_observation() -> io::Result<()> {
     let observed: Vec<_> = observation.lines().map(str::to_owned).collect();
     eprintln!("Lake/Lean observed roots: {observed:?}");
     prepared.check_observed(Some(&observed))?;
-    assert!(prepared.check_observed(Some(&observed[..3])).is_err());
+    assert!(prepared.check_observed(observed.get(..3)).is_err());
     let mut swapped = observed.clone();
     swapped.swap(0, 1);
     assert!(prepared.check_observed(Some(&swapped)).is_err());
     assert!(prepared.check_observed(None).is_err());
-    assert!(prepared.check_observed(Some(&observed[1..])).is_err());
+    assert!(prepared.check_observed(observed.get(1..)).is_err());
     // Deliberately model a noncooperating directory replacement inside this fixture.
     let moved = dep_root.with_file_name("lean-original");
     fs::rename(&dep_root, &moved)?;
@@ -491,7 +522,9 @@ fn build_path_dependency() -> io::Result<()> {
     let roots = if let Some(ref path) = installed {
         let sidecar: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
         let mut roots = vec![project.join(".lake/build/lib/lean"), dep.join(".lake/build/lib/lean")];
-        for root in sidecar["deployment"]["prepared"]["shim_search_paths"]
+        for root in sidecar
+            .pointer("/deployment/prepared/shim_search_paths")
+            .ok_or_else(invalid)?
             .as_array()
             .ok_or_else(invalid)?
         {
@@ -545,11 +578,21 @@ fn build_path_dependency() -> io::Result<()> {
 #[test]
 #[ignore = "requires the disposable installed-worker control after its parent exits"]
 fn collect_installed_fixture() -> io::Result<()> {
+    collect_fixture("r2-prepared-project")
+}
+#[test]
+#[ignore = "requires the disposable installed semantic project"]
+fn collect_semantic_fixture() -> io::Result<()> {
+    collect_fixture("r2-semantic-project")
+}
+#[cfg(test)]
+fn collect_fixture(directory: &str) -> io::Result<()> {
     use std::time::Duration;
-    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/r2-prepared-project")
-        .canonicalize()?;
-    let owners = base.join("owners");
+    let owners = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(directory)
+        .canonicalize()?
+        .join("owners");
     lean_toolchain::native_guardian::collect_closed_owner_records(&owners, Duration::from_secs(10))?;
     for entry in fs::read_dir(owners)? {
         if entry?.file_type()?.is_dir() {
@@ -586,4 +629,46 @@ fn replace_installed_fixture_dependency() -> io::Result<()> {
     assert_eq!(file_hash(&dep)?, file_hash(&root)?);
     drop(writer);
     Ok(())
+}
+
+#[test]
+#[ignore = "requires a disposable installed worker and a clean miniRat project"]
+fn prepare_mini_rat() -> io::Result<()> {
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
+    let base = checkout.join("target/r2-semantic-project");
+    let project = base.join("project");
+    let sidecar: serde_json::Value = serde_json::from_slice(&fs::read(
+        std::env::var_os("TEST_INSTALLED_SIDECAR").ok_or_else(invalid)?,
+    )?)?;
+    let deployment = sidecar.get("deployment").ok_or_else(invalid)?;
+    let release = Path::new(
+        deployment
+            .get("sysroot")
+            .ok_or_else(invalid)?
+            .as_str()
+            .ok_or_else(invalid)?,
+    )
+    .join("lib/lean");
+    let mut roots = vec![project.join(".lake/build/lib/lean")];
+    for shim in deployment
+        .pointer("/prepared/shim_search_paths")
+        .ok_or_else(invalid)?
+        .as_array()
+        .ok_or_else(invalid)?
+    {
+        roots.push(PathBuf::from(shim.as_str().ok_or_else(invalid)?));
+    }
+    roots.push(release.clone());
+    let modules = ["LeanRsFixture.ProofAgent", "LeanRsFixture.ProofSearchFacts"]
+        .map(|name| (name.to_owned(), project.clone()))
+        .to_vec();
+    let mut writer = lean_toolchain::shared_writer::SharedWriter::open(
+        &base.join("tools/bin/lean-rs-writer"),
+        &project,
+        std::time::Duration::from_secs(15),
+    )?;
+    let record = ImportPlan::new(project, roots, release, modules)
+        .build_generation(&mut writer)?
+        .launch_input()?;
+    fs::write(base.join("installed-input"), record)
 }
