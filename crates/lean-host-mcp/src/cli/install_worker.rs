@@ -376,7 +376,7 @@ fn clean_in(root: &Path, target: Option<&ToolchainId>) -> anyhow::Result<()> {
     if let Some(id) = target {
         let dir = root.join(id.as_str());
         if dir.is_dir() {
-            fs::remove_dir_all(&dir)?;
+            retire_slot(&dir, &WorkerBinary::selected_dir(&dir)?)?;
             println!("removed worker for {id}");
         } else {
             println!("no worker installed for {id}");
@@ -391,11 +391,76 @@ fn clean_in(root: &Path, target: Option<&ToolchainId>) -> anyhow::Result<()> {
             continue;
         }
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
-        fs::remove_dir_all(&path)?;
+        retire_slot(&path, &WorkerBinary::selected_dir(&path)?)?;
         println!("removed worker for {name}");
         removed = removed.saturating_add(1);
     }
     println!("removed {removed} worker(s) from {}", root.display());
+    Ok(())
+}
+
+/// Serialize candidate construction, activation and retirement on the slot directory itself.
+fn lock_slot(slot: &Path) -> anyhow::Result<fs::File> {
+    let file = fs::File::open(slot)?;
+    file.try_lock().map_err(std::io::Error::from)?;
+    verify_named_handle(slot, &file, true)?;
+    Ok(file)
+}
+
+fn verify_named_handle(path: &Path, file: &fs::File, directory: bool) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let named = fs::symlink_metadata(path)?;
+    let held = file.metadata()?;
+    anyhow::ensure!(
+        (if directory {
+            named.is_dir()
+        } else {
+            named.is_file() && held.nlink() == 1
+        }) && (held.dev(), held.ino()) == (named.dev(), named.ino()),
+        "installation path changed: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Take all reader domains before removing anything, including for superseded workers.
+fn retire_slot(slot: &Path, expected: &Path) -> anyhow::Result<()> {
+    let _mutation = lock_slot(slot)?;
+    let mut guards = Vec::new();
+    for entry in fs::read_dir(slot)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("generation-") {
+            continue;
+        }
+        anyhow::ensure!(entry.file_type()?.is_dir(), "invalid worker generation directory");
+        let dir = entry.path();
+        for domain in [
+            "shims/lean-rs-host-shims",
+            "shims/lean-rs-interop-shims",
+            "smoke-project",
+        ] {
+            let root = dir.join(domain);
+            anyhow::ensure!(
+                root.canonicalize()? == root && root.is_dir(),
+                "invalid installed artifact domain"
+            );
+            let path = lean_toolchain::shared_writer::project_lock_path(&root)?;
+            let file = fs::File::open(&path)?;
+            file.try_lock().map_err(std::io::Error::from)?;
+            verify_named_handle(&path, &file, false)?;
+            anyhow::ensure!(
+                lean_toolchain::shared_writer::previous_writer_stopped(&file)?,
+                "installed artifact writer still active"
+            );
+            guards.push(file);
+        }
+    }
+    anyhow::ensure!(
+        WorkerBinary::selected_dir(slot)? == expected,
+        "selected generation changed before retirement"
+    );
+    fs::remove_dir_all(slot)?;
+    drop(guards);
     Ok(())
 }
 
@@ -429,7 +494,7 @@ fn prune_in(root: &Path) -> anyhow::Result<()> {
             continue;
         }
         if let Some(reason) = prune_reason(name, &selected) {
-            fs::remove_dir_all(&path)?;
+            retire_slot(&path, &selected)?;
             println!("pruned {name}: {reason}");
             removed = removed.saturating_add(1);
         } else {
@@ -515,6 +580,8 @@ fn install_one(
     }
     .canonicalize()
     .map_err(|e| anyhow::anyhow!("select the installed SDK writer with --standalone-writer: {e}"))?;
+    fs::create_dir_all(&dest_dir)?;
+    let _mutation = lock_slot(&dest_dir)?;
     let generation = prepare_generation(
         &dest_dir,
         id,
@@ -909,6 +976,45 @@ mod tests {
         assert!(old.is_file());
         std::fs::write(slot.join("current-generation"), "../outside")?;
         assert!(resolve().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn active_generation_refuses_retirement_until_reader_closes() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let root = temp.path().canonicalize()?;
+        let id = ToolchainId::parse("v4.23.0")?;
+        let slot = root.join(id.as_str());
+        std::fs::create_dir(&slot)?;
+        let mut locks = Vec::new();
+        for name in ["generation-old", "generation-current"] {
+            let dir = slot.join(name);
+            for domain in [
+                "shims/lean-rs-host-shims",
+                "shims/lean-rs-interop-shims",
+                "smoke-project",
+            ] {
+                let path = dir.join(domain);
+                std::fs::create_dir_all(&path)?;
+                locks.push(std::fs::File::create_new(
+                    lean_toolchain::shared_writer::project_lock_path(&path)?,
+                )?);
+            }
+            std::fs::write(dir.join(WORKER_FILE_NAME), b"worker")?;
+            super::select_generation(&slot, &dir)?;
+        }
+        let selected = slot.join("generation-current");
+        assert!(super::retire_slot(&slot, &slot.join("generation-old")).is_err());
+        for reader in &locks {
+            reader.try_lock_shared().map_err(std::io::Error::from)?;
+            assert!(super::clean_in(&root, Some(&id)).is_err());
+            assert!(super::prune_in(&root).is_err());
+            assert_eq!(crate::toolchain::WorkerBinary::selected_dir(&slot)?, selected);
+            assert!(slot.join("generation-old").join(WORKER_FILE_NAME).is_file());
+            reader.unlock()?;
+        }
+        super::prune_in(&root)?;
+        assert!(!slot.exists());
         Ok(())
     }
 
