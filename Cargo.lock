@@ -1041,6 +1041,7 @@ dependencies = [
  "lean-semantic-search-retrieval",
  "lean-semantic-search-runtime",
  "lean-toolchain",
+ "libc",
  "libproc",
  "lru",
  "parking_lot",

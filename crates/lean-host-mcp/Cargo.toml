@@ -95,6 +95,9 @@ lean-toolchain.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "net", "pipe", "process"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 reqwest = { version = "0.13", default-features = false }

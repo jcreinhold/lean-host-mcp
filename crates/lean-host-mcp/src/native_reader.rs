@@ -899,6 +899,10 @@ fn wait_child(child: &mut MeasuredChild, deadline: Instant) -> io::Result<Option
 fn prepare_payload(args: &NativeReaderArgs, deadline: Instant) -> io::Result<(GuardianHandle, Vec<NativeReadDomain>)> {
     args.validate()?;
     rustix::process::setsid()?;
+    // In this private session the guardian starts in its own group. Keep the
+    // bootstrap as the nearest adopter of orphaned payload descendants on Linux.
+    #[cfg(target_os = "linux")]
+    rustix::process::set_child_subreaper(Some(rustix::process::Pid::INIT))?;
     let helper = crate::shared_writer::contract()?;
     let socket =
         std::env::var_os("LEAN_RS_WORKER_PARENT_SOCKET").ok_or_else(|| invalid("reader parent socket missing"))?;
@@ -970,6 +974,36 @@ fn verified_stdin(args: &NativeReaderArgs) -> io::Result<Option<(std::fs::File, 
     }
     let file = input::open_verified(&staged)?;
     Ok(Some((file, staged)))
+}
+
+/// Called only after wait4 has reaped the payload. The private group cannot
+/// acquire an outside session's processes. Within the supported non-escaping
+/// payload tree, any surviving branch now has a direct child of the bootstrap
+/// at its root. The guardian is in a separate group and retains stop authority.
+#[cfg(target_os = "linux")]
+fn payload_group_is_finished() -> io::Result<bool> {
+    use rustix::process::{WaitId, WaitIdOptions, getpgrp, getpid, waitid};
+
+    if getpgrp() != getpid() {
+        return Err(invalid("private native reader group leader required"));
+    }
+    // Include clone children with non-SIGCHLD exit signals. NOWAIT leaves
+    // every status untouched. Only ECHILD establishes an empty selection;
+    // a live or waitable child requires normal guardian cleanup.
+    let options = WaitIdOptions::EXITED
+        | WaitIdOptions::NOHANG
+        | WaitIdOptions::NOWAIT
+        | WaitIdOptions::from_bits_retain(libc::__WALL.cast_unsigned());
+    match waitid(WaitId::Pgid(Some(getpgrp())), options) {
+        Err(rustix::io::Errno::CHILD) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn payload_group_is_finished() -> io::Result<bool> {
+    lean_toolchain::process_group::current_group_is_singleton()
 }
 
 /// Controlled bootstrap only; called by `native-reader` after lifetime binding.
@@ -1058,7 +1092,7 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
                     payload.exit_code = status.code();
                     payload.exit_status = Some(status.to_string());
                     payload.payload_usage = child.get()?.usage().and_then(PayloadUsage::from_waited);
-                    payload.intervened = !lean_toolchain::process_group::current_group_is_singleton()?;
+                    payload.intervened = !payload_group_is_finished()?;
                     if payload.intervened {
                         payload.detail = Some("native descendants required guardian cleanup; no usable result".into());
                     }
