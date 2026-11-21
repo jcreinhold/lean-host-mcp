@@ -672,9 +672,7 @@
         "Mutation": "\"writer-recapture\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterHandoffSafe"
-      ],
+      "invariants": ["WriterHandoffSafe"],
       "properties": [],
       "invariant": "WriterHandoffSafe"
     },
@@ -687,9 +685,7 @@
         "Mutation": "\"writer-ignore-invalidity\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterHandoffSafe"
-      ],
+      "invariants": ["WriterHandoffSafe"],
       "properties": [],
       "invariant": "WriterHandoffSafe"
     },
@@ -702,9 +698,7 @@
         "Mutation": "\"writer-overlap-early\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterOverlapSafe"
-      ],
+      "invariants": ["WriterOverlapSafe"],
       "properties": [],
       "invariant": "WriterOverlapSafe"
     },
@@ -717,9 +711,7 @@
         "Mutation": "\"writer-unknown-is-idle\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -732,9 +724,7 @@
         "Mutation": "\"writer-partial-union\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -747,9 +737,7 @@
         "Mutation": "\"writer-stale-owner\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -762,9 +750,7 @@
         "Mutation": "\"writer-stale-digest\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -777,9 +763,7 @@
         "Mutation": "\"writer-unmarked-absence\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -792,9 +776,7 @@
         "Mutation": "\"writer-skip-reacquire\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -807,9 +789,7 @@
         "Mutation": "\"writer-double-settle\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterSettlesOnce"
-      ],
+      "invariants": ["WriterSettlesOnce"],
       "properties": [],
       "invariant": "WriterSettlesOnce"
     },
@@ -822,9 +802,7 @@
         "Mutation": "\"writer-rewrite-outcome\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterOutcomeStable"
-      ],
+      "invariants": ["WriterOutcomeStable"],
       "properties": [],
       "invariant": "WriterOutcomeStable"
     },
@@ -837,9 +815,7 @@
         "Mutation": "\"writer-replay\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterNoReplay"
-      ],
+      "invariants": ["WriterNoReplay"],
       "properties": [],
       "invariant": "WriterNoReplay"
     },
@@ -852,9 +828,7 @@
         "Mutation": "\"writer-recover-legacy\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -873,9 +847,7 @@
         "ClosureIdentity",
         "WriterSafety"
       ],
-      "properties": [
-        "WriterDisjointProgress"
-      ]
+      "properties": ["WriterDisjointProgress"]
     },
     {
       "name": "host-writer-unlocked-disjoint",
@@ -885,9 +857,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterUnlockedDisjoint"
-      ],
+      "invariants": ["NoWriterUnlockedDisjoint"],
       "properties": [],
       "invariant": "NoWriterUnlockedDisjoint",
       "witness": true
@@ -900,9 +870,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterPartialIdleFence"
-      ],
+      "invariants": ["NoWriterPartialIdleFence"],
       "properties": [],
       "invariant": "NoWriterPartialIdleFence",
       "witness": true
@@ -915,9 +883,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterInvalidHandoffFence"
-      ],
+      "invariants": ["NoWriterInvalidHandoffFence"],
       "properties": [],
       "invariant": "NoWriterInvalidHandoffFence",
       "witness": true
@@ -930,9 +896,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterUnknownRetirement"
-      ],
+      "invariants": ["NoWriterUnknownRetirement"],
       "properties": [],
       "invariant": "NoWriterUnknownRetirement",
       "witness": true
@@ -945,9 +909,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterSavedRetirement"
-      ],
+      "invariants": ["NoWriterSavedRetirement"],
       "properties": [],
       "invariant": "NoWriterSavedRetirement",
       "witness": true
@@ -960,9 +922,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterIntentRecovery"
-      ],
+      "invariants": ["NoWriterIntentRecovery"],
       "properties": [],
       "invariant": "NoWriterIntentRecovery",
       "witness": true
@@ -975,9 +935,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterRemovalRecovery"
-      ],
+      "invariants": ["NoWriterRemovalRecovery"],
       "properties": [],
       "invariant": "NoWriterRemovalRecovery",
       "witness": true
@@ -990,9 +948,7 @@
         "Profile": "\"writer-command-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterSyncRecovery"
-      ],
+      "invariants": ["NoWriterSyncRecovery"],
       "properties": [],
       "invariant": "NoWriterSyncRecovery",
       "witness": true
@@ -1005,9 +961,7 @@
         "Profile": "\"writer-legacy\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoLegacyIdleDisjoint"
-      ],
+      "invariants": ["NoLegacyIdleDisjoint"],
       "properties": [],
       "invariant": "NoLegacyIdleDisjoint",
       "witness": true
@@ -1044,9 +998,7 @@
         "Fault": "\"writer-unverifiable\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoWriterUnverifiableIdle"
-      ],
+      "invariants": ["NoWriterUnverifiableIdle"],
       "properties": [],
       "invariant": "NoWriterUnverifiableIdle",
       "witness": true
@@ -1171,9 +1123,7 @@
         "Fault": "\"writer-operator\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoOperatorRetirementAfterRemoval"
-      ],
+      "invariants": ["NoOperatorRetirementAfterRemoval"],
       "properties": [],
       "invariant": "NoOperatorRetirementAfterRemoval",
       "witness": true
@@ -1187,9 +1137,7 @@
         "Fault": "\"writer-operator-ack-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoOperatorAckOnlyDisjoint"
-      ],
+      "invariants": ["NoOperatorAckOnlyDisjoint"],
       "properties": [],
       "invariant": "NoOperatorAckOnlyDisjoint",
       "witness": true
@@ -1203,9 +1151,7 @@
         "Fault": "\"writer-operator-stale\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoOperatorStaleDisjoint"
-      ],
+      "invariants": ["NoOperatorStaleDisjoint"],
       "properties": [],
       "invariant": "NoOperatorStaleDisjoint",
       "witness": true
@@ -1219,9 +1165,7 @@
         "Fault": "\"writer-operator-closure-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoOperatorClosureOnlyDisjoint"
-      ],
+      "invariants": ["NoOperatorClosureOnlyDisjoint"],
       "properties": [],
       "invariant": "NoOperatorClosureOnlyDisjoint",
       "witness": true
@@ -1235,9 +1179,7 @@
         "Fault": "\"writer-operator-unverifiable\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoOperatorUnverifiableDisjoint"
-      ],
+      "invariants": ["NoOperatorUnverifiableDisjoint"],
       "properties": [],
       "invariant": "NoOperatorUnverifiableDisjoint",
       "witness": true
@@ -1252,9 +1194,7 @@
         "Mutation": "\"writer-accept-ack-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -1268,9 +1208,7 @@
         "Mutation": "\"writer-accept-stale-attestation\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -1284,9 +1222,7 @@
         "Mutation": "\"writer-accept-closure-only\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -1305,9 +1241,7 @@
         "ClosureIdentity",
         "WriterSafety"
       ],
-      "properties": [
-        "WriterRecoveryProgress"
-      ]
+      "properties": ["WriterRecoveryProgress"]
     },
     {
       "name": "host-writer-operator-stall-settlement",
@@ -1325,9 +1259,7 @@
         "ClosureIdentity",
         "WriterSafety"
       ],
-      "properties": [
-        "WriterRecoveryProgress"
-      ]
+      "properties": ["WriterRecoveryProgress"]
     },
 
     {
@@ -1340,9 +1272,7 @@
         "Mutation": "\"writer-partial-union\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },
@@ -1356,9 +1286,7 @@
         "Mutation": "\"writer-wrong-scratch\""
       },
       "expect": "invariant",
-      "invariants": [
-        "WriterCleanupSafe"
-      ],
+      "invariants": ["WriterCleanupSafe"],
       "properties": [],
       "invariant": "WriterCleanupSafe"
     },

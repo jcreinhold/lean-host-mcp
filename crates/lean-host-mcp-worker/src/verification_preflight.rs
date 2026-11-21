@@ -192,6 +192,7 @@ pub(super) fn check_handoff(deliver: impl FnOnce(&str) -> io::Result<String>) ->
         .ok_or_else(refusal)?
         .canonicalize()?;
     let target = checkout.join("target");
+    fs::create_dir_all(&target)?;
     canonical(&target)?;
     let scratch = target.join(format!("r2-preflight-{}", std::process::id()));
     fs::create_dir(&scratch)?;
