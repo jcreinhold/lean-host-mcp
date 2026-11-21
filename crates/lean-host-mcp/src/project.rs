@@ -3635,6 +3635,7 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
         .shared_writer_executable(writer.executable.clone())
         .native_guardian(writer.executable)
         .lifetime_directory(writer.ownership_registry)
+        .lifetime_socket_directory(crate::native_socket::directory()?)
         .native_capacity_slot(config.session_id.clone(), scope, config.native_capacity_limit)
         .shared_artifact_reads(true);
     if let Some(artifacts) = &config.prepared_host_artifacts {

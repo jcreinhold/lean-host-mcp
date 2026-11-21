@@ -10,6 +10,11 @@ the [tool catalog](tool-catalog.md) for request and response contracts.
 - [Process lifetime](#process-lifetime) and [runtime failures](#runtime-error-contract)
 - [Worker installation](#installing-workers) and [test harnesses](#build-test-lint)
 
+
+Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set,
+otherwise `$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700.
+The SDK removes each worker's socket on closure. Durable owner records continue to use their configured registry.
+
 ## Configuration file
 
 Generate a commented TOML file with the current defaults:

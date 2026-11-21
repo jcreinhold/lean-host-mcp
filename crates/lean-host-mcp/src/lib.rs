@@ -37,6 +37,7 @@ mod ilean;
 pub mod lake_meta;
 mod lake_options;
 pub mod native_reader;
+mod native_socket;
 mod project;
 pub mod projections;
 mod request_journal;

@@ -606,6 +606,7 @@ fn reserve_scope(
     } else {
         deadline
     };
+    let socket_root = crate::native_socket::directory()?;
     loop {
         if cancelled() {
             return Err(io::Error::new(
@@ -613,7 +614,12 @@ fn reserve_scope(
                 "native utility admission cancelled",
             ));
         }
-        match LeanWorkerNativeScope::prepare(&helper.ownership_registry, remaining(admission_deadline)?, Some(&slot)) {
+        match LeanWorkerNativeScope::prepare_with_socket_directory(
+            &helper.ownership_registry,
+            remaining(admission_deadline)?,
+            Some(&slot),
+            &socket_root,
+        ) {
             Ok(scope) => return Ok(scope),
             Err(error) if utility && error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(POLL.min(remaining(admission_deadline)?));
@@ -924,7 +930,13 @@ fn prepare_payload(args: &NativeReaderArgs, deadline: Instant) -> io::Result<(Gu
     // close every tentative SH before waiting, so a later-domain writer never
     // waits cyclically on an earlier partial read. Payload launch remains once.
     // Parent cancellation/lifeline stop owns this entire pre-body process group.
-    let readers = SharedReader::acquire_union(&helper.executable, &roots, remaining(deadline)?, &|| false)?;
+    let readers = SharedReader::acquire_union_with_ipc_root(
+        &helper.executable,
+        &roots,
+        remaining(deadline)?,
+        &|| false,
+        &crate::native_socket::directory()?,
+    )?;
     if args.roots()? != roots {
         return Err(invalid("native-reader artifact union changed during admission"));
     }

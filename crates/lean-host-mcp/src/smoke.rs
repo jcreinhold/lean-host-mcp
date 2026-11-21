@@ -173,7 +173,16 @@ fn probe_with_writer(
     };
     // An install smoke owns a temporary unscoped generation; it must never
     // invent a broker capacity limit or share an unrelated actor's slot.
+    let socket_root = match crate::native_socket::directory() {
+        Ok(root) => root,
+        Err(error) => {
+            return SmokeOutcome::Failed {
+                detail: error.to_string(),
+            };
+        }
+    };
     let child = LeanWorkerChild::for_toolchain(worker_path, lean_sysroot)
+        .lifetime_socket_directory(socket_root)
         .shared_writer_executable(writer.executable.clone())
         .native_guardian(writer.executable)
         .lifetime_directory(writer.ownership_registry)

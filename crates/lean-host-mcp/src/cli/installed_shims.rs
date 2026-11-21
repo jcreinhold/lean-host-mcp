@@ -204,6 +204,8 @@ pub(super) fn probe(
     let worker = candidate.join(crate::toolchain::WORKER_FILE_NAME);
     let tracker = LeanWorkerProcessTracker::new();
     let child = LeanWorkerChild::for_toolchain(&worker, sysroot)
+        .lifetime_directory(candidate.join("probe-owners"))
+        .lifetime_socket_directory(crate::native_socket::directory()?)
         .checked_native_loader_environment()
         .prepared_host_artifacts(prepared);
     let mut handle =
