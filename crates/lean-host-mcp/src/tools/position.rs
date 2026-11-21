@@ -836,7 +836,10 @@ fn required_file_diagnostics(outcome: LeanWorkerModuleQueryBatchOutcome) -> Resu
                 return Err(ServerError::Internal("unexpected extra file diagnostics item".into()));
             }
             match item {
-                LeanWorkerModuleQueryBatchItem::Ok { id, result: body } if id == PROOF_STATE_DIAGNOSTICS_ID => {
+                LeanWorkerModuleQueryBatchItem::Ok { id, result: body } => {
+                    if id != PROOF_STATE_DIAGNOSTICS_ID {
+                        return Err(ServerError::Internal("unexpected file diagnostics selector ID".into()));
+                    }
                     let LeanWorkerModuleQueryBatchResult::Diagnostics(failure) = *body else {
                         return Err(ServerError::Internal(
                             "file diagnostics response has wrong payload".into(),
@@ -847,11 +850,9 @@ fn required_file_diagnostics(outcome: LeanWorkerModuleQueryBatchOutcome) -> Resu
                     Ok((block, missing_imports))
                 }
                 LeanWorkerModuleQueryBatchItem::BudgetExceeded { id, message }
-                | LeanWorkerModuleQueryBatchItem::Unavailable { id, message }
-                    if id == PROOF_STATE_DIAGNOSTICS_ID =>
-                {
-                    Err(ServerError::Internal(format!("file diagnostics incomplete: {message}")))
-                }
+                | LeanWorkerModuleQueryBatchItem::Unavailable { id, message } => Err(ServerError::Internal(format!(
+                    "file diagnostics incomplete ({id}): {message}"
+                ))),
                 _ => Err(ServerError::Internal(
                     "unexpected file diagnostics selector result".into(),
                 )),
