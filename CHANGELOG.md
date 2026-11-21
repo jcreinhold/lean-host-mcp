@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.12] - 2026-11-21
+
+### Fixed
+
+- Installer smoke, worker sessions, and file-backed verification and search use a private socket directory.
+  Set `LEAN_HOST_MCP_SOCKET_DIR` to select it explicitly. Durable worker records stay in their existing registry.
+- The embedded writer checks its complete lock set for outstanding storage charges before starting work.
+  An overlapping charge refuses admission while a disjoint project can proceed.
+
 ## [0.16.11] - 2026-11-21
 
 ### Fixed
@@ -688,7 +697,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.11...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.12...HEAD
+[0.16.12]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.11...v0.16.12
 [0.16.11]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.10...v0.16.11
 [0.16.10]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.9...v0.16.10
 [0.16.9]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.8...v0.16.9
