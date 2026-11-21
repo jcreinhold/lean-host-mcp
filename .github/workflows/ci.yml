@@ -69,6 +69,8 @@ jobs:
         run: cargo build -p lean-host-mcp --all-targets
       - name: build (worker)
         run: cargo build -p lean-host-mcp-worker --all-targets
+      - name: Installed package proof and semantic search
+        run: scripts/test-installed-module-setup.sh
       - name: test (parent)
         run: scripts/test-installed-stdio.sh --all-targets
       # The parent must NOT link libleanshared. Built as a separate per-member

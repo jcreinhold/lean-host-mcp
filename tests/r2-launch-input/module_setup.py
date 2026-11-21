@@ -4,15 +4,17 @@ import hashlib
 import json
 import os
 import select
+import sys
 import subprocess as s
 import argparse
 from pathlib import Path
 
 r = Path(__file__).resolve().parents[2]
-b = r / "target/r2-module-setup"
+b = Path(os.environ.get("R2_SETUP_ROOT", r / "target/r2-module-setup"))
+parent = Path(os.environ.get("R2_SETUP_PARENT", r / "target/debug/lean-host-mcp"))
 release = Path.home() / ".elan/toolchains/leanprover--lean4---v4.36.0"
 assert (b / "workers/v4.36.0/current-generation").is_file(), (
-    "install the matched fb98113 shims first"
+    "install the matching 4.36 worker and shims first"
 )
 env = dict(
     os.environ,
@@ -73,7 +75,7 @@ def inventory(p):
 def probe(p, *, search=False):
     proc = s.Popen(
         [
-            r / "target/debug/lean-host-mcp",
+            parent,
             "--lake-root",
             p,
             "--request-journal",
@@ -159,10 +161,16 @@ for label, plugin in [("project", True), ("omitted", False)]:
     assert (project / "Demo.lean").read_text() == source
     assert (project / ".lake/build/lib/lean/Demo.olean").is_file()
     before = inventory(project)
-    verdict = row(probe(project))
+    proof = probe(project)
+    if plugin:
+        lookup = probe(project, search=True)
+        for tool, response in [("lean_verify", proof), ("lean_lookup", lookup)]:
+            if "error" in response:
+                print(tool, response["error"], flush=True)
+    verdict = row(proof)
     print(label, verdict["verification_status"])
     if plugin:
-        reply = probe(project, search=True)
+        reply = lookup
         assert "error" not in reply, reply
         search = json.loads(reply["result"]["content"][0]["text"])
         assert not search["errors"], search
@@ -175,7 +183,7 @@ for label, plugin in [("project", True), ("omitted", False)]:
     assert inventory(project) == before, "project changed during verification"
 
 project = b / "project"
-(image,) = project.glob(".lake/build/lib/*Witness.dylib")
+(image,) = project.glob(".lake/build/lib/*Witness." + ("dylib" if sys.platform == "darwin" else "so"))
 saved = b / "held-plugin.dylib"
 image.rename(saved)
 try:
