@@ -50,7 +50,7 @@ print('payload result')
 ";
 
 struct Fixture {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     root: PathBuf,
     project: PathBuf,
     dependency: PathBuf,
@@ -79,7 +79,7 @@ impl Fixture {
         fs::write(&executable, PAYLOAD).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
-            _directory: directory,
+            directory,
             root,
             project,
             dependency,
@@ -413,9 +413,9 @@ fn missing_stdin_eof_refuses_before_any_native_bootstrap_or_payload() {
 
 #[test]
 fn stdin_offer_from_another_directory_is_refused_before_payload() {
-    use lean_rs_worker_parent::LeanWorkerNativeScope;
+    use lean_rs_worker_parent::{LeanWorkerNativeScope, LeanWorkerNativeSpawnError};
     use lean_toolchain::native_guardian::NativeCapacitySlot;
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let registry = fixture.root.join("owners");
     let slot = NativeCapacitySlot {
         key: "foreign-input-test".into(),
@@ -448,13 +448,31 @@ fn stdin_offer_from_another_directory_is_refused_before_payload() {
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    scope.configure(&mut command);
-    let mut child = OwnedChild::spawn(command);
-    let mut lease = scope.accept(child.child().id(), LIMIT).unwrap();
+    // An assertion or ACK error after possible spawn must leave the registry
+    // and staged inputs available to SDK cleanup and the failed-test observer.
+    fixture.directory.disable_cleanup(true);
+    let mut lease = match scope.spawn(&mut command, LIMIT) {
+        Ok(lease) => lease,
+        Err(LeanWorkerNativeSpawnError::BeforeSpawn(source)) => panic!("reader bootstrap did not spawn: {source}"),
+        Err(LeanWorkerNativeSpawnError::AfterSpawn { source, pending }) => {
+            drop(pending); // SDK retains cleanup; no closure claim.
+            panic!(
+                "reader bootstrap failed after spawn: {source}; preserved {}",
+                fixture.root.display()
+            );
+        }
+    };
+    let stdout = lease.take_stdout().unwrap();
+    let mut stderr = lease.take_stderr().unwrap();
     lease.acknowledge().unwrap();
-    wait_for(|| child.child().try_wait().unwrap().is_some());
+    wait_for(|| lease.try_wait().unwrap().is_some());
     wait_for(|| lease.custody_closed().unwrap());
-    let (_, result) = child.finish();
+    fixture.directory.disable_cleanup(false);
+    let result: Value = serde_json::from_reader(stdout).unwrap_or_else(|error| {
+        let mut diagnostics = String::new();
+        io::Read::read_to_string(&mut stderr, &mut diagnostics).unwrap();
+        panic!("invalid native-reader result: {error}: stderr={diagnostics}");
+    });
     assert_eq!(result["target_started"], false);
     assert!(
         result["detail"]

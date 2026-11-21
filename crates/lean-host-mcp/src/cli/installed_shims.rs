@@ -270,7 +270,10 @@ mod tests {
         let sidecar = candidate.join("worker.json");
         let original = fs::read(&sidecar)?;
         let mut value: serde_json::Value = serde_json::from_slice(&original)?;
-        ensure!(value["smoke"]["result"] == "passed", "sidecar lost successful smoke");
+        ensure!(
+            value.pointer("/smoke/result").and_then(serde_json::Value::as_str) == Some("passed"),
+            "sidecar lost successful smoke"
+        );
         let refuse = |why: &str| -> Result<()> {
             let out = std::process::Command::new(&worker)
                 .arg("--lean-rs-ready-host-artifacts")
@@ -282,13 +285,17 @@ mod tests {
             );
             Ok(())
         };
-        value["deployment"]["worker_sha256"] = serde_json::Value::String("0".repeat(64));
+        *value
+            .pointer_mut("/deployment/worker_sha256")
+            .context("worker digest")? = serde_json::Value::String("0".repeat(64));
         fs::write(&sidecar, serde_json::to_vec(&value)?)?;
         let result = refuse("installed worker digest mismatch");
         fs::write(&sidecar, &original)?;
         result?;
         let mut value: serde_json::Value = serde_json::from_slice(&original)?;
-        value["deployment"]["prepared"]["shim_search_paths"]
+        value
+            .pointer_mut("/deployment/prepared/shim_search_paths")
+            .context("prepared shim paths")?
             .as_array_mut()
             .context("ordered paths")?
             .reverse();
