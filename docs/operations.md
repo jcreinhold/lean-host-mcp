@@ -435,3 +435,5 @@ Measured on a Mathlib-scale project (kan-proofs, four tools against one file, 15
 generation 1 throughout, 0 restarts, residue 1786 MiB peak and final against a 9216 MiB budget, RSS 5.46 GB.** This
 baseline exercises a repeated import profile; it does not predict the residue growth of a changed-file sweep. The latter
 is bounded by the residue budget and covered by `crates/lean-host-mcp/tests/kanproofs_eval.rs`.
+
+Native worker admission requires an operator-selected primary project. Set `--lake-root`, `LEAN_HOST_MCP_PROJECT`, or an absolute `primary_project` in the home configuration. CLI and environment selection take precedence over the home setting. Filesystem discovery and project-local configuration can select a project for metadata. A native request using discovery or an explicit `project=` must resolve to the approved canonical directory before the broker prepares Lake options or opens a worker. Worker-side source and capability checks still apply.

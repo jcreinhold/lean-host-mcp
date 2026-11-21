@@ -239,7 +239,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Merged config file (project-local `lean-host-mcp.toml` over the home
     // file). It is the layer beneath env/CLI: each knob is CLI > env > file >
     // default.
-    let file = ConfigFile::load(&cwd);
+    let (file, home_primary) = ConfigFile::load_for_server(&cwd);
 
     // Transport: clap already folds CLI-or-env into `args.*`, so `.or(file)`
     // yields CLI > env > file. The file's `bind` is a raw string, parsed here so
@@ -262,7 +262,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let (max_projects, idle_timeout) = BrokerConfig::pool_from_env_with_file(&file.broker)?;
     let (max_workers, max_workers_per_project) = BrokerConfig::worker_limits_from_file(&file.broker, max_projects)?;
     let max_projects = max_workers; // Legacy internal name; the limit counts worker processes.
-    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?;
+    let approved = env_default.clone().or(home_primary);
+    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?
+        .with_operator_primary(approved.as_deref())?;
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());

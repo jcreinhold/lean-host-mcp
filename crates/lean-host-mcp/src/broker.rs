@@ -922,9 +922,10 @@ impl ProjectBroker {
     ) -> Result<(Arc<LeanProject>, LeanWorkerElabOptions, Instant)> {
         let file_label = options.file_label.clone();
         let admission = async {
-            let meta = self.resolve_meta(&hint)?;
+            let root = self.native_root(&hint)?;
+            let meta = self.meta(&root)?;
             let options = self.resolve_options(&meta, options).await?;
-            let (project, admission_deadline) = self.project_for(hint).await?;
+            let (project, admission_deadline) = self.acquire(root).await?;
             Ok((project, options, admission_deadline))
         }
         .await;
@@ -958,8 +959,14 @@ impl ProjectBroker {
         .await
     }
 
+    fn native_root(&self, hint: &ProjectHint) -> Result<PathBuf> {
+        let root = self.resolve(hint)?;
+        self.runtime_config.require_operator_primary(&root)?;
+        Ok(root)
+    }
+
     async fn project_for(&self, hint: ProjectHint) -> Result<(Arc<LeanProject>, Instant)> {
-        let root = self.resolve(&hint)?;
+        let root = self.native_root(&hint)?;
         self.acquire(root).await
     }
 
@@ -1530,6 +1537,37 @@ mod tests {
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn operator_primary_refuses_discovered_and_explicit_project_before_options() {
+        let tree = tempfile::tempdir().unwrap();
+        let approved = tree.path().join("approved");
+        let other = tree.path().join("other");
+        fs::create_dir(&approved).unwrap();
+        fs::create_dir(&other).unwrap();
+        // This marker permits discovery. There is deliberately no Lean toolchain.
+        fs::write(other.join("lakefile.lean"), "").unwrap();
+        let runtime = ProjectRuntimeConfig::default()
+            .with_operator_primary(Some(&approved))
+            .unwrap();
+        let broker = ProjectBroker::new_with_runtime_config(cfg(other.clone(), None, None), runtime);
+        for hint in [ProjectHint::Default, ProjectHint::Explicit(other.clone())] {
+            let err = broker
+                .prepare_check(hint, LeanWorkerElabOptions::new())
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, ServerError::BadProject(reason) if reason.contains("operator-approved")));
+            assert!(broker.resident_paths().is_empty());
+        }
+        let canonical = broker.resolve(&ProjectHint::Explicit(approved.join("."))).unwrap();
+        assert!(broker.runtime_config.require_operator_primary(&canonical).is_ok());
+        assert!(
+            ProjectRuntimeConfig::default()
+                .require_operator_primary(&canonical)
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -105,24 +105,37 @@ impl ConfigFile {
     /// skipped. Never fails: the worst case is an empty config (env + defaults).
     #[must_use]
     pub fn load(cwd: &Path) -> Self {
-        let mut merged = toml::Value::Table(toml::Table::new());
-        if let Some(home) = home_config_path()
-            && let Some(value) = read_toml(&home)
-        {
-            merge_toml(&mut merged, value);
-        }
+        Self::load_for_server(cwd).0
+    }
+
+    /// Return merged settings and the independent primary project from the home file.
+    #[must_use]
+    pub fn load_for_server(cwd: &Path) -> (Self, Option<PathBuf>) {
+        Self::load_from(cwd, home_config_path().as_deref())
+    }
+
+    fn load_from(cwd: &Path, home: Option<&Path>) -> (Self, Option<PathBuf>) {
+        let mut merged = home
+            .and_then(read_toml)
+            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+        let approved = merged
+            .get("primary_project")
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
         if let Some(local) = walk_up_for(cwd, LOCAL_FILE_NAME)
             && let Some(value) = read_toml(&local)
         {
             merge_toml(&mut merged, value);
         }
-        match merged.try_into() {
+        let settings = match merged.try_into() {
             Ok(config) => config,
             Err(err) => {
                 tracing::warn!(error = %err, "merged config did not match the schema; ignoring it");
                 Self::default()
             }
-        }
+        };
+        (settings, approved)
     }
 }
 
@@ -190,6 +203,18 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_primary_is_independent_of_the_local_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home.toml");
+        std::fs::write(&home, "primary_project = '/approved'").unwrap();
+        std::fs::write(dir.path().join(LOCAL_FILE_NAME), "primary_project = '/other'").unwrap();
+        let (merged, approved) = ConfigFile::load_from(dir.path(), Some(&home));
+        assert_eq!(merged.primary_project.as_deref(), Some(Path::new("/other")));
+        assert_eq!(approved.as_deref(), Some(Path::new("/approved")));
+        assert!(ConfigFile::load_from(dir.path(), None).1.is_none());
+    }
 
     #[test]
     fn merge_overlays_local_over_home_per_key() {

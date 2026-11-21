@@ -281,6 +281,7 @@ const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 /// rereading process environment during project open.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectRuntimeConfig {
+    operator_primary: Option<PathBuf>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -297,6 +298,26 @@ impl Default for ProjectRuntimeConfig {
 }
 
 impl ProjectRuntimeConfig {
+    pub(crate) fn require_operator_primary(&self, root: &Path) -> Result<()> {
+        if self.operator_primary.as_deref() == Some(root) {
+            Ok(())
+        } else {
+            Err(ServerError::BadProject(
+                "native execution requires an operator-approved project".into(),
+            ))
+        }
+    }
+
+    /// Bind native project authority once, before serving requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected directory cannot be resolved.
+    pub fn with_operator_primary(mut self, root: Option<&Path>) -> std::io::Result<Self> {
+        self.operator_primary = root.map(Path::canonicalize).transpose()?;
+        Ok(self)
+    }
+
     /// Defaults for a broker that keeps up to `max_projects` worker children
     /// resident.
     ///
@@ -309,6 +330,7 @@ impl ProjectRuntimeConfig {
     pub fn default_for_projects(max_projects: usize) -> Self {
         let import_residue_budget_bytes = default_import_residue_budget_bytes(max_projects);
         Self {
+            operator_primary: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -568,6 +590,7 @@ fn parse_runtime_config(
     )?
     .saturating_mul(1024 * 1024);
     let config = ProjectRuntimeConfig {
+        operator_primary: None,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),
