@@ -120,7 +120,7 @@ memory budgets, response presentation, and durable request journals. By default 
 
 | Component | Current source requirement |
 | --- | --- |
-| `lean-host-mcp` | 0.16.9 |
+| `lean-host-mcp` | 0.16.10 |
 | `lean-rs` stack and `lean-toolchain` | 0.10.2 |
 | `lean-semantic-search` stack | 0.7.9 |
 | Worker protocol | 13 |

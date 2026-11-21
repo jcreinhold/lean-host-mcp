@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.10] - 2026-11-21
+
+### Fixed
+
+- Ship the bounded Lake module setup transfer described below. Version 0.16.9 did not publish because the
+  release workflow selected an incomplete Lean prefix. Release verification now checks the header and
+  shared library under the prefix reported by the selected Lean executable.
+
 ## [0.16.9] - 2026-11-21
 
 ### Fixed
@@ -673,7 +681,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.9...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.10...HEAD
+[0.16.10]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.9...v0.16.10
 [0.16.9]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.8...v0.16.9
 [0.16.8]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.7...v0.16.8
 [0.16.5]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.4...v0.16.5
