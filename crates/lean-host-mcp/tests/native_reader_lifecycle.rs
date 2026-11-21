@@ -216,6 +216,67 @@ fn descriptor_closing_descendant_is_stopped_before_read_custody_releases() {
     assert_eq!(fs::read(fixture.root.join("heartbeat")).unwrap(), heartbeat);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_survivor_at_verdict_refuses_success() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.executable,
+        r"#!/usr/bin/env python3
+import os, signal, time
+from pathlib import Path
+root = Path(__file__).parent
+if os.fork() == 0:
+    os.setsid()
+    os.closerange(0, 4096)
+    signal.alarm(8)
+    (root/'detached').touch()
+    while not (root/'release').exists(): time.sleep(.01)
+    (root/'finished').touch()
+    os._exit(0)
+while not (root/'detached').exists(): time.sleep(.01)
+print('normal payload exit')
+",
+    )
+    .unwrap();
+    let (status, result) = OwnedChild::spawn(fixture.command(3000)).finish();
+    // The escaped fixture owns its bounded exit; group cleanup cannot certify it.
+    fs::write(fixture.root.join("release"), "").unwrap();
+    wait_for(|| fixture.root.join("finished").exists());
+    assert!(!status.success(), "{result}");
+    assert_eq!(result["state"], "stopped");
+    assert_eq!(result["intervened"], true);
+    assert_eq!(result["exit_code"], 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn lost_waiter_before_report_cannot_publish_payload_success() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.executable,
+        r"#!/usr/bin/env python3
+import os, signal
+from pathlib import Path
+root = Path(__file__).parent
+pid = os.getppid()
+args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\x00')
+assert args[1] == b'native-reader-wait'
+(root/'started').open('x').close()
+os.kill(pid, signal.SIGKILL)
+print('not a completion report')
+",
+    )
+    .unwrap();
+    let (status, result) = OwnedChild::spawn(fixture.command(3000)).finish();
+    assert!(fixture.root.join("started").exists());
+    assert!(!status.success(), "{result}");
+    assert_eq!(result["scope_closed"], true);
+    assert_eq!(result["target_started"], Value::Null);
+    assert_eq!(result["exit_status"], Value::Null);
+    assert!(result["detail"].as_str().unwrap().contains("waiter exited"));
+}
+
 #[test]
 fn deadline_stops_scope_without_returning_semantic_success_or_replaying() {
     let fixture = Fixture::new();

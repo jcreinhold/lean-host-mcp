@@ -447,8 +447,12 @@ Server death is observed by the guardian through the private channel and exact p
 while the parent survives, the parent retains its actual unreaped child and uses the same owned-group termination
 primitive as other supervised commands. Failed kill, or loss of both parent and guardian, retains passive ownership
 fences until actual group absence; recovery never signals a PID recovered from disk. The supported boundary requires
-descendants to remain in the inherited process group. Deliberate detachment and weaker Linux process observation do not
-become successful proof results. The actor quota bounds admitted generations, not every paused pre-admission OS process;
+descendants to remain in the inherited process group. On Linux a short-lived payload waiter adopts orphaned descendants.
+After reaping the payload it checks for children across all groups and sessions. A survivor at verdict time prevents
+success. The bootstrap retains the guardian and its acknowledged read loans until the exact waiter exits and its
+bounded report is collected. A lost waiter or report supplies no verdict. The outer owner separately checks closure of
+the original scope. That closure does not establish that an escaped process stopped writing, including after a waiter
+crash. This check cannot detect a descendant that detached and exited before the verdict. The actor quota bounds admitted generations, not every paused pre-admission OS process;
 one bounded preparation utility may coexist without evicting a warm actor. Independent uncoordinated writers and
 arbitrary user IO outside declared cooperating domains are outside this lock protocol.
 

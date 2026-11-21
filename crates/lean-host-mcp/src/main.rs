@@ -63,6 +63,9 @@ enum Command {
     NativeReader(lean_host_mcp::native_reader::NativeReaderArgs),
     #[command(hide = true)]
     NativeReaderExec(lean_host_mcp::native_reader::NativeReaderArgs),
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    NativeReaderWait(lean_host_mcp::native_reader::NativeReaderArgs),
     /// Build and install a per-toolchain worker binary.
     InstallWorker(InstallWorkerArgs),
     /// Generate and manage the configuration file.
@@ -155,6 +158,14 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("lean-host-mcp native-reader-exec: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        #[cfg(target_os = "linux")]
+        Some(Command::NativeReaderWait(args)) => match lean_host_mcp::native_reader::run_waiter(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp native-reader-wait: {error}");
                 ExitCode::FAILURE
             }
         },

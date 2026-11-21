@@ -513,12 +513,12 @@ impl<R: Read + AsFd> Capture<R> {
             truncated: false,
         })
     }
-    fn poll(&mut self) -> io::Result<()> {
+    fn poll(&mut self) -> io::Result<bool> {
         let mut buffer = [0_u8; 8192];
         // Bound each turn even when a payload writes continuously.
         for _ in 0..128 {
             match self.reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => return Ok(true),
                 Ok(count) => {
                     let accepted = count.min(self.limit.saturating_sub(self.bytes.len()));
                     self.bytes
@@ -530,7 +530,7 @@ impl<R: Read + AsFd> Capture<R> {
                 Err(error) => return Err(error),
             }
         }
-        Ok(())
+        Ok(false)
     }
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
@@ -861,6 +861,10 @@ fn run_internal(
                     .ok()
                     .filter(|payload| payload.protocol == PROTOCOL)
             };
+            if payload.is_none() && interrupted.is_none() {
+                diagnostics.poll()?;
+                interrupted = Some(format!("no complete native payload report: {}", diagnostics.text()));
+            }
             if let Some(staged) = &staged_input
                 && payload.as_ref().is_some_and(|payload| payload.target_started)
                 && !payload.as_ref().is_some_and(|payload| {
@@ -899,10 +903,6 @@ fn wait_child(child: &mut MeasuredChild, deadline: Instant) -> io::Result<Option
 fn prepare_payload(args: &NativeReaderArgs, deadline: Instant) -> io::Result<(GuardianHandle, Vec<NativeReadDomain>)> {
     args.validate()?;
     rustix::process::setsid()?;
-    // In this private session the guardian starts in its own group. Keep the
-    // bootstrap as the nearest adopter of orphaned payload descendants on Linux.
-    #[cfg(target_os = "linux")]
-    rustix::process::set_child_subreaper(Some(rustix::process::Pid::INIT))?;
     let helper = crate::shared_writer::contract()?;
     let socket =
         std::env::var_os("LEAN_RS_WORKER_PARENT_SOCKET").ok_or_else(|| invalid("reader parent socket missing"))?;
@@ -976,17 +976,10 @@ fn verified_stdin(args: &NativeReaderArgs) -> io::Result<Option<(std::fs::File, 
     Ok(Some((file, staged)))
 }
 
-/// Called only after wait4 has reaped the payload. The private group cannot
-/// acquire an outside session's processes. Within the supported non-escaping
-/// payload tree, any surviving branch now has a direct child of the bootstrap
-/// at its root. The guardian is in a separate group and retains stop authority.
+// The Linux waiter has no children other than its payload and adopted descendants.
 #[cfg(target_os = "linux")]
-fn payload_group_is_finished() -> io::Result<bool> {
-    use rustix::process::{WaitId, WaitIdOptions, getpgrp, getpid, waitid};
-
-    if getpgrp() != getpid() {
-        return Err(invalid("private native reader group leader required"));
-    }
+fn payload_has_no_survivors() -> io::Result<bool> {
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
     // Include clone children with non-SIGCHLD exit signals. NOWAIT leaves
     // every status untouched. Only ECHILD establishes an empty selection;
     // a live or waitable child requires normal guardian cleanup.
@@ -994,7 +987,7 @@ fn payload_group_is_finished() -> io::Result<bool> {
         | WaitIdOptions::NOHANG
         | WaitIdOptions::NOWAIT
         | WaitIdOptions::from_bits_retain(libc::__WALL.cast_unsigned());
-    match waitid(WaitId::Pgid(Some(getpgrp())), options) {
+    match waitid(WaitId::All, options) {
         Err(rustix::io::Errno::CHILD) => Ok(true),
         Ok(_) => Ok(false),
         Err(error) => Err(error.into()),
@@ -1002,7 +995,7 @@ fn payload_group_is_finished() -> io::Result<bool> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn payload_group_is_finished() -> io::Result<bool> {
+fn payload_has_no_survivors() -> io::Result<bool> {
     lean_toolchain::process_group::current_group_is_singleton()
 }
 
@@ -1026,12 +1019,10 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
             return Ok(());
         }
     };
-    payload.protected_domains = domains;
-    let executable = args
-        .command
-        .first()
-        .ok_or_else(|| invalid("payload executable missing"))?;
-    let mut command = Command::new(executable);
+    #[cfg(not(target_os = "linux"))]
+    {
+        payload.protected_domains = domains;
+    }
     let payload_cwd = match std::env::var_os(PROGRAM_CWD_ENV) {
         Some(cwd) if std::env::var(PROGRAM_ROLE_ENV).ok().as_deref() == Some("preparation") => {
             let cwd = PathBuf::from(cwd);
@@ -1056,15 +1047,111 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
     } else {
         Stdio::null()
     };
-    command
-        .args(args.command.iter().skip(1))
-        .current_dir(payload_cwd)
-        .stdin(stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    #[cfg(not(target_os = "linux"))]
+    let mut command = payload_command(args)?;
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut waiter = Command::new(std::env::current_exe()?);
+        waiter.arg("native-reader-wait");
+        let mut request = args.clone();
+        request.timeout_millis = u64::try_from(remaining(deadline)?.as_millis()).map_err(io::Error::other)?;
+        request.append(&mut waiter);
+        waiter
+    };
+    command.current_dir(payload_cwd).stdin(stdin);
     for name in PRIVATE_ENV {
         command.env_remove(name);
     }
+    #[cfg(not(target_os = "linux"))]
+    measure_payload(command, args.max_output_bytes, deadline, &mut payload)?;
+    #[cfg(target_os = "linux")]
+    {
+        let mut report = wait_for_payload_report(command, deadline)?;
+        report.protected_domains = domains;
+        report.stdin_sha256 = payload.stdin_sha256;
+        report.stdin_bytes = payload.stdin_bytes;
+        payload = report;
+    }
+    emit(&payload)
+}
+
+fn payload_command(args: &NativeReaderArgs) -> io::Result<Command> {
+    let executable = args
+        .command
+        .first()
+        .ok_or_else(|| invalid("payload executable missing"))?;
+    let mut command = Command::new(executable);
+    command.args(args.command.iter().skip(1));
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_payload_report(mut command: Command, deadline: Instant) -> io::Result<PayloadResult> {
+    // The payload gets separate captured stdout/stderr. Only the waiter writes
+    // this pipe. Its own stderr goes to the bootstrap's bounded diagnostics.
+    command.stdout(Stdio::piped());
+    let mut waiter = ChildOwner::spawn_measured(command)?;
+    let pipe = waiter
+        .get()?
+        .take_stdout()
+        .ok_or_else(|| invalid("missing waiter report pipe"))?;
+    let mut report = Capture::new(pipe, FRAME_LIMIT)?;
+    loop {
+        let eof = report.poll()?;
+        if let Some(status) = waiter.get()?.try_wait()? {
+            if !status.success() {
+                return Err(invalid(format!("native payload waiter exited {status}")));
+            }
+            if eof {
+                remaining(deadline)?;
+                break;
+            }
+        }
+        remaining(deadline)?;
+        thread::sleep(POLL);
+    }
+    if report.truncated || report.bytes.last() != Some(&b'\n') {
+        return Err(invalid("incomplete or oversized native payload waiter report"));
+    }
+    let payload: PayloadResult = serde_json::from_slice(&report.bytes).map_err(io::Error::other)?;
+    if payload.protocol != PROTOCOL {
+        return Err(invalid("invalid native payload waiter protocol"));
+    }
+    Ok(payload)
+}
+
+/// Measure one payload for its owning bootstrap. The private report carries no custody receipt.
+///
+/// # Errors
+/// Fails on invalid bootstrap context, loss of wait authority, or incomplete output.
+#[cfg(target_os = "linux")]
+pub fn run_waiter(args: &NativeReaderArgs) -> io::Result<()> {
+    use rustix::process::{Pid, getpgrp, getppid, getsid, set_child_subreaper};
+    if getppid() != Some(getpgrp()) || getsid(None)? != getpgrp() {
+        return Err(invalid("payload waiter requires its private session leader as parent"));
+    }
+    args.validate()?;
+    set_child_subreaper(Some(Pid::INIT))?;
+    let mut payload = PayloadResult {
+        protocol: PROTOCOL,
+        ..PayloadResult::default()
+    };
+    measure_payload(
+        payload_command(args)?,
+        args.max_output_bytes,
+        until(Duration::from_millis(args.timeout_millis))?,
+        &mut payload,
+    )?;
+    emit(&payload)
+}
+
+fn measure_payload(
+    mut command: Command,
+    limit: usize,
+    deadline: Instant,
+    payload: &mut PayloadResult,
+) -> io::Result<()> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     match ChildOwner::spawn_measured(command) {
         Err(error) => payload.detail = Some(format!("payload spawn failed: {error}")),
         Ok(mut child) => {
@@ -1074,14 +1161,14 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
                     .get()?
                     .take_stdout()
                     .ok_or_else(|| invalid("payload stdout missing"))?,
-                args.max_output_bytes,
+                limit,
             )?;
             let mut diagnostics = Capture::new(
                 child
                     .get()?
                     .take_stderr()
                     .ok_or_else(|| invalid("payload stderr missing"))?,
-                args.max_output_bytes,
+                limit,
             )?;
             loop {
                 output.poll()?;
@@ -1092,9 +1179,9 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
                     payload.exit_code = status.code();
                     payload.exit_status = Some(status.to_string());
                     payload.payload_usage = child.get()?.usage().and_then(PayloadUsage::from_waited);
-                    payload.intervened = !payload_group_is_finished()?;
+                    payload.intervened = !payload_has_no_survivors()?;
                     if payload.intervened {
-                        payload.detail = Some("native descendants required guardian cleanup; no usable result".into());
+                        payload.detail = Some("payload descendant still present at verdict; no usable result".into());
                     }
                     break;
                 }
@@ -1106,7 +1193,7 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
             payload.output_truncated = output.truncated || diagnostics.truncated;
         }
     }
-    emit(&payload)
+    Ok(())
 }
 
 fn emit(value: &impl Serialize) -> io::Result<()> {
