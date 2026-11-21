@@ -44,9 +44,11 @@ jobs:
           curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
             | sh -s -- -y --default-toolchain "$toolchain"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          # lean-rs-sys/build.rs consumes LEAN_SYSROOT; export the shell-expanded
-          # path so discovery does not depend on PATH ordering.
-          echo "LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---${toolchain##*:}" >> "$GITHUB_ENV"
+          prefix="$("$HOME/.elan/bin/elan" run --install "$toolchain" lean --print-prefix)"
+          [[ "$prefix" = /* ]]
+          test -f "$prefix/include/lean/lean.h"
+          test -f "$prefix/lib/lean/libleanshared.so"
+          echo "LEAN_SYSROOT=$prefix" >> "$GITHUB_ENV"
       - name: fmt
         run: cargo fmt --all -- --check
       # clippy --workspace is link-safe (no final link happens) per AGENTS.md.
