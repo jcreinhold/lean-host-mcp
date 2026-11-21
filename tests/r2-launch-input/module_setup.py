@@ -27,27 +27,31 @@ env = dict(
     LAKE_ARTIFACT_CACHE="false",
 )
 source = """import Lean
-open Lean
-theorem demo : True := by
+import LeanRsFixture.ProofSearchFacts
+open Lean LeanRsFixture.ProofSearchFacts
+theorem demo (q : MiniRat) : cast (q.num * q.den) = q.num * q.den := by
   run_tac
     unless (← getOptionDecls).contains `r2PluginWitness do
       throwError "missing setup plugin"
-  trivial
+  exact cast_num_den_helper q
 """
 
 
 def build(project, plugin):
     project.mkdir(exist_ok=True)
-    config = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Witness\nlean_lib Demo"
+    config = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Witness\nlean_lib LeanRsFixture\nlean_lib Demo"
     if plugin:
         config += " where\n  plugins := #[`@demo/Witness:shared]"
+    facts = Path("LeanRsFixture/ProofSearchFacts.lean")
+    (project / facts.parent).mkdir(exist_ok=True)
+    (project / facts).write_bytes((r / "fixtures/lean" / facts).read_bytes())
     (project / "lakefile.lean").write_text(config + "\n")
     (project / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n")
     (project / "Witness.lean").write_text(
         'import Lean\nregister_option r2PluginWitness : Bool := { defValue := false, descr := "plugin witness" }\n'
     )
     (project / "Demo.lean").write_text(
-        source if plugin else "import Lean\ntheorem demo : True := True.intro\n"
+        source if plugin else source.split("  run_tac")[0] + "  exact cast_num_den_helper q\n"
     )
     s.run(
         [release / "bin/lake", "--no-cache", "build", "+Demo"],
@@ -174,7 +178,13 @@ for label, plugin in [("project", True), ("omitted", False)]:
         assert "error" not in reply, reply
         search = json.loads(reply["result"]["content"][0]["text"])
         assert not search["errors"], search
-        assert "candidates" in search["data"], search
+        data = search["data"]
+        assert data["diagnostics"]["proof_state_status"] == "semantic_frontend", data
+        assert not any("no proof-goal features" in warning for warning in data.get("warnings", [])), data
+        top = data["candidates"][0]
+        assert top["name"] == "LeanRsFixture.ProofSearchFacts.cast_num_den_helper", top
+        assert "semantic:" in str(top["match_reason"]), top
+        print("semantic_frontend ranked", top["name"], flush=True)
         assert verdict["verification_status"] == "verified", verdict
     else:
         assert verdict[

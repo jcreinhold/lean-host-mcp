@@ -6,7 +6,7 @@ export CARGO_TARGET_DIR=$(cargo metadata --locked --no-deps --format-version 1 |
 export R2_SETUP_ROOT=$(mktemp -d "$CARGO_TARGET_DIR/module-setup.XXXXXX")
 export TMPDIR="$R2_SETUP_ROOT/tmp" LEAN_RS_WORKER_OWNERS_DIRECTORY="$R2_SETUP_ROOT/owners"
 export LEAN_HOST_MCP_SEMANTIC_CACHE_DIR="$R2_SETUP_ROOT/semantic-cache"
-mkdir -p "$TMPDIR" "$R2_SETUP_ROOT/cache" "$R2_SETUP_ROOT/server-owners"
+mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$R2_SETUP_ROOT/cache" "$R2_SETUP_ROOT/server-owners"
 toolchain=$(cat fixtures/lean/lean-toolchain)
 id=${toolchain##*:}
 export LEAN_SYSROOT="${LEAN_SYSROOT:-$HOME/.elan/toolchains/leanprover--lean4---$id}"
