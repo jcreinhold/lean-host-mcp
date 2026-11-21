@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.9] - 2026-11-21
+
+### Fixed
+
+- File-backed verification and search now accept Lake module setup data up to 16 MiB from the selected
+  no-build setup command. Large import maps no longer exhaust the generic writer output limit.
+
 ## [0.16.8] - 2026-11-21
 
 ### Changed
@@ -666,7 +673,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.8...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.9...HEAD
+[0.16.9]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.8...v0.16.9
 [0.16.8]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.7...v0.16.8
 [0.16.5]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.3...v0.16.4

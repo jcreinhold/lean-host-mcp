@@ -1027,7 +1027,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lean-host-mcp"
-version = "0.16.8"
+version = "0.16.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "lean-host-mcp-worker"
-version = "0.16.8"
+version = "0.16.9"
 dependencies = [
  "lean-rs",
  "lean-rs-host",
