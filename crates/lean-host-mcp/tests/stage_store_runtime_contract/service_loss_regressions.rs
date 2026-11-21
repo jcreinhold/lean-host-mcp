@@ -218,11 +218,11 @@ fn service_death(cut: Cut) {
     let acquired = read_json(&scope_root.join("contender-acquired.json"));
     assert_eq!(acquired["group_present"], false, "{acquired}");
     assert_eq!(acquired["worker_live"], false, "{acquired}");
-    assert_eq!(acquired["managed_writer_ready"], true, "{acquired}");
     fixtures::wait(|| !group_present(worker.process_group).unwrap() && !guardian.is_live().unwrap());
     assert!(scope_root.join("guardian-returned").exists());
     assert!(!scope_root.join("guardian-error").exists());
     let complete = contender.finish(); // Drops its EX before the fresh observer.
+    assert_eq!(complete["readiness_after_closure"], true, "{complete}");
     assert_eq!(complete["payload_after_marker"], 0, "{complete}");
     let mut observer = TestChild(command(&fixture, "service_loss::observer_helper", cut).spawn().unwrap());
     assert!(

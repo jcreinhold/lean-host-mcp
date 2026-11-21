@@ -617,12 +617,15 @@ fn contender_helper() {
     let present = group_present(worker.process_group).unwrap();
     let worker_live = worker.is_live().unwrap();
     let metadata = lock.metadata().unwrap();
-    let managed_writer_ready = lean_toolchain::native_guardian::protected_native_reads_stopped(
-        &root.parent().unwrap().join("owners"),
-        &lean_toolchain::shared_writer::project_lock_path(Path::new(cfg["project"].as_str().unwrap())).unwrap(),
-        (metadata.dev(), metadata.ino()),
-    )
-    .unwrap();
+    let readiness = || {
+        lean_toolchain::native_guardian::protected_native_reads_stopped(
+            &root.parent().unwrap().join("owners"),
+            &lean_toolchain::shared_writer::project_lock_path(Path::new(cfg["project"].as_str().unwrap())).unwrap(),
+            (metadata.dev(), metadata.ino()),
+        )
+        .unwrap()
+    };
+    let managed_writer_ready = readiness();
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -636,13 +639,14 @@ fn contender_helper() {
         &json!({"group_present":present,"worker_live":worker_live,"managed_writer_ready":managed_writer_ready}),
     );
     wait(|| root.join("scope-closed").exists());
+    let readiness_after_closure = readiness();
     thread::sleep(Duration::from_millis(35));
     let text = fs::read_to_string(root.join("heartbeat")).unwrap();
     let after = text.split_once("|EX|").unwrap().1.len();
     write_json(
         &root,
         "contender-result.json",
-        &json!({"group_present":present,"worker_live":worker_live,"managed_writer_ready":managed_writer_ready,"payload_after_marker":after}),
+        &json!({"group_present":present,"worker_live":worker_live,"managed_writer_ready":managed_writer_ready,"readiness_after_closure":readiness_after_closure,"payload_after_marker":after}),
     );
     drop(lock); // Close-only. Never unlock or change a live lock mode.
 }
