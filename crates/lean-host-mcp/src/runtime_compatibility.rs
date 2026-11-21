@@ -46,6 +46,8 @@ struct SourceHandoffCutover {
     executable: PathBuf,
     sha256: String,
     ownership_registry: PathBuf,
+    registry_device: u64,
+    registry_inode: u64,
 }
 
 fn source_handoff_observation(registry: &Path) -> Option<SourceHandoffObservation> {
@@ -71,7 +73,12 @@ fn source_handoff_for_pin(registry: &Path, pin: SourceHandoffCutover) -> Option<
     {
         return None;
     }
-    let directory = std::fs::metadata(registry).ok()?;
+    let approved = || {
+        let directory = std::fs::symlink_metadata(registry).ok()?;
+        (directory.is_dir() && (directory.dev(), directory.ino()) == (pin.registry_device, pin.registry_inode))
+            .then_some(())
+    };
+    approved()?;
     let helper = std::fs::File::open(&pin.executable).ok()?;
     let opened = helper.metadata().ok()?;
     if !opened.is_file() || opened.permissions().mode() & 0o111 == 0 {
@@ -92,13 +99,14 @@ fn source_handoff_for_pin(registry: &Path, pin: SourceHandoffCutover) -> Option<
     if named.dev() != opened.dev() || named.ino() != opened.ino() || digest_hex(hash.finalize()) != pin.sha256 {
         return None;
     }
+    approved()?;
     Some(SourceHandoffObservation {
         // The embedded writer checks retained charges before owner publication.
         fence: "embedded_storage_fence_v1",
         executable: pin.executable,
         sha256: pin.sha256,
-        registry_device: directory.dev(),
-        registry_inode: directory.ino(),
+        registry_device: pin.registry_device,
+        registry_inode: pin.registry_inode,
     })
 }
 
@@ -385,18 +393,31 @@ mod tests {
         std::fs::create_dir(&other)?;
         let executable = Path::new("/usr/bin/true").canonicalize()?;
         let sha256 = digest_hex(Sha256::digest(std::fs::read(&executable)?));
+        use std::os::unix::fs::MetadataExt as _;
+        let approved_registry = std::fs::metadata(&registry)?;
         let pin = |ownership_registry: PathBuf, sha256: String| SourceHandoffCutover {
             executable: executable.clone(),
             sha256,
             ownership_registry,
+            registry_device: approved_registry.dev(),
+            registry_inode: approved_registry.ino(),
         };
         let observed = source_handoff_for_pin(&registry, pin(registry.clone(), sha256.clone()))
             .ok_or("exact standalone pin must be advertised")?;
         assert_eq!(observed.fence, "embedded_storage_fence_v1");
         assert_eq!(observed.executable, executable);
         assert_eq!(observed.sha256, sha256);
-        assert!(source_handoff_for_pin(&registry, pin(other, sha256)).is_none());
+        assert!(source_handoff_for_pin(&registry, pin(other, sha256.clone())).is_none());
         assert!(source_handoff_for_pin(&registry, pin(registry.clone(), "0".repeat(64))).is_none());
+        let registry_path = registry.join("replaceable");
+        std::fs::create_dir(&registry_path)?;
+        let original = std::fs::metadata(&registry_path)?;
+        let mut configured = pin(registry_path.clone(), sha256);
+        configured.registry_device = original.dev();
+        configured.registry_inode = original.ino();
+        std::fs::rename(&registry_path, registry.join("prior"))?;
+        std::fs::create_dir(&registry_path)?;
+        assert!(source_handoff_for_pin(&registry_path, configured).is_none());
         Ok(())
     }
 
