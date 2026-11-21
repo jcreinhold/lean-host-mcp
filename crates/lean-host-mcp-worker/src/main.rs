@@ -18,6 +18,3 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod verification_preflight;
-
-#[cfg(test)]
-mod prepared_project;

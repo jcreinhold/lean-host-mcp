@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) struct PreparedProject {
+pub struct PreparedProject {
     project: PathBuf,
     domains: Vec<PathBuf>,
     guards: LocalArtifactRead,
@@ -23,7 +23,7 @@ impl PreparedProject {
     // The approval supplies the order. The SDK manifest graph independently supplies
     // the lock domains. Installed shim locks remain owned by Installed, and Elan
     // replacement is excluded for the lifetime of the job.
-    pub(super) fn capture(
+    pub fn capture(
         project: &Path,
         order: &[PathBuf],
         installed_shim_roots: &[PathBuf],
@@ -66,7 +66,7 @@ impl PreparedProject {
             ordered,
         })
     }
-    pub(super) fn check_observed(&self, observed: Option<&[String]>) -> io::Result<()> {
+    pub fn check_observed(&self, observed: Option<&[String]>) -> io::Result<()> {
         let roots = observed.ok_or_else(invalid)?;
         self.guards.validate()?;
         if project_artifact_roots(&self.project)? != self.domains || roots.len() != self.ordered.len() {
@@ -87,6 +87,151 @@ impl PreparedProject {
     }
 }
 
+/// Closed build selection, supplied by the operator/preparer, never extracted from a theorem request.
+/// Each local module belongs to one SDK writer domain and uses the default Lake output layout.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportPlan {
+    project: PathBuf,
+    roots: Vec<PathBuf>,
+    release: PathBuf,
+    modules: Vec<(String, PathBuf)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedGeneration {
+    plan: ImportPlan,
+    identity: [u8; 32],
+}
+
+fn file_hash(path: &Path) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+    let named = fs::symlink_metadata(path)?;
+    if !named.is_file() || named.nlink() != 1 || path.canonicalize()?.as_os_str() != path.as_os_str() {
+        return Err(invalid());
+    }
+    let mut file = File::open(path)?;
+    let opened = file.metadata()?;
+    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+        return Err(invalid());
+    }
+    let mut hash = Sha256::new();
+    let mut buf = [0; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(buf.get(..n).ok_or_else(invalid)?);
+    }
+    Ok(hash.finalize().into())
+}
+
+impl ImportPlan {
+    /// Select only direct, non-plugin Lake modules from the approved clean build.
+    pub fn new(project: PathBuf, roots: Vec<PathBuf>, release: PathBuf, modules: Vec<(String, PathBuf)>) -> Self {
+        Self {
+            project,
+            roots,
+            release,
+            modules,
+        }
+    }
+    fn identity(&self, domains: &[PathBuf]) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        if self.modules.is_empty() || self.modules.len() > 32 || self.roots.is_empty() || self.roots.len() > 64 {
+            return Err(invalid());
+        }
+        let mut hash = Sha256::new();
+        hash.update(serde_json::to_vec(&("prepared-project-v1", self))?);
+        for (name, domain) in &self.modules {
+            let selected = lean_toolchain::olean_candidate(&self.roots, name, |p| fs::metadata(p))
+                .map_err(io::Error::other)?
+                .ok_or_else(invalid)?;
+            if !domains.contains(domain) || name.contains('.') {
+                return Err(invalid());
+            }
+            let expected = domain.join(".lake/build/lib/lean").join(name).with_extension("olean");
+            if selected != expected {
+                return Err(invalid());
+            }
+            hash.update(file_hash(&domain.join(name).with_extension("lean"))?);
+            hash.update(file_hash(&selected)?);
+            for suffix in ["olean.server", "olean.private", "ir.sig", "ir"] {
+                let part = selected.with_extension(suffix);
+                match fs::symlink_metadata(&part) {
+                    Ok(_) => {
+                        hash.update([1]);
+                        hash.update(file_hash(&part)?);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => hash.update([0]),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        let init = lean_toolchain::olean_candidate(&self.roots, "Init", |p| fs::metadata(p))
+            .map_err(io::Error::other)?
+            .ok_or_else(invalid)?;
+        if init != self.release.join("Init.olean") {
+            return Err(invalid());
+        }
+        hash.update(file_hash(&init)?);
+        Ok(hash.finalize().into())
+    }
+    /// Capture only after a successful fresh build with independently selected, plugin-free sources.
+    /// The caller supplies the complete local graph, including transitive modules. Capture while the *same* writer still holds all local build domains after successful preparation.
+    pub fn finish(self, writer: &lean_toolchain::shared_writer::SharedWriter) -> io::Result<PreparedGeneration> {
+        if writer.project_root() != self.project || !writer.covers_project(&self.project)? {
+            return Err(invalid());
+        }
+        let identity = self.identity(writer.write_roots())?;
+        Ok(PreparedGeneration { plan: self, identity })
+    }
+}
+impl PreparedGeneration {
+    /// Bounded launch data for an explicitly selected generation. Contains no module bytes.
+    pub fn launch_input(&self) -> io::Result<String> {
+        let input = serde_json::to_string(self)?;
+        if input.len() > 4096 {
+            return Err(invalid());
+        }
+        Ok(input)
+    }
+    /// Re-resolve under reader custody before any native import. Caller supplies the separately
+    /// selected project, known release and installed shim roots. Keep the result through use.
+    pub fn verify_before_import(
+        input: &str,
+        project: &Path,
+        release: &Path,
+        shims: &[PathBuf],
+        ordered_inputs: &[PathBuf],
+        names: &[String],
+    ) -> io::Result<PreparedProject> {
+        if input.len() > 4096 {
+            return Err(invalid());
+        }
+        let generation: Self = serde_json::from_str(input)?;
+        let plan = &generation.plan;
+        let pre_import = plan.roots.iter().filter(|path| path.as_path() != release);
+        if plan.project != project
+            || plan.release != release
+            || pre_import.ne(ordered_inputs.iter())
+            || names
+                .iter()
+                .any(|name| name != "Init" && !plan.modules.iter().any(|(approved, _)| approved == name))
+        {
+            return Err(invalid());
+        }
+        let held = PreparedProject::capture(project, &plan.roots, shims, release)?;
+        if plan.identity(&held.domains)? != generation.identity {
+            return Err(invalid());
+        }
+        Ok(held)
+    }
+}
+
 #[test]
 #[ignore = "needs the disposable path-dependency Lake project and released standalone writer"]
 fn path_dependency_custody_and_observation() -> io::Result<()> {
@@ -104,7 +249,37 @@ fn path_dependency_custody_and_observation() -> io::Result<()> {
     assert!(dep_root.join("Dep.olean").is_file() && main_root.join("Root.olean").is_file());
     let builtin = release.join("lib/lean");
     let order = vec![dep_root.clone(), main_root.clone(), builtin.clone(), builtin.clone()];
-    let prepared = PreparedProject::capture(&project, &order, &[], &builtin)?;
+    let input = fs::read_to_string(base.join("launch-input"))?;
+    let names = vec![String::from("Root")];
+    let verify = || PreparedGeneration::verify_before_import(&input, &project, &builtin, &[], &order[..2], &names);
+    assert!(
+        PreparedGeneration::verify_before_import(&input, &project, &builtin, &[], &order[..2], &["Other".into()])
+            .is_err()
+    );
+    assert!(
+        PreparedGeneration::verify_before_import(
+            &input,
+            &project,
+            &builtin,
+            &[],
+            &[main_root.clone(), dep_root.clone()],
+            &names
+        )
+        .is_err()
+    );
+    let leaf = dep_root.join("Dep.olean");
+    let saved = dep_root.join("original-output");
+    fs::rename(&leaf, &saved)?;
+    fs::write(&leaf, b"unapproved output")?;
+    let refused = verify().is_err();
+    fs::remove_file(&leaf)?;
+    fs::rename(&saved, &leaf)?;
+    assert!(refused);
+    let prepared = verify()?;
+    assert_eq!(
+        prepared.ordered.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+        order.iter().collect::<Vec<_>>()
+    );
     for domain in [&project, &dep] {
         let competing = File::open(project_lock_path(domain)?)?;
         assert!(matches!(competing.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
@@ -196,6 +371,25 @@ fn build_path_dependency() -> io::Result<()> {
     if !built.status.success() {
         return Err(io::Error::other(String::from_utf8_lossy(&built.stderr).into_owned()));
     }
+    let release = lake
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(invalid)?
+        .join("lib/lean");
+    let roots = vec![
+        dep.join(".lake/build/lib/lean"),
+        project.join(".lake/build/lib/lean"),
+        release.clone(),
+        release.clone(),
+    ];
+    let plan = ImportPlan::new(
+        project.clone(),
+        roots,
+        release,
+        vec![("Root".into(), project.clone()), ("Dep".into(), dep.clone())],
+    );
+    let generation = plan.finish(&writer)?;
+    fs::write(base.join("launch-input"), generation.launch_input()?)?;
     drop(writer);
     Ok(())
 }
