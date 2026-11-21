@@ -39,6 +39,8 @@ HostInit == Init /\ h = [
   startsAtFence |-> 0, racedStart |-> FALSE, fencedRunnable |-> FALSE,
   hostPermitTaken |-> FALSE, hostPermitReturns |-> 0, actorSealed |-> FALSE,
   hostClosure |-> <<>>, staleSeen |-> FALSE, duplicateSeen |-> FALSE,
+  stopped |-> [committed |-> FALSE, frozen |-> FALSE, read |-> <<>>, request |-> <<>>,
+    permitAtPause |-> "unused", startsAtPause |-> 0],
   deadline |-> [tick |-> 0, arm |-> "idle", armedKey |-> <<>>, finishedKey |-> <<>>,
     sentAt |-> <<>>, frozen |-> FALSE, paused |-> FALSE, expired |-> FALSE],
   writer |-> [phase |-> "new", handoff |-> <<>>, admittedHandoff |-> <<>>, valid |-> TRUE,
@@ -271,6 +273,70 @@ NoStaleWithOpenScope == ~(h.staleSeen /\ phase="running" /\ capacityReserved /\ 
 NoSdkReturnBeforeHost == ~(ConfirmedHostClosure /\ capacityReturns=1 /\ HostPermitHeld /\ ~h.actorSealed)
 NoHostReturnWithoutAck == ~(h.duplicateSeen /\ h.hostPermitReturns=1 /\ h.copied="success" /\ ~h.ack)
 NoHostReturnAfterNoStart == ~(h.hostPermitReturns=1 /\ h.fenced /\ ~runningDurable /\ capacityReturns=1)
+
+\* One stage owns this scope for its whole lifetime. The original broker
+\* prepares SDK custody and commits its binding before the stage's GO.
+Stopped == h.stopped
+StartedStoppedScope == phase="running" /\ startupAcked /\ h.readAdmitted /\ supervisorAlive
+CommitStoppedBinding == HostOnly(StartedStoppedScope /\ guardianPresent /\ ~Stopped.committed
+  /\ h'=[h EXCEPT !.stopped.committed=TRUE])
+ConsumeStoppedPermit == HostOnly(StartedStoppedScope /\ Stopped.committed /\ ~Stopped.frozen
+  /\ h.permit="unused" /\ h'=[h EXCEPT !.permit="spent"])
+StoppedRecoveryPrelude == Submit \/ Accept \/ AcquireDomain \/ ReserveScope \/ SdkOnly(Spawn)
+  \/ Boot \/ LoadReads \/ CommitStoppedBinding \/ ConsumeStoppedPermit
+StartOriginalStoppedStage == HostOnly(StartedStoppedScope /\ ~Stopped.frozen
+  /\ h.permit="spent" /\ h.targetStarts=0
+  /\ h'=[h EXCEPT !.targetStarts=1])
+PauseRecoveryBroker == HostOnly(StartedStoppedScope /\ Stopped.committed /\ ~Stopped.frozen /\ guardianPresent
+  /\ h'=[h EXCEPT !.stopped.frozen=TRUE, !.stopped.permitAtPause=h.permit,
+    !.stopped.startsAtPause=h.targetStarts])
+
+StoppedKeys == {Original, [Original EXCEPT ![1]=2],
+  [Original EXCEPT ![2]=2], [Original EXCEPT ![3]=2]}
+\* The saved capability, intent and native ID authenticate in this projection.
+\* Vary each caller field independently while preserving those inputs.
+ReadStoppedBinding(key) == HostOnly(Stopped.frozen /\ Stopped.committed /\ Stopped.read= <<>>
+  /\ (key[1]=h.binding[1][1] \/ Mutation="drain-ignore-job")
+  /\ (key[2]=h.binding[1][2] \/ Mutation="drain-ignore-stage")
+  /\ (key[3]=h.binding[1][3] \/ Mutation="drain-ignore-revision")
+  /\ h'=[h EXCEPT !.stopped.read= <<key,h.bound>>])
+
+\* Publication rechecks the SDK identity independently of the earlier read.
+\* Drain authority is a distinct input; the read never mints it.
+PublishStoppedDrain(scope, authorized) == HostOnly(StartedStoppedScope /\ Stopped.frozen
+  /\ guardianPresent /\ Stopped.read/= <<>> /\ Stopped.request= <<>>
+  /\ (scope=Stopped.read[2] \/ Mutation="drain-ignore-sdk-generation")
+  /\ (authorized \/ Mutation="drain-read-authority")
+  /\ h'=[h EXCEPT !.stopped.request= <<Stopped.read,scope,authorized>>])
+GuardianAcceptStoppedDrain == Stopped.frozen /\ guardianPresent /\ Stopped.request/= <<>>
+  /\ SdkOnly(RequestStop)
+GuardianDrainStoppedScope == Stopped.request/= <<>> /\ guardianPresent
+  /\ SdkOnly(CleanupGroup \/ GuardianExitsAfterGroup)
+ObserveStoppedClosure == Stopped.request/= <<>>
+  /\ SdkOnly(ObserveGroupAbsent \/ ObserveGuardianAbsent \/ Retire)
+ResumeRecoveryBroker == HostOnly(Stopped.frozen /\ phase="closed"
+  /\ h'=[h EXCEPT !.stopped.frozen=FALSE])
+
+ReaderStartsStoppedStage == HostOnly(Mutation="drain-read-launch" /\ StartedStoppedScope
+  /\ Stopped.frozen /\ Stopped.read/= <<>> /\ h.targetStarts=Stopped.startsAtPause
+  /\ h'=[h EXCEPT !.permit="authorized", !.targetStarts=@+1])
+ReaderReleasesStoppedDomains == HostOnly(Mutation="drain-read-release" /\ Stopped.frozen
+  /\ Stopped.read/= <<>> /\ h.domains>0
+  /\ h'=[h EXCEPT !.domains=0, !.closure=h.bound])
+StoppedRecoveryNext == StoppedRecoveryPrelude \/ StartOriginalStoppedStage \/ PauseRecoveryBroker
+  \/ (\E key \in StoppedKeys: ReadStoppedBinding(key))
+  \/ (\E scope \in {Scope,PreviousScope}, authorized \in BOOLEAN: PublishStoppedDrain(scope,authorized))
+  \/ GuardianAcceptStoppedDrain \/ GuardianDrainStoppedScope \/ ObserveStoppedClosure
+  \/ ResumeRecoveryBroker \/ (~Stopped.frozen /\ ReleaseDomains)
+  \/ ReaderStartsStoppedStage \/ ReaderReleasesStoppedDomains
+StoppedRecoverySpec == HostInit /\ [][StoppedRecoveryNext]_hv
+StoppedDrainExact == Stopped.request/= <<>> =>
+  Stopped.request= << <<Original,Scope>>, Scope, TRUE >>
+StoppedLaunchUnchanged == Stopped.frozen =>
+  h.permit=Stopped.permitAtPause /\ h.targetStarts=Stopped.startsAtPause
+StoppedReleaseSafe == Stopped.frozen =>
+  h.domains=2 /\ h.closure= <<>> /\ (phase/="closed" => capacityReserved)
+NoStoppedRecoveryCompletion == ~(Stopped.startsAtPause=1 /\ h.closure=Scope /\ capacityReturns=1)
 
 \* Opt-in projection: command 1 only warms the single generation. Command 2
 \* has one immutable deadline on a shared logical clock. No guardian loss,

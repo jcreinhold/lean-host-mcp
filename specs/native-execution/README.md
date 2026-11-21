@@ -43,6 +43,18 @@ case tests a live, responsive old authority and one durable request under two co
 It assumes durable arbitration and a receiver that enforces the fence. Unavailable authority or evidence can
 leave execution uncertain. The model grants recovery no right to signal a PID or issue another GO.
 
+**Stopped broker recovery.** `StoppedRecoverySpec` projects the early O3 lookup (`aa8ec30`) onto one SDK scope
+dedicated to one stage. The original broker commits the stage-to-scope binding before GO. A reader matches the
+original job, stage and execution revision. The case assumes the saved capability, native ID and intent have
+authenticated. An independently authorized drain request must also match the SDK scope under the publication
+lock, so an exact lookup followed by a stale SDK generation still fails. The reader cannot authorize a drain,
+send GO, start a target or release custody by reading the binding. An available, unarmed original guardian
+accepts an authorized request and performs the SDK cleanup. Exact closure returns SDK capacity, and the
+resumed broker releases its domain holds. The controls exercise each mismatched field and each reader
+authority violation. A separate witness reaches release after the original target starts. This models committed
+publication and authentic OS evidence as inputs. It does not qualify SQLite durability, registry discovery,
+OS stop or closure, an armed guardian, or the autonomous drain after actual parent death.
+
 **Managed writer recovery.** `WriterSpec` in `Stages.tla` uses the existing SDK
 reader-closure and conflicting-admission steps. It binds the source handoff to
 the original store, manifest, audit baseline, and exact ordered lock union.

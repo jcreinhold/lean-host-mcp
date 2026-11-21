@@ -153,6 +153,116 @@
   },
   "cases": [
     {
+      "name": "host-stopped-recovery",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "StoppedDrainExact",
+        "StoppedLaunchUnchanged",
+        "StoppedReleaseSafe",
+        "ClosureIdentity",
+        "NoEarlyCapacityReturn",
+        "CapacityReturnsOnce"
+      ],
+      "properties": ["Spec"]
+    },
+    {
+      "name": "host-stopped-recovery-completes",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "invariants": ["NoStoppedRecoveryCompletion"],
+      "properties": [],
+      "invariant": "NoStoppedRecoveryCompletion",
+      "witness": true
+    },
+    {
+      "name": "host-stopped-drain-ignore-job",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": {
+        "Mutation": "\"drain-ignore-job\""
+      },
+      "invariants": ["StoppedDrainExact"],
+      "properties": [],
+      "invariant": "StoppedDrainExact"
+    },
+    {
+      "name": "host-stopped-drain-ignore-stage",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": {
+        "Mutation": "\"drain-ignore-stage\""
+      },
+      "invariants": ["StoppedDrainExact"],
+      "properties": [],
+      "invariant": "StoppedDrainExact"
+    },
+    {
+      "name": "host-stopped-drain-ignore-revision",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": {
+        "Mutation": "\"drain-ignore-revision\""
+      },
+      "invariants": ["StoppedDrainExact"],
+      "properties": [],
+      "invariant": "StoppedDrainExact"
+    },
+    {
+      "name": "host-stopped-drain-ignore-sdk-generation",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": {
+        "Mutation": "\"drain-ignore-sdk-generation\""
+      },
+      "invariants": ["StoppedDrainExact"],
+      "properties": [],
+      "invariant": "StoppedDrainExact"
+    },
+    {
+      "name": "host-stopped-drain-read-authority",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": {
+        "Mutation": "\"drain-read-authority\""
+      },
+      "invariants": ["StoppedDrainExact"],
+      "properties": [],
+      "invariant": "StoppedDrainExact"
+    },
+    {
+      "name": "host-stopped-drain-read-launch",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": {
+        "Mutation": "\"drain-read-launch\""
+      },
+      "invariants": ["StoppedLaunchUnchanged"],
+      "properties": [],
+      "invariant": "StoppedLaunchUnchanged"
+    },
+    {
+      "name": "host-stopped-drain-read-release",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": {
+        "Mutation": "\"drain-read-release\""
+      },
+      "invariants": ["StoppedReleaseSafe"],
+      "properties": [],
+      "invariant": "StoppedReleaseSafe"
+    },
+    {
       "name": "host-recovery-race",
       "model": "Stages",
       "expect": "pass",
