@@ -394,7 +394,7 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
         "version":1,"floor_bytes":0,"budget_bytes":1048576,"command_only":true,
         "handoff_sha256":digest,"roots":roots,
     });
-    let mut command = Command::new(standalone);
+    let mut command = Command::new(&standalone);
     command
         .arg("writer")
         .arg(&fixture.root)
@@ -418,6 +418,40 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     let asset = Path::new(ready["asset_dir"].as_str().expect("bound scratch"));
     let charge = registry.join(".writer-storage-v1").join(turn);
     let charged = fs::read(&charge).expect("real retained charge");
+    let extended_owner = fs::read(&fixture.domain).expect("exact original owner");
+    let registry_identity = fs::metadata(&registry).expect("exact registry");
+    let registry_args = [
+        "--registry",
+        registry.to_str().expect("fixture path"),
+        "--registry-device",
+        &registry_identity.dev().to_string(),
+        "--registry-inode",
+        &registry_identity.ino().to_string(),
+    ];
+    let rollback = |confirmed: bool| {
+        let mut check = Command::new(executable());
+        check
+            .args(["doctor", "writer-rollback"])
+            .args(registry_args)
+            .env(REGISTRY_ENV, &registry)
+            .env_remove("LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER");
+        if confirmed {
+            check.arg("--confirm-launchers-drained");
+        }
+        check
+    };
+    let refused = rollback(true).output().expect("check unsettled rollback");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("writer storage custody remains open"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(&fixture.domain).expect("rollback leaves exact owner"),
+        extended_owner
+    );
+    assert_eq!(fs::read(&charge).expect("rollback leaves charge"), charged);
+
     assert_eq!(
         serde_json::from_slice::<Value>(&charged).expect("valid charge")["handoff_sha256"],
         digest
@@ -464,6 +498,51 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
         fs::read(&fixture.domain).expect("unrelated owner unchanged"),
         prior_owner
     );
+    // Restore the actual record to undo only the deliberate fixture cut.
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture.domain)
+            .expect("same inode");
+        file.try_lock().expect("no overlapping work admitted");
+        file.set_len(0).expect("restore actual test owner");
+        file.write_all(&extended_owner).expect("restore exact owner bytes");
+        file.sync_all().expect("sync fixture restoration");
+    }
+    let recovered = Command::new(&standalone)
+        .args(["writer-storage", "recover"])
+        .args(registry_args)
+        .args(["--turn", turn, "--acknowledge-unknown-result"])
+        .env(REGISTRY_ENV, &registry)
+        .output()
+        .expect("settle using the actual SDK recovery command");
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert!(!charge.exists() && !asset.exists());
+    assert!(!rollback(false).output().expect("unconfirmed drain").status.success());
+    assert!(
+        !rollback(true)
+            .env("LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER", "{}")
+            .output()
+            .expect("active cutover")
+            .status
+            .success()
+    );
+    assert!(
+        !rollback(true)
+            .env(REGISTRY_ENV, &disjoint)
+            .output()
+            .expect("wrong registry")
+            .status
+            .success()
+    );
+    let allowed = rollback(true).output().expect("check legitimately settled rollback");
+    assert!(allowed.status.success(), "{allowed:?}");
+    let saved_registry = root.join("unavailable-owners");
+    fs::rename(&registry, &saved_registry).expect("make disposable registry unavailable");
+    let unavailable = rollback(true).output().expect("check unavailable registry");
+    assert!(!unavailable.status.success());
+    fs::rename(&saved_registry, &registry).expect("restore disposable registry");
 }
 
 #[test]

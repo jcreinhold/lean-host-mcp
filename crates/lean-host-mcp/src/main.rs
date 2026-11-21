@@ -84,6 +84,17 @@ enum Command {
 enum DoctorCommand {
     /// List registered lean-host-mcp server PIDs and remove stale records.
     Processes(DoctorProcessesArgs),
+    /// Check the exact registry after draining supported writer launchers.
+    WriterRollback {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long)]
+        registry_device: u64,
+        #[arg(long)]
+        registry_inode: u64,
+        #[arg(long)]
+        confirm_launchers_drained: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -143,6 +154,21 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("lean-host-mcp doctor processes: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Doctor {
+            command:
+                DoctorCommand::WriterRollback {
+                    registry,
+                    registry_device,
+                    registry_inode,
+                    confirm_launchers_drained,
+                },
+        }) => match check_writer_rollback(&registry, registry_device, registry_inode, confirm_launchers_drained) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp doctor writer-rollback: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -214,6 +240,37 @@ fn main() -> ExitCode {
         Some(Command::Serve(args)) => run_serve(args),
         None => run_serve(cli.serve),
     }
+}
+
+#[cfg(unix)]
+fn check_writer_rollback(root: &std::path::Path, device: u64, inode: u64, drained: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !drained || std::env::var_os("LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER").is_some() {
+        return Err(std::io::Error::other(
+            "disable source-bound admission and confirm supported launchers are drained before rollback",
+        ));
+    }
+    if lean_toolchain::native_guardian::registry_directory()? != root {
+        return Err(std::io::Error::other(
+            "rollback registry differs from the selected native registry",
+        ));
+    }
+    let verify = || {
+        let metadata = std::fs::symlink_metadata(root)?;
+        if !metadata.is_dir() || (metadata.dev(), metadata.ino()) != (device, inode) {
+            return Err(std::io::Error::other("rollback registry identity changed"));
+        }
+        Ok(())
+    };
+    verify()?;
+    lean_toolchain::native_guardian::collect_closed_owner_records(root, std::time::Duration::from_secs(5))?;
+    verify()
+}
+
+#[cfg(not(unix))]
+fn check_writer_rollback(_root: &std::path::Path, _device: u64, _inode: u64, _drained: bool) -> std::io::Result<()> {
+    Err(std::io::Error::other("native writer rollback is unsupported"))
 }
 
 fn run_serve(args: ServeArgs) -> ExitCode {
