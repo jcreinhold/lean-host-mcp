@@ -765,19 +765,19 @@ impl WorkerSidecar {
     pub(crate) fn load(install_dir: &Path) -> Option<Self> {
         let bytes = std::fs::read(install_dir.join(SIDECAR_FILE_NAME)).ok()?;
         let mut record: Self = serde_json::from_slice(&bytes).ok()?;
-        if let Some(runtime) = record.deployment.as_mut().and_then(|d| d.runtime.as_mut()) {
-            if Path::new(&runtime.prepared.shim_manifest_path).is_relative() {
-                runtime
-                    .map_generation_paths(|path| {
-                        if !path.starts_with("shims")
-                            || path.components().any(|c| !matches!(c, std::path::Component::Normal(_)))
-                        {
-                            return Err(std::io::Error::other("invalid generation-relative path"));
-                        }
-                        Ok(install_dir.join(path))
-                    })
-                    .ok()?;
-            }
+        if let Some(runtime) = record.deployment.as_mut().and_then(|d| d.runtime.as_mut())
+            && Path::new(&runtime.prepared.shim_manifest_path).is_relative()
+        {
+            runtime
+                .map_generation_paths(|path| {
+                    if !path.starts_with("shims")
+                        || path.components().any(|c| !matches!(c, std::path::Component::Normal(_)))
+                    {
+                        return Err(std::io::Error::other("invalid generation-relative path"));
+                    }
+                    Ok(install_dir.join(path))
+                })
+                .ok()?;
         }
         Some(record)
     }

@@ -311,7 +311,7 @@ mod tests {
                 })
                 .collect();
             ensure!(
-                images.len() == 1 && images[0].starts_with(candidate.join("shims")),
+                matches!(images.as_slice(), [image] if image.starts_with(candidate.join("shims"))),
                 "unexpected mapped {package} image: {images:?}"
             );
         }

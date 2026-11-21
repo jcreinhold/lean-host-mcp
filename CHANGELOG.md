@@ -25,7 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Enforce compiled host ABI expectations before every first or replacement session. Add runtime-free
   `lean_compatibility` discovery with explicit `pure_v1` mode.
 - Reevaluate Lake options under shared custody with generation-owned private caches, preserving warm workers and saved
-  root options. Require matched SDK 0.10.1 and worker protocol 13.
+  root options. Require matched SDK 0.10.2 and worker protocol 13.
 
 
 ## [0.16.7] - 2026-11-14

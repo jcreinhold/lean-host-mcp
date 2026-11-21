@@ -85,7 +85,7 @@ enum DoctorCommand {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    /// Select and approve the primary Lake project for native calls (also LEAN_HOST_MCP_PROJECT).
+    /// Select and approve the primary Lake project for native calls (also `LEAN_HOST_MCP_PROJECT`).
     /// A per-call project can select this root. Discovery alone cannot approve a native project.
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
