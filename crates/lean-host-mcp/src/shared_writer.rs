@@ -867,6 +867,47 @@ pub(crate) const MODULE_SETUP_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) const MODULE_SETUP_ENV: &str = "LEAN_HOST_MCP_CAPTURE_MODULE_SETUP";
 pub(crate) const MODULE_SETUP_FILE: &str = "module-setup.json";
 
+fn module_setup_path(message: &Value, root: &Path, assets: &Path) -> io::Result<Option<PathBuf>> {
+    let env = field(message, "env");
+    if env.get(MODULE_SETUP_ENV).is_none() {
+        return Ok(None);
+    }
+    let refused = || invalid("marked writer stage requires selected Lake no-build setup-file for this project");
+    if env != &json!({(MODULE_SETUP_ENV): "1", "LAKE_CACHE_DIR": assets, "LAKE_ARTIFACT_CACHE": "false"})
+        || field(message, "cwd").as_str() != root.to_str()
+    {
+        return Err(refused());
+    }
+    let args = field(message, "command").as_array().ok_or_else(refused)?;
+    let [program, no_build, no_cache, setup_file, source] = args.as_slice() else {
+        return Err(refused());
+    };
+    if no_build != "--no-build" || no_cache != "--no-cache" || setup_file != "setup-file" {
+        return Err(refused());
+    }
+    let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(io::Error::other)?;
+    if id.window_verdict() != crate::toolchain::WindowVerdict::Supported {
+        return Err(refused());
+    }
+    let lake = id
+        .elan_dir()
+        .map_err(io::Error::other)?
+        .canonicalize()?
+        .join("bin/lake");
+    let file = Path::new(source.as_str().ok_or_else(refused)?);
+    if program.as_str() != lake.to_str()
+        || !lake.is_file()
+        || lake.canonicalize()?.as_os_str() != lake.as_os_str()
+        || !file.starts_with(root)
+        || file.extension().is_none_or(|s| s != "lean")
+        || !file.is_file()
+        || file.canonicalize()?.as_os_str() != file.as_os_str()
+    {
+        return Err(refused());
+    }
+    Ok(Some(assets.join(MODULE_SETUP_FILE)))
+}
+
 pub(crate) fn module_setup_digest(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
@@ -1340,8 +1381,7 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                             return Err(invalid("native artifact readers remain unresolved before GO"));
                         }
                     }
-                    let setup_path = (field(field(&message, "env"), MODULE_SETUP_ENV).as_str() == Some("1"))
-                        .then(|| asset_dir.join(MODULE_SETUP_FILE));
+                    let setup_path = module_setup_path(&message, &args.root, &asset_dir)?;
                     if !execute_with_launcher(
                         &message,
                         &args.root,

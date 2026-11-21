@@ -184,6 +184,31 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
+fn marked_non_setup_command_refuses_before_launch() {
+    let fixture = Fixture::new();
+    let mut writer = fixture.open();
+    let assets = writer.asset_dir().to_path_buf();
+    fs::write(fixture.root.join("lean-toolchain"), "leanprover/lean4:v4.36.0\n").unwrap();
+    let source = fixture.root.join("Main.lean");
+    fs::write(&source, "def x := 1\n").unwrap();
+    let impostor = fixture.root.join("lake");
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::write(&impostor, "#!/bin/sh\ntouch effects\n").unwrap();
+    fs::set_permissions(&impostor, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(impostor);
+    command
+        .current_dir(&fixture.root)
+        .args(["--no-build", "--no-cache", "setup-file"])
+        .arg(source)
+        .env("LEAN_HOST_MCP_CAPTURE_MODULE_SETUP", "1")
+        .env("LAKE_CACHE_DIR", &assets)
+        .env("LAKE_ARTIFACT_CACHE", "false");
+    assert!(writer.run(&command, LIMIT).is_err());
+    fixture.release(writer, &assets);
+    assert!(!fixture.root.join("effects").exists());
+}
+
+#[test]
 fn actual_helper_preserves_clean_output_lock_and_assets_until_sdk_drop() {
     let fixture = Fixture::new();
     let mut writer = fixture.open();
