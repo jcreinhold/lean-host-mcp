@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.13] - 2026-11-21
+
+### Fixed
+
+- File-wide verification and file diagnostics now use the current source and Lake file setup for ordinary projects.
+  Diagnostics preserve Lean messages, source ranges, and truncation.
+
 ## [0.16.12] - 2026-11-21
 
 ### Fixed
@@ -697,7 +704,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.12...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.13...HEAD
+[0.16.13]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.12...v0.16.13
 [0.16.12]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.11...v0.16.12
 [0.16.11]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.10...v0.16.11
 [0.16.10]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.9...v0.16.10

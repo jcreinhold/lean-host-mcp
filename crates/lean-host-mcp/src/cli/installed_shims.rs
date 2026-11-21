@@ -14,7 +14,7 @@ pub(super) fn prepare(
     lean_toolchain::shared_writer::SharedWriter,
 )> {
     fs::create_dir(destination)?;
-    for row in include_str!("shim-inputs-0.10.4.txt").lines() {
+    for row in include_str!("shim-inputs-0.10.5.txt").lines() {
         let (hash, name) = row.split_once(' ').context("invalid packaged shim inventory")?;
         let path = source.join("shims").join(name);
         ensure!(
@@ -132,7 +132,7 @@ pub(super) fn bind(
         .collect();
     // Bind every compiled package module, including split olean data if emitted.
     // Package order in the search path is part of the installation contract.
-    for row in include_str!("shim-inputs-0.10.4.txt").lines() {
+    for row in include_str!("shim-inputs-0.10.5.txt").lines() {
         let (_, name) = row.split_once(' ').context("invalid packaged shim inventory")?;
         let (package, file) = name.split_once('/').context("missing shim package")?;
         let Some(module) = file.strip_suffix(".lean").filter(|name| *name != "lakefile") else {
