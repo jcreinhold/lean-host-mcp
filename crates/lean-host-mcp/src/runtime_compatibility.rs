@@ -110,6 +110,7 @@ impl ExpectedContract {
                 "generation_bound_worker_stop_v1".into(),
                 "capacity_until_reaped_v1".into(),
                 "worker_owned_shared_artifact_reads_v1".into(),
+                "native_reader_stdout_frame_v1".into(),
             ],
             required_host_bindings,
             enforcement: "every-host-session-before-body-commands".into(),
