@@ -84,35 +84,19 @@ async fn stdio_shutdown_after_tool_call_exits_worker_child() {
     assert_eq!(result.get("errors"), Some(&json!([])));
     assert_eq!(result.pointer("/data/status"), Some(&json!("found")));
     assert_eq!(result.pointer("/data/declaration/name"), Some(&json!("Nat.add_zero")));
+    // Only the installed child can provide this receipt after opening its
+    // checked Lean session. This isolated server has one request and one worker.
+    let loaded = result
+        .pointer("/trust/native_compatibility/loaded")
+        .and_then(Value::as_array)
+        .expect("loaded worker handshake");
+    let [receipt] = loaded.as_slice() else {
+        panic!("expected one loaded generation")
+    };
+    assert_eq!(receipt.get("project_root").and_then(Value::as_str), project.to_str());
+    assert_eq!(receipt.get("worker_session_id"), result.pointer("/trust/session_id"));
     let worker_pids = wait_for_child_pids(server.pid()).await;
-    assert!(
-        !worker_pids.is_empty(),
-        "tool call should leave a direct worker child for exact-PID shutdown assertion; response: {response:?}"
-    );
-
-    let worker = project
-        .parent()
-        .expect("installed generation")
-        .join("lean-host-mcp-worker");
-    for pid in &worker_pids {
-        #[cfg(target_os = "linux")]
-        let executable = std::fs::read_link(format!("/proc/{pid}/exe")).expect("inspect worker executable");
-        #[cfg(target_os = "macos")]
-        let executable = {
-            let process = std::process::Command::new("ps")
-                .args(["-ww", "-o", "comm=", "-p", &pid.to_string()])
-                .output()
-                .expect("inspect worker executable");
-            assert!(process.status.success());
-            PathBuf::from(
-                String::from_utf8(process.stdout)
-                    .expect("worker executable path")
-                    .trim(),
-            )
-        };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        assert_eq!(executable, worker.canonicalize().expect("installed worker"));
-    }
+    assert_eq!(worker_pids.len(), 1, "expected one direct worker after the handshake");
 
     server.close_stdin_and_wait().await;
     for pid in worker_pids {
