@@ -368,7 +368,7 @@ enum CleanupJob {
         keepalive: Option<Box<dyn Send>>,
     },
     Native {
-        lease: LeanWorkerNativeScopeLease,
+        lease: Box<LeanWorkerNativeScopeLease>,
         keepalive: Option<Box<dyn Send>>,
     },
 }
@@ -432,7 +432,7 @@ impl Drop for NativeGroupOwner {
             // This is the first and only job for the pre-created receiver.
             // The same actual Child and its resource lease remain owned.
             let _handoff = self.reaper.send(CleanupJob::Native {
-                lease,
+                lease: Box::new(lease),
                 keepalive: self.keepalive.take(),
             });
         }
