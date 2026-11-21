@@ -1019,10 +1019,7 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
             return Ok(());
         }
     };
-    #[cfg(not(target_os = "linux"))]
-    {
-        payload.protected_domains = domains;
-    }
+    payload.protected_domains = domains;
     let payload_cwd = match std::env::var_os(PROGRAM_CWD_ENV) {
         Some(cwd) if std::env::var(PROGRAM_ROLE_ENV).ok().as_deref() == Some("preparation") => {
             let cwd = PathBuf::from(cwd);
@@ -1067,7 +1064,7 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let mut report = wait_for_payload_report(command, deadline)?;
-        report.protected_domains = domains;
+        report.protected_domains = payload.protected_domains;
         report.stdin_sha256 = payload.stdin_sha256;
         report.stdin_bytes = payload.stdin_bytes;
         payload = report;
