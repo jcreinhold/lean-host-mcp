@@ -2249,7 +2249,11 @@ async fn assert_drain_resumes(real_worker: bool) {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
     std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
-    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    std::fs::copy(
+        fixture_root().join("lean-toolchain"),
+        root.path().join("lean-toolchain"),
+    )
+    .unwrap();
     let root_s = root.path().to_string_lossy();
     // The transport-only test must not depend on a cold worker's shim build.
     // An empty explicit worker directory gives a deterministic post-drain error.
