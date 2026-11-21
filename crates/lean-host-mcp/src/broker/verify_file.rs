@@ -72,33 +72,10 @@ impl ProjectBroker {
         if plan.project != root {
             return Err(invalid("unexpected prepared project"));
         }
-        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root).map_err(invalid)?;
-        let (worker, sysroot, _) = crate::project::resolve_worker(meta)?;
-        let generation = worker.parent().ok_or_else(|| invalid("missing worker generation"))?;
-        let installed = crate::toolchain::WorkerSidecar::load(generation)
-            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
-            .ok_or_else(|| invalid("missing installed shim deployment"))?;
-        let domains: Vec<_> = installed.prepared.artifact_roots.iter().map(PathBuf::from).collect();
-        let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&domains)?;
-        if installed.sysroot != sysroot
-            || plan.release != sysroot.join("lib/lean")
-            || selection.products.len() != plan.modules.len()
-        {
-            return Err(invalid("incomplete prepared import selection"));
-        }
-        for (path, hash) in &installed.files {
-            verify_hash(path, hash)?;
-        }
-        let shims: Vec<_> = installed.prepared.shim_search_paths.iter().map(PathBuf::from).collect();
-        for module in crate::toolchain::VERIFIER_MODULES {
-            let path = lean_toolchain::olean_candidate(&shims, module, |path| fs::metadata(path))
-                .map_err(invalid)?
-                .ok_or_else(|| invalid("missing verification driver shim module"))?;
-            if !installed.files.contains_key(&path) {
-                return Err(invalid(
-                    "installed generation lacks verification driver module identity",
-                ));
-            }
+        let reader = Self::installed_reader(root, meta)?;
+        let PreparedReader { sysroot, shims, .. } = &reader;
+        if plan.release != sysroot.join("lib/lean") || selection.products.len() != plan.modules.len() {
+            return Err(invalid("incomplete prepared selection"));
         }
         let project_domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
         let mut expected: Vec<_> = project_domains.iter().map(|p| p.join(".lake/build/lib/lean")).collect();
@@ -144,12 +121,44 @@ impl ProjectBroker {
             return Err(invalid("unsupported import outside prepared project"));
         }
         Ok(PreparedReader {
+            roots: plan.roots,
+            ..reader
+        })
+    }
+
+    fn installed_reader(root: &Path, meta: &crate::lake_meta::LakeProjectMeta) -> Result<PreparedReader> {
+        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root).map_err(invalid)?;
+        let (worker, sysroot, _) = crate::project::resolve_worker(meta)?;
+        let generation = worker.parent().ok_or_else(|| invalid("missing worker generation"))?;
+        let installed = crate::toolchain::WorkerSidecar::load(generation)
+            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+            .ok_or_else(|| invalid("missing installed shim deployment"))?;
+        let domains: Vec<_> = installed.prepared.artifact_roots.iter().map(PathBuf::from).collect();
+        let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&domains)?;
+        if installed.sysroot != sysroot {
+            return Err(invalid("incomplete prepared import selection"));
+        }
+        for (path, hash) in &installed.files {
+            verify_hash(path, hash)?;
+        }
+        let shims: Vec<_> = installed.prepared.shim_search_paths.iter().map(PathBuf::from).collect();
+        for module in crate::toolchain::VERIFIER_MODULES {
+            let path = lean_toolchain::olean_candidate(&shims, module, |path| fs::metadata(path))
+                .map_err(invalid)?
+                .ok_or_else(|| invalid("missing verification driver shim module"))?;
+            if !installed.files.contains_key(&path) {
+                return Err(invalid(
+                    "installed generation lacks verification driver module identity",
+                ));
+            }
+        }
+        Ok(PreparedReader {
             custody,
             sysroot,
             shims,
             domains,
             shim_guards,
-            roots: plan.roots,
+            roots: Vec::new(),
         })
     }
     pub(crate) async fn verify_file(
@@ -159,21 +168,32 @@ impl ProjectBroker {
         freshness: Vec<String>,
         request: LeanWorkerDeclarationVerificationBatchRequest,
         options: LeanWorkerElabOptions,
-        input: &str,
+        input: Option<&str>,
     ) -> Result<BrokerCall<LeanWorkerDeclarationVerificationBatchResult>> {
         use lean_rs_worker_protocol::types::{
             LeanWorkerDeclarationVerificationTarget as Target, LeanWorkerSorryPolicy,
         };
         let root = self.native_root(&hint)?;
         let meta = self.meta(&root)?;
-        let file = Path::new(&options.file_label);
+        let file = PathBuf::from(&options.file_label);
         if !file.starts_with(&root)
             || file.canonicalize()? != file
             || file.extension().and_then(|x| x.to_str()) != Some("lean")
         {
             return Err(invalid("unapproved verification path"));
         }
-        let options = self.resolve_options(&meta, options).await?;
+        let setup = if input.is_none() {
+            Some(
+                self.prepare_file_setup(&hint, &options.file_label, &request.source)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let options = match &setup {
+            Some(setup) => options.lean_options(setup.options.clone()),
+            None => self.resolve_options(&meta, options).await?,
+        };
         let activity = self.preparation_activity(&root).await?;
         let PreparedReader {
             custody,
@@ -182,7 +202,16 @@ impl ProjectBroker {
             domains,
             shim_guards,
             roots,
-        } = Self::prepared_reader(&root, &meta, input, &imports)?;
+        } = match input {
+            Some(selection) => Self::prepared_reader(&root, &meta, selection, &imports)?,
+            None => Self::installed_reader(&root, &meta)?,
+        };
+        if let Some(setup) = &setup {
+            setup.check(&root, &sysroot, &custody)?;
+            if fs::read(file)? != request.source.as_bytes() {
+                return Err(invalid("verification source changed during transfer"));
+            }
+        }
         let targets = request
             .targets
             .iter()
@@ -215,12 +244,19 @@ impl ProjectBroker {
             Some(Box::new((activity, shim_guards))),
             move |assets| {
                 let driver = assets.join("VerifyBatch.lean");
-                fs::write(&driver, include_bytes!("../lake/VerifyBatch.lean"))?;
+                let entry = if let Some(setup) = setup {
+                    fs::write(assets.join("module.setup.json"), setup.bytes)?;
+                    include_str!("../lake/VerifySetup.lean")
+                } else {
+                    include_str!("../lake/VerifyBatch.lean")
+                };
+                fs::write(&driver, [include_str!("../lake/VerifyCommon.lean"), entry].concat())?;
                 let data = assets.join("request.json");
                 fs::write(&data, body)?;
                 Ok(crate::native_reader::NativeReaderProgram {
                     command: vec![
                         sysroot.join("bin/lean").into_os_string(),
+                        "-j1".into(),
                         "--run".into(),
                         driver.into_os_string(),
                         data.into_os_string(),

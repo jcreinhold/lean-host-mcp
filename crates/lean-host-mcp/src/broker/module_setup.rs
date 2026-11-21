@@ -29,8 +29,7 @@ struct ModuleSetup {
     import_arts: BTreeMap<String, Vec<Vec<PathBuf>>>,
     plugins: Vec<Plugin>,
     dynlibs: Vec<PathBuf>,
-    #[serde(rename = "options")]
-    _options: BTreeMap<String, serde_json::Value>,
+    options: BTreeMap<String, lean_toolchain::LeanOptionValue>,
 }
 
 #[derive(Deserialize)]
@@ -44,17 +43,66 @@ enum Plugin {
     },
 }
 
-fn stage(bytes: &[u8], writer: &SharedWriter, sysroot: &Path) -> io::Result<()> {
+#[derive(Eq, PartialEq)]
+struct Identity(u64, u64, u64, i64, i64);
+
+impl Identity {
+    fn read(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = fs::symlink_metadata(path)?;
+        if !m.is_file() || path.canonicalize()? != path {
+            return Err(invalid("setup file no longer canonical"));
+        }
+        Ok(Self(m.dev(), m.ino(), m.len(), m.ctime(), m.ctime_nsec()))
+    }
+}
+
+pub(super) struct StagedSetup {
+    pub(super) bytes: Vec<u8>,
+    pub(super) options: BTreeMap<String, lean_toolchain::LeanOptionValue>,
+    sysroot: PathBuf,
+    domains: Vec<PathBuf>,
+    inputs: BTreeMap<PathBuf, Identity>,
+}
+
+impl StagedSetup {
+    pub(super) fn check(
+        &self,
+        root: &Path,
+        sysroot: &Path,
+        custody: &crate::artifact_reads::ArtifactReadGuard,
+    ) -> io::Result<()> {
+        if self.sysroot != sysroot || self.domains != lean_toolchain::shared_writer::project_artifact_roots(root)? {
+            return Err(invalid("setup domains or toolchain changed during reader transfer"));
+        }
+        for (p, identity) in &self.inputs {
+            if p != &root.join("lean-toolchain")
+                && !p.starts_with(sysroot)
+                && !p.starts_with(root)
+                && !custody.covers_artifact_root(p)
+            {
+                return Err(invalid("setup path outside reader custody"));
+            }
+            if Identity::read(p)? != *identity {
+                return Err(invalid("setup input changed during reader transfer"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, file: &Path) -> io::Result<StagedSetup> {
     if bytes.len() > 1024 * 1024 {
         return Err(invalid("Lake module setup exceeds capture limit"));
     }
-    let setup: ModuleSetup = serde_json::from_slice(bytes)?;
+    let setup: ModuleSetup = serde_json::from_slice(&bytes)?;
     if setup.name.is_empty() {
         return Err(invalid("missing Lake module name"));
     }
     // These fields pass through byte-for-byte. Only Lake/Lean interprets them.
     let release_lib = sysroot.join("lib");
-    let validate = |p: &Path| -> io::Result<()> {
+    let mut inputs = BTreeMap::new();
+    let mut validate = |p: &Path| -> io::Result<()> {
         if !p.is_absolute()
             || p.canonicalize()? != p
             || !p.is_file()
@@ -68,6 +116,7 @@ fn stage(bytes: &[u8], writer: &SharedWriter, sysroot: &Path) -> io::Result<()> 
                 "Lake setup artifact outside held project outputs or selected release",
             ));
         }
+        inputs.insert(p.to_owned(), Identity::read(p)?);
         Ok(())
     };
     for parts in setup.import_arts.values() {
@@ -96,11 +145,24 @@ fn stage(bytes: &[u8], writer: &SharedWriter, sysroot: &Path) -> io::Result<()> 
             }
         }
     }
-    fs::write(writer.asset_dir().join("module.setup.json"), bytes)
+    for path in [
+        file.to_owned(),
+        root.join("lean-toolchain"),
+        root.join("lake-manifest.json"),
+    ] {
+        inputs.insert(path.clone(), Identity::read(&path)?);
+    }
+    Ok(StagedSetup {
+        bytes,
+        options: setup.options,
+        inputs,
+        domains: writer.write_roots().to_vec(),
+        sysroot: sysroot.to_owned(),
+    })
 }
 
 impl ProjectBroker {
-    pub(crate) async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<()> {
+    pub(super) async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
         let root = self.native_root(hint)?;
         let activity = self.preparation_activity(&root).await?;
         let timeout = Duration::from_millis(self.request_timeout_millis());
@@ -108,7 +170,7 @@ impl ProjectBroker {
         let source = source.to_owned();
         let cancel = CallCancellation::current();
         let mut on_drop = cancel.cancel_on_drop();
-        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> Result<StagedSetup> {
             let _activity = activity;
             let helper = crate::shared_writer::contract()?.executable;
             let started = Instant::now();
@@ -145,11 +207,44 @@ impl ProjectBroker {
                     String::from_utf8_lossy(&result.stderr)
                 )));
             }
-            stage(&result.stdout, &writer, &sysroot)?;
-            Ok(())
+            Ok(stage(result.stdout, &writer, &sysroot, &root, &file)?)
         })
         .await;
         on_drop.disarm();
         result.map_err(|e| ServerError::Internal(e.to_string()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reader_refuses_replaced_artifact_even_with_identical_bytes() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let output = root.join(".lake/build/lib/lean");
+        fs::create_dir_all(&output)?;
+        let leaf = output.join("Dep.olean");
+        fs::write(&leaf, b"same bytes")?;
+        let setup = StagedSetup {
+            bytes: Vec::new(),
+            options: BTreeMap::new(),
+            sysroot: root.join("release"),
+            domains: lean_toolchain::shared_writer::project_artifact_roots(&root)?,
+            inputs: BTreeMap::from([(leaf.clone(), Identity::read(&leaf)?)]),
+        };
+        {
+            let guard = crate::artifact_reads::ArtifactReadGuard::for_project(&root)?;
+            setup.check(&root, &setup.sysroot, &guard)?;
+        }
+        let replacement = output.join("replacement");
+        fs::write(&replacement, b"same bytes")?;
+        fs::rename(replacement, leaf)?;
+        let guard = crate::artifact_reads::ArtifactReadGuard::for_project(&root)?;
+        assert!(
+            matches!(setup.check(&root, &setup.sysroot, &guard), Err(error) if error.kind() == io::ErrorKind::InvalidData)
+        );
+        Ok(())
     }
 }

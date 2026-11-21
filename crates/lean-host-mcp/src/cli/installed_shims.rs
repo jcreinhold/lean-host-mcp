@@ -27,7 +27,10 @@ pub(super) fn prepare(
             use std::fmt::Write as _;
             write!(actual, "{byte:02x}")?;
         }
-        ensure!(actual == hash, "published shim input changed: {name}");
+        // SDK fb98113 changes only this Lean source in the inventoried shim inputs.
+        let setup_shim = name == "lean-rs-host-shims/LeanRsHostShims/InfoTree.lean"
+            && actual == "f6e5aa7d41520e906b9251a634fe0195a26bf1ff30dccf1b9f567ac0cb7aa591";
+        ensure!(actual == hash || setup_shim, "published shim input changed: {name}");
         let output = destination.join(name);
         fs::create_dir_all(output.parent().context("missing source directory")?)?;
         fs::write(output, bytes)?;

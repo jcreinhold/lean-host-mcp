@@ -708,17 +708,9 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
             let session = session_imports(imports.clone());
             let options = elab_options(&file_label, ctx.config.output.heartbeat_limit);
             async move {
-                if file_backed && scoped.is_none() {
+                if file_backed {
                     ctx.broker
-                        .prepare_file_setup(&hint, &options.file_label, &request.source)
-                        .await?;
-                    return Err(crate::error::ServerError::BadProject(
-                        "Lake module setup staged; installed verification shim lacks setup-aware elaboration".into(),
-                    ));
-                }
-                if let Some(selection) = scoped {
-                    ctx.broker
-                        .verify_file(hint, session, imports, request, options, selection)
+                        .verify_file(hint, session, imports, request, options, scoped)
                         .await
                 } else {
                     ctx.broker

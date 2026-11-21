@@ -1,16 +1,19 @@
 """Exercise the public no-build ModuleSetup handoff on a disposable cached project."""
 
-import os, json, subprocess as s, hashlib, select, shutil
+import hashlib
+import json
+import os
+import select
+import subprocess as s
+import argparse
 from pathlib import Path
 
 r = Path(__file__).resolve().parents[2]
 b = r / "target/r2-module-setup"
-b.mkdir()
-p = b / "project"
-p.mkdir()
-for n in ["owners", "tmp", "workers", "server-owners", "cache"]:
-    (b / n).mkdir(mode=0o700)
 release = Path.home() / ".elan/toolchains/leanprover--lean4---v4.36.0"
+assert (b / "workers/v4.36.0/current-generation").is_file(), (
+    "install the matched fb98113 shims first"
+)
 env = dict(
     os.environ,
     LEAN_SYSROOT=str(release),
@@ -19,23 +22,43 @@ env = dict(
     LEAN_RS_WORKER_OWNERS_DIRECTORY=str(b / "owners"),
     LEAN_HOST_MCP_WORKERS_DIR=str(b / "workers"),
     LAKE_CACHE_DIR=str(b / "cache"),
+    LAKE_ARTIFACT_CACHE="false",
 )
-(p / "lakefile.toml").write_text(
-    'name = "demo"\n[[lean_lib]]\nname = "Dep"\n[[lean_lib]]\nname = "Demo"\n'
-)
-(p / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n")
-(p / "Dep.lean").write_text("theorem dep : True := True.intro\n")
-(p / "Demo.lean").write_text("import Dep\ntheorem demo : True := dep\n")
-s.run(
-    [release / "bin/lake", "--no-cache", "build", "+Demo"],
-    cwd=p,
-    env=env,
-    check=True,
-    capture_output=True,
-)
+source = """import Lean
+open Lean
+theorem demo : True := by
+  run_tac
+    unless (← getOptionDecls).contains `r2PluginWitness do
+      throwError "missing setup plugin"
+  trivial
+"""
 
 
-def inventory():
+def build(project, plugin):
+    project.mkdir(exist_ok=True)
+    config = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Witness\nlean_lib Demo"
+    if plugin:
+        config += " where\n  plugins := #[`@demo/Witness:shared]"
+    (project / "lakefile.lean").write_text(config + "\n")
+    (project / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n")
+    (project / "Witness.lean").write_text(
+        'import Lean\nregister_option r2PluginWitness : Bool := { defValue := false, descr := "plugin witness" }\n'
+    )
+    (project / "Demo.lean").write_text(
+        source if plugin else "import Lean\ntheorem demo : True := True.intro\n"
+    )
+    s.run(
+        [release / "bin/lake", "--no-cache", "build", "+Demo"],
+        cwd=project,
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    if not plugin:
+        (project / "Demo.lean").write_text(source)
+
+
+def inventory(p):
     return {
         str(f.relative_to(p)): (
             f.stat().st_ino,
@@ -47,7 +70,7 @@ def inventory():
     }
 
 
-def probe():
+def probe(p):
     proc = s.Popen(
         [
             r / "target/debug/lean-host-mcp",
@@ -103,25 +126,49 @@ def probe():
         assert proc.wait(timeout=30) == 0
 
 
-a = inventory()
-v = probe()
-print(str(v)[:1000])
-assert "Lake module setup staged" in str(v)
-assert inventory() == a
-dep = p / ".lake/build/lib/lean/Dep.olean"
-dep.rename(b / "held-Dep.olean")
-v = probe()
-print(str(v)[:1000])
-assert (
-    "Lake module setup staged" not in str(v)
-    and not dep.exists()
-    and ("failed" in str(v) or "No such file" in str(v))
+def row(reply):
+    assert "error" not in reply, reply
+    envelope = json.loads(reply["result"]["content"][0]["text"])
+    assert not envelope["errors"], envelope
+    return envelope["data"]["results"][0]
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--already-built",
+    action="store_true",
+    help="exercise both existing test projects without any fixture build",
 )
-(b / "held-Dep.olean").rename(dep)
-print("restored; no rebuild")
-records = [f for f in b.glob(".lean-rs-writer-*.lock") if "demand" not in f.name]
-assert len(records) == 1 and json.loads(records[0].read_text())["process"] is None
-assert not list((b / "owners").iterdir())
-assert sum(f.stat().st_blocks * 512 for f in b.rglob("*")) < 16 * 1024 * 1024
-shutil.rmtree(b)
-assert not b.exists()
+args = parser.parse_args()
+
+for label, plugin in [("project", True), ("omitted", False)]:
+    project = b / label
+    if not args.already_built:
+        build(project, plugin)
+    assert (project / "Demo.lean").read_text() == source
+    assert (project / ".lake/build/lib/lean/Demo.olean").is_file()
+    before = inventory(project)
+    verdict = row(probe(project))
+    print(label, verdict["verification_status"])
+    if plugin:
+        assert verdict["verification_status"] == "verified", verdict
+    else:
+        assert verdict[
+            "verification_status"
+        ] != "verified" and "missing setup plugin" in str(verdict), verdict
+    assert inventory(project) == before, "project changed during verification"
+
+project = b / "project"
+(image,) = project.glob(".lake/build/lib/*Witness.dylib")
+saved = b / "held-plugin.dylib"
+image.rename(saved)
+try:
+    refused = probe(project)
+    print("missing plugin", refused.get("error"))
+    assert (
+        "error" in refused
+        and not image.exists()
+        and "needs to be rebuilt" in str(refused)
+    ), refused
+finally:
+    saved.rename(image)
