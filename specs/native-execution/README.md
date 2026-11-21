@@ -44,12 +44,37 @@ It assumes durable arbitration and a receiver that enforces the fence. Unavailab
 leave execution uncertain. The model grants recovery no right to signal a PID or issue another GO.
 
 **Managed writer recovery.** `WriterSpec` in `Stages.tla` uses the existing SDK
-reader-closure and conflicting-admission steps. It binds a staged handoff to
+reader-closure and conflicting-admission steps. It binds the source handoff to
 the original store, manifest, audit baseline, and exact ordered lock union.
 Handoff validity can be lost even when those identities still match.
 After controller loss, kernel locks can close while the charge remains.
 The charge fences overlapping admissions until settlement. Disjoint work
 can proceed with its own scope and budget.
+
+The helper-staging profile captures the handoff before admission. The helper
+alone writes it under the original locks. One committed transition publishes
+the digest-verified file and closes the writable descriptor. The caller checks
+the matching staging acknowledgment before issuing GO. The supervised child
+then checks the original source binding before it can return success. The
+digest matches staged bytes even if the source has since become invalid. The
+cases reach both validated success and retirement after a child starts with
+invalid source and yields no success.
+
+If the helper dies during staging, the model observes closure of its write
+authority separately from loss of the controller or locks. Recovery can retire
+partial scratch after that observation. After commit and loss of old lock custody,
+exact Idle recovery also works with the acknowledgment missing. The old result
+stays unknown and GO never occurred. Checks
+exercise both interruptions and reject GO before readiness and settlement with
+a surviving caller write. The other writer profiles keep their existing paths.
+
+The rollout case lets the caller negotiate with the standalone helper while
+the supported embedded launcher still lacks the charge fence. Admission also
+requires an observed drain and exact agreement across the two supported launchers.
+Rollback to an unaware writer requires observed runtime quiescence and settlement
+of the extended charge. Drain and agreement are trusted inputs that stay valid
+through the switch for the named supported launcher set. Process discovery and
+pin enforcement outside that scope require separate evidence.
 
 Automatic recovery requires a command-only turn with durable idle records.
 An older caller-owned turn needs an independently authenticated fact that
@@ -69,7 +94,9 @@ One transition represents acquiring the whole ordered lock set. The model
 allows one interruption during cleanup. Exact old closure is an authenticated
 input to TLC. An unlocked descriptor, an operator acknowledgment, a reboot,
 or a missing PID supplies no such input. Real tests must check lock acquisition
-and OS closure evidence. Durable handoff, SQLite behavior, and matched
+and OS closure evidence. The model represents successful publication as one
+committed transition. Crash durability of the filesystem requires real fault tests.
+Durable handoff, SQLite behavior, and matched
 installation and rollback have separate acceptance checks.
 
 **Host actor permit.** One warm actor holds one host permit and binds one custody scope. It saves the result

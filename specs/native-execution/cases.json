@@ -643,6 +643,197 @@
       ]
     },
     {
+      "name": "host-writer-helper-staging",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-helper-go-before-stage",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Mutation": "\"writer-go-before-stage\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterStageSafe"],
+      "properties": [],
+      "invariant": "WriterStageSafe"
+    },
+    {
+      "name": "host-writer-helper-caller-write",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Mutation": "\"writer-caller-stage-write\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterStageSettlesClosed"],
+      "properties": [],
+      "invariant": "WriterStageSettlesClosed"
+    },
+    {
+      "name": "host-writer-helper-partial-stage-retired",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoPartialHelperStageRetirement"],
+      "properties": [],
+      "invariant": "NoPartialHelperStageRetirement",
+      "witness": true
+    },
+    {
+      "name": "host-writer-helper-lost-stage-ack-retired",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoPublishedHelperStageRetirement"],
+      "properties": [],
+      "invariant": "NoPublishedHelperStageRetirement",
+      "witness": true
+    },
+    {
+      "name": "host-writer-helper-validated-go",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoHelperStageValidatedGo"],
+      "properties": [],
+      "invariant": "NoHelperStageValidatedGo",
+      "witness": true
+    },
+    {
+      "name": "host-writer-helper-invalid-source-retired",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoHelperStageInvalidSourceRetirement"],
+      "properties": [],
+      "invariant": "NoHelperStageInvalidSourceRetirement",
+      "witness": true
+    },
+    {
+      "name": "host-writer-rollout",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-rollout-mixed-negotiation",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoMixedWriterNegotiation"],
+      "properties": [],
+      "invariant": "NoMixedWriterNegotiation",
+      "witness": true
+    },
+    {
+      "name": "host-writer-rollout-negotiate-only",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\"",
+        "Mutation": "\"writer-negotiate-only\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterRolloutAdmissionSafe"],
+      "properties": [],
+      "invariant": "WriterRolloutAdmissionSafe"
+    },
+    {
+      "name": "host-writer-rollout-unsettled-rollback",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\"",
+        "Mutation": "\"writer-rollback-unsettled\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterRolloutRollbackSafe"],
+      "properties": [],
+      "invariant": "WriterRolloutRollbackSafe"
+    },
+    {
+      "name": "host-writer-rollout-undrained-rollback",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\"",
+        "Mutation": "\"writer-rollback-without-drain\""
+      },
+      "expect": "invariant",
+      "invariants": ["WriterRolloutRollbackSafe"],
+      "properties": [],
+      "invariant": "WriterRolloutRollbackSafe"
+    },
+    {
+      "name": "host-writer-rollout-drained-rollback",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\"",
+        "Fault": "\"writer-rollout\""
+      },
+      "expect": "invariant",
+      "invariants": ["NoDrainedWriterRollback"],
+      "properties": [],
+      "invariant": "NoDrainedWriterRollback",
+      "witness": true
+    },
+    {
       "name": "host-writer-legacy",
       "model": "Stages",
       "specification": "WriterSpec",
