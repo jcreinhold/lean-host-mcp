@@ -591,7 +591,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                 expansion.push_explicit_group(group_index, file, declarations);
             }
             LeanVerifyTargetGroup::FileAll { file } => {
-                let inventory = crate::tools::declaration_inventory::declaration_inventory(
+                let inventory = crate::tools::declaration_inventory::verification_inventory(
                     ctx,
                     crate::tools::declaration_inventory::DeclarationInventoryRequest {
                         target: crate::tools::declaration_inventory::DeclarationInventoryTarget::File {
@@ -619,7 +619,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                 }
             }
             LeanVerifyTargetGroup::ModuleAll { module } => {
-                let inventory = crate::tools::declaration_inventory::declaration_inventory(
+                let inventory = crate::tools::declaration_inventory::verification_inventory(
                     ctx,
                     crate::tools::declaration_inventory::DeclarationInventoryRequest {
                         target: crate::tools::declaration_inventory::DeclarationInventoryTarget::Module {

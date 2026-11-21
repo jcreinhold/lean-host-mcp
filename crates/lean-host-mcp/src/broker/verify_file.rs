@@ -51,6 +51,11 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) enum FileProjection {
+    Outline,
+    Diagnostics,
+}
+
 pub(super) struct PreparedReader {
     pub(super) custody: crate::artifact_reads::ArtifactReadGuard,
     pub(super) sysroot: PathBuf,
@@ -198,14 +203,7 @@ impl ProjectBroker {
                 activity,
             )
         };
-        let PreparedReader {
-            custody,
-            sysroot,
-            shims,
-            domains,
-            shim_guards,
-            roots,
-        } = reader;
+        let roots = &reader.roots;
         let targets = request
             .targets
             .iter()
@@ -229,7 +227,64 @@ impl ProjectBroker {
             "diagnosticBytes": options.diagnostic_byte_limit,
         }))
         .map_err(invalid)?;
-        let bytes = crate::lake_options::discovery_output(
+        let entry = if setup.is_some() {
+            use crate::tools::proof_action::LeanVerifyDetail;
+            let selection = match detail {
+                LeanVerifyDetail::Compact => "private abbrev verifySetup := verifyDeclarationBatchCompactWithSetup\n",
+                LeanVerifyDetail::Full => "private abbrev verifySetup := verifyDeclarationBatchWithSetup\n",
+            };
+            [
+                include_str!("../lake/VerifyCommon.lean"),
+                selection,
+                include_str!("../lake/VerifySetup.lean"),
+            ]
+            .concat()
+        } else {
+            [
+                include_str!("../lake/VerifyCommon.lean"),
+                include_str!("../lake/VerifyBatch.lean"),
+            ]
+            .concat()
+        };
+        let bytes = self.run_file_driver(root, reader, activity, setup, entry, body).await?;
+        let value = serde_json::from_slice(&bytes).map_err(invalid)?;
+        if let LeanWorkerDeclarationVerificationBatchResult::Ok { results, .. }
+        | LeanWorkerDeclarationVerificationBatchResult::MissingImports { results, .. } = &value
+            && (results.len() != request.targets.len()
+                || results
+                    .iter()
+                    .zip(&request.targets)
+                    .any(|(row, target)| row.id != target.id || row.target != target.target))
+        {
+            return Err(invalid("verification verdict does not match requested targets"));
+        }
+        let mut freshness = freshness_from_meta(&meta, freshness);
+        freshness.elaboration_options = Some(facts);
+        Ok(BrokerCall {
+            value,
+            runtime: RuntimeFacts::default(),
+            freshness,
+        })
+    }
+
+    async fn run_file_driver(
+        &self,
+        root: PathBuf,
+        reader: PreparedReader,
+        activity: super::control::PreparationActivityGuard,
+        setup: Option<super::module_setup::StagedSetup>,
+        entry: String,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let PreparedReader {
+            custody,
+            sysroot,
+            shims,
+            domains,
+            shim_guards,
+            ..
+        } = reader;
+        crate::lake_options::discovery_output(
             root.clone(),
             Duration::from_millis(self.request_timeout_millis()),
             self.config.max_projects.get(),
@@ -237,24 +292,11 @@ impl ProjectBroker {
             None,
             Some(Box::new((activity, shim_guards))),
             move |assets| {
-                let driver = assets.join("VerifyBatch.lean");
-                let (selection, entry) = if let Some(setup) = setup {
+                let driver = assets.join("FileDriver.lean");
+                if let Some(setup) = setup {
                     fs::write(assets.join("module.setup.json"), setup.bytes)?;
-                    use crate::tools::proof_action::LeanVerifyDetail;
-                    let selection = match detail {
-                        LeanVerifyDetail::Compact => {
-                            "private abbrev verifySetup := verifyDeclarationBatchCompactWithSetup\n"
-                        }
-                        LeanVerifyDetail::Full => "private abbrev verifySetup := verifyDeclarationBatchWithSetup\n",
-                    };
-                    (selection, include_str!("../lake/VerifySetup.lean"))
-                } else {
-                    ("", include_str!("../lake/VerifyBatch.lean"))
-                };
-                fs::write(
-                    &driver,
-                    [include_str!("../lake/VerifyCommon.lean"), selection, entry].concat(),
-                )?;
+                }
+                fs::write(&driver, entry)?;
                 let data = assets.join("request.json");
                 fs::write(&data, body)?;
                 Ok(crate::native_reader::NativeReaderProgram {
@@ -278,21 +320,59 @@ impl ProjectBroker {
             },
         )
         .await
-        .map_err(|e| e.error)?;
-        let value = serde_json::from_slice(&bytes).map_err(invalid)?;
-        if let LeanWorkerDeclarationVerificationBatchResult::Ok { results, .. }
-        | LeanWorkerDeclarationVerificationBatchResult::MissingImports { results, .. } = &value
-            && (results.len() != request.targets.len()
-                || results
-                    .iter()
-                    .zip(&request.targets)
-                    .any(|(row, target)| row.id != target.id || row.target != target.target))
-        {
-            return Err(invalid("verification verdict does not match requested targets"));
-        }
-        let mut freshness = freshness_from_meta(&meta, freshness);
-        freshness.elaboration_options = Some(facts);
-        Ok(BrokerCall {
+        .map_err(|e| e.error)
+    }
+
+    pub(crate) async fn file_projection(
+        &self,
+        hint: &ProjectHint,
+        file: &str,
+        source: &str,
+        imports: Vec<String>,
+        projection: FileProjection,
+        budgets: lean_rs_worker_parent::LeanWorkerOutputBudgets,
+    ) -> Result<super::CachedBrokerCall<lean_rs_worker_parent::LeanWorkerModuleQueryBatchOutcome>> {
+        let root = self.native_root(hint)?;
+        let meta = self.meta(&root)?;
+        let (setup, reader, activity) = self.file_reader_with_setup(hint, &meta, file, source).await?;
+        let options = LeanWorkerElabOptions::new()
+            .file_label(file)
+            .lean_options(setup.options.clone());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "source": source, "file": file, "perFieldBytes": budgets.per_field_bytes,
+            "totalBytes": budgets.total_bytes, "namespaceContext": options.namespace_context,
+            "optionsJson": lean_toolchain::lean_options_json(&options.lean_options),
+            "heartbeats": options.heartbeat_limit, "diagnosticBytes": options.diagnostic_byte_limit
+        }))
+        .map_err(invalid)?;
+        let entry = [
+            include_str!("../lake/VerifyCommon.lean"),
+            match projection {
+                FileProjection::Outline => "private abbrev projectFile := declarationOutlineWithSetup\n",
+                FileProjection::Diagnostics => "private abbrev projectFile := fileDiagnosticsWithSetup\n",
+            },
+            include_str!("../lake/OutlineSetup.lean"),
+        ]
+        .concat();
+        let bytes = self
+            .run_file_driver(root, reader, activity, Some(setup), entry, body)
+            .await?;
+        let mut result: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
+        let object = result
+            .as_object_mut()
+            .ok_or_else(|| invalid("invalid supervised file result"))?;
+        object.insert(
+            "facts".into(),
+            serde_json::to_value(lean_rs_worker_parent::LeanWorkerModuleQueryCacheFacts::uncached(
+                bytes.len() as u64,
+            ))
+            .map_err(invalid)?,
+        );
+        let value = serde_json::from_value(result).map_err(invalid)?;
+        let mut freshness = freshness_from_meta(&meta, imports);
+        freshness.elaboration_options = Some(crate::envelope::ElaborationOptions::from_worker(&options));
+        Ok(super::CachedBrokerCall {
+            freshly_processed: true,
             value,
             runtime: RuntimeFacts::default(),
             freshness,

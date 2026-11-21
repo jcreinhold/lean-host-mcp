@@ -93,6 +93,21 @@ pub async fn declaration_inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
 ) -> Result<Response<DeclarationInventoryResult>> {
+    inventory(ctx, req, false).await
+}
+
+pub(super) async fn verification_inventory(
+    ctx: &ToolContext,
+    req: DeclarationInventoryRequest,
+) -> Result<Response<DeclarationInventoryResult>> {
+    inventory(ctx, req, ctx.broker.prepared_generation().is_none()).await
+}
+
+async fn inventory(
+    ctx: &ToolContext,
+    req: DeclarationInventoryRequest,
+    supervised: bool,
+) -> Result<Response<DeclarationInventoryResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
@@ -109,12 +124,12 @@ pub async fn declaration_inventory(
                     )),
                 );
             }
-            worker_declarations(ctx, hint, &meta.canonical_root, &path, None, limit).await
+            worker_declarations(ctx, hint, &meta.canonical_root, &path, None, limit, supervised).await
         }
         DeclarationInventoryTarget::Module { module } => {
             let path = source_path_for_module(&meta.canonical_root, &module);
             if path.is_file() {
-                worker_declarations(ctx, hint, &meta.canonical_root, &path, Some(module), limit).await
+                worker_declarations(ctx, hint, &meta.canonical_root, &path, Some(module), limit, supervised).await
             } else {
                 index_declarations(ctx, hint, &meta.canonical_root, &module, limit)
             }
@@ -129,6 +144,7 @@ async fn worker_declarations(
     path: &Path,
     module_hint: Option<String>,
     limit: usize,
+    supervised: bool,
 ) -> Result<Response<DeclarationInventoryResult>> {
     let input = read_query_file(root, path)?;
     let source_for_index = input.source.clone();
@@ -138,7 +154,18 @@ async fn worker_declarations(
     let selectors = vec![LeanWorkerModuleQuerySelector::DeclarationOutline {
         id: DECLARATION_OUTLINE_ID.to_owned(),
     }];
-    let call = match classify_missing_olean(
+    let outcome = if supervised {
+        ctx.broker
+            .file_projection(
+                &hint,
+                &file_label,
+                &input.source,
+                input.imports,
+                crate::broker::FileProjection::Outline,
+                outline_budgets(),
+            )
+            .await
+    } else {
         ctx.broker
             .process_cached_module_query_batch(
                 hint.clone(),
@@ -151,8 +178,9 @@ async fn worker_declarations(
                 outline_budgets(),
                 LeanWorkerElabOptions::new().file_label(&file_label),
             )
-            .await,
-    )? {
+            .await
+    };
+    let call = match classify_missing_olean(outcome)? {
         CallOutcome::Ready(call) => call,
         CallOutcome::NeedsBuild(err) => return worker_needs_build_response(ctx, hint, err),
     };

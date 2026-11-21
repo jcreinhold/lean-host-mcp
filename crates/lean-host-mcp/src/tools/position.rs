@@ -732,7 +732,18 @@ pub async fn file_diagnostics(
     let selectors = vec![LeanWorkerModuleQuerySelector::Diagnostics {
         id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
     }];
-    let call = match crate::diagnosis::classify_missing_olean(
+    let outcome = if ctx.broker.prepared_generation().is_none() {
+        ctx.broker
+            .file_projection(
+                &hint,
+                &file_label,
+                &input.source,
+                imports.clone(),
+                crate::broker::FileProjection::Diagnostics,
+                proof_agent_budgets(),
+            )
+            .await
+    } else {
         ctx.broker
             .process_cached_module_query_batch(
                 hint.clone(),
@@ -745,14 +756,15 @@ pub async fn file_diagnostics(
                 proof_agent_budgets(),
                 LeanWorkerElabOptions::new().file_label(&file_label),
             )
-            .await,
-    )? {
+            .await
+    };
+    let call = match crate::diagnosis::classify_missing_olean(outcome)? {
         crate::diagnosis::CallOutcome::Ready(call) => call,
         crate::diagnosis::CallOutcome::NeedsBuild(err) => {
             return file_diagnostics_needs_build_response(ctx, hint, imports, source_fact, err);
         }
     };
-    let (block, missing_imports) = diagnostics_from_batch_outcome(call.value);
+    let (block, missing_imports) = required_file_diagnostics(call.value)?;
     let mut response = Response::ok(
         FileDiagnosticsResult {
             diagnostics: block,
@@ -806,6 +818,47 @@ fn file_diagnostics_needs_build_response(
         response,
         &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
     ))
+}
+
+fn required_file_diagnostics(outcome: LeanWorkerModuleQueryBatchOutcome) -> Result<(DiagnosticsBlock, Vec<String>)> {
+    match route_batch_outcome(outcome) {
+        BatchQueryRun::HeaderParseFailed { diagnostics, .. } => Ok((diagnostics_block(diagnostics), Vec::new())),
+        BatchQueryRun::Ready {
+            result,
+            missing_imports,
+            ..
+        } => {
+            let mut items = result.items.into_iter();
+            let item = items
+                .next()
+                .ok_or_else(|| ServerError::Internal("file diagnostics item missing".into()))?;
+            if items.next().is_some() {
+                return Err(ServerError::Internal("unexpected extra file diagnostics item".into()));
+            }
+            match item {
+                LeanWorkerModuleQueryBatchItem::Ok { id, result: body } if id == PROOF_STATE_DIAGNOSTICS_ID => {
+                    let LeanWorkerModuleQueryBatchResult::Diagnostics(failure) = *body else {
+                        return Err(ServerError::Internal(
+                            "file diagnostics response has wrong payload".into(),
+                        ));
+                    };
+                    let mut block = diagnostics_block(project_failure(&failure));
+                    block.truncated |= result.total_truncated;
+                    Ok((block, missing_imports))
+                }
+                LeanWorkerModuleQueryBatchItem::BudgetExceeded { id, message }
+                | LeanWorkerModuleQueryBatchItem::Unavailable { id, message }
+                    if id == PROOF_STATE_DIAGNOSTICS_ID =>
+                {
+                    Err(ServerError::Internal(format!("file diagnostics incomplete: {message}")))
+                }
+                _ => Err(ServerError::Internal(
+                    "unexpected file diagnostics selector result".into(),
+                )),
+            }
+        }
+        BatchQueryRun::Unsupported => Err(ServerError::Internal("file diagnostics unsupported".into())),
+    }
 }
 
 fn diagnostics_from_batch_outcome(outcome: LeanWorkerModuleQueryBatchOutcome) -> (DiagnosticsBlock, Vec<String>) {

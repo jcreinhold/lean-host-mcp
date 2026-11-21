@@ -72,6 +72,7 @@ mod module_setup;
 mod preparation;
 mod semantic_file;
 mod verify_file;
+pub(crate) use verify_file::FileProjection;
 mod writer_handoff;
 pub(crate) use control::MaintenanceAccess;
 pub use control::{
