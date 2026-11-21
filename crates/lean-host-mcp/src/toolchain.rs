@@ -197,32 +197,46 @@ impl WorkerBinary {
     ///
     /// Same as [`Self::resolve_for`].
     pub fn resolve_with_override(toolchain: &ToolchainId, override_dir: Option<&Path>) -> Result<Self, ToolchainError> {
-        if let Some(dir) = override_dir {
-            let bare = dir.join(WORKER_FILE_NAME);
-            if bare.is_file() {
-                return Ok(Self {
-                    path: bare,
-                    toolchain: toolchain.clone(),
-                });
-            }
-            let with_id = dir.join(toolchain.as_str()).join(WORKER_FILE_NAME);
-            if with_id.is_file() {
-                return Ok(Self {
-                    path: with_id,
-                    toolchain: toolchain.clone(),
-                });
-            }
+        let root = override_dir.map_or_else(Self::install_root, Path::to_path_buf);
+        let direct = override_dir.is_some() && root.join(WORKER_FILE_NAME).is_file();
+        let slot = if direct { root } else { root.join(toolchain.as_str()) };
+        let generation = Self::selected_dir(&slot).map_err(|_| Self::not_installed(toolchain))?;
+        let path = generation.join(WORKER_FILE_NAME);
+        if !path.is_file() {
             return Err(Self::not_installed(toolchain));
         }
-        let candidate = Self::install_root().join(toolchain.as_str()).join(WORKER_FILE_NAME);
-        if candidate.is_file() {
-            Ok(Self {
-                path: candidate,
-                toolchain: toolchain.clone(),
-            })
-        } else {
-            Err(Self::not_installed(toolchain))
+        Ok(Self {
+            path,
+            toolchain: toolchain.clone(),
+        })
+    }
+
+    /// Resolve the generation once. A malformed selector must not revive an old binary.
+    pub(crate) fn selected_dir(slot: &Path) -> std::io::Result<PathBuf> {
+        use std::io::Read as _;
+        let selector = slot.join("current-generation");
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid installed worker generation");
+        match std::fs::symlink_metadata(&selector) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(slot.to_owned()),
+            Ok(meta) if meta.is_file() && meta.len() <= 80 => {}
+            Err(e) => return Err(e),
+            Ok(_) => return Err(invalid()),
         }
+        let mut file = std::fs::File::open(&selector)?;
+        let mut name = String::new();
+        file.by_ref().take(81).read_to_string(&mut name)?;
+        if name.len() > 80
+            || !name
+                .strip_prefix("generation-")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        {
+            return Err(invalid());
+        }
+        let path = slot.join(name);
+        if !std::fs::symlink_metadata(&path)?.is_dir() {
+            return Err(invalid());
+        }
+        Ok(path)
     }
 
     /// `~/.local/share/lean-host-mcp/workers` (or
@@ -604,6 +618,8 @@ const SIDECAR_FILE_NAME: &str = "worker.json";
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct WorkerSidecar {
     toolchain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deployment: Option<WorkerDeployment>,
     /// Full SHA-256 of the `lean.h` the worker was built against.
     header_digest: String,
     /// `lean_toolchain::LEAN_VERSION` the host was built against.
@@ -626,26 +642,75 @@ pub(crate) struct WorkerSidecar {
     smoke: Option<SmokeOutcome>,
 }
 
+/// Candidate executable binding. This alone grants no native operation.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkerDeployment {
+    worker_sha256: String,
+    #[serde(flatten)]
+    runtime: Option<InstalledRuntime>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct InstalledRuntime {
+    pub(crate) sysroot: PathBuf,
+    pub(crate) prepared: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts,
+    pub(crate) files: std::collections::BTreeMap<PathBuf, String>,
+}
+
 impl WorkerSidecar {
     /// Write `<install_dir>/worker.json` recording `header_digest`, the host's
     /// build-time context, and the post-build `smoke` outcome. Overwrites any
     /// existing record.
+    #[cfg(test)]
     pub(crate) fn record(
         install_dir: &Path,
         id: &ToolchainId,
         header_digest: String,
         smoke: SmokeOutcome,
     ) -> std::io::Result<()> {
-        let sidecar = Self {
+        let mut sidecar = Self::candidate(id, header_digest, None);
+        sidecar.smoke = Some(smoke);
+        sidecar.write(install_dir)
+    }
+
+    pub(crate) fn candidate(id: &ToolchainId, header_digest: String, worker_sha256: Option<String>) -> Self {
+        Self {
+            deployment: worker_sha256.map(|worker_sha256| WorkerDeployment {
+                worker_sha256,
+                runtime: None,
+            }),
             toolchain: id.as_str().to_owned(),
             digest_supported_at_build: lean_toolchain::supported_by_digest(&header_digest).is_some(),
             built_against_lean_version: lean_toolchain::LEAN_VERSION.to_owned(),
             built_by_host_version: env!("CARGO_PKG_VERSION").to_owned(),
             worker_protocol_version: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
             header_digest,
-            smoke: Some(smoke),
-        };
-        let json = serde_json::to_string_pretty(&sidecar).map_err(std::io::Error::other)?;
+            smoke: None,
+        }
+    }
+
+    pub(crate) fn bind_runtime(&mut self, runtime: InstalledRuntime) -> std::io::Result<()> {
+        let deployment = self
+            .deployment
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("missing candidate worker identity"))?;
+        deployment.runtime = Some(runtime);
+        Ok(())
+    }
+
+    pub(crate) fn complete(&mut self, digest: &str, smoke: SmokeOutcome) -> std::io::Result<()> {
+        if self.deployment.as_ref().is_none_or(|d| d.worker_sha256 != digest) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "candidate worker changed during smoke",
+            ));
+        }
+        self.smoke = Some(smoke);
+        Ok(())
+    }
+
+    pub(crate) fn write(&self, install_dir: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(install_dir.join(SIDECAR_FILE_NAME), json)
     }
 

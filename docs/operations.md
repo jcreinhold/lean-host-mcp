@@ -356,7 +356,11 @@ The provenance sidecar records the worker wire-protocol version independently of
   stale** — protocol mismatch, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that are
   current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current workers
   too (e.g. to re-run the smoke test or replace a corrupted binary).
-- `install-worker --toolchain <id>` builds one worker, always overwriting.
+- `install-worker --toolchain <id>` builds a fresh generation in its final directory. The installer verifies the
+  published SDK shim sources, builds them with the standalone SDK writer, and records their identities in
+  `worker.json`. Use `--shim-source DIR` or `--standalone-writer PATH` for explicit inputs. After the builtin
+  `Nat.add_zero` inspection and successful shutdown it atomically updates `current-generation`. Existing workers
+  retain their original paths. Installs without a selector continue to use the legacy directory.
 - `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
   `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
 - `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are

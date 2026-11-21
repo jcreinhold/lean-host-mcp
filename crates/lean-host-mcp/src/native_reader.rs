@@ -7,11 +7,13 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lean_rs_worker_parent::{LeanWorkerNativeScope, LeanWorkerNativeScopeLease};
+use lean_rs_worker_parent::{
+    LeanWorkerNativePendingCleanup, LeanWorkerNativeScope, LeanWorkerNativeScopeLease, LeanWorkerNativeSpawnError,
+};
 use lean_toolchain::native_guardian::{GuardianHandle, NativeCapacitySlot, NativeProcessIdentity, NativeReadDomain};
 use lean_toolchain::process_group::{MeasuredChild, WaitedChildUsage};
 use lean_toolchain::shared_reader::SharedReader;
@@ -151,7 +153,7 @@ pub(crate) fn run_program_with_contract(
             max_output_bytes: OUTPUT_LIMIT,
             command: program.command.clone(),
         };
-        Ok::<_, io::Error>((scope, program, args))
+        Ok::<_, io::Error>(((scope, deadline), program, args))
     }));
     let (scope, program, args) = match prepared {
         Ok(Ok(prepared)) => prepared,
@@ -178,9 +180,21 @@ pub(crate) fn run_program_with_contract(
         Err(_) => Ok(result(
             None,
             false,
-            Some("native utility owner panicked after bootstrap spawn; owned cleanup continues".into()),
+            Some("native utility owner panicked during or after bootstrap spawn; closure unconfirmed".into()),
         )),
     }
+}
+
+fn startup_failure(source: &io::Error, scope_closed: bool) -> NativeReaderResult {
+    result(
+        Some(PayloadResult {
+            protocol: PROTOCOL,
+            target_started: false,
+            ..PayloadResult::default()
+        }),
+        scope_closed,
+        Some(format!("native startup refused before payload ACK: {source}")),
+    )
 }
 
 fn not_started(message: impl std::fmt::Display) -> NativeReaderResult {
@@ -347,16 +361,13 @@ impl NativeReaderArgs {
 }
 
 enum CleanupJob {
-    Child {
-        child: Child,
-        keepalive: Option<Box<dyn Send>>,
-    },
-    Measured {
-        child: MeasuredChild,
+    Measured(MeasuredChild),
+    Pending {
+        pending: LeanWorkerNativePendingCleanup,
+        closed: std::sync::mpsc::Sender<()>,
         keepalive: Option<Box<dyn Send>>,
     },
     Native {
-        group: lean_toolchain::process_group::OwnedCommandGroup,
         lease: LeanWorkerNativeScopeLease,
         keepalive: Option<Box<dyn Send>>,
     },
@@ -364,34 +375,31 @@ enum CleanupJob {
 
 fn finish_cleanup(job: CleanupJob) {
     match job {
-        CleanupJob::Child { mut child, keepalive } => {
-            while let Err(error) = child.wait() {
-                if error.kind() != io::ErrorKind::Interrupted {
-                    break;
-                }
+        CleanupJob::Measured(mut child) => loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => thread::sleep(POLL),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => break,
+                Err(_) => thread::sleep(POLL),
             }
-            drop(keepalive);
-        }
-        CleanupJob::Measured { mut child, keepalive } => {
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => thread::sleep(POLL),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => break,
-                    Err(_) => thread::sleep(POLL),
-                }
-            }
-            drop(keepalive);
-        }
-        CleanupJob::Native {
-            mut group,
-            lease,
+        },
+        CleanupJob::Pending {
+            mut pending,
             keepalive,
+            closed,
         } => loop {
-            let _stop = lease.request_stop();
-            let _fallback = group.request_stop();
-            let _status = group.try_wait();
+            let _status = pending.try_wait();
+            if matches!(pending.custody_closed(), Ok(true)) {
+                drop(keepalive);
+                let _observed = closed.send(());
+                break;
+            }
+            thread::sleep(POLL);
+        },
+        CleanupJob::Native { mut lease, keepalive } => loop {
+            let _stop = lease.kill();
+            let _status = lease.try_wait();
             if matches!(lease.custody_closed(), Ok(true)) {
                 let _inputs = lease.cleanup_inputs();
                 drop(keepalive);
@@ -404,18 +412,12 @@ fn finish_cleanup(job: CleanupJob) {
 
 /// One scope owner, transferred to its pre-created reaper on every early return.
 struct NativeGroupOwner {
-    group: Option<lean_toolchain::process_group::OwnedCommandGroup>,
     lease: Option<LeanWorkerNativeScopeLease>,
     keepalive: Option<Box<dyn Send>>,
     reaper: std::sync::mpsc::SyncSender<CleanupJob>,
     closed: bool,
 }
 impl NativeGroupOwner {
-    fn group(&mut self) -> io::Result<&mut lean_toolchain::process_group::OwnedCommandGroup> {
-        self.group
-            .as_mut()
-            .ok_or_else(|| invalid("native group ownership missing"))
-    }
     fn lease(&mut self) -> io::Result<&mut LeanWorkerNativeScopeLease> {
         self.lease
             .as_mut()
@@ -425,12 +427,11 @@ impl NativeGroupOwner {
 impl Drop for NativeGroupOwner {
     fn drop(&mut self) {
         if !self.closed
-            && let (Some(group), Some(lease)) = (self.group.take(), self.lease.take())
+            && let Some(lease) = self.lease.take()
         {
             // This is the first and only job for the pre-created receiver.
             // The same actual Child and its resource lease remain owned.
             let _handoff = self.reaper.send(CleanupJob::Native {
-                group,
                 lease,
                 keepalive: self.keepalive.take(),
             });
@@ -438,74 +439,38 @@ impl Drop for NativeGroupOwner {
     }
 }
 
-/// The raw bootstrap and measured payload share one owner and reaper protocol.
-trait ReapChild: Sized {
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
-    fn kill(&mut self) -> io::Result<()>;
-    fn cleanup(self, keepalive: Option<Box<dyn Send>>) -> CleanupJob;
-}
-impl ReapChild for Child {
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        Self::try_wait(self)
-    }
-    fn kill(&mut self) -> io::Result<()> {
-        Self::kill(self)
-    }
-    fn cleanup(self, keepalive: Option<Box<dyn Send>>) -> CleanupJob {
-        CleanupJob::Child { child: self, keepalive }
-    }
-}
-impl ReapChild for MeasuredChild {
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        Self::try_wait(self)
-    }
-    fn kill(&mut self) -> io::Result<()> {
-        Self::kill(self)
-    }
-    fn cleanup(self, keepalive: Option<Box<dyn Send>>) -> CleanupJob {
-        CleanupJob::Measured { child: self, keepalive }
-    }
+/// Allocate the handoff before starting an operation that can create a child.
+fn cleanup_reaper() -> io::Result<std::sync::mpsc::SyncSender<CleanupJob>> {
+    let (reaper, receiver) = std::sync::mpsc::sync_channel::<CleanupJob>(1);
+    thread::Builder::new()
+        .name("native-reader-reaper".into())
+        .spawn(move || {
+            if let Ok(job) = receiver.recv() {
+                finish_cleanup(job);
+            }
+        })?;
+    Ok(reaper)
 }
 
-/// Reserve actual-child reaping before spawn, including early error returns.
-struct ChildOwner<C: ReapChild = Child> {
-    child: Option<C>,
-    keepalive: Option<Box<dyn Send>>,
+struct ChildOwner {
+    child: Option<MeasuredChild>,
     reaper: std::sync::mpsc::SyncSender<CleanupJob>,
 }
-impl ChildOwner<Child> {
-    fn spawn(mut command: Command, keepalive: Option<Box<dyn Send>>) -> io::Result<Self> {
-        Self::spawn_with(|| command.spawn(), keepalive)
-    }
-}
-impl ChildOwner<MeasuredChild> {
+impl ChildOwner {
     fn spawn_measured(command: Command) -> io::Result<Self> {
-        Self::spawn_with(|| MeasuredChild::spawn(command), None)
-    }
-}
-impl<C: ReapChild> ChildOwner<C> {
-    fn spawn_with(spawn: impl FnOnce() -> io::Result<C>, keepalive: Option<Box<dyn Send>>) -> io::Result<Self> {
-        let (reaper, receiver) = std::sync::mpsc::sync_channel::<CleanupJob>(1);
-        thread::Builder::new()
-            .name("native-reader-reaper".into())
-            .spawn(move || {
-                if let Ok(job) = receiver.recv() {
-                    finish_cleanup(job);
-                }
-            })?;
+        let reaper = cleanup_reaper()?;
         Ok(Self {
-            child: Some(spawn()?),
-            keepalive,
+            child: Some(MeasuredChild::spawn(command)?),
             reaper,
         })
     }
-    fn get(&mut self) -> io::Result<&mut C> {
+    fn get(&mut self) -> io::Result<&mut MeasuredChild> {
         self.child
             .as_mut()
             .ok_or_else(|| invalid("native-reader actual child missing"))
     }
 }
-impl<C: ReapChild> Drop for ChildOwner<C> {
+impl Drop for ChildOwner {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             match child.try_wait() {
@@ -516,7 +481,7 @@ impl<C: ReapChild> Drop for ChildOwner<C> {
                     let _kill = child.kill();
                 }
                 Err(_) => {
-                    let _handoff = self.reaper.send(child.cleanup(self.keepalive.take()));
+                    let _handoff = self.reaper.send(CleanupJob::Measured(child));
                     return;
                 }
             }
@@ -526,7 +491,7 @@ impl<C: ReapChild> Drop for ChildOwner<C> {
             if matches!(wait_child(&mut child, deadline), Ok(Some(_))) {
                 return;
             }
-            let _handoff = self.reaper.send(child.cleanup(self.keepalive.take()));
+            let _handoff = self.reaper.send(CleanupJob::Measured(child));
         }
     }
 }
@@ -687,7 +652,7 @@ fn run_internal(
     args: &NativeReaderArgs,
     program: Option<&NativeReaderProgram>,
     configured_helper: Option<&crate::shared_writer::WriterContract>,
-    prepared_scope: Option<LeanWorkerNativeScope>,
+    prepared_scope: Option<(LeanWorkerNativeScope, Instant)>,
     mut keepalive: Option<Box<dyn Send>>,
     cancelled: &(impl Fn() -> bool + ?Sized),
     spawned: &mut bool,
@@ -705,7 +670,10 @@ fn run_internal(
     if let Some(program) = program {
         canonical(&program.cwd)?;
     }
-    let deadline = until(Duration::from_millis(args.timeout_millis))?;
+    let deadline = match &prepared_scope {
+        Some((_, deadline)) => *deadline,
+        None => until(Duration::from_millis(args.timeout_millis))?,
+    };
     let caller = if program.is_none() {
         let parent = rustix::process::getppid().ok_or_else(|| invalid("native-reader caller identity missing"))?;
         if parent.as_raw_nonzero().get() <= 1 {
@@ -733,7 +701,7 @@ fn run_internal(
         return Err(invalid("native utility helper protocol differs"));
     }
     let scope = match prepared_scope {
-        Some(scope) => scope,
+        Some((scope, _)) => scope,
         None => reserve_scope(
             &helper,
             usize::from(args.capacity_limit),
@@ -773,83 +741,63 @@ fn run_internal(
             .env(PROGRAM_CWD_ENV, &program.cwd)
             .env(PROGRAM_ROLE_ENV, "preparation");
     }
-    scope.configure(&mut command);
     if let Some(staged) = &staged_input {
         command.env(STDIN_ENV, serde_json::to_string(staged).map_err(io::Error::other)?);
     }
     command.env("LEAN_RS_WORKER_GUARDIAN_EXECUTABLE", &helper.executable);
-    let mut child = ChildOwner::spawn(command, keepalive.take())?;
+    let reaper = cleanup_reaper()?;
+    let hello_timeout = remaining(deadline)?.min(Duration::from_secs(30));
+    // An unwind inside startup cannot establish that no bootstrap was created.
     *spawned = true;
+    let startup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scope.spawn(&mut command, hello_timeout).map_err(Box::new)
+    }));
+    let startup = startup.unwrap_or_else(|panic| {
+        // No typed owner came back to certify closure. Fence these guards for
+        // the remaining host lifetime, including when the utility catches the panic.
+        if let Some(guard) = keepalive.take() {
+            let _fenced = Box::leak(guard);
+        }
+        std::panic::resume_unwind(panic)
+    });
+    let lease = match startup {
+        Ok(lease) => lease,
+        Err(error) => match *error {
+            LeanWorkerNativeSpawnError::BeforeSpawn(source) => {
+                *spawned = false;
+                return Err(source);
+            }
+            LeanWorkerNativeSpawnError::AfterSpawn { source, pending } => {
+                let (closed, observation) = std::sync::mpsc::channel();
+                let _handoff = reaper.send(CleanupJob::Pending {
+                    pending,
+                    keepalive,
+                    closed,
+                });
+                return Ok(startup_failure(&source, observation.recv_timeout(CLEANUP).is_ok()));
+            }
+        },
+    };
+    let mut native = NativeGroupOwner {
+        lease: Some(lease),
+        keepalive,
+        reaper,
+        closed: false,
+    };
     let mut output = Capture::new(
-        child
-            .get()?
-            .stdout
-            .take()
+        native
+            .lease()?
+            .take_stdout()
             .ok_or_else(|| invalid("bootstrap stdout missing"))?,
         FRAME_LIMIT,
     )?;
     let mut diagnostics = Capture::new(
-        child
-            .get()?
-            .stderr
-            .take()
+        native
+            .lease()?
+            .take_stderr()
             .ok_or_else(|| invalid("bootstrap stderr missing"))?,
         OUTPUT_LIMIT,
     )?;
-    let lease = match scope.accept(child.get()?.id(), remaining(deadline)?.min(Duration::from_secs(30))) {
-        Ok(lease) => lease,
-        Err(error) => {
-            // This controlled bootstrap cannot dispatch before the missing ACK.
-            if matches!(child.get()?.try_wait(), Ok(None)) {
-                let _kill = child.get()?.kill();
-            }
-            let _reaped = wait_child(
-                child.get()?,
-                Instant::now().checked_add(CLEANUP).unwrap_or_else(Instant::now),
-            );
-            let _capture = output.poll();
-            let _diagnostics = diagnostics.poll();
-            return Ok(result(
-                Some(PayloadResult {
-                    protocol: PROTOCOL,
-                    target_started: false,
-                    stderr: diagnostics.text(),
-                    ..PayloadResult::default()
-                }),
-                false,
-                Some(format!("native startup refused before payload ACK: {error}")),
-            ));
-        }
-    };
-    // The actual child stays unreaped while any group member remains. Reuse
-    // this same custody primitive as the SDK for independent guardian failure.
-    let actual = child
-        .child
-        .take()
-        .ok_or_else(|| invalid("native bootstrap missing before adoption"))?;
-    let group = match lean_toolchain::process_group::OwnedCommandGroup::adopt_private_session(actual, lease.owner()) {
-        Ok(group) => group,
-        Err((error, actual)) => {
-            child.child = Some(actual);
-            let _stop = lease.request_stop();
-            return Ok(result(
-                Some(PayloadResult {
-                    protocol: PROTOCOL,
-                    target_started: false,
-                    ..PayloadResult::default()
-                }),
-                false,
-                Some(format!("native bootstrap custody refused before ACK: {error}")),
-            ));
-        }
-    };
-    let mut native = NativeGroupOwner {
-        group: Some(group),
-        lease: Some(lease),
-        keepalive: child.keepalive.take(),
-        reaper: child.reaper.clone(),
-        closed: false,
-    };
     let mut interrupted = None;
     if !cancelled()
         && caller
@@ -868,7 +816,7 @@ fn run_internal(
     loop {
         output.poll()?;
         diagnostics.poll()?;
-        let status = match native.group()?.try_wait() {
+        let status = match native.lease()?.try_wait() {
             Ok(status) => status,
             Err(error) => {
                 interrupted.get_or_insert_with(|| format!("native child wait authority lost: {error}"));
@@ -890,10 +838,9 @@ fn run_internal(
             interrupted = Some("native reader cancelled by deadline or caller exit".into());
         }
         if interrupted.is_some() {
-            let _stop = native.lease()?.request_stop();
-            let _fallback = native.group()?.request_stop();
+            let _stop = native.lease()?.kill();
         }
-        if (status.is_some() || interrupted.is_some() || native.group()?.cleanup_pending())
+        if (status.is_some() || interrupted.is_some() || native.lease()?.cleanup_pending())
             && cleanup_deadline.is_none()
         {
             cleanup_deadline = Some(Instant::now().checked_add(CLEANUP).unwrap_or_else(Instant::now));
@@ -930,14 +877,14 @@ fn run_internal(
             return Ok(result(
                 None,
                 false,
-                Some("native scope closure remains unconfirmed".into()),
+                interrupted.or_else(|| Some("native scope closure remains unconfirmed".into())),
             ));
         }
         thread::sleep(POLL);
     }
 }
 
-fn wait_child(child: &mut impl ReapChild, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+fn wait_child(child: &mut MeasuredChild, deadline: Instant) -> io::Result<Option<ExitStatus>> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));

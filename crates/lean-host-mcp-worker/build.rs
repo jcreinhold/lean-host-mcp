@@ -45,6 +45,10 @@ fn main() -> Result<(), String> {
         // the underlying issue with a clearer error than we could here.
         return Ok(());
     };
+    println!(
+        "cargo:rustc-env=LEAN_HOST_COMPILED_SYSROOT={}",
+        prefix.canonicalize().map_err(|e| e.to_string())?.display()
+    );
     let lib_lean = prefix.join("lib").join("lean");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_lean.display());
     Ok(())

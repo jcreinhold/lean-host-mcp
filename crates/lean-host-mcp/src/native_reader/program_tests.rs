@@ -426,3 +426,23 @@ fn explicit_domain_input_limit_preserves_deduplication_and_complete_union_bound(
         "33 explicit inputs exceed the bounded input list"
     );
 }
+
+#[test]
+fn failed_bootstrap_preserves_primary_error_and_independent_closure() {
+    let source = io::Error::other("HELLO identity mismatch");
+    let before = not_started(&source);
+    assert_eq!(before.state, "not_started");
+    assert_eq!(before.target_started, Some(false));
+    assert!(before.detail.as_deref().unwrap().contains("HELLO identity mismatch"));
+
+    for (closed, state) in [(false, "unknown"), (true, "stopped")] {
+        let after = startup_failure(&source, closed);
+        assert_eq!(after.scope_closed, closed);
+        assert_eq!(after.state, state);
+        assert_eq!(after.target_started, Some(false));
+        assert_eq!(
+            after.detail.as_deref(),
+            Some("native startup refused before payload ACK: HELLO identity mismatch")
+        );
+    }
+}

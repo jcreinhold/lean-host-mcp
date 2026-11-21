@@ -603,6 +603,7 @@ mod pure_tests {
         );
         assert_eq!(expected.checked_host_bindings.len(), 3);
         let mut actual = LeanWorkerHostRuntimeMetadata {
+            effective_import_roots: None,
             artifact_read_epochs: None,
             compiled_lean_version: "4.35.0".into(),
             compiled_header_sha256: expected.compiled_header_sha256.clone().ok_or("header missing")?,
@@ -631,6 +632,7 @@ mod pure_tests {
     fn actual_metadata_cannot_teach_the_compiled_contract() -> Result<(), String> {
         let expectation = session_expectation("v4.35.0", None)?;
         let mut actual = LeanWorkerHostRuntimeMetadata {
+            effective_import_roots: None,
             artifact_read_epochs: None,
             compiled_lean_version: "4.35.0".into(),
             compiled_header_sha256: expectation.compiled_header_sha256.ok_or("header missing")?,

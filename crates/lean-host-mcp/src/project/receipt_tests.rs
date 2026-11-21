@@ -206,6 +206,7 @@ fn fake_worker(root: &Path, remove_executable: bool) -> PathBuf {
         "metadata",
         Message::Response(Response::HostRuntimeMetadata {
             metadata: lean_rs_worker_parent::LeanWorkerHostRuntimeMetadata {
+                effective_import_roots: None,
                 artifact_read_epochs: Some(vec![lean_rs_worker_parent::LeanWorkerArtifactReadEpoch {
                     project_root: root.to_string_lossy().into_owned(),
                     epoch: "fake-owned-writer-17".into(),
@@ -1085,6 +1086,7 @@ async fn incompatible_session_metadata_refuses_before_target_body() {
         "metadata",
         Message::Response(Response::HostRuntimeMetadata {
             metadata: lean_rs_worker_parent::LeanWorkerHostRuntimeMetadata {
+                effective_import_roots: None,
                 artifact_read_epochs: None,
                 compiled_lean_version: "4.35.0".into(),
                 compiled_header_sha256: incompatible.compiled_header_sha256.expect("header"),

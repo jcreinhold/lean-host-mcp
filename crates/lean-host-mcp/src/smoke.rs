@@ -19,15 +19,19 @@
 //! instead of re-probing on the hot path — complexity pulled down into install
 //! rather than up into every call.
 
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use lean_rs_worker_parent::{
     LeanWorkerChild, LeanWorkerDeclarationInspectionRequest, LeanWorkerError, LeanWorkerHostHandleBuilder,
     LeanWorkerProcessTracker,
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::toolchain::ToolchainId;
 
 /// Whether a freshly-built worker survived a trivial real elaboration.
@@ -69,6 +73,7 @@ impl SmokeOutcome {
 
 /// A cold worker importing `Init` can take a second or two; this runs once at
 /// install, so the budget is generous rather than tight.
+#[cfg(test)]
 const SMOKE_STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Spawn `worker_path` against `lean_sysroot`, load Lean, and run a trivial real
@@ -78,6 +83,7 @@ const SMOKE_STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
 ///
 /// `toolchain` selects the compiled host compatibility expectation; resolution
 /// of the worker binary and sysroot is the caller's job (it just built them).
+#[cfg(test)]
 pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &ToolchainId) -> SmokeOutcome {
     let writer = match crate::shared_writer::contract() {
         Ok(writer) => writer,
@@ -96,6 +102,7 @@ pub(crate) fn probe(worker_path: &Path, lean_sysroot: &Path, toolchain: &Toolcha
     )
 }
 
+#[cfg(test)]
 fn probe_with_writer(
     worker_path: &Path,
     lean_sysroot: &Path,
@@ -226,6 +233,7 @@ fn probe_with_writer(
     clippy::wildcard_enum_match_arm,
     reason = "only the two process-death variants carry an exit status to prefer; LeanWorkerError is upstream-evolving and every other variant falls back to its Display string"
 )]
+#[cfg(test)]
 fn describe(err: &LeanWorkerError) -> String {
     match err {
         LeanWorkerError::ChildPanicOrAbort { exit } | LeanWorkerError::ChildExited { exit } => exit.status.clone(),
@@ -258,7 +266,8 @@ mod tests {
     fn actual_guarded_smoke_uses_canonical_temporary_project_custody() {
         let worker = std::env::var_os("LEAN_HOST_MCP_SMOKE_WORKER").expect("actual worker path");
         let helper = std::env::var_os("LEAN_HOST_MCP_SMOKE_HELPER").expect("actual helper path");
-        let toolchain = ToolchainId::parse("v4.35.0").expect("supported toolchain");
+        let selected = std::env::var("LEAN_HOST_MCP_SMOKE_TOOLCHAIN").unwrap_or_else(|_| "v4.35.0".to_owned());
+        let toolchain = ToolchainId::parse(&selected).expect("supported toolchain");
         let sysroot = toolchain.elan_dir().expect("installed test toolchain");
         let mut writer = crate::shared_writer::contract().expect("common native namespace");
         writer.executable = std::path::PathBuf::from(helper)

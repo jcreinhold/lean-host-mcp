@@ -8,4 +8,5 @@
 
 pub mod config_init;
 pub mod install_worker;
+mod installed_shims;
 pub mod processes;

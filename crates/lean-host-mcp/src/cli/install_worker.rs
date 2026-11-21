@@ -33,7 +33,6 @@ use std::time::SystemTime;
 
 use clap::Args;
 use sha2::{Digest, Sha256};
-use tempfile::TempDir;
 
 use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WindowVerdict, WorkerBinary, WorkerSidecar, hash_lean_header};
 
@@ -89,6 +88,14 @@ pub struct InstallWorkerArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Extracted lean-rs-host package containing the pinned published shim sources.
+    #[arg(long)]
+    pub shim_source: Option<PathBuf>,
+
+    /// Explicit standalone writer for preparing the candidate's two shim packages.
+    #[arg(long)]
+    pub standalone_writer: Option<PathBuf>,
+
     /// Workspace root to build from. Defaults to the workspace this
     /// binary was compiled in; useful when the installed binary lives
     /// somewhere other than the source tree.
@@ -121,10 +128,10 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
         // `check_arg_combination` ruled out `--toolchain --auto`, so this is a
         // single-toolchain install (always overwrites — no freshness check).
         let id = ToolchainId::parse(raw)?;
-        install_one(&id, &source)?;
+        install_one(&id, &source, args)?;
         return Ok(());
     }
-    run_auto(&source, args.force)
+    run_auto(&source, args)
 }
 
 /// Validate the `--toolchain` target modifier against the chosen action. The
@@ -169,7 +176,8 @@ fn run_list() -> anyhow::Result<()> {
         let Some(id) = id_path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        let bin = id_path.join(WORKER_FILE_NAME);
+        let selected = WorkerBinary::selected_dir(&id_path)?;
+        let bin = selected.join(WORKER_FILE_NAME);
         if !bin.is_file() {
             continue;
         }
@@ -192,7 +200,7 @@ fn run_list() -> anyhow::Result<()> {
             .and_then(|t| t.elan_dir().ok())
             .and_then(|dir| hash_lean_header(&dir).ok());
         // One sidecar load feeds build, runtime, and protocol compatibility.
-        let sidecar = WorkerSidecar::load(&id_path);
+        let sidecar = WorkerSidecar::load(&selected);
         let header = sidecar
             .as_ref()
             .map_or("unknown", |s| s.header_status(current.as_deref()));
@@ -246,7 +254,8 @@ struct ListRow {
     sort_key: (u8, (u32, u32, u32, u8, u32), String),
 }
 
-fn run_auto(source: &WorkerSource, force: bool) -> anyhow::Result<()> {
+fn run_auto(source: &WorkerSource, args: &InstallWorkerArgs) -> anyhow::Result<()> {
+    let force = args.force;
     let toolchains = discover_elan_toolchains()?;
     if toolchains.is_empty() {
         println!("(no Lean toolchains found under ~/.elan/toolchains)");
@@ -259,7 +268,7 @@ fn run_auto(source: &WorkerSource, force: bool) -> anyhow::Result<()> {
             AutoDecision::SkipCurrent => {
                 println!("{id}: current; skipping (use --force to rebuild)");
             }
-            AutoDecision::Install(reason) => match install_one(&id, source) {
+            AutoDecision::Install(reason) => match install_one(&id, source, args) {
                 Ok(_) => println!("{id}: installed ({reason})"),
                 Err(err) => {
                     eprintln!("{id}: failed: {err}");
@@ -322,7 +331,9 @@ fn worker_freshness(id: &ToolchainId) -> Freshness {
 /// the staleness decision is testable against a temp root (mirroring
 /// [`clean_in`] / [`prune_in`]).
 fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
-    let dir = root.join(id.as_str());
+    let Ok(dir) = WorkerBinary::selected_dir(&root.join(id.as_str())) else {
+        return Freshness::Stale("invalid generation selector");
+    };
     if !dir.join(WORKER_FILE_NAME).is_file() {
         return Freshness::Absent;
     }
@@ -415,10 +426,11 @@ fn prune_in(root: &Path) -> anyhow::Result<()> {
             continue;
         };
         // Only consider real worker installs (a binary present); skip strays.
-        if !path.join(WORKER_FILE_NAME).is_file() {
+        let selected = WorkerBinary::selected_dir(&path)?;
+        if !selected.join(WORKER_FILE_NAME).is_file() {
             continue;
         }
-        if let Some(reason) = prune_reason(name, &path) {
+        if let Some(reason) = prune_reason(name, &selected) {
             fs::remove_dir_all(&path)?;
             println!("pruned {name}: {reason}");
             removed = removed.saturating_add(1);
@@ -449,7 +461,7 @@ fn prune_reason(name: &str, install_dir: &Path) -> Option<&'static str> {
     None
 }
 
-fn install_one(id: &ToolchainId, source: &WorkerSource) -> anyhow::Result<PathBuf> {
+fn install_one(id: &ToolchainId, source: &WorkerSource, args: &InstallWorkerArgs) -> anyhow::Result<PathBuf> {
     // Classify against the supported window *before* the multi-minute build —
     // an out-of-window worker would only fail lean-rs-sys's header-digest
     // check minutes later.
@@ -473,62 +485,84 @@ fn install_one(id: &ToolchainId, source: &WorkerSource) -> anyhow::Result<PathBu
     // crate's build.rs to point at it.
     let elan_dir = id.elan_dir()?;
 
-    // Build the worker (local checkout or published crate — `build_worker`
-    // hides which). `staged` owns the temp dir for the registry build, so it
-    // must stay alive until the binary has been relocated below.
-    let staged = build_worker(source, id, &elan_dir)?;
-
     let dest_dir = WorkerBinary::install_root().join(id.as_str());
-    fs::create_dir_all(&dest_dir)?;
-    let dest = dest_dir.join(WORKER_FILE_NAME);
-    if dest.is_file() {
-        fs::remove_file(&dest)?;
+    let registry_source = match &args.shim_source {
+        Some(path) => path.canonicalize()?,
+        None => {
+            let cargo = std::env::var_os("CARGO_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|p| p.join(".cargo")))
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve Cargo home"))?;
+            let package = fs::read_dir(cargo.join("registry/src"))?
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.starts_with("index.crates.io-"))
+                        && p.join("lean-rs-host-0.10.1/shims").is_dir()
+                })
+                .ok_or_else(|| anyhow::anyhow!("provide --shim-source for published lean-rs-host 0.10.1"))?;
+            package.join("lean-rs-host-0.10.1").canonicalize()?
+        }
+    };
+    let writer = match &args.standalone_writer {
+        Some(path) => path.clone(),
+        None => std::env::current_exe()?.with_file_name("lean-rs-writer"),
     }
-    if fs::rename(&staged.binary, &dest).is_err() {
-        // Cross-device move: fall back to copy + remove.
-        fs::copy(&staged.binary, &dest)?;
-        fs::remove_file(&staged.binary)?;
-    }
+    .canonicalize()
+    .map_err(|e| anyhow::anyhow!("select the installed SDK writer with --standalone-writer: {e}"))?;
+    let generation = prepare_generation(
+        &dest_dir,
+        id,
+        &elan_dir.canonicalize()?,
+        &registry_source,
+        &writer,
+        |dir| build_worker(source, id, &elan_dir, dir),
+    )?;
+    select_generation(&dest_dir, &generation)?;
+    Ok(generation.join(WORKER_FILE_NAME))
+}
 
-    // Prove the worker can actually run before vouching for it: a matching
-    // header digest does not imply ABI compatibility with this toolchain's
-    // libleanshared, so spawn the binary once and run a trivial real
-    // elaboration. This runs here, over the multi-minute build, instead of
-    // letting every project-open rediscover a crash at call time.
-    println!("==> smoke test: inspect Nat.add_zero [imports=Init] for {id}");
-    let smoke = crate::smoke::probe(&dest, &elan_dir, id);
+pub(super) fn prepare_generation(
+    slot: &Path,
+    id: &ToolchainId,
+    sysroot: &Path,
+    shim_source: &Path,
+    writer: &Path,
+    build: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(slot)?;
+    let generation = tempfile::Builder::new().prefix("generation-").tempdir_in(slot)?;
+    build(generation.path())?;
+    // The generated manifests contain absolute paths, including during the smoke.
+    // Keep the generation if a native operation leaves cleanup uncertain.
+    let generation = generation.keep().canonicalize()?;
+    super::installed_shims::qualify(&generation, id, shim_source, sysroot, writer)?;
+    Ok(generation)
+}
 
-    // Record provenance next to the binary: the full lean.h digest the worker
-    // was built against (so a later open can detect header drift — the rc
-    // republished under the same id) and the smoke outcome (so the gate can
-    // demote a worker that builds and digest-matches but cannot run).
-    let header_digest = hash_lean_header(&elan_dir)?;
-    let supported = lean_toolchain::supported_by_digest(&header_digest).is_some();
-    WorkerSidecar::record(&dest_dir, id, header_digest, smoke.clone())?;
-
-    let meta = fs::metadata(&dest)?;
-    let sha = sha256_prefix(&dest, 16)?;
-    println!(
-        "==> installed {} ({} bytes, sha256 {}…, digest {}, runtime {})",
-        dest.display(),
-        meta.len(),
-        sha,
-        if supported { "supported" } else { "unrecognized" },
-        smoke.label(),
+fn select_generation(slot: &Path, generation: &Path) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    anyhow::ensure!(
+        generation.parent() == Some(slot.canonicalize()?.as_path()),
+        "generation outside install slot"
     );
-
-    // A worker that built and digest-matched but crashed the smoke test is
-    // recorded as unusable (so `--list` shows it and the gate refuses it) and
-    // surfaced as a hard install failure — exit non-zero so the user/CI sees it.
-    if let Some(detail) = smoke.failure_detail() {
-        return Err(anyhow::anyhow!(
-            "worker for {id} built but FAILED its runtime smoke test ({detail}); this toolchain's \
-             libleanshared is ABI-incompatible with this lean-rs build. The worker is recorded as \
-             unusable (runtime=crashed) and will not be served — pin a supported toolchain the host can \
-             run, or rebuild lean-rs."
-        ));
-    }
-    Ok(dest)
+    let name = generation
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid generation"))?;
+    anyhow::ensure!(
+        name.strip_prefix("generation-")
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())),
+        "invalid generation name"
+    );
+    let mut file = tempfile::NamedTempFile::new_in(slot)?;
+    file.write_all(name.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(slot.join("current-generation"))?;
+    fs::File::open(slot)?.sync_all()?;
+    Ok(())
 }
 
 fn discover_elan_toolchains() -> anyhow::Result<Vec<ToolchainId>> {
@@ -572,15 +606,6 @@ enum WorkerSource {
     /// No checkout: fetch and build the published `lean-host-mcp-worker` crate
     /// at this binary's own version.
     Registry,
-}
-
-/// A freshly built worker binary, ready to relocate into the install root.
-struct StagedWorker {
-    /// Path to the built binary.
-    binary: PathBuf,
-    /// Kept alive (registry build only) so the binary isn't deleted before it
-    /// is relocated; dropping a [`TempDir`] removes its contents.
-    _tmp: Option<TempDir>,
 }
 
 /// Decide where to get the worker source. `--source-dir` wins; otherwise, if
@@ -641,7 +666,7 @@ fn worker_cargo(id: &ToolchainId, sysroot: &Path) -> Command {
 /// returning its path (and, for the registry build, the temp-dir guard that
 /// must outlive the relocate). This is the only place the two source strategies
 /// diverge.
-fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path) -> anyhow::Result<StagedWorker> {
+fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path, candidate: &Path) -> anyhow::Result<()> {
     match source {
         WorkerSource::LocalWorkspace(workspace) => {
             let target_dir = std::env::var_os("CARGO_TARGET_DIR");
@@ -665,17 +690,13 @@ fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path) -> anyh
                     built.display()
                 ));
             }
-            Ok(StagedWorker {
-                binary: built,
-                _tmp: None,
-            })
+            fs::copy(built, candidate.join(WORKER_FILE_NAME))?;
         }
         WorkerSource::Registry => {
             // Pin the worker to this binary's exact version — they share the
             // workspace version and are ABI-coupled, so lockstep is intended.
             let version = env!("CARGO_PKG_VERSION");
             println!("==> installing lean-host-mcp-worker {version} for {id} (crates.io)");
-            let tmp = tempfile::tempdir()?;
             let status = worker_cargo(id, sysroot)
                 .arg("install")
                 .arg(WORKER_FILE_NAME)
@@ -684,7 +705,8 @@ fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path) -> anyh
                 .arg("--bin")
                 .arg(WORKER_FILE_NAME)
                 .arg("--root")
-                .arg(tmp.path())
+                .arg(candidate)
+                .arg("--no-track")
                 .arg("--locked")
                 .status()?;
             if !status.success() {
@@ -693,22 +715,21 @@ fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path) -> anyh
                      a Rust toolchain and network access are required"
                 ));
             }
-            let built = tmp.path().join("bin").join(WORKER_FILE_NAME);
+            let built = candidate.join("bin").join(WORKER_FILE_NAME);
             if !built.is_file() {
                 return Err(anyhow::anyhow!(
                     "cargo install did not produce a worker binary at {}",
                     built.display()
                 ));
             }
-            Ok(StagedWorker {
-                binary: built,
-                _tmp: Some(tmp),
-            })
+            fs::rename(built, candidate.join(WORKER_FILE_NAME))?;
+            fs::remove_dir(candidate.join("bin"))?;
         }
     }
+    Ok(())
 }
 
-fn sha256_prefix(path: &Path, hex_chars: usize) -> anyhow::Result<String> {
+pub(super) fn sha256_prefix(path: &Path, hex_chars: usize) -> anyhow::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut buf = [0u8; 8192];
     let mut hasher = Sha256::new();
@@ -832,6 +853,60 @@ mod tests {
         std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("binary stub");
         let tid = ToolchainId::parse(id).expect("parse id");
         WorkerSidecar::record(&dir, &tid, digest.to_owned(), crate::smoke::SmokeOutcome::Passed).expect("sidecar");
+    }
+
+    #[test]
+    fn failed_upgrade_preserves_installed_worker_and_sidecar() -> anyhow::Result<()> {
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let id = ToolchainId::parse("v4.36.0")?;
+        fake_worker(root.path(), id.as_str(), "old");
+        let slot = root.path().join(id.as_str());
+        let sidecar = std::fs::read(slot.join("worker.json"))?;
+        for fail_build in [true, false] {
+            let failed = super::prepare_generation(&slot, &id, root.path(), root.path(), root.path(), |dir| {
+                anyhow::ensure!(!fail_build, "build failed");
+                std::fs::write(dir.join(WORKER_FILE_NAME), b"candidate")?;
+                Ok(())
+            });
+            assert!(failed.is_err());
+            assert_eq!(crate::toolchain::WorkerBinary::selected_dir(&slot)?, slot);
+            assert_eq!(std::fs::read(slot.join(WORKER_FILE_NAME))?, b"#!/bin/sh\n");
+            assert_eq!(std::fs::read(slot.join("worker.json"))?, sidecar);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_worker_replaced_after_probe_is_not_published() -> anyhow::Result<()> {
+        let id = ToolchainId::parse("v4.36.0")?;
+        let mut record = WorkerSidecar::candidate(&id, "header".into(), Some("before".into()));
+        let error = record
+            .complete("after", crate::smoke::SmokeOutcome::Passed)
+            .expect_err("replacement refused");
+        assert!(error.to_string().contains("candidate worker changed"));
+        assert!(record.smoke().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn generation_selection_keeps_paths_stable_and_refuses_bad_current() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let root = temp.path().canonicalize()?;
+        let id = ToolchainId::parse("v4.36.0")?;
+        fake_worker(&root, id.as_str(), "old");
+        let slot = root.join(id.as_str());
+        let resolve = || crate::toolchain::WorkerBinary::resolve_with_override(&id, Some(&root));
+        let old = resolve()?.path;
+        let generation = slot.join("generation-new");
+        std::fs::create_dir(&generation)?;
+        std::fs::write(generation.join(WORKER_FILE_NAME), b"qualified")?;
+        assert_eq!(resolve()?.path, old);
+        super::select_generation(&slot, &generation)?;
+        assert_eq!(resolve()?.path, generation.join(WORKER_FILE_NAME));
+        assert!(old.is_file());
+        std::fs::write(slot.join("current-generation"), "../outside")?;
+        assert!(resolve().is_err());
+        Ok(())
     }
 
     #[test]
