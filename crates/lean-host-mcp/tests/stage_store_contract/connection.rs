@@ -11,9 +11,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const EXPECTED_VERSION: &str = "3.53.2";
-const EXPECTED_VERSION_NUMBER: i32 = 3_053_002;
-const EXPECTED_SOURCE_ID: &str = "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24";
+const EXPECTED_VERSION: &str = "3.54.1";
+const EXPECTED_VERSION_NUMBER: i32 = 3_054_001;
+const EXPECTED_SOURCE_ID: &str = "2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76";
 const BUSY_TIMEOUT: Duration = Duration::from_millis(1_000);
 const BUSY_TIMEOUT_MILLIS: i64 = 1_000;
 const SELECTED_VFS: &str = "unix";

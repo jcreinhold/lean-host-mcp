@@ -675,7 +675,7 @@ fn checked_writer_and_checkpoint_connections_preserve_all_commits() {
     let fixture = Fixture::new();
     let (mut caller, store) = fixture.init();
     let connection = CheckedConnection::open_existing(&fixture.native(), native_schema_valid).unwrap();
-    assert_eq!(connection.provenance().version_number, 3_053_002);
+    assert_eq!(connection.provenance().version_number, 3_054_001);
     let barrier = Arc::new(Barrier::new(2));
     let go = Arc::clone(&barrier);
     let checkpoint = thread::spawn(move || {

@@ -23,7 +23,7 @@ guardian; no SQLite API moved into it.
 | `stage_store_runtime_contract/service_loss_regressions.rs` | Actual service-death cuts and a fresh passive observer |
 
 The code is private test support. It adds no public library API, production module, actor framework or new crate. A
-Unix-only dev dependency pins `rusqlite 0.40.2` with bundled SQLite; the lockfile selects `libsqlite3-sys 0.38.2`.
+Unix-only dev dependency pins `rusqlite 0.41.1` with bundled SQLite; the lockfile selects `libsqlite3-sys 0.39.1`.
 Production builds do not gain a SQLite dependency. Integrating a production store remains a separate review, rather than
 hiding experimental code behind an unused public interface.
 
@@ -97,9 +97,9 @@ payload fields; strict `Discover {}` rejects them. Capabilities and decoder diag
 
 ## SQLite and opening files
 
-Every connection checks the actual linked SQLite version/source ID and relevant compile options. The reviewed build
-reports **SQLite 3.53.2**, source ID
-`2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24`. It includes the fix in SQLite's
+Every connection checks the actual linked SQLite version/source ID and relevant compile options. The pinned build
+requires **SQLite 3.54.1**, source ID
+`2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76`. It includes the fix in SQLite's
 [WAL-reset advisory](https://sqlite.org/wal.html#the_wal_reset_bug).
 
 An existing file must pass its concrete role, version, required-column and native store-identity checks **before** the
