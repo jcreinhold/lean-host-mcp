@@ -380,6 +380,22 @@ At runtime, package-version skew is silent when the protocol matches. A recorded
 `runtime_unavailable` response with `lean-host-mcp install-worker --auto` as the exact recovery command. Header drift or
 smoke failure is also a hard refusal with an actionable reinstall command.
 
+### Managed source-bound writer cutover
+
+Source-bound staging is opt-in. After draining the supported launchers, install the matched digest-aware host and
+standalone SDK writer. Use that writer's `writer-storage approve-handoff` with the existing registry path, device,
+and inode. Set `LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` on the managed broker to the approved JSON fields
+`ownership_registry`, `registry_device`, `registry_inode`, `executable`, `sha256`, and the returned
+`approval_generation`. The broker reports that approval in its compatibility receipt. The SDK enforces the
+generation at admission. Startup does not issue approval.
+
+For managed rollback, disable source-bound admission and pause the supported launchers. Use the same pinned
+SDK writer's `writer-storage revoke-handoff` on the original registry. If revocation is busy or its result is
+unknown, keep the launchers paused and retry after custody closes. Once revocation succeeds, restart the matched
+digest-aware host with `LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` unset. Keep the same registry and lock inodes.
+Use `make mcp-rollback` for the supported Proofs launcher. This procedure has been qualified with source-built
+images. Published package identities require a repeat with the installed artifacts.
+
 ## Build, test, lint
 
 ```sh

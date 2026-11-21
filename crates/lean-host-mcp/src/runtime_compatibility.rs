@@ -38,6 +38,7 @@ pub struct SourceHandoffObservation {
     pub sha256: String,
     pub registry_device: u64,
     pub registry_inode: u64,
+    pub approval_generation: String,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +49,7 @@ struct SourceHandoffCutover {
     ownership_registry: PathBuf,
     registry_device: u64,
     registry_inode: u64,
+    approval_generation: String,
 }
 
 fn source_handoff_observation(registry: &Path) -> Option<SourceHandoffObservation> {
@@ -68,6 +70,11 @@ fn source_handoff_for_pin(registry: &Path, pin: SourceHandoffCutover) -> Option<
         || registry.canonicalize().ok()?.as_path() != registry
         || !registry.is_dir()
         || !is_digest(&pin.sha256)
+        || pin.approval_generation.len() != 32
+        || !pin
+            .approval_generation
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         || !pin.executable.is_absolute()
         || pin.executable.canonicalize().ok()? != pin.executable
     {
@@ -107,6 +114,7 @@ fn source_handoff_for_pin(registry: &Path, pin: SourceHandoffCutover) -> Option<
         sha256: pin.sha256,
         registry_device: pin.registry_device,
         registry_inode: pin.registry_inode,
+        approval_generation: pin.approval_generation,
     })
 }
 
@@ -401,10 +409,12 @@ mod tests {
             ownership_registry,
             registry_device: approved_registry.dev(),
             registry_inode: approved_registry.ino(),
+            approval_generation: "a".repeat(32),
         };
         let observed = source_handoff_for_pin(&registry, pin(registry.clone(), sha256.clone()))
             .ok_or("exact standalone pin must be advertised")?;
         assert_eq!(observed.fence, "embedded_storage_fence_v1");
+        assert_eq!(observed.approval_generation, "a".repeat(32));
         assert_eq!(observed.executable, executable);
         assert_eq!(observed.sha256, sha256);
         assert!(source_handoff_for_pin(&registry, pin(other, sha256.clone())).is_none());
