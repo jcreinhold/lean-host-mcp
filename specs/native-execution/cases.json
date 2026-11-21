@@ -621,6 +621,748 @@
       "witness": true
     },
 
+    {
+      "name": "host-writer-recovery",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-legacy",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-recapture",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-recapture\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterHandoffSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterHandoffSafe"
+    },
+    {
+      "name": "host-writer-ignore-invalidity",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-ignore-invalidity\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterHandoffSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterHandoffSafe"
+    },
+    {
+      "name": "host-writer-overlap-early",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-overlap-early\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterOverlapSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterOverlapSafe"
+    },
+    {
+      "name": "host-writer-unknown-is-idle",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-unknown-is-idle\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-partial-union",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-partial-union\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-stale-owner",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-stale-owner\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-stale-digest",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-stale-digest\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-unmarked-absence",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-unmarked-absence\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-skip-reacquire",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-skip-reacquire\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-double-settle",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-double-settle\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterSettlesOnce"
+      ],
+      "properties": [],
+      "invariant": "WriterSettlesOnce"
+    },
+    {
+      "name": "host-writer-rewrite-outcome",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-rewrite-outcome\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterOutcomeStable"
+      ],
+      "properties": [],
+      "invariant": "WriterOutcomeStable"
+    },
+    {
+      "name": "host-writer-replay",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-replay\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterNoReplay"
+      ],
+      "properties": [],
+      "invariant": "WriterNoReplay"
+    },
+    {
+      "name": "host-writer-recover-legacy",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Mutation": "\"writer-recover-legacy\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-global-fence",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-global-fence\""
+      },
+      "expect": "liveness",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "WriterDisjointProgress"
+      ]
+    },
+    {
+      "name": "host-writer-unlocked-disjoint",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterUnlockedDisjoint"
+      ],
+      "properties": [],
+      "invariant": "NoWriterUnlockedDisjoint",
+      "witness": true
+    },
+    {
+      "name": "host-writer-partial-idle",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterPartialIdleFence"
+      ],
+      "properties": [],
+      "invariant": "NoWriterPartialIdleFence",
+      "witness": true
+    },
+    {
+      "name": "host-writer-invalid-handoff",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterInvalidHandoffFence"
+      ],
+      "properties": [],
+      "invariant": "NoWriterInvalidHandoffFence",
+      "witness": true
+    },
+    {
+      "name": "host-writer-unknown-retired",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterUnknownRetirement"
+      ],
+      "properties": [],
+      "invariant": "NoWriterUnknownRetirement",
+      "witness": true
+    },
+    {
+      "name": "host-writer-saved-retired",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterSavedRetirement"
+      ],
+      "properties": [],
+      "invariant": "NoWriterSavedRetirement",
+      "witness": true
+    },
+    {
+      "name": "host-writer-intent-recovery",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterIntentRecovery"
+      ],
+      "properties": [],
+      "invariant": "NoWriterIntentRecovery",
+      "witness": true
+    },
+    {
+      "name": "host-writer-removal-recovery",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterRemovalRecovery"
+      ],
+      "properties": [],
+      "invariant": "NoWriterRemovalRecovery",
+      "witness": true
+    },
+    {
+      "name": "host-writer-sync-recovery",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterSyncRecovery"
+      ],
+      "properties": [],
+      "invariant": "NoWriterSyncRecovery",
+      "witness": true
+    },
+    {
+      "name": "host-writer-legacy-unlocked-disjoint",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoLegacyIdleDisjoint"
+      ],
+      "properties": [],
+      "invariant": "NoLegacyIdleDisjoint",
+      "witness": true
+    },
+
+    {
+      "name": "host-writer-unverifiable",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Fault": "\"writer-unverifiable\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-unverifiable-idle",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Fault": "\"writer-unverifiable\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoWriterUnverifiableIdle"
+      ],
+      "properties": [],
+      "invariant": "NoWriterUnverifiableIdle",
+      "witness": true
+    },
+
+    {
+      "name": "host-writer-operator",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-operator-ack-only",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-ack-only\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-operator-stale",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-stale\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-operator-closure-only",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-closure-only\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-operator-unverifiable",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-unverifiable\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "Spec",
+        "WriterRecoveryProgress",
+        "WriterDisjointProgress",
+        "WriterSuccessorProgress"
+      ]
+    },
+    {
+      "name": "host-writer-operator-retires-after-removal",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoOperatorRetirementAfterRemoval"
+      ],
+      "properties": [],
+      "invariant": "NoOperatorRetirementAfterRemoval",
+      "witness": true
+    },
+    {
+      "name": "host-writer-operator-ack-only-disjoint",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-ack-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoOperatorAckOnlyDisjoint"
+      ],
+      "properties": [],
+      "invariant": "NoOperatorAckOnlyDisjoint",
+      "witness": true
+    },
+    {
+      "name": "host-writer-operator-stale-disjoint",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-stale\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoOperatorStaleDisjoint"
+      ],
+      "properties": [],
+      "invariant": "NoOperatorStaleDisjoint",
+      "witness": true
+    },
+    {
+      "name": "host-writer-operator-closure-only-disjoint",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-closure-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoOperatorClosureOnlyDisjoint"
+      ],
+      "properties": [],
+      "invariant": "NoOperatorClosureOnlyDisjoint",
+      "witness": true
+    },
+    {
+      "name": "host-writer-operator-unverifiable-disjoint",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-unverifiable\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoOperatorUnverifiableDisjoint"
+      ],
+      "properties": [],
+      "invariant": "NoOperatorUnverifiableDisjoint",
+      "witness": true
+    },
+    {
+      "name": "host-writer-accept-ack-only",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-ack-only\"",
+        "Mutation": "\"writer-accept-ack-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-accept-stale-attestation",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-stale\"",
+        "Mutation": "\"writer-accept-stale-attestation\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-accept-closure-only",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator-closure-only\"",
+        "Mutation": "\"writer-accept-closure-only\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-stall-settlement",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-command-only\"",
+        "Mutation": "\"writer-stall-settlement\""
+      },
+      "expect": "liveness",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "WriterRecoveryProgress"
+      ]
+    },
+    {
+      "name": "host-writer-operator-stall-settlement",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator\"",
+        "Mutation": "\"writer-stall-settlement\""
+      },
+      "expect": "liveness",
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterSafety"
+      ],
+      "properties": [
+        "WriterRecoveryProgress"
+      ]
+    },
+
+    {
+      "name": "host-writer-operator-partial-union",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator\"",
+        "Mutation": "\"writer-partial-union\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+    {
+      "name": "host-writer-operator-wrong-scratch",
+      "model": "Stages",
+      "specification": "WriterSpec",
+      "constants": {
+        "Profile": "\"writer-legacy\"",
+        "Fault": "\"writer-operator\"",
+        "Mutation": "\"writer-wrong-scratch\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "WriterCleanupSafe"
+      ],
+      "properties": [],
+      "invariant": "WriterCleanupSafe"
+    },
+
     { "name": "host-healthy", "model": "Stages", "expect": "pass" },
     {
       "name": "host-faults",

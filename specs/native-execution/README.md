@@ -43,6 +43,33 @@ case tests a live, responsive old authority and one durable request under two co
 It assumes durable arbitration and a receiver that enforces the fence. Unavailable authority or evidence can
 leave execution uncertain. The model grants recovery no right to signal a PID or issue another GO.
 
+**Managed writer recovery.** `WriterSpec` in `Stages.tla` uses the existing SDK
+reader-closure and conflicting-admission steps. It binds a staged handoff to
+the original store, manifest, audit baseline, and exact ordered lock union.
+Handoff validity can be lost even when those identities still match.
+After controller loss, kernel locks can close while the charge remains.
+The charge fences overlapping admissions until settlement. Disjoint work
+can proceed with its own scope and budget.
+
+Automatic recovery requires a command-only turn with durable idle records.
+An older caller-owned turn needs an independently authenticated fact that
+all write authority for that exact turn has stopped, including any pending
+launch. A separate operator acknowledgment binds the same turn and its
+recorded disposition. With missing or stale attestation, missing acknowledgment,
+or unverifiable scope, the reservation stays fenced.
+
+Both paths reacquire the full union and validate the bound scratch before
+recording cleanup intent. They can resume removal or sync after another
+interruption and settle once without replaying the old job or changing its
+result. Progress requires settlement when exact evidence and either the
+bound scratch or a durable cleanup mark remain valid. Scratch missing
+before intent leaves the charge open.
+
+The cases assume authentic scope and closure facts. An unlocked descriptor,
+an operator acknowledgment, a reboot, or a missing PID gives no such fact
+in the model. Real OS observations, durable handoff and SQLite behavior,
+and matched installation and rollback have separate acceptance checks.
+
 **Host actor permit.** One warm actor holds one host permit and binds one custody scope. It saves the result
 of one request and starts a second request on that generation while still charged. It returns the permit after
 sealing admission and accepting authenticated closure for its bound scope. A serialized fence and certified

@@ -40,7 +40,14 @@ HostInit == Init /\ h = [
   hostPermitTaken |-> FALSE, hostPermitReturns |-> 0, actorSealed |-> FALSE,
   hostClosure |-> <<>>, staleSeen |-> FALSE, duplicateSeen |-> FALSE,
   deadline |-> [tick |-> 0, arm |-> "idle", armedKey |-> <<>>, finishedKey |-> <<>>,
-    sentAt |-> <<>>, frozen |-> FALSE, paused |-> FALSE, expired |-> FALSE]]
+    sentAt |-> <<>>, frozen |-> FALSE, paused |-> FALSE, expired |-> FALSE],
+  writer |-> [phase |-> "new", handoff |-> <<>>, admittedHandoff |-> <<>>, valid |-> TRUE,
+    checked |-> <<>>, starts |-> 0, interrupted |-> FALSE,
+    result |-> "none", resultAtLoss |-> "none", outcome |-> "none",
+    attestation |-> <<>>, operatorAck |-> <<>>,
+    scratch |-> FALSE, cleanup |-> "none", intentBound |-> FALSE, evidence |-> <<>>,
+    oldLocks |-> FALSE, held |-> FALSE, unheldCleanup |-> FALSE,
+    cut |-> "none", settlements |-> 0]]
 HostOnly(change) == change /\ UNCHANGED vars
 SdkOnly(action) == action /\ UNCHANGED h
 Submit == HostOnly(~h.submitted /\ h.online /\ h'=[h EXCEPT !.submitted=TRUE, !.binding= <<Original,NativeId,"intent-a">>])
@@ -336,4 +343,208 @@ FrozenGuardianRetires == h.deadline.paused ~> (h.closure=Scope /\ capacityReturn
 LostAckRetires == (h.deadline.arm="lost") ~> (h.closure=Scope /\ capacityReturns=1)
 NoFrozenDrain == ~(h.deadline.frozen /\ h.deadline.expired /\ ~groupPresent)
 NoLostAckRetirement == ~(h.deadline.arm="lost" /\ h.closure=Scope /\ capacityReturns=1)
+
+\* Opt-in writer projection: an exact SDK reader closure releases the host's
+\* domain holds before the old writer turn. The overlapping successor still
+\* uses the SDK WriterAcquire through AdmitSuccessor. Other has its own scope.
+Writer == h.writer
+CommandOnlyTurn == Profile="writer-command-only"
+OriginalHandoff == [source |-> Original, store |-> NativeId, file |-> "store-file-a",
+  manifest |-> "manifest-a", audit |-> "audit-a", notices |-> "notices-a"]
+WriterInputs == {OriginalHandoff,
+  [OriginalHandoff EXCEPT !.store= <<"other-store",1,"nonce">>],
+  [OriginalHandoff EXCEPT !.file="restored-file"],
+  [OriginalHandoff EXCEPT !.manifest="manifest-b"],
+  [OriginalHandoff EXCEPT !.audit="audit-b"],
+  [OriginalHandoff EXCEPT !.notices="notices-b"]}
+WriterLockUnion == << <<"project", "device-a", "inode-a">>,
+                      <<"dependency", "device-a", "inode-b">> >>
+WriterOwner == <<"writer",2,"writer-owner">>
+PreviousWriterOwner == <<"writer",1,"writer-owner">>
+\* A symbolic digest binds all captured identities; no hash or durability claim.
+WriterDigest(input) == <<"handoff-digest", input>>
+WriterReservation == [turn |-> "turn-a", owner |-> WriterOwner, registry |-> "registry-a",
+  digest |-> WriterDigest(OriginalHandoff), locks |-> WriterLockUnion,
+  scratch |-> <<"scratch-a", "device-a", "inode-c">>]
+WriterEvidence == {WriterReservation,
+  [WriterReservation EXCEPT !.owner=PreviousWriterOwner],
+  [WriterReservation EXCEPT !.digest=WriterDigest([OriginalHandoff EXCEPT !.audit="audit-b"])],
+  [WriterReservation EXCEPT !.locks= <<WriterLockUnion[1]>>],
+  [WriterReservation EXCEPT !.locks= <<WriterLockUnion[1], <<"dependency","device-a","other-inode">>>>],
+  [WriterReservation EXCEPT !.scratch= <<"scratch-a","device-a","other-inode">>]}
+ExactWriterEvidenceAvailable == Fault \notin {"writer-unverifiable","writer-operator-unverifiable"}
+OfferedWriterEvidence == IF ExactWriterEvidenceAvailable THEN WriterEvidence
+  ELSE {e \in WriterEvidence: e/=WriterReservation}
+OperatorCase == ~CommandOnlyTurn /\ Fault \in {"writer-operator","writer-operator-ack-only",
+  "writer-operator-stale","writer-operator-closure-only","writer-operator-unverifiable"}
+WriterTurnKey == <<WriterReservation.turn,WriterReservation.owner,WriterReservation.registry>>
+StaleWriterTurnKey == <<"previous-turn",WriterReservation.owner,WriterReservation.registry>>
+OperatorAttestations == CASE Fault="writer-operator-ack-only" -> {}
+  [] Fault="writer-operator-stale" -> {StaleWriterTurnKey}
+  [] OTHER -> {WriterTurnKey,StaleWriterTurnKey}
+ExactOperatorClosure == Writer.attestation=WriterTurnKey
+ExpectedOperatorAck == <<WriterTurnKey,Writer.outcome>>
+ExactOperatorAck == Writer.operatorAck=ExpectedOperatorAck
+OperatorClosureAuthorized == OperatorCase /\ ExactOperatorClosure /\ ExactOperatorAck
+
+WriterReader == Submit \/ Accept \/ AcquireDomain \/ ReserveScope \/ ConsumePermit
+  \/ SendLaunch \/ ReceiveLaunch \/ NativeLaunch \/ LoadReads \/ Boot
+  \/ (h.readAdmitted /\ startupAcked /\ SdkOnly(RequestStop))
+  \/ Maintenance \/ ReleaseDomains
+StageWriterHandoff == HostOnly(Writer.handoff= <<>>
+  /\ h'=[h EXCEPT !.writer.handoff=OriginalHandoff])
+\* Invalidation can retain every original identifier (edit and restore).
+InvalidateWriterInput == HostOnly(Writer.handoff/= <<>> /\ Writer.checked= <<>> /\ Writer.valid
+  /\ h'=[h EXCEPT !.writer.valid=FALSE])
+ReserveWriter == HostOnly(Writer.phase="new" /\ Writer.handoff=OriginalHandoff
+  /\ h.closure=Scope /\ h.domains=0
+  /\ h'=[h EXCEPT !.writer.phase="idle", !.writer.scratch=TRUE, !.writer.oldLocks=TRUE,
+     !.writer.admittedHandoff=WriterReservation])
+ValidWriterInput(input) == WriterDigest(input)=Writer.admittedHandoff.digest /\ Writer.valid
+ValidateWriterInput(input) == HostOnly(Writer.phase="idle" /\ ~Writer.interrupted /\ Writer.checked= <<>>
+  /\ (ValidWriterInput(input)
+      \/ (Mutation="writer-recapture" /\ Writer.valid)
+      \/ (Mutation="writer-ignore-invalidity" /\ input=Writer.handoff))
+  /\ h'=[h EXCEPT !.writer.checked=input])
+\* Persist the non-idle phase before GO. An already issued GO may arrive
+\* after loss, but recovery never issues another GO for that turn.
+ArmWriter == HostOnly(Writer.phase="idle" /\ Writer.checked/= <<>> /\ ~Writer.interrupted /\ Writer.starts=0
+  /\ h'=[h EXCEPT !.writer.phase="starting"])
+RunWriter == HostOnly(((Writer.phase="starting" /\ Writer.starts=0)
+  \/ (Mutation="writer-replay" /\ Writer.interrupted /\ Writer.phase="running" /\ Writer.starts=1))
+  /\ h'=[h EXCEPT !.writer.phase="running", !.writer.starts=@+1])
+\* The stop action assumes authentic observation that the command and all
+\* delegated writes stopped. Until all Idle records agree, recovery is fenced.
+StopWriter == HostOnly(Writer.phase="running"
+  /\ h'=[h EXCEPT !.writer.phase="partial-idle"])
+PublishWriterIdle == HostOnly(Writer.phase="partial-idle" /\ ~Writer.interrupted
+  /\ h'=[h EXCEPT !.writer.phase="idle"])
+SaveWriterResult == HostOnly(Writer.phase \in {"partial-idle","idle"} /\ Writer.starts=1
+  /\ ~Writer.interrupted /\ Writer.result="none"
+  /\ h'=[h EXCEPT !.writer.result="success"])
+\* An unconfirmed close says nothing new about the command's result.
+WriterLossOutcome == IF Writer.resultAtLoss="none" THEN "unknown" ELSE Writer.resultAtLoss
+InterruptWriter == HostOnly(Writer.phase \in {"idle","starting","running","partial-idle"} /\ ~Writer.interrupted
+  /\ h'=[h EXCEPT !.writer.interrupted=TRUE, !.writer.resultAtLoss=Writer.result,
+     !.writer.outcome=IF Writer.result="none" THEN "unknown" ELSE Writer.result])
+WriterMayWrite == Writer.phase \in {"starting","running"}
+  \/ (~CommandOnlyTurn /\ Writer.phase \in {"idle","partial-idle"})
+\* Old kernel locks can close before the reservation settles. The charge,
+\* not descriptor liveness, continues to fence conflicting admission.
+DropOldWriterLocks == HostOnly(Writer.interrupted /\ Writer.oldLocks
+  /\ h'=[h EXCEPT !.writer.oldLocks=FALSE])
+WriterIdleRecovery == CommandOnlyTurn /\ Writer.interrupted /\ Writer.phase="idle" /\ ~Writer.oldLocks
+
+\* An independently authenticated fact for this exact turn certifies that
+\* every old write authority has stopped, including any pending GO. The
+\* model does not manufacture it from a boot change or PID observation.
+ReceiveOperatorAttestation(attestation) == HostOnly(OperatorCase /\ Writer.interrupted
+  /\ ~ExactOperatorClosure /\ attestation/=Writer.attestation
+  /\ h'=[h EXCEPT !.writer.attestation=attestation,
+     !.writer.phase=IF attestation=WriterTurnKey THEN "operator-closed" ELSE @])
+AcknowledgeOperatorRecovery == HostOnly(OperatorCase /\ Fault/="writer-operator-closure-only"
+  /\ Writer.interrupted /\ Writer.operatorAck= <<>>
+  /\ h'=[h EXCEPT !.writer.operatorAck=ExpectedOperatorAck])
+OperatorWriterRecovery == OperatorClosureAuthorized /\ Writer.phase="operator-closed"
+WriterRecoveryAuthorized == WriterIdleRecovery \/ OperatorWriterRecovery
+WriterRecoveryInputs == ExactWriterEvidenceAvailable /\ (Writer.scratch \/ Writer.cleanup/="none")
+
+\* Both routes reacquire the original ordered EX union and prove the bound
+\* scratch before writing intent. After intent, absence can resume cleanup.
+FindUnmarkedScratchAbsent == HostOnly(Writer.interrupted /\ ~Writer.oldLocks
+  /\ Writer.scratch /\ Writer.cleanup="none"
+  /\ h'=[h EXCEPT !.writer.scratch=FALSE])
+ClaimWriterCleanup(evidence) == HostOnly(Writer.interrupted /\ ~Writer.oldLocks /\ ~Writer.held
+  /\ (WriterRecoveryAuthorized
+      \/ (Mutation="writer-recover-legacy" /\ Writer.phase="idle")
+      \/ (Mutation="writer-accept-ack-only" /\ OperatorCase /\ ExactOperatorAck /\ Writer.attestation= <<>>)
+      \/ (Mutation="writer-accept-stale-attestation" /\ OperatorCase /\ ExactOperatorAck
+          /\ Writer.attestation=StaleWriterTurnKey)
+      \/ (Mutation="writer-accept-closure-only" /\ OperatorCase /\ ExactOperatorClosure)
+      \/ (Mutation="writer-unknown-is-idle" /\ Writer.phase \in {"starting","running","partial-idle"}))
+  /\ (evidence=WriterReservation
+      \/ (Mutation="writer-partial-union" /\ evidence.locks= <<WriterLockUnion[1]>>)
+      \/ (Mutation="writer-stale-owner" /\ evidence.owner=PreviousWriterOwner)
+      \/ (Mutation="writer-stale-digest" /\ evidence.digest/=WriterReservation.digest)
+      \/ (Mutation="writer-wrong-scratch" /\ evidence.scratch/=WriterReservation.scratch))
+  /\ (Writer.scratch \/ Writer.cleanup/="none" \/ Mutation="writer-unmarked-absence")
+  /\ h'=[h EXCEPT !.writer.held=TRUE, !.writer.evidence=evidence,
+     !.writer.intentBound=IF Writer.cleanup="none" THEN Writer.scratch ELSE @,
+     !.writer.cleanup=IF @="none" THEN "intent" ELSE @])
+RemoveWriterScratch == HostOnly(Writer.cleanup="intent" /\ Writer.scratch
+  /\ (Writer.held \/ (Mutation="writer-skip-reacquire" /\ Writer.cut="intent"))
+  /\ h'=[h EXCEPT !.writer.scratch=FALSE, !.writer.unheldCleanup=~Writer.held])
+SyncWriterCleanup == HostOnly(Writer.held /\ Writer.cleanup="intent" /\ ~Writer.scratch
+  /\ h'=[h EXCEPT !.writer.cleanup="synced"])
+InterruptWriterCleanup == HostOnly(Writer.held /\ Writer.cut="none"
+  /\ h'=[h EXCEPT !.writer.held=FALSE,
+     !.writer.cut=IF Writer.cleanup="synced" THEN "synced" ELSE IF Writer.scratch THEN "intent" ELSE "removed"])
+SettleWriter == HostOnly(Mutation/="writer-stall-settlement"
+  /\ ((Writer.held /\ Writer.cleanup="synced" /\ Writer.settlements=0)
+      \/ (Mutation="writer-double-settle" /\ Writer.settlements=1))
+  /\ h'=[h EXCEPT !.writer.phase="settled", !.writer.held=FALSE, !.writer.settlements=@+1,
+     !.writer.outcome=IF Mutation="writer-rewrite-outcome" THEN "settled" ELSE @])
+WriterOverlap == (Writer.settlements=1
+  \/ (Mutation="writer-overlap-early" /\ Writer.interrupted /\ ~Writer.oldLocks /\ WriterMayWrite))
+  /\ AdmitSuccessor
+WriterOther == Writer.interrupted /\ (Mutation/="writer-global-fence" \/ Writer.settlements=1) /\ Other
+WriterFlow == WriterReader \/ StageWriterHandoff \/ ReserveWriter
+  \/ (\E input \in WriterInputs: ValidateWriterInput(input))
+  \/ ArmWriter \/ RunWriter \/ PublishWriterIdle \/ SaveWriterResult
+  \/ (\E evidence \in OfferedWriterEvidence: ClaimWriterCleanup(evidence))
+  \/ RemoveWriterScratch \/ SyncWriterCleanup \/ SettleWriter \/ WriterOverlap \/ FinishSuccessor
+WriterNext == WriterFlow \/ WriterOther \/ InvalidateWriterInput \/ InterruptWriter
+  \/ StopWriter \/ DropOldWriterLocks \/ FindUnmarkedScratchAbsent \/ InterruptWriterCleanup
+  \/ (\E attestation \in OperatorAttestations: ReceiveOperatorAttestation(attestation))
+  \/ AcknowledgeOperatorRecovery
+WriterSpec == HostInit /\ [][WriterNext]_hv /\ WF_hv(WriterFlow) /\ WF_hv(WriterOther)
+
+WriterHandoffSafe ==
+  /\ (Writer.handoff/= <<>> => Writer.handoff=OriginalHandoff)
+  /\ (Writer.phase/="new" => Writer.admittedHandoff=WriterReservation)
+  /\ (Writer.checked/= <<>> => ValidWriterInput(Writer.checked))
+WriterNoReplay == Writer.starts<=1
+WriterOperatorSafe ==
+  /\ (Writer.operatorAck/= <<>> => OperatorCase /\ Writer.interrupted /\ ExactOperatorAck)
+  /\ (Writer.phase="operator-closed" => OperatorCase /\ Writer.interrupted /\ ExactOperatorClosure)
+WriterCleanupSafe == Writer.cleanup/="none" =>
+  Writer.interrupted
+  /\ (IF CommandOnlyTurn THEN Writer.phase \in {"idle","settled"}
+      ELSE OperatorClosureAuthorized /\ Writer.phase \in {"operator-closed","settled"})
+  /\ ~Writer.oldLocks /\ ~WriterMayWrite /\ Writer.intentBound /\ Writer.evidence=WriterReservation
+  /\ ~Writer.unheldCleanup /\ (Writer.cleanup="synced" => ~Writer.scratch)
+WriterSettlesOnce == Writer.settlements<=1 /\ (Writer.settlements=1 => Writer.cleanup="synced")
+WriterOutcomeStable == Writer.interrupted =>
+  Writer.outcome=WriterLossOutcome /\ Writer.result=Writer.resultAtLoss
+WriterOverlapSafe == h.successor/="queued" =>
+  Writer.settlements=1 /\ Writer.phase="settled" /\ ~WriterMayWrite /\ writerAdmitted
+WriterUnverifiableFenced == ~ExactWriterEvidenceAvailable =>
+  Writer.settlements=0 /\ h.successor="queued"
+WriterSafety == WriterHandoffSafe /\ WriterNoReplay /\ WriterCleanupSafe
+  /\ WriterSettlesOnce /\ WriterOutcomeStable /\ WriterOverlapSafe /\ WriterUnverifiableFenced /\ WriterOperatorSafe
+WriterRecoveryProgress ==
+  [] ((WriterRecoveryAuthorized /\ ~Writer.oldLocks /\ WriterRecoveryInputs)
+      => (([] WriterRecoveryInputs) => <> (Writer.settlements=1)))
+WriterDisjointProgress == Writer.interrupted ~> h.unrelated="done"
+WriterSuccessorProgress == Writer.settlements=1 ~> h.successor="done"
+NoWriterUnlockedDisjoint == ~(Writer.interrupted /\ ~Writer.oldLocks /\ WriterMayWrite /\ h.unrelated="done")
+NoLegacyIdleDisjoint == ~(~CommandOnlyTurn /\ Writer.interrupted /\ ~Writer.oldLocks
+  /\ Writer.phase="idle" /\ Writer.starts=1 /\ h.unrelated="done")
+NoWriterUnverifiableIdle == ~(~ExactWriterEvidenceAvailable /\ WriterIdleRecovery
+  /\ Writer.starts=1 /\ Writer.scratch /\ h.unrelated="done")
+NoWriterPartialIdleFence == ~(Writer.interrupted /\ Writer.phase="partial-idle" /\ h.unrelated="done")
+NoWriterInvalidHandoffFence == ~(~Writer.valid /\ Writer.interrupted /\ Writer.starts=0 /\ h.unrelated="done")
+NoWriterUnknownRetirement == ~(Writer.outcome="unknown" /\ Writer.starts=1 /\ h.successor="done")
+NoWriterSavedRetirement == ~(Writer.outcome="success" /\ h.successor="done")
+NoWriterIntentRecovery == ~(Writer.cut="intent" /\ Writer.settlements=1)
+NoWriterRemovalRecovery == ~(Writer.cut="removed" /\ Writer.settlements=1)
+NoWriterSyncRecovery == ~(Writer.cut="synced" /\ Writer.settlements=1)
+OperatorFenceExercised == ~Writer.oldLocks /\ h.unrelated="done"
+NoOperatorAckOnlyDisjoint == ~(ExactOperatorAck /\ Writer.attestation= <<>> /\ OperatorFenceExercised)
+NoOperatorStaleDisjoint == ~(ExactOperatorAck /\ Writer.attestation=StaleWriterTurnKey /\ OperatorFenceExercised)
+NoOperatorClosureOnlyDisjoint == ~(ExactOperatorClosure /\ Writer.operatorAck= <<>> /\ OperatorFenceExercised)
+NoOperatorUnverifiableDisjoint == ~(OperatorWriterRecovery /\ ~ExactWriterEvidenceAvailable /\ OperatorFenceExercised)
+NoOperatorRetirementAfterRemoval ==
+  ~(OperatorClosureAuthorized /\ Writer.starts=1 /\ Writer.outcome="unknown" /\ Writer.cut="removed"
+    /\ h.successor="done")
 =============================================================================
