@@ -22,22 +22,35 @@ impl ProjectBroker {
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
         let root = self.native_root(&hint)?;
         let meta = self.meta(&root)?;
-        let Some(input) = input else {
+        let (reader, setup, activity) = if let Some(input) = input {
+            let activity = self.preparation_activity(&root).await?;
+            let mut selected = imports;
+            selected.extend(request.candidate_modules.iter().cloned());
+            (Self::prepared_reader(&root, &meta, input, &selected)?, None, activity)
+        } else {
             let file = request
                 .goal
                 .file_label
                 .as_deref()
                 .ok_or_else(|| invalid("missing semantic source file"))?;
-            let (_setup, _reader, _activity) = self
+            let (setup, mut reader, activity) = self
                 .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
                 .await?;
-            return Err(invalid(
-                "semantic runtime 0.7.8 cannot elaborate a goal with the selected Lake ModuleSetup",
-            ));
+            // The released 0.7.8 payload predates the Lean-only setup entry point.
+            if lean_semantic_search_runtime::RUNTIME_SOURCE_DIGEST
+                == "cd1dc009159d1d466f845840f837d5fc9478a92562e383031af6124d3d10ce3a"
+            {
+                return Err(invalid(
+                    "semantic runtime 0.7.8 cannot elaborate a goal with the selected Lake ModuleSetup",
+                ));
+            }
+            reader.roots = crate::lake_meta::artifact_roots(&root);
+            if reader.roots.iter().any(|p| !reader.custody.covers_artifact_root(p)) {
+                return Err(invalid("semantic declaration root outside held project domains"));
+            }
+            reader.roots.push(reader.sysroot.join("lib/lean"));
+            (reader, Some(setup), activity)
         };
-        let activity = self.preparation_activity(&root).await?;
-        let mut selected = imports;
-        selected.extend(request.candidate_modules.iter().cloned());
         let PreparedReader {
             custody,
             sysroot,
@@ -45,7 +58,7 @@ impl ProjectBroker {
             shim_guards,
             roots,
             ..
-        } = Self::prepared_reader(&root, &meta, input, &selected)?;
+        } = reader;
         let cancellation = CallCancellation::current();
         let label = meta.toolchain.clone();
         let prefix = sysroot.clone();
@@ -113,7 +126,13 @@ impl ProjectBroker {
             Some(Box::new((activity, shim_guards, runtime_guard))),
             move |assets| {
                 let driver = assets.join("SemanticFeatures.lean");
-                fs::write(&driver, include_bytes!("../lake/SemanticFeatures.lean"))?;
+                let entry = if let Some(setup) = setup {
+                    fs::write(assets.join("module.setup.json"), setup.bytes)?;
+                    include_str!("../lake/SemanticSetup.lean")
+                } else {
+                    include_str!("../lake/SemanticPrepared.lean")
+                };
+                fs::write(&driver, [include_str!("../lake/SemanticFeatures.lean"), entry].concat())?;
                 let data = assets.join("semantic.json");
                 fs::write(&data, body)?;
                 Ok(crate::native_reader::NativeReaderProgram {

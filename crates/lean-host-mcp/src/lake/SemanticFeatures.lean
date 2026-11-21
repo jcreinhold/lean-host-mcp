@@ -61,13 +61,13 @@ private def commandResponse (raw command version : String) : IO CommandResponse 
     throw (IO.userError "unexpected semantic response contract")
   return response
 
-unsafe def run (path : String) : IO String := do
+unsafe def run (path : String) (goalFeatures : Json → IO String) : IO String := do
   let input ← readInput path
   if input.roots.isEmpty then
     throw (IO.userError "semantic search requires explicit import roots")
   searchPathRef.set (input.roots.toList.map System.FilePath.mk)
   let goal ← commandResponse
-    (← LeanSemanticSearch.Capability.proofGoalFeatures input.goal.compress)
+    (← goalFeatures input.goal)
     LeanSemanticSearch.JsonSupport.proofGoalCommand
     LeanSemanticSearch.JsonSupport.proofGoalFeatureCommandVersion
   let declarations ← commandResponse
@@ -81,8 +81,3 @@ unsafe def run (path : String) : IO String := do
   return frame
 
 end LeanHostSemantic
-
-unsafe def main (args : List String) : IO Unit := do
-  let [path] := args | throw (IO.userError "expected one staged semantic request")
-  let frame ← IO.withStdout (← IO.getStderr) (LeanHostSemantic.run path)
-  (← IO.getStdout).putStrLn frame

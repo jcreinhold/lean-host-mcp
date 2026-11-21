@@ -139,6 +139,7 @@ pub struct SearchForProofResult {
 
 #[derive(Debug, Clone)]
 struct TargetProfile {
+    source_declaration: Option<String>,
     kind: GoalProfileKind,
     namespace: Option<String>,
     constants: Vec<String>,
@@ -282,7 +283,7 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
         let semantic =
             semantic_request_for_source(&root, &input, &declaration, &req.proof_position, None, &imports, limit)
                 .ok_or_else(|| ServerError::BadProject("cannot select semantic source module".into()))?;
-        return Ok(profile_from_text(
+        let mut profile = profile_from_text(
             explicit_text,
             None,
             imports,
@@ -290,7 +291,9 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
             None,
             Vec::new(),
             Some(semantic),
-        ));
+        );
+        profile.source_declaration = Some(declaration);
+        return Ok(profile);
     }
 
     Ok(profile_from_text(
@@ -318,6 +321,7 @@ fn profile_from_text(
     let kind = classify_goal_profile(&text, &constants);
     let name_fragments = extract_name_fragments(&text, &constants, &heads, kind);
     TargetProfile {
+        source_declaration: None,
         kind,
         namespace,
         constants,
@@ -598,6 +602,7 @@ fn rank_results(
     let mut by_name: BTreeMap<String, CandidateAccumulator> = BTreeMap::new();
     let mut warnings = warnings;
 
+    let semantic_only = search_results.is_empty() && profile.semantic.is_some();
     if let Some(semantic) = semantic {
         generated_count = generated_count.saturating_add(semantic.declaration_rows);
         for diagnostic in semantic.diagnostics {
@@ -635,7 +640,13 @@ fn rank_results(
                     is_internal: false,
                 },
             };
-            let score = candidate_score(&row, profile, mode, "semantic");
+            // With no lexical search, retain the semantic ranker's order. A name
+            // penalty must not demote a statement match below a shared constant.
+            let score = if semantic_only {
+                row.score
+            } else {
+                candidate_score(&row, profile, mode, "semantic")
+            };
             let entry = by_name.entry(row.name.clone()).or_insert_with(|| CandidateAccumulator {
                 row: row.clone(),
                 score,
@@ -672,6 +683,9 @@ fn rank_results(
         }
     }
 
+    if let Some(name) = &profile.source_declaration {
+        by_name.remove(name);
+    }
     // Name-fragment bonus, applied once per candidate now that the full set of
     // corroborating searches is known. The structural `+10` is earned only when
     // a head or required-constants search also vouches for the candidate; a bare
