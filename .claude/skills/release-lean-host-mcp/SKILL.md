@@ -31,22 +31,22 @@ another worker's staged files.
 
 ## Validate the release commit
 
-Run `scripts/prerelease.sh` in full. `--quick` skips cargo-deny and is only for iteration. Use the fixture's Lean
-toolchain and export its `LEAN_SYSROOT` for the full invocation as described in `AGENTS.md` and CI.
+Run `scripts/prerelease.sh` in full with cargo-deny installed. `--quick` is for iteration. The runner resolves the
+fixture's Lean pin through Elan.
 
-Check packaging explicitly:
+Test the packaged proof and search paths:
 
 ```sh
-cargo package --workspace --locked
+scripts/test-installed-module-setup.sh
 ```
 
-Cargo verifies each packaged member with access to the archives of selected workspace dependencies.
-Check the parent archive for its crate-local README and the worker archive for Cargo.lock, as Verify does.
+The smoke test runs `cargo package --workspace --locked` before installing from the unpacked archives. Check the parent
+archive for its crate-local README and the worker archive for Cargo.lock, as Verify does.
 External SDK and semantic dependencies must resolve from the configured registry.
 
-Confirm `CARGO_REGISTRY_TOKEN` is configured for the workflow without printing its value. A manual workflow run with
-`dry_run: true` rehearses verification and packaging without publishing. Present the exact release commit, matching
-`vX.Y.Z` tag, changelog, and validation results for approval.
+Confirm `CARGO_REGISTRY_TOKEN` is configured for the workflow without printing its value. Dispatch the workflow from
+`main` to rehearse verification and packaging. Present the exact release commit, matching `vX.Y.Z` tag, changelog, and
+validation results for approval.
 
 ## Publish after confirmation
 
@@ -56,10 +56,10 @@ git tag -s vX.Y.Z -m "lean-host-mcp vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-The tag must match the workspace version and identify the verified release commit. The workflow's Lean-equipped `verify`
-job checks both packages, then the Lean-free `publish` job uploads worker first and parent second with `--no-verify`,
+The tag must match the workspace version and identify the verified release commit. The `verify` job checks the exact
+changelog section and both packages. The `publish` job then uploads worker first and parent second with `--no-verify`,
 relying on that verification. Watch the run through completion and report the published versions and release URL.
 
-If publication stops after one crate, inspect the failure before retrying. A manual run with `dry_run: false` skips
-versions already present on crates.io and uploads only the missing crate. Published versions cannot be replaced; a bad
-release can only be yanked.
+If publication stops after one crate, inspect the failure and rerun the original tagged workflow. The publish job skips
+versions already present on crates.io, uploads the missing crate, and creates the GitHub Release. Published versions are
+immutable and can be yanked.

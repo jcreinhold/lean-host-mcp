@@ -1,21 +1,36 @@
 """Exercise the public no-build ModuleSetup handoff on a disposable cached project."""
 
+import argparse
 import hashlib
 import json
 import os
 import select
-import sys
 import subprocess as s
-import argparse
+import sys
 from pathlib import Path
 
-r = Path(__file__).resolve().parents[2]
-b = Path(os.environ.get("R2_SETUP_ROOT", r / "target/r2-module-setup"))
-parent = Path(os.environ.get("R2_SETUP_PARENT", r / "target/debug/lean-host-mcp"))
-release = Path.home() / ".elan/toolchains/leanprover--lean4---v4.36.0"
-assert (b / "workers/v4.36.0/current-generation").is_file(), (
-    "install the matching 4.36 worker and shims first"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--already-built",
+    action="store_true",
+    help="exercise both existing test projects without any fixture build",
 )
+args = parser.parse_args()
+
+r = Path(__file__).resolve().parents[2]
+b = Path(os.environ.get("R2_SETUP_ROOT") or r / "target/r2-module-setup").resolve()
+parent = Path(os.environ.get("R2_SETUP_PARENT") or r / "target/debug/lean-host-mcp").resolve()
+toolchain = (r / "fixtures/lean/lean-toolchain").read_text().strip()
+toolchain_id = toolchain.rsplit(":", 1)[-1]
+worker = b / "workers" / toolchain_id / "current-generation"
+if not worker.is_file():
+    parser.error(f"install the matching {toolchain_id} worker and shims first: {worker}")
+if not parent.is_file() or not os.access(parent, os.X_OK):
+    parser.error(f"expected an executable parent binary: {parent}")
+prefix_check = s.run([r / "scripts/fixture-lean-prefix.sh"], cwd=r, stdout=s.PIPE, text=True)
+if prefix_check.returncode != 0:
+    raise SystemExit(prefix_check.returncode)
+release = Path(prefix_check.stdout.rstrip("\n"))
 env = dict(
     os.environ,
     LEAN_SYSROOT=str(release),
@@ -46,7 +61,7 @@ def build(project, plugin):
     (project / facts.parent).mkdir(exist_ok=True)
     (project / facts).write_bytes((r / "fixtures/lean" / facts).read_bytes())
     (project / "lakefile.lean").write_text(config + "\n")
-    (project / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n")
+    (project / "lean-toolchain").write_text(toolchain + "\n")
     (project / "Witness.lean").write_text(
         'import Lean\nregister_option r2PluginWitness : Bool := { defValue := false, descr := "plugin witness" }\n'
     )
@@ -140,7 +155,15 @@ def probe(p, *, search=False):
         )
     finally:
         proc.stdin.close()
-        assert proc.wait(timeout=30) == 0
+        try:
+            exit_status = proc.wait(timeout=30)
+        except s.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            proc.stdout.close()
+        assert exit_status == 0, f"server exited with status {exit_status}"
 
 
 def row(reply):
@@ -149,14 +172,6 @@ def row(reply):
     assert not envelope["errors"], envelope
     return envelope["data"]["results"][0]
 
-
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument(
-    "--already-built",
-    action="store_true",
-    help="exercise both existing test projects without any fixture build",
-)
-args = parser.parse_args()
 
 for label, plugin in [("project", True), ("omitted", False)]:
     project = b / label

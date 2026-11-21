@@ -5,18 +5,15 @@ name: Release
 # creates a GitHub Release whose body is the matching `## [<version>]` section of
 # `CHANGELOG.md` (`publish`, depends on `verify`).
 #
-# Manual re-runs use `workflow_dispatch` with `dry_run: true` to exercise the
-# gates and packaging without uploading or creating a release. A live re-run
-# (dry_run: false) is idempotent: each crate is skipped if its version is
-# already on crates.io, so a partial release can be completed without burning a
-# version (crates.io versions are immutable).
+# Manual runs rehearse verification and packaging. To recover a partial
+# release, rerun the original tagged workflow. It skips crate versions that
+# are already on crates.io.
 #
 # `CARGO_REGISTRY_TOKEN` must be set in the repository secrets before the first
 # tag push — a scoped publish token from <https://crates.io/settings/tokens>.
 #
-# Verify builds the checkout members separately, then packages the workspace
-# together so Cargo verifies each archive with access to its packaged siblings.
-# Publish reuses that gate and needs neither Lean nor a token for a rehearsal.
+# Verify builds the checkout members separately and tests the packaged pair.
+# Publish needs the verification result and runs without a Lean toolchain.
 
 on:
   push:
@@ -24,21 +21,18 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Run all gates but skip the crates.io publish and GitHub Release."
-        type: boolean
-        default: false
 
 concurrency:
-  # One release at a time per tag. `cancel-in-progress: false`: a half-finished
-  # publish that gets cancelled mid-run wastes a published crate version
-  # (crates.io versions are immutable).
-  group: release-${{ github.ref }}
+  # Keep rehearsals separate from tagged releases and let an active release finish.
+  group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,69 +41,92 @@ env:
 jobs:
   verify:
     name: Verify
+    if: github.event_name != 'push' || !github.event.deleted
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      notes: ${{ steps.release.outputs.notes }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      # Development may patch an unpublished worker fix, but a release must
-      # resolve the same published sources that downstream users receive.
-      - name: Reject unpublished dependency patches
+      - name: Select Rust from rust-toolchain.toml
+        run: rustup show
+
+      - name: Validate release version and changelog
+        id: release
         run: |
           python3 - <<'PYTHON'
+          import json
+          import os
           import pathlib
+          import subprocess
           import tomllib
+          import uuid
 
-          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          with pathlib.Path("Cargo.toml").open("rb") as manifest_file:
+              manifest = tomllib.load(manifest_file)
+          # Release dependencies must resolve from the sources users receive.
           if manifest.get("patch"):
               raise SystemExit("Release blocked: publish upstream fixes and remove Cargo.toml patches first")
+          version = manifest["workspace"]["package"]["version"]
+          metadata = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--locked", "--no-deps", "--format-version", "1",
+          ]))
+          versions = {package["name"]: package["version"] for package in metadata["packages"]}
+          for name in ("lean-host-mcp", "lean-host-mcp-worker"):
+              if versions.get(name) != version:
+                  raise SystemExit(f"{name} must use workspace version {version}")
+          if os.environ["GITHUB_EVENT_NAME"] == "push":
+              expected_ref = f"refs/tags/v{version}"
+              ref = os.environ["GITHUB_REF"]
+              if ref != expected_ref:
+                  raise SystemExit(f"Release ref {ref} does not match workspace version {version} ({expected_ref})")
+
+          heading = f"## [{version}]"
+          lines = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          body = []
+          found = False
+          for line in lines:
+              if found and line.startswith("## "):
+                  break
+              if found:
+                  body.append(line)
+              elif line == heading or line.startswith(f"{heading} "):
+                  found = True
+          notes = "\n".join(body)
+          if not notes.strip():
+              raise SystemExit(f"CHANGELOG.md needs a nonblank [{version}] section")
+
+          delimiter = uuid.uuid4().hex
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
+              print(f"package_dir={pathlib.Path(metadata['target_directory']) / 'package'}", file=output)
+              print(f"notes<<{delimiter}\n{notes}\n{delimiter}", file=output)
           PYTHON
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install fixture Lean toolchain
+        run: scripts/ci-setup-lean.sh
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('fixtures/lean/lean-toolchain') }}
 
-      - name: Install elan + supported Lean toolchain
-        run: |
-          set -euo pipefail
-          # A real, supported Lean toolchain is mandatory to build/test the
-          # worker (lean-rs-sys's build.rs hashes lean.h and fails unless it
-          # matches SUPPORTED_TOOLCHAINS). Track the fixture's pin so the gate
-          # follows the supported head automatically.
-          toolchain="$(cat fixtures/lean/lean-toolchain)"
-          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-            | sh -s -- -y --default-toolchain "$toolchain"
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          prefix="$("$HOME/.elan/bin/elan" run --install "$toolchain" lean --print-prefix)"
-          [[ "$prefix" = /* ]]
-          test -f "$prefix/include/lean/lean.h"
-          test -f "$prefix/lib/lean/libleanshared.so"
-          echo "LEAN_SYSROOT=$prefix" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
 
-      - name: Verify tag matches workspace version
-        if: github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          version="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="lean-host-mcp"))')"
-          expected="v${version}"
-          if [ "$tag" != "$expected" ]; then
-            echo "::error::Tag $tag does not match workspace version $version (expected $expected). Bump Cargo.toml or re-tag."
-            exit 1
-          fi
-          echo "Tag $tag matches workspace version $version"
+      - name: Dependency policy
+        run: cargo deny --locked check
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       # clippy --workspace is link-safe (no final link happens) per AGENTS.md.
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # rustdoc per member: a broken or private intra-doc link ships to docs.rs
       # as dead text, so fail on it here.
@@ -117,46 +134,43 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc -p lean-host-mcp --no-deps
-          cargo doc -p lean-host-mcp-worker --no-deps
+          cargo doc --locked -p lean-host-mcp --no-deps
+          cargo doc --locked -p lean-host-mcp-worker --no-deps
 
       # Build and test PER-MEMBER: selecting both members in one build
       # unifies the lean-rs-sys feature set across the parent and
       # worker, silently re-linking libleanshared into the parent.
       - name: build (parent)
-        run: cargo build -p lean-host-mcp --all-targets
+        run: cargo build --locked -p lean-host-mcp --all-targets
 
-      - name: build (worker)
-        run: cargo build -p lean-host-mcp-worker --all-targets
+      - name: test (worker)
+        run: cargo test --locked -p lean-host-mcp-worker --all-targets
 
       - name: test (parent)
         run: scripts/test-installed-stdio.sh --all-targets
 
-      - name: parent ⊥ libleanshared
-        run: |
-          set -euo pipefail
-          cargo build --release -p lean-host-mcp
-          if ldd target/release/lean-host-mcp | grep -q libleanshared; then
-            echo "FAIL: parent links libleanshared" >&2
-            exit 1
-          fi
+      - name: Check parent linkage
+        run: scripts/check-parent-link.sh
 
-      - name: Verify workspace packages and installer inputs
+      # This also runs `cargo package --workspace --locked` to verify both archives.
+      - name: Test packaged proof and semantic search
+        run: scripts/test-installed-module-setup.sh
+
+      - name: Check packaged installer inputs
+        env:
+          PACKAGE_DIR: ${{ steps.release.outputs.package_dir }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          set -euo pipefail
-          cargo package --workspace --locked
           python3 - <<'PYTHON'
-          import json
+          import os
           import pathlib
-          import subprocess
           import tarfile
 
-          metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]))
-          archives = pathlib.Path(metadata["target_directory"]) / "package"
+          archives = pathlib.Path(os.environ["PACKAGE_DIR"])
+          version = os.environ["RELEASE_VERSION"]
           inputs = {"lean-host-mcp": "README.md", "lean-host-mcp-worker": "Cargo.lock"}
           for name, required in inputs.items():
-              package = next(p for p in metadata["packages"] if p["name"] == name)
-              stem = f"{name}-{package['version']}"
+              stem = f"{name}-{version}"
               with tarfile.open(archives / f"{stem}.crate", "r:gz") as archive:
                   if not archive.getmember(f"{stem}/{required}").isfile():
                       raise SystemExit(f"{stem}: expected packaged file {required}")
@@ -167,82 +181,60 @@ jobs:
     permissions:
       contents: write # Create the GitHub Release after publication.
     needs: verify
-    if: inputs.dry_run != true
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Select Rust from rust-toolchain.toml
+        run: rustup show
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Resolve workspace version
-        id: ver
+      - name: Require verified release information
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_NOTES: ${{ needs.verify.outputs.notes }}
         run: |
-          set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="lean-host-mcp"))')"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ -z "$RELEASE_VERSION" || -z "$RELEASE_NOTES" ]]; then
+            echo "::error::Verify did not provide the version and release notes."
+            exit 1
+          fi
 
       - name: Publish to crates.io (worker first, idempotent)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          set -euo pipefail
-          version="${{ steps.ver.outputs.version }}"
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
             echo "::error::CARGO_REGISTRY_TOKEN secret is not configured."
             exit 1
           fi
           publish_one() {
-            crate="$1"; shift
+            local crate="$1" status
             # crates.io returns 200 for an existing version, 404 otherwise. A
             # User-Agent is required or the API returns 403.
-            status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            status=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+              --output /dev/null --write-out '%{http_code}' \
               -H "User-Agent: lean-host-mcp-release (github.com/jcreinhold/lean-host-mcp)" \
-              "https://crates.io/api/v1/crates/$crate/$version")
+              "https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION")
             case "$status" in
-              200) echo "$crate@$version already published"; return 0 ;;
+              200) echo "$crate@$RELEASE_VERSION already published"; return 0 ;;
               404) ;;
-              *) echo "::error::Could not check $crate@$version (HTTP $status)"; return 1 ;;
+              *) echo "::error::Could not check $crate@$RELEASE_VERSION (HTTP $status)"; return 1 ;;
             esac
-            echo "→ publishing $crate@$version"
-            cargo publish --locked -p "$crate" "$@"
+            echo "Publishing $crate@$RELEASE_VERSION"
+            cargo publish --locked --no-verify --registry crates-io -p "$crate"
           }
-          # Worker first: a user must never install a parent whose install-worker
-          # resolves a not-yet-published worker. Both publish with --no-verify:
-          # the verify build pulls lean-rs-sys (and, for the worker, links
-          # libleanshared), which demands a Lean toolchain this Lean-free job
-          # does not have. The `verify` gate built both members, tested the parent,
-          # verified both packaged crates with their installer inputs.
-          publish_one lean-host-mcp-worker --no-verify
-          publish_one lean-host-mcp --no-verify
-
-      - name: Extract CHANGELOG section for this release
-        if: inputs.dry_run != true && github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
-            capture && /^## \[/ { exit }
-            capture { print }
-          ' CHANGELOG.md > release-body.md
-          if [ ! -s release-body.md ]; then
-            echo "::error::No CHANGELOG section for [$version]; add one before tagging."
-            exit 1
-          fi
-          echo "--- Release body ---"
-          cat release-body.md
-          echo "--- End release body ---"
+          # The parent installs the worker at its own exact version. Cargo
+          # repackages both crates here. The Verify job builds the packages with Lean.
+          publish_one lean-host-mcp-worker
+          publish_one lean-host-mcp
 
       - name: Create GitHub Release
-        if: inputs.dry_run != true && github.event_name == 'push'
         uses: softprops/action-gh-release@v3
         with:
-          body_path: release-body.md
+          body: ${{ needs.verify.outputs.notes }}
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}

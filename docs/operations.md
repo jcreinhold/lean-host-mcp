@@ -378,22 +378,31 @@ smoke failure is also a hard refusal with an actionable reinstall command.
 ## Build, test, lint
 
 ```sh
-cargo build -p lean-host-mcp                          # parent only
-cargo build -p lean-host-mcp-worker                   # worker only (links libleanshared)
-cargo clippy --workspace --all-targets -- -D warnings # safe; clippy doesn't link
-cargo test -p lean-host-mcp --lib                     # unit tests; no Lean fixture required
-scripts/test-installed-stdio.sh --all-targets         # includes installed-worker EOF and exit
+cargo build --locked -p lean-host-mcp                          # parent only
+cargo build --locked -p lean-host-mcp-worker                   # worker only (links libleanshared)
+cargo clippy --locked --workspace --all-targets -- -D warnings # safe; clippy doesn't link
+cargo test --locked -p lean-host-mcp --lib                      # parent unit tests
+cargo test --locked -p lean-host-mcp-worker --all-targets       # worker tests
+scripts/test-installed-stdio.sh --all-targets                  # includes installed-worker EOF and exit
+scripts/test-installed-module-setup.sh                         # packaged proof and semantic search
+scripts/check-parent-link.sh                                  # build and inspect the release parent
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
-    cargo test -p lean-host-mcp --test e2e -- --ignored   # opt-in end-to-end
+    cargo test --locked -p lean-host-mcp --test e2e -- --ignored
 ```
 
-Build per-member (`-p <name>`); avoid `cargo build --workspace`, which unifies the `lean-rs-sys` feature set across
-members and silently links `libleanshared` into the parent. The invariant is asserted by:
+Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
+and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
+`cargo package --workspace --locked` to verify the archives and installs from the unpacked sources in the target
+directory's `package/` subdirectory.
 
-```sh
-! otool -L target/release/lean-host-mcp | grep -q libleanshared    # macOS
-! ldd  target/release/lean-host-mcp | grep -q libleanshared        # Linux
-```
+The installed smoke scripts require Python 3.11 or later and a native build. They resolve the pin in
+`fixtures/lean/lean-toolchain` through Elan and use Cargo's configured target directory for artifacts. Keep the matching
+toolchain under `~/.elan/toolchains` for worker installation and discovery. `LEAN_SYSROOT` can select a matching prefix
+for the build. Run `actionlint` and `shellcheck scripts/*.sh` to lint the workflow and shell files.
+
+Dispatch the Release workflow from `main` to rehearse verification and packaging. A push of a matching `v<version>` tag
+triggers publication after the changelog and packages pass verification. To recover after partial publication, rerun
+the original tagged workflow. It skips crate versions already present on crates.io and continues to GitHub Release creation.
 
 ## Smoke and performance baseline
 

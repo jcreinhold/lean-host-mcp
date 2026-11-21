@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -15,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
@@ -22,66 +27,47 @@ jobs:
       # that drags a pre-0.3 lean-rs copy back into the graph fails here with a
       # named diagnostic instead of as a deep E0308 in a consumer.
       - name: cargo deny check
-        run: cargo deny check
+        run: cargo deny --locked check
 
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust
+        with:
+          persist-credentials: false
+      - name: Select Rust from rust-toolchain.toml
         run: rustup show
+      - name: Install the fixture Lean toolchain
+        run: scripts/ci-setup-lean.sh
       - name: Cache
         uses: Swatinem/rust-cache@v2
-      - name: Install elan + supported Lean toolchain
-        run: |
-          set -euo pipefail
-          # A real, supported Lean toolchain is mandatory: lean-rs-sys's build.rs
-          # discovers the prefix, hashes lean.h, and fails early unless it matches
-          # SUPPORTED_TOOLCHAINS (intentional ABI guard). `--default-toolchain none`
-          # builds nothing past fmt. Track the fixture's pin so CI follows the
-          # supported head automatically.
-          toolchain="$(cat fixtures/lean/lean-toolchain)"
-          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-            | sh -s -- -y --default-toolchain "$toolchain"
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          prefix="$("$HOME/.elan/bin/elan" run --install "$toolchain" lean --print-prefix)"
-          [[ "$prefix" = /* ]]
-          test -f "$prefix/include/lean/lean.h"
-          test -f "$prefix/lib/lean/libleanshared.so"
-          echo "LEAN_SYSROOT=$prefix" >> "$GITHUB_ENV"
+        with:
+          key: lean-${{ hashFiles('fixtures/lean/lean-toolchain') }}
       - name: fmt
         run: cargo fmt --all -- --check
       # clippy --workspace is link-safe (no final link happens) per AGENTS.md.
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # rustdoc per member: a broken or private intra-doc link ships to docs.rs
       # as dead text, so fail on it here.
       - name: rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc -p lean-host-mcp --no-deps
-          cargo doc -p lean-host-mcp-worker --no-deps
+          cargo doc --locked -p lean-host-mcp --no-deps
+          cargo doc --locked -p lean-host-mcp-worker --no-deps
       # Build and test PER-MEMBER: selecting both members in one build
       # unifies the lean-rs-sys feature set across the parent and
       # worker, silently re-linking libleanshared into the parent (AGENTS.md
       # "Build and validation"). That also makes the parent's own test binary
       # unrunnable — it would reference @rpath/libleanshared.dylib with no rpath.
       - name: build (parent)
-        run: cargo build -p lean-host-mcp --all-targets
-      - name: build (worker)
-        run: cargo build -p lean-host-mcp-worker --all-targets
+        run: cargo build --locked -p lean-host-mcp --all-targets
+      - name: test (worker)
+        run: cargo test --locked -p lean-host-mcp-worker --all-targets
       - name: Installed package proof and semantic search
         run: scripts/test-installed-module-setup.sh
       - name: test (parent)
         run: scripts/test-installed-stdio.sh --all-targets
-      # The parent must NOT link libleanshared. Built as a separate per-member
-      # release invocation so the worker's feature set never unifies in.
-      - name: parent ⊥ libleanshared
-        run: |
-          set -euo pipefail
-          cargo build --release -p lean-host-mcp
-          if ldd target/release/lean-host-mcp | grep -q libleanshared; then
-            echo "FAIL: parent links libleanshared" >&2
-            exit 1
-          fi
+      - name: Check the parent link set
+        run: scripts/check-parent-link.sh

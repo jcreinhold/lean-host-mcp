@@ -14,13 +14,14 @@ Build each member separately. `cargo build --workspace` unifies `lean-rs-sys` fe
 the parent, breaking multi-toolchain dispatch. Workspace clippy does not link and is safe.
 
 ```sh
-cargo build -p lean-host-mcp
-cargo build -p lean-host-mcp-worker
+cargo build --locked -p lean-host-mcp
+cargo build --locked -p lean-host-mcp-worker
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p lean-host-mcp --lib
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked -p lean-host-mcp --lib
+cargo test --locked -p lean-host-mcp-worker --all-targets
 scripts/test-installed-stdio.sh --all-targets
-cargo test -p lean-host-mcp --test http_transport
+cargo test --locked -p lean-host-mcp --test http_transport
 ```
 
 The parent library tests need no Lean fixture. The all-target runner provisions a disposable installed worker for the stdio EOF check. Opt-in e2e tests require built fixture `.olean` files and a matching worker:
@@ -28,7 +29,7 @@ The parent library tests need no Lean fixture. The all-target runner provisions 
 ```sh
 LEAN_HOST_MCP_WORKERS_DIR=$PWD/target/release \
 LEAN_HOST_MCP_TEST_FIXTURE=$PWD/fixtures/lean \
-    cargo test -p lean-host-mcp --test e2e -- --ignored
+    cargo test --locked -p lean-host-mcp --test e2e -- --ignored
 ```
 
 For a non-default toolchain, export `LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---<id>` for the whole
@@ -36,13 +37,7 @@ build-and-test invocation. Set `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` for the wor
 rpath; it does not select the header fingerprint baked into dependencies and parent tests. A mismatched header fails
 bootstrap with `lean_rs.loader.unsupported_toolchain_fingerprint`. See CI's environment setup.
 
-Verify the parent link set after a separate release build:
-
-```sh
-cargo build --release -p lean-host-mcp
-! otool -L target/release/lean-host-mcp | grep -q libleanshared    # macOS
-! ldd target/release/lean-host-mcp | grep -q libleanshared         # Linux
-```
+Use `scripts/check-parent-link.sh` to build and inspect the parent separately in release mode.
 
 Run targeted checks for the changed behavior. Before tagging, run the full `scripts/prerelease.sh`; `--quick` skips
 cargo-deny and is for iteration. Release and toolchain-bump procedures live in `.claude/skills/`, with discovery aliases

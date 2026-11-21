@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# scripts/prerelease.sh — run every pre-release gate locally.
+# scripts/prerelease.sh — run the local pre-release checks.
 #
-# Mirrors CI's Rust checks, parent-binary link-set assertion and cargo-deny.
+# Runs the Rust checks, parent link check, and cargo-deny from CI.
 # Adds local taplo/prettier formatting, mdwright linting and cargo-shear.
 # See AGENTS.md "Build and validation" for the per-member build invariant.
 #
@@ -9,17 +9,17 @@
 #
 # All gates are attempted even if an earlier one fails; the run ends with
 # a pass/fail/skip summary and a non-zero exit if anything failed. Optional
-# tools (taplo, mdwright, cargo-deny, cargo-shear) are SKIPPED, not failed,
+# tools (taplo, mdwright, prettier via npx, cargo-deny, cargo-shear) are skipped
 # when absent — so the script runs on any dev box.
 #
 # Usage:
-#   scripts/prerelease.sh            # all gates
+#   scripts/prerelease.sh            # run local checks
 #   scripts/prerelease.sh --quick    # skip cargo-deny for iteration
 #   scripts/prerelease.sh --help
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 QUICK=0
@@ -41,7 +41,7 @@ log_ok() { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
 log_warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 log_err() { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; }
 
-usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^$/p' "$REPO_ROOT/scripts/prerelease.sh" | sed 's/^# \{0,1\}//'; }
 
 # -- arg parsing ------------------------------------------------------------
 
@@ -73,23 +73,14 @@ require_cmd() {
 }
 
 require_cmd cargo "install via https://rustup.rs"
+require_cmd python3 "install Python 3.11 or later"
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 
-# Build against the fixture's pinned toolchain, as ci.yml does. Without this,
-# lean-rs-sys discovers whatever `lean --print-prefix` resolves to from the
-# repo root (elan's default), so the debug worker the stdio lifecycle test
-# spawns links a different libleanshared than the fixture's .oleans need.
-# An explicit LEAN_SYSROOT still wins.
-if [[ -z "${LEAN_SYSROOT:-}" ]]; then
-	fixture_toolchain="$(cat fixtures/lean/lean-toolchain)"
-	export LEAN_SYSROOT="$HOME/.elan/toolchains/leanprover--lean4---${fixture_toolchain##*:}"
-	if [[ ! -d "$LEAN_SYSROOT" ]]; then
-		log_err "fixture toolchain $fixture_toolchain is not installed (elan toolchain install $fixture_toolchain)"
-		exit 2
-	fi
-fi
+# Use the same fixture prefix for the builds and the installed-worker tests.
+LEAN_SYSROOT=$(scripts/fixture-lean-prefix.sh)
+export LEAN_SYSROOT
 
 # -- gate runner ------------------------------------------------------------
 
@@ -122,15 +113,15 @@ run_gate "cargo fmt --all -- --check" \
 	cargo fmt --all -- --check
 
 # clippy --workspace is link-safe (no linking happens) per AGENTS.md.
-run_gate "cargo clippy --workspace --all-targets -- -D warnings" \
-	cargo clippy --workspace --all-targets -- -D warnings
+run_gate "cargo clippy --locked --workspace --all-targets -- -D warnings" \
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # rustdoc per member: a broken or private intra-doc link is a warning docs.rs
 # renders as dead text, so it fails here instead of shipping.
-run_gate "cargo doc -p lean-host-mcp --no-deps (-D warnings)" \
-	env RUSTDOCFLAGS="-D warnings" cargo doc -p lean-host-mcp --no-deps
-run_gate "cargo doc -p lean-host-mcp-worker --no-deps (-D warnings)" \
-	env RUSTDOCFLAGS="-D warnings" cargo doc -p lean-host-mcp-worker --no-deps
+run_gate "cargo doc --locked -p lean-host-mcp --no-deps (-D warnings)" \
+	env RUSTDOCFLAGS="-D warnings" cargo doc --locked -p lean-host-mcp --no-deps
+run_gate "cargo doc --locked -p lean-host-mcp-worker --no-deps (-D warnings)" \
+	env RUSTDOCFLAGS="-D warnings" cargo doc --locked -p lean-host-mcp-worker --no-deps
 
 # Build and test PER-MEMBER. A build selecting both workspace members
 # unifies the `lean-rs-sys` feature set across the
@@ -140,49 +131,18 @@ run_gate "cargo doc -p lean-host-mcp-worker --no-deps (-D warnings)" \
 # unrunnable — it references `@rpath/libleanshared.dylib` with no rpath to
 # find it. Scoping to `-p` keeps the parent on `lean-rs-sys` metadata-only,
 # so its tests run on any machine without the dylib on the loader path.
-run_gate "cargo build -p lean-host-mcp --all-targets" \
-	cargo build -p lean-host-mcp --all-targets
+run_gate "cargo build --locked -p lean-host-mcp --all-targets" \
+	cargo build --locked -p lean-host-mcp --all-targets
 
-run_gate "cargo build -p lean-host-mcp-worker --all-targets" \
-	cargo build -p lean-host-mcp-worker --all-targets
+run_gate "cargo build --locked -p lean-host-mcp-worker --all-targets" \
+	cargo build --locked -p lean-host-mcp-worker --all-targets
 
-# The worker crate has no tests of its own (a 2-line entry point); the worker
-# build gate above is its coverage. Test the parent per-member.
-run_gate "cargo test -p lean-host-mcp --all-targets" \
+run_gate "cargo test --locked -p lean-host-mcp-worker --all-targets" \
+	cargo test --locked -p lean-host-mcp-worker --all-targets
+run_gate "cargo test --locked -p lean-host-mcp --all-targets (installed stdio worker)" \
 	scripts/test-installed-stdio.sh --all-targets
 
-# -- Key invariant: the parent must NOT link libleanshared ------------------
-#
-# Built as a SEPARATE per-member release invocation so the worker crate's
-# feature set never unifies into the parent (a plain `--workspace` build
-# would silently re-link the dylib). Then assert with the platform linker.
-gate_link_invariant() {
-	cargo build --release -p lean-host-mcp
-	local bin="${CARGO_TARGET_DIR:-target}/release/lean-host-mcp"
-	[[ -x "$bin" ]] || {
-		log_err "expected release binary not found: $bin"
-		return 1
-	}
-	case "$(uname -s)" in
-	Darwin)
-		if otool -L "$bin" | grep -q libleanshared; then
-			log_err "$bin links libleanshared — the parent must stay free of it (AGENTS.md)."
-			return 1
-		fi
-		;;
-	Linux)
-		if ldd "$bin" 2>/dev/null | grep -q libleanshared; then
-			log_err "$bin links libleanshared — the parent must stay free of it (AGENTS.md)."
-			return 1
-		fi
-		;;
-	*)
-		log_warn "unknown OS '$(uname -s)'; skipping link-set assertion"
-		;;
-	esac
-	return 0
-}
-run_gate "parent ⊥ libleanshared (release link-set)" gate_link_invariant
+run_gate "Parent release link check" scripts/check-parent-link.sh
 
 # -- Local formatting and Markdown lint checks (beyond CI) ------------------
 
@@ -215,24 +175,26 @@ fi
 # -- Dependency hygiene (cargo-deny also runs in CI; shear is local) ---------
 
 if [[ "$QUICK" == 1 ]]; then
-	skip_gate "cargo deny check (--quick)"
+	skip_gate "cargo deny --locked check (--quick)"
 elif command -v cargo-deny >/dev/null 2>&1; then
-	run_gate "cargo deny check" cargo deny check
+	run_gate "cargo deny --locked check" cargo deny --locked check
 else
-	skip_gate "cargo deny check (cargo-deny not installed)"
+	skip_gate "cargo deny --locked check (cargo-deny not installed)"
 fi
 
 if command -v cargo-shear >/dev/null 2>&1; then
-	run_gate "cargo shear" cargo shear
+	run_gate "cargo shear --locked" cargo shear --locked
 else
-	skip_gate "cargo shear (cargo-shear not installed)"
+	skip_gate "cargo shear --locked (cargo-shear not installed)"
 fi
 
 # -- summary ----------------------------------------------------------------
 
 printf '\n%s====== Pre-release summary ======%s\n' "$BOLD" "$RESET"
 printf '\npassed (%d):\n' "${#PASSED[@]}"
-for name in "${PASSED[@]}"; do printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$name"; done
+if ((${#PASSED[@]} > 0)); then
+	for name in "${PASSED[@]}"; do printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$name"; done
+fi
 
 if ((${#SKIPPED[@]} > 0)); then
 	printf '\nskipped (%d):\n' "${#SKIPPED[@]}"
@@ -245,4 +207,8 @@ if ((${#FAILED[@]} > 0)); then
 	exit 1
 fi
 
-printf '\n%sAll gates passed.%s\n' "$GREEN" "$RESET"
+if ((${#SKIPPED[@]} > 0)); then
+	printf '\n%sAll completed checks passed.%s\n' "$GREEN" "$RESET"
+else
+	printf '\n%sAll checks passed.%s\n' "$GREEN" "$RESET"
+fi
