@@ -791,3 +791,96 @@ mod caller_results;
 
 #[path = "boundary_cases.rs"]
 mod boundary_cases;
+
+#[test]
+fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
+    use crate::store::recovery::RegistryIdentity;
+    use lean_toolchain::native_guardian::NativeProcessIdentity;
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt},
+    };
+
+    let fixture = Fixture::new();
+    let (mut journal, mut store) = fixture.init();
+    let lock_path = fixture.root.join("owner.lock");
+    let owner = fs::File::create_new(&lock_path).unwrap();
+    owner.try_lock().unwrap();
+    let contender = fs::File::open(lock_path).unwrap();
+    assert!(contender.try_lock().is_err());
+
+    let saved = saved(&mut journal, &store, 1);
+    store.create(&saved).unwrap();
+    let registry_root = fixture.root.join("registry");
+    fs::DirBuilder::new().mode(0o700).create(&registry_root).unwrap();
+    let meta = registry_root.metadata().unwrap();
+    let process = |pid| NativeProcessIdentity {
+        version: 1,
+        pid,
+        start: format!("birth-{pid}"),
+        session: 1,
+        process_group: 2,
+    };
+    let registry = RegistryIdentity {
+        directory: registry_root.as_os_str().as_bytes().to_vec(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        generation: [8; 16],
+        boot: [9; 16],
+        worker: process(10),
+        guardian: process(11),
+    };
+    let read =
+        |request: &SavedRequest, generation| NativeStore::read_recovery_scope(&fixture.native(), request, generation);
+    assert!(matches!(read(&saved, None), Err(Problem::Rejected(Reject::WrongScope))));
+    let binding = store.bind_recovery_scope(&saved, scope(5), &registry).unwrap();
+    assert_eq!(
+        read(&saved, Some(registry.generation)).unwrap(),
+        (binding, registry.clone())
+    );
+
+    let mut wrong = saved.clone();
+    wrong.capability = Capability([1; 32]);
+    assert!(matches!(
+        read(&wrong, None),
+        Err(Problem::Rejected(Reject::CapabilityDenied))
+    ));
+    wrong = saved.clone();
+    wrong.intent.push(0);
+    assert!(matches!(
+        read(&wrong, None),
+        Err(Problem::Rejected(Reject::IntentChanged))
+    ));
+    wrong = saved.clone();
+    wrong.caller.stage += 1;
+    assert!(matches!(
+        read(&wrong, None),
+        Err(Problem::Rejected(Reject::CallerBindingChanged))
+    ));
+    wrong = saved.clone();
+    wrong.caller.revision += 1;
+    assert!(matches!(
+        read(&wrong, None),
+        Err(Problem::Rejected(Reject::CallerBindingChanged))
+    ));
+    assert!(matches!(
+        read(&saved, Some([7; 16])),
+        Err(Problem::Rejected(Reject::StaleGeneration))
+    ));
+    assert!(granted(store.consume_launch(binding, &saved.capability).unwrap()));
+
+    let second = journal.bind(caller(2), b"second", candidate(&store, 2), cap()).unwrap();
+    store.create(&second).unwrap();
+    assert!(store.bind_recovery_scope(&second, scope(6), &registry).is_err());
+    assert_eq!(store.get(second.key).unwrap().unwrap().scope, None);
+    assert_eq!(read(&saved, None).unwrap().0, binding);
+    let next = RegistryIdentity {
+        generation: [6; 16],
+        ..registry
+    };
+    store.bind_recovery_scope(&second, scope(6), &next).unwrap();
+    assert!(matches!(
+        read(&saved, None),
+        Err(Problem::Rejected(Reject::StaleGeneration))
+    ));
+}

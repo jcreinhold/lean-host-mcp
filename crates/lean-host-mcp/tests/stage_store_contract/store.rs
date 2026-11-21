@@ -7,6 +7,8 @@ use std::{fmt, path::Path};
 // This decoder is a private no-dispatch contract, not a production RPC server.
 #[path = "store/boundary.rs"]
 pub(crate) mod boundary;
+#[path = "store/recovery.rs"]
+pub(crate) mod recovery;
 
 const CALLER_ROLE: i64 = 0x4c53_434a;
 const NATIVE_ROLE: i64 = 0x4c53_4e53;
@@ -284,11 +286,12 @@ pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
-    if !has_role(db, NATIVE_ROLE, 1)? {
+    if !has_role(db, NATIVE_ROLE, 2)? {
         return Ok(false);
     }
     drop(db.prepare("SELECT epoch,nonce,stage,intent,cap_hash,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages LIMIT 0")?);
     drop(db.prepare("SELECT scope,generation,owner FROM scope_heads LIMIT 0")?);
+    drop(db.prepare("SELECT epoch,nonce,stage,job,caller_stage,revision,registry_generation,identity FROM recovery_bindings LIMIT 0")?);
     let meta: Option<(Id, i64)> = db
         .query_row("SELECT store,epoch FROM meta WHERE singleton=1", [], |r| {
             Ok((fixed(r, 0)?, r.get(1)?))
@@ -489,7 +492,7 @@ impl NativeStore {
         let tx = db
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(&format!("PRAGMA application_id={NATIVE_ROLE}; PRAGMA user_version=1;\n\
+        tx.execute_batch(&format!("PRAGMA application_id={NATIVE_ROLE}; PRAGMA user_version=2;\n\
             CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),store BLOB NOT NULL CHECK(length(store)=16),epoch INTEGER NOT NULL CHECK(epoch>0)) STRICT;\n\
             CREATE TABLE scope_heads(scope BLOB PRIMARY KEY CHECK(length(scope)=16),generation INTEGER NOT NULL CHECK(generation>=0),owner BLOB NOT NULL CHECK(length(owner)=16)) STRICT;\n\
             CREATE TABLE stages(epoch INTEGER NOT NULL,nonce BLOB NOT NULL CHECK(length(nonce)=16),stage INTEGER NOT NULL,\n\
@@ -500,6 +503,7 @@ impl NativeStore {
             result_kind INTEGER NOT NULL DEFAULT 0 CHECK(result_kind IN(0,1,2,3)),result_id BLOB,result_hash BLOB,result_body BLOB CHECK(length(result_body)<=65536),\n\
             PRIMARY KEY(epoch,nonce,stage),UNIQUE(scope,generation),\n\
             CHECK((scope IS NULL AND generation IS NULL AND owner IS NULL) OR (scope IS NOT NULL AND generation IS NOT NULL AND owner IS NOT NULL AND length(scope)=16 AND generation>=0 AND length(owner)=16))) STRICT;"))?;
+        tx.execute_batch(recovery::SCHEMA)?;
         tx.execute("INSERT INTO meta VALUES(1,?1,1)", [store.as_slice()])?;
         tx.commit()?;
         Ok(Self { db, store })
@@ -585,44 +589,11 @@ impl NativeStore {
             .db
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authenticate(&tx, key, capability)?;
-        let old = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
-        if let Some(previous) = old.scope {
-            return if previous == scope {
-                Ok(Binding { key, scope })
-            } else {
-                reject(Reject::ScopeAlreadyBound)
-            };
-        }
-        if old.gate == Gate::Sealed {
-            return reject(Reject::LaunchSealed);
-        }
-        let highest: Option<i64> = tx
-            .query_row(
-                "SELECT generation FROM scope_heads WHERE scope=?1",
-                [scope.id.as_slice()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if highest.is_some_and(|n| number(scope.generation).is_ok_and(|g| g <= n)) {
-            return reject(Reject::StaleGeneration);
-        }
-        let generation = number(scope.generation)?;
-        tx.execute("INSERT INTO scope_heads(scope,generation,owner) VALUES(?1,?2,?3) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,owner=excluded.owner",params![scope.id.as_slice(),generation,scope.owner.as_slice()])?;
-        tx.execute(
-            "UPDATE stages SET scope=?1,generation=?2,owner=?3 WHERE epoch=?4 AND nonce=?5 AND stage=?6",
-            params![
-                scope.id.as_slice(),
-                generation,
-                scope.owner.as_slice(),
-                number(key.epoch)?,
-                key.nonce.as_slice(),
-                number(key.stage)?
-            ],
-        )?;
+        let binding = bind_scope_transaction(&tx, key, capability, scope)?;
         tx.commit()?;
-        Ok(Binding { key, scope })
+        Ok(binding)
     }
+
     pub(crate) fn consume_launch(&mut self, binding: Binding, capability: &Capability) -> Answer<Consume> {
         self.checked_key(binding.key)?;
         self.db.check_profile()?;
@@ -854,6 +825,49 @@ impl NativeStore {
         }
         Ok(())
     }
+}
+fn bind_scope_transaction(
+    tx: &Transaction<'_>,
+    key: NativeKey,
+    capability: &Capability,
+    scope: Scope,
+) -> Answer<Binding> {
+    authenticate(tx, key, capability)?;
+    let old = read_stage(tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
+    if let Some(previous) = old.scope {
+        return if previous == scope {
+            Ok(Binding { key, scope })
+        } else {
+            reject(Reject::ScopeAlreadyBound)
+        };
+    }
+    if old.gate == Gate::Sealed {
+        return reject(Reject::LaunchSealed);
+    }
+    let highest: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM scope_heads WHERE scope=?1",
+            [scope.id.as_slice()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if highest.is_some_and(|n| number(scope.generation).is_ok_and(|g| g <= n)) {
+        return reject(Reject::StaleGeneration);
+    }
+    let generation = number(scope.generation)?;
+    tx.execute("INSERT INTO scope_heads(scope,generation,owner) VALUES(?1,?2,?3) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,owner=excluded.owner",params![scope.id.as_slice(),generation,scope.owner.as_slice()])?;
+    tx.execute(
+        "UPDATE stages SET scope=?1,generation=?2,owner=?3 WHERE epoch=?4 AND nonce=?5 AND stage=?6",
+        params![
+            scope.id.as_slice(),
+            generation,
+            scope.owner.as_slice(),
+            number(key.epoch)?,
+            key.nonce.as_slice(),
+            number(key.stage)?
+        ],
+    )?;
+    Ok(Binding { key, scope })
 }
 fn gate_code(gate: Gate) -> i64 {
     match gate {

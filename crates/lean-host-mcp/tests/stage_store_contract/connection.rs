@@ -173,7 +173,7 @@ impl CheckedConnection {
         }
         // Close the exclusive creation handle before SQLite takes file locks.
         drop(OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?);
-        Self::configure(Self::open_file(path)?, provenance)
+        Self::configure(Self::open_file(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?, provenance)
     }
 
     /// Validate the concrete format BEFORE requesting persistent profile changes.
@@ -185,21 +185,27 @@ impl CheckedConnection {
         validate_schema: fn(&Connection) -> rusqlite::Result<bool>,
     ) -> Result<Self, ConnectionError> {
         let provenance = linked_runtime()?;
-        let connection = Self::open_file(path)?;
+        let connection = Self::open_file(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         if !validate_schema(&connection)? {
             return Err(ConnectionError::WrongSchema);
         }
         Self::configure(connection, provenance)
     }
 
-    fn open_file(path: &Path) -> Result<Connection, ConnectionError> {
+    pub(crate) fn open_recovery(path: &Path) -> Result<Connection, ConnectionError> {
+        linked_runtime()?;
+        let connection = Self::open_file(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.pragma_update(None, "query_only", "ON")?;
+        Ok(connection)
+    }
+
+    fn open_file(path: &Path, access: OpenFlags) -> Result<Connection, ConnectionError> {
         if !path.is_absolute() || !fs::symlink_metadata(path)?.is_file() {
             return Err(ConnectionError::NotAnAbsoluteRegularFile(path.to_owned()));
         }
         // No CREATE, URI interpretation, shared cache or implicit default VFS.
         // NOFOLLOW rejects symlinks; this is not protection from hostile parents.
-        let flags =
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let flags = access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags_and_vfs(path, flags, SELECTED_VFS)?;
         // Connection-local only; bounds lock waits during schema reads too.
         connection.busy_timeout(BUSY_TIMEOUT)?;
