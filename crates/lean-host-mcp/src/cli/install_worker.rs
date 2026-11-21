@@ -732,10 +732,7 @@ fn worker_cargo(id: &ToolchainId, sysroot: &Path) -> Command {
     cargo
 }
 
-/// Build a worker binary for `id` with the matching toolchain rpath baked in,
-/// returning its path (and, for the registry build, the temp-dir guard that
-/// must outlive the relocate). This is the only place the two source strategies
-/// diverge.
+/// Build a worker for the selected toolchain and place it in the candidate generation.
 fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path, candidate: &Path) -> anyhow::Result<()> {
     match source {
         WorkerSource::LocalWorkspace(workspace) => {
@@ -767,35 +764,49 @@ fn build_worker(source: &WorkerSource, id: &ToolchainId, sysroot: &Path, candida
             // workspace version and are ABI-coupled, so lockstep is intended.
             let version = env!("CARGO_PKG_VERSION");
             println!("==> installing lean-host-mcp-worker {version} for {id} (crates.io)");
-            let status = worker_cargo(id, sysroot)
-                .arg("install")
-                .arg(WORKER_FILE_NAME)
-                .arg("--version")
-                .arg(format!("={version}"))
-                .arg("--bin")
-                .arg(WORKER_FILE_NAME)
-                .arg("--root")
-                .arg(candidate)
-                .arg("--no-track")
-                .arg("--locked")
-                .status()?;
-            if !status.success() {
-                return Err(anyhow::anyhow!(
+            stage_registry_worker(candidate, |install_root| {
+                let status = worker_cargo(id, sysroot)
+                    .arg("install")
+                    .arg(WORKER_FILE_NAME)
+                    .arg("--version")
+                    .arg(format!("={version}"))
+                    .arg("--bin")
+                    .arg(WORKER_FILE_NAME)
+                    .arg("--root")
+                    .arg(install_root)
+                    .arg("--no-track")
+                    .arg("--locked")
+                    .status()?;
+                anyhow::ensure!(
+                    status.success(),
                     "cargo install lean-host-mcp-worker@={version} (toolchain {id}) failed with status {status}; \
                      a Rust toolchain and network access are required"
-                ));
-            }
-            let built = candidate.join("bin").join(WORKER_FILE_NAME);
-            if !built.is_file() {
-                return Err(anyhow::anyhow!(
-                    "cargo install did not produce a worker binary at {}",
-                    built.display()
-                ));
-            }
-            fs::rename(built, candidate.join(WORKER_FILE_NAME))?;
-            fs::remove_dir(candidate.join("bin"))?;
+                );
+                Ok(())
+            })?;
         }
     }
+    Ok(())
+}
+
+fn stage_registry_worker(candidate: &Path, install: impl FnOnce(&Path) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let slot = candidate
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("candidate has no install slot"))?;
+    // Cargo can leave tracking files with --no-track. Keep its install root
+    // beside the generation so only the worker crosses into it, by rename.
+    let scratch = tempfile::Builder::new().prefix("cargo-install-").tempdir_in(slot)?;
+    install(scratch.path())?;
+    let bin = scratch.path().join("bin");
+    let worker = bin.join(WORKER_FILE_NAME);
+    anyhow::ensure!(
+        fs::symlink_metadata(&bin).is_ok_and(|meta| meta.is_dir())
+            && fs::symlink_metadata(&worker).is_ok_and(|meta| meta.is_file()),
+        "cargo install did not produce a regular worker binary at {}",
+        worker.display()
+    );
+    fs::rename(worker, candidate.join(WORKER_FILE_NAME))?;
+    scratch.close()?;
     Ok(())
 }
 
@@ -943,6 +954,31 @@ mod tests {
             assert_eq!(std::fs::read(slot.join(WORKER_FILE_NAME))?, b"#!/bin/sh\n");
             assert_eq!(std::fs::read(slot.join("worker.json"))?, sidecar);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn registry_install_stages_only_the_worker() -> anyhow::Result<()> {
+        use std::fs;
+
+        let slot = tempfile::Builder::new()
+            .prefix("registry-install-test.")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let candidate = slot.path().join("generation-candidate");
+        fs::create_dir(&candidate)?;
+        let worker = b"compiled worker";
+        super::stage_registry_worker(&candidate, |root| {
+            fs::write(root.join(".crates.toml"), [])?;
+            fs::write(root.join(".crates2.json"), [])?;
+            fs::write(root.join(WORKER_FILE_NAME), b"not the bin entry")?;
+            let bin = root.join("bin");
+            fs::create_dir(&bin)?;
+            fs::write(bin.join(WORKER_FILE_NAME), worker)?;
+            Ok(())
+        })?;
+        assert_eq!(fs::read_dir(&candidate)?.count(), 1);
+        assert_eq!(fs::read(candidate.join(WORKER_FILE_NAME))?, worker);
+        assert_eq!(fs::read_dir(slot.path())?.count(), 1, "Cargo scratch was not removed");
         Ok(())
     }
 
