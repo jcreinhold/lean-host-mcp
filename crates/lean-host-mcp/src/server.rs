@@ -618,7 +618,7 @@ impl ServerHandler for LeanHostService {
         request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
-        std::future::ready(self.tasks.get_for_client(&request.task_id).map(GetTaskResult::new))
+        std::future::ready(self.tasks.get(&request.task_id).map(GetTaskResult::new))
     }
 
     fn update_task(
@@ -653,7 +653,7 @@ impl ServerHandler for LeanHostService {
              verification, lookup, and status. Context, trial, lookup, and \
              status select a mode with `kind`; verification takes explicit \
              target groups. Clients advertising io.modelcontextprotocol/tasks \
-             may receive task handles; results can be retained for up to ten minutes \
+             may receive task handles; results remain available for ten minutes \
              after completion while this server process lives. Use lean_request to submit, \
              retrieve or cancel retained requests without task negotiation."
                 .to_owned(),
