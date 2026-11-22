@@ -29,7 +29,10 @@ that same unused revision. A consumed gate reports `execution: "unknown"` even a
 accepts `discover`, `create`, `get`, `cancel` and `ack`. A saved result carries its original ID, SHA-256 digest and retained body.
 After saving the bound result durably, send `ack` with the original key and capability plus `result_id` and
 `result_digest`. ACK retains the result body while custody is unresolved. When ACK and confirmed closure are both
-recorded, the store removes the body and keeps its ID and digest, so repeated ACK remains authenticated and idempotent.
+recorded, the same transaction removes the request and result bodies. It keeps the request SHA-256, result ID and
+result digest. Compacted replies return `intent: null` and `intent_sha256`. An identical CREATE still returns the original
+status, a changed CREATE fails by digest, and repeated START or ACK cannot revive the attempt. Unresolved stages keep
+their requests for authenticated recovery. Results stay bounded and inline in SQLite, with no external result assets.
 Unacknowledged results remain retrievable. The current inline policy prunes on confirmed closure or ACK, whichever is
 last. It keeps at most 1,024 stage identities and rejects new intents at capacity while existing status, cancellation
 and ACK stay available. At capacity, discovery can reclaim expired stages with durable ACK and confirmed closure.

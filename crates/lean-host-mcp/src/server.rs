@@ -1054,6 +1054,7 @@ mod tests {
         assert_eq!(acknowledged["result"]["state"], "acknowledged");
         assert_eq!(acknowledged["result"]["body"], json!(body));
         assert_eq!(acknowledged["custody"], "open");
+        assert_eq!(acknowledged["intent"], json!([42]));
         {
             use crate::native_store::store::{Capability, ResourceReport};
             let mut store = service.managed_store.as_ref().unwrap().lock();
@@ -1071,6 +1072,25 @@ mod tests {
         let expired = call(&service, ack(json!(cap), digest.clone())).unwrap();
         assert_eq!(expired["execution"], "unknown");
         assert_eq!(expired["custody"], "closed");
+        assert!(expired["intent"].is_null());
+        assert_eq!(expired["intent_sha256"], json!(sha2::Sha256::digest([42]).to_vec()));
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            raw.query_row(
+                "SELECT length(intent),length(compacted_intent_sha256),result_body IS NULL
+                 FROM stages WHERE nonce=?1",
+                [[8u8; 16]],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, bool>(2)?)),
+            )
+            .unwrap(),
+            (0, 32, true)
+        );
+        drop(raw);
+        let equal_create = json!({"op":"create","key":saved_key,"capability":cap,"intent":[42]});
+        assert_eq!(call(&service, equal_create.clone()).unwrap(), expired);
+        let mut changed = equal_create;
+        changed["intent"] = json!([43]);
+        assert_eq!(call(&service, changed).unwrap_err().message, "intent_changed");
         assert_eq!(
             expired["result"],
             json!({"state":"expired","id":saved["result"]["id"],"sha256":digest})

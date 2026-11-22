@@ -17,7 +17,7 @@ pub(crate) fn accept_then_ack(
     let source = native
         .get(request.key)?
         .ok_or(Problem::Rejected(Reject::ResultUnavailable))?;
-    if source.key != request.key || source.intent != request.intent || source.scope != Some(expected.scope) {
+    if source.key != request.key || !source.matches_intent(&request.intent) || source.scope != Some(expected.scope) {
         return Err(Problem::Rejected(Reject::WrongScope));
     }
     // save_result first recovers an existing matching caller copy, including

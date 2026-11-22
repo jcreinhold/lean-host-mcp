@@ -244,6 +244,7 @@ impl ResultKnowledge {
 pub(crate) struct Snapshot {
     pub(crate) key: NativeKey,
     pub(crate) intent: Vec<u8>,
+    pub(crate) compacted_intent_sha256: Option<[u8; 32]>,
     pub(crate) scope: Option<Scope>,
     pub(crate) gate: Gate,
     pub(crate) spawn: Option<Spawn>,
@@ -251,6 +252,13 @@ pub(crate) struct Snapshot {
     pub(crate) resource_report: ResourceReport,
     pub(crate) result: ResultKnowledge,
 }
+impl Snapshot {
+    pub(crate) fn matches_intent(&self, intent: &[u8]) -> bool {
+        self.compacted_intent_sha256
+            .map_or_else(|| self.intent == intent, |hash| hash.as_slice() == digest(intent))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LaunchPermit {
     binding: Binding,
@@ -358,7 +366,7 @@ impl CallerJournal {
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actual = caller_get(&tx, &request.caller)?.ok_or(Problem::Rejected(Reject::UnknownCaller))?;
-        if actual != *request || source.key != request.key || source.intent != request.intent {
+        if actual != *request || source.key != request.key || !source.matches_intent(&request.intent) {
             return reject(Reject::CallerBindingChanged);
         }
         let scope = source.scope.ok_or(Problem::Rejected(Reject::WrongScope))?;
@@ -518,6 +526,7 @@ impl NativeStore {
             resource_report INTEGER NOT NULL DEFAULT 0 CHECK(resource_report IN(0,1,2,3)),\n\
             result_kind INTEGER NOT NULL DEFAULT 0 CHECK(result_kind IN(0,1,2,3)),result_id BLOB,result_hash BLOB,result_body BLOB CHECK(length(result_body)<=65536),\n\
             managed_ack INTEGER NOT NULL DEFAULT 0 CHECK(managed_ack IN(0,1)),\n\
+            compacted_intent_sha256 BLOB CHECK(length(compacted_intent_sha256)=32),\n\
             PRIMARY KEY(epoch,nonce,stage),UNIQUE(scope,generation),\n\
             CHECK((scope IS NULL AND generation IS NULL AND owner IS NULL) OR (scope IS NOT NULL AND generation IS NOT NULL AND owner IS NOT NULL AND length(scope)=16 AND generation>=0 AND length(owner)=16))) STRICT;"))?;
         tx.execute_batch(recovery::SCHEMA)?;
@@ -547,7 +556,37 @@ impl NativeStore {
                 "ALTER TABLE stages ADD COLUMN managed_ack INTEGER NOT NULL DEFAULT 0 CHECK(managed_ack IN(0,1))",
             )?;
         }
+        let has_intent_digest: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('stages') WHERE name='compacted_intent_sha256')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_intent_digest {
+            tx.execute_batch(
+                "ALTER TABLE stages ADD COLUMN compacted_intent_sha256 BLOB CHECK(length(compacted_intent_sha256)=32)",
+            )?;
+        }
         let store = tx.query_row("SELECT store FROM meta WHERE singleton=1", [], |r| fixed(r, 0))?;
+        let prior = {
+            let mut query = tx.prepare(
+                "SELECT epoch,nonce,stage FROM stages
+                 WHERE managed_ack=1 AND resource_report=3 AND result_kind=3
+                   AND compacted_intent_sha256 IS NULL LIMIT ?1",
+            )?;
+            query
+                .query_map([MAX_STAGES], |r| {
+                    Ok(NativeKey {
+                        store,
+                        epoch: positive(r.get(0)?)?,
+                        nonce: fixed(r, 1)?,
+                        stage: positive(r.get(2)?)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for key in prior {
+            compact_closed_acknowledged(&tx, key)?;
+        }
         tx.commit()?;
         Ok(Self { db, store })
     }
@@ -592,7 +631,7 @@ impl NativeStore {
         if exists {
             authenticate(&tx, key, capability)?;
             let previous = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
-            if previous.intent != intent {
+            if !previous.matches_intent(intent) {
                 return reject(Reject::IntentChanged);
             }
             return Ok(previous);
@@ -735,6 +774,9 @@ impl NativeStore {
                     number(binding.key.stage)?
                 ],
             )?;
+            if report == ResourceReport::Closed {
+                compact_closed_acknowledged(tx, binding.key)?;
+            }
             Ok(())
         })
     }
@@ -988,8 +1030,28 @@ fn bound_stage(db: &Connection, binding: Binding, capability: &Capability) -> An
     }
     Ok(old)
 }
+fn compact_closed_acknowledged(tx: &Transaction<'_>, key: NativeKey) -> Answer<()> {
+    let identity = params![number(key.epoch)?, key.nonce, number(key.stage)?];
+    let hash = tx
+        .query_row(
+            "SELECT intent FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3
+           AND resource_report=3 AND result_kind=3 AND managed_ack=1
+           AND compacted_intent_sha256 IS NULL",
+            identity,
+            |row| Ok(digest(blob(row, 0)?)),
+        )
+        .optional()?;
+    if let Some(hash) = hash {
+        tx.execute(
+            "UPDATE stages SET intent=x'', compacted_intent_sha256=?4 WHERE epoch=?1 AND nonce=?2 AND stage=?3",
+            params![number(key.epoch)?, key.nonce, number(key.stage)?, hash],
+        )?;
+    }
+    Ok(())
+}
+
 fn read_stage(db: &Connection, key: NativeKey) -> Answer<Option<Snapshot>> {
-    let snapshot = db.query_row("SELECT intent,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",params![number(key.epoch)?,key.nonce.as_slice(),number(key.stage)?],|r| {
+    let snapshot = db.query_row("SELECT intent,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body,compacted_intent_sha256,managed_ack FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",params![number(key.epoch)?,key.nonce.as_slice(),number(key.stage)?],|r| {
         let scope = match (optional_fixed(r,1)?,r.get::<_,Option<i64>>(2)?,optional_fixed(r,3)?) {
             (None,None,None) => None,
             (Some(id),Some(generation),Some(owner)) => Some(Scope{id,generation:positive(generation)?,owner}),
@@ -1017,7 +1079,14 @@ fn read_stage(db: &Connection, key: NativeKey) -> Answer<Option<Snapshot>> {
             || (gate==Gate::Pending && (stop_requested || resource_report>=ResourceReport::Stopping)) {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        Ok(Snapshot{key,intent:blob(r,0)?.to_vec(),scope,gate,spawn,stop_requested,resource_report,result})
+        let intent = blob(r,0)?;
+        let compacted_intent_sha256 = optional_fixed(r,12)?;
+        if compacted_intent_sha256.is_some() && (!intent.is_empty()
+            || resource_report != ResourceReport::Closed || !matches!(result, ResultKnowledge::Expired { .. })
+            || r.get::<_,i64>(13)? != 1) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok(Snapshot{key,intent:intent.to_vec(),compacted_intent_sha256,scope,gate,spawn,stop_requested,resource_report,result})
     }).optional()?;
     if let Some(snapshot) = &snapshot {
         match snapshot.result {

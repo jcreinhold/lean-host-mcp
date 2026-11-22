@@ -171,12 +171,17 @@ impl NativeStore {
                     ResourceReport::Stopping => "stopping",
                     ResourceReport::Closed => "closed",
                 };
-                serde_json::json!({
+                let mut reply = serde_json::json!({
                     "version": 1, "key": snapshot.key, "intent": snapshot.intent,
                     "dispatch_enabled": false, "execution": execution,
                     "cancel_requested": snapshot.stop_requested,
                     "result": result, "custody": custody,
-                })
+                });
+                if let Some(hash) = snapshot.compacted_intent_sha256 {
+                    reply["intent"] = serde_json::Value::Null;
+                    reply["intent_sha256"] = serde_json::json!(hash);
+                }
+                reply
             }
         })
     }
@@ -264,6 +269,9 @@ impl NativeStore {
                 prune_closed
             ],
         )?;
+        if prune_closed {
+            super::compact_closed_acknowledged(&tx, key)?;
+        }
         let snapshot = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
         commit(tx, "native-ack")?;
         Ok(snapshot)
