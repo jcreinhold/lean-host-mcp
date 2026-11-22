@@ -21,6 +21,7 @@ use crate::error::{Result, ServerError};
 use crate::toolchain::ToolchainId;
 
 const HELPER: &str = include_str!("lake/ModuleOptions.lean");
+const LAKE_OPTIONS: &str = "Lake option discovery";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
@@ -53,11 +54,11 @@ impl PreparationFailure {
         }
     }
 
-    fn writer(error: std::io::Error) -> Self {
+    fn writer(label: &str, error: std::io::Error) -> Self {
         let disposition =
             WriterFailure::from_io(&error).map_or(WriterDisposition::Unknown, |failure| failure.disposition);
         Self {
-            error: bad_project(error),
+            error: reader_error(label, error),
             disposition,
         }
     }
@@ -198,7 +199,8 @@ async fn resolve_inner(
     let (custody, sysroot, file, package, config_file, dependency_name, root) = context?;
     let command_root = root.clone();
     let command_package = package.clone();
-    let output = discovery_output(
+    let output = reader_output(
+        LAKE_OPTIONS,
         root,
         TIMEOUT,
         capacity_limit,
@@ -254,7 +256,8 @@ async fn resolve_inner(
 
 /// Cancellation signals the owner rather than dropping its process evidence.
 /// The same deadline covers preparation, native admission, and command delivery.
-pub(crate) async fn discovery_output(
+pub(crate) async fn reader_output(
+    label: &'static str,
     root: PathBuf,
     timeout: Duration,
     capacity_limit: usize,
@@ -273,8 +276,10 @@ pub(crate) async fn discovery_output(
         let keepalive: Option<Box<dyn Send>> = Some(Box::new((custody, keepalive)));
         let cancelled = || cancellation.is_cancelled();
         let remaining = timeout.saturating_sub(started.elapsed());
-        let result = if remaining.is_zero() || cancelled() {
-            Err(bad_project("cancelled or deadline expired before native reader admission").into())
+        let result = if remaining.is_zero() {
+            Err(reader_error(label, "deadline expired before native reader admission").into())
+        } else if cancelled() {
+            Err(reader_error(label, "cancelled before native reader admission").into())
         } else {
             let reader = match contract {
                 Some(contract) => crate::native_reader::run_program_with_contract(
@@ -290,7 +295,9 @@ pub(crate) async fn discovery_output(
                     crate::native_reader::run_program(&root, remaining, capacity_limit, &cancelled, keepalive, prepare)
                 }
             };
-            reader.map_err(PreparationFailure::writer).and_then(discovery_metadata)
+            reader
+                .map_err(|error| PreparationFailure::writer(label, error))
+                .and_then(|result| reader_bytes(label, result))
         };
         match result
             .as_ref()
@@ -304,10 +311,10 @@ pub(crate) async fn discovery_output(
     })
     .await;
     on_drop.disarm();
-    result.map_err(|error| PreparationFailure::unknown(bad_project(error)))?
+    result.map_err(|error| PreparationFailure::unknown(reader_error(label, error)))?
 }
 
-fn discovery_metadata(reader: crate::native_reader::NativeReaderResult) -> PreparationResult<Vec<u8>> {
+fn reader_bytes(label: &str, reader: crate::native_reader::NativeReaderResult) -> PreparationResult<Vec<u8>> {
     if reader.protocol == crate::native_reader::PROTOCOL
         && reader.state == "completed"
         && reader.scope_closed
@@ -326,15 +333,23 @@ fn discovery_metadata(reader: crate::native_reader::NativeReaderResult) -> Prepa
     } else {
         WriterDisposition::Stopped
     };
+    let target_note = if label == LAKE_OPTIONS {
+        "; no proof check ran"
+    } else {
+        ""
+    };
     Err(PreparationFailure {
         disposition,
-        error: bad_project(format!(
-            "native reader did not return a complete result; no proof check ran: state={} {}{}{}",
-            reader.state,
-            reader.detail.unwrap_or_default(),
-            reader.stdout,
-            reader.stderr,
-        )),
+        error: reader_error(
+            label,
+            format!(
+                "native reader did not return a complete result{target_note}: state={} {}{}{}",
+                reader.state,
+                reader.detail.unwrap_or_default(),
+                reader.stdout,
+                reader.stderr,
+            ),
+        ),
     })
 }
 
@@ -352,7 +367,11 @@ async fn test_child_output(command: &mut tokio::process::Command, timeout: Durat
 }
 
 fn bad_project(error: impl std::fmt::Display) -> ServerError {
-    ServerError::BadProject(format!("Lake option discovery: {error}"))
+    reader_error(LAKE_OPTIONS, error)
+}
+
+fn reader_error(label: &str, error: impl std::fmt::Display) -> ServerError {
+    ServerError::BadProject(format!("{label}: {error}"))
 }
 
 fn source_path(root: &Path, label: &str) -> Option<PathBuf> {
@@ -480,7 +499,7 @@ mod tests {
 
     #[test]
     fn discovery_requires_complete_uninterrupted_closed_reader_result() {
-        assert!(discovery_metadata(reader_result()).is_ok());
+        assert!(reader_bytes(LAKE_OPTIONS, reader_result()).is_ok());
         for mutation in 0..5 {
             let mut reader = reader_result();
             match mutation {
@@ -490,10 +509,29 @@ mod tests {
                 3 => reader.exit_code = Some(1),
                 _ => reader.state = "stopped".into(),
             }
-            let error = discovery_metadata(reader).unwrap_err();
+            let error = reader_bytes(LAKE_OPTIONS, reader).unwrap_err();
             assert_eq!(error.disposition, WriterDisposition::Stopped);
             assert!(error.error.to_string().contains("no proof check ran"));
         }
+    }
+
+    #[test]
+    fn stopped_file_driver_reports_its_own_error_without_a_target_verdict() {
+        let mut reader = reader_result();
+        reader.state = "stopped".into();
+        reader.intervened = true;
+        reader.stdout.clear();
+        reader.detail = Some("native reader deadline elapsed".into());
+        let failure = reader_bytes("Lean file driver", reader).unwrap_err();
+        assert_eq!(failure.disposition, WriterDisposition::Stopped);
+        let error = rmcp::ErrorData::from(failure.error);
+        assert_eq!(
+            error,
+            rmcp::ErrorData::internal_error(
+                "lake project not usable: Lean file driver: native reader did not return a complete result: state=stopped native reader deadline elapsed",
+                None,
+            )
+        );
     }
 
     #[test]
@@ -501,13 +539,13 @@ mod tests {
         let mut reader = reader_result();
         reader.state = "not_started".into();
         reader.target_started = Some(false);
-        let error = discovery_metadata(reader).unwrap_err();
+        let error = reader_bytes(LAKE_OPTIONS, reader).unwrap_err();
         assert_eq!(error.disposition, WriterDisposition::NotStarted);
         let mut reader = reader_result();
         reader.state = "unknown".into();
         reader.target_started = Some(false);
         reader.scope_closed = false;
-        let error = discovery_metadata(reader).unwrap_err();
+        let error = reader_bytes(LAKE_OPTIONS, reader).unwrap_err();
         assert_eq!(error.disposition, WriterDisposition::Unknown);
     }
 
@@ -1037,7 +1075,8 @@ lean_lib Demo
         let request = tokio_util::sync::CancellationToken::new();
         request.cancel();
         let (result, evidence) = crate::cancellation::with_cancellation_evidence(&request, async {
-            discovery_output(
+            reader_output(
+                LAKE_OPTIONS,
                 root.path().to_path_buf(),
                 Duration::from_secs(1),
                 1,

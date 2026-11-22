@@ -284,7 +284,8 @@ impl ProjectBroker {
             shim_guards,
             ..
         } = reader;
-        crate::lake_options::discovery_output(
+        crate::lake_options::reader_output(
+            "Lean file driver",
             root.clone(),
             Duration::from_millis(self.request_timeout_millis()),
             self.config.max_projects.get(),

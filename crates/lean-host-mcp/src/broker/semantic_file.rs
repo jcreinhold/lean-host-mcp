@@ -109,7 +109,8 @@ impl ProjectBroker {
         }
         let body = request.reader_input(&roots)?;
         domains.push(package);
-        let bytes = crate::lake_options::discovery_output(
+        let bytes = crate::lake_options::reader_output(
+            "Lean semantic feature reader",
             root,
             Duration::from_millis(self.request_timeout_millis()),
             self.config.max_projects.get(),

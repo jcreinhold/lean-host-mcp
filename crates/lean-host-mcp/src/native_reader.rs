@@ -839,16 +839,19 @@ fn run_internal(
         if interrupted.is_none() && status.is_none() && !native.lease()?.guardian_alive()? {
             interrupted = Some("native guardian exited before owned group closure".into());
         }
-        if interrupted.is_none()
-            && (Instant::now() >= deadline
-                || cancelled()
-                || !caller
-                    .as_ref()
-                    .map(NativeProcessIdentity::is_live)
-                    .transpose()?
-                    .unwrap_or(true))
-        {
-            interrupted = Some("native reader cancelled by deadline or caller exit".into());
+        if interrupted.is_none() {
+            if Instant::now() >= deadline {
+                interrupted = Some("native reader deadline elapsed".into());
+            } else if cancelled() {
+                interrupted = Some("native reader cancellation requested".into());
+            } else if !caller
+                .as_ref()
+                .map(NativeProcessIdentity::is_live)
+                .transpose()?
+                .unwrap_or(true)
+            {
+                interrupted = Some("native reader invoking caller exited".into());
+            }
         }
         if interrupted.is_some() {
             let _stop = native.lease()?.kill();
