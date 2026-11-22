@@ -27,6 +27,7 @@ pub(super) const CONSUMER: &str = "lake_configured_consumer_v1";
 use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
 pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION, OUTLINE as SETUP_OUTLINE};
+pub(super) use writer_preparation::whole_lint::OPERATION as WHOLE_LINT;
 #[path = "formatter_fix.rs"]
 mod formatter_fix;
 pub(super) const FORMAT_FIX: &str = "lean_formatter_fix_v1";
@@ -96,6 +97,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | SETUP_VERIFICATION
                     | SETUP_DIAGNOSTICS
                     | SETUP_OUTLINE
+                    | WHOLE_LINT
             )
         )
     })
@@ -143,7 +145,8 @@ pub(super) async fn run(
     ) {
         (OPERATION, None, None, None, None) => Stage::Cache,
         (writer_preparation::OPERATION, Some(target), None, None, None)
-            if !matches!(target, Target::VerifierModules { .. }) && target.validate().is_ok() =>
+            if !matches!(target, Target::VerifierModules { .. } | Target::WholeLint { .. })
+                && target.validate().is_ok() =>
         {
             Stage::Preparation(target)
         }
@@ -152,6 +155,7 @@ pub(super) async fn run(
         {
             Stage::Preparation(target)
         }
+        (WHOLE_LINT, Some(target @ Target::WholeLint { .. }), None, None, None) => Stage::Preparation(target),
         (CONSUMER, None, Some(source), None, None) if source.valid() => Stage::Consumer(source),
         (FORMAT_FIX, None, None, Some(formatter), None) if formatter.valid() => Stage::Formatter(formatter),
         (FORMAT_PREVIEW, None, None, Some(formatter), None) if formatter.valid_preview() => {
@@ -216,6 +220,10 @@ fn execute(
     prepared_generation: Option<String>,
 ) -> Result<(), McpError> {
     let no_start = |_| McpError::invalid_params("readiness_writer_not_started", None);
+    let invalid_lint_input = || McpError::invalid_params("whole_library_lint_configuration_changed", None);
+    if let Stage::Preparation(Target::WholeLint { lakefile_sha256 }) = &stage {
+        writer_preparation::whole_lint::check_config(root, lakefile_sha256).map_err(|_| invalid_lint_input())?;
+    }
     let expired = || deadline.remaining().is_err();
     let shims = if matches!(stage, Stage::SetupVerification(..)) {
         let meta = crate::LakeProjectMeta::from_explicit(root)
@@ -339,6 +347,11 @@ fn execute(
     // Preserve the primary waited result independently of helper settlement.
     // The caller waits for closed custody before using it.
     let body = result.ok().and_then(|output| match &stage {
+        Stage::Preparation(Target::WholeLint { .. }) if output.status.success() => {
+            writer_preparation::whole_lint::Receipt::parse(&output.stdout)
+                .ok()
+                .and_then(|receipt| serde_json::to_value(receipt).ok())
+        }
         Stage::Preparation(target) if output.status.success() => Receipt::parse(&output.stdout, target)
             .ok()
             .and_then(|receipt| serde_json::to_value(receipt).ok()),

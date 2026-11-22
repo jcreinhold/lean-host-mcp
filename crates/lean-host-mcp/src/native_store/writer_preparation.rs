@@ -17,6 +17,9 @@ pub(crate) const VERIFIER_OPERATION: &str = "lake_verifier_preparation_v1";
 const MAX_MODULES: usize = 64;
 const MAX_PLAN_BYTES: usize = 32 * 1024;
 
+#[path = "whole_lint.rs"]
+pub(crate) mod whole_lint;
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Target {
@@ -24,6 +27,7 @@ pub(crate) enum Target {
     Modules { names: Vec<String> },
     VerifierModules { names: Vec<String> },
     Ready { name: String, package: Option<String> },
+    WholeLint { lakefile_sha256: [u8; 32] },
 }
 
 impl Target {
@@ -47,6 +51,7 @@ impl Target {
                     && names.len() <= MAX_MODULES
                     && names.iter().all(|target| module(target) && unique.insert(target))
             }
+            Self::WholeLint { .. } => true,
             Self::Ready { name: target, package } => name(target) && package.as_deref().is_none_or(name),
         };
         if !valid {
@@ -298,6 +303,9 @@ pub fn run(encoded: &str) -> io::Result<()> {
     };
     authorize()?;
     let lake = lake_executable(&plan.root)?;
+    if let Target::WholeLint { lakefile_sha256 } = &plan.target {
+        return whole_lint::run(&plan.root, &lake, lakefile_sha256, authorize);
+    }
     let watched = |args: &[&str]| -> io::Result<i32> {
         authorize()?;
         Command::new(&lake)
@@ -316,6 +324,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
 
     let after_deps = || test_cut_after_dependencies(&authorize);
     let receipt = match plan.target {
+        Target::WholeLint { .. } => return Err(io::Error::other("whole-library lint already dispatched")),
         Target::Module { name } => {
             let outcome = run_module(name, &watched, &after_deps)?;
             Receipt {
