@@ -26,7 +26,9 @@ A different intent or capability for that key is refused. All replies advertise 
 Use `cancel` with the original key and capability. Its transaction seals an unused launch gate and records the stop
 request together. After a lost cancel reply, either `get` or an equal `cancel` returns `execution: "not_started"` for
 that same unused revision. A consumed gate reports `execution: "unknown"` even after cancellation. The opt-in route
-accepts only `discover`, `create`, `get` and `cancel`.
+accepts only `discover`, `create`, `get` and `cancel`. A saved result carries its original ID, SHA-256 digest and retained body.
+The separate `custody` field reports the last trusted resource observation. Reading a result does not advance custody
+or reissue a launch grant.
 
 ## What is saved
 

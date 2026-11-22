@@ -9,8 +9,8 @@
 )]
 
 use super::{
-    Answer, Capability, Gate, NativeKey, NativeStore, Problem, Reject, ResultKnowledge, Snapshot, authenticate, commit,
-    number, read_stage, reject,
+    Answer, Capability, Gate, NativeKey, NativeStore, Problem, Reject, ResourceReport, ResultKnowledge, Snapshot,
+    authenticate, commit, number, read_stage, reject,
 };
 use rusqlite::{TransactionBehavior, params};
 use serde::Deserialize;
@@ -131,10 +131,29 @@ impl NativeStore {
                     Gate::Sealed => "sealed",
                     Gate::Consumed => "unknown",
                 };
+                let result = match snapshot.result {
+                    ResultKnowledge::Pending => serde_json::json!({"state":"pending"}),
+                    ResultKnowledge::Retained { id, hash, body } => {
+                        serde_json::json!({"state":"retained", "id":id, "sha256":hash, "body":body})
+                    }
+                    ResultKnowledge::Acknowledged { id, hash, body } => {
+                        serde_json::json!({"state":"acknowledged", "id":id, "sha256":hash, "body":body})
+                    }
+                    ResultKnowledge::Expired { id, hash } => {
+                        serde_json::json!({"state":"expired", "id":id, "sha256":hash})
+                    }
+                };
+                let custody = match snapshot.resource_report {
+                    ResourceReport::None => "unobserved",
+                    ResourceReport::Open => "open",
+                    ResourceReport::Stopping => "stopping",
+                    ResourceReport::Closed => "closed",
+                };
                 serde_json::json!({
                     "version": 1, "key": snapshot.key, "intent": snapshot.intent,
                     "dispatch_enabled": false, "execution": execution,
                     "cancel_requested": snapshot.stop_requested,
+                    "result": result, "custody": custody,
                 })
             }
         })

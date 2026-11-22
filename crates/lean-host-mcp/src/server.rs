@@ -880,6 +880,48 @@ mod tests {
         let consumed: Value = serde_json::from_str(&consumed.content.first().unwrap().as_text().unwrap().text).unwrap();
         assert_eq!(consumed["execution"], "unknown");
         assert_eq!(consumed["cancel_requested"], true);
+        assert_eq!(consumed["result"]["state"], "pending");
+
+        // A stored reply may outlive both the caller connection and the
+        // broker, even when the exact worker's retirement is unconfirmed.
+        let saved_key = consumed["key"].clone();
+        let body = b"checked reply bytes";
+        {
+            use crate::native_store::store::{Capability, ResourceReport, Scope};
+            let mut store = service.managed_store.as_ref().unwrap().lock();
+            let key = serde_json::from_value(saved_key.clone()).unwrap();
+            let cap = Capability([1; 32]);
+            let binding = crate::native_store::store::Binding {
+                key,
+                scope: Scope {
+                    id: [3; 16],
+                    generation: 1,
+                    owner: [4; 16],
+                },
+            };
+            store.observe_resource(binding, &cap, ResourceReport::Open).unwrap();
+            store.observe_result(binding, &cap, [5; 16], body).unwrap();
+        }
+        drop(service);
+        let service = stock().with_managed_native_store(&path).unwrap();
+        let saved = call(&service, json!({"op":"get","key":saved_key,"capability":cap})).unwrap();
+        assert_eq!(saved["result"]["state"], "retained");
+        assert_eq!(saved["result"]["id"], json!(vec![5; 16]));
+        assert_eq!(saved["result"]["sha256"], json!(sha2::Sha256::digest(body).to_vec()));
+        assert_eq!(saved["result"]["body"], json!(body));
+        assert_eq!(saved["custody"], "open");
+        assert_eq!(
+            call(&service, json!({"op":"get","key":saved_key,"capability":vec![2;32]}))
+                .unwrap_err()
+                .message,
+            "capability_denied"
+        );
+        assert_eq!(
+            call(&service, json!({"op":"start","key":saved_key,"capability":cap}))
+                .unwrap_err()
+                .message,
+            "operation_disabled"
+        );
         peer.cancel().await.unwrap();
     }
 
