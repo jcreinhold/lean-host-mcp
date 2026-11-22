@@ -42,7 +42,7 @@ NewState == [service |-> TRUE, epoch |-> 0, crashed |-> FALSE,
  pending |-> EmptyOwners, live |-> EmptyOwners, cancelling |-> EmptyOwners,
  starts |-> ZeroCounts, spawnCalls |-> ZeroCounts,
  finished |-> {}, terminal |-> {}, publishedResult |-> {}, knownResult |-> {}, retained |-> {},
- acknowledged |-> {}, expired |-> {}, idle |-> TRUE, redeliveries |-> 0,
+ callerSaved |-> {}, acknowledged |-> {}, expired |-> {}, idle |-> TRUE, redeliveries |-> 0,
  replaced |-> FALSE, injected |-> {}, delivered |-> 0,
  observed |-> {},
  badCancel |-> FALSE, badLaunch |-> FALSE, badAck |-> FALSE, badCallback |-> FALSE]
@@ -51,7 +51,7 @@ BoundState == [NewState EXCEPT !.created={1}, !.ready={1}, !.scopeOwner=1,
 SecondState == [BoundState EXCEPT !.bindings[2]= <<1,0>>, !.authEpoch[2]=0,
  !.issued={K1,K2}, !.sent={K1,K2}, !.consumed={K1,K2}, !.sealed={K1},
  !.starts[1]=1, !.spawnCalls[1]=1, !.finished={1}, !.terminal={1},
- !.publishedResult={1}, !.knownResult={1}, !.retained={1}]
+ !.publishedResult={1}, !.knownResult={1}, !.retained={1}, !.callerSaved={1}]
 Initial == CASE Scenario="Full" -> NewState
  [] Scenario="Bound" -> BoundState
  [] Scenario="CrashBeforeSend" -> [BoundState EXCEPT !.service=FALSE, !.crashed=TRUE]
@@ -102,7 +102,10 @@ BadRebind == LET u==IF s.bindings[1][1]=1 THEN 2 ELSE 1
  /\ 1 \notin s.terminal /\ u \in s.ready /\ k \notin s.issued
  /\ s'=[s EXCEPT !.issued=@\cup{k}, !.sent=@\cup{k},
                   !.messages=Insert(@,Frame(GoKind,1,u,s.generations[u],u,1))]
-Expire(i) == /\ s.service /\ i \in s.retained
+SaveResult(i) == /\ s.service /\ i \in s.retained\s.callerSaved
+                 /\ s'=[s EXCEPT !.callerSaved=@\cup{i}]
+Expire(i) == /\ s.service /\ i \in s.retained \cap s.acknowledged
+             /\ (i \in s.terminal \/ Mutant="ExpireBeforeClosure")
              /\ s'=[s EXCEPT !.retained=@\{i}, !.expired=@\cup{i}]
 Observe(i) == /\ s.service /\ i \in s.finished\s.terminal /\ ~Active(i)
  /\ s'=[s EXCEPT !.terminal=@\cup{i}, !.idle=TRUE,
@@ -125,7 +128,7 @@ DuplicateGo(k,d) == /\ ~Late /\ k \in s.sent
 OldControl(k,kind) == /\ ~Late /\ Controls /\ k \in s.issued
  /\ kind \in {CancelKind,ResultKind,AckKind}
  /\ (kind=CancelKind \/ (kind=ResultKind /\ k[1] \in s.publishedResult)
-                     \/ (kind=AckKind /\ k[1] \in s.knownResult))
+                     \/ (kind=AckKind /\ k[1] \in s.callerSaved))
  /\ Enqueue(Frame(kind,k[1],k[2],k[3],k[2],k[1]))
 InjectLate(slot) == LET kind==IF slot=1 THEN LateKindA ELSE LateKindB IN
  /\ Late /\ slot \notin s.injected
@@ -176,8 +179,8 @@ Receive(a) == LET f==s.messages[a] kind==f[1] i==f[2] u==f[5]
                                THEN @\cup{i} ELSE @,
                     !.idle=IF Mutant="ResultIdle" THEN TRUE ELSE @]
             [] kind=AckKind ->
-              IF i \notin s.knownResult THEN s'=base ELSE
-              s'=[base EXCEPT !.retained=IF Mutant="AckCurrent" THEN @\{i,2} ELSE @\{i},
+              IF i \notin s.callerSaved THEN s'=base ELSE
+              s'=[base EXCEPT !.retained=IF Mutant="AckCurrent" THEN @\{2} ELSE @,
                     !.acknowledged=@\cup{i},
                     !.badAck=@ \/ (Mutant="AckCurrent" /\ i#2 /\ 2 \in s.retained)]
             [] kind=CleanupKind ->
@@ -207,7 +210,7 @@ Stopped(u) == LET f==s.cancelling[u] i==f[2] IN
 
 Next == Crash \/ Restart \/ Replace \/ BadRebind
  \/ (\E u \in Owners: Create(u) \/ Ready(u) \/ BindScope(u) \/ Spawn(u) \/ SpawnFailed(u) \/ Exit(u) \/ Stopped(u))
- \/ (\E i \in Stages: Bind(i) \/ Expire(i) \/ Observe(i) \/ FirstResult(i)
+ \/ (\E i \in Stages: Bind(i) \/ SaveResult(i) \/ Expire(i) \/ Observe(i) \/ FirstResult(i)
                         \/ (\E t \in Stages: Retry(i,t)))
  \/ (\E k \in AllKeys: FirstGo(k) \/ (\E d \in Owners: DuplicateGo(k,d))
                      \/ (\E kind \in {CancelKind,ResultKind,AckKind}: OldControl(k,kind)))
@@ -226,7 +229,8 @@ TypeOK == /\ s.service \in BOOLEAN /\ s.crashed \in BOOLEAN /\ s.epoch \in 0..1
           /\ s.finished \subseteq Stages /\ s.terminal \subseteq s.finished
           /\ s.publishedResult \subseteq Stages /\ s.knownResult \subseteq Stages
           /\ s.retained \subseteq s.knownResult
-          /\ s.acknowledged \subseteq s.knownResult /\ s.expired \subseteq s.knownResult
+          /\ s.callerSaved \subseteq s.knownResult
+          /\ s.acknowledged \subseteq s.callerSaved /\ s.expired \subseteq s.knownResult
           /\ s.redeliveries \in 0..MaxRedeliveries /\ s.delivered \in 0..2
           /\ s.observed \subseteq {"activeSecond","afterRestart","afterReplacement","cleanupReceived"}
 UniqueStageAuthorization == \A i \in Stages: Cardinality({k \in s.issued:k[1]=i})<=1
@@ -243,7 +247,10 @@ OldCancelIsolated == ~s.badCancel
 OldAckIsolated == ~s.badAck
 OldCleanupIsolated == ~s.badCallback
 IdleMeansNoActive == s.idle => NoActive
-ExpiredResultsStayAbsent == s.retained \cap (s.acknowledged\cup s.expired)={}
+ExpiredResultsStayAbsent ==
+  /\ s.retained \cap s.expired = {}
+  /\ s.expired \subseteq s.acknowledged \cap s.terminal
+  /\ s.acknowledged\s.terminal \subseteq s.retained
 NoTwoReceived == s.delivered<2
 NoLateReceiveWhileSecondActive == "activeSecond" \notin s.observed
 NoLateReceiveAfterRestart == "afterRestart" \notin s.observed

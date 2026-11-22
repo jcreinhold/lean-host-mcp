@@ -3188,6 +3188,18 @@
       "invariant": "IdleMeansNoActive"
     },
     {
+      "name": "bad-expire-before-closure",
+      "model": "HistoricalStages",
+      "constants": {
+        "MaxRedeliveries": "1",
+        "Controls": "TRUE",
+        "Mutant": "\"ExpireBeforeClosure\""
+      },
+      "invariants": ["ExpiredResultsStayAbsent"],
+      "expect": "invariant",
+      "invariant": "ExpiredResultsStayAbsent"
+    },
+    {
       "name": "bad-late-AckCurrent",
       "model": "HistoricalStages",
       "constants": {
