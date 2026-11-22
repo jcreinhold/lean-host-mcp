@@ -309,6 +309,8 @@ pub struct ProjectBroker {
     runtime_config: ProjectRuntimeConfig,
     worker_slots: Arc<Semaphore>,
     capacity_admission: AsyncMutex<()>,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    launcher_guards: Mutex<HashMap<PathBuf, std::fs::File>>,
 }
 
 impl std::fmt::Debug for ProjectBroker {
@@ -351,6 +353,8 @@ impl ProjectBroker {
             runtime_config,
             worker_slots: Arc::new(Semaphore::new(config.max_projects.get())),
             capacity_admission: AsyncMutex::new(()),
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            launcher_guards: Mutex::new(HashMap::new()),
             config,
         });
         broker.spawn_reaper();
@@ -436,6 +440,29 @@ impl ProjectBroker {
     /// Returns [`ServerError::BadProject`] when the explicit / env /
     /// config path is unusable or no lakefile is reachable from `cwd`.
     pub fn resolve(&self, hint: &ProjectHint) -> Result<PathBuf> {
+        let root = self.resolve_candidate(hint)?;
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        {
+            let mut guards = self.launcher_guards.lock();
+            if !guards.contains_key(&root) {
+                if guards.len() >= 256 {
+                    return Err(ServerError::BadProject("launcher project guard limit reached".into()));
+                }
+                let guard = crate::launcher_selection::admit_unenrolled(&root)
+                    .map_err(|error| ServerError::BadProject(format!("launcher admission refused: {error}")))?;
+                guards.insert(root.clone(), guard);
+            }
+        }
+        Ok(root)
+    }
+
+    /// Retain the checked startup selector for its exact canonical project.
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub fn retain_launcher_guard(&self, root: PathBuf, guard: std::fs::File) {
+        self.launcher_guards.lock().insert(root, guard);
+    }
+
+    fn resolve_candidate(&self, hint: &ProjectHint) -> Result<PathBuf> {
         if let ProjectHint::Explicit(p) = hint {
             return canonicalise(p);
         }

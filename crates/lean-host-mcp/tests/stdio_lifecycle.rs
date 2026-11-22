@@ -180,13 +180,18 @@ impl StdioServer {
             .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", config_dir.join("native-owners"))
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", registry)
-            .env("RUST_LOG", "warn")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .env("RUST_LOG", "warn");
         if let Some(dir) = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR") {
             command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
         }
+        Self::spawn(&mut command)
+    }
+
+    fn spawn(command: &mut Command) -> Self {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn lean-host-mcp stdio server");
         let stdin = child.stdin.take().expect("server stdin");
         let stdout = BufReader::new(child.stdout.take().expect("server stdout"));
@@ -399,4 +404,313 @@ fn child_pids(parent: u32) -> Vec<u32> {
 #[cfg(not(unix))]
 fn child_pids(_parent: u32) -> Vec<u32> {
     Vec::new()
+}
+
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+mod launcher_regressions {
+    use super::*;
+    use std::fs;
+
+    struct Fixture {
+        scratch: tempfile::TempDir,
+        project: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let scratch = tempfile::tempdir().expect("private launcher fixture");
+            let project = scratch
+                .path()
+                .canonicalize()
+                .expect("canonical fixture")
+                .join("project");
+            fs::create_dir(&project).expect("project directory");
+            fs::write(
+                project.join("lakefile.lean"),
+                "import Lake\nopen Lake DSL\npackage Probe\nlean_lib Probe\n",
+            )
+            .expect("project file");
+            fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.36.0\n").expect("toolchain");
+            fs::write(
+                project.join("lake-manifest.json"),
+                json!({"version": "1.2.0", "packagesDir": ".lake/packages",
+                    "name": "Probe", "lakeDir": ".lake", "packages": []})
+                .to_string(),
+            )
+            .expect("empty Lake manifest");
+            fs::create_dir_all(scratch.path().join("config/lean-host-mcp")).expect("private config");
+            Self { scratch, project }
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+            command
+                .current_dir(&self.project)
+                .env_remove("LEAN_HOST_MCP_PROJECT")
+                .env_remove("LEAN_HOST_MCP_BIND")
+                .env_remove("LEAN_HOST_MCP_HTTP_PATH")
+                .env_remove("LEAN_HOST_MCP_REQUEST_JOURNAL")
+                .env("LEAN_HOST_MCP_CONFIG_DIR", self.scratch.path().join("config"))
+                .env(
+                    "LEAN_HOST_MCP_PROCESS_REGISTRY_DIR",
+                    self.scratch.path().join("processes"),
+                )
+                .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", self.project.join("owners"))
+                .kill_on_drop(true);
+            command
+        }
+
+        async fn new_store(&self, directory: &str) -> (PathBuf, uuid::Uuid) {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let path = self.project.join(directory);
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .expect("private store parent");
+            let path = path.join("stages.sqlite3");
+            let mut command = self.command();
+            command
+                .arg("--lake-root")
+                .arg(&self.project)
+                .arg("--managed-native-store")
+                .arg(&path);
+            let mut server = StdioServer::spawn(&mut command);
+            server.initialize().await;
+            let reply = server
+                .request(
+                    "tools/call",
+                    json!({"name": "lean_managed_admission", "arguments": {
+                        "request": json!({"version": 1, "command": {"op": "discover"}}).to_string()
+                    }}),
+                )
+                .await;
+            let data: Value = serde_json::from_str(
+                reply
+                    .pointer("/result/content/0/text")
+                    .and_then(Value::as_str)
+                    .expect("discover reply"),
+            )
+            .expect("discover JSON");
+            let bytes: [u8; 16] = serde_json::from_value(data["store"].clone()).expect("store UUID bytes");
+            server.close_stdin_and_wait().await;
+            (path, uuid::Uuid::from_bytes(bytes))
+        }
+
+        fn enroll(&self, store: &Path, id: uuid::Uuid) -> PathBuf {
+            let config = self.project.join("lean-host-mcp.toml");
+            fs::write(
+                &config,
+                format!(
+                    "[launcher]\nmode = \"ordinary\"\ngeneration = 1\nmanaged_store = {:?}\nmanaged_store_uuid = \"{id}\"\n",
+                    store.to_str().expect("UTF-8 test path")
+                ),
+            )
+            .expect("enroll project");
+            config
+        }
+
+        #[cfg(lean_host_cutover_sdk)]
+        async fn custody(&self) -> PathBuf {
+            use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+            let output = self
+                .command()
+                .arg("writer-lock-path")
+                .arg(&self.project)
+                .output()
+                .await
+                .expect("lock domain");
+            assert!(output.status.success(), "{output:?}");
+            let path: Value = serde_json::from_slice(&output.stdout).expect("lock JSON");
+            let path = PathBuf::from(path["lock_path"].as_str().expect("lock path"));
+            assert!(
+                path.starts_with(self.project.parent().expect("private fixture root")),
+                "{path:?}"
+            );
+            fs::create_dir_all(path.parent().expect("lock parent")).expect("lock parent directory");
+            let create_lock = |path: &Path| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .expect("private lock")
+            };
+            let lock = create_lock(&path).metadata().expect("lock identity");
+            let owners = self.project.join("owners");
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&owners)
+                .expect("private registry");
+            create_lock(&owners.join(".admission.lock"));
+            let registry = owners.metadata().expect("registry identity");
+            let pins = self.project.join("custody.json");
+            fs::write(
+                &pins,
+                json!({
+                    "registry": {"path": owners, "device": registry.dev(), "inode": registry.ino()},
+                    "locks": [[path, lock.dev(), lock.ino()]]
+                })
+                .to_string(),
+            )
+            .expect("custody proof");
+            pins
+        }
+
+        #[cfg(lean_host_cutover_sdk)]
+        fn transition(&self, pins: &Path, from: &str, to: &str) -> Command {
+            let mut command = self.command();
+            command
+                .arg("launcher-transition")
+                .arg("--project")
+                .arg(&self.project)
+                .args(["--from-generation", from, "--to", to])
+                .arg("--custody")
+                .arg(pins);
+            command
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_cross_project_loaded_request_requires_actual_project_selection() {
+        let fixture = Fixture::new();
+        let (store, id) = fixture.new_store("store").await;
+        fixture.enroll(&store, id);
+        fs::write(
+            fixture.scratch.path().join("config/lean-host-mcp/config.toml"),
+            format!(
+                "primary_project = {:?}\n",
+                fixture.project.to_str().expect("UTF-8 project")
+            ),
+        )
+        .expect("approve enrolled project");
+        let cwd = fixture.scratch.path().join("other");
+        fs::create_dir(&cwd).expect("other project");
+        fs::write(cwd.join("lean-host-mcp.toml"), "[runtime]\n").expect("unenrolled config");
+        let mut server = StdioServer::spawn(fixture.command().current_dir(cwd));
+        server.initialize().await;
+        let response = server
+            .request_allow_error(
+                "tools/call",
+                json!({
+                    "name": "lean_compatibility",
+                    "arguments": {"project": fixture.project, "mode": "loaded"}
+                }),
+            )
+            .await;
+        let response = response.to_string();
+        assert!(response.contains("launcher admission refused"), "{response}");
+        assert!(response.contains("enrolled project requires"), "{response}");
+        server.close_stdin_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn launcher_rejects_valid_replacement_store_at_original_path() {
+        let fixture = Fixture::new();
+        let (store, id) = fixture.new_store("store").await;
+        let (substitute, other_id) = fixture.new_store("substitute").await;
+        assert_ne!(id, other_id);
+        let config = fixture.enroll(&store, id);
+        #[cfg(lean_host_cutover_sdk)]
+        let pins = {
+            let pins = fixture.custody().await;
+            let output = fixture
+                .transition(&pins, "1", "managed")
+                .output()
+                .await
+                .expect("switch to managed");
+            assert!(output.status.success(), "{output:?}");
+            pins
+        };
+        let before = fs::read(&config).expect("original selector");
+        let saved = store.with_extension("original");
+        fs::rename(&store, &saved).expect("save original store");
+        fs::rename(substitute, &store).expect("install empty substitute");
+        let mut startup = fixture.command();
+        startup.arg("--lake-root").arg(&fixture.project);
+        #[cfg(lean_host_cutover_sdk)]
+        startup
+            .args([
+                "--launcher-mode",
+                "managed",
+                "--launcher-generation",
+                "2",
+                "--managed-only",
+            ])
+            .arg("--managed-native-store")
+            .arg(&store);
+        #[cfg(not(lean_host_cutover_sdk))]
+        startup.args(["--launcher-mode", "ordinary", "--launcher-generation", "1"]);
+        let output = startup.output().await.expect("startup rejection");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("original launcher store UUID changed"),
+            "{output:?}"
+        );
+        #[cfg(lean_host_cutover_sdk)]
+        {
+            let output = fixture
+                .transition(&pins, "2", "ordinary")
+                .output()
+                .await
+                .expect("rollback rejection");
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("original launcher store UUID changed"),
+                "{output:?}"
+            );
+        }
+        assert_eq!(fs::read(config).expect("selector after refusal"), before);
+    }
+
+    #[cfg(lean_host_cutover_sdk)]
+    #[tokio::test]
+    async fn launcher_uncertain_publication_reconciles_without_another_generation() {
+        use std::os::unix::fs::MetadataExt as _;
+        let fixture = Fixture::new();
+        let (store, id) = fixture.new_store("store").await;
+        let config = fixture.enroll(&store, id);
+        let pins = fixture.custody().await;
+        let cut = fixture
+            .transition(&pins, "1", "managed")
+            .env("LEAN_HOST_MCP_TEST_LAUNCHER_RENAME_CUT", "1")
+            .output()
+            .await
+            .expect("rename cut");
+        assert!(!cut.status.success(), "{cut:?}");
+        assert!(
+            String::from_utf8_lossy(&cut.stderr).contains("disposable cut after selector rename"),
+            "{cut:?}"
+        );
+        let visible = fs::read_to_string(&config).expect("visible selector");
+        let selector: toml::Table = toml::from_str(&visible).expect("selector TOML");
+        assert_eq!(selector["launcher"]["generation"].as_integer(), Some(2));
+        assert_eq!(selector["launcher"]["mode"].as_str(), Some("managed"));
+        let inode = config.metadata().expect("visible inode").ino();
+
+        let retry = fixture
+            .transition(&pins, "1", "managed")
+            .output()
+            .await
+            .expect("exact retry");
+        assert!(retry.status.success(), "{retry:?}");
+        assert_eq!(fs::read_to_string(&config).expect("reconciled selector"), visible);
+        assert_eq!(config.metadata().expect("reconciled inode").ino(), inode);
+        let mut server = StdioServer::spawn(
+            fixture
+                .command()
+                .arg("--lake-root")
+                .arg(&fixture.project)
+                .args([
+                    "--launcher-mode",
+                    "managed",
+                    "--launcher-generation",
+                    "2",
+                    "--managed-only",
+                ])
+                .arg("--managed-native-store")
+                .arg(&store),
+        );
+        server.initialize().await;
+        server.close_stdin_and_wait().await;
+    }
 }

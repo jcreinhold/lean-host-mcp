@@ -44,6 +44,9 @@ struct Cli {
 enum Command {
     /// Run the stdio MCP server (default when no subcommand is given).
     Serve(ServeArgs),
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    LauncherTransition(lean_host_mcp::launcher_selection::Transition),
+
     /// Internal process-bound shared-writer supervisor.
     Writer(lean_host_mcp::shared_writer::WriterArgs),
     /// Resolve the shared project-lock domain without starting runtime work.
@@ -110,6 +113,15 @@ struct ServeArgs {
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
 
+    /// Expected project launcher mode. The server holds the selection guard until shutdown.
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    #[arg(long, requires_all = ["launcher_generation", "lake_root"])]
+    launcher_mode: Option<lean_host_mcp::launcher_selection::LauncherMode>,
+
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    #[arg(long, requires = "launcher_mode")]
+    launcher_generation: Option<u64>,
+
     /// Operator-reviewed verify-batch-v1 digest for this primary project.
     /// Records startup policy only; the released worker keeps native source grants closed.
     #[arg(long)]
@@ -158,6 +170,14 @@ fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        Some(Command::LauncherTransition(args)) => match args.run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp launcher-transition: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some(Command::InstallWorker(args)) => match install_worker::run(&args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -354,6 +374,35 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // file). It is the layer beneath env/CLI: each knob is CLI > env > file >
     // default.
     let (file, home_primary) = ConfigFile::load_for_server(&cwd);
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    let launcher = {
+        use lean_host_mcp::launcher_selection::{self, LauncherMode};
+        if let Some(mode) = args.launcher_mode {
+            if args.managed_only != (mode == LauncherMode::Managed) {
+                anyhow::bail!("launcher mode differs from managed-only startup policy");
+            }
+            let root = args.lake_root.as_deref().context("launcher project required")?;
+            let (guard, store) = launcher_selection::admit(
+                root,
+                mode,
+                args.launcher_generation.context("launcher generation required")?,
+                args.managed_native_store.as_deref(),
+            )?;
+            Some((root.to_owned(), guard, (mode == LauncherMode::Managed).then_some(store)))
+        } else {
+            let root = args
+                .lake_root
+                .as_deref()
+                .or_else(|| launcher_selection::enclosing_config_root(&cwd))
+                .or(file.primary_project.as_deref());
+            root.map(|root| -> std::io::Result<_> {
+                let root = root.canonicalize()?;
+                let guard = launcher_selection::admit_unenrolled(&root)?;
+                Ok((root, guard, None))
+            })
+            .transpose()?
+        }
+    };
 
     // Transport: clap already folds CLI-or-env into `args.*`, so `.or(file)`
     // yields CLI > env > file. The file's `bind` is a raw string, parsed here so
@@ -422,6 +471,17 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         },
         runtime_config,
     );
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    let expected_launcher_store = launcher.and_then(|(root, guard, store)| {
+        broker.retain_launcher_guard(root, guard);
+        store
+    });
+    #[cfg(all(
+        unix,
+        feature = "managed-native-store",
+        not(any(target_os = "macos", target_os = "linux"))
+    ))]
+    let expected_launcher_store = None;
     let _process_record = processes::ServerProcessRecord::register(transport, bind_display.clone(), http_path_log)?;
     let mut service = LeanHostService::new(Arc::clone(&broker), tool_config);
     if let Some(path) = args.request_journal {
@@ -429,7 +489,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
     #[cfg(all(unix, feature = "managed-native-store"))]
     if let Some(path) = args.managed_native_store {
-        service = service.with_managed_native_store(&path)?;
+        service = service.with_managed_native_store_identity(&path, expected_launcher_store)?;
     }
     let result = if let Some(config) = http {
         transport_http::serve(service, config).await

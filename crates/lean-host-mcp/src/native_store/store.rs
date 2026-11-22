@@ -553,6 +553,50 @@ pub(crate) struct NativeStore {
     active_stops: std::collections::HashMap<NativeKey, ActiveStop>,
 }
 impl NativeStore {
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn launcher_store_identity(path: &std::path::Path) -> std::io::Result<Id> {
+        let db = CheckedConnection::open_recovery(path).map_err(std::io::Error::other)?;
+        if !native_schema_valid(&db).map_err(std::io::Error::other)? {
+            return Err(std::io::Error::other("original launcher store schema changed"));
+        }
+        db.query_row("SELECT store FROM meta WHERE singleton=1", [], |row| fixed(row, 0))
+            .map_err(std::io::Error::other)
+    }
+
+    #[cfg(lean_host_cutover_sdk)]
+    pub(crate) fn with_settled_launcher_store<T>(
+        path: &std::path::Path,
+        expected: Id,
+        switch: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut db = CheckedConnection::open_existing(path, |db| {
+            if !native_schema_valid(db)? {
+                return Ok(false);
+            }
+            let integrity: String = db.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+            Ok(integrity == "ok")
+        })
+        .map_err(std::io::Error::other)?;
+        let tx = db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let actual: Id = tx
+            .query_row("SELECT store FROM meta WHERE singleton=1", [], |row| fixed(row, 0))
+            .map_err(std::io::Error::other)?;
+        if actual != expected {
+            return Err(std::io::Error::other("original launcher store UUID changed"));
+        }
+        let unsettled: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stages WHERE gate=0 OR resource_report IN (1,2) OR (gate=1 AND (resource_report<>3 OR result_kind=0)))",
+            [], |row| row.get(0),
+        ).map_err(std::io::Error::other)?;
+        if unsettled {
+            return Err(std::io::Error::other("managed store has unsettled stages"));
+        }
+        switch()
+    }
+
     pub(crate) fn database_path(&self) -> Option<&std::path::Path> {
         self.db.connection().path().map(std::path::Path::new)
     }

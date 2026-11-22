@@ -146,7 +146,20 @@ impl LeanHostService {
     /// # Errors
     /// Returns an error if the selected private database cannot be opened or created.
     #[cfg(all(unix, feature = "managed-native-store"))]
-    pub fn with_managed_native_store(mut self, path: &std::path::Path) -> std::io::Result<Self> {
+    pub fn with_managed_native_store(self, path: &std::path::Path) -> std::io::Result<Self> {
+        self.with_managed_native_store_identity(path, None)
+    }
+
+    /// Open a managed store while enforcing the enrolled UUID on that connection.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid store or a changed enrollment identity.
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    pub fn with_managed_native_store_identity(
+        mut self,
+        path: &std::path::Path,
+        expected: Option<[u8; 16]>,
+    ) -> std::io::Result<Self> {
         use crate::native_store::store::NativeStore;
         use std::os::unix::fs::MetadataExt as _;
         let parent = path
@@ -173,10 +186,15 @@ impl LeanHostService {
                 NativeStore::open(path)
             }
             Ok(_) => return Err(std::io::Error::other("managed store requires a private regular file")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => NativeStore::create_new(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() => {
+                NativeStore::create_new(path)
+            }
             Err(error) => return Err(error),
         }
         .map_err(std::io::Error::other)?;
+        if expected.is_some_and(|uuid| store.identity() != uuid) {
+            return Err(std::io::Error::other("original launcher store UUID changed"));
+        }
         self.managed_store = Some(Arc::new(parking_lot::Mutex::new(store)));
         self.tool_router.merge(Self::managed_tool_router());
         Ok(self)

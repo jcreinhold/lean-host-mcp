@@ -89,3 +89,7 @@ pub use server::LeanHostService;
 pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};
 pub use tools::{OutputBudgetOverrides, ResponseCarrier, TelemetryVerbosity, ToolConfig};
 pub use trust::{ArtifactKind, ArtifactTrust, TrustScope, TrustStatus};
+
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+#[doc(hidden)]
+pub mod launcher_selection;
