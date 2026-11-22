@@ -1,6 +1,6 @@
 """Darwin installed cancellation check.
 
-Run with PARENT DISPOSABLE_WORKERS_DIR NEW_CHECKOUT_TARGET_CHILD [cancel|death].
+Run with PARENT DISPOSABLE_WORKERS_DIR NEW_CHECKOUT_TARGET_CHILD [cancel|death|broker].
 Use the normal install-worker command with --workers-dir under target.
 The smoke project and native registry must be exclusive to this test.
 """
@@ -126,28 +126,32 @@ def check(parent, workers, scope, mode):
         LEAN_HOST_MCP_MAX_WORKERS="1",
         LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT="1",
     )
-    proc = subprocess.Popen(
-        [
-            "sandbox-exec",
-            "-p",
-            '(version 1)(allow default)(deny file-write* (subpath "/private/tmp"))',
-            parent,
-            "--lake-root",
-            project,
-            "--request-journal",
-            scope / "journal",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
+
+    def start():
+        return subprocess.Popen(
+            [
+                "sandbox-exec",
+                "-p",
+                '(version 1)(allow default)(deny file-write* (subpath "/private/tmp"))',
+                parent,
+                "--lake-root",
+                project,
+                "--request-journal",
+                scope / "journal",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    proc = start()
     events = queue.Queue()
     replies = {}
     ids = itertools.count(1)
 
-    def reader():
-        for line in proc.stdout:
+    def reader(stream, events):
+        for line in stream:
             msg = json.loads(line)
             if "id" in msg:
                 events.put(msg)
@@ -185,9 +189,8 @@ def check(parent, workers, scope, mode):
     def found(result, name):
         assert not result["errors"] and name in json.dumps(result["data"]), result
 
-    threading.Thread(target=reader, daemon=True).start()
-    resumes = contextlib.ExitStack()
-    try:
+    def initialize():
+        threading.Thread(target=reader, args=(proc.stdout, events), daemon=True).start()
         receive(
             send(
                 "initialize",
@@ -199,12 +202,9 @@ def check(parent, workers, scope, mode):
             )
         )
         send("notifications/initialized", {}, True)
-        found(body(lookup("Nat.add_comm")), "Nat.add_comm")
-        (worker,) = children(proc.pid)
-        (guardian,) = children(worker)
-        assert os.getpgid(worker) == worker and os.getpgid(guardian) == guardian
-        worker_birth, guardian_birth = birth(worker), birth(guardian)
-        args = {"kind": "declaration", "project": str(project), "name": "Nat.add_assoc"}
+
+    def prepare(name):
+        args = {"kind": "declaration", "project": str(project), "name": name}
         ticket = body(
             call("lean_request", action="prepare", tool="lean_lookup", arguments=args)
         )
@@ -212,6 +212,17 @@ def check(parent, workers, scope, mode):
             "request_id": ticket["taskId"],
             "request_epoch": ticket["request"]["request_epoch"],
         }
+        return args, ticket, binding
+
+    resumes = contextlib.ExitStack()
+    try:
+        initialize()
+        found(body(lookup("Nat.add_comm")), "Nat.add_comm")
+        (worker,) = children(proc.pid)
+        (guardian,) = children(worker)
+        assert os.getpgid(worker) == worker and os.getpgid(guardian) == guardian
+        worker_birth, guardian_birth = birth(worker), birth(guardian)
+        args, ticket, binding = prepare("Nat.add_assoc")
         before, count = pipe_state(worker)
         assert count == 0
         submit = call(
@@ -237,7 +248,19 @@ def check(parent, workers, scope, mode):
         )
         body(submit)
         parked_pipe = pipe_state(worker)
-        second = lookup("Nat.mul_comm")
+        if mode == "broker":
+            queued_args, queued_ticket, queued_binding = prepare("Nat.mul_comm")
+            body(
+                call(
+                    "lean_request",
+                    action="submit",
+                    tool="lean_lookup",
+                    arguments=queued_args,
+                    **queued_binding,
+                )
+            )
+        else:
+            second = lookup("Nat.mul_comm")
         state = until(lambda: s if (s := pool())["outstanding_jobs"] == 2 else None)
         assert (
             state["occupied_slots"] == 1
@@ -255,82 +278,119 @@ def check(parent, workers, scope, mode):
                 )
             )
         )
-        try:
-            if mode == "death":
-                assert birth(worker) == worker_birth and worker in children(proc.pid)
-                os.kill(worker, signal.SIGKILL)
+        if mode == "broker":
+            proc.kill()
+            assert proc.wait(timeout=5) == -signal.SIGKILL
+            proc.stdin.close()
+            proc = start()
+            events, replies = queue.Queue(), {}
+            initialize()
 
-                def dead_or_zombie():
-                    state = subprocess.run(
-                        ["ps", "-o", "state=", "-p", str(worker)],
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                    )
-                    return (
-                        state.returncode == 1
-                        and not state.stdout.strip()
-                        and not state.stderr
-                    ) or (state.returncode == 0 and "Z" in state.stdout)
+            def recovered(binding, ticket):
+                record = body(call("lean_request", action="get", **binding))
+                assert record["request"] == ticket["request"], record
+                return record["execution"]
 
-                until(dead_or_zombie)
-            else:
-                intent = body(call("lean_request", action="cancel", **binding))
-                assert intent["cancellation_requested"], intent
-            held = pool()
-            if mode == "cancel" or held["occupied_slots"] == 1:
-                assert held["occupied_slots"] == 1, held
-                if mode == "cancel":
-                    assert not absent(guardian)
-            else:
-                assert (
-                    held["workers_stopped"] and absent(worker) and absent(guardian)
-                ), held
-            assert set(children(proc.pid)) <= {worker}
-            if mode == "cancel":
-                assert second not in replies
-            # Cancellation may already have reaped the worker while its stopped
-            # guardian still holds custody. Only consult the original live pipe.
-            try:
-                if mode != "death" and birth(worker) == worker_birth:
-                    assert pipe_state(worker) == parked_pipe
-            except ProcessLookupError:
-                pass
-        finally:
+            original = recovered(binding, ticket)
+            queued = recovered(queued_binding, queued_ticket)
+            assert original["disposition"] == "unknown", original
+            assert queued["disposition"] in {"unknown", "not_started"}, queued
+            assert not children(proc.pid) and birth(guardian) == guardian_birth
+            probe = receive(lookup("Nat.succ"))
+            print("fenced probe", probe.get("error"), flush=True)
+            assert birth(guardian) == guardian_birth and not children(proc.pid)
+            assert "native actor capacity occupied" in probe.get("error", {}).get(
+                "message", ""
+            ), probe
             guard_resume.close()
-        result = body(second)
-        if result["errors"]:
-            assert (
-                result["errors"][0]["details"]["reason"] == "project_shutting_down"
-            ), result
-            until(lambda: pool()["occupied_slots"] == 0)
-            assert absent(worker) and absent(guardian)
+            until(lambda: absent(worker) and absent(guardian))
             found(body(lookup("Nat.mul_assoc")), "Nat.mul_assoc")
+            assert (
+                recovered(binding, ticket) == original
+                and recovered(queued_binding, queued_ticket) == queued
+            )
+            print("recovered dispositions", original, queued, flush=True)
         else:
-            found(result, "Nat.mul_comm")
+            try:
+                if mode == "death":
+                    assert birth(worker) == worker_birth and worker in children(
+                        proc.pid
+                    )
+                    os.kill(worker, signal.SIGKILL)
+
+                    def dead_or_zombie():
+                        state = subprocess.run(
+                            ["ps", "-o", "state=", "-p", str(worker)],
+                            text=True,
+                            capture_output=True,
+                            check=False,
+                        )
+                        return (
+                            state.returncode == 1
+                            and not state.stdout.strip()
+                            and not state.stderr
+                        ) or (state.returncode == 0 and "Z" in state.stdout)
+
+                    until(dead_or_zombie)
+                else:
+                    intent = body(call("lean_request", action="cancel", **binding))
+                    assert intent["cancellation_requested"], intent
+                held = pool()
+                if mode == "cancel" or held["occupied_slots"] == 1:
+                    assert held["occupied_slots"] == 1, held
+                    if mode == "cancel":
+                        assert not absent(guardian)
+                else:
+                    assert (
+                        held["workers_stopped"] and absent(worker) and absent(guardian)
+                    ), held
+                assert set(children(proc.pid)) <= {worker}
+                if mode == "cancel":
+                    assert second not in replies
+                # Cancellation may already have reaped the worker while its stopped
+                # guardian still holds custody. Only consult the original live pipe.
+                try:
+                    if mode != "death" and birth(worker) == worker_birth:
+                        assert pipe_state(worker) == parked_pipe
+                except ProcessLookupError:
+                    pass
+            finally:
+                guard_resume.close()
+            result = body(second)
+            if result["errors"]:
+                assert (
+                    result["errors"][0]["details"]["reason"] == "project_shutting_down"
+                ), result
+                until(lambda: pool()["occupied_slots"] == 0)
+                assert absent(worker) and absent(guardian)
+                found(body(lookup("Nat.mul_assoc")), "Nat.mul_assoc")
+            else:
+                found(result, "Nat.mul_comm")
         assert absent(worker) and absent(guardian)
         (replacement,) = children(proc.pid)
         assert replacement != worker and os.getpgid(replacement) == replacement
         (replacement_guardian,) = children(replacement)
-        terminal = body(call("lean_request", action="get", **binding))
-        assert terminal["execution"]["disposition"] == "stopped", terminal
-        receipt = terminal["execution"]["worker_stop_receipt"]
-        assert receipt["worker_pid"] == worker, receipt
-        if mode == "death":
+        if mode != "broker":
+            terminal = body(call("lean_request", action="get", **binding))
+            assert terminal["execution"]["disposition"] == "stopped", terminal
+            receipt = terminal["execution"]["worker_stop_receipt"]
+            assert receipt["worker_pid"] == worker, receipt
+            if mode == "death":
+                assert (
+                    not terminal["cancellation_requested"]
+                    and not receipt["exit_success"]
+                ), receipt
+                assert "SIGKILL" in receipt["exit_status"] and receipt["cause"] in {
+                    "child_abort",
+                    "child_exit",
+                }, receipt
+            else:
+                assert receipt["cause"] == "cancelled", receipt
             assert (
-                not terminal["cancellation_requested"] and not receipt["exit_success"]
+                receipt["worker_generation"] == 1 and receipt["worker_request_id"] > 0
             ), receipt
-            assert "SIGKILL" in receipt["exit_status"] and receipt["cause"] in {
-                "child_abort",
-                "child_exit",
-            }, receipt
-        else:
-            assert receipt["cause"] == "cancelled", receipt
-        assert receipt["worker_generation"] == 1 and receipt["worker_request_id"] > 0, (
-            receipt
-        )
-        assert receipt["operation"] == "open_worker_session", receipt
-        print(receipt, flush=True)
+            assert receipt["operation"] == "open_worker_session", receipt
+            print(receipt, flush=True)
         print(
             f"{mode} request {ticket['taskId']}, one occupied slot for two jobs; "
             f"closed groups {worker}/{guardian}; replacement {replacement}",
@@ -364,5 +424,5 @@ def check(parent, workers, scope, mode):
 
 if __name__ == "__main__":
     mode = sys.argv[4] if len(sys.argv) == 5 else "cancel"
-    assert mode in {"death", "cancel"} and len(sys.argv) in {4, 5}
+    assert mode in {"death", "cancel", "broker"} and len(sys.argv) in {4, 5}
     check(*(Path(arg).resolve() for arg in sys.argv[1:4]), mode)
