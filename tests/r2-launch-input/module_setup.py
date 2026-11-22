@@ -91,7 +91,7 @@ def inventory(p):
     }
 
 
-def probe(p, *, search=False):
+def probe(p, *, search=False, diagnostics=False):
     proc = s.Popen(
         [
             parent,
@@ -130,6 +130,10 @@ def probe(p, *, search=False):
             ),
         )
         rpc(None, "notifications/initialized", {})
+        if diagnostics:
+            return rpc(2, "tools/call", dict(
+                name="lean_status", arguments=dict(kind="file_diagnostics", file="Demo.lean")
+            ))
         if search:
             return rpc(
                 2,
@@ -245,6 +249,36 @@ for label, plugin in [("project", True), ("omitted", False)]:
     assert inventory(project) == before, "project changed during verification"
 
 project = b / "project"
+# Exercise the packaged setup-aware diagnostics driver on current source. The
+# leading informational message alone exceeds the default total output budget.
+demo = project / "Demo.lean"
+original = demo.read_bytes()
+noise = '#check "' + "λ" * 35000 + '"\n'
+missing = "MissingAfterReleaseSmokeNoise"
+noisy_source = original + (noise + f"#check {missing}\n").encode()
+try:
+    demo.write_bytes(noisy_source)
+    before = inventory(project)
+    reply = probe(project, diagnostics=True)
+    envelope = json.loads(reply["result"]["content"][0]["text"])
+    assert not envelope["errors"], envelope
+    diagnostics = envelope["data"]["diagnostics"]
+    assert diagnostics["summary"]["errors"] > 0 and diagnostics["truncated"], diagnostics
+    line = noisy_source.count(b"\n")
+    column = len("#check ")
+    expected_range = {
+        "file": str(demo), "start_line": line, "start_column": column,
+        "end_line": line, "end_column": column + len(missing),
+    }
+    assert any(
+        row["severity"] == "error" and missing in row["message"]
+        and row.get("original_range") == expected_range
+        for row in diagnostics["diagnostics"]
+    ), [row for row in diagnostics["diagnostics"] if row["severity"] == "error"]
+    assert inventory(project) == before, "project changed during file diagnostics"
+finally:
+    demo.write_bytes(original)
+
 (image,) = project.glob(".lake/build/lib/*Witness." + ("dylib" if sys.platform == "darwin" else "so"))
 saved = b / "held-plugin.dylib"
 image.rename(saved)
