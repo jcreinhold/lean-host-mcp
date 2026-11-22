@@ -20,6 +20,8 @@ use lean_toolchain::shared_reader::SharedReader;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+pub(crate) mod admitted;
 mod control;
 mod input;
 
@@ -32,6 +34,8 @@ const STDIN_ENV: &str = "LEAN_HOST_MCP_NATIVE_READER_STDIN";
 const PROGRAM_CWD_ENV: &str = "LEAN_HOST_MCP_NATIVE_READER_CWD";
 const PROGRAM_ROLE_ENV: &str = "LEAN_HOST_MCP_NATIVE_READER_ROLE";
 const PRIVATE_ENV: &[&str] = &[
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    admitted::DEADLINE_ENV,
     STDIN_ENV,
     PROGRAM_CWD_ENV,
     PROGRAM_ROLE_ENV,
@@ -171,6 +175,8 @@ pub(crate) fn run_program_with_contract(
             Some(&program),
             Some(helper),
             Some(scope),
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            None,
             keepalive,
             cancelled,
             &mut spawned,
@@ -651,6 +657,8 @@ fn run(args: &NativeReaderArgs) -> io::Result<NativeReaderResult> {
         None,
         None,
         None,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
         None,
         &|| cancellation.as_ref().is_some_and(control::CancellationPipe::cancelled),
         &mut spawned,
@@ -666,6 +674,9 @@ fn run_internal(
     program: Option<&NativeReaderProgram>,
     configured_helper: Option<&crate::shared_writer::WriterContract>,
     prepared_scope: Option<(LeanWorkerNativeScope, Instant)>,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] mut admitted: Option<
+        &mut admitted::Stage,
+    >,
     mut keepalive: Option<Box<dyn Send>>,
     cancelled: &(impl Fn() -> bool + ?Sized),
     spawned: &mut bool,
@@ -725,14 +736,22 @@ fn run_internal(
     };
     let staged_input = if args.stdin {
         let directory = scope.input_directory()?;
-        Some(input::capture(&io::stdin(), &directory, deadline, &|| {
+        let still_alive = || {
             Ok(!cancelled()
                 && caller
                     .as_ref()
                     .map(NativeProcessIdentity::is_live)
                     .transpose()?
                     .unwrap_or(true))
-        })?)
+        };
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        let generated = admitted.as_ref().and_then(|stage| stage.generated_input());
+        #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+        let generated: Option<&[u8]> = None;
+        Some(match generated {
+            Some(bytes) => input::stage_bytes(&directory, bytes, deadline, &still_alive)?,
+            None => input::capture(&io::stdin(), &directory, deadline, &still_alive)?,
+        })
     } else {
         None
     };
@@ -756,6 +775,12 @@ fn run_internal(
     }
     if let Some(staged) = &staged_input {
         command.env(STDIN_ENV, serde_json::to_string(staged).map_err(io::Error::other)?);
+    }
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if let Some(stage) = admitted.as_deref() {
+        command
+            .stdin(Stdio::piped())
+            .env(admitted::DEADLINE_ENV, stage.envelope()?);
     }
     command.env("LEAN_RS_WORKER_GUARDIAN_EXECUTABLE", &helper.executable);
     let reaper = cleanup_reaper()?;
@@ -824,6 +849,13 @@ fn run_internal(
     } else {
         interrupted = Some("caller ended or deadline elapsed before payload admission".into());
         let _stop = native.lease()?.request_stop();
+    }
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if interrupted.is_none()
+        && let Some(stage) = admitted.as_deref_mut()
+        && let Err(error) = stage.release(native.lease()?, &mut output, cancelled)
+    {
+        interrupted = Some(format!("admitted native reader gate refused: {error}"));
     }
     let mut cleanup_deadline = None;
     loop {
@@ -1037,7 +1069,14 @@ fn payload_has_no_survivors() -> io::Result<bool> {
 /// Returns malformed private admission or result emission failures. It never
 /// falls back to running the payload without a guardian.
 pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
-    let deadline = until(Duration::from_millis(args.timeout_millis))?;
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    let admitted = admitted::bootstrap_deadline()?;
+    let budget = Duration::from_millis(args.timeout_millis);
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    let budget = admitted
+        .as_ref()
+        .map_or(Ok(budget), |(_, deadline)| deadline.remaining())?;
+    let deadline = until(budget)?;
     let mut payload = PayloadResult {
         protocol: PROTOCOL,
         ..PayloadResult::default()
@@ -1051,6 +1090,10 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
             return Ok(());
         }
     };
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if let Some((_, original)) = &admitted {
+        admitted::await_go(*original)?;
+    }
     payload.protected_domains = domains;
     let payload_cwd = match std::env::var_os(PROGRAM_CWD_ENV) {
         Some(cwd) if std::env::var(PROGRAM_ROLE_ENV).ok().as_deref() == Some("preparation") => {
@@ -1090,6 +1133,12 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
     command.current_dir(payload_cwd).stdin(stdin);
     for name in PRIVATE_ENV {
         command.env_remove(name);
+    }
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if let Some((_encoded, original)) = admitted {
+        original.remaining()?;
+        #[cfg(target_os = "linux")]
+        command.env(admitted::DEADLINE_ENV, _encoded);
     }
     #[cfg(not(target_os = "linux"))]
     measure_payload(command, args, deadline, &mut payload)?;
@@ -1165,12 +1214,13 @@ pub fn run_waiter(args: &NativeReaderArgs) -> io::Result<()> {
         protocol: PROTOCOL,
         ..PayloadResult::default()
     };
-    measure_payload(
-        payload_command(args)?,
-        args,
-        until(Duration::from_millis(args.timeout_millis))?,
-        &mut payload,
-    )?;
+    let budget = Duration::from_millis(args.timeout_millis);
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    let budget = admitted::bootstrap_deadline()?.map_or(Ok(budget), |(_, deadline)| deadline.remaining())?;
+    let mut command = payload_command(args)?;
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    command.env_remove(admitted::DEADLINE_ENV);
+    measure_payload(command, args, until(budget)?, &mut payload)?;
     emit(&payload)
 }
 

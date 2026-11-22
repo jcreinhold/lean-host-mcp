@@ -325,7 +325,7 @@ pub(crate) fn lake_trace_paths(targets: &[String]) -> Option<Vec<String>> {
                 return None;
             }
             Some(if target == "runLinter" {
-                ".lake/build/bin/runLinter.trace".into()
+                format!("{}.trace", crate::lake_meta::RUN_LINTER_REL)
             } else {
                 format!(".lake/build/lib/lean/{}.trace", target.replace('.', "/"))
             })

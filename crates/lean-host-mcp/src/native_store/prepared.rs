@@ -26,6 +26,9 @@ use crate::{ProjectBroker, error::ServerError};
 #[path = "trace_snapshot.rs"]
 mod trace_snapshot;
 
+#[path = "readiness_writer.rs"]
+mod readiness_writer;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Intent {
@@ -207,7 +210,19 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
     if let Some(fields) = reply.as_object_mut() {
         fields.insert("dispatch_enabled".into(), broker.prepared_generation().is_some().into());
         if fields.contains_key("acceptance_epoch") && trace_snapshot::available(broker) {
-            fields.insert("operations".into(), serde_json::json!([trace_snapshot::OPERATION]));
+            let operations = vec![trace_snapshot::OPERATION];
+            let operations = {
+                let mut operations = operations;
+                if readiness_writer::selection().is_ok() {
+                    operations.extend([
+                        readiness_writer::OPERATION,
+                        crate::writer_preparation::OPERATION,
+                        readiness_writer::CONSUMER,
+                    ]);
+                }
+                operations
+            };
+            fields.insert("operations".into(), serde_json::json!(operations));
         }
     }
     reply
@@ -233,6 +248,10 @@ pub(crate) async fn start(
     };
     let snapshot = store.lock().client_get(key, &capability).map_err(public_error)?;
     if snapshot.gate != Gate::Pending || snapshot.scope.is_some() {
+        return get();
+    }
+    if readiness_writer::is_operation(&snapshot.intent) {
+        readiness_writer::run(broker, store, snapshot, capability.clone()).await?;
         return get();
     }
     if trace_snapshot::is_operation(&snapshot.intent) {
@@ -311,18 +330,27 @@ pub(crate) fn reconcile_lookup(
     if snapshot.scope.is_none() || snapshot.resource_report == ResourceReport::Closed {
         return None;
     }
-    let Ok(intent) = serde_json::from_slice::<Intent>(&snapshot.intent) else {
-        return None;
-    };
-    let saved = SavedRequest {
-        caller: CallerKey {
-            job: intent.job,
-            stage: key.stage,
-            revision: intent.revision,
-        },
-        key,
-        intent: snapshot.intent,
-        capability: capability.clone(),
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    let external = crate::native_reader::admitted::recovery_request(key, snapshot.intent.clone(), capability.clone());
+    #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+    let external: Option<SavedRequest> = None;
+    let external_reader = external.is_some();
+    let saved = if let Some(saved) = external {
+        saved
+    } else {
+        let Ok(intent) = serde_json::from_slice::<Intent>(&snapshot.intent) else {
+            return None;
+        };
+        SavedRequest {
+            caller: CallerKey {
+                job: intent.job,
+                stage: key.stage,
+                revision: intent.revision,
+            },
+            key,
+            intent: snapshot.intent,
+            capability: capability.clone(),
+        }
     };
     let Ok((stage, identity)) = store.open_stage_recovery(&saved, None) else {
         return None;
@@ -339,9 +367,9 @@ pub(crate) fn reconcile_lookup(
         Ok(false) => {}
         Err(error) => tracing::debug!(%error, "original managed scope closure remains unresolved"),
     }
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") && !external_reader {
         return Some(serde_json::json!({
-            "generation":identity.generation,"revision":intent.revision,
+            "generation":identity.generation,"revision":saved.caller.revision,
         }));
     }
     None

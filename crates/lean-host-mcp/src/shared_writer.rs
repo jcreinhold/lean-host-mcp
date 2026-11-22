@@ -862,22 +862,8 @@ fn code(status: ExitStatus) -> i32 {
         .unwrap_or_else(|| status.signal().unwrap_or(1).saturating_neg())
 }
 
-/// Execute only after the supervisor has synced actual group ownership.
-///
-/// # Errors
-/// Returns protocol or exec errors without running an uncommitted command.
-pub fn run_exec() -> io::Result<()> {
-    let mut bytes = Vec::new();
-    io::stdin().lock().take(FRAME_BYTES + 1).read_until(b'\n', &mut bytes)?;
-    if bytes.len() as u64 > FRAME_BYTES || bytes.last() != Some(&b'\n') {
-        return Err(invalid("writer launch handshake missing or oversized"));
-    }
-    let message: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    let lock_path = Path::new(
-        field(&message, "lock")
-            .as_str()
-            .ok_or_else(|| invalid("writer lock binding missing"))?,
-    );
+/// Verify the current process is the writer's committed group leader.
+pub(crate) fn verify_committed_writer_process(lock_path: &Path) -> io::Result<()> {
     let mut check = OpenOptions::new().read(true).write(true).open(lock_path)?;
     let committed = owner(&mut check, OwnerRecordUse::EmbeddedLaunch)?
         .ok_or_else(|| invalid("writer launch ownership is not committed"))?;
@@ -900,6 +886,26 @@ pub fn run_exec() -> io::Result<()> {
             return Err(invalid("writer launch has no inherited lock custody"));
         }
     }
+    Ok(())
+}
+
+/// Execute only after the supervisor has synced actual group ownership.
+///
+/// # Errors
+/// Returns protocol or exec errors without running an uncommitted command.
+pub fn run_exec() -> io::Result<()> {
+    let mut bytes = Vec::new();
+    io::stdin().lock().take(FRAME_BYTES + 1).read_until(b'\n', &mut bytes)?;
+    if bytes.len() as u64 > FRAME_BYTES || bytes.last() != Some(&b'\n') {
+        return Err(invalid("writer launch handshake missing or oversized"));
+    }
+    let message: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let lock_path = Path::new(
+        field(&message, "lock")
+            .as_str()
+            .ok_or_else(|| invalid("writer lock binding missing"))?,
+    );
+    verify_committed_writer_process(lock_path)?;
     let arguments: Vec<String> =
         serde_json::from_value(field(&message, "command").clone()).map_err(io::Error::other)?;
     let (program, arguments) = arguments

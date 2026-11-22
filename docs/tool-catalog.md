@@ -888,3 +888,13 @@ fact for the file snapshot.
 A worker crash or timeout returns `data: null` and an `errors` issue with `code: "runtime_unavailable"`, with MCP
 `isError: true`. Interrupted results are not cached. Planned recycling before a successful check does not invalidate its
 result.
+
+### Opt-in managed module lint
+
+`lean_module_lint_v1` accepts an ordered list of qualified module names for the approved primary
+project. It runs the project's canonical prebuilt `.lake/build/bin/runLinter` with
+`--no-build --module-only --deny=all` and returns its bounded output, exit code, and verdict.
+This version uses the same standard Lake layout as the managed artifact trace reader. It
+does not resolve custom Lake build or binary directories. If the canonical executable is
+missing or resolves through an alias, START refuses with `prebuilt_module_linter_unavailable`
+before launching it. The operation does not invoke Lake to discover or build the executable.

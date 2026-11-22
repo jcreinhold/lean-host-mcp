@@ -55,6 +55,9 @@ enum Command {
     ReadProxy(lean_host_mcp::shared_writer::ReadProxyArgs),
     #[command(hide = true)]
     WriterExec,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    #[command(hide = true)]
+    WriterPrepare { plan: String },
     /// Internal independent owner for a native worker generation.
     #[command(hide = true)]
     NativeGuardian,
@@ -234,6 +237,14 @@ fn main() -> ExitCode {
             Err(error) => {
                 eprintln!("lean-host-mcp reader: {error}");
                 ExitCode::from(lean_host_mcp::shared_writer::reader_failure_exit_code(&error))
+            }
+        },
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        Some(Command::WriterPrepare { plan }) => match lean_host_mcp::writer_preparation::run(&plan) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp writer-prepare: {error}");
+                ExitCode::FAILURE
             }
         },
         Some(Command::WriterExec) => match lean_host_mcp::shared_writer::run_exec() {

@@ -319,6 +319,15 @@ fn fingerprint_lake_project(lake_root: &Path) -> Result<String> {
     Ok(s)
 }
 
+/// Relative location of the prebuilt linter and its trace in the supported managed layout.
+#[cfg(all(
+    unix,
+    any(
+        test,
+        all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))
+    )
+))]
+pub(crate) const RUN_LINTER_REL: &str = ".lake/build/bin/runLinter";
 /// Project-relative directory holding built module artifacts: `.olean` for the
 /// environment, `.ilean` for the reference index. One definition, because
 /// [`artifact_roots`] and the `.ilean` reader must agree on where Lake writes.

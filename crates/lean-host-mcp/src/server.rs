@@ -254,6 +254,24 @@ impl LeanHostService {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let reply = {
             let mut reply = crate::managed_prepared::advertise(reply, &self.ctx.broker);
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            if reply.get("acceptance_epoch").is_some()
+                && self
+                    .ctx
+                    .broker
+                    .native_root(&crate::broker::ProjectHint::Default)
+                    .is_ok()
+                && let Some(fields) = reply.as_object_mut()
+            {
+                let operations = fields.entry("operations").or_insert_with(|| serde_json::json!([]));
+                if let Some(operations) = operations.as_array_mut() {
+                    operations.extend([
+                        serde_json::json!(crate::native_reader::admitted::OPERATION),
+                        serde_json::json!(crate::native_reader::admitted::AXIOMS),
+                        serde_json::json!(crate::native_reader::admitted::MODULE_LINT),
+                    ]);
+                }
+            }
             if let Some(recovery) = recovery {
                 reply["recovery"] = recovery;
             }
@@ -522,6 +540,14 @@ impl ServerHandler for LeanHostService {
             && let Ok(command) = crate::native_store::store::boundary::decode(input.request.as_bytes())
             && let Some((key, capability)) = command.start_identity()
         {
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            if let Some(result) =
+                crate::native_reader::admitted::start(&self.ctx.broker, store, key, capability.clone()).await?
+            {
+                return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                    ContentBlock::text(result.to_string()),
+                ])));
+            }
             let result = crate::managed_prepared::start(&self.ctx.broker, store, key, capability).await?;
             return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
                 ContentBlock::text(result.to_string()),
