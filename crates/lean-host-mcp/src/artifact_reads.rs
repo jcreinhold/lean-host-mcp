@@ -236,7 +236,7 @@ mod tests;
     )
 ))]
 fn open_lake_trace(root: &File, path: &str, directory: rustix::fs::OFlags) -> io::Result<Option<File>> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+    use rustix::fs::{AtFlags, FileType, OFlags, statat};
 
     let (directories, name) = path
         .rsplit_once('/')
@@ -252,8 +252,10 @@ fn open_lake_trace(root: &File, path: &str, directory: rustix::fs::OFlags) -> io
         )))
     {
         let fd = parent.as_ref().unwrap_or(root);
-        let Ok(named) = statat(fd, component, AtFlags::SYMLINK_NOFOLLOW) else {
-            return Ok(None);
+        let named = match statat(fd, component, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(named) => named,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         let actual = FileType::from_raw_mode(named.st_mode);
         if actual == FileType::Symlink {
@@ -262,18 +264,42 @@ fn open_lake_trace(root: &File, path: &str, directory: rustix::fs::OFlags) -> io
         if actual != kind {
             return Ok(None);
         }
-        let opened = match openat(fd, component, flags, Mode::empty()) {
-            Ok(opened) => opened,
-            Err(rustix::io::Errno::LOOP) => return Err(io::ErrorKind::InvalidData.into()),
-            Err(_) => return Ok(None),
+        let Some(opened) = open_trace_component(fd, component, flags, &named)? else {
+            return Ok(None);
         };
-        let metadata = fstat(&opened)?;
-        if (named.st_dev, named.st_ino) != (metadata.st_dev, metadata.st_ino) {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        parent = Some(File::from(opened));
+        parent = Some(opened);
     }
     Ok(parent)
+}
+
+#[cfg(all(
+    unix,
+    any(
+        test,
+        all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))
+    )
+))]
+fn open_trace_component(
+    parent: &File,
+    name: &str,
+    flags: rustix::fs::OFlags,
+    named: &rustix::fs::Stat,
+) -> io::Result<Option<File>> {
+    use rustix::fs::{Mode, fstat, openat};
+    use rustix::io::Errno;
+
+    let opened = match openat(parent, name, flags, Mode::empty()) {
+        Ok(opened) => opened,
+        Err(Errno::NOENT) => return Ok(None),
+        // Linux can report ENOTDIR for O_DIRECTORY | O_NOFOLLOW on a link.
+        Err(Errno::LOOP | Errno::NOTDIR) => return Err(io::ErrorKind::InvalidData.into()),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = fstat(&opened)?;
+    if (named.st_dev, named.st_ino) != (metadata.st_dev, metadata.st_ino) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(Some(File::from(opened)))
 }
 
 #[cfg(all(

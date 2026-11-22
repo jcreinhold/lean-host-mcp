@@ -331,3 +331,37 @@ fn lake_trace_snapshot_selects_exact_files_and_rejects_incomplete_sets() {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }
+
+#[test]
+fn lake_trace_directory_replacement_is_refused_after_stat() {
+    use rustix::fs::{AtFlags, OFlags, statat};
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let directory = root.join("directory");
+    let moved = root.join("moved");
+    std::fs::create_dir(&directory).unwrap();
+    let parent = File::open(root).unwrap();
+    let named = statat(&parent, "directory", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    assert!(
+        super::open_trace_component(&parent, "directory", flags, &named)
+            .unwrap()
+            .is_some()
+    );
+
+    std::fs::rename(&directory, &moved).unwrap();
+    assert!(
+        super::open_trace_component(&parent, "directory", flags, &named)
+            .unwrap()
+            .is_none()
+    );
+    symlink(&moved, &directory).unwrap();
+    let alias = super::open_trace_component(&parent, "directory", flags, &named).unwrap_err();
+    assert_eq!(alias.kind(), std::io::ErrorKind::InvalidData);
+    std::fs::remove_file(&directory).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let changed = super::open_trace_component(&parent, "directory", flags, &named).unwrap_err();
+    assert_eq!(changed.kind(), std::io::ErrorKind::InvalidData);
+}
