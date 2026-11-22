@@ -1636,7 +1636,10 @@ mod tests {
         caller.as_object_mut().expect("fixture object").remove("command_phase");
         assert!(decode(&caller, OwnerRecordUse::Predecessor).is_ok());
         assert!(decode(&caller, OwnerRecordUse::EmbeddedLaunch).is_err());
-        caller["scratch_identity"] = json!("a1".repeat(32));
+        caller
+            .as_object_mut()
+            .expect("fixture object")
+            .insert("scratch_identity".to_owned(), json!("a1".repeat(32)));
         assert!(decode(&caller, OwnerRecordUse::Predecessor).is_err());
 
         for (key, value) in [
