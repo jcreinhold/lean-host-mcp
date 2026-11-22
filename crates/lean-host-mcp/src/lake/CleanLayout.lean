@@ -20,7 +20,7 @@ def main (args : List String) : IO Unit := do
   let some workspace ← (loadWorkspaceRoot config).toBaseIO
     | throw (IO.userError "cannot evaluate clean project configuration")
   let package := workspace.root
-  unless package.name == `Proofs && package.dir == root &&
+  unless package.baseName == `Proofs && package.dir == root &&
       package.buildDir == root / ".lake" / "build" &&
       package.pkgsDir == root / ".lake" / "packages" do
     throw (IO.userError "unsupported first-party output layout")

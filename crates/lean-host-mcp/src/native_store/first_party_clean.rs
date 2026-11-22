@@ -84,10 +84,18 @@ fn verify_layout(root: &Path) -> io::Result<()> {
     let scratch = tempfile::Builder::new().prefix("clean-layout-").tempdir()?;
     let script = scratch.path().join("CleanLayout.lean");
     fs::write(&script, include_str!("../lake/CleanLayout.lean"))?;
+    let sysroot = bin.parent().ok_or_else(|| io::Error::other("missing Lean sysroot"))?;
+    let plugin = sysroot.join("lib/lean").join(if cfg!(target_os = "macos") {
+        "libLake_shared.dylib"
+    } else {
+        "libLake_shared.so"
+    });
     let mut command = std::process::Command::new(lean);
     command
         .current_dir(root)
-        .args(["-j1", "--run"])
+        .args(["-j1", "--plugin"])
+        .arg(plugin)
+        .arg("--run")
         .arg(script)
         .arg(root)
         .arg(scratch.path())
