@@ -825,7 +825,7 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         directory: registry_root.as_os_str().as_bytes().to_vec(),
         device: meta.dev(),
         inode: meta.ino(),
-        generation: [8; 16],
+        generation: "0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         boot: [9; 16],
         worker: process(10),
         guardian: process(11),
@@ -833,9 +833,29 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
     let read =
         |request: &SavedRequest, generation| NativeStore::read_recovery_scope(&fixture.native(), request, generation);
     assert!(matches!(read(&saved, None), Err(Problem::Rejected(Reject::WrongScope))));
+    for invalid in [
+        "0123456789abcdef0123456789abcdef",
+        "0123456789abcdef0123456789abcdef0123456789abcde",
+        "0123456789abcdef0123456789abcdef0123456789abcdeG",
+        "0123456789abcdef0123456789abcdef0123456789abcdeF",
+    ] {
+        let invalid_registry = RegistryIdentity {
+            generation: invalid.to_owned(),
+            ..registry.clone()
+        };
+        assert!(matches!(
+            store.bind_recovery_scope(&saved, scope(5), &invalid_registry),
+            Err(Problem::Rejected(Reject::WrongScope))
+        ));
+        assert!(matches!(
+            read(&saved, Some(invalid)),
+            Err(Problem::Rejected(Reject::WrongScope))
+        ));
+    }
+    assert_eq!(store.get(saved.key).unwrap().unwrap().scope, None);
     let binding = store.bind_recovery_scope(&saved, scope(5), &registry).unwrap();
     assert_eq!(
-        read(&saved, Some(registry.generation)).unwrap(),
+        read(&saved, Some(&registry.generation)).unwrap(),
         (binding, registry.clone())
     );
 
@@ -864,7 +884,7 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         Err(Problem::Rejected(Reject::CallerBindingChanged))
     ));
     assert!(matches!(
-        read(&saved, Some([7; 16])),
+        read(&saved, Some("0123456789abcdef0123456789abcdef0123456789abcdee")),
         Err(Problem::Rejected(Reject::StaleGeneration))
     ));
     assert!(granted(store.consume_launch(binding, &saved.capability).unwrap()));
@@ -875,7 +895,7 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
     assert_eq!(store.get(second.key).unwrap().unwrap().scope, None);
     assert_eq!(read(&saved, None).unwrap().0, binding);
     let next = RegistryIdentity {
-        generation: [6; 16],
+        generation: "f0e1d2c3b4a59687f0e1d2c3b4a59687f0e1d2c3b4a59687".to_owned(),
         ..registry
     };
     store.bind_recovery_scope(&second, scope(6), &next).unwrap();

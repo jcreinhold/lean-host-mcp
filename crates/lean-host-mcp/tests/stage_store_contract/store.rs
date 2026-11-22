@@ -286,7 +286,7 @@ pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
-    if !has_role(db, NATIVE_ROLE, 2)? {
+    if !has_role(db, NATIVE_ROLE, 3)? {
         return Ok(false);
     }
     drop(db.prepare("SELECT epoch,nonce,stage,intent,cap_hash,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages LIMIT 0")?);
@@ -492,7 +492,7 @@ impl NativeStore {
         let tx = db
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(&format!("PRAGMA application_id={NATIVE_ROLE}; PRAGMA user_version=2;\n\
+        tx.execute_batch(&format!("PRAGMA application_id={NATIVE_ROLE}; PRAGMA user_version=3;\n\
             CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),store BLOB NOT NULL CHECK(length(store)=16),epoch INTEGER NOT NULL CHECK(epoch>0)) STRICT;\n\
             CREATE TABLE scope_heads(scope BLOB PRIMARY KEY CHECK(length(scope)=16),generation INTEGER NOT NULL CHECK(generation>=0),owner BLOB NOT NULL CHECK(length(owner)=16)) STRICT;\n\
             CREATE TABLE stages(epoch INTEGER NOT NULL,nonce BLOB NOT NULL CHECK(length(nonce)=16),stage INTEGER NOT NULL,\n\

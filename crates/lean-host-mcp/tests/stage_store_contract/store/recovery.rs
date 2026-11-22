@@ -8,7 +8,9 @@ pub(super) const SCHEMA: &str = "
         epoch INTEGER NOT NULL, nonce BLOB NOT NULL, stage INTEGER NOT NULL,
         job BLOB NOT NULL CHECK(length(job) BETWEEN 1 AND 65536),
         caller_stage INTEGER NOT NULL, revision INTEGER NOT NULL,
-        registry_generation BLOB NOT NULL UNIQUE CHECK(length(registry_generation)=16),
+        registry_generation TEXT NOT NULL UNIQUE CHECK(
+            length(CAST(registry_generation AS BLOB))=48 AND registry_generation NOT GLOB '*[^0-9a-f]*'
+        ),
         identity BLOB NOT NULL CHECK(length(identity) BETWEEN 1 AND 32768),
         PRIMARY KEY(epoch,nonce,stage), UNIQUE(job,caller_stage,revision),
         FOREIGN KEY(epoch,nonce,stage) REFERENCES stages(epoch,nonce,stage)
@@ -21,10 +23,17 @@ pub(crate) struct RegistryIdentity {
     pub(crate) directory: Vec<u8>,
     pub(crate) device: u64,
     pub(crate) inode: u64,
-    pub(crate) generation: Id,
+    pub(crate) generation: String,
     pub(crate) boot: Id,
     pub(crate) worker: NativeProcessIdentity,
     pub(crate) guardian: NativeProcessIdentity,
+}
+
+fn valid_generation(generation: &str) -> bool {
+    generation.len() == 48
+        && generation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl RegistryIdentity {
@@ -34,7 +43,7 @@ impl RegistryIdentity {
             && self.directory.len() <= 4096
             && !self.directory.contains(&0)
             && self.inode != 0
-            && self.generation != [0; 16]
+            && valid_generation(&self.generation)
             && self.boot != [0; 16]
             && self.worker.pid != self.guardian.pid
             && [&self.worker, &self.guardian].into_iter().all(|identity| {
@@ -116,10 +125,13 @@ impl NativeStore {
     pub(crate) fn read_recovery_scope(
         path: &Path,
         saved: &SavedRequest,
-        expected_generation: Option<Id>,
+        expected_generation: Option<&str>,
     ) -> Answer<(Binding, RegistryIdentity)> {
         bounded(&saved.caller.job)?;
         bounded(&saved.intent)?;
+        if expected_generation.is_some_and(|generation| !valid_generation(generation)) {
+            return reject(Reject::WrongScope);
+        }
         let mut db = CheckedConnection::open_recovery(path)?;
         let tx = db.transaction()?;
         if !native_schema_valid(&tx)? {
@@ -168,7 +180,11 @@ impl NativeStore {
                     if bytes.len() > IDENTITY_LIMIT {
                         return Err(rusqlite::Error::InvalidQuery);
                     }
-                    Ok((fixed::<16>(row, 0)?, bytes.to_vec()))
+                    let generation = row.get_ref(0)?.as_str()?;
+                    if !valid_generation(generation) {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok((generation.to_owned(), bytes.to_vec()))
                 },
             )
             .optional()?
