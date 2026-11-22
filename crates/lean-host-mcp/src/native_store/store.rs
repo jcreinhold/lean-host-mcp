@@ -241,11 +241,38 @@ impl ResultKnowledge {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionDeadline {
+    pub(crate) boot: Id,
+    pub(crate) expires_ns: u64,
+}
+
+impl AdmissionDeadline {
+    fn encode(self) -> [u8; 24] {
+        let mut data = [0; 24];
+        let (boot, expiry) = data.split_at_mut(16);
+        boot.copy_from_slice(&self.boot);
+        expiry.copy_from_slice(&self.expires_ns.to_be_bytes());
+        data
+    }
+
+    fn decode(data: [u8; 24]) -> rusqlite::Result<Self> {
+        let (boot, expiry) = data.split_at(16);
+        let boot = boot.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let expires_ns = u64::from_be_bytes(expiry.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?);
+        if boot == [0; 16] || expires_ns == 0 || i64::try_from(expires_ns).is_err() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok(Self { boot, expires_ns })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Snapshot {
     pub(crate) key: NativeKey,
     pub(crate) intent: Vec<u8>,
     pub(crate) compacted_intent_sha256: Option<[u8; 32]>,
+    pub(crate) admission_deadline: Option<AdmissionDeadline>,
     pub(crate) scope: Option<Scope>,
     pub(crate) gate: Gate,
     pub(crate) spawn: Option<Spawn>,
@@ -536,6 +563,7 @@ impl NativeStore {
             result_kind INTEGER NOT NULL DEFAULT 0 CHECK(result_kind IN(0,1,2,3)),result_id BLOB,result_hash BLOB,result_body BLOB CHECK(length(result_body)<=65536),\n\
             managed_ack INTEGER NOT NULL DEFAULT 0 CHECK(managed_ack IN(0,1)),\n\
             compacted_intent_sha256 BLOB CHECK(length(compacted_intent_sha256)=32),\n\
+            admission_deadline BLOB CHECK(length(admission_deadline)=24),\n\
             drain_auth_hash BLOB CHECK(length(drain_auth_hash)=32),\n\
             recovery_claim_hash BLOB CHECK(length(recovery_claim_hash)=32),\n\
             PRIMARY KEY(epoch,nonce,stage),UNIQUE(scope,generation),\n\
@@ -589,6 +617,16 @@ impl NativeStore {
         )?;
         if !has_drain_auth {
             tx.execute_batch("ALTER TABLE stages ADD COLUMN drain_auth_hash BLOB CHECK(length(drain_auth_hash)=32)")?;
+        }
+        let has_deadline: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('stages') WHERE name='admission_deadline')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_deadline {
+            tx.execute_batch(
+                "ALTER TABLE stages ADD COLUMN admission_deadline BLOB CHECK(length(admission_deadline)=24)",
+            )?;
         }
         let has_claim: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('stages') WHERE name='recovery_claim_hash')",
@@ -652,7 +690,7 @@ impl NativeStore {
         read_stage(self.db.connection(), key)
     }
     pub(crate) fn create(&mut self, saved: &SavedRequest) -> Answer<Snapshot> {
-        self.create_intent(saved.key, &saved.capability, &saved.intent, None)
+        self.create_intent(saved.key, &saved.capability, &saved.intent, None, None)
     }
     fn create_intent(
         &mut self,
@@ -660,6 +698,7 @@ impl NativeStore {
         capability: &Capability,
         intent: &[u8],
         drain_auth: Option<[u8; 32]>,
+        deadline: Option<Answer<AdmissionDeadline>>,
     ) -> Answer<Snapshot> {
         self.checked_key(key)?;
         bounded(intent)?;
@@ -705,15 +744,17 @@ impl NativeStore {
         if tx.query_row("SELECT count(*) FROM stages", [], |row| row.get::<_, i64>(0))? >= MAX_STAGES {
             return reject(Reject::StoreFull);
         }
+        let deadline = deadline.transpose()?.map(AdmissionDeadline::encode);
         tx.execute(
-            "INSERT INTO stages(epoch,nonce,stage,intent,cap_hash,drain_auth_hash) VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO stages(epoch,nonce,stage,intent,cap_hash,drain_auth_hash,admission_deadline) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 number(key.epoch)?,
                 key.nonce.as_slice(),
                 number(key.stage)?,
                 intent,
                 digest(&capability.0),
-                drain_hash
+                drain_hash,
+                deadline
             ],
         )?;
         let snapshot = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
@@ -754,6 +795,9 @@ impl NativeStore {
             return reject(Reject::StaleGeneration);
         }
         let deadline = recovery::launch_deadline(&tx, binding, old.intent)?;
+        if let Some(admitted) = old.admission_deadline {
+            recovery::check_admitted_grant(admitted, deadline.as_ref())?;
+        }
         let changed = tx.execute(
             "UPDATE stages SET gate=1 WHERE epoch=?1 AND nonce=?2 AND stage=?3 AND gate=0",
             params![
@@ -1160,43 +1204,128 @@ fn compact_closed_acknowledged(tx: &Transaction<'_>, key: NativeKey) -> Answer<(
 }
 
 fn read_stage(db: &Connection, key: NativeKey) -> Answer<Option<Snapshot>> {
-    let snapshot = db.query_row("SELECT intent,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body,compacted_intent_sha256,managed_ack FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",params![number(key.epoch)?,key.nonce.as_slice(),number(key.stage)?],|r| {
-        let scope = match (optional_fixed(r,1)?,r.get::<_,Option<i64>>(2)?,optional_fixed(r,3)?) {
-            (None,None,None) => None,
-            (Some(id),Some(generation),Some(owner)) => Some(Scope{id,generation:positive(generation)?,owner}),
-            _ => return Err(rusqlite::Error::InvalidQuery),
-        };
-        let gate=match r.get::<_,i64>(4)? {0=>Gate::Pending,1=>Gate::Consumed,2=>Gate::Sealed,_=>return Err(rusqlite::Error::InvalidQuery)};
-        let spawn=match r.get::<_,Option<i64>>(5)? {None=>None,Some(1)=>Some(Spawn::Spawned),Some(2)=>Some(Spawn::Failed),_=>return Err(rusqlite::Error::InvalidQuery)};
-        let stop_requested=match r.get::<_,i64>(6)? {0=>false,1=>true,_=>return Err(rusqlite::Error::InvalidQuery)};
-        let resource_report=match r.get::<_,i64>(7)? {0=>ResourceReport::None,1=>ResourceReport::Open,2=>ResourceReport::Stopping,3=>ResourceReport::Closed,_=>return Err(rusqlite::Error::InvalidQuery)};
-        let result=match r.get::<_,i64>(8)? {
-            0 if (9..=11).all(|column| r.get_ref(column).is_ok_and(|value| value==rusqlite::types::ValueRef::Null)) => ResultKnowledge::Pending,
-            kind @ 1..=3=>{
-                let id=fixed(r,9)?; let hash=fixed::<32>(r,10)?.to_vec();
-                match kind {
-                    1=>ResultKnowledge::Retained{id,hash,body:blob(r,11)?.to_vec()},
-                    2=>ResultKnowledge::Acknowledged{id,hash,body:blob(r,11)?.to_vec()},
-                    _ if r.get_ref(11)? == rusqlite::types::ValueRef::Null => ResultKnowledge::Expired{id,hash},
-                    _=>return Err(rusqlite::Error::InvalidQuery),
+    read_stage_columns(db, key, true)
+}
+
+fn read_stage_columns(db: &Connection, key: NativeKey, include_admission: bool) -> Answer<Option<Snapshot>> {
+    let deadline = if include_admission {
+        "admission_deadline"
+    } else {
+        "NULL"
+    };
+    let query = format!(
+        "SELECT intent,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,
+        result_id,result_hash,result_body,compacted_intent_sha256,managed_ack,{deadline}
+        FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3"
+    );
+    let snapshot = db
+        .query_row(
+            &query,
+            params![number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?],
+            |r| {
+                let scope = match (
+                    optional_fixed(r, 1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    optional_fixed(r, 3)?,
+                ) {
+                    (None, None, None) => None,
+                    (Some(id), Some(generation), Some(owner)) => Some(Scope {
+                        id,
+                        generation: positive(generation)?,
+                        owner,
+                    }),
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                let gate = match r.get::<_, i64>(4)? {
+                    0 => Gate::Pending,
+                    1 => Gate::Consumed,
+                    2 => Gate::Sealed,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                let spawn = match r.get::<_, Option<i64>>(5)? {
+                    None => None,
+                    Some(1) => Some(Spawn::Spawned),
+                    Some(2) => Some(Spawn::Failed),
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                let stop_requested = match r.get::<_, i64>(6)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                let resource_report = match r.get::<_, i64>(7)? {
+                    0 => ResourceReport::None,
+                    1 => ResourceReport::Open,
+                    2 => ResourceReport::Stopping,
+                    3 => ResourceReport::Closed,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                let result = match r.get::<_, i64>(8)? {
+                    0 if (9..=11).all(|column| {
+                        r.get_ref(column)
+                            .is_ok_and(|value| value == rusqlite::types::ValueRef::Null)
+                    }) =>
+                    {
+                        ResultKnowledge::Pending
+                    }
+                    kind @ 1..=3 => {
+                        let id = fixed(r, 9)?;
+                        let hash = fixed::<32>(r, 10)?.to_vec();
+                        match kind {
+                            1 => ResultKnowledge::Retained {
+                                id,
+                                hash,
+                                body: blob(r, 11)?.to_vec(),
+                            },
+                            2 => ResultKnowledge::Acknowledged {
+                                id,
+                                hash,
+                                body: blob(r, 11)?.to_vec(),
+                            },
+                            _ if r.get_ref(11)? == rusqlite::types::ValueRef::Null => {
+                                ResultKnowledge::Expired { id, hash }
+                            }
+                            _ => return Err(rusqlite::Error::InvalidQuery),
+                        }
+                    }
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                if (scope.is_none()
+                    && (gate == Gate::Consumed
+                        || spawn.is_some()
+                        || resource_report != ResourceReport::None
+                        || result != ResultKnowledge::Pending))
+                    || (spawn.is_some() && gate != Gate::Consumed)
+                    || (gate == Gate::Pending && (stop_requested || resource_report >= ResourceReport::Stopping))
+                {
+                    return Err(rusqlite::Error::InvalidQuery);
                 }
-            }
-            _=>return Err(rusqlite::Error::InvalidQuery),
-        };
-        if (scope.is_none() && (gate==Gate::Consumed || spawn.is_some() || resource_report!=ResourceReport::None || result!=ResultKnowledge::Pending))
-            || (spawn.is_some() && gate!=Gate::Consumed)
-            || (gate==Gate::Pending && (stop_requested || resource_report>=ResourceReport::Stopping)) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        let intent = blob(r,0)?;
-        let compacted_intent_sha256 = optional_fixed(r,12)?;
-        if compacted_intent_sha256.is_some() && (!intent.is_empty()
-            || resource_report != ResourceReport::Closed || !matches!(result, ResultKnowledge::Expired { .. })
-            || r.get::<_,i64>(13)? != 1) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        Ok(Snapshot{key,intent:intent.to_vec(),compacted_intent_sha256,scope,gate,spawn,stop_requested,resource_report,result})
-    }).optional()?;
+                let intent = blob(r, 0)?;
+                let compacted_intent_sha256 = optional_fixed(r, 12)?;
+                if compacted_intent_sha256.is_some()
+                    && (!intent.is_empty()
+                        || resource_report != ResourceReport::Closed
+                        || !matches!(result, ResultKnowledge::Expired { .. })
+                        || r.get::<_, i64>(13)? != 1)
+                {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let admission_deadline = optional_fixed(r, 14)?.map(AdmissionDeadline::decode).transpose()?;
+                Ok(Snapshot {
+                    key,
+                    intent: intent.to_vec(),
+                    compacted_intent_sha256,
+                    admission_deadline,
+                    scope,
+                    gate,
+                    spawn,
+                    stop_requested,
+                    resource_report,
+                    result,
+                })
+            },
+        )
+        .optional()?;
     if let Some(snapshot) = &snapshot {
         match snapshot.result {
             ResultKnowledge::Pending => {}

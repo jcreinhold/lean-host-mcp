@@ -11,15 +11,15 @@ use std::{
 use lean_rs_worker_parent::{
     LeanWorkerCancellationToken, LeanWorkerDeclarationInspectionRequest, LeanWorkerHostHandle,
 };
-use lean_toolchain::native_guardian::{NativeGuardianDrainBinding, guardian_deadline_ticks, registry_directory};
+use lean_toolchain::native_guardian::{NativeGuardianDrainBinding, registry_directory};
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::native_store::store::{
-    Binding, CallerKey, Capability, Consume, Gate, NativeKey, NativeStore, Problem, Reject, ResourceReport,
-    SavedRequest, Scope, recovery::RegistryIdentity,
+    AdmissionDeadline, Binding, CallerKey, Capability, Consume, Gate, NativeKey, NativeStore, Problem, Reject,
+    ResourceReport, SavedRequest, Scope, recovery::RegistryIdentity,
 };
 use crate::{ProjectBroker, error::ServerError};
 
@@ -37,7 +37,7 @@ pub(crate) struct Job {
     store: Arc<Mutex<NativeStore>>,
     original: SavedRequest,
     intent: Intent,
-    expiry: u64,
+    deadline: AdmissionDeadline,
 }
 
 struct StopRegistration<'a> {
@@ -68,11 +68,11 @@ impl Job {
     ) -> crate::error::Result<()> {
         if !operator_prepared
             .is_some_and(|input| Sha256::digest(input.as_bytes()).as_slice() == self.intent.prepared_sha256)
-            || guardian_deadline_ticks().map_err(internal)?.as_nanos() >= u128::from(self.expiry)
         {
             return Err(internal("prepared generation changed or original admission expired"));
         }
 
+        self.deadline.remaining().map_err(internal)?;
         {
             let mut store = self.store.lock();
             let current = store
@@ -87,9 +87,9 @@ impl Job {
         let original = worker.managed_guardian_binding().map_err(internal)?;
         actor_healthy.store(false, Ordering::Release);
         let expected = worker
-            .prepare_managed_artifact_read(self.intent.imports.clone(), self.expiry)
+            .prepare_managed_artifact_read(self.intent.imports.clone(), self.deadline.expires_ns)
             .map_err(internal)?;
-        if expected != original || guardian_deadline_ticks().map_err(internal)?.as_nanos() >= u128::from(self.expiry) {
+        if expected != original {
             return Err(internal("prepared receiver changed or original deadline elapsed"));
         }
         let registry = RegistryIdentity {
@@ -117,7 +117,7 @@ impl Job {
                 return Ok(());
             }
             let binding = store
-                .bind_timed_recovery_scope(&self.original, scope, &registry, self.expiry)
+                .bind_timed_recovery_scope(&self.original, scope, &registry, self.deadline.expires_ns)
                 .map_err(internal)?;
             store
                 .observe_resource(binding, &self.original.capability, ResourceReport::Open)
@@ -145,7 +145,7 @@ impl Job {
         let (admitted, admitted_registry, expires_ns, intent) = permit.into_parts();
         if admitted != binding
             || admitted_registry != registry
-            || expires_ns != self.expiry
+            || expires_ns != self.deadline.expires_ns
             || intent != self.original.intent
         {
             return Err(internal("consumed grant differs from the original stage"));
@@ -238,16 +238,15 @@ pub(crate) async fn start(
     if Sha256::digest(configured.as_bytes()).as_slice() != intent.prepared_sha256 {
         return Err(McpError::invalid_params("prepared_generation_changed", None));
     }
-    let budget = Duration::from_millis(broker.request_timeout_millis());
+    let admitted = snapshot
+        .admission_deadline
+        .ok_or_else(|| McpError::invalid_params("missing_admission_deadline", None))?;
     let now = Instant::now();
-    let expiry = guardian_deadline_ticks()
-        .ok()
-        .and_then(|now| now.checked_add(budget))
-        .and_then(|end| u64::try_from(end.as_nanos()).ok())
-        .filter(|end| i64::try_from(*end).is_ok())
-        .ok_or_else(|| McpError::internal_error("boot_deadline_unavailable", None))?;
+    let remaining = admitted
+        .remaining()
+        .map_err(|_| McpError::invalid_params("admission_deadline_unavailable_or_expired", None))?;
     let deadline = now
-        .checked_add(budget)
+        .checked_add(remaining)
         .ok_or_else(|| McpError::internal_error("deadline_overflow", None))?;
     let actor = broker
         .managed_actor(deadline.into())
@@ -267,7 +266,7 @@ pub(crate) async fn start(
         store: Arc::clone(store),
         original,
         intent,
-        expiry,
+        deadline: admitted,
     };
     if let Err(error) = actor.inspect_managed(job, deadline).await {
         tracing::debug!(%error, "managed inspection did not confirm a result");
@@ -449,4 +448,220 @@ pub(crate) fn drain(
         }
     };
     Ok(serde_json::json!({"drain":disposition,"key":key,"claim":claim_status}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{broker::BrokerConfig, project::ProjectRuntimeConfig};
+    use lean_toolchain::native_guardian::NativeProcessIdentity;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[tokio::test]
+    async fn original_admission_deadline_survives_retry_restart_and_binding_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("stages.sqlite3");
+        let prepared = serde_json::json!({"plan":{"project":root}}).to_string();
+        let runtime = ProjectRuntimeConfig::default()
+            .with_operator_primary(Some(&root))
+            .unwrap()
+            .with_prepared_generation(Some(prepared.clone()))
+            .unwrap();
+        let broker = ProjectBroker::new_with_runtime_config(
+            BrokerConfig {
+                env_default: Some(root.clone()),
+                config_default: None,
+                cwd: root.clone(),
+                max_projects: std::num::NonZeroUsize::MIN,
+                max_workers_per_project: std::num::NonZeroUsize::MIN,
+                idle_timeout: Duration::ZERO,
+            },
+            runtime,
+        );
+        let store = Arc::new(Mutex::new(NativeStore::create_new(&path).unwrap()));
+        let capability = Capability([1; 32]);
+        let intent = serde_json::to_vec(&serde_json::json!({
+            "job":[1], "revision":1,
+            "prepared_sha256":Sha256::digest(prepared.as_bytes()).to_vec(),
+            "imports":["Init"], "declaration":"Nat.add_zero",
+        }))
+        .unwrap();
+        let key = NativeKey {
+            store: store.lock().identity(),
+            epoch: 1,
+            nonce: [1; 16],
+            stage: 1,
+        };
+        let create = |key, budget| {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "version":1,"command":{"op":"create","key":key,"capability":capability.0,"intent":intent}
+            }))
+            .unwrap();
+            store.lock().admission_with_budget(&bytes, budget).unwrap()
+        };
+        let deadline = |key| store.lock().client_get(key, &capability).unwrap().admission_deadline;
+
+        create(key, Some(Duration::from_secs(60)));
+        let original = deadline(key).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                start(&broker, &store, key, capability.clone())
+                    .await
+                    .unwrap_err()
+                    .message,
+                "prepared_actor_unavailable"
+            );
+            create(key, Some(Duration::from_secs(180)));
+            assert_eq!(deadline(key), Some(original));
+        }
+        *store.lock() = NativeStore::open(&path).unwrap();
+        assert_eq!(
+            start(&broker, &store, key, capability.clone())
+                .await
+                .unwrap_err()
+                .message,
+            "prepared_actor_unavailable"
+        );
+        assert_eq!(deadline(key), Some(original));
+
+        let saved = SavedRequest {
+            caller: CallerKey {
+                job: vec![1],
+                stage: 1,
+                revision: 1,
+            },
+            key,
+            intent: intent.clone(),
+            capability: capability.clone(),
+        };
+        let meta = root.metadata().unwrap();
+        let process = |pid| NativeProcessIdentity {
+            version: 1,
+            pid,
+            start: format!("test-{pid}"),
+            session: 1,
+            process_group: 2,
+        };
+        let identity = RegistryIdentity {
+            directory: root.as_os_str().as_bytes().to_vec(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            generation: "a".repeat(48),
+            boot: original.boot,
+            parent: process(10),
+            worker: process(11),
+            guardian: process(12),
+        };
+        let scope = Scope {
+            id: [4; 16],
+            generation: 1,
+            owner: [5; 16],
+        };
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(matches!(
+            store.lock().bind_timed_recovery_scope(&saved, scope, &identity, original.expires_ns),
+            Err(Problem::Sql(rusqlite::Error::SqliteFailure(code, _)))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(store.lock().client_get(key, &capability).unwrap().scope, None);
+        assert_eq!(deadline(key), Some(original));
+        assert!(matches!(
+            store
+                .lock()
+                .bind_timed_recovery_scope(&saved, scope, &identity, original.expires_ns + 1),
+            Err(Problem::Rejected(Reject::InvalidLaunchDeadline))
+        ));
+        holder
+            .execute_batch(
+                "CREATE TRIGGER reject_binding BEFORE INSERT ON recovery_bindings
+             BEGIN SELECT RAISE(ABORT, 'binding failed'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .lock()
+                .bind_timed_recovery_scope(&saved, scope, &identity, original.expires_ns),
+            Err(Problem::Sql(_))
+        ));
+        holder.execute_batch("DROP TRIGGER reject_binding").unwrap();
+        assert_eq!(store.lock().client_get(key, &capability).unwrap().scope, None);
+        assert_eq!(deadline(key), Some(original));
+
+        let bound = store
+            .lock()
+            .bind_timed_recovery_scope(&saved, scope, &identity, original.expires_ns)
+            .unwrap();
+        let Consume::Granted(grant) = store.lock().consume_launch(bound, &capability).unwrap() else {
+            panic!("the original deadline must authorize one grant");
+        };
+        assert_eq!(grant.into_deadline_grant().unwrap().into_parts().2, original.expires_ns);
+        *store.lock() = NativeStore::open(&path).unwrap();
+        let consumed = start(&broker, &store, key, capability.clone()).await.unwrap();
+        assert_eq!(consumed["execution"], "unknown");
+        assert_eq!(deadline(key), Some(original));
+        assert!(matches!(
+            store.lock().consume_launch(bound, &capability).unwrap(),
+            Consume::AlreadyConsumed
+        ));
+
+        let legacy = NativeKey { nonce: [2; 16], ..key };
+        create(legacy, None);
+        create(legacy, Some(Duration::from_secs(60)));
+        assert_eq!(deadline(legacy), None);
+        assert_eq!(
+            start(&broker, &store, legacy, capability.clone())
+                .await
+                .unwrap_err()
+                .message,
+            "missing_admission_deadline"
+        );
+
+        let expired = NativeKey { nonce: [3; 16], ..key };
+        create(expired, Some(Duration::from_millis(1)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let wrong_boot = NativeKey { nonce: [4; 16], ..key };
+        create(wrong_boot, Some(Duration::from_secs(60)));
+        let mut data = holder
+            .query_row(
+                "SELECT admission_deadline FROM stages WHERE nonce=?1",
+                [wrong_boot.nonce.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        data[0] ^= 1;
+        holder
+            .execute(
+                "UPDATE stages SET admission_deadline=?1 WHERE nonce=?2",
+                rusqlite::params![data, wrong_boot.nonce],
+            )
+            .unwrap();
+        for refused in [expired, wrong_boot] {
+            let prior = deadline(refused);
+            create(refused, Some(Duration::from_secs(180)));
+            assert_eq!(
+                start(&broker, &store, refused, capability.clone())
+                    .await
+                    .unwrap_err()
+                    .message,
+                "admission_deadline_unavailable_or_expired"
+            );
+            assert_eq!(deadline(refused), prior);
+        }
+        holder
+            .execute_batch("ALTER TABLE stages DROP COLUMN admission_deadline")
+            .unwrap();
+        assert_eq!(
+            NativeStore::read_recovery_scope(&path, &saved, None, None).unwrap(),
+            (bound, identity)
+        );
+        *store.lock() = NativeStore::open(&path).unwrap();
+        assert!(matches!(
+            store.lock().consume_launch(bound, &capability).unwrap(),
+            Consume::AlreadyConsumed
+        ));
+    }
 }

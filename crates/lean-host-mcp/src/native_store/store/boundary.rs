@@ -165,6 +165,14 @@ impl std::fmt::Debug for NativeStore {
 impl NativeStore {
     /// The managed service exposes admission, reconnect and cancellation.
     pub(crate) fn admission(&mut self, bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
+        self.admission_with_budget(bytes, None)
+    }
+
+    pub(crate) fn admission_with_budget(
+        &mut self,
+        bytes: &[u8],
+        budget: Option<std::time::Duration>,
+    ) -> Result<serde_json::Value, &'static str> {
         let request = decode(bytes).map_err(|_| "invalid_request")?;
         match &request.command {
             ClientCommand::Discover {} => {}
@@ -180,6 +188,20 @@ impl NativeStore {
             }
         }
         let outcome = match request.command {
+            ClientCommand::Create {
+                key,
+                capability,
+                intent,
+                drain_authorization,
+            } => self
+                .create_intent(
+                    key,
+                    &Capability(capability),
+                    &intent,
+                    drain_authorization,
+                    budget.map(super::recovery::admission_deadline),
+                )
+                .map(ClientReply::Snapshot),
             ClientCommand::Discover {} => self
                 .reclaim_spent_stages()
                 .map(|acceptance_epoch| ClientReply::Discovery {
@@ -266,7 +288,7 @@ impl NativeStore {
                 intent,
                 drain_authorization,
             } => self
-                .create_intent(key, &Capability(capability), &intent, drain_authorization)
+                .create_intent(key, &Capability(capability), &intent, drain_authorization, None)
                 .map(ClientReply::Snapshot),
             ClientCommand::Get { key, capability } => {
                 self.client_get(key, &Capability(capability)).map(ClientReply::Snapshot)

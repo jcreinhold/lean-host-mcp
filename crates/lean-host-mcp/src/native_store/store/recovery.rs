@@ -90,6 +90,76 @@ impl DeadlineLaunchGrant {
     }
 }
 
+fn boot_id() -> Answer<Id> {
+    static BOOT: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+    if let Some(boot) = BOOT.get() {
+        return Ok(*boot);
+    }
+    let unavailable = || Problem::Rejected(Reject::InvalidLaunchDeadline);
+    #[cfg(target_os = "macos")]
+    let bytes = {
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.bootsessionuuid"])
+            .output()
+            .map_err(|_| unavailable())?;
+        if !output.status.success() {
+            return Err(unavailable());
+        }
+        output.stdout
+    };
+    #[cfg(target_os = "linux")]
+    let bytes = std::fs::read("/proc/sys/kernel/random/boot_id").map_err(|_| unavailable())?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let bytes: Vec<u8> = Vec::new();
+    let boot = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|value| uuid::Uuid::parse_str(value.trim()).ok())
+        .filter(|boot| !boot.is_nil())
+        .ok_or_else(unavailable)?;
+    Ok(*BOOT.get_or_init(|| *boot.as_bytes()))
+}
+
+fn boot_ticks() -> Answer<std::time::Duration> {
+    lean_toolchain::native_guardian::guardian_deadline_ticks()
+        .map_err(|_| Problem::Rejected(Reject::InvalidLaunchDeadline))
+}
+
+pub(crate) fn admission_deadline(budget: std::time::Duration) -> Answer<AdmissionDeadline> {
+    let expires_ns = boot_ticks()?
+        .checked_add(budget)
+        .and_then(|expiry| u64::try_from(expiry.as_nanos()).ok())
+        .filter(|&ticks| ticks > 0 && i64::try_from(ticks).is_ok())
+        .ok_or(Problem::Rejected(Reject::InvalidLaunchDeadline))?;
+    Ok(AdmissionDeadline {
+        boot: boot_id()?,
+        expires_ns,
+    })
+}
+
+impl AdmissionDeadline {
+    pub(crate) fn remaining(self) -> Answer<std::time::Duration> {
+        if boot_id()? != self.boot {
+            return reject(Reject::InvalidLaunchDeadline);
+        }
+        std::time::Duration::from_nanos(self.expires_ns)
+            .checked_sub(boot_ticks()?)
+            .filter(|time| !time.is_zero())
+            .ok_or(Problem::Rejected(Reject::InvalidLaunchDeadline))
+    }
+
+    fn matches(self, identity: &RegistryIdentity, expiry: Option<u64>) -> Answer<()> {
+        if identity.boot != self.boot || expiry != Some(self.expires_ns) {
+            return reject(Reject::InvalidLaunchDeadline);
+        }
+        self.remaining().map(|_| ())
+    }
+}
+
+pub(super) fn check_admitted_grant(admitted: AdmissionDeadline, grant: Option<&DeadlineLaunchGrant>) -> Answer<()> {
+    let grant = grant.ok_or(Problem::Rejected(Reject::InvalidLaunchDeadline))?;
+    admitted.matches(&grant.registry, Some(grant.expires_ns))
+}
+
 pub(super) fn launch_deadline(
     tx: &Transaction<'_>,
     binding: Binding,
@@ -187,6 +257,9 @@ impl NativeStore {
         }
         if old.scope.is_some() || old.gate != Gate::Pending {
             return reject(Reject::ScopeAlreadyBound);
+        }
+        if let Some(admitted) = old.admission_deadline {
+            admitted.matches(identity, expires_ns.and_then(|ticks| u64::try_from(ticks).ok()))?;
         }
         let binding = bind_scope_transaction(&tx, key, &saved.capability, scope)?;
         tx.execute(
@@ -327,7 +400,9 @@ impl NativeStore {
             return reject(Reject::WrongStore);
         }
         authenticate(&tx, key, &saved.capability)?;
-        let old = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
+        // A recovery-only connection can precede a writable schema migration.
+        // Closure for a consumed scope is independent of its admission budget.
+        let old = read_stage_columns(&tx, key, false)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
         if old.intent != saved.intent {
             return reject(Reject::IntentChanged);
         }

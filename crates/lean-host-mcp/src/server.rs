@@ -246,8 +246,10 @@ impl LeanHostService {
             let reply = crate::managed_prepared::drain(&mut store, claim)?;
             return Ok(CallToolResult::success(vec![ContentBlock::text(reply.to_string())]));
         }
+        let budget = cfg!(any(target_os = "macos", target_os = "linux"))
+            .then(|| Duration::from_millis(self.ctx.broker.request_timeout_millis()));
         let reply = store
-            .admission(input.request.as_bytes())
+            .admission_with_budget(input.request.as_bytes(), budget)
             .map_err(|reason| McpError::invalid_params(reason, None))?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let reply = {
@@ -897,16 +899,15 @@ mod tests {
             saved
         );
 
-        // A trusted fixture marks another original revision consumed. Public
-        // cancellation can record a stop request without certifying no start.
-        call(
-            &service,
-            json!({"op":"create","key":other_revision,"capability":cap,"intent":[42]}),
-        )
-        .unwrap();
+        // Seed a legacy untimed consumed revision through the private store
+        // fixture. Public cancellation still must not certify no start.
         {
             use crate::native_store::store::{Capability, Consume, Scope};
             let mut store = service.managed_store.as_ref().unwrap().lock();
+            let fixture = json!({"version":1,"command":{
+                "op":"create","key":other_revision,"capability":cap,"intent":[42]
+            }});
+            store.admission(fixture.to_string().as_bytes()).unwrap();
             let native_key = serde_json::from_value(other_revision.clone()).unwrap();
             let cap = Capability([1; 32]);
             let binding = store
