@@ -656,7 +656,23 @@ pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 ///
 /// Returns infrastructure failures only; malformed requests are structured
 /// semantic data.
-pub async fn lean_verify_raw(ctx: &ToolContext, mut value: Value) -> Result<SemanticResponse<Value>> {
+pub async fn lean_verify_raw(ctx: &ToolContext, value: Value) -> Result<SemanticResponse<Value>> {
+    lean_verify_raw_inner(
+        ctx,
+        value,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lean_verify_raw_inner(
+    ctx: &ToolContext,
+    mut value: Value,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<SemanticResponse<Value>> {
     normalize_verify_request(&mut value);
     if let Some(kind) = value
         .get("kind")
@@ -670,6 +686,13 @@ pub async fn lean_verify_raw(ctx: &ToolContext, mut value: Value) -> Result<Sema
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if managed.is_some() {
+        return from_tool_response(
+            proof_action::verify_targets_inner(ctx, request, managed).await?,
+            ctx.config,
+        );
+    }
     lean_verify_targets(ctx, request).await
 }
 

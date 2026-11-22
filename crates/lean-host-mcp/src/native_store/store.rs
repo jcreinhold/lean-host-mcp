@@ -153,7 +153,7 @@ pub(crate) struct CallerKey {
     pub(crate) stage: u64,
     pub(crate) revision: u64,
 }
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeKey {
     pub(crate) store: Id,

@@ -248,3 +248,97 @@ pub fn run(encoded: &str) -> io::Result<()> {
     use io::Write as _;
     io::stdout().lock().write_all(&verdict)
 }
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Reference {
+    key: crate::native_store::store::NativeKey,
+    capability: [u8; 32],
+}
+
+pub(crate) struct ManagedCall<'a> {
+    pub(crate) reference: Reference,
+    pub(crate) store: &'a std::sync::Arc<parking_lot::Mutex<crate::native_store::store::NativeStore>>,
+}
+
+pub(crate) type Outcome = lean_rs_worker_protocol::types::LeanWorkerDeclarationVerificationBatchResult;
+
+impl ManagedCall<'_> {
+    pub(crate) async fn verify(
+        &self,
+        broker: &crate::ProjectBroker,
+        hint: &crate::ProjectHint,
+        root: &Path,
+        file: &Path,
+        imports: Vec<String>,
+        request: lean_rs_worker_protocol::types::LeanWorkerDeclarationVerificationBatchRequest,
+    ) -> crate::Result<crate::broker::BrokerCall<Outcome>> {
+        use crate::native_store::store::{Capability, Gate, ResourceReport, ResultKnowledge};
+        use lean_rs_worker_protocol::types::LeanWorkerDeclarationVerificationTarget as Target;
+        let unavailable = |message: &str| crate::ServerError::BadProject(message.to_owned());
+        let key = self.reference.key;
+        let capability = Capability(self.reference.capability);
+        let snapshot = self
+            .store
+            .lock()
+            .client_get(key, &capability)
+            .map_err(|_| unavailable("managed verification identity unavailable"))?;
+        let (approved_root, admitted) = crate::managed_prepared::readiness_writer::setup_intent(&snapshot.intent)
+            .ok_or_else(|| unavailable("managed verification intent unavailable"))?;
+        let digest: [u8; 32] = Sha256::digest(request.source.as_bytes()).into();
+        if approved_root != root
+            || file.strip_prefix(root).ok() != Some(admitted.file.as_path())
+            || digest != admitted.sha256
+            || admitted.declarations.len() != request.targets.len()
+            || admitted
+                .declarations
+                .iter()
+                .zip(&request.targets)
+                .any(|(name, target)| !matches!(&target.target, Target::Name { name: actual } if name == actual))
+        {
+            return Err(unavailable(
+                "managed verification differs from the admitted source or targets",
+            ));
+        }
+        let saved = if snapshot.gate == Gate::Pending && snapshot.scope.is_none() {
+            crate::managed_prepared::start(broker, self.store, key, capability.clone())
+                .await
+                .map_err(|error| unavailable(&error.message))?;
+            self.store
+                .lock()
+                .client_get(key, &capability)
+                .map_err(|_| unavailable("managed verification result unavailable"))?
+        } else {
+            snapshot
+        };
+        if saved.resource_report != ResourceReport::Closed {
+            return Err(unavailable("managed verification custody is unresolved"));
+        }
+        let body = match saved.result {
+            ResultKnowledge::Retained { body, .. } | ResultKnowledge::Acknowledged { body, .. } => body,
+            _ => return Err(unavailable("managed verification result unavailable")),
+        };
+        let mut value: Outcome =
+            serde_json::from_slice(&body).map_err(|_| unavailable("invalid managed verification result"))?;
+        match &mut value {
+            Outcome::Ok { results, .. } | Outcome::MissingImports { results, .. } => {
+                if results.len() != request.targets.len() {
+                    return Err(unavailable("incomplete managed verification result"));
+                }
+                for (row, original) in results.iter_mut().zip(request.targets) {
+                    if row.target != original.target {
+                        return Err(unavailable("managed verification result target changed"));
+                    }
+                    row.id = original.id;
+                }
+            }
+            _ => (),
+        }
+        let identity = broker.project_identity_without_worker(hint, imports)?;
+        Ok(crate::broker::BrokerCall {
+            value,
+            runtime: identity.runtime,
+            freshness: identity.freshness,
+        })
+    }
+}

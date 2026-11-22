@@ -649,7 +649,34 @@ impl LeanHostService {
         let result = match call {
             TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
             TaskCall::Trial(req) => tools::semantic::lean_trial(&self.ctx, req.into_inner()).await,
-            TaskCall::Verify(req) => tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await,
+            TaskCall::Verify(req) => {
+                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+                if self.ctx.broker.managed_only() {
+                    let mut args = req.into_inner();
+                    let store = self
+                        .managed_store
+                        .as_ref()
+                        .ok_or_else(|| McpError::invalid_params("managed_store_required", None))?;
+                    let reference = args
+                        .as_object_mut()
+                        .and_then(|object| object.remove("managed_original"))
+                        .and_then(|original| serde_json::from_value(original).ok())
+                        .ok_or_else(|| McpError::invalid_params("managed_verify_original_required", None))?;
+                    let result = tools::semantic::lean_verify_raw_inner(
+                        &self.ctx,
+                        args,
+                        Some(crate::writer_setup_verification::ManagedCall { reference, store }),
+                    )
+                    .await;
+                    log.finish(&result);
+                    return self.respond_semantic(result);
+                }
+                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+                if req.as_value().get("managed_original").is_some() {
+                    return Err(McpError::invalid_params("managed_only_required", None));
+                }
+                tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await
+            }
             TaskCall::Lookup(req) => tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await,
             TaskCall::Status(req) => tools::semantic::lean_status(&self.ctx, req.into_inner()).await,
         };

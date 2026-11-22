@@ -169,7 +169,25 @@ impl JsonSchema for LeanVerifyToolRequest {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        LeanVerifyRequest::json_schema(generator)
+        let schema = LeanVerifyRequest::json_schema(generator);
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        let schema = {
+            let mut schema = schema;
+            if let Some(properties) = schema
+                .ensure_object()
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+            {
+                properties.insert(
+                    "managed_original".into(),
+                    generator
+                        .subschema_for::<crate::writer_setup_verification::Reference>()
+                        .to_value(),
+                );
+            }
+            schema
+        };
+        schema
     }
 }
 
@@ -581,6 +599,33 @@ pub async fn verify_declaration(
 /// Returns infrastructure failures only. Per-declaration Lean failures are
 /// projected into row verdicts.
 pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result<Response<LeanVerifyResult>> {
+    verify_targets_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn verify_targets_inner(
+    ctx: &ToolContext,
+    req: LeanVerifyRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<Response<LeanVerifyResult>> {
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if managed.is_some()
+        && (req.allow_sorry
+            || req.retry_tainted_non_positive
+            || !matches!(req.targets.as_slice(), [LeanVerifyTargetGroup::Explicit { declarations, .. }] if !declarations.is_empty()
+            && declarations.len() <= 16))
+    {
+        return Err(crate::ServerError::BadProject(
+            "managed verification requires one explicit file and bounded named declarations".into(),
+        ));
+    }
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let mut expansion = VerifyExpansion::new(meta.canonical_root.clone());
@@ -707,7 +752,24 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
             let imports = prepared.imports.clone();
             let session = session_imports(imports.clone());
             let options = elab_options(&file_label, ctx.config.output.heartbeat_limit);
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            let managed = managed.as_ref();
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            let root = &meta.canonical_root;
             async move {
+                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+                if let Some(managed) = managed {
+                    return managed
+                        .verify(
+                            &ctx.broker,
+                            &hint,
+                            root,
+                            Path::new(&options.file_label),
+                            imports,
+                            request,
+                        )
+                        .await;
+                }
                 if file_backed {
                     ctx.broker
                         .verify_file(hint, session, imports, request, options, detail)

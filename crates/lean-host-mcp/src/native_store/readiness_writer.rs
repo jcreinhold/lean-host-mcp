@@ -64,6 +64,20 @@ struct Intent {
     setup_verification: Option<setup::Request>,
 }
 
+pub(crate) fn setup_intent(bytes: &[u8]) -> Option<(PathBuf, setup::Request)> {
+    let intent: Intent = serde_json::from_slice(bytes).ok()?;
+    if intent.operation != SETUP_VERIFICATION
+        || intent.job.is_empty()
+        || intent.revision == 0
+        || intent.target.is_some()
+        || intent.source.is_some()
+        || intent.formatter.is_some()
+    {
+        return None;
+    }
+    Some((intent.project, intent.setup_verification.filter(setup::Request::valid)?))
+}
+
 pub(super) fn is_operation(intent: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
         matches!(

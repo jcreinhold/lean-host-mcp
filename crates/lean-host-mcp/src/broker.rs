@@ -828,6 +828,11 @@ impl ProjectBroker {
         Ok(out)
     }
 
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn managed_only(&self) -> bool {
+        self.runtime_config.managed_only
+    }
+
     pub(crate) fn prepared_generation(&self) -> Option<&str> {
         self.runtime_config.prepared_generation()
     }
