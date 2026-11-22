@@ -28,6 +28,8 @@ struct Check {
     name: String,
     exit_code: i32,
     output: String,
+    #[serde(default)]
+    output_truncated: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -85,6 +87,27 @@ pub(crate) fn check_config(root: &Path, expected: &[u8; 32]) -> io::Result<()> {
     Ok(())
 }
 
+/// Keep the beginning of the diagnostic stream and drain the rest so its size
+/// never turns a real lint exit into an artificial pipe failure.
+fn diagnostic_preview(mut input: impl io::Read) -> io::Result<(String, bool)> {
+    let mut bytes = Vec::new();
+    input.by_ref().take(OUTPUT_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+    let clipped = bytes.len() > OUTPUT_LIMIT;
+    bytes.truncate(OUTPUT_LIMIT);
+    if clipped {
+        io::copy(&mut input, &mut io::sink())?;
+    }
+    match String::from_utf8(bytes) {
+        Ok(output) => Ok((output, clipped)),
+        Err(error) => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            Ok((String::from_utf8(bytes).map_err(io::Error::other)?, true))
+        }
+    }
+}
+
 pub(crate) fn run(
     root: &Path,
     lake: &Path,
@@ -131,24 +154,17 @@ pub(crate) fn run(
             .stdout(Stdio::from(output.try_clone()?))
             .stderr(Stdio::from(output))
             .spawn()?;
-        let mut bytes = Vec::new();
-        let read = input.take(OUTPUT_LIMIT as u64 + 1).read_to_end(&mut bytes);
-        if read.is_err() || bytes.len() > OUTPUT_LIMIT {
-            let _killed = child.kill();
-        }
+        let preview = diagnostic_preview(input);
         let status = child.wait()?;
-        read?;
-        if bytes.len() > OUTPUT_LIMIT {
-            return Err(io::Error::other("whole-library lint output exceeds retained bound"));
-        }
+        let (output, output_truncated) = preview?;
         let code = status
             .code()
             .ok_or_else(|| io::Error::other("whole-library lint interrupted"))?;
-        let output = String::from_utf8(bytes).map_err(io::Error::other)?;
         checks.push(Check {
             name: name.to_owned(),
             exit_code: code,
             output,
+            output_truncated,
         });
         if code != 0 {
             break;
@@ -162,4 +178,25 @@ pub(crate) fn run(
         checks,
     })?;
     io::stdout().lock().write_all(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_preview_drains_oversized_output_without_exposing_partial_utf8() -> io::Result<()> {
+        let mut data = vec![b'x'; OUTPUT_LIMIT - 1];
+        data.extend_from_slice("é and the rest".as_bytes());
+        let mut input = io::Cursor::new(&data);
+        let (preview, truncated) = diagnostic_preview(&mut input)?;
+        assert!(truncated);
+        assert_eq!(preview.len(), OUTPUT_LIMIT - 1);
+        assert_eq!(input.position(), data.len() as u64);
+        assert_eq!(
+            diagnostic_preview(&b"ordinary finding\n"[..])?,
+            ("ordinary finding\n".to_owned(), false)
+        );
+        Ok(())
+    }
 }
