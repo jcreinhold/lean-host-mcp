@@ -422,6 +422,14 @@ fn bound_drain_recovery_helper() {
     match action.as_str() {
         "read" => assert_eq!(record["guardian_drain"], "available"),
         "observe-delivery" => assert_eq!(record["guardian_drain"], "requested"),
+        "refuse-stopped-guardian" => {
+            assert!(fixture_process_stopped(&expected.parent));
+            assert!(fixture_process_stopped(&expected.guardian));
+            let error =
+                request_bound_original_guardian_drain(registry, &expected, Duration::from_millis(100)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(read_json(&record_path), record);
+        }
         "deliver" => {
             let stale = NativeGuardianDrainBinding {
                 guardian: NativeProcessIdentity {
@@ -458,13 +466,51 @@ fn exiting_recoverer(fixture: &Fixture, cut: Cut, action: &str) -> u32 {
     pid
 }
 
-#[derive(Clone, Copy)]
-enum RecoveryExit {
-    AfterRead,
-    AfterDelivery,
+fn fixture_process_stopped(process: &NativeProcessIdentity) -> bool {
+    // Darwin sys/proc.h defines the libproc pbi_status value for suspension.
+    const SSTOP: u32 = 4;
+    let raw = i32::try_from(process.pid).unwrap();
+    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(raw, 0).unwrap();
+    assert_eq!(
+        NativeProcessIdentity::capture(process.pid).unwrap().as_ref(),
+        Some(process)
+    );
+    assert_eq!(info.pbi_pid, process.pid);
+    info.pbi_status == SSTOP
 }
 
-fn bound_drain_after_recovery_exit(exit: RecoveryExit, cut: Cut) {
+/// Only used for the exact guardian launched by this private fixture. On a
+/// failed assertion, resume it before the service Child's cleanup guard runs.
+struct StoppedFixtureGuardian<'a>(&'a NativeProcessIdentity);
+impl<'a> StoppedFixtureGuardian<'a> {
+    fn stop(guardian: &'a NativeProcessIdentity) -> Self {
+        assert!(guardian.is_live().unwrap());
+        assert!(!fixture_process_stopped(guardian));
+        let pid = rustix::process::Pid::from_raw(i32::try_from(guardian.pid).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+        let stopped = Self(guardian);
+        fixtures::wait(|| fixture_process_stopped(guardian));
+        stopped
+    }
+}
+impl Drop for StoppedFixtureGuardian<'_> {
+    fn drop(&mut self) {
+        if NativeProcessIdentity::capture(self.0.pid).ok().flatten().as_ref() == Some(self.0)
+            && let Some(pid) = i32::try_from(self.0.pid).ok().and_then(rustix::process::Pid::from_raw)
+        {
+            let _resume = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryCase {
+    AfterRead,
+    AfterDelivery,
+    GuardianStopped,
+}
+
+fn bound_drain_case(case: RecoveryCase, cut: Cut) {
     use std::os::unix::fs::MetadataExt as _;
     let fixture = Fixture::new();
     let base = &fixture.root;
@@ -527,18 +573,37 @@ fn bound_drain_after_recovery_exit(exit: RecoveryExit, cut: Cut) {
         fixtures::wait(|| heartbeat.metadata().unwrap().len() > before);
         assert!(!scope_root.join("contender-acquired.json").exists());
     }
-    let (first, second) = match exit {
-        RecoveryExit::AfterRead => {
+    let (first, second) = match case {
+        RecoveryCase::AfterRead => {
             let reader = exiting_recoverer(&fixture, cut, "read");
             assert_eq!(read_json(&record_path), original_record);
             assert!(original.worker.is_live().unwrap());
             assert!(!scope_root.join("contender-acquired.json").exists());
             (reader, exiting_recoverer(&fixture, cut, "deliver"))
         }
-        RecoveryExit::AfterDelivery => (
+        RecoveryCase::AfterDelivery => (
             exiting_recoverer(&fixture, cut, "deliver"),
             exiting_recoverer(&fixture, cut, "observe-delivery"),
         ),
+        RecoveryCase::GuardianStopped => {
+            fixtures::wait(|| fixture_process_stopped(&original.parent));
+            let stopped = StoppedFixtureGuardian::stop(&original.guardian);
+            let refusal = exiting_recoverer(&fixture, cut, "refuse-stopped-guardian");
+            assert_eq!(read_json(&record_path), original_record);
+            assert!(!scope_root.join("contender-acquired.json").exists());
+            assert!(matches!(
+                File::open(&lock_path).unwrap().try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            let heartbeat = scope_root.join("heartbeat");
+            let before = heartbeat.metadata().unwrap().len();
+            fixtures::wait(|| heartbeat.metadata().unwrap().len() > before);
+            assert!(fixture_process_stopped(&original.guardian));
+            assert!(!scope_root.join("contender-acquired.json").exists());
+            drop(stopped);
+            fixtures::wait(|| !fixture_process_stopped(&original.guardian));
+            (refusal, exiting_recoverer(&fixture, cut, "deliver"))
+        }
     };
     assert_ne!(first, second);
     assert_ne!(first, service.0.id());
@@ -566,15 +631,20 @@ fn bound_drain_after_recovery_exit(exit: RecoveryExit, cut: Cut) {
 
 #[test]
 fn bound_drain_reads_original_under_stopped_writer_lock() {
-    bound_drain_after_recovery_exit(RecoveryExit::AfterRead, Cut::ConsumedBeforeGo);
+    bound_drain_case(RecoveryCase::AfterRead, Cut::ConsumedBeforeGo);
 }
 
 #[test]
 fn bound_drain_delivery_survives_recoverer_exit() {
-    bound_drain_after_recovery_exit(RecoveryExit::AfterDelivery, Cut::ConsumedBeforeGo);
+    bound_drain_case(RecoveryCase::AfterDelivery, Cut::ConsumedBeforeGo);
 }
 
 #[test]
 fn bound_drain_stops_descendant_writes_before_same_inode_handoff() {
-    bound_drain_after_recovery_exit(RecoveryExit::AfterDelivery, Cut::WitnessedStart);
+    bound_drain_case(RecoveryCase::AfterDelivery, Cut::WitnessedStart);
+}
+
+#[test]
+fn stopped_guardian_refuses_drain_and_keeps_same_inode_writer_blocked() {
+    bound_drain_case(RecoveryCase::GuardianStopped, Cut::WitnessedStart);
 }
