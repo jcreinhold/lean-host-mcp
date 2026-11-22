@@ -419,6 +419,11 @@ fn bound_drain_recovery_helper() {
     assert_eq!(record["process"], json!(expected.worker));
     assert_eq!(record["guardian"], json!(expected.guardian));
 
+    if action.starts_with("slot-") {
+        bound_slot_recovery_action(&base.join("native.sqlite3"), &request, &expected.parent, &action);
+        return;
+    }
+
     match action.as_str() {
         "read" => assert_eq!(record["guardian_drain"], "available"),
         "observe-delivery" => assert_eq!(record["guardian_drain"], "requested"),
@@ -508,17 +513,20 @@ enum RecoveryCase {
     AfterRead,
     AfterDelivery,
     GuardianStopped,
+
+    ManagedSlot,
 }
 
 fn bound_drain_case(case: RecoveryCase, cut: Cut) {
     use std::os::unix::fs::MetadataExt as _;
     let fixture = Fixture::new();
     let base = &fixture.root;
-    let mut service = TestChild(
-        command(&fixture, "service_loss::bound_drain_service_helper", cut)
-            .spawn()
-            .unwrap(),
-    );
+    let mut service = command(&fixture, "service_loss::bound_drain_service_helper", cut);
+
+    if matches!(case, RecoveryCase::ManagedSlot) {
+        service.env(lean_toolchain::native_guardian::DRAIN_SLOT_ENV, "1");
+    }
+    let mut service = TestChild(service.spawn().unwrap());
     let ready_path = base.join("bound-recovery-ready.json");
     fixtures::wait(|| ready_path.exists() || service.0.try_wait().unwrap().is_some());
     assert!(
@@ -604,6 +612,27 @@ fn bound_drain_case(case: RecoveryCase, cut: Cut) {
             fixtures::wait(|| !fixture_process_stopped(&original.guardian));
             (refusal, exiting_recoverer(&fixture, cut, "deliver"))
         }
+
+        RecoveryCase::ManagedSlot => {
+            assert_eq!(original_record["guardian_drain_protocol"], "slot-v1");
+            fixtures::wait(|| fixture_process_stopped(&original.parent));
+            let stopped = StoppedFixtureGuardian::stop(&original.guardian);
+            let first = exiting_recoverer(&fixture, cut, "slot-submit");
+            let duplicate = exiting_recoverer(&fixture, cut, "slot-duplicate");
+            assert_ne!(first, duplicate);
+            assert_eq!(read_json(&record_path), original_record);
+            assert!(matches!(
+                File::open(&lock_path).unwrap().try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            assert!(!scope_root.join("contender-acquired.json").exists());
+            assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), cut.starts());
+            let heartbeat = scope_root.join("heartbeat");
+            let before = heartbeat.metadata().unwrap().len();
+            fixtures::wait(|| heartbeat.metadata().unwrap().len() > before);
+            drop(stopped);
+            (first, exiting_recoverer(&fixture, cut, "slot-observe"))
+        }
     };
     assert_ne!(first, second);
     assert_ne!(first, service.0.id());
@@ -647,4 +676,125 @@ fn bound_drain_stops_descendant_writes_before_same_inode_handoff() {
 #[test]
 fn stopped_guardian_refuses_drain_and_keeps_same_inode_writer_blocked() {
     bound_drain_case(RecoveryCase::GuardianStopped, Cut::WitnessedStart);
+}
+
+fn bound_slot_recovery_action(database: &Path, request: &SavedRequest, parent: &NativeProcessIdentity, action: &str) {
+    use lean_toolchain::native_guardian::NativeGuardianDrainStatus;
+    use slot::{DrainAuthorization, StageDrain};
+
+    let stale = NativeProcessIdentity {
+        start: "wrong parent birth".to_owned(),
+        ..parent.clone()
+    };
+    assert!(matches!(
+        StageDrain::lookup(database, request, Some(&stale)),
+        Err(store::Problem::Rejected(store::Reject::WrongScope))
+    ));
+    let drain = StageDrain::lookup(database, request, Some(parent)).unwrap();
+    // The fixture explicitly authorizes its previously selected stage. This
+    // is independent of the recovery lookup and never read from the slot.
+    let scope = Scope {
+        id: [4; 16],
+        generation: 1,
+        owner: [5; 16],
+    };
+    let authorized = DrainAuthorization(Binding {
+        key: request.key,
+        scope,
+    });
+    match action {
+        "slot-submit" | "slot-duplicate" => {
+            let before = if action == "slot-submit" {
+                NativeGuardianDrainStatus::Empty
+            } else {
+                NativeGuardianDrainStatus::Pending
+            };
+            assert_eq!(drain.observe().unwrap(), before);
+            let wrong = DrainAuthorization(Binding {
+                key: request.key,
+                scope: Scope { generation: 2, ..scope },
+            });
+            assert_eq!(
+                drain.submit(&wrong).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(drain.observe().unwrap(), before);
+            drain.submit(&authorized).unwrap();
+            assert_eq!(drain.observe().unwrap(), NativeGuardianDrainStatus::Pending);
+        }
+        "slot-observe" => fixtures::wait(|| match drain.observe() {
+            Ok(NativeGuardianDrainStatus::Accepted) => true,
+            Ok(NativeGuardianDrainStatus::Pending) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            status => panic!("unexpected SDK drain observation: {status:?}"),
+        }),
+        _ => panic!("invalid slot recovery fixture action"),
+    }
+}
+
+#[test]
+fn managed_slot_keeps_writer_fenced_until_original_guardian_closes() {
+    bound_drain_case(RecoveryCase::ManagedSlot, Cut::WitnessedStart);
+}
+
+mod slot {
+    use super::*;
+    use lean_toolchain::native_guardian::{
+        NativeGuardianDrainBinding, NativeGuardianDrainStatus, observe_original_guardian_drain,
+        submit_original_guardian_drain,
+    };
+    use std::{io, os::unix::ffi::OsStrExt};
+
+    /// Issued by the trusted recovery caller after authorizing this exact
+    /// original stage. A read of the store does not produce this value.
+    pub(crate) struct DrainAuthorization(pub(crate) Binding);
+
+    /// One authenticated lookup. It carries no writer admission, launch, or
+    /// closure authority.
+    pub(crate) struct StageDrain {
+        stage: Binding,
+        registry: PathBuf,
+        expected: NativeGuardianDrainBinding,
+    }
+
+    impl StageDrain {
+        pub(crate) fn lookup(
+            database: &Path,
+            request: &SavedRequest,
+            expected_parent: Option<&NativeProcessIdentity>,
+        ) -> Result<Self, store::Problem> {
+            let (stage, identity) = NativeStore::read_recovery_scope(database, request, None, expected_parent)?;
+            Ok(Self {
+                stage,
+                registry: PathBuf::from(std::ffi::OsStr::from_bytes(&identity.directory)),
+                expected: NativeGuardianDrainBinding {
+                    registry_device: identity.device,
+                    registry_inode: identity.inode,
+                    generation: identity.generation,
+                    boot: uuid::Uuid::from_bytes(identity.boot).to_string(),
+                    parent: identity.parent,
+                    worker: identity.worker,
+                    guardian: identity.guardian,
+                },
+            })
+        }
+
+        /// Success describes slot insertion or coalescence. In particular it
+        /// advances neither the SDK's guardian decision nor the store's gate.
+        pub(crate) fn submit(&self, authority: &DrainAuthorization) -> io::Result<()> {
+            if authority.0 != self.stage {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "drain authorization differs from original stage",
+                ));
+            }
+            submit_original_guardian_drain(&self.registry, &self.expected)
+        }
+
+        /// The SDK reports the guardian's decision. Even Accepted confers
+        /// no writer admission. Observe native closure independently.
+        pub(crate) fn observe(&self) -> io::Result<NativeGuardianDrainStatus> {
+            observe_original_guardian_drain(&self.registry, &self.expected)
+        }
+    }
 }
