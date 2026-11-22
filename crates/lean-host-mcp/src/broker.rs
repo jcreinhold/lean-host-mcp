@@ -1206,6 +1206,20 @@ impl ProjectBroker {
         Ok(inner.registry.get(&key).cloned())
     }
 
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) async fn managed_actor(&self, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
+        let root = self.native_root(&ProjectHint::Default)?;
+        if let Some(actor) = self.select_existing_worker(&root)? {
+            return Ok(actor);
+        }
+        // The actor's ordinary bootstrap validates its installed shims and
+        // starts a guarded receiver with an empty import set. There is no
+        // OpenHostSession or target body until the managed job binds it.
+        tokio::time::timeout_at(deadline, self.acquire_until(root.clone(), deadline))
+            .await
+            .map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
+    }
+
     fn select_existing_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;

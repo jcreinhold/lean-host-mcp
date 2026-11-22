@@ -36,10 +36,16 @@ mod host_preparation;
 mod ilean;
 pub mod lake_meta;
 mod lake_options;
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+#[path = "native_store/prepared.rs"]
+mod managed_prepared;
 pub mod native_reader;
 mod native_socket;
 #[cfg(all(unix, feature = "managed-native-store"))]
-#[expect(dead_code, reason = "managed broker wiring is intentionally separate from store qualification")]
+#[expect(
+    dead_code,
+    reason = "managed broker wiring is intentionally separate from store qualification"
+)]
 mod native_store;
 mod project;
 pub mod projections;

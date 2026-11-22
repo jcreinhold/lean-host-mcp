@@ -35,6 +35,57 @@ struct WireRequest {
     version: u8,
     command: ClientCommand,
 }
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+impl ClientRequest {
+    pub(crate) fn get_identity(&self) -> Option<(NativeKey, Capability)> {
+        match self.command {
+            ClientCommand::Get { key, capability } => Some((key, Capability(capability))),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn start_identity(&self) -> Option<(NativeKey, Capability)> {
+        match self.command {
+            ClientCommand::Start { key, capability } => Some((key, Capability(capability))),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(all(feature = "managed-native-store", target_os = "macos"))]
+impl ClientRequest {
+    pub(crate) fn drain_claim(&self) -> Option<DrainClaim> {
+        match &self.command {
+            ClientCommand::Drain {
+                key,
+                capability,
+                generation,
+                revision,
+                submit,
+                authorization,
+            } => Some(DrainClaim {
+                key: *key,
+                capability: Capability(*capability),
+                generation: generation.clone(),
+                revision: *revision,
+                submit: *submit,
+                authorization: *authorization,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(all(feature = "managed-native-store", target_os = "macos"))]
+pub(crate) struct DrainClaim {
+    pub(crate) key: NativeKey,
+    pub(crate) capability: Capability,
+    pub(crate) generation: String,
+    pub(crate) revision: u64,
+    pub(crate) submit: bool,
+    pub(crate) authorization: Option<[u8; 32]>,
+}
+
 impl std::fmt::Debug for ClientRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClientRequest([redacted])")
@@ -48,6 +99,8 @@ enum ClientCommand {
         key: NativeKey,
         capability: [u8; 32],
         intent: Vec<u8>,
+        #[serde(default)]
+        drain_authorization: Option<[u8; 32]>,
     },
     Get {
         key: NativeKey,
@@ -60,6 +113,15 @@ enum ClientCommand {
     Cancel {
         key: NativeKey,
         capability: [u8; 32],
+    },
+    Drain {
+        key: NativeKey,
+        capability: [u8; 32],
+        generation: String,
+        revision: u64,
+        submit: bool,
+        #[serde(default)]
+        authorization: Option<[u8; 32]>,
     },
     Ack {
         key: NativeKey,
@@ -105,6 +167,7 @@ impl NativeStore {
             | ClientCommand::Get { capability, .. }
             | ClientCommand::Start { capability, .. }
             | ClientCommand::Cancel { capability, .. }
+            | ClientCommand::Drain { capability, .. }
             | ClientCommand::Ack { capability, .. } => {
                 if *capability == [0; 32] {
                     return Err("capability_denied");
@@ -196,8 +259,9 @@ impl NativeStore {
                 key,
                 capability,
                 intent,
+                drain_authorization,
             } => self
-                .create_intent(key, &Capability(capability), &intent)
+                .create_intent(key, &Capability(capability), &intent, drain_authorization)
                 .map(ClientReply::Snapshot),
             ClientCommand::Get { key, capability } => {
                 self.client_get(key, &Capability(capability)).map(ClientReply::Snapshot)
@@ -209,6 +273,7 @@ impl NativeStore {
             ClientCommand::Cancel { key, capability } => self
                 .cancel_original(key, &Capability(capability), None)
                 .map(ClientReply::Snapshot),
+            ClientCommand::Drain { .. } => reject(Reject::DispatchDisabled),
             ClientCommand::Ack {
                 key,
                 capability,

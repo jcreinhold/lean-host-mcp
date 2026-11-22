@@ -62,7 +62,7 @@ impl RegistryIdentity {
                 })
     }
 
-    fn matches_directory(&self) -> bool {
+    pub(crate) fn matches_directory(&self) -> bool {
         let directory = Path::new(std::ffi::OsStr::from_bytes(&self.directory));
         std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
             metadata.is_dir()
@@ -207,6 +207,22 @@ impl NativeStore {
         Ok(binding)
     }
 
+    pub(crate) fn authorize_drain(&self, key: NativeKey, secret: Option<[u8; 32]>) -> Answer<()> {
+        self.checked_key(key)?;
+        let Some(secret) = secret else {
+            return reject(Reject::CapabilityDenied);
+        };
+        let expected = self.db.connection().query_row(
+            "SELECT drain_auth_hash FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",
+            params![number(key.epoch)?, key.nonce, number(key.stage)?],
+            |row| optional_fixed::<32>(row, 0),
+        )?;
+        if expected.as_ref().map(<[u8; 32]>::as_slice) != Some(digest(&secret).as_slice()) {
+            return reject(Reject::CapabilityDenied);
+        }
+        Ok(())
+    }
+
     /// Read one authenticated binding without opening the service ownership
     /// lock. The SDK must recheck all of it under its publication lock
     /// before acting on a scope. This read confers no process authority.
@@ -291,5 +307,56 @@ impl NativeStore {
         }
         tx.commit()?;
         Ok((Binding { key, scope }, identity))
+    }
+}
+
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+impl NativeStore {
+    pub(crate) fn open_stage_recovery(
+        &self,
+        saved: &SavedRequest,
+        generation: Option<&str>,
+    ) -> Answer<(Binding, RegistryIdentity)> {
+        let path = self
+            .db
+            .connection()
+            .path()
+            .ok_or(Problem::Rejected(Reject::WrongStore))?;
+        Self::read_recovery_scope(Path::new(path), saved, generation, None)
+    }
+
+    /// Record trusted SDK closure without granting launch or inventing a result.
+    pub(crate) fn reconcile_closed_scope(&mut self, binding: Binding, identity: &RegistryIdentity) -> Answer<()> {
+        self.checked_key(binding.key)?;
+        self.db.check_profile()?;
+        let encoded = serde_json::to_vec(identity).map_err(|_| Problem::Rejected(Reject::WrongScope))?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE stages SET resource_report=3,gate=CASE WHEN gate=0 THEN 2 ELSE gate END,
+             result_body=CASE WHEN result_kind=2 THEN NULL ELSE result_body END,
+             result_kind=CASE WHEN result_kind=2 THEN 3 ELSE result_kind END
+             WHERE epoch=?1 AND nonce=?2 AND stage=?3 AND scope=?4 AND generation=?5 AND owner=?6
+             AND EXISTS(SELECT 1 FROM scope_heads h WHERE h.scope=?4 AND h.generation=?5 AND h.owner=?6)
+             AND EXISTS(SELECT 1 FROM recovery_bindings r WHERE r.epoch=?1 AND r.nonce=?2 AND r.stage=?3
+                        AND r.identity=?7 AND r.expires_ns IS NOT NULL)",
+            params![
+                number(binding.key.epoch)?,
+                binding.key.nonce,
+                number(binding.key.stage)?,
+                binding.scope.id,
+                number(binding.scope.generation)?,
+                binding.scope.owner,
+                encoded
+            ],
+        )?;
+        if changed != 1 {
+            return reject(Reject::WrongScope);
+        }
+        compact_closed_acknowledged(&tx, binding.key)?;
+        tx.commit()?;
+        Ok(())
     }
 }

@@ -861,6 +861,13 @@ struct JobMeta {
 }
 
 enum ProjectMessage {
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    ManagedInspection {
+        meta: JobMeta,
+        job: crate::managed_prepared::Job,
+        reply: oneshot::Sender<Result<ProjectCall<()>>>,
+    },
+
     NativeCompatibility {
         meta: JobMeta,
         reply: oneshot::Sender<Result<ProjectCall<()>>>,
@@ -920,6 +927,8 @@ enum ProjectMessage {
 impl ProjectMessage {
     fn meta(&self) -> &JobMeta {
         match self {
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            Self::ManagedInspection { meta, .. } => meta,
             Self::NativeCompatibility { meta, .. }
             | Self::ModuleQuery { meta, .. }
             | Self::ModuleQueryBatch { meta, .. }
@@ -938,6 +947,10 @@ impl ProjectMessage {
 
     fn reject(self, state: &ProjectActorState, reason: &'static str) {
         match self {
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            Self::ManagedInspection { meta, reply, .. } => {
+                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
+            }
             Self::NativeCompatibility { meta, reply } => {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
@@ -1435,6 +1448,17 @@ impl LeanProject {
             reply,
         };
         self.enqueue(message, rx).await
+    }
+
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) async fn inspect_managed(&self, job: crate::managed_prepared::Job, deadline: Instant) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let message = ProjectMessage::ManagedInspection {
+            meta: self.job_meta(job.imports().to_vec(), RetryPolicy::Never, deadline),
+            job,
+            reply,
+        };
+        self.enqueue(message, rx).await.map(|_| ())
     }
 
     /// Inspect one declaration through this project's serialized worker actor.
@@ -2055,6 +2079,20 @@ impl ProjectActorState {
         // A call was served, so the next quiet period earns a fresh idle cycle.
         self.cycled_while_idle = false;
         match message {
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            ProjectMessage::ManagedInspection { meta, job, reply } => {
+                let result = if meta.cancellation.is_cancelled() {
+                    Err(self.shutdown_unavailable(&meta, "request_cancelled"))
+                } else {
+                    job.run(
+                        &mut self.handle,
+                        self.config.prepared_generation.as_deref(),
+                        &self.config.healthy,
+                    )
+                    .map(|()| ProjectCall::new((), RuntimeFacts::default()))
+                };
+                let _ = reply.send(result);
+            }
             ProjectMessage::NativeCompatibility { meta, reply } => {
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     let _session = handle.open_session_with_imports(imports, Some(cancellation), None)?;

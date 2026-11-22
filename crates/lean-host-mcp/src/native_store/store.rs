@@ -527,6 +527,7 @@ impl NativeStore {
             result_kind INTEGER NOT NULL DEFAULT 0 CHECK(result_kind IN(0,1,2,3)),result_id BLOB,result_hash BLOB,result_body BLOB CHECK(length(result_body)<=65536),\n\
             managed_ack INTEGER NOT NULL DEFAULT 0 CHECK(managed_ack IN(0,1)),\n\
             compacted_intent_sha256 BLOB CHECK(length(compacted_intent_sha256)=32),\n\
+            drain_auth_hash BLOB CHECK(length(drain_auth_hash)=32),\n\
             PRIMARY KEY(epoch,nonce,stage),UNIQUE(scope,generation),\n\
             CHECK((scope IS NULL AND generation IS NULL AND owner IS NULL) OR (scope IS NOT NULL AND generation IS NOT NULL AND owner IS NOT NULL AND length(scope)=16 AND generation>=0 AND length(owner)=16))) STRICT;"))?;
         tx.execute_batch(recovery::SCHEMA)?;
@@ -565,6 +566,14 @@ impl NativeStore {
             tx.execute_batch(
                 "ALTER TABLE stages ADD COLUMN compacted_intent_sha256 BLOB CHECK(length(compacted_intent_sha256)=32)",
             )?;
+        }
+        let has_drain_auth: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('stages') WHERE name='drain_auth_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_drain_auth {
+            tx.execute_batch("ALTER TABLE stages ADD COLUMN drain_auth_hash BLOB CHECK(length(drain_auth_hash)=32)")?;
         }
         let store = tx.query_row("SELECT store FROM meta WHERE singleton=1", [], |r| fixed(r, 0))?;
         let prior = {
@@ -613,11 +622,21 @@ impl NativeStore {
         read_stage(self.db.connection(), key)
     }
     pub(crate) fn create(&mut self, saved: &SavedRequest) -> Answer<Snapshot> {
-        self.create_intent(saved.key, &saved.capability, &saved.intent)
+        self.create_intent(saved.key, &saved.capability, &saved.intent, None)
     }
-    fn create_intent(&mut self, key: NativeKey, capability: &Capability, intent: &[u8]) -> Answer<Snapshot> {
+    fn create_intent(
+        &mut self,
+        key: NativeKey,
+        capability: &Capability,
+        intent: &[u8],
+        drain_auth: Option<[u8; 32]>,
+    ) -> Answer<Snapshot> {
         self.checked_key(key)?;
         bounded(intent)?;
+        if drain_auth.is_some_and(|secret| secret == [0; 32] || secret == capability.0) {
+            return reject(Reject::CapabilityDenied);
+        }
+        let drain_hash = drain_auth.map(|secret| digest(&secret));
         self.db.check_profile()?;
         let tx = self
             .db
@@ -630,6 +649,16 @@ impl NativeStore {
         )?;
         if exists {
             authenticate(&tx, key, capability)?;
+            if let Some(hash) = drain_hash.as_deref() {
+                let original = tx.query_row(
+                    "SELECT drain_auth_hash FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3",
+                    params![number(key.epoch)?, key.nonce, number(key.stage)?],
+                    |row| optional_fixed::<32>(row, 0),
+                )?;
+                if original.as_ref().map(<[u8; 32]>::as_slice) != Some(hash) {
+                    return reject(Reject::CapabilityDenied);
+                }
+            }
             let previous = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
             if !previous.matches_intent(intent) {
                 return reject(Reject::IntentChanged);
@@ -647,13 +676,14 @@ impl NativeStore {
             return reject(Reject::StoreFull);
         }
         tx.execute(
-            "INSERT INTO stages(epoch,nonce,stage,intent,cap_hash) VALUES(?1,?2,?3,?4,?5)",
+            "INSERT INTO stages(epoch,nonce,stage,intent,cap_hash,drain_auth_hash) VALUES(?1,?2,?3,?4,?5,?6)",
             params![
                 number(key.epoch)?,
                 key.nonce.as_slice(),
                 number(key.stage)?,
                 intent,
-                digest(&capability.0)
+                digest(&capability.0),
+                drain_hash
             ],
         )?;
         let snapshot = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;

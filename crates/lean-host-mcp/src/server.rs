@@ -234,9 +234,29 @@ impl LeanHostService {
         let mut store = store
             .try_lock()
             .ok_or_else(|| McpError::internal_error("store_busy", None))?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let recovery = crate::native_store::store::boundary::decode(input.request.as_bytes())
+            .ok()
+            .and_then(|command| command.get_identity())
+            .and_then(|(key, capability)| crate::managed_prepared::reconcile_lookup(&mut store, key, &capability));
+        #[cfg(target_os = "macos")]
+        if let Ok(command) = crate::native_store::store::boundary::decode(input.request.as_bytes())
+            && let Some(claim) = command.drain_claim()
+        {
+            let reply = crate::managed_prepared::drain(&mut store, claim)?;
+            return Ok(CallToolResult::success(vec![ContentBlock::text(reply.to_string())]));
+        }
         let reply = store
             .admission(input.request.as_bytes())
             .map_err(|reason| McpError::invalid_params(reason, None))?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let reply = {
+            let mut reply = crate::managed_prepared::advertise(reply, &self.ctx.broker);
+            if let Some(recovery) = recovery {
+                reply["recovery"] = recovery;
+            }
+            reply
+        };
         Ok(CallToolResult::success(vec![ContentBlock::text(reply.to_string())]))
     }
 }
@@ -492,6 +512,20 @@ impl ServerHandler for LeanHostService {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        if request.name.as_ref() == "lean_managed_admission"
+            && self.ctx.broker.prepared_generation().is_some()
+            && let Some(store) = &self.managed_store
+            && let Some(arguments) = &request.arguments
+            && let Ok(input) = serde_json::from_value::<ManagedAdmission>(serde_json::Value::Object(arguments.clone()))
+            && let Ok(command) = crate::native_store::store::boundary::decode(input.request.as_bytes())
+            && let Some((key, capability)) = command.start_identity()
+        {
+            let result = crate::managed_prepared::start(&self.ctx.broker, store, key, capability).await?;
+            return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                ContentBlock::text(result.to_string()),
+            ])));
+        }
         // Coordination is immediate and must return its lease token directly,
         // even for clients that negotiate asynchronous Lean job handles.
         if !matches!(
@@ -757,11 +791,35 @@ mod tests {
             json!({"store":discovery["store"], "epoch":discovery["acceptance_epoch"], "nonce":vec![9;16], "stage":1});
         let cap = vec![1; 32];
         let create = |intent| json!({"op":"create","key":key,"capability":cap,"intent":intent});
+        let reserved =
+            json!({"store":discovery["store"],"epoch":discovery["acceptance_epoch"],"nonce":vec![6;16],"stage":1});
+        let with_drain = |secret| {
+            json!({
+                "op":"create","key":reserved,"capability":cap,"intent":[42],"drain_authorization":secret
+            })
+        };
+        assert_eq!(
+            call(&service, with_drain(json!(cap))).unwrap_err().message,
+            "capability_denied"
+        );
+        let admitted = call(&service, with_drain(json!(vec![3; 32]))).unwrap();
+        assert!(admitted.get("drain_authorization").is_none());
+        assert_eq!(
+            call(&service, with_drain(json!(vec![4; 32]))).unwrap_err().message,
+            "capability_denied",
+        );
         let original = call(&service, create(vec![42])).unwrap();
         assert_eq!(original["dispatch_enabled"], false);
         drop(service);
         let service = stock().with_managed_native_store(&path).unwrap();
         assert_eq!(call(&service, create(vec![42])).unwrap(), original);
+        {
+            let store = service.managed_store.as_ref().unwrap().lock();
+            let original_key = serde_json::from_value(reserved).unwrap();
+            assert!(store.authorize_drain(original_key, None).is_err());
+            assert!(store.authorize_drain(original_key, Some([1; 32])).is_err());
+            assert!(store.authorize_drain(original_key, Some([3; 32])).is_ok());
+        }
         assert_eq!(
             call(&service, json!({"op":"get","key":key,"capability":cap})).unwrap(),
             original

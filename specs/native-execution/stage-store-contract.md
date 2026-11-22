@@ -22,7 +22,9 @@ The tool takes a `request` string containing version 1 JSON with a `command` obj
 values with a fresh 16-byte nonce, stage number, randomly generated 32-byte capability, and the original intent bytes.
 Send the store UUID, epoch, nonce and stage as `key`, and the bytes as `capability` and `intent`. Use `get` with the
 same key and capability after an interrupted response. The same `create` returns the original key and intent.
-A different intent or capability for that key is refused. All replies advertise `dispatch_enabled: false`.
+A different intent or capability for that key is refused. The store-only route advertises
+`dispatch_enabled: false`. A matched server with both an explicitly selected managed store and a prepared
+generation advertises managed inspection on macOS and Linux.
 Use `cancel` with the original key and capability. Its transaction seals an unused launch gate and records the stop
 request together. After a lost cancel reply, either `get` or an equal `cancel` returns `execution: "not_started"` for
 that same unused revision. A consumed gate reports `execution: "unknown"` even after cancellation. The opt-in route
@@ -42,6 +44,15 @@ created again. Existing stores gain an additive ACK marker on checked open. Prev
 until the original caller supplies an authenticated repeat ACK.
 The separate `custody` field reports the last trusted resource observation. Reading a result does not advance custody
 or reissue a launch grant.
+
+For the matched macOS prepared route, authenticated GET can return a recovery claim with the original revision
+and worker generation. Send the complete claim and original key/capability with `drain`. Set `submit: false`
+to observe the slot. Offering handoff with `submit: true` also requires the independent `authorization` secret
+committed as `drain_authorization` at CREATE. GET and slot observation never disclose that secret. An offer or acceptance
+does not certify closure. The original guardian decides eligibility and retains the original hard deadline
+when armed. Select the SDK drain-slot mode with `LEAN_RS_WORKER_GUARDIAN_DRAIN_SLOT=1` for the matched
+guardian. The replacement records closure only from the exact SDK witness or independently observed whole-group
+absence when the original generation directory has already been removed.
 
 ## What is saved
 

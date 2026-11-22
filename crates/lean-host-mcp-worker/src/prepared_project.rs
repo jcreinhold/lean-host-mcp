@@ -490,8 +490,11 @@ fn path_dependency_custody_and_observation() -> io::Result<()> {
 fn build_path_dependency() -> io::Result<()> {
     use lean_toolchain::shared_writer::SharedWriter;
     use std::{process::Command, time::Duration};
-    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/r2-prepared-project")
+    let base = std::env::var_os("TEST_PREPARED_FIXTURE")
+        .map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/r2-prepared-project"),
+            PathBuf::from,
+        )
         .canonicalize()?;
     let project = base.join("project");
     let lake = PathBuf::from(std::env::var_os("LEAN_SYSROOT").ok_or_else(invalid)?).join("bin/lake");
@@ -538,6 +541,8 @@ fn build_path_dependency() -> io::Result<()> {
         .join("lib/lean");
     let installed = std::env::var_os("TEST_INSTALLED_SIDECAR");
     let roots = if let Some(ref path) = installed {
+        let path = Path::new(path);
+        let generation = path.parent().ok_or_else(invalid)?;
         let sidecar: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
         let mut roots = vec![project.join(".lake/build/lib/lean"), dep.join(".lake/build/lib/lean")];
         for root in sidecar
@@ -546,7 +551,7 @@ fn build_path_dependency() -> io::Result<()> {
             .as_array()
             .ok_or_else(invalid)?
         {
-            roots.push(PathBuf::from(root.as_str().ok_or_else(invalid)?));
+            roots.push(generation.join(root.as_str().ok_or_else(invalid)?).canonicalize()?);
         }
         roots.push(release.clone());
         roots
