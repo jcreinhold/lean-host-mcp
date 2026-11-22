@@ -38,6 +38,9 @@ pub mod lake_meta;
 mod lake_options;
 pub mod native_reader;
 mod native_socket;
+#[cfg(all(unix, feature = "managed-native-store"))]
+#[expect(dead_code, reason = "managed broker wiring is intentionally separate from store qualification")]
+mod native_store;
 mod project;
 pub mod projections;
 mod request_journal;

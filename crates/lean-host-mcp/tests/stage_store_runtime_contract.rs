@@ -12,8 +12,9 @@
     dead_code,
     reason = "this target exercises native callers; database-only tests cover remaining store operations"
 )]
-#[path = "stage_store_contract/connection.rs"]
-mod connection;
+#[path = "../src/native_store/mod.rs"]
+mod native_store;
+use native_store::{connection, store};
 #[path = "stage_runtime_contract/fixtures.rs"]
 mod fixtures;
 #[path = "../../../specs/native-execution/stage_kernel.rs"]
@@ -22,8 +23,6 @@ mod kernel;
 mod result_client;
 #[path = "stage_runtime_contract/runtime.rs"]
 mod runtime;
-#[path = "stage_store_contract/store.rs"]
-mod store;
 use fixtures::{Contender, Dispatch, Fixture, GoFault, ObservedKind};
 use kernel::{AttemptId, ScopeBinding, StageBinding, StageKey};
 use runtime::{PollFault, Runtime};
@@ -32,9 +31,6 @@ use store::{
     ResultKnowledge, SavedRequest, Scope,
 };
 
-// Commit/crash hooks are exercised in the database-only target. Delivery loss
-// uses fixture switches; SQL rejection below comes from an actual SQLite trigger.
-fn cut(_point: &str) {}
 struct Mapping {
     key: StageKey,
     scope: ScopeBinding,

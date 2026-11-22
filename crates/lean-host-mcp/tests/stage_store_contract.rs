@@ -9,14 +9,10 @@
     reason = "disposable fixtures assert exact commit and crash observations"
 )]
 
-#[path = "stage_store_contract/connection.rs"]
-mod connection;
-#[path = "stage_store_contract/cuts.rs"]
-mod cuts;
+#[path = "../src/native_store/mod.rs"]
+mod native_store;
+use native_store::{connection, store};
 #[path = "stage_store_contract/result_client.rs"]
 mod result_client;
-#[path = "stage_store_contract/store.rs"]
-mod store;
 #[path = "stage_store_contract/cases.rs"]
 mod tests;
-use cuts::cut;

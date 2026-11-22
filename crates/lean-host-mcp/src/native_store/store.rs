@@ -1,12 +1,16 @@
-//! Isolated SQL state prototype. No process launch, custody or admission API.
-use crate::connection::{CheckedConnection, ConnectionError};
+//! Durable native stage state and one-time launch grants.
+use super::connection::{CheckedConnection, ConnectionError};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, path::Path};
 
-// This decoder is a private no-dispatch contract, not a production RPC server.
-#[path = "store/boundary.rs"]
+// These protocol and crash fixtures are compiled only in tests.
+#[cfg(test)]
+#[path = "../../tests/stage_store_contract/store/boundary.rs"]
 pub(crate) mod boundary;
+#[cfg(test)]
+#[path = "../../tests/stage_store_contract/cuts.rs"]
+mod cuts;
 #[path = "store/recovery.rs"]
 pub(crate) mod recovery;
 
@@ -268,10 +272,12 @@ pub(crate) enum Consume {
     Sealed,
 }
 
-fn commit(tx: Transaction<'_>, point: &str) -> Answer<()> {
-    crate::cut(&format!("{point}:before"));
+fn commit(tx: Transaction<'_>, _point: &str) -> Answer<()> {
+    #[cfg(test)]
+    cuts::cut(&format!("{_point}:before"));
     tx.commit()?;
-    crate::cut(&format!("{point}:after"));
+    #[cfg(test)]
+    cuts::cut(&format!("{_point}:after"));
     Ok(())
 }
 fn has_role(db: &Connection, expected: i64, expected_version: i64) -> rusqlite::Result<bool> {

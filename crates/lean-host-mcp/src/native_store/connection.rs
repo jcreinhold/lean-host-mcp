@@ -1,4 +1,4 @@
-//! Checked connections for the disposable store prototype, not a live database.
+//! Checked connections for the internal native stage store.
 //!
 //! `fullfsync = 1` records SQLite's requested setting. The bundled Unix VFS can
 //! fall back to ordinary fsync; this module does not prove physical durability.
