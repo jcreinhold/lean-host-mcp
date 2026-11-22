@@ -1,6 +1,6 @@
 """Darwin installed cancellation check.
 
-Run with PARENT DISPOSABLE_WORKERS_DIR NEW_CHECKOUT_TARGET_CHILD.
+Run with PARENT DISPOSABLE_WORKERS_DIR NEW_CHECKOUT_TARGET_CHILD [cancel|death].
 Use the normal install-worker command with --workers-dir under target.
 The smoke project and native registry must be exclusive to this test.
 """
@@ -92,7 +92,7 @@ def until(probe):
     raise AssertionError(f"timed out waiting for {probe}")
 
 
-def check(parent, workers, scope):
+def check(parent, workers, scope, mode):
     target = Path(__file__).resolve().parents[1] / "target"
     assert sys.platform == "darwin" and os.uname().machine == "arm64"
     assert parent.is_file() and workers.is_relative_to(target) and workers != target
@@ -256,16 +256,43 @@ def check(parent, workers, scope):
             )
         )
         try:
-            intent = body(call("lean_request", action="cancel", **binding))
-            assert intent["cancellation_requested"], intent
+            if mode == "death":
+                assert birth(worker) == worker_birth and worker in children(proc.pid)
+                os.kill(worker, signal.SIGKILL)
+
+                def dead_or_zombie():
+                    state = subprocess.run(
+                        ["ps", "-o", "state=", "-p", str(worker)],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    return (
+                        state.returncode == 1
+                        and not state.stdout.strip()
+                        and not state.stderr
+                    ) or (state.returncode == 0 and "Z" in state.stdout)
+
+                until(dead_or_zombie)
+            else:
+                intent = body(call("lean_request", action="cancel", **binding))
+                assert intent["cancellation_requested"], intent
             held = pool()
-            assert not absent(guardian) and held["occupied_slots"] == 1, held
+            if mode == "cancel" or held["occupied_slots"] == 1:
+                assert held["occupied_slots"] == 1, held
+                if mode == "cancel":
+                    assert not absent(guardian)
+            else:
+                assert (
+                    held["workers_stopped"] and absent(worker) and absent(guardian)
+                ), held
             assert set(children(proc.pid)) <= {worker}
-            assert second not in replies
+            if mode == "cancel":
+                assert second not in replies
             # Cancellation may already have reaped the worker while its stopped
             # guardian still holds custody. Only consult the original live pipe.
             try:
-                if birth(worker) == worker_birth:
+                if mode != "death" and birth(worker) == worker_birth:
                     assert pipe_state(worker) == parked_pipe
             except ProcessLookupError:
                 pass
@@ -288,16 +315,24 @@ def check(parent, workers, scope):
         terminal = body(call("lean_request", action="get", **binding))
         assert terminal["execution"]["disposition"] == "stopped", terminal
         receipt = terminal["execution"]["worker_stop_receipt"]
-        assert receipt["cause"] == "cancelled" and receipt["worker_pid"] == worker, (
-            receipt
-        )
+        assert receipt["worker_pid"] == worker, receipt
+        if mode == "death":
+            assert (
+                not terminal["cancellation_requested"] and not receipt["exit_success"]
+            ), receipt
+            assert "SIGKILL" in receipt["exit_status"] and receipt["cause"] in {
+                "child_abort",
+                "child_exit",
+            }, receipt
+        else:
+            assert receipt["cause"] == "cancelled", receipt
         assert receipt["worker_generation"] == 1 and receipt["worker_request_id"] > 0, (
             receipt
         )
         assert receipt["operation"] == "open_worker_session", receipt
         print(receipt, flush=True)
         print(
-            f"cancelled request {ticket['taskId']}, one occupied slot for two jobs; "
+            f"{mode} request {ticket['taskId']}, one occupied slot for two jobs; "
             f"closed groups {worker}/{guardian}; replacement {replacement}",
             flush=True,
         )
@@ -328,4 +363,6 @@ def check(parent, workers, scope):
 
 
 if __name__ == "__main__":
-    check(*(Path(arg).resolve() for arg in sys.argv[1:]))
+    mode = sys.argv[4] if len(sys.argv) == 5 else "cancel"
+    assert mode in {"death", "cancel"} and len(sys.argv) in {4, 5}
+    check(*(Path(arg).resolve() for arg in sys.argv[1:4]), mode)
