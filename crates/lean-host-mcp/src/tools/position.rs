@@ -751,13 +751,14 @@ pub(crate) async fn file_diagnostics_inner(
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     let admitted = if let Some(call) = managed {
         Some(
-            call.diagnostics(
+            call.project_file(
                 &ctx.broker,
                 &hint,
                 &meta.canonical_root,
                 &input.resolved,
                 &input.source,
                 imports.clone(),
+                crate::writer_setup_verification::Projection::Diagnostics,
             )
             .await,
         )

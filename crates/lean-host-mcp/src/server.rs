@@ -694,7 +694,22 @@ impl LeanHostService {
                 #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
                 tools::semantic::lean_verify_raw(&self.ctx, args).await
             }
-            TaskCall::Lookup(req) => tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await,
+            TaskCall::Lookup(req) => {
+                let req = req.into_inner();
+                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+                {
+                    let mut req = req;
+                    let outline = req.kind().is_some_and(|kind| {
+                        tools::request_aliases::canonical_kind("lean_lookup", kind) == "declarations"
+                    });
+                    let original = req.args.remove("managed_original");
+                    let managed =
+                        self.managed_setup_call(original, outline.then_some("managed_outline_original_required"))?;
+                    tools::semantic::lean_lookup_inner(&self.ctx, req, managed).await
+                }
+                #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+                tools::semantic::lean_lookup(&self.ctx, req).await
+            }
             TaskCall::Status(req) => {
                 #[allow(
                     unused_mut,

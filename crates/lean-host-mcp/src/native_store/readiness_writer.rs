@@ -26,7 +26,7 @@ pub(crate) mod configured_consumer;
 pub(super) const CONSUMER: &str = "lake_configured_consumer_v1";
 use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
-pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION};
+pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION, OUTLINE as SETUP_OUTLINE};
 #[path = "formatter_fix.rs"]
 mod formatter_fix;
 pub(super) const FORMAT_FIX: &str = "lean_formatter_fix_v1";
@@ -45,7 +45,7 @@ enum Stage {
     Consumer(SourceIdentity),
     Formatter(formatter_fix::Request),
     FormatterPreview(formatter_fix::Request),
-    SetupVerification(setup::Request),
+    SetupVerification(setup::Request, setup::Projection),
 }
 
 pub(super) const OPERATION: &str = "lake_mathlib_cache_readiness_v1";
@@ -64,10 +64,10 @@ struct Intent {
     setup_verification: Option<setup::Request>,
 }
 
-pub(crate) fn setup_intent(bytes: &[u8]) -> Option<(PathBuf, setup::Request)> {
+pub(crate) fn setup_intent(bytes: &[u8]) -> Option<(PathBuf, setup::Request, setup::Projection)> {
     let intent: Intent = serde_json::from_slice(bytes).ok()?;
-    if !matches!(intent.operation.as_str(), SETUP_VERIFICATION | SETUP_DIAGNOSTICS)
-        || intent.job.is_empty()
+    let projection = setup::Projection::from_operation(&intent.operation)?;
+    if intent.job.is_empty()
         || intent.revision == 0
         || intent.target.is_some()
         || intent.source.is_some()
@@ -76,10 +76,10 @@ pub(crate) fn setup_intent(bytes: &[u8]) -> Option<(PathBuf, setup::Request)> {
         return None;
     }
     let setup = intent.setup_verification.filter(setup::Request::valid)?;
-    if setup.is_diagnostics() != (intent.operation == SETUP_DIAGNOSTICS) {
+    if !setup.matches_projection(projection) {
         return None;
     }
-    Some((intent.project, setup))
+    Some((intent.project, setup, projection))
 }
 
 pub(super) fn is_operation(intent: &[u8]) -> bool {
@@ -95,6 +95,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | FORMAT_PREVIEW
                     | SETUP_VERIFICATION
                     | SETUP_DIAGNOSTICS
+                    | SETUP_OUTLINE
             )
         )
     })
@@ -156,10 +157,11 @@ pub(super) async fn run(
         (FORMAT_PREVIEW, None, None, Some(formatter), None) if formatter.valid_preview() => {
             Stage::FormatterPreview(formatter)
         }
-        (operation @ (SETUP_VERIFICATION | SETUP_DIAGNOSTICS), None, None, None, Some(request))
-            if request.valid() && request.is_diagnostics() == (operation == SETUP_DIAGNOSTICS) =>
-        {
-            Stage::SetupVerification(request)
+        (operation, None, None, None, Some(request)) if request.valid() => {
+            let projection = setup::Projection::from_operation(operation)
+                .filter(|projection| request.matches_projection(*projection))
+                .ok_or_else(|| invalid("invalid_readiness_intent"))?;
+            Stage::SetupVerification(request, projection)
         }
         _ => return Err(invalid("invalid_readiness_intent")),
     };
@@ -181,7 +183,7 @@ pub(super) async fn run(
         .map_err(|_| McpError::internal_error("readiness_busy", None))?;
     let store = Arc::clone(store);
     let prepared_generation = broker.prepared_generation().map(str::to_owned);
-    if let Stage::SetupVerification(request) = &stage
+    if let Stage::SetupVerification(request, _) = &stage
         && !request.matches_prepared(prepared_generation.as_deref())
     {
         return Err(invalid("setup_verification_prepared_generation_changed"));
@@ -215,7 +217,7 @@ fn execute(
 ) -> Result<(), McpError> {
     let no_start = |_| McpError::invalid_params("readiness_writer_not_started", None);
     let expired = || deadline.remaining().is_err();
-    let shims = if matches!(stage, Stage::SetupVerification(_)) {
+    let shims = if matches!(stage, Stage::SetupVerification(..)) {
         let meta = crate::LakeProjectMeta::from_explicit(root)
             .map_err(|_| McpError::invalid_params("setup_verification_not_started", None))?;
         Some(
@@ -253,7 +255,7 @@ fn execute(
                     .env("TMPDIR", writer.asset_dir());
                 command
             }
-            Stage::SetupVerification(request) => {
+            Stage::SetupVerification(request, projection) => {
                 let shims = shims
                     .as_ref()
                     .ok_or_else(|| McpError::invalid_params("setup_verification_not_started", None))?;
@@ -263,6 +265,7 @@ fn execute(
                     domains: writer.write_roots().to_vec(),
                     prepared: prepared_generation,
                     request: request.clone(),
+                    projection: *projection,
                     boot: deadline.boot,
                     expires_ns: deadline.expires_ns,
                 };
@@ -340,7 +343,7 @@ fn execute(
             .ok()
             .and_then(|receipt| serde_json::to_value(receipt).ok()),
         Stage::Preparation(_) => None,
-        Stage::SetupVerification(request) => request.receipt(&output),
+        Stage::SetupVerification(request, projection) => request.receipt(*projection, &output),
         Stage::Cache => output
             .status
             .code()

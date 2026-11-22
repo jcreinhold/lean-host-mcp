@@ -18,6 +18,26 @@ use crate::{
 
 pub(crate) const OPERATION: &str = "lean_registered_module_verify_v1";
 pub(crate) const DIAGNOSTICS: &str = "lean_file_diagnostics_v1";
+pub(crate) const OUTLINE: &str = "lean_file_outline_v1";
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum Projection {
+    Verify,
+    Diagnostics,
+    Outline,
+}
+
+impl Projection {
+    pub(crate) fn from_operation(operation: &str) -> Option<Self> {
+        match operation {
+            OPERATION => Some(Self::Verify),
+            DIAGNOSTICS => Some(Self::Diagnostics),
+            OUTLINE => Some(Self::Outline),
+            _ => None,
+        }
+    }
+}
+
 const MAX_RESULT: usize = 60 * 1024;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -49,22 +69,22 @@ impl Request {
             })
     }
 
-    pub(crate) fn is_diagnostics(&self) -> bool {
-        self.declarations.is_empty()
+    pub(crate) fn matches_projection(&self, projection: Projection) -> bool {
+        self.declarations.is_empty() == (projection != Projection::Verify)
     }
 
     pub(crate) fn matches_prepared(&self, prepared: Option<&str>) -> bool {
         self.prepared_sha256 == prepared.map(|input| Sha256::digest(input.as_bytes()).into())
     }
 
-    pub(crate) fn receipt(&self, output: &std::process::Output) -> Option<serde_json::Value> {
+    pub(crate) fn receipt(&self, projection: Projection, output: &std::process::Output) -> Option<serde_json::Value> {
         use lean_rs_worker_protocol::types::{
             LeanWorkerDeclarationVerificationBatchResult as Outcome, LeanWorkerDeclarationVerificationTarget as Target,
         };
         if !output.status.success() || output.stdout.len() > MAX_RESULT {
             return None;
         }
-        if self.is_diagnostics() {
+        if projection != Projection::Verify {
             let mut body: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
             body.as_object_mut()?.insert(
                 "facts".into(),
@@ -107,6 +127,7 @@ pub(crate) struct Plan {
     pub(crate) domains: Vec<PathBuf>,
     pub(crate) prepared: Option<String>,
     pub(crate) request: Request,
+    pub(crate) projection: Projection,
     pub(crate) boot: [u8; 16],
     pub(crate) expires_ns: u64,
 }
@@ -168,6 +189,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
     }
     let plan: Plan = serde_json::from_str(encoded)?;
     if !plan.request.valid()
+        || !plan.request.matches_projection(plan.projection)
         || !plan.request.matches_prepared(plan.prepared.as_deref())
         || plan.root.canonicalize()? != plan.root
         || std::env::current_dir()? != plan.root
@@ -234,18 +256,22 @@ pub fn run(encoded: &str) -> io::Result<()> {
         "namespaceContext":"","optionsJson":lean_toolchain::lean_options_json(&setup.options),
         "heartbeats":200000,"diagnosticBytes":16384
     });
-    let entry = if plan.request.is_diagnostics() {
-        concat!(
+    let entry = match plan.projection {
+        Projection::Diagnostics => concat!(
             include_str!("../lake/VerifyCommon.lean"),
             "private abbrev projectFile := fileDiagnosticsWithSetup\n",
             include_str!("../lake/OutlineSetup.lean")
-        )
-    } else {
-        concat!(
+        ),
+        Projection::Outline => concat!(
+            include_str!("../lake/VerifyCommon.lean"),
+            "private abbrev projectFile := declarationOutlineWithSetup\n",
+            include_str!("../lake/OutlineSetup.lean")
+        ),
+        Projection::Verify => concat!(
             include_str!("../lake/VerifyCommon.lean"),
             "private abbrev verifySetup := verifyDeclarationBatchWithSetup\n",
             include_str!("../lake/VerifySetup.lean")
-        )
+        ),
     };
     let driver = assets.path().join("FileDriver.lean");
     let data = assets.path().join("request.json");
@@ -311,7 +337,9 @@ impl ManagedCall<'_> {
                 _ => Err(unavailable("managed verification requires named declarations")),
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        let body = self.saved(broker, root, file, &request.source, &names).await?;
+        let body = self
+            .saved(broker, root, file, &request.source, &names, Projection::Verify)
+            .await?;
         let mut value: Outcome =
             serde_json::from_slice(&body).map_err(|_| unavailable("invalid managed verification result"))?;
         match &mut value {
@@ -335,7 +363,7 @@ impl ManagedCall<'_> {
             freshness: identity.freshness,
         })
     }
-    pub(crate) async fn diagnostics(
+    pub(crate) async fn project_file(
         &self,
         broker: &crate::ProjectBroker,
         hint: &crate::ProjectHint,
@@ -343,18 +371,19 @@ impl ManagedCall<'_> {
         file: &Path,
         source: &str,
         imports: Vec<String>,
+        projection: Projection,
     ) -> crate::Result<crate::broker::CachedBrokerCall<DiagnosticOutcome>> {
         #[derive(Deserialize)]
         struct Receipt {
             source_sha256: [u8; 32],
             outcome: DiagnosticOutcome,
         }
-        let body = self.saved(broker, root, file, source, &[]).await?;
+        let body = self.saved(broker, root, file, source, &[], projection).await?;
         let receipt: Receipt = serde_json::from_slice(&body)
-            .map_err(|_| crate::ServerError::BadProject("invalid managed diagnostics result".into()))?;
+            .map_err(|_| crate::ServerError::BadProject("invalid managed file projection result".into()))?;
         if Sha256::digest(source.as_bytes()).as_slice() != receipt.source_sha256 {
             return Err(crate::ServerError::BadProject(
-                "managed diagnostics source digest changed".into(),
+                "managed file projection source digest changed".into(),
             ));
         }
         let identity = broker.project_identity_without_worker(hint, imports)?;
@@ -373,6 +402,7 @@ impl ManagedCall<'_> {
         file: &Path,
         source: &str,
         names: &[&str],
+        projection: Projection,
     ) -> crate::Result<Vec<u8>> {
         use crate::native_store::store::{Capability, Gate, ResourceReport, ResultKnowledge};
         let unavailable = |message: &str| crate::ServerError::BadProject(message.to_owned());
@@ -383,10 +413,12 @@ impl ManagedCall<'_> {
             .lock()
             .client_get(key, &capability)
             .map_err(|_| unavailable("managed verification identity unavailable"))?;
-        let (approved_root, admitted) = crate::managed_prepared::readiness_writer::setup_intent(&snapshot.intent)
-            .ok_or_else(|| unavailable("managed verification intent unavailable"))?;
+        let (approved_root, admitted, approved_projection) =
+            crate::managed_prepared::readiness_writer::setup_intent(&snapshot.intent)
+                .ok_or_else(|| unavailable("managed verification intent unavailable"))?;
         let digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
-        if approved_root != root
+        if approved_projection != projection
+            || approved_root != root
             || file.strip_prefix(root).ok() != Some(admitted.file.as_path())
             || digest != admitted.sha256
             || !admitted

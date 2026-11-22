@@ -720,6 +720,22 @@ pub async fn lean_verify_targets(ctx: &ToolContext, request: LeanVerifyRequest) 
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
+    lean_lookup_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lean_lookup_inner(
+    ctx: &ToolContext,
+    req: SemanticToolRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<SemanticResponse<Value>> {
     let kind = req.kind().map(|kind| canonical_kind("lean_lookup", kind).to_owned());
     match kind.as_deref() {
         Some("declaration") => {
@@ -734,6 +750,13 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            if managed.is_some() {
+                return from_tool_response(
+                    declaration_inventory::inventory(ctx, request, false, managed).await?,
+                    ctx.config,
+                );
+            }
             from_tool_response(
                 declaration_inventory::declaration_inventory(ctx, request).await?,
                 ctx.config,
