@@ -915,7 +915,6 @@ async fn semantic_shutdown_receipt_cannot_settle_ordinary_or_new_companion_scope
     let meta = project.job_meta(Vec::new(), RetryPolicy::Never, admission_deadline());
     let receipt = state
         .finish_semantic_shutdown(&meta, &after, shutdown, Some(&upstream), false)
-        .expect("same production adapter confirms shutdown")
         .expect("semantic receipt");
     assert_eq!(receipt.worker_scope, "semantic");
     assert_eq!(receipt.worker_pid, Some(companion_pid));
@@ -994,12 +993,12 @@ async fn injected_semantic_cleanup_failure_keeps_original_receipt_and_live_repla
     );
     let after = companion.lifecycle_snapshot();
 
-    let (error, evidence) = crate::cancellation::with_cancellation_evidence(&CancellationToken::new(), async {
+    let ((), evidence) = crate::cancellation::with_cancellation_evidence(&CancellationToken::new(), async {
         let meta = project.job_meta(Vec::new(), RetryPolicy::Never, admission_deadline());
         let operation = meta.cancellation.begin_operation();
         // Fault-inject only the cleanup syscall outcome. Both processes and the
         // interrupted request receipt are genuine; replacement stays live here.
-        let error = state
+        let receipt = state
             .finish_semantic_shutdown(
                 &meta,
                 &after,
@@ -1010,21 +1009,14 @@ async fn injected_semantic_cleanup_failure_keeps_original_receipt_and_live_repla
                 Some(&upstream),
                 false,
             )
-            .expect_err("cleanup failure remains separate from original request stop");
-        let failure = failure(error);
-        let receipt = failure
-            .worker_stop_receipt
-            .as_ref()
-            .expect("original receipt preserved");
+            .expect("original receipt preserved despite uncertain replacement cleanup");
         assert_eq!(receipt.worker_scope, "semantic");
         assert_eq!(receipt.worker_pid, Some(original_pid));
         assert_ne!(receipt.worker_pid, Some(replacement_pid));
         assert_eq!(receipt.operation_id, meta.correlation_id.to_string());
-        operation.stopped(receipt.clone());
-        failure
+        operation.stopped(receipt);
     })
     .await;
-    assert!(error.reason.contains("shutdown uncertain"));
     assert_eq!(evidence.stopped, 1, "original operation has real stop evidence");
     assert!(evidence.uncertain, "original stop cannot settle replacement cleanup");
     assert!(state.config.startup_uncertain.load(Ordering::Acquire));

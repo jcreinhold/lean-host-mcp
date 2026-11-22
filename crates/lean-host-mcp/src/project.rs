@@ -2692,7 +2692,7 @@ impl ProjectActorState {
             shutdown,
             capability.confirmed_request_stop_since(&checkpoint),
             deferred_stop,
-        )?;
+        );
         let runtime = self.runtime_facts(
             &meta,
             generation_before,
@@ -2767,7 +2767,7 @@ impl ProjectActorState {
         shutdown: std::result::Result<LeanWorkerShutdownReport, LeanWorkerError>,
         receipt: Option<&LeanWorkerRequestStopReceipt>,
         deferred_stop: bool,
-    ) -> Result<Option<WorkerStopReceipt>> {
+    ) -> Option<WorkerStopReceipt> {
         let worker_stop_receipt = receipt.map(|receipt| {
             confirmed_stop_receipt(
                 &self.config.session_id,
@@ -2789,20 +2789,14 @@ impl ProjectActorState {
             if !deferred_stop {
                 meta.cancellation.mark_uncertain();
             }
-            return Err(with_stop_receipt(
-                self.worker_unavailable_for(
-                    meta,
-                    format!("semantic capability shutdown uncertain: {error}"),
-                    false,
-                    false,
-                    None,
-                    None,
-                    None,
-                ),
-                worker_stop_receipt,
-            ));
+            tracing::warn!(
+                %error,
+                session_id = %self.config.session_id,
+                operation_id = %meta.correlation_id,
+                "semantic capability shutdown uncertain"
+            );
         }
-        Ok(worker_stop_receipt)
+        worker_stop_receipt
     }
 
     /// Spawn the semantic-search child for one call. The child is dropped when
