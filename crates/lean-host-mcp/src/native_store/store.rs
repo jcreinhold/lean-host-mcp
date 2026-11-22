@@ -9,6 +9,8 @@ pub(crate) mod boundary;
 #[cfg(test)]
 #[path = "../../tests/stage_store_contract/cuts.rs"]
 mod cuts;
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+pub(crate) mod inspection;
 #[path = "store/recovery.rs"]
 pub(crate) mod recovery;
 
@@ -627,7 +629,7 @@ impl NativeStore {
         if current != (number(binding.scope.generation)?, binding.scope.owner) {
             return reject(Reject::StaleGeneration);
         }
-        let deadline = recovery::launch_deadline(&tx, binding)?;
+        let deadline = recovery::launch_deadline(&tx, binding, old.intent)?;
         let changed = tx.execute(
             "UPDATE stages SET gate=1 WHERE epoch=?1 AND nonce=?2 AND stage=?3 AND gate=0",
             params![

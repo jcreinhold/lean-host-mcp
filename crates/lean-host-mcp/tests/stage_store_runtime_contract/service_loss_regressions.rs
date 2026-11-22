@@ -974,3 +974,164 @@ fn abrupt_broker_replacement_waits_for_original_guardian_and_runs_explicit_succe
     assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), 1);
     fixture.assert_no_safety_exit();
 }
+
+#[cfg(feature = "managed-native-store")]
+#[test]
+#[ignore = "requires a prepared disposable worker fixture and exact managed SDK"]
+fn consumed_inspection_requires_guardian_ack_and_cannot_reissue() {
+    use crate::store::{inspection::inspect_consumed, recovery::RegistryIdentity};
+    use lean_rs_worker_parent::{
+        LeanWorker, LeanWorkerConfig, LeanWorkerDeclarationInspectionRequest, LeanWorkerError, LeanWorkerSessionConfig,
+    };
+    use std::os::unix::{
+        ffi::OsStrExt as _,
+        fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _},
+    };
+
+    let inputs: Value = serde_json::from_str(&std::env::var("LEAN_TEST_MANAGED_INSPECTION_FIXTURE").unwrap()).unwrap();
+    let worker_path = Path::new(inputs["worker"].as_str().unwrap());
+    let sysroot = Path::new(inputs["sysroot"].as_str().unwrap());
+    let project = Path::new(inputs["project"].as_str().unwrap());
+    let root = Fixture::new();
+    let registry = root.root.join("owners");
+    fs::DirBuilder::new().mode(0o700).create(&registry).unwrap();
+    let socket_root = Path::new(inputs["sockets"].as_str().unwrap());
+    let guardian_scope = root.root.join("scope-inspection");
+    fs::create_dir(&guardian_scope).unwrap();
+    let guard = guardian_scope.join("guardian");
+    let bin = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\'', "'\\''");
+    let path = guardian_scope.to_string_lossy().replace('\'', "'\\''");
+    fs::write(&guard, format!("#!/bin/sh\nexport LEAN_STAGE_RUNTIME_ROOT='{path}'\nexec '{bin}' --exact fixtures::guardian_helper --nocapture\n")).unwrap();
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config = LeanWorkerConfig::new(worker_path)
+        .checked_native_loader_environment()
+        .env("LEAN_SYSROOT", sysroot)
+        .env("LEAN_RS_PREPARED_HOST_ARTIFACTS", inputs["prepared"].to_string())
+        .native_guardian(&guard)
+        .lifetime_directory(&registry)
+        .lifetime_socket_directory(socket_root)
+        .shutdown_timeout(Duration::from_millis(500));
+    let session = LeanWorkerSessionConfig::shims_only(project, ["Init"]);
+    let caller_path = root.root.join("caller.sqlite3");
+    let store_path = root.root.join("native.sqlite3");
+    let mut caller = CallerJournal::create_new(&caller_path).unwrap();
+    let mut store = NativeStore::create_new(&store_path).unwrap();
+    for (i, mode) in ["lost", "no-ack", "success"].into_iter().enumerate() {
+        let mut worker = LeanWorker::spawn(&config).unwrap();
+        worker.open_session(&session, None, None).map(|_| ()).unwrap();
+        let raw = read_json(&guardian_scope.join("guardian-birth.json"));
+        let parent_and_child = raw["parent_pid"].as_u64().unwrap() as u32;
+        let record = fs::read_dir(&registry)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("owner.json"))
+            .filter(|path| path.is_file())
+            .map(|path| read_json(&path))
+            .find(|row| row["process"]["pid"] == parent_and_child)
+            .unwrap();
+        let parse = |name| serde_json::from_value::<NativeProcessIdentity>(record[name].clone()).unwrap();
+        let meta = registry.metadata().unwrap();
+        let identity = RegistryIdentity {
+            directory: registry.as_os_str().as_bytes().to_vec(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            generation: record["generation_id"].as_str().unwrap().to_owned(),
+            boot: uuid::Uuid::parse_str(record["original_worker_boot"].as_str().unwrap())
+                .unwrap()
+                .into_bytes(),
+            parent: parse("parent"),
+            worker: parse("process"),
+            guardian: parse("guardian"),
+        };
+        let stage = u64::try_from(i + 1).unwrap();
+        let key = NativeKey {
+            store: store.identity(),
+            epoch: store.epoch().unwrap(),
+            nonce: uuid::Uuid::new_v4().into_bytes(),
+            stage,
+        };
+        let intent = serde_json::to_vec(&LeanWorkerDeclarationInspectionRequest::new("Nat.add")).unwrap();
+        let saved = caller
+            .bind(
+                CallerKey {
+                    job: b"disposable inspection".to_vec(),
+                    stage,
+                    revision: 1,
+                },
+                &intent,
+                key,
+                Capability([7; 32]),
+            )
+            .unwrap();
+        store.create(&saved).unwrap();
+        let expiry = lean_toolchain::native_guardian::guardian_deadline_ticks().unwrap()
+            + if mode == "no-ack" {
+                Duration::from_millis(400)
+            } else {
+                Duration::from_secs(3)
+            };
+        let binding = store
+            .bind_timed_recovery_scope(
+                &saved,
+                Scope {
+                    id: key.nonce,
+                    generation: 1,
+                    owner: [9; 16],
+                },
+                &identity,
+                u64::try_from(expiry.as_nanos()).unwrap(),
+            )
+            .unwrap();
+        let Consume::Granted(permit) = store.consume_launch(binding, &saved.capability).unwrap() else {
+            panic!("missing first grant");
+        };
+        let baseline = worker.stats().requests;
+        let checkpoint = worker.request_checkpoint();
+        if mode == "lost" {
+            drop(permit);
+            drop(store);
+            store = NativeStore::open(&store_path).unwrap();
+            assert_eq!(worker.stats().requests, baseline);
+            assert!(worker.pending_request_stop_since(&checkpoint).is_none());
+            worker.try_shutdown().unwrap();
+        } else {
+            let stopped = (mode == "no-ack").then(|| StoppedFixtureGuardian::stop(&identity.guardian));
+            let observed = inspect_consumed(&mut worker, permit.into_deadline_grant().unwrap()).unwrap();
+            observed.save_result(&mut store, &saved.capability).unwrap();
+            let outcome = observed.outcome;
+            drop(stopped);
+            if mode == "no-ack" {
+                assert!(matches!(outcome.result, Err(LeanWorkerError::Setup { .. })));
+                assert_eq!(worker.stats().requests, baseline);
+                assert!(worker.pending_request_stop_since(&checkpoint).is_none());
+                worker.try_shutdown().unwrap();
+            } else {
+                let result = outcome.result.unwrap();
+                let lean_rs_worker_parent::LeanWorkerDeclarationInspectionResult::Found { declaration } = &result
+                else {
+                    panic!("expected concrete Nat.add declaration: {result:?}");
+                };
+                assert_eq!(declaration.name, "Nat.add");
+                let expected = serde_json::to_vec(&result).unwrap();
+                drop(store);
+                store = NativeStore::open(&store_path).unwrap();
+                let request = json!({"version":1,"command":{"op":"get","key":key,"capability":saved.capability.0}});
+                let reply = store.admission(request.to_string().as_bytes()).unwrap();
+                assert_eq!(reply["result"]["state"], "retained");
+                assert_eq!(reply["result"]["body"], json!(expected));
+                assert_ne!(reply["custody"], "closed");
+                outcome.retirement.unwrap();
+                assert_eq!(worker.stats().requests, baseline + 1);
+            }
+        }
+        assert!(matches!(
+            store.consume_launch(binding, &saved.capability).unwrap(),
+            Consume::AlreadyConsumed
+        ));
+        assert!(!identity.worker.is_live().unwrap());
+        assert!(!identity.guardian.is_live().unwrap());
+    }
+}

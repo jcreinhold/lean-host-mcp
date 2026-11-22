@@ -81,15 +81,20 @@ pub(crate) struct DeadlineLaunchGrant {
     binding: Binding,
     registry: RegistryIdentity,
     expires_ns: u64,
+    intent: Vec<u8>,
 }
 
 impl DeadlineLaunchGrant {
-    pub(crate) fn into_parts(self) -> (Binding, RegistryIdentity, u64) {
-        (self.binding, self.registry, self.expires_ns)
+    pub(crate) fn into_parts(self) -> (Binding, RegistryIdentity, u64, Vec<u8>) {
+        (self.binding, self.registry, self.expires_ns, self.intent)
     }
 }
 
-pub(super) fn launch_deadline(tx: &Transaction<'_>, binding: Binding) -> Answer<Option<DeadlineLaunchGrant>> {
+pub(super) fn launch_deadline(
+    tx: &Transaction<'_>,
+    binding: Binding,
+    intent: Vec<u8>,
+) -> Answer<Option<DeadlineLaunchGrant>> {
     let key = binding.key;
     let row = tx
         .query_row(
@@ -120,6 +125,7 @@ pub(super) fn launch_deadline(tx: &Transaction<'_>, binding: Binding) -> Answer<
         binding,
         registry,
         expires_ns,
+        intent,
     }))
 }
 

@@ -933,7 +933,10 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         panic!("timed admission did not consume");
     };
     let grant = permit.into_deadline_grant().unwrap();
-    assert_eq!(grant.into_parts(), (binding, registry.clone(), expires_ns));
+    assert_eq!(
+        grant.into_parts(),
+        (binding, registry.clone(), expires_ns, saved.intent.clone())
+    );
     // The observer inspected the returned identity but never delivered GO.
     drop(store);
     let mut store = NativeStore::open(&fixture.native()).unwrap();
