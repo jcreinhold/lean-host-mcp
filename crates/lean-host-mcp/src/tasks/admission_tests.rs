@@ -105,6 +105,80 @@ fn assert_no_start(error: &McpError, reason: &str) {
 }
 
 #[tokio::test]
+async fn pressure_reclaims_fetched_anonymous_tasks_without_consuming_identified_results() {
+    let tasks = RequestTasks::default();
+    let delivered = tasks
+        .spawn("test", || async { Ok(CallToolResult::success(vec![])) })
+        .expect("anonymous task");
+    let unfetched = tasks
+        .spawn("test", || async { Ok(CallToolResult::success(vec![])) })
+        .expect("unfetched anonymous task");
+    let (id, exact) = prepare_submission(&tasks);
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&dispatches);
+    tasks
+        .submit("test", id.clone(), exact.clone(), move || async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(CallToolResult::success(vec![]))
+        })
+        .expect("start exact request");
+    for task_id in [&delivered.task_id, &unfetched.task_id, &id] {
+        terminal(&tasks, task_id).await;
+    }
+    for _ in 3..MAX_TASKS {
+        prepare_submission(&tasks);
+    }
+    assert!(
+        tasks
+            .get_for_client(&id)
+            .expect("poll exact request")
+            .status()
+            .is_terminal()
+    );
+    let full = tasks
+        .prepare(binding())
+        .expect_err("unfetched or exact results are protected");
+    assert_no_start(&full, "request_registry_full");
+
+    assert!(
+        tasks
+            .get_for_client(&delivered.task_id)
+            .expect("poll anonymous result")
+            .status()
+            .is_terminal()
+    );
+    prepare_submission(&tasks);
+    assert!(tasks.get(&delivered.task_id).is_err());
+    assert!(tasks.get(&unfetched.task_id).is_ok());
+    assert!(tasks.get_retained(&id).expect("original request").result_available);
+    let count = Arc::clone(&dispatches);
+    tasks
+        .submit("test", id.clone(), exact.clone(), move || async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(CallToolResult::success(vec![]))
+        })
+        .expect("recover original request");
+    assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    let full = tasks
+        .prepare(binding())
+        .expect_err("exact polling did not acknowledge the result");
+    assert_no_start(&full, "request_registry_full");
+
+    let epoch = exact.request_epoch.as_deref().expect("original epoch");
+    tasks
+        .acknowledge(&id, epoch, &exact.submission_sha256)
+        .expect("ack saved result");
+    prepare_submission(&tasks);
+    let error = tasks
+        .submit("test", id, exact, || async {
+            panic!("acknowledged and reclaimed request must not replay")
+        })
+        .expect_err("reclaimed ticket remains unknown");
+    assert_eq!(error.data.expect("typed rejection")["reason"], "request_ticket_unknown");
+    assert!(tasks.get(&unfetched.task_id).is_ok());
+}
+
+#[tokio::test]
 async fn mixed_pressure_backpressures_concurrent_preparation_without_eviction_or_epoch_rotation() {
     let (tasks, terminal_ids, active_ids, gate) = mixed_registry(MAX_TASKS - 3).await;
     let observed_epoch = tasks.status().request_epoch;

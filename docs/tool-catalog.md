@@ -124,11 +124,13 @@ task can contain Lean errors or a negative verification verdict; it does not est
 bridge remains synchronous for task-aware clients and never submits `lean_runtime` or another `lean_request`.
 
 The registry holds at most 128 prepared, active and finished records. Preparing can reclaim acknowledged records and
-expired records, but pressure never removes an unacknowledged terminal result. If all slots are protected, it returns
+expired records. Under pressure it can also reclaim an anonymous MCP Task after a terminal `tasks/get`. A lost reply to
+that poll may therefore leave the task unavailable. Pressure preserves unfetched anonymous results and identified
+results without an acknowledgment. If all slots are protected, it returns
 `request_registry_full` with typed `execution.disposition: not_started`; no tool was submitted. Read or acknowledge
 existing results, then prepare new work. Unsubmitted tickets expire after five minutes and become irrevocably
 `not_started`; cancellation can close them earlier. Active dispatched requests never expire. Terminal bridge results
-have 24-hour retention; negotiated MCP Tasks keep their ten-minute process-local retention. Reads and admissions prune
+have 24-hour retention; negotiated MCP Tasks have up to ten minutes of process-local retention. Reads and admissions prune
 expired records. The record bound is 4 MiB, so an oversized result explicitly loses its verdict
 (`result_available: false`) while retaining execution evidence.
 

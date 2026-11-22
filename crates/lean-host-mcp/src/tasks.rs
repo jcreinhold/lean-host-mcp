@@ -57,6 +57,7 @@ struct Entry {
     created: Instant,
     expires: Option<Instant>,
     pending_lifecycle: Option<CallExecutionEvidence>,
+    terminal_task_requested: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,6 +190,7 @@ impl RequestTasks {
                 Entry {
                     stored: record,
                     pending_lifecycle: None,
+                    terminal_task_requested: false,
                     cancellation: CancellationToken::new(),
                     created: Instant::now(),
                     expires: remaining.and_then(|duration| Instant::now().checked_add(duration)),
@@ -370,6 +372,7 @@ impl RequestTasks {
                     Entry {
                         stored,
                         pending_lifecycle: None,
+                        terminal_task_requested: false,
                         cancellation,
                         created: Instant::now(),
                         expires: Instant::now().checked_add(RETENTION),
@@ -385,6 +388,7 @@ impl RequestTasks {
                 Entry {
                     stored,
                     pending_lifecycle: None,
+                    terminal_task_requested: false,
                     cancellation: cancellation.clone(),
                     created: Instant::now(),
                     expires: None,
@@ -463,14 +467,25 @@ impl RequestTasks {
     }
 
     pub(crate) fn get(&self, id: &str) -> Result<DetailedTask, McpError> {
+        self.get_task(id, false)
+    }
+
+    pub(crate) fn get_for_client(&self, id: &str) -> Result<DetailedTask, McpError> {
+        self.get_task(id, true)
+    }
+
+    fn get_task(&self, id: &str, client_poll: bool) -> Result<DetailedTask, McpError> {
         let mut registry = self.0.lock();
         registry.prune(Instant::now());
-        registry
+        let entry = registry
             .entries
-            .get(id)
-            .filter(|e| !e.stored.acknowledged)
-            .map(|e| e.stored.task.clone())
-            .ok_or_else(unknown_task)
+            .get_mut(id)
+            .filter(|entry| !entry.stored.acknowledged)
+            .ok_or_else(unknown_task)?;
+        if client_poll && entry.stored.request.is_none() && entry.stored.task.status().is_terminal() {
+            entry.terminal_task_requested = true;
+        }
+        Ok(entry.stored.task.clone())
     }
 
     pub(crate) fn get_retained(&self, id: &str) -> Result<RetainedTask, McpError> {
@@ -732,7 +747,8 @@ impl Registry {
         // Submission never creates a missing ID. Forgetting records therefore
         // cannot authorize replay and does not invalidate unrelated tickets.
         for id in ids {
-            if let Some(journal) = &self.journal
+            if self.entries.get(&id).is_some_and(|entry| entry.stored.is_epoch_bound())
+                && let Some(journal) = &self.journal
                 && let Err(error) = journal.remove(&id)
             {
                 self.journal_error = true;
@@ -790,8 +806,9 @@ impl Registry {
         if self.entries.len() < MAX_TASKS {
             return;
         }
-        // Never discard an unacknowledged result under pressure. Expired pure
-        // preparation has no tool result; its ticket remains permanently fenced.
+        // Prefer acknowledged exact tickets and expired preparations. An
+        // anonymous MCP task has no save/ACK protocol. A terminal tasks/get
+        // makes that process-local record eligible only under pressure.
         let id = self
             .entries
             .iter()
@@ -799,12 +816,13 @@ impl Registry {
                 entry.pending_lifecycle.is_none()
                     && entry.stored.task.status().is_terminal()
                     && (entry.stored.acknowledged
+                        || entry.terminal_task_requested
                         || matches!(
                             entry.stored.execution.reason.as_str(),
                             "request_ticket_expired" | "request_preparation_unavailable"
                         ))
             })
-            .min_by_key(|(_, entry)| (entry.stored.finished_at, entry.created))
+            .min_by_key(|(_, entry)| (entry.terminal_task_requested, entry.stored.finished_at, entry.created))
             .map(|(id, _)| id.clone());
         self.forget(id.into_iter().collect());
     }
@@ -842,6 +860,7 @@ impl Registry {
                 Entry {
                     stored,
                     pending_lifecycle: None,
+                    terminal_task_requested: false,
                     cancellation: CancellationToken::new(),
                     created: Instant::now(),
                     expires: Instant::now().checked_add(RETENTION),
@@ -857,6 +876,7 @@ impl Registry {
             Entry {
                 stored: stored.clone(),
                 pending_lifecycle: None,
+                terminal_task_requested: false,
                 cancellation: CancellationToken::new(),
                 created: Instant::now(),
                 expires: Instant::now().checked_add(PREPARED_RETENTION),
