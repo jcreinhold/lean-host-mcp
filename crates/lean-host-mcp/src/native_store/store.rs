@@ -13,6 +13,9 @@ mod cuts;
 pub(crate) mod inspection;
 #[path = "store/recovery.rs"]
 pub(crate) mod recovery;
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+#[path = "store/trace_read.rs"]
+mod trace_read;
 
 const CALLER_ROLE: i64 = 0x4c53_434a;
 const NATIVE_ROLE: i64 = 0x4c53_4e53;
@@ -566,6 +569,7 @@ impl NativeStore {
             admission_deadline BLOB CHECK(length(admission_deadline)=24),\n\
             drain_auth_hash BLOB CHECK(length(drain_auth_hash)=32),\n\
             recovery_claim_hash BLOB CHECK(length(recovery_claim_hash)=32),\n\
+            trace_reader BLOB CHECK(length(trace_reader) BETWEEN 1 AND 512),\n\
             PRIMARY KEY(epoch,nonce,stage),UNIQUE(scope,generation),\n\
             CHECK((scope IS NULL AND generation IS NULL AND owner IS NULL) OR (scope IS NOT NULL AND generation IS NOT NULL AND owner IS NOT NULL AND length(scope)=16 AND generation>=0 AND length(owner)=16))) STRICT;"))?;
         tx.execute_batch(recovery::SCHEMA)?;
@@ -636,6 +640,16 @@ impl NativeStore {
         if !has_claim {
             tx.execute_batch(
                 "ALTER TABLE stages ADD COLUMN recovery_claim_hash BLOB CHECK(length(recovery_claim_hash)=32)",
+            )?;
+        }
+        let has_trace_reader: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('stages') WHERE name='trace_reader')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_trace_reader {
+            tx.execute_batch(
+                "ALTER TABLE stages ADD COLUMN trace_reader BLOB CHECK(length(trace_reader) BETWEEN 1 AND 512)",
             )?;
         }
         let store = tx.query_row("SELECT store FROM meta WHERE singleton=1", [], |r| fixed(r, 0))?;

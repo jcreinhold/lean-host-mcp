@@ -98,7 +98,13 @@ impl ArtifactReadGuard {
     }
 
     /// Hash only the selected Lake provenance files while this guard owns SH custody.
-    #[cfg(all(unix, test))]
+    #[cfg(all(
+        unix,
+        any(
+            test,
+            all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))
+        )
+    ))]
     pub(crate) fn lake_trace_snapshot(
         &self,
         root: &Path,
@@ -109,7 +115,7 @@ impl ArtifactReadGuard {
         use std::io::Read as _;
         use std::os::unix::fs::MetadataExt as _;
 
-        use rustix::fs::{Mode, OFlags, open, openat};
+        use rustix::fs::{Mode, OFlags, open};
         use sha2::{Digest as _, Sha256};
 
         const FILE_LIMIT: usize = 8 * 1024 * 1024;
@@ -121,53 +127,54 @@ impl ArtifactReadGuard {
         let Some(paths) = lake_trace_paths(targets) else {
             return Err(invalid("invalid Lake artifact trace selection"));
         };
+        if std::fs::symlink_metadata(root.join(".lake")).is_ok_and(|metadata| metadata.is_symlink()) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
         if !self.covers_artifact_root(&root.join(".lake")) {
             return Err(invalid("Lake artifact trace root is outside read custody"));
         }
         check_deadline()?;
-        let root = open(root, DIRECTORY, Mode::empty())?;
+        let named_root = std::fs::symlink_metadata(root)?;
+        let root_fd = File::from(open(root, DIRECTORY, Mode::empty())?);
+        let opened_root = root_fd.metadata()?;
+        if root.canonicalize()? != root
+            || (named_root.dev(), named_root.ino()) != (opened_root.dev(), opened_root.ino())
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
         let mut result = BTreeMap::new();
         let mut remaining = TOTAL_LIMIT;
+        let mut incomplete = false;
         for path in paths {
             check_deadline()?;
-            let (directory, name) = path
-                .rsplit_once('/')
-                .ok_or_else(|| invalid("missing Lake trace directory"))?;
-            let mut parent = None;
-            for component in directory.split('/') {
-                let fd = match openat(parent.as_ref().unwrap_or(&root), component, DIRECTORY, Mode::empty()) {
-                    Ok(fd) => fd,
-                    Err(_) => return Ok(None),
-                };
-                parent = Some(fd);
+            if result.contains_key(&path) {
+                continue;
             }
-            let fd = match openat(
-                parent.as_ref().unwrap_or(&root),
-                name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(_) => return Ok(None),
+            let Some(file) = open_lake_trace(&root_fd, &path, DIRECTORY)? else {
+                incomplete = true;
+                continue;
             };
-            let file = File::from(fd);
             let limit = remaining.min(FILE_LIMIT);
-            let Ok(metadata) = file.metadata() else {
-                return Ok(None);
-            };
-            if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > limit as u64 {
-                return Ok(None);
+            let metadata = file.metadata()?;
+            if metadata.nlink() != 1 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            if limit == 0 || metadata.len() > limit as u64 {
+                incomplete = true;
+                continue;
             }
             let mut bytes = Vec::new();
-            let read = file.take(limit as u64 + 1).read_to_end(&mut bytes);
+            let read = file.take((limit as u64).saturating_add(1)).read_to_end(&mut bytes);
             check_deadline()?;
+            remaining = remaining.saturating_sub(bytes.len());
             if read.is_err() || bytes.len() > limit || !usable_lake_trace(&bytes) {
-                return Ok(None);
+                incomplete = true;
+                continue;
             }
-            remaining -= bytes.len();
             result.insert(path, crate::runtime_compatibility::digest_hex(Sha256::digest(&bytes)));
         }
-        Ok(Some(result))
+        check_deadline()?;
+        Ok((!incomplete).then_some(result))
     }
 
     /// Artifact search paths must not escape into an unprotected `LEAN_PATH` or
@@ -221,8 +228,62 @@ fn busy() -> io::Error {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(unix, test))]
-fn lake_trace_paths(targets: &[String]) -> Option<std::collections::BTreeSet<String>> {
+#[cfg(all(
+    unix,
+    any(
+        test,
+        all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))
+    )
+))]
+fn open_lake_trace(root: &File, path: &str, directory: rustix::fs::OFlags) -> io::Result<Option<File>> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+
+    let (directories, name) = path
+        .rsplit_once('/')
+        .ok_or_else(|| invalid("missing Lake trace directory"))?;
+    let mut parent = None;
+    for (component, kind, flags) in directories
+        .split('/')
+        .map(|component| (component, FileType::Directory, directory))
+        .chain(std::iter::once((
+            name,
+            FileType::RegularFile,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        )))
+    {
+        let fd = parent.as_ref().unwrap_or(root);
+        let Ok(named) = statat(fd, component, AtFlags::SYMLINK_NOFOLLOW) else {
+            return Ok(None);
+        };
+        let actual = FileType::from_raw_mode(named.st_mode);
+        if actual == FileType::Symlink {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        if actual != kind {
+            return Ok(None);
+        }
+        let opened = match openat(fd, component, flags, Mode::empty()) {
+            Ok(opened) => opened,
+            Err(rustix::io::Errno::LOOP) => return Err(io::ErrorKind::InvalidData.into()),
+            Err(_) => return Ok(None),
+        };
+        let metadata = fstat(&opened)?;
+        if (named.st_dev, named.st_ino) != (metadata.st_dev, metadata.st_ino) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        parent = Some(File::from(opened));
+    }
+    Ok(parent)
+}
+
+#[cfg(all(
+    unix,
+    any(
+        test,
+        all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))
+    )
+))]
+pub(crate) fn lake_trace_paths(targets: &[String]) -> Option<Vec<String>> {
     if targets.is_empty() || targets.len() > 64 {
         return None;
     }
@@ -246,7 +307,13 @@ fn lake_trace_paths(targets: &[String]) -> Option<std::collections::BTreeSet<Str
         .collect()
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(
+    unix,
+    any(
+        test,
+        all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))
+    )
+))]
 fn usable_lake_trace(bytes: &[u8]) -> bool {
     use serde_json::Value;
 

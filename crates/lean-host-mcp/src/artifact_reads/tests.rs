@@ -323,10 +323,11 @@ fn lake_trace_snapshot_selects_exact_files_and_rejects_incomplete_sets() {
 
     let alias = modules.join("Alias.trace");
     symlink(modules.join("Foo.trace"), alias).unwrap();
-    assert!(
-        guard
-            .lake_trace_snapshot(&root, &["Demo.Alias".into()], || Ok(()))
-            .unwrap()
-            .is_none()
-    );
+    symlink(&modules, root.join(".lake/build/lib/lean/Linked")).unwrap();
+    for target in ["Demo.Alias", "Linked.Foo"] {
+        let error = guard
+            .lake_trace_snapshot(&root, &["Demo.Missing".into(), target.into()], || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

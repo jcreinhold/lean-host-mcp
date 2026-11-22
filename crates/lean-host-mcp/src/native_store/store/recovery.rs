@@ -90,7 +90,7 @@ impl DeadlineLaunchGrant {
     }
 }
 
-fn boot_id() -> Answer<Id> {
+pub(super) fn boot_id() -> Answer<Id> {
     static BOOT: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
     if let Some(boot) = BOOT.get() {
         return Ok(*boot);

@@ -516,7 +516,6 @@ impl ServerHandler for LeanHostService {
     ) -> Result<CallToolResponse, McpError> {
         #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
         if request.name.as_ref() == "lean_managed_admission"
-            && self.ctx.broker.prepared_generation().is_some()
             && let Some(store) = &self.managed_store
             && let Some(arguments) = &request.arguments
             && let Ok(input) = serde_json::from_value::<ManagedAdmission>(serde_json::Value::Object(arguments.clone()))

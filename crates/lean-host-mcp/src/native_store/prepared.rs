@@ -23,6 +23,9 @@ use crate::native_store::store::{
 };
 use crate::{ProjectBroker, error::ServerError};
 
+#[path = "trace_snapshot.rs"]
+mod trace_snapshot;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Intent {
@@ -201,7 +204,12 @@ fn public_error(error: Problem) -> McpError {
 }
 
 pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) -> serde_json::Value {
-    reply["dispatch_enabled"] = serde_json::Value::Bool(broker.prepared_generation().is_some());
+    if let Some(fields) = reply.as_object_mut() {
+        fields.insert("dispatch_enabled".into(), broker.prepared_generation().is_some().into());
+        if fields.contains_key("acceptance_epoch") && trace_snapshot::available(broker) {
+            fields.insert("operations".into(), serde_json::json!([trace_snapshot::OPERATION]));
+        }
+    }
     reply
 }
 
@@ -226,6 +234,13 @@ pub(crate) async fn start(
     let snapshot = store.lock().client_get(key, &capability).map_err(public_error)?;
     if snapshot.gate != Gate::Pending || snapshot.scope.is_some() {
         return get();
+    }
+    if trace_snapshot::is_operation(&snapshot.intent) {
+        trace_snapshot::run(broker, store, snapshot, capability.clone()).await?;
+        return get();
+    }
+    if broker.prepared_generation().is_none() {
+        return Err(McpError::invalid_params("operation_disabled", None));
     }
     let intent: Intent = serde_json::from_slice(&snapshot.intent)
         .map_err(|_| McpError::invalid_params("invalid_inspection_intent", None))?;
@@ -286,6 +301,9 @@ pub(crate) fn reconcile_lookup(
 ) -> Option<serde_json::Value> {
     if capability.0 == [0; 32] {
         return None;
+    }
+    if let Err(error) = store.reconcile_trace_read(key, capability) {
+        tracing::debug!(%error, "original trace reader closure remains unresolved");
     }
     let Ok(snapshot) = store.client_get(key, capability) else {
         return None;
