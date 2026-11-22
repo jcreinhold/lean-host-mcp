@@ -132,7 +132,7 @@ pub(crate) struct Plan {
     pub(crate) expires_ns: u64,
 }
 
-fn capture(command: &mut Command, limit: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn capture(command: &mut Command, limit: usize) -> io::Result<Vec<u8>> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

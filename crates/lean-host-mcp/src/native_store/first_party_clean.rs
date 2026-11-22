@@ -72,12 +72,49 @@ fn check_tree(path: &Path, device: u64) -> io::Result<()> {
     Ok(())
 }
 
+fn verify_layout(root: &Path) -> io::Result<()> {
+    let lake = super::lake_executable(root)?;
+    let bin = lake
+        .parent()
+        .ok_or_else(|| io::Error::other("missing selected Lean bin"))?;
+    let lean = bin.join("lean");
+    if lean.canonicalize()? != lean || !lean.is_file() {
+        return Err(io::Error::other("selected Lean executable is not canonical"));
+    }
+    let scratch = tempfile::Builder::new().prefix("clean-layout-").tempdir()?;
+    let script = scratch.path().join("CleanLayout.lean");
+    fs::write(&script, include_str!("../lake/CleanLayout.lean"))?;
+    let mut command = std::process::Command::new(lean);
+    command
+        .current_dir(root)
+        .args(["-j1", "--run"])
+        .arg(script)
+        .arg(root)
+        .arg(scratch.path())
+        .env_remove("LEAN_PATH")
+        .env_remove("LEAN_SRC_PATH")
+        .env(
+            "LEAN_SYSROOT",
+            bin.parent().ok_or_else(|| io::Error::other("missing Lean sysroot"))?,
+        )
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_NO_LAZY_FETCH", "1");
+    let output = crate::writer_setup_verification::capture(&mut command, 1024)?;
+    if output != b"canonical first-party layout\n" {
+        return Err(io::Error::other("first-party clean layout is unconfirmed"));
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     root: &Path,
     expected: &[u8; 32],
     authorize: impl Fn() -> io::Result<std::time::Duration>,
 ) -> io::Result<()> {
     let build = check(root, expected)?;
+    authorize()?;
+    verify_layout(root)?;
+    check(root, expected)?;
     let removed = match build.symlink_metadata() {
         Ok(metadata) => {
             let device = root.metadata()?.dev();
