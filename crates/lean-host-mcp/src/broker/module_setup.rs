@@ -44,7 +44,7 @@ enum Plugin {
     },
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
 struct Identity(u64, u64, u64, i64, i64);
 
 impl Identity {
@@ -67,6 +67,12 @@ pub(crate) struct StagedSetup {
 }
 
 impl StagedSetup {
+    pub(super) fn artifact_identity_sha256(&self, shim_digest: &str) -> io::Result<String> {
+        let executable = Identity::read(&self.sysroot.join("bin/lean"))?;
+        let bytes = serde_json::to_vec(&(&self.sysroot, executable, &self.domains, &self.inputs, shim_digest))?;
+        Ok(crate::shared_writer::module_setup_digest(&bytes))
+    }
+
     pub(super) fn check(
         &self,
         root: &Path,

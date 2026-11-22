@@ -267,7 +267,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
         ),
         Projection::Verify => concat!(
             include_str!("../lake/VerifyCommon.lean"),
-            "private abbrev verifySetup := verifyDeclarationBatchWithSetup\n",
+            "private abbrev verifySetup := verifyDeclarationBatchWithSetup\nprivate abbrev verifySetupReportRuntime := false\n",
             include_str!("../lake/VerifySetup.lean")
         ),
     };

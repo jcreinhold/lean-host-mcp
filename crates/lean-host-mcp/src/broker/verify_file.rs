@@ -63,6 +63,7 @@ pub(super) struct PreparedReader {
     pub(super) domains: Vec<PathBuf>,
     pub(super) shim_guards: lean_toolchain::shared_writer::LocalArtifactRead,
     pub(super) roots: Vec<PathBuf>,
+    shim_identity_sha256: String,
 }
 
 impl ProjectBroker {
@@ -138,7 +139,11 @@ impl ProjectBroker {
         let shims = VerifierShims::select(meta)?;
         let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&shims.domains)?;
         shims.validate()?;
+        let shim_identity_sha256 = crate::shared_writer::module_setup_digest(
+            &serde_json::to_vec(&(&shims.sysroot, &shims.paths, &shims.domains, &shims.files)).map_err(invalid)?,
+        );
         Ok(PreparedReader {
+            shim_identity_sha256,
             custody,
             sysroot: shims.sysroot,
             shims: shims.paths,
@@ -194,6 +199,26 @@ impl VerifierShims {
         }
         Ok(())
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupVerdict {
+    runtime_lean_version: String,
+    outcome: LeanWorkerDeclarationVerificationBatchResult,
+}
+
+fn selected_lean_version(toolchain: &str) -> &str {
+    let label = toolchain.strip_prefix("leanprover/lean4:").unwrap_or(toolchain);
+    label.strip_prefix('v').unwrap_or(label)
+}
+
+fn decode_setup_verdict(bytes: &[u8], toolchain: &str) -> Result<SetupVerdict> {
+    let frame: SetupVerdict = serde_json::from_slice(bytes).map_err(invalid)?;
+    if frame.runtime_lean_version != selected_lean_version(toolchain) {
+        return Err(invalid("executing Lean version differs from the selected toolchain"));
+    }
+    Ok(frame)
 }
 
 impl ProjectBroker {
@@ -256,6 +281,7 @@ impl ProjectBroker {
             "optionsJson": lean_toolchain::lean_options_json(&options.lean_options),
             "heartbeats": options.heartbeat_limit,
             "diagnosticBytes": options.diagnostic_byte_limit,
+            "expectedRuntimeVersion": setup.as_ref().map(|_| selected_lean_version(&meta.toolchain)),
         }))
         .map_err(invalid)?;
         let entry = if setup.is_some() {
@@ -267,6 +293,7 @@ impl ProjectBroker {
             [
                 include_str!("../lake/VerifyCommon.lean"),
                 selection,
+                "private abbrev verifySetupReportRuntime := true\n",
                 include_str!("../lake/VerifySetup.lean"),
             ]
             .concat()
@@ -277,8 +304,45 @@ impl ProjectBroker {
             ]
             .concat()
         };
-        let bytes = self.run_file_driver(root, reader, activity, setup, entry, body).await?;
-        let value = serde_json::from_slice(&bytes).map_err(invalid)?;
+        let setup_binding = setup
+            .as_ref()
+            .map(|staged| {
+                Ok::<_, io::Error>((
+                    crate::shared_writer::module_setup_digest(&staged.bytes),
+                    staged.artifact_identity_sha256(&reader.shim_identity_sha256)?,
+                ))
+            })
+            .transpose()?;
+        let lean_executable = reader.sysroot.join("bin/lean");
+        let request_sha256 = crate::shared_writer::module_setup_digest(&body);
+        let source_sha256 = crate::shared_writer::module_setup_digest(request.source.as_bytes());
+        let bytes = self
+            .run_file_driver(root.clone(), reader, activity, setup, entry, body)
+            .await?;
+        let mut runtime = RuntimeFacts::default();
+        let mut freshness = freshness_from_meta(&meta, freshness);
+        let value = if let Some((module_setup_sha256, artifact_identity_sha256)) = setup_binding {
+            let frame = decode_setup_verdict(&bytes, &freshness.lean_toolchain)?;
+            if matches!(frame.outcome, LeanWorkerDeclarationVerificationBatchResult::Ok { .. }) {
+                runtime.cli_file_verification = Some(Box::new(crate::envelope::CliFileVerification {
+                    schema: "lean-host-cli-file-verification-v1",
+                    server_instance_id: self.instance_id(),
+                    project_root: root,
+                    source_file: file,
+                    lean_toolchain: freshness.lean_toolchain.clone(),
+                    runtime_lean_version: frame.runtime_lean_version,
+                    lean_executable,
+                    source_sha256,
+                    module_setup_sha256,
+                    artifact_identity_sha256,
+                    request_sha256,
+                    data_sha256: String::new(),
+                }));
+            }
+            frame.outcome
+        } else {
+            serde_json::from_slice(&bytes).map_err(invalid)?
+        };
         if let LeanWorkerDeclarationVerificationBatchResult::Ok { results, .. }
         | LeanWorkerDeclarationVerificationBatchResult::MissingImports { results, .. } = &value
             && (results.len() != request.targets.len()
@@ -289,11 +353,10 @@ impl ProjectBroker {
         {
             return Err(invalid("verification verdict does not match requested targets"));
         }
-        let mut freshness = freshness_from_meta(&meta, freshness);
         freshness.elaboration_options = Some(facts);
         Ok(BrokerCall {
             value,
-            runtime: RuntimeFacts::default(),
+            runtime,
             freshness,
         })
     }

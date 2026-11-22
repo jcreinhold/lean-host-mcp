@@ -1200,6 +1200,7 @@ impl RuntimeSnapshot {
     fn facts(&self) -> RuntimeFacts {
         RuntimeFacts {
             native_compatibility: None,
+            cli_file_verification: None,
             worker_generation: self.worker_generation,
             worker_restarted: false,
             retry_count: 0,
@@ -3110,6 +3111,7 @@ impl ProjectActorState {
         self.record_restart(event.clone());
         self.publish_runtime(&RuntimeFacts {
             native_compatibility: None,
+            cli_file_verification: None,
             worker_generation: event.worker_generation,
             worker_restarted: true,
             retry_count: 0,
@@ -3308,6 +3310,7 @@ impl ProjectActorState {
             self.record_restart(event.clone());
             self.publish_runtime(&RuntimeFacts {
                 native_compatibility: None,
+                cli_file_verification: None,
                 worker_generation: self.observed_generation(),
                 worker_restarted: false,
                 retry_count: 0,
@@ -3357,6 +3360,7 @@ impl ProjectActorState {
         let snapshot = self.handle.lifecycle_snapshot();
         RuntimeFacts {
             native_compatibility: None,
+            cli_file_verification: None,
             worker_generation: generation,
             worker_restarted: call_restart.is_some() || generation > generation_before,
             retry_count,

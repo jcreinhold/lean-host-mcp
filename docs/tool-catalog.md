@@ -78,6 +78,19 @@ request cancellation. Cheap project status remains synchronous. Existing clients
 HTTP server shares task records across client sessions, so reconnecting clients can retrieve their existing handles. A
 task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
 
+For one explicit named file group on the ordinary setup-aware `lean_verify` route, a complete verdict includes
+`trust.cli_file_verification` with schema `lean-host-cli-file-verification-v1`. It identifies the
+`server_instance_id`, canonical `project_root` and `source_file`, selected `lean_toolchain`,
+`lean_executable`, and `runtime_lean_version` reported by the executing Lean CLI. The runtime version must
+match the selection before that process opens the staged setup.
+
+The receipt includes lowercase SHA-256 strings `source_sha256`, `module_setup_sha256`, `artifact_identity_sha256`,
+`request_sha256`, and `data_sha256`. These bind the exact source bytes, staged ModuleSetup bytes, checked input
+identities and installed shim digests under read custody, the staged driver request bytes, and the returned `data`
+respectively. The `data` digest uses compact UTF-8 JSON with sorted object keys and unchanged array order. A caller
+must check the exact requested names and compare the source digest against its saved input before accepting a verdict.
+The receipt establishes CLI provenance. Loaded-worker ABI evidence continues to use `trust.native_compatibility`.
+
 ### Prepared retained lifecycle (v3)
 
 Clients without the Tasks extension use `lean_request`. Servers advertise `retained_request_lifecycle_v3` in

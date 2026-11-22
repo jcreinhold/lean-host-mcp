@@ -150,12 +150,32 @@ pub enum FinalAttemptStatus {
     Interrupted,
 }
 
+/// Provenance of one named file check by the supervised setup-aware Lean CLI.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CliFileVerification {
+    pub schema: &'static str,
+    pub server_instance_id: String,
+    pub project_root: std::path::PathBuf,
+    pub source_file: std::path::PathBuf,
+    pub lean_toolchain: String,
+    pub runtime_lean_version: String,
+    pub lean_executable: std::path::PathBuf,
+    pub source_sha256: String,
+    pub module_setup_sha256: String,
+    pub artifact_identity_sha256: String,
+    pub request_sha256: String,
+    pub data_sha256: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RuntimeFacts {
     /// Actual loaded compatibility for this call, preserved in semantic trust
     /// even when operational telemetry is quiet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub cli_file_verification: Option<Box<CliFileVerification>>,
     pub worker_generation: u64,
     pub worker_restarted: bool,
     pub retry_count: u32,

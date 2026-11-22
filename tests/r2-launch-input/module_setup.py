@@ -7,6 +7,7 @@ import os
 import select
 import subprocess as s
 import sys
+import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -91,7 +92,7 @@ def inventory(p):
     }
 
 
-def probe(p, *, search=False, diagnostics=False):
+def probe(p, *, search=False, diagnostics=False, retained=False):
     proc = s.Popen(
         [
             parent,
@@ -145,18 +146,25 @@ def probe(p, *, search=False, diagnostics=False):
                     ),
                 ),
             )
-        return rpc(
-            2,
-            "tools/call",
-            dict(
-                name="lean_verify",
-                arguments=dict(
-                    targets=[
-                        dict(kind="explicit", file="Demo.lean", declarations=["demo"])
-                    ]
-                ),
-            ),
-        )
+        arguments = {"targets": [{"kind": "explicit", "file": "Demo.lean", "declarations": ["demo"]}]}
+        if not retained:
+            return rpc(2, "tools/call", {"name": "lean_verify", "arguments": arguments})
+
+        def request(i, **fields):
+            return tool_payload(rpc(i, "tools/call", {"name": "lean_request", "arguments": fields}))
+
+        ticket = request(2, action="prepare", tool="lean_verify", arguments=arguments)
+        key = {"request_id": ticket["taskId"], "request_epoch": ticket["request"]["request_epoch"]}
+        task = request(3, action="submit", tool="lean_verify", arguments=arguments, **key)
+        deadline = time.monotonic() + 30
+        while task["execution"]["disposition"] == "pending":
+            assert time.monotonic() < deadline, task
+            time.sleep(0.1)
+            task = request(4, action="get", **key)
+        assert task["status"] == "completed" and task["result_available"], task
+        envelope = tool_payload({"result": task["result"]})
+        assert envelope["trust"]["cli_file_verification"]["server_instance_id"] == ticket["request"]["server_instance_id"]
+        return envelope
     finally:
         proc.stdin.close()
         try:
@@ -170,11 +178,34 @@ def probe(p, *, search=False, diagnostics=False):
         assert exit_status == 0, f"server exited with status {exit_status}"
 
 
-def row(reply):
+def tool_payload(reply):
     assert "error" not in reply, reply
-    envelope = json.loads(reply["result"]["content"][0]["text"])
+    return json.loads(reply["result"]["content"][0]["text"])
+
+
+def row(reply):
+    envelope = tool_payload(reply)
     assert not envelope["errors"], envelope
     return envelope["data"]["results"][0]
+
+
+def cli_receipt(envelope, project):
+    trust = envelope["trust"]
+    receipt = trust["cli_file_verification"]
+    assert "native_compatibility" not in trust, trust
+    assert receipt["schema"] == "lean-host-cli-file-verification-v1", receipt
+    assert receipt["project_root"] == str(project), receipt
+    assert receipt["source_file"] == str(project / "Demo.lean"), receipt
+    assert receipt["lean_toolchain"] == toolchain, receipt
+    assert receipt["runtime_lean_version"] == toolchain_id.removeprefix("v"), receipt
+    assert receipt["lean_executable"] == str(release / "bin/lean"), receipt
+    assert receipt["source_sha256"] == hashlib.sha256((project / "Demo.lean").read_bytes()).hexdigest(), receipt
+    data = json.dumps(envelope["data"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    assert receipt["data_sha256"] == hashlib.sha256(data).hexdigest(), receipt
+    for key in ("module_setup_sha256", "artifact_identity_sha256", "request_sha256"):
+        assert len(bytes.fromhex(receipt[key])) == 32, receipt
+    # The direct and retained probes each own their own broker instance.
+    return {key: value for key, value in receipt.items() if key != "server_instance_id"}
 
 
 def check_reader_frames(project):
@@ -242,6 +273,11 @@ for label, plugin in [("project", True), ("omitted", False)]:
         assert "semantic:" in str(top["match_reason"]), top
         print("semantic_frontend ranked", top["name"], flush=True)
         assert verdict["verification_status"] == "verified", verdict
+        direct = tool_payload(proof)
+        retained = probe(project, retained=True)
+        assert retained["data"] == direct["data"], retained
+        assert cli_receipt(retained, project) == cli_receipt(direct, project)
+
     else:
         assert verdict[
             "verification_status"

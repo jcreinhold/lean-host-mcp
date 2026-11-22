@@ -832,14 +832,23 @@ pub(crate) async fn verify_targets_inner(
 
     rows.sort_by_key(|row| order_by_id.get(&row.id).copied().unwrap_or(usize::MAX));
     let summary = summarize_rows(requested, expansion.truncated, &rows);
-    let (freshness, runtime) = match last_identity {
+    let (freshness, mut runtime) = match last_identity {
         Some(identity) => identity,
         None => {
             let base = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
             (base.freshness, base.runtime)
         }
     };
-    let mut response = Response::ok(LeanVerifyResult { summary, results: rows }, freshness)
+    let data = LeanVerifyResult { summary, results: rows };
+    if !matches!(req.targets.as_slice(), [LeanVerifyTargetGroup::Explicit { .. }]) || data.summary.truncated {
+        runtime.cli_file_verification = None;
+    }
+    if let Some(receipt) = &mut runtime.cli_file_verification {
+        let ordered = serde_json::to_value(&data).map_err(|error| crate::ServerError::Internal(error.to_string()))?;
+        let bytes = serde_json::to_vec(&ordered).map_err(|error| crate::ServerError::Internal(error.to_string()))?;
+        receipt.data_sha256 = crate::shared_writer::module_setup_digest(&bytes);
+    }
+    let mut response = Response::ok(data, freshness)
         .with_runtime(runtime)
         .with_trust_artifacts(expansion.trust_artifacts.into_vec());
     response.warnings.extend(expansion.warnings);

@@ -460,6 +460,8 @@ fn semantic_examples(tool: &str, allowed: &[&str]) -> Option<Value> {
 pub struct SemanticTrust {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_file_verification: Option<Box<crate::envelope::CliFileVerification>>,
     pub project_root: String,
     pub session_id: String,
     pub lean_toolchain: String,
@@ -471,6 +473,7 @@ impl SemanticTrust {
     fn unknown() -> Self {
         Self {
             native_compatibility: None,
+            cli_file_verification: None,
             project_root: String::new(),
             session_id: "request-invalid".to_owned(),
             lean_toolchain: String::new(),
@@ -481,6 +484,7 @@ impl SemanticTrust {
     fn from_parts(freshness: FreshnessIdentity, artifacts: Vec<ArtifactTrust>) -> Self {
         Self {
             native_compatibility: None,
+            cli_file_verification: None,
             project_root: freshness.project_root,
             session_id: freshness.session_id,
             lean_toolchain: freshness.lean_toolchain,
@@ -954,6 +958,9 @@ where
     let compatibility = response
         .runtime()
         .and_then(|runtime| runtime.native_compatibility.clone());
+    let cli_file_verification = response
+        .runtime()
+        .and_then(|runtime| runtime.cli_file_verification.clone());
     if !config.verbosity.is_full() {
         response.drop_telemetry();
     }
@@ -964,6 +971,7 @@ where
         .map_err(|err| ServerError::Internal(err.to_string()))?;
     let mut trust = SemanticTrust::from_parts(response.freshness, response.trust_artifacts);
     trust.native_compatibility = compatibility;
+    trust.cli_file_verification = cli_file_verification;
     let errors = semantic_issues(response.runtime_error, response.warnings, response.next_actions);
     Ok(SemanticResponse {
         data,

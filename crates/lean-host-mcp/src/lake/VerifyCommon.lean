@@ -73,6 +73,7 @@ structure Input where
   optionsJson : String
   heartbeats : Nat
   diagnosticBytes : Nat
+  expectedRuntimeVersion : Option String := none
   deriving FromJson
 
 private def batch (input : Input) : DeclarationVerificationBatchRequest :=
