@@ -952,6 +952,17 @@
       ]
     },
     {
+      "name": "host-writer-blocked-permit-expiry",
+      "model": "Stages",
+      "specification": "WriterPermitSpec",
+      "constants": {
+        "Profile": "\"writer-helper-staging\""
+      },
+      "expect": "pass",
+      "invariants": ["TypeOK", "WriterExclusion", "ClosureIdentity", "WriterPermitSafe"],
+      "properties": ["WriterPermitProgress"]
+    },
+    {
       "name": "host-writer-helper-go-before-stage",
       "model": "Stages",
       "specification": "WriterSpec",

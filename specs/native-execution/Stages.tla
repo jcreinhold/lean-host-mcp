@@ -50,6 +50,7 @@ HostInit == Init /\ h = [
     checked |-> <<>>, starts |-> 0, interrupted |-> FALSE,
     stage |-> "none", stageDigest |-> <<>>, stageAck |-> <<>>,
     helperWrite |-> FALSE, callerWrite |-> FALSE,
+    permit |-> [key |-> <<>>, state |-> "unused", expired |-> FALSE],
     rollout |-> [negotiated |-> FALSE, agreed |-> {"standalone"}, drained |-> FALSE,
       selected |-> "older", rollbackDrained |-> FALSE,
       generation |-> 0, enabled |-> FALSE, captured |-> {}, publication |-> <<>>,
@@ -721,6 +722,38 @@ WriterNext == WriterFlow \/ WriterOther \/ InvalidateWriterInput \/ InterruptWri
   \/ (\E attestation \in OperatorAttestations: ReceiveOperatorAttestation(attestation))
   \/ AcknowledgeOperatorRecovery
 WriterSpec == HostInit /\ [][WriterNext]_hv /\ WF_hv(WriterFlow) /\ WF_hv(WriterOther)
+
+\* The dedicated SDK regression is in lean-rs writer tests/storage/stage_permit.rs.
+\* This cut starts after Ready and durable wrapper commit. The final clock
+\* check and command entry are separate; expiry can interleave between them.
+WriterPermit == Writer.permit
+WriterPermitKey == <<WriterTurnKey, HardTick>>
+CommitBlockedWriter == HostOnly(Writer.phase="starting" /\ WriterPermit.state="unused"
+  /\ h'=[h EXCEPT !.writer.permit.key=WriterPermitKey, !.writer.permit.state="blocked"])
+ExpireBlockedWriter == HostOnly(WriterPermit.state \in {"blocked","checked"} /\ ~WriterPermit.expired
+  /\ h'=[h EXCEPT !.writer.permit.expired=TRUE])
+CheckBlockedWriter == HostOnly(WriterPermit.state="blocked" /\ WriterPermit.key=WriterPermitKey
+  /\ h'=[h EXCEPT !.writer.permit.state=IF WriterPermit.expired THEN "refused" ELSE "checked"])
+EnterCheckedWriter == WriterPermit.state="checked" /\ RunWriter
+\* A refusal establishes no command entry, independently of wrapper cleanup.
+ObserveRefusedWrapperClosure == HostOnly(WriterPermit.state="refused" /\ Writer.phase="starting"
+  /\ h'=[h EXCEPT !.writer.phase="partial-idle", !.writer.permit.state="observed"])
+CloseRefusedWriter == HostOnly(WriterPermit.state="observed" /\ Writer.phase="idle"
+  /\ h'=[h EXCEPT !.writer.oldLocks=FALSE, !.writer.permit.state="closed"])
+WriterPermitFlow == WriterReader \/ CaptureWriterHandoff \/ ReserveWriter(0)
+  \/ BeginHelperStaging(OriginalHandoff) \/ CommitHelperStaging \/ AcknowledgeHelperStaging
+  \/ (WriterPermit.state="unused" /\ ArmWriter) \/ CommitBlockedWriter
+  \/ ExpireBlockedWriter \/ CheckBlockedWriter \/ EnterCheckedWriter
+  \/ ObserveRefusedWrapperClosure \/ PublishWriterIdle \/ CloseRefusedWriter
+WriterPermitSpec == HostInit /\ [][WriterPermitFlow]_hv /\ WF_hv(WriterPermitFlow)
+WriterPermitSafe ==
+  /\ (WriterPermit.state/="unused" => WriterPermit.key=WriterPermitKey)
+  /\ (WriterPermit.state \in {"refused","observed","closed"} =>
+        WriterPermit.expired /\ Writer.starts=0 /\ Writer.result="none")
+  /\ (WriterPermit.state \in {"blocked","refused","observed"} => UnderOriginalWriterLocks)
+  /\ (WriterPermit.state="refused" => Writer.phase="starting")
+  /\ (WriterPermit.state="closed" => Writer.phase="idle" /\ ~Writer.oldLocks)
+WriterPermitProgress == <> (Writer.starts=1 \/ WriterPermit.state="closed")
 
 WriterHandoffSafe ==
   /\ (Writer.handoff/= <<>> => Writer.handoff=OriginalHandoff)
