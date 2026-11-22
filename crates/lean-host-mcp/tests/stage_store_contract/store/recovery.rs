@@ -25,6 +25,7 @@ pub(crate) struct RegistryIdentity {
     pub(crate) inode: u64,
     pub(crate) generation: String,
     pub(crate) boot: Id,
+    pub(crate) parent: NativeProcessIdentity,
     pub(crate) worker: NativeProcessIdentity,
     pub(crate) guardian: NativeProcessIdentity,
 }
@@ -45,15 +46,19 @@ impl RegistryIdentity {
             && self.inode != 0
             && valid_generation(&self.generation)
             && self.boot != [0; 16]
+            && self.parent.pid != self.worker.pid
+            && self.parent.pid != self.guardian.pid
             && self.worker.pid != self.guardian.pid
-            && [&self.worker, &self.guardian].into_iter().all(|identity| {
-                identity.version == 1
-                    && !identity.start.is_empty()
-                    && identity.start.len() <= 4096
-                    && [identity.pid, identity.session, identity.process_group]
-                        .into_iter()
-                        .all(|id| id != 0 && i32::try_from(id).is_ok())
-            })
+            && [&self.parent, &self.worker, &self.guardian]
+                .into_iter()
+                .all(|identity| {
+                    identity.version == 1
+                        && !identity.start.is_empty()
+                        && identity.start.len() <= 4096
+                        && [identity.pid, identity.session, identity.process_group]
+                            .into_iter()
+                            .all(|id| id != 0 && i32::try_from(id).is_ok())
+                })
     }
 
     fn matches_directory(&self) -> bool {
@@ -126,6 +131,7 @@ impl NativeStore {
         path: &Path,
         saved: &SavedRequest,
         expected_generation: Option<&str>,
+        expected_parent: Option<&NativeProcessIdentity>,
     ) -> Answer<(Binding, RegistryIdentity)> {
         bounded(&saved.caller.job)?;
         bounded(&saved.intent)?;
@@ -194,7 +200,10 @@ impl NativeStore {
         }
         let identity: RegistryIdentity =
             serde_json::from_slice(&encoded).map_err(|_| Problem::Rejected(Reject::WrongScope))?;
-        if !identity.valid() || identity.generation != generation {
+        if !identity.valid()
+            || identity.generation != generation
+            || expected_parent.is_some_and(|parent| parent != &identity.parent)
+        {
             return reject(Reject::WrongScope);
         }
         tx.commit()?;

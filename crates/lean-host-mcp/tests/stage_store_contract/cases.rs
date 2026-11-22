@@ -827,11 +827,13 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         inode: meta.ino(),
         generation: "0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         boot: [9; 16],
+        parent: process(9),
         worker: process(10),
         guardian: process(11),
     };
-    let read =
-        |request: &SavedRequest, generation| NativeStore::read_recovery_scope(&fixture.native(), request, generation);
+    let read = |request: &SavedRequest, generation| {
+        NativeStore::read_recovery_scope(&fixture.native(), request, generation, None)
+    };
     assert!(matches!(read(&saved, None), Err(Problem::Rejected(Reject::WrongScope))));
     for invalid in [
         "0123456789abcdef0123456789abcdef",
@@ -858,6 +860,19 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         read(&saved, Some(&registry.generation)).unwrap(),
         (binding, registry.clone())
     );
+
+    let matches_parent = |parent: &NativeProcessIdentity| {
+        NativeStore::read_recovery_scope(&fixture.native(), &saved, Some(&registry.generation), Some(parent))
+    };
+    assert_eq!(matches_parent(&registry.parent).unwrap().1.parent, registry.parent);
+    let stale_parent = NativeProcessIdentity {
+        start: "different birth for the same PID".to_owned(),
+        ..registry.parent.clone()
+    };
+    assert!(matches!(
+        matches_parent(&stale_parent),
+        Err(Problem::Rejected(Reject::WrongScope))
+    ));
 
     let mut wrong = saved.clone();
     wrong.capability = Capability([1; 32]);
