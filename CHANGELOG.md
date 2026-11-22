@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.15] - 2026-11-22
+
+### Fixed
+
+- File diagnostics prioritize Lean errors when earlier informational messages exhaust the output budget.
+
 ## [0.16.14] - 2026-11-21
 
 ### Added
@@ -711,7 +717,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.14...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.15...HEAD
+[0.16.15]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.14...v0.16.15
 [0.16.14]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.13...v0.16.14
 [0.16.13]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.12...v0.16.13
 [0.16.12]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.11...v0.16.12
