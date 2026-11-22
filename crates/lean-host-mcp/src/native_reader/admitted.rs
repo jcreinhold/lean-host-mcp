@@ -18,7 +18,7 @@ use crate::{
 
 #[path = "module_lint.rs"]
 mod module_lint;
-pub(crate) use module_lint::OPERATION as MODULE_LINT;
+pub(crate) use module_lint::{CHECKPOINT as CHECKPOINT_LINT, OPERATION as MODULE_LINT};
 
 pub(crate) const OPERATION: &str = "lean_import_scan_v1";
 pub(crate) const AXIOMS: &str = "lean_declaration_axioms_v1";
@@ -148,6 +148,7 @@ struct Intent {
     imports: Option<Vec<String>>,
     declarations: Option<Vec<String>>,
     modules: Option<Vec<String>>,
+    checkpoint: Option<module_lint::Checkpoint>,
 }
 
 fn qualified_name(name: &str) -> bool {
@@ -224,13 +225,16 @@ pub(crate) fn operation(intent: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|v| {
         v.get("operation")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|op| matches!(op, OPERATION | AXIOMS | MODULE_LINT))
+            .is_some_and(|op| matches!(op, OPERATION | AXIOMS | MODULE_LINT | CHECKPOINT_LINT))
     })
 }
 
 pub(crate) fn recovery_request(key: NativeKey, intent: Vec<u8>, capability: Capability) -> Option<SavedRequest> {
     let parsed = serde_json::from_slice::<Intent>(&intent).ok()?;
-    if !matches!(parsed.operation.as_str(), OPERATION | AXIOMS | MODULE_LINT) {
+    if !matches!(
+        parsed.operation.as_str(),
+        OPERATION | AXIOMS | MODULE_LINT | CHECKPOINT_LINT
+    ) {
         return None;
     }
     Some(SavedRequest {
@@ -372,7 +376,7 @@ impl Stage {
         &self,
         outcome: io::Result<NativeReaderResult>,
         declarations: Option<&[String]>,
-        lint: bool,
+        lint: Option<module_lint::Request<'_>>,
     ) -> io::Result<()> {
         let Some(binding) = self.binding else {
             return outcome.map(|_| ());
@@ -408,8 +412,8 @@ impl Stage {
                     body = serde_json::json!({"version":1, "status":"axiom_reports_unavailable"});
                 }
             }
-            if lint {
-                module_lint::record_verdict(&mut body, outcome.exit_code);
+            if let Some(lint) = lint {
+                lint.record(&mut body, &outcome);
             }
             let body = serde_json::to_vec(&body)?;
             store
@@ -463,12 +467,19 @@ pub(crate) async fn start(
             &intent.imports,
             &intent.declarations,
             &intent.modules,
+            &intent.checkpoint,
         ) {
-            (OPERATION, Some(_), None, None, None) => None,
-            (AXIOMS, None, Some(imports), Some(declarations), None) => {
+            (OPERATION, Some(_), None, None, None, None) => None,
+            (AXIOMS, None, Some(imports), Some(declarations), None, None) => {
                 Some(axiom_input(imports, declarations).map_err(|_| invalid("invalid_reader_intent"))?)
             }
-            (MODULE_LINT, None, None, None, Some(modules)) if module_lint::valid_modules(modules) => {
+            (MODULE_LINT, None, None, None, Some(modules), None) if module_lint::valid_modules(modules) => {
+                module_lint::executable(&root).map_err(|_| invalid("prebuilt_module_linter_unavailable"))?;
+                None
+            }
+            (CHECKPOINT_LINT, None, None, None, Some(modules), Some(checkpoint))
+                if modules.len() == 1 && module_lint::valid_modules(modules) && checkpoint.valid() =>
+            {
                 module_lint::executable(&root).map_err(|_| invalid("prebuilt_module_linter_unavailable"))?;
                 None
             }
@@ -490,14 +501,12 @@ pub(crate) async fn start(
                 binding: None,
                 generated,
             };
-            let result = execute(
-                &mut stage,
-                &root,
-                intent.file.as_deref(),
-                intent.modules.as_deref(),
-                max_workers,
-            );
-            stage.finish(result, intent.declarations.as_deref(), intent.modules.is_some())
+            let lint = intent.modules.as_deref().map(|modules| module_lint::Request {
+                modules,
+                checkpoint: intent.checkpoint.as_ref(),
+            });
+            let result = execute(&mut stage, &root, intent.file.as_deref(), lint, max_workers);
+            stage.finish(result, intent.declarations.as_deref(), lint)
         })
         .await
         .map_err(|_| McpError::internal_error("reader_task_lost", None))?
@@ -531,7 +540,7 @@ fn execute(
     stage: &mut Stage,
     root: &Path,
     relative: Option<&Path>,
-    lint_modules: Option<&[String]>,
+    lint: Option<module_lint::Request<'_>>,
     capacity_limit: usize,
 ) -> io::Result<NativeReaderResult> {
     let selected = ToolchainId::from_lake_root(root).map_err(io::Error::other)?;
@@ -552,13 +561,13 @@ fn execute(
     )
     .map_err(io::Error::other)?;
     let program = NativeReaderProgram {
-        command: match (relative, lint_modules) {
+        command: match (relative, lint) {
             (Some(file), _) => vec![
                 lean.into_os_string(),
                 "--deps".into(),
                 scan_file(root, file)?.into_os_string(),
             ],
-            (None, Some(modules)) => module_lint::command(root, modules)?,
+            (None, Some(request)) => request.command(root)?,
             (None, None) => vec![lean.into_os_string(), "--json".into(), "--stdin".into()],
         },
         environment: vec![

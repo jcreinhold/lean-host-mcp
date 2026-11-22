@@ -2,10 +2,97 @@
 
 use std::{ffi::OsString, io, os::unix::fs::PermissionsExt as _, path::Path};
 
-use super::{MAX_NAMES, invalid, qualified_name};
+use serde::{Deserialize, Serialize};
+
+use super::{MAX_NAMES, NativeReaderResult, invalid, qualified_name};
 use crate::lake_meta::RUN_LINTER_REL;
 
 pub(crate) const OPERATION: &str = "lean_module_lint_v1";
+pub(crate) const CHECKPOINT: &str = "lean_checkpoint_lint_v1";
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Checkpoint {
+    Default {},
+    Proof {
+        term_objects: i32,
+        branch_score: i32,
+        branch_depth: i32,
+    },
+}
+
+impl Checkpoint {
+    pub(super) fn valid(&self) -> bool {
+        match *self {
+            Self::Default {} => true,
+            Self::Proof {
+                term_objects,
+                branch_score,
+                branch_depth,
+            } => term_objects > 0 && branch_score > 0 && branch_depth > 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Request<'a> {
+    pub(super) modules: &'a [String],
+    pub(super) checkpoint: Option<&'a Checkpoint>,
+}
+
+impl Request<'_> {
+    pub(super) fn command(self, root: &Path) -> io::Result<Vec<OsString>> {
+        let mut command = vec![
+            executable(root)?.into_os_string(),
+            "--no-build".into(),
+            "--module-only".into(),
+        ];
+        if self.checkpoint.is_some() {
+            command.push("--format=json".into());
+        }
+        match self.checkpoint {
+            Some(Checkpoint::Proof {
+                term_objects,
+                branch_score,
+                branch_depth,
+            }) => {
+                command.extend([
+                    "--only=largeProofTermLinter,proofBranchingLinter".into(),
+                    format!("--proof-term-objects={term_objects}").into(),
+                    format!("--proof-branch-score={branch_score}").into(),
+                    format!("--proof-branch-depth={branch_depth}").into(),
+                ]);
+            }
+            None | Some(Checkpoint::Default {}) => command.push("--deny=all".into()),
+        }
+        command.extend(self.modules.iter().map(OsString::from));
+        Ok(command)
+    }
+
+    pub(super) fn record(self, body: &mut serde_json::Value, outcome: &NativeReaderResult) {
+        if let Some(checkpoint) = self.checkpoint {
+            let report = serde_json::from_str::<serde_json::Value>(&outcome.stdout);
+            if !matches!(outcome.exit_code, Some(0 | 1))
+                || !report.is_ok_and(|value| {
+                    value
+                        .get("findings")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|rows| rows.iter().all(serde_json::Value::is_object))
+                })
+            {
+                *body = serde_json::json!({"version":1,"status":"checkpoint_lint_report_unavailable"});
+                return;
+            }
+            body["checkpoint"] = serde_json::json!(checkpoint);
+        }
+        body["verdict"] = match outcome.exit_code {
+            Some(0) => "pass",
+            Some(_) => "fail",
+            None => "unavailable",
+        }
+        .into();
+    }
+}
 
 pub(super) fn valid_modules(modules: &[String]) -> bool {
     !modules.is_empty()
@@ -24,26 +111,6 @@ pub(super) fn executable(root: &Path) -> io::Result<std::path::PathBuf> {
     Ok(executable)
 }
 
-pub(super) fn command(root: &Path, modules: &[String]) -> io::Result<Vec<OsString>> {
-    let mut command = vec![
-        executable(root)?.into_os_string(),
-        "--no-build".into(),
-        "--module-only".into(),
-        "--deny=all".into(),
-    ];
-    command.extend(modules.iter().map(OsString::from));
-    Ok(command)
-}
-
-pub(super) fn record_verdict(body: &mut serde_json::Value, exit_code: Option<i32>) {
-    body["verdict"] = match exit_code {
-        Some(0) => "pass",
-        Some(_) => "fail",
-        None => "unavailable",
-    }
-    .into();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,23 +123,51 @@ mod tests {
         assert!(valid_modules(&modules));
         assert!(!valid_modules(&["--allow=all".to_owned()]));
         assert!(!valid_modules(&["A.lean".to_owned()]));
-        assert!(command(&root, &modules).is_err());
+        let request = Request {
+            modules: &modules,
+            checkpoint: None,
+        };
+        assert!(request.command(&root).is_err());
 
         let alternative = root.join("custom/bin/runLinter");
         std::fs::create_dir_all(alternative.parent().unwrap()).unwrap();
         std::fs::write(&alternative, b"fixture executable").unwrap();
         std::fs::set_permissions(&alternative, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(command(&root, &modules).is_err());
+        assert!(request.command(&root).is_err());
 
         let path = root.join(RUN_LINTER_REL);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"fixture executable").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let args = command(&root, &modules).unwrap();
+        let args = request.command(&root).unwrap();
         assert_eq!(args[0], path.into_os_string());
         assert_eq!(
             args[1..],
             ["--no-build", "--module-only", "--deny=all", "Z.Second", "A.First"]
         );
+        let checkpoint = Checkpoint::Proof {
+            term_objects: 10,
+            branch_score: 20,
+            branch_depth: 30,
+        };
+        assert!(checkpoint.valid());
+        let request = Request {
+            modules: &modules[..1],
+            checkpoint: Some(&checkpoint),
+        };
+        assert_eq!(
+            request.command(&root).unwrap()[1..],
+            [
+                "--no-build",
+                "--module-only",
+                "--format=json",
+                "--only=largeProofTermLinter,proofBranchingLinter",
+                "--proof-term-objects=10",
+                "--proof-branch-score=20",
+                "--proof-branch-depth=30",
+                "Z.Second"
+            ],
+        );
+        assert!(serde_json::from_str::<Checkpoint>(r#"{"kind":"default","flag":"--no-build"}"#).is_err());
     }
 }
