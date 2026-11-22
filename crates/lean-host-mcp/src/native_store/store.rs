@@ -966,6 +966,16 @@ impl NativeStore {
         tx.commit()?;
         u64::try_from(next).map_err(|_| Problem::Rejected(Reject::IdentifierRange))
     }
+    #[cfg(test)]
+    pub(crate) fn limit_growth_for_test(&self) -> Answer<()> {
+        let db = self.db.connection();
+        let pages: i64 = db.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        db.pragma_update(None, "max_page_count", pages)?;
+        let limit: i64 = db.query_row("PRAGMA max_page_count", [], |row| row.get(0))?;
+        assert_eq!(limit, pages);
+        Ok(())
+    }
+
     pub(crate) fn checkpoint(&self) -> Answer<()> {
         self.db.check_profile()?;
         let (busy, _, _): (i64, i64, i64) =

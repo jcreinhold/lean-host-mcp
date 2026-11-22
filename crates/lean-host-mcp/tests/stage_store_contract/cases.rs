@@ -544,6 +544,85 @@ fn process_cut_helper() {
 }
 
 #[test]
+fn bounded_storage_fault_at_commit_returns_no_grant_and_lost_reply_never_replays() {
+    let fixture = Fixture::new();
+    let (mut journal, mut store) = fixture.init();
+    let (request, binding) = bound(&mut journal, &mut store, 1, 0);
+    let before = store.get(request.key).unwrap().unwrap();
+    let mut fault = CheckedConnection::open_existing(&fixture.native(), native_schema_valid).unwrap();
+    fault
+        .connection()
+        .execute_batch(
+            "CREATE TABLE fault_parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE fault_child(parent_id INTEGER NOT NULL REFERENCES fault_parent(id)
+                                  DEFERRABLE INITIALLY DEFERRED);
+         CREATE TRIGGER defer_consume_failure AFTER UPDATE OF gate ON stages
+         WHEN OLD.gate=0 AND NEW.gate=1
+         BEGIN INSERT INTO fault_child(parent_id) VALUES(1); END;",
+        )
+        .unwrap();
+
+    // The update and its trigger succeed. The deferred constraint rejects COMMIT.
+    let control = fault.connection_mut().transaction().unwrap();
+    assert_eq!(control.execute("UPDATE stages SET gate=1 WHERE gate=0", []).unwrap(), 1);
+    let refused = |error: &rusqlite::Error| {
+        matches!(error,
+            rusqlite::Error::SqliteFailure(code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+        )
+    };
+    assert!(refused(&control.commit().unwrap_err()));
+    let error = store.consume_launch(binding, &request.capability).unwrap_err();
+    assert!(matches!(error, Problem::Sql(sql) if refused(&sql)));
+    assert_eq!(
+        NativeStore::open(&fixture.native()).unwrap().get(request.key).unwrap(),
+        Some(before)
+    );
+
+    fault
+        .connection()
+        .execute_batch("DROP TRIGGER defer_consume_failure")
+        .unwrap();
+    // A real successful COMMIT whose grant is discarded models a lost return.
+    // The process-kill test covers the same cut before the grant is returned.
+    assert!(granted(store.consume_launch(binding, &request.capability).unwrap()));
+    drop(fault);
+    drop(store);
+    let mut reopened = NativeStore::open(&fixture.native()).unwrap();
+    assert!(matches!(
+        reopened.consume_launch(binding, &request.capability).unwrap(),
+        Consume::AlreadyConsumed
+    ));
+    let observed = reopened.get(request.key).unwrap().unwrap();
+    assert_eq!(observed.gate, Gate::Consumed);
+    assert_eq!(observed.spawn, None);
+    assert_eq!(observed.result, ResultKnowledge::Pending);
+}
+
+#[test]
+fn bounded_storage_fault_at_sqlite_page_limit_preserves_original_stage() {
+    let fixture = Fixture::new();
+    let (mut journal, mut store) = fixture.init();
+    let (original, binding) = bound(&mut journal, &mut store, 1, 0);
+    let before = store.get(original.key).unwrap().unwrap();
+    let new = journal
+        .bind(caller(2), &vec![b'x'; 65_536], candidate(&store, 2), cap())
+        .unwrap();
+    store.limit_growth_for_test().unwrap();
+    let error = store.create(&new).unwrap_err();
+    assert!(matches!(error, Problem::Sql(rusqlite::Error::SqliteFailure(code, _))
+        if code.extended_code == rusqlite::ffi::SQLITE_FULL));
+    assert!(store.get(new.key).unwrap().is_none());
+    assert_eq!(store.get(original.key).unwrap(), Some(before));
+    store.cancel(binding, &original.capability).unwrap();
+    drop(store);
+    let mut reads = NativeStore::open(&fixture.native()).unwrap();
+    assert!(matches!(
+        reads.consume_launch(binding, &original.capability).unwrap(),
+        Consume::Sealed
+    ));
+}
+
+#[test]
 fn killed_transactions_recover_original_bindings_and_never_reissue_committed_go() {
     use std::os::unix::process::ExitStatusExt;
     for operation in ["caller-bind", "native-create", "consume", "result"] {

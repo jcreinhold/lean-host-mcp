@@ -171,7 +171,14 @@ the published 0.10.9 baseline.
 - **Refused writes.** Persistent trigger cuts exercised caller INSERT refusal, native ACK UPDATE refusal,
   and native updates before GO and during result publication. The opt-in MCP test verified the caller's failed
   save left the result retained. A managed declaration cut also verified a rejected result write left the result
-  absent while verified custody closure could still commit.
+  absent while verified custody closure could still commit. A deferred foreign-key fault let the GO UPDATE
+  succeed and then made SQLite refuse COMMIT with `SQLITE_CONSTRAINT_FOREIGNKEY`. No grant escaped, and
+  a fresh connection saw the unchanged pending stage. With the fault removed, discarding the successful
+  grant and reopening returned AlreadyConsumed and preserved absence of spawn and result evidence.
+- **Bounded full store.** The admission cap test refused new stage identities and preserved old lookup and
+  cancellation. A separate test capped the disposable SQLite connection at its existing page count. It
+  returned `SQLITE_FULL` on a large CREATE, admitted no row, and could still read and cancel the original
+  stage on the capped connection. Reopen confirmed that cancellation sealed launch.
 - **Corruption and controlled replacement.** The actual broker refused a damaged SQLite file while a separate
   worker and guardian were alive. The owner record was unchanged and the exact read-lock paths still refused
   an exclusive lock. The separate offline quarantine test kept the damaged bytes and opened an explicit fresh
@@ -186,8 +193,9 @@ the published 0.10.9 baseline.
 | OS crash | Unrun. No kernel crash, VM power cut or filesystem recovery assertion is qualified here. |
 | Physical power loss | Unrun. No evidence establishes physical flush completion or power-loss persistence. |
 
-Trigger refusal is distinct from disk-full, I/O or flush errors, and an ambiguous SQLite COMMIT return. Those
-faults remain unqualified. H0 owns the independently counted target-start and actor/registry capacity checks.
+The bounded page limit exercises SQLite capacity without filling a filesystem. The deferred constraint denies
+COMMIT without injecting a disk or flush failure. Process death after a committed write qualifies a lost grant
+reply, while a storage API that reports an ambiguous COMMIT error remains unqualified. H0 owns the independently counted target-start and actor/registry capacity checks.
 This is source acceptance, with no managed host publication or live activation.
 
 ## What the tests establish
