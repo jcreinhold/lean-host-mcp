@@ -171,7 +171,7 @@ fn launch_permission_is_never_reissued_after_lost_reply_or_reopen() {
         Consume::Granted(p) => p,
         other @ (Consume::AlreadyConsumed | Consume::Sealed) => panic!("{other:?}"),
     };
-    assert_eq!(permit.into_binding(), binding); // Discard delivery: no payload runs.
+    assert_eq!(permit.into_binding(), Some(binding)); // Discard delivery: no payload runs.
     let duplicate = store.consume_launch(binding, &request.capability).unwrap();
     assert!(
         matches!(duplicate, Consume::AlreadyConsumed),
@@ -855,7 +855,21 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         ));
     }
     assert_eq!(store.get(saved.key).unwrap().unwrap().scope, None);
-    let binding = store.bind_recovery_scope(&saved, scope(5), &registry).unwrap();
+    for invalid in [0, u64::MAX] {
+        assert!(matches!(
+            store.bind_timed_recovery_scope(&saved, scope(5), &registry, invalid),
+            Err(Problem::Rejected(Reject::InvalidLaunchDeadline))
+        ));
+    }
+    assert_eq!(store.get(saved.key).unwrap().unwrap().scope, None);
+    let expires_ns = 9_876_543_210;
+    let binding = store
+        .bind_timed_recovery_scope(&saved, scope(5), &registry, expires_ns)
+        .unwrap();
+    assert!(matches!(
+        store.bind_timed_recovery_scope(&saved, scope(5), &registry, expires_ns + 1),
+        Err(Problem::Rejected(Reject::ScopeAlreadyBound))
+    ));
     assert_eq!(
         read(&saved, Some(&registry.generation)).unwrap(),
         (binding, registry.clone())
@@ -902,7 +916,34 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         read(&saved, Some("0123456789abcdef0123456789abcdef0123456789abcdee")),
         Err(Problem::Rejected(Reject::StaleGeneration))
     ));
-    assert!(granted(store.consume_launch(binding, &saved.capability).unwrap()));
+    assert!(matches!(
+        store.consume_launch(binding, &Capability([1; 32])),
+        Err(Problem::Rejected(Reject::CapabilityDenied))
+    ));
+    let wrong_binding = Binding {
+        scope: scope(6),
+        ..binding
+    };
+    assert!(matches!(
+        store.consume_launch(wrong_binding, &saved.capability),
+        Err(Problem::Rejected(Reject::WrongScope))
+    ));
+    assert_eq!(store.get(saved.key).unwrap().unwrap().gate, Gate::Pending);
+    let Consume::Granted(permit) = store.consume_launch(binding, &saved.capability).unwrap() else {
+        panic!("timed admission did not consume");
+    };
+    let grant = permit.into_deadline_grant().unwrap();
+    assert_eq!(grant.into_parts(), (binding, registry.clone(), expires_ns));
+    // The observer inspected the returned identity but never delivered GO.
+    drop(store);
+    let mut store = NativeStore::open(&fixture.native()).unwrap();
+    assert!(matches!(
+        store.consume_launch(binding, &saved.capability).unwrap(),
+        Consume::AlreadyConsumed
+    ));
+    let snapshot = store.get(saved.key).unwrap().unwrap();
+    assert_eq!(snapshot.gate, Gate::Consumed);
+    assert_eq!(snapshot.spawn, None);
 
     let second = journal.bind(caller(2), b"second", candidate(&store, 2), cap()).unwrap();
     store.create(&second).unwrap();

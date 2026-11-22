@@ -152,7 +152,7 @@ fn start_original(
     };
     let delivery = match store.consume_launch(mapping.sql, &mapping.request.capability) {
         Ok(Consume::Granted(permit)) => {
-            if permit.into_binding() != mapping.sql {
+            if permit.into_binding() != Some(mapping.sql) {
                 stop_original(runtime, binding);
                 return Err(LiveError::IdentityMismatch);
             }

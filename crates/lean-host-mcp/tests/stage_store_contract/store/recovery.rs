@@ -12,6 +12,7 @@ pub(super) const SCHEMA: &str = "
             length(CAST(registry_generation AS BLOB))=48 AND registry_generation NOT GLOB '*[^0-9a-f]*'
         ),
         identity BLOB NOT NULL CHECK(length(identity) BETWEEN 1 AND 32768),
+        expires_ns INTEGER CHECK(expires_ns > 0),
         PRIMARY KEY(epoch,nonce,stage), UNIQUE(job,caller_stage,revision),
         FOREIGN KEY(epoch,nonce,stage) REFERENCES stages(epoch,nonce,stage)
     ) STRICT;";
@@ -73,6 +74,55 @@ impl RegistryIdentity {
     }
 }
 
+/// The exact guardian scope and absolute tick admitted before consume. This is
+/// internal launch data, not a caller-supplied duration or recoverable permit.
+#[derive(Debug)]
+pub(crate) struct DeadlineLaunchGrant {
+    binding: Binding,
+    registry: RegistryIdentity,
+    expires_ns: u64,
+}
+
+impl DeadlineLaunchGrant {
+    pub(crate) fn into_parts(self) -> (Binding, RegistryIdentity, u64) {
+        (self.binding, self.registry, self.expires_ns)
+    }
+}
+
+pub(super) fn launch_deadline(tx: &Transaction<'_>, binding: Binding) -> Answer<Option<DeadlineLaunchGrant>> {
+    let key = binding.key;
+    let row = tx
+        .query_row(
+            "SELECT registry_generation,identity,expires_ns FROM recovery_bindings
+             WHERE epoch=?1 AND nonce=?2 AND stage=?3 AND expires_ns IS NOT NULL",
+            params![number(key.epoch)?, key.nonce, number(key.stage)?],
+            |row| {
+                let bytes = blob(row, 1)?;
+                if bytes.len() > IDENTITY_LIMIT {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok((row.get::<_, String>(0)?, bytes.to_vec(), positive(row.get(2)?)?))
+            },
+        )
+        .optional()?;
+    let Some((generation, encoded, expires_ns)) = row else {
+        return Ok(None);
+    };
+    let registry: RegistryIdentity =
+        serde_json::from_slice(&encoded).map_err(|_| Problem::Rejected(Reject::WrongScope))?;
+    if !registry.valid() || registry.generation != generation || !registry.matches_directory() {
+        return reject(Reject::WrongScope);
+    }
+    if expires_ns == 0 {
+        return reject(Reject::InvalidLaunchDeadline);
+    }
+    Ok(Some(DeadlineLaunchGrant {
+        binding,
+        registry,
+        expires_ns,
+    }))
+}
+
 impl NativeStore {
     /// The trusted adapter supplies SDK observations under its publication
     /// lock. Seal the exact stage and registry reference in one transaction.
@@ -81,6 +131,32 @@ impl NativeStore {
         saved: &SavedRequest,
         scope: Scope,
         identity: &RegistryIdentity,
+    ) -> Answer<Binding> {
+        self.bind_exact_scope(saved, scope, identity, None)
+    }
+
+    /// Admit an absolute nanosecond tick from the trusted guardian boot clock.
+    /// Bind it before consume. Neither retries nor caller timing can change it.
+    pub(crate) fn bind_timed_recovery_scope(
+        &mut self,
+        saved: &SavedRequest,
+        scope: Scope,
+        identity: &RegistryIdentity,
+        expires_ns: u64,
+    ) -> Answer<Binding> {
+        let expires_ns = i64::try_from(expires_ns)
+            .ok()
+            .filter(|tick| *tick > 0)
+            .ok_or(Problem::Rejected(Reject::InvalidLaunchDeadline))?;
+        self.bind_exact_scope(saved, scope, identity, Some(expires_ns))
+    }
+
+    fn bind_exact_scope(
+        &mut self,
+        saved: &SavedRequest,
+        scope: Scope,
+        identity: &RegistryIdentity,
+        expires_ns: Option<i64>,
     ) -> Answer<Binding> {
         self.checked_key(saved.key)?;
         bounded(&saved.caller.job)?;
@@ -108,7 +184,7 @@ impl NativeStore {
         }
         let binding = bind_scope_transaction(&tx, key, &saved.capability, scope)?;
         tx.execute(
-            "INSERT INTO recovery_bindings VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO recovery_bindings VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 number(key.epoch)?,
                 key.nonce,
@@ -117,7 +193,8 @@ impl NativeStore {
                 number(saved.caller.stage)?,
                 number(saved.caller.revision)?,
                 identity.generation,
-                encoded
+                encoded,
+                expires_ns
             ],
         )?;
         commit(tx, "bind-recovery-scope")?;

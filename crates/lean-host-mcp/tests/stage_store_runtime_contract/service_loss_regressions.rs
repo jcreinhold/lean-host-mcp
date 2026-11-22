@@ -114,7 +114,7 @@ fn service_helper() {
     let Consume::Granted(permit) = store.consume_launch(mapping.sql, &mapping.request.capability).unwrap() else {
         panic!("fresh original consumption did not grant permission");
     };
-    assert_eq!(permit.into_binding(), mapping.sql);
+    assert_eq!(permit.into_binding(), Some(mapping.sql));
     if cut == "witnessed-start" {
         assert_eq!(
             runtime.deliver_launch(&packet, GoFault::AfterWrite),

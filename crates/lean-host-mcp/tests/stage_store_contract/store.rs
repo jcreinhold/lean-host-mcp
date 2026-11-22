@@ -70,6 +70,7 @@ pub(crate) enum Reject {
     ScopeAlreadyBound,
     StaleGeneration,
     NoConsumedGate,
+    InvalidLaunchDeadline,
     ConflictingSpawn,
     ConflictingResult,
     ResultUnknown,
@@ -247,10 +248,17 @@ pub(crate) struct Snapshot {
 #[derive(Debug)]
 pub(crate) struct LaunchPermit {
     binding: Binding,
+    deadline: Option<recovery::DeadlineLaunchGrant>,
 }
 impl LaunchPermit {
-    pub(crate) fn into_binding(self) -> Binding {
-        self.binding
+    /// Untimed native fixtures cannot silently discard a timed grant's identity.
+    pub(crate) fn into_binding(self) -> Option<Binding> {
+        self.deadline.is_none().then_some(self.binding)
+    }
+
+    /// Transfer the one-time grant to the deadline/launch adapter.
+    pub(crate) fn into_deadline_grant(self) -> Option<recovery::DeadlineLaunchGrant> {
+        self.deadline
     }
 }
 #[derive(Debug)]
@@ -286,12 +294,12 @@ pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
-    if !has_role(db, NATIVE_ROLE, 4)? {
+    if !has_role(db, NATIVE_ROLE, 5)? {
         return Ok(false);
     }
     drop(db.prepare("SELECT epoch,nonce,stage,intent,cap_hash,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages LIMIT 0")?);
     drop(db.prepare("SELECT scope,generation,owner FROM scope_heads LIMIT 0")?);
-    drop(db.prepare("SELECT epoch,nonce,stage,job,caller_stage,revision,registry_generation,identity FROM recovery_bindings LIMIT 0")?);
+    drop(db.prepare("SELECT epoch,nonce,stage,job,caller_stage,revision,registry_generation,identity,expires_ns FROM recovery_bindings LIMIT 0")?);
     let meta: Option<(Id, i64)> = db
         .query_row("SELECT store,epoch FROM meta WHERE singleton=1", [], |r| {
             Ok((fixed(r, 0)?, r.get(1)?))
@@ -492,7 +500,7 @@ impl NativeStore {
         let tx = db
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(&format!("PRAGMA application_id={NATIVE_ROLE}; PRAGMA user_version=4;\n\
+        tx.execute_batch(&format!("PRAGMA application_id={NATIVE_ROLE}; PRAGMA user_version=5;\n\
             CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),store BLOB NOT NULL CHECK(length(store)=16),epoch INTEGER NOT NULL CHECK(epoch>0)) STRICT;\n\
             CREATE TABLE scope_heads(scope BLOB PRIMARY KEY CHECK(length(scope)=16),generation INTEGER NOT NULL CHECK(generation>=0),owner BLOB NOT NULL CHECK(length(owner)=16)) STRICT;\n\
             CREATE TABLE stages(epoch INTEGER NOT NULL,nonce BLOB NOT NULL CHECK(length(nonce)=16),stage INTEGER NOT NULL,\n\
@@ -615,6 +623,7 @@ impl NativeStore {
         if current != (number(binding.scope.generation)?, binding.scope.owner) {
             return reject(Reject::StaleGeneration);
         }
+        let deadline = recovery::launch_deadline(&tx, binding)?;
         let changed = tx.execute(
             "UPDATE stages SET gate=1 WHERE epoch=?1 AND nonce=?2 AND stage=?3 AND gate=0",
             params![
@@ -627,7 +636,7 @@ impl NativeStore {
             return reject(Reject::NoConsumedGate);
         }
         commit(tx, "consume")?;
-        Ok(Consume::Granted(LaunchPermit { binding }))
+        Ok(Consume::Granted(LaunchPermit { binding, deadline }))
     }
     pub(crate) fn cancel(&mut self, binding: Binding, capability: &Capability) -> Answer<()> {
         self.cancel_original(binding.key, capability, Some(binding.scope))
