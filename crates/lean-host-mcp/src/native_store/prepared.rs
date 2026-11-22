@@ -223,6 +223,7 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                         readiness_writer::SETUP_DIAGNOSTICS,
                         readiness_writer::SETUP_OUTLINE,
                         readiness_writer::WHOLE_LINT,
+                        readiness_writer::FIRST_PARTY_CLEAN,
                     ]);
                     if let Ok(root) = broker.native_root(&crate::broker::ProjectHint::Default)
                         && let Some((digest, preview)) = readiness_writer::formatter_approval(&root)

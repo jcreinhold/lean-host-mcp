@@ -62,6 +62,10 @@ impl Receipt {
 }
 
 pub(crate) fn check_config(root: &Path, expected: &[u8; 32]) -> io::Result<()> {
+    read_checked_config(root, expected).map(drop)
+}
+
+pub(crate) fn read_checked_config(root: &Path, expected: &[u8; 32]) -> io::Result<Vec<u8>> {
     let path = root.join("lakefile.lean");
     let file = fs::File::from(rustix::fs::open(
         &path,
@@ -84,7 +88,7 @@ pub(crate) fn check_config(root: &Path, expected: &[u8; 32]) -> io::Result<()> {
     if bytes.len() as u64 > CONFIG_LIMIT || Sha256::digest(&bytes).as_slice() != expected {
         return Err(io::Error::other("whole-library lint configuration changed"));
     }
-    Ok(())
+    Ok(bytes)
 }
 
 /// Keep the beginning of the diagnostic stream and drain the rest so its size

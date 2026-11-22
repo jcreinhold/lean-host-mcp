@@ -553,6 +553,10 @@ pub(crate) struct NativeStore {
     active_stops: std::collections::HashMap<NativeKey, ActiveStop>,
 }
 impl NativeStore {
+    pub(crate) fn database_path(&self) -> Option<&std::path::Path> {
+        self.db.connection().path().map(std::path::Path::new)
+    }
+
     pub(crate) fn create_new(path: &Path) -> Answer<Self> {
         let mut db = CheckedConnection::create_new(path)?;
         let store = *uuid::Uuid::new_v4().as_bytes();

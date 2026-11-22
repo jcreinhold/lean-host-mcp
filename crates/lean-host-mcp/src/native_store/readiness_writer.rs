@@ -27,6 +27,7 @@ pub(super) const CONSUMER: &str = "lake_configured_consumer_v1";
 use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
 pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION, OUTLINE as SETUP_OUTLINE};
+pub(super) use writer_preparation::first_party_clean::OPERATION as FIRST_PARTY_CLEAN;
 pub(super) use writer_preparation::whole_lint::OPERATION as WHOLE_LINT;
 #[path = "formatter_fix.rs"]
 mod formatter_fix;
@@ -98,6 +99,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | SETUP_DIAGNOSTICS
                     | SETUP_OUTLINE
                     | WHOLE_LINT
+                    | FIRST_PARTY_CLEAN
             )
         )
     })
@@ -145,14 +147,19 @@ pub(super) async fn run(
     ) {
         (OPERATION, None, None, None, None) => Stage::Cache,
         (writer_preparation::OPERATION, Some(target), None, None, None)
-            if !matches!(target, Target::VerifierModules { .. } | Target::WholeLint { .. })
-                && target.validate().is_ok() =>
+            if !matches!(
+                target,
+                Target::VerifierModules { .. } | Target::WholeLint { .. } | Target::FirstPartyClean { .. }
+            ) && target.validate().is_ok() =>
         {
             Stage::Preparation(target)
         }
         (writer_preparation::VERIFIER_OPERATION, Some(target @ Target::VerifierModules { .. }), None, None, None)
             if target.validate().is_ok() =>
         {
+            Stage::Preparation(target)
+        }
+        (FIRST_PARTY_CLEAN, Some(target @ Target::FirstPartyClean { .. }), None, None, None) => {
             Stage::Preparation(target)
         }
         (WHOLE_LINT, Some(target @ Target::WholeLint { .. }), None, None, None) => Stage::Preparation(target),
@@ -223,6 +230,26 @@ fn execute(
     let invalid_lint_input = || McpError::invalid_params("whole_library_lint_configuration_changed", None);
     if let Stage::Preparation(Target::WholeLint { lakefile_sha256 }) = &stage {
         writer_preparation::whole_lint::check_config(root, lakefile_sha256).map_err(|_| invalid_lint_input())?;
+    }
+    if let Stage::Preparation(Target::FirstPartyClean { lakefile_sha256 }) = &stage {
+        let unsafe_clean = |_| McpError::invalid_params("first_party_clean_input_or_scope_changed", None);
+        let build = writer_preparation::first_party_clean::check(root, lakefile_sha256).map_err(unsafe_clean)?;
+        if helper.starts_with(&build)
+            || std::env::current_exe().map_err(unsafe_clean)?.starts_with(&build)
+            || store
+                .lock()
+                .database_path()
+                .is_some_and(|path| path.starts_with(&build))
+            || lean_toolchain::native_guardian::registry_directory()
+                .map_err(unsafe_clean)?
+                .starts_with(&build)
+            || std::env::temp_dir().starts_with(&build)
+        {
+            return Err(McpError::invalid_params(
+                "first_party_clean_overlaps_native_state",
+                None,
+            ));
+        }
     }
     let expired = || deadline.remaining().is_err();
     let shims = if matches!(stage, Stage::SetupVerification(..)) {
@@ -347,6 +374,11 @@ fn execute(
     // Preserve the primary waited result independently of helper settlement.
     // The caller waits for closed custody before using it.
     let body = result.ok().and_then(|output| match &stage {
+        Stage::Preparation(Target::FirstPartyClean { .. }) if output.status.success() => {
+            writer_preparation::first_party_clean::Receipt::parse(&output.stdout)
+                .ok()
+                .and_then(|receipt| serde_json::to_value(receipt).ok())
+        }
         Stage::Preparation(Target::WholeLint { .. }) if output.status.success() => {
             writer_preparation::whole_lint::Receipt::parse(&output.stdout)
                 .ok()
