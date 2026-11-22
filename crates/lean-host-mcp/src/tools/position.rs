@@ -723,6 +723,22 @@ pub async fn file_diagnostics(
     ctx: &ToolContext,
     req: FileDiagnosticsRequest,
 ) -> Result<Response<FileDiagnosticsResult>> {
+    file_diagnostics_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn file_diagnostics_inner(
+    ctx: &ToolContext,
+    req: FileDiagnosticsRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<Response<FileDiagnosticsResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
@@ -732,7 +748,27 @@ pub async fn file_diagnostics(
     let selectors = vec![LeanWorkerModuleQuerySelector::Diagnostics {
         id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
     }];
-    let outcome = if ctx.broker.prepared_generation().is_none() {
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    let admitted = if let Some(call) = managed {
+        Some(
+            call.diagnostics(
+                &ctx.broker,
+                &hint,
+                &meta.canonical_root,
+                &input.resolved,
+                &input.source,
+                imports.clone(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+    let admitted = None;
+    let outcome = if let Some(outcome) = admitted {
+        outcome
+    } else if ctx.broker.prepared_generation().is_none() {
         ctx.broker
             .file_projection(
                 &hint,

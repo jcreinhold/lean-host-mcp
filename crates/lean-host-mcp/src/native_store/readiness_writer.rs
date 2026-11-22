@@ -26,7 +26,7 @@ pub(crate) mod configured_consumer;
 pub(super) const CONSUMER: &str = "lake_configured_consumer_v1";
 use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
-pub(super) use setup::OPERATION as SETUP_VERIFICATION;
+pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION};
 #[path = "formatter_fix.rs"]
 mod formatter_fix;
 pub(super) const FORMAT_FIX: &str = "lean_formatter_fix_v1";
@@ -66,7 +66,7 @@ struct Intent {
 
 pub(crate) fn setup_intent(bytes: &[u8]) -> Option<(PathBuf, setup::Request)> {
     let intent: Intent = serde_json::from_slice(bytes).ok()?;
-    if intent.operation != SETUP_VERIFICATION
+    if !matches!(intent.operation.as_str(), SETUP_VERIFICATION | SETUP_DIAGNOSTICS)
         || intent.job.is_empty()
         || intent.revision == 0
         || intent.target.is_some()
@@ -75,7 +75,11 @@ pub(crate) fn setup_intent(bytes: &[u8]) -> Option<(PathBuf, setup::Request)> {
     {
         return None;
     }
-    Some((intent.project, intent.setup_verification.filter(setup::Request::valid)?))
+    let setup = intent.setup_verification.filter(setup::Request::valid)?;
+    if setup.is_diagnostics() != (intent.operation == SETUP_DIAGNOSTICS) {
+        return None;
+    }
+    Some((intent.project, setup))
 }
 
 pub(super) fn is_operation(intent: &[u8]) -> bool {
@@ -90,6 +94,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | FORMAT_FIX
                     | FORMAT_PREVIEW
                     | SETUP_VERIFICATION
+                    | SETUP_DIAGNOSTICS
             )
         )
     })
@@ -151,7 +156,11 @@ pub(super) async fn run(
         (FORMAT_PREVIEW, None, None, Some(formatter), None) if formatter.valid_preview() => {
             Stage::FormatterPreview(formatter)
         }
-        (SETUP_VERIFICATION, None, None, None, Some(request)) if request.valid() => Stage::SetupVerification(request),
+        (operation @ (SETUP_VERIFICATION | SETUP_DIAGNOSTICS), None, None, None, Some(request))
+            if request.valid() && request.is_diagnostics() == (operation == SETUP_DIAGNOSTICS) =>
+        {
+            Stage::SetupVerification(request)
+        }
         _ => return Err(invalid("invalid_readiness_intent")),
     };
     if request.job.is_empty() || request.revision == 0 {

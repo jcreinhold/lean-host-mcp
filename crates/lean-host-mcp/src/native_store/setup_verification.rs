@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub(crate) const OPERATION: &str = "lean_registered_module_verify_v1";
+pub(crate) const DIAGNOSTICS: &str = "lean_file_diagnostics_v1";
 const MAX_RESULT: usize = 60 * 1024;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -24,6 +25,7 @@ const MAX_RESULT: usize = 60 * 1024;
 pub(crate) struct Request {
     pub(crate) file: PathBuf,
     pub(crate) sha256: [u8; 32],
+    #[serde(default)]
     pub(crate) declarations: Vec<String>,
     pub(crate) prepared_sha256: Option<[u8; 32]>,
 }
@@ -35,7 +37,6 @@ impl Request {
             sha256: self.sha256,
         }
         .valid()
-            && !self.declarations.is_empty()
             && self.declarations.len() <= 16
             && self.declarations.iter().collect::<BTreeSet<_>>().len() == self.declarations.len()
             && self.declarations.iter().all(|name| {
@@ -48,6 +49,10 @@ impl Request {
             })
     }
 
+    pub(crate) fn is_diagnostics(&self) -> bool {
+        self.declarations.is_empty()
+    }
+
     pub(crate) fn matches_prepared(&self, prepared: Option<&str>) -> bool {
         self.prepared_sha256 == prepared.map(|input| Sha256::digest(input.as_bytes()).into())
     }
@@ -58,6 +63,19 @@ impl Request {
         };
         if !output.status.success() || output.stdout.len() > MAX_RESULT {
             return None;
+        }
+        if self.is_diagnostics() {
+            let mut body: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+            body.as_object_mut()?.insert(
+                "facts".into(),
+                serde_json::to_value(lean_rs_worker_parent::LeanWorkerModuleQueryCacheFacts::uncached(
+                    output.stdout.len() as u64,
+                ))
+                .ok()?,
+            );
+            serde_json::from_value::<DiagnosticOutcome>(body.clone()).ok()?;
+            let receipt = serde_json::json!({"source_sha256": self.sha256, "outcome": body});
+            return (receipt.to_string().len() <= MAX_RESULT).then_some(receipt);
         }
         let outcome: Outcome = serde_json::from_slice(&output.stdout).ok()?;
         match &outcome {
@@ -216,11 +234,19 @@ pub fn run(encoded: &str) -> io::Result<()> {
         "namespaceContext":"","optionsJson":lean_toolchain::lean_options_json(&setup.options),
         "heartbeats":200000,"diagnosticBytes":16384
     });
-    let entry = concat!(
-        include_str!("../lake/VerifyCommon.lean"),
-        "private abbrev verifySetup := verifyDeclarationBatchWithSetup\n",
-        include_str!("../lake/VerifySetup.lean")
-    );
+    let entry = if plan.request.is_diagnostics() {
+        concat!(
+            include_str!("../lake/VerifyCommon.lean"),
+            "private abbrev projectFile := fileDiagnosticsWithSetup\n",
+            include_str!("../lake/OutlineSetup.lean")
+        )
+    } else {
+        concat!(
+            include_str!("../lake/VerifyCommon.lean"),
+            "private abbrev verifySetup := verifyDeclarationBatchWithSetup\n",
+            include_str!("../lake/VerifySetup.lean")
+        )
+    };
     let driver = assets.path().join("FileDriver.lean");
     let data = assets.path().join("request.json");
     fs::write(assets.path().join("module.setup.json"), &setup.bytes)?;
@@ -261,6 +287,8 @@ pub(crate) struct ManagedCall<'a> {
     pub(crate) store: &'a std::sync::Arc<parking_lot::Mutex<crate::native_store::store::NativeStore>>,
 }
 
+pub(crate) type DiagnosticOutcome = lean_rs_worker_parent::LeanWorkerModuleQueryBatchOutcome;
+
 pub(crate) type Outcome = lean_rs_worker_protocol::types::LeanWorkerDeclarationVerificationBatchResult;
 
 impl ManagedCall<'_> {
@@ -273,51 +301,17 @@ impl ManagedCall<'_> {
         imports: Vec<String>,
         request: lean_rs_worker_protocol::types::LeanWorkerDeclarationVerificationBatchRequest,
     ) -> crate::Result<crate::broker::BrokerCall<Outcome>> {
-        use crate::native_store::store::{Capability, Gate, ResourceReport, ResultKnowledge};
         use lean_rs_worker_protocol::types::LeanWorkerDeclarationVerificationTarget as Target;
         let unavailable = |message: &str| crate::ServerError::BadProject(message.to_owned());
-        let key = self.reference.key;
-        let capability = Capability(self.reference.capability);
-        let snapshot = self
-            .store
-            .lock()
-            .client_get(key, &capability)
-            .map_err(|_| unavailable("managed verification identity unavailable"))?;
-        let (approved_root, admitted) = crate::managed_prepared::readiness_writer::setup_intent(&snapshot.intent)
-            .ok_or_else(|| unavailable("managed verification intent unavailable"))?;
-        let digest: [u8; 32] = Sha256::digest(request.source.as_bytes()).into();
-        if approved_root != root
-            || file.strip_prefix(root).ok() != Some(admitted.file.as_path())
-            || digest != admitted.sha256
-            || admitted.declarations.len() != request.targets.len()
-            || admitted
-                .declarations
-                .iter()
-                .zip(&request.targets)
-                .any(|(name, target)| !matches!(&target.target, Target::Name { name: actual } if name == actual))
-        {
-            return Err(unavailable(
-                "managed verification differs from the admitted source or targets",
-            ));
-        }
-        let saved = if snapshot.gate == Gate::Pending && snapshot.scope.is_none() {
-            crate::managed_prepared::start(broker, self.store, key, capability.clone())
-                .await
-                .map_err(|error| unavailable(&error.message))?;
-            self.store
-                .lock()
-                .client_get(key, &capability)
-                .map_err(|_| unavailable("managed verification result unavailable"))?
-        } else {
-            snapshot
-        };
-        if saved.resource_report != ResourceReport::Closed {
-            return Err(unavailable("managed verification custody is unresolved"));
-        }
-        let body = match saved.result {
-            ResultKnowledge::Retained { body, .. } | ResultKnowledge::Acknowledged { body, .. } => body,
-            _ => return Err(unavailable("managed verification result unavailable")),
-        };
+        let names = request
+            .targets
+            .iter()
+            .map(|target| match &target.target {
+                Target::Name { name } => Ok(name.as_str()),
+                _ => Err(unavailable("managed verification requires named declarations")),
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let body = self.saved(broker, root, file, &request.source, &names).await?;
         let mut value: Outcome =
             serde_json::from_slice(&body).map_err(|_| unavailable("invalid managed verification result"))?;
         match &mut value {
@@ -340,5 +334,88 @@ impl ManagedCall<'_> {
             runtime: identity.runtime,
             freshness: identity.freshness,
         })
+    }
+    pub(crate) async fn diagnostics(
+        &self,
+        broker: &crate::ProjectBroker,
+        hint: &crate::ProjectHint,
+        root: &Path,
+        file: &Path,
+        source: &str,
+        imports: Vec<String>,
+    ) -> crate::Result<crate::broker::CachedBrokerCall<DiagnosticOutcome>> {
+        #[derive(Deserialize)]
+        struct Receipt {
+            source_sha256: [u8; 32],
+            outcome: DiagnosticOutcome,
+        }
+        let body = self.saved(broker, root, file, source, &[]).await?;
+        let receipt: Receipt = serde_json::from_slice(&body)
+            .map_err(|_| crate::ServerError::BadProject("invalid managed diagnostics result".into()))?;
+        if Sha256::digest(source.as_bytes()).as_slice() != receipt.source_sha256 {
+            return Err(crate::ServerError::BadProject(
+                "managed diagnostics source digest changed".into(),
+            ));
+        }
+        let identity = broker.project_identity_without_worker(hint, imports)?;
+        Ok(crate::broker::CachedBrokerCall {
+            value: receipt.outcome,
+            freshness: identity.freshness,
+            runtime: identity.runtime,
+            freshly_processed: false,
+        })
+    }
+
+    async fn saved(
+        &self,
+        broker: &crate::ProjectBroker,
+        root: &Path,
+        file: &Path,
+        source: &str,
+        names: &[&str],
+    ) -> crate::Result<Vec<u8>> {
+        use crate::native_store::store::{Capability, Gate, ResourceReport, ResultKnowledge};
+        let unavailable = |message: &str| crate::ServerError::BadProject(message.to_owned());
+        let key = self.reference.key;
+        let capability = Capability(self.reference.capability);
+        let snapshot = self
+            .store
+            .lock()
+            .client_get(key, &capability)
+            .map_err(|_| unavailable("managed verification identity unavailable"))?;
+        let (approved_root, admitted) = crate::managed_prepared::readiness_writer::setup_intent(&snapshot.intent)
+            .ok_or_else(|| unavailable("managed verification intent unavailable"))?;
+        let digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        if approved_root != root
+            || file.strip_prefix(root).ok() != Some(admitted.file.as_path())
+            || digest != admitted.sha256
+            || !admitted
+                .declarations
+                .iter()
+                .map(String::as_str)
+                .eq(names.iter().copied())
+        {
+            return Err(unavailable(
+                "managed verification differs from the admitted source or targets",
+            ));
+        }
+        let saved = if snapshot.gate == Gate::Pending && snapshot.scope.is_none() {
+            crate::managed_prepared::start(broker, self.store, key, capability.clone())
+                .await
+                .map_err(|error| unavailable(&error.message))?;
+            self.store
+                .lock()
+                .client_get(key, &capability)
+                .map_err(|_| unavailable("managed verification result unavailable"))?
+        } else {
+            snapshot
+        };
+        if saved.resource_report != ResourceReport::Closed {
+            return Err(unavailable("managed verification custody is unresolved"));
+        }
+        match saved.result {
+            ResultKnowledge::Retained { body, .. } | ResultKnowledge::Acknowledged { body, .. } => Ok(body),
+            _ => Err(unavailable("managed setup result unavailable")),
+        }
     }
 }

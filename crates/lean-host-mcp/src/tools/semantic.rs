@@ -75,7 +75,7 @@ semantic_tool_request_wrapper!(LeanLookupToolRequest, "LeanLookupToolRequest", l
 semantic_tool_request_wrapper!(LeanStatusToolRequest, "LeanStatusToolRequest", lean_status_schema);
 
 impl SemanticToolRequest {
-    fn kind(&self) -> Option<&str> {
+    pub(crate) fn kind(&self) -> Option<&str> {
         self.kind.as_deref().map(str::trim).filter(|kind| !kind.is_empty())
     }
 }
@@ -373,6 +373,7 @@ fn lean_status_schema() -> Schema {
                 "properties": {
                     "kind": { "const": "file_diagnostics" },
                     "file": { "type": "string" },
+                    "managed_original": { "type": "object", "description": "Original managed key and capability for file diagnostics in managed-only mode." },
                     "project": { "type": ["string", "null"] }
                 },
                 "additionalProperties": false,
@@ -771,6 +772,22 @@ pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 /// Returns Lake-project resolution failures. Invalid semantic modes are
 /// returned as structured semantic errors.
 pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
+    lean_status_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lean_status_inner(
+    ctx: &ToolContext,
+    req: SemanticToolRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<SemanticResponse<Value>> {
     let kind = canonical_kind("lean_status", req.kind().unwrap_or("project")).to_owned();
     match kind.as_str() {
         "project" => {
@@ -829,6 +846,13 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            if managed.is_some() {
+                return from_tool_response(
+                    position::file_diagnostics_inner(ctx, request, managed).await?,
+                    ctx.config,
+                );
+            }
             from_tool_response(position::file_diagnostics(ctx, request).await?, ctx.config)
         }
         other => Ok(invalid_kind("lean_status", other, &["project", "file_diagnostics"])),
