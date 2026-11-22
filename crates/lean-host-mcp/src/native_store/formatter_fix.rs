@@ -1,4 +1,4 @@
-//! Fixed finite formatting under the already admitted writer.
+//! Fixed formatting and implicit preview under the admitted writer.
 use std::{
     collections::BTreeMap,
     io::{self, Read as _},
@@ -21,6 +21,8 @@ const APPROVAL_ENV: &str = "LEAN_HOST_MCP_MANAGED_FORMATTER_APPROVAL";
 #[serde(deny_unknown_fields)]
 pub(super) struct Approval {
     pub(super) sha256: [u8; 32],
+    #[serde(default)]
+    pub(super) preview: bool,
     dependency_revision: String,
     toolchain: String,
 }
@@ -88,7 +90,9 @@ fn executable(root: &Path) -> io::Result<PathBuf> {
 #[serde(deny_unknown_fields)]
 pub(super) struct Request {
     formatter_sha256: [u8; 32],
+    #[serde(default)]
     targets: Vec<SourceIdentity>,
+    preview_input_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +104,11 @@ struct Report {
     rejected: u64,
     written: usize,
     files: Vec<FileResult>,
+    findings: u64,
+    changed: usize,
+    broken: usize,
+    unbuilt: usize,
+    verbatim_commands: usize,
 }
 
 #[derive(Deserialize)]
@@ -110,12 +119,15 @@ struct FileResult {
     written: bool,
     formatted: Option<String>,
     validation_bypassed: u64,
+    verbatim_commands: usize,
+    findings: Vec<serde::de::IgnoredAny>,
 }
 
 impl Request {
     pub(super) fn valid(&self) -> bool {
         let mut unique = std::collections::BTreeSet::new();
-        !self.targets.is_empty()
+        self.preview_input_sha256.is_none()
+            && !self.targets.is_empty()
             && self.targets.len() <= 32
             && self.targets.iter().all(|source| {
                 source.valid()
@@ -129,13 +141,17 @@ impl Request {
             })
     }
 
+    pub(super) fn valid_preview(&self) -> bool {
+        self.targets.is_empty() && self.preview_input_sha256.is_some()
+    }
+
     pub(super) fn check_sources(&self, root: &Path) -> io::Result<()> {
         self.targets.iter().try_for_each(|source| source.check(root))
     }
 
     pub(super) fn command(&self, root: &Path, assets: &Path) -> io::Result<Command> {
         let approved = Approval::select(root)?;
-        if approved.sha256 != self.formatter_sha256 {
+        if approved.sha256 != self.formatter_sha256 || (self.valid_preview() && !approved.preview) {
             return Err(invalid("formatter approval differs from original intent"));
         }
         let bin = executable(root)?;
@@ -177,11 +193,15 @@ impl Request {
                 command.env_remove(name);
             }
         }
+        let mode = if self.valid_preview() {
+            ["format", "--check"]
+        } else {
+            ["check", "--fix"]
+        };
         command
             .current_dir(root)
+            .args(mode)
             .args([
-                "check",
-                "--fix",
                 "--no-build",
                 "--inherit-process-group",
                 "--no-cache",
@@ -198,13 +218,14 @@ impl Request {
             .env("GIT_NO_LAZY_FETCH", "1")
             .env("LAKE_CACHE_DIR", assets)
             .env("TMPDIR", assets);
+        if let Some(digest) = self.preview_input_sha256 {
+            command.arg("--admitted-preview").arg(hex_digest(digest));
+        }
         for source in &self.targets {
-            let mut digest = String::with_capacity(64);
-            use std::fmt::Write as _;
-            for byte in &source.sha256 {
-                write!(digest, "{byte:02x}").map_err(io::Error::other)?;
-            }
-            command.arg("--admitted-source").arg(&source.file).arg(digest);
+            command
+                .arg("--admitted-source")
+                .arg(&source.file)
+                .arg(hex_digest(source.sha256));
         }
         Ok(command)
     }
@@ -224,30 +245,69 @@ impl Request {
         }
     }
 
+    pub(super) fn preview_receipt(&self, assets: &Path, output: &Output) -> serde_json::Value {
+        let complete = || -> io::Result<serde_json::Value> {
+            let (report, _) = read_report(assets)?;
+            let selected = report.files.len();
+            let mut unique = std::collections::BTreeSet::new();
+            let mut changed = 0;
+            let mut findings = 0;
+            for row in &report.files {
+                if row.written
+                    || row.validation_bypassed != 0
+                    || row.verbatim_commands != 0
+                    || !unique.insert(&row.path)
+                {
+                    return Err(invalid("formatter preview file result is incomplete"));
+                }
+                match row.status.as_str() {
+                    "clean" => (),
+                    "would-format" => changed += 1,
+                    _ => return Err(invalid("formatter preview file result is incomplete")),
+                }
+                findings += row.findings.len() as u64;
+            }
+            let exit = i32::from(changed != 0);
+            if report.mode != "format"
+                || report.validation_bypassed != 0
+                || report.verbatim_commands != 0
+                || report.written != 0
+                || report.broken != 0
+                || report.unbuilt != 0
+                || report.rejected != 0
+                || !report.infrastructure_failures.is_empty()
+                || selected > 16384
+                || report.changed != changed
+                || report.findings != findings
+                || output.status.code() != Some(exit)
+            {
+                return Err(invalid("formatter preview has no complete result"));
+            }
+            Ok(serde_json::json!({
+                "version":1, "stage":"formatter-preview", "status":"complete",
+                "verdict":if changed == 0 {"clean"} else {"would_format"},
+                "selected_count":selected, "finding_count":findings,
+                "preview_input_sha256":self.preview_input_sha256,
+            }))
+        };
+        complete().unwrap_or_else(|_| {
+            let changed = output.status.code() == Some(2)
+                && String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line.trim() == "lean-fmt: formatter preview inputs differ from the admitted digest");
+            serde_json::json!({
+                "version":1, "stage":"formatter-preview", "status":"unavailable",
+                "reason":if changed {"inputs_changed"} else {"outcome_incomplete"},
+                "preview_input_sha256":self.preview_input_sha256,
+            })
+        })
+    }
+
     fn validated_receipt(&self, root: &Path, assets: &Path, output: &Output) -> io::Result<serde_json::Value> {
         let Some(exit @ (0 | 1)) = output.status.code() else {
             return Err(invalid("formatter has no complete result"));
         };
-        use rustix::fs::{Mode, OFlags, open};
-        let file = std::fs::File::from(open(
-            assets.join(REPORT),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        let meta = file.metadata()?;
-        if !meta.is_file()
-            || meta.nlink() != 1
-            || meta.uid() != rustix::process::geteuid().as_raw()
-            || meta.len() > REPORT_LIMIT
-        {
-            return Err(invalid("formatter report is not bounded private data"));
-        }
-        let mut bytes = Vec::new();
-        file.take(REPORT_LIMIT + 1).read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).map_err(io::Error::other)? > REPORT_LIMIT {
-            return Err(invalid("formatter report exceeds limit"));
-        }
-        let report: Report = serde_json::from_slice(&bytes)?;
+        let (report, report_sha256) = read_report(assets)?;
         if report.mode != "fix"
             || report.validation_bypassed != 0
             || report.rejected != 0
@@ -290,10 +350,42 @@ impl Request {
         if written != report.written {
             return Err(invalid("formatter write count differs"));
         }
-        let report_sha256: [u8; 32] = Sha256::digest(&bytes).into();
         Ok(serde_json::json!({
             "version":1,"stage":"formatter-fix","exit_code":exit,"formatter_sha256":self.formatter_sha256,
             "report_sha256":report_sha256,"files":files,
         }))
     }
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn read_report(assets: &Path) -> io::Result<(Report, [u8; 32])> {
+    use rustix::fs::{Mode, OFlags, open};
+    let file = std::fs::File::from(open(
+        assets.join(REPORT),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.len() > REPORT_LIMIT
+    {
+        return Err(invalid("formatter report is not bounded private data"));
+    }
+    let mut bytes = Vec::new();
+    file.take(REPORT_LIMIT + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_err(io::Error::other)? > REPORT_LIMIT {
+        return Err(invalid("formatter report exceeds limit"));
+    }
+    let report = serde_json::from_slice(&bytes)?;
+    Ok((report, Sha256::digest(&bytes).into()))
 }

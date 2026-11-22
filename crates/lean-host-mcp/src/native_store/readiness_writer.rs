@@ -29,8 +29,12 @@ use configured_consumer::SourceIdentity;
 mod formatter_fix;
 pub(super) const FORMAT_FIX: &str = "lean_formatter_fix_v1";
 
-pub(super) fn formatter_digest(root: &Path) -> Option<[u8; 32]> {
-    formatter_fix::Approval::select(root).ok().map(|pin| pin.sha256)
+pub(super) const FORMAT_PREVIEW: &str = "lean_formatter_preview_v1";
+
+pub(super) fn formatter_approval(root: &Path) -> Option<([u8; 32], bool)> {
+    formatter_fix::Approval::select(root)
+        .ok()
+        .map(|pin| (pin.sha256, pin.preview))
 }
 
 enum Stage {
@@ -38,6 +42,7 @@ enum Stage {
     Preparation(Target),
     Consumer(SourceIdentity),
     Formatter(formatter_fix::Request),
+    FormatterPreview(formatter_fix::Request),
 }
 
 pub(super) const OPERATION: &str = "lake_mathlib_cache_readiness_v1";
@@ -65,6 +70,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | writer_preparation::VERIFIER_OPERATION
                     | CONSUMER
                     | FORMAT_FIX
+                    | FORMAT_PREVIEW
             )
         )
     })
@@ -122,6 +128,9 @@ pub(super) async fn run(
         }
         (CONSUMER, None, Some(source), None) if source.valid() => Stage::Consumer(source),
         (FORMAT_FIX, None, None, Some(formatter)) if formatter.valid() => Stage::Formatter(formatter),
+        (FORMAT_PREVIEW, None, None, Some(formatter)) if formatter.valid_preview() => {
+            Stage::FormatterPreview(formatter)
+        }
         _ => return Err(invalid("invalid_readiness_intent")),
     };
     if request.job.is_empty() || request.revision == 0 {
@@ -194,7 +203,7 @@ fn execute(
                     .map_err(|_| McpError::invalid_params("configured_consumer_source_changed", None))?;
                 source.command(root, writer.asset_dir()).map_err(no_start)?
             }
-            Stage::Formatter(request) => {
+            Stage::Formatter(request) | Stage::FormatterPreview(request) => {
                 request
                     .check_sources(root)
                     .map_err(|_| McpError::invalid_params("formatter_source_changed", None))?;
@@ -251,6 +260,7 @@ fn execute(
             .map(|exit_code| serde_json::json!({"version":1,"stage":"mathlib-cache-check","exit_code":exit_code})),
         Stage::Consumer(source) => Some(source.receipt(root, output)),
         Stage::Formatter(request) => Some(request.receipt(root, writer.asset_dir(), &output)),
+        Stage::FormatterPreview(request) => Some(request.preview_receipt(writer.asset_dir(), &output)),
     });
     let saved = body.map_or(Ok(()), |body| {
         store

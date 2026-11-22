@@ -221,9 +221,12 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                         readiness_writer::CONSUMER,
                     ]);
                     if let Ok(root) = broker.native_root(&crate::broker::ProjectHint::Default)
-                        && let Some(digest) = readiness_writer::formatter_digest(&root)
+                        && let Some((digest, preview)) = readiness_writer::formatter_approval(&root)
                     {
                         operations.push(readiness_writer::FORMAT_FIX);
+                        if preview {
+                            operations.push(readiness_writer::FORMAT_PREVIEW);
+                        }
                         fields.insert("formatter_sha256".into(), serde_json::json!(digest));
                     }
                 }
