@@ -58,7 +58,9 @@ HostInit == Init /\ h = [
     attestation |-> <<>>, operatorAck |-> <<>>,
     scratch |-> FALSE, cleanup |-> "none", intentBound |-> FALSE, evidence |-> <<>>,
     oldLocks |-> FALSE, held |-> FALSE, unheldCleanup |-> FALSE,
-    cut |-> "none", settlements |-> 0]]
+    cut |-> "none", settlements |-> 0],
+  scopedLocks |-> [op \in {"legacy-reader", "private-writer", "same-output-writer", "broad-clean"}
+                  |-> "idle"]]
 HostOnly(change) == change /\ UNCHANGED vars
 SdkOnly(action) == action /\ UNCHANGED h
 Submit == HostOnly(~h.submitted /\ h.online /\ h'=[h EXCEPT !.submitted=TRUE, !.binding= <<Original,NativeId,"intent-a">>])
@@ -805,4 +807,40 @@ NoOperatorUnverifiableDisjoint == ~(OperatorWriterRecovery /\ ~ExactWriterEviden
 NoOperatorRetirementAfterRemoval ==
   ~(OperatorClosureAuthorized /\ Writer.starts=1 /\ Writer.outcome="unknown" /\ Writer.cut="removed"
     /\ h.successor="done")
+
+\* Projection of the proposed shim lock plan, before any mixed-mode SDK handoff.
+\* A legacy reader protects its 4.35 artifacts using the two package locks.
+\* Both 4.36 writers read the same package inputs and write the same private roots.
+ScopedOps == DOMAIN h.scopedLocks
+ScopedSources == {"host-package", "interop-package"}
+ScopedOutputs == {"private-host-436", "private-interop-436"}
+ScopedPlan(op) ==
+  CASE op="legacy-reader" -> [sh |-> ScopedSources, ex |-> {}]
+    [] op="broad-clean" ->
+       IF Mutation="scoped-clean-sh"
+       THEN [sh |-> ScopedSources, ex |-> {}]
+       ELSE [sh |-> {}, ex |-> ScopedSources]
+    [] OTHER ->
+       CASE Mutation="scoped-legacy-ex" -> [sh |-> {}, ex |-> ScopedSources \cup ScopedOutputs]
+         [] op="same-output-writer" /\ Mutation="scoped-omit-output" ->
+            [sh |-> ScopedSources, ex |-> {}]
+         [] OTHER -> [sh |-> ScopedSources, ex |-> ScopedOutputs]
+ScopedCompatible(a,b) ==
+  LET aPlan == ScopedPlan(a)
+      bPlan == ScopedPlan(b)
+  IN /\ aPlan.ex \cap (bPlan.sh \cup bPlan.ex) = {}
+     /\ bPlan.ex \cap (aPlan.sh \cup aPlan.ex) = {}
+ScopedHeld(op) == h.scopedLocks[op]="held"
+ScopedAdmit(op) == HostOnly(h.scopedLocks[op]="idle"
+  /\ (\A peer \in ScopedOps: ScopedHeld(peer) => ScopedCompatible(op,peer))
+  /\ h'=[h EXCEPT !.scopedLocks[op]="held"])
+ScopedRelease(op) == HostOnly(ScopedHeld(op)
+  /\ h'=[h EXCEPT !.scopedLocks[op]="released"])
+ScopedNext == \E op \in ScopedOps: ScopedAdmit(op) \/ ScopedRelease(op)
+ScopedLockSpec == HostInit /\ [][ScopedNext]_hv
+ScopedWritersExcluded == ~(ScopedHeld("private-writer") /\ ScopedHeld("same-output-writer"))
+ScopedCleanExcluded == ScopedHeld("broad-clean") =>
+  \A op \in ScopedOps \ {"broad-clean"}: ~ScopedHeld(op)
+NoScopedOverlap == ~(ScopedHeld("legacy-reader") /\ ScopedHeld("private-writer"))
+
 =============================================================================

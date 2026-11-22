@@ -806,6 +806,53 @@
     },
 
     {
+      "name": "host-scoped-shim-exclusion",
+      "model": "Stages",
+      "specification": "ScopedLockSpec",
+      "expect": "pass",
+      "invariants": ["ScopedWritersExcluded", "ScopedCleanExcluded"],
+      "properties": []
+    },
+    {
+      "name": "host-scoped-shim-overlap",
+      "model": "Stages",
+      "specification": "ScopedLockSpec",
+      "expect": "invariant",
+      "invariants": ["NoScopedOverlap"],
+      "properties": [],
+      "invariant": "NoScopedOverlap",
+      "witness": true
+    },
+    {
+      "name": "host-scoped-shim-legacy-exclusive",
+      "model": "Stages",
+      "specification": "ScopedLockSpec",
+      "constants": {"Mutation": "\"scoped-legacy-ex\""},
+      "expect": "pass",
+      "invariants": ["NoScopedOverlap"],
+      "properties": []
+    },
+    {
+      "name": "host-scoped-shim-missing-output",
+      "model": "Stages",
+      "specification": "ScopedLockSpec",
+      "constants": {"Mutation": "\"scoped-omit-output\""},
+      "expect": "invariant",
+      "invariants": ["ScopedWritersExcluded"],
+      "properties": [],
+      "invariant": "ScopedWritersExcluded"
+    },
+    {
+      "name": "host-scoped-shim-clean-shared",
+      "model": "Stages",
+      "specification": "ScopedLockSpec",
+      "constants": {"Mutation": "\"scoped-clean-sh\""},
+      "expect": "invariant",
+      "invariants": ["ScopedCleanExcluded"],
+      "properties": [],
+      "invariant": "ScopedCleanExcluded"
+    },
+    {
       "name": "host-writer-recovery",
       "model": "Stages",
       "specification": "WriterSpec",
