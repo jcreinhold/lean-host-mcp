@@ -39,8 +39,11 @@ HostInit == Init /\ h = [
   startsAtFence |-> 0, racedStart |-> FALSE, fencedRunnable |-> FALSE,
   hostPermitTaken |-> FALSE, hostPermitReturns |-> 0, actorSealed |-> FALSE,
   hostClosure |-> <<>>, staleSeen |-> FALSE, duplicateSeen |-> FALSE,
-  stopped |-> [committed |-> FALSE, frozen |-> FALSE, read |-> <<>>, request |-> <<>>,
-    permitAtPause |-> "unused", startsAtPause |-> 0],
+  stopped |-> [committed |-> FALSE, frozen |-> FALSE, pauses |-> 0, read |-> <<>>,
+    offer |-> <<>>, inserter |-> "none", coalesced |-> FALSE, request |-> <<>>,
+    decision |-> "none", sampledStopped |-> FALSE, responsiveRefusal |-> FALSE,
+    sent |-> {}, returned |-> {}, frozenSenders |-> {}, resumedAfterSample |-> FALSE,
+    evidenceUnknown |-> FALSE, permitAtPause |-> "unused", startsAtPause |-> 0],
   deadline |-> [tick |-> 0, arm |-> "idle", armedKey |-> <<>>, finishedKey |-> <<>>,
     sentAt |-> <<>>, frozen |-> FALSE, paused |-> FALSE, expired |-> FALSE],
   writer |-> [phase |-> "new", handoff |-> <<>>, admittedHandoff |-> <<>>, valid |-> TRUE,
@@ -274,10 +277,11 @@ NoSdkReturnBeforeHost == ~(ConfirmedHostClosure /\ capacityReturns=1 /\ HostPerm
 NoHostReturnWithoutAck == ~(h.duplicateSeen /\ h.hostPermitReturns=1 /\ h.copied="success" /\ ~h.ack)
 NoHostReturnAfterNoStart == ~(h.hostPermitReturns=1 /\ h.fenced /\ ~runningDurable /\ capacityReturns=1)
 
-\* One stage owns this scope for its whole lifetime. The original broker
-\* prepares SDK custody and commits its binding before the stage's GO.
+\* This boot-qualified Running scope fixes the entire binding for one stage.
+\* The original broker commits the association before the stage's GO.
 Stopped == h.stopped
-StartedStoppedScope == phase="running" /\ startupAcked /\ h.readAdmitted /\ supervisorAlive
+StartedStoppedScope == phase="running" /\ runningDurable /\ startupAcked
+  /\ h.readAdmitted /\ supervisorAlive /\ h.deadline.arm="idle"
 CommitStoppedBinding == HostOnly(StartedStoppedScope /\ guardianPresent /\ ~Stopped.committed
   /\ h'=[h EXCEPT !.stopped.committed=TRUE])
 ConsumeStoppedPermit == HostOnly(StartedStoppedScope /\ Stopped.committed /\ ~Stopped.frozen
@@ -288,7 +292,8 @@ StartOriginalStoppedStage == HostOnly(StartedStoppedScope /\ ~Stopped.frozen
   /\ h.permit="spent" /\ h.targetStarts=0
   /\ h'=[h EXCEPT !.targetStarts=1])
 PauseRecoveryBroker == HostOnly(StartedStoppedScope /\ Stopped.committed /\ ~Stopped.frozen /\ guardianPresent
-  /\ h'=[h EXCEPT !.stopped.frozen=TRUE, !.stopped.permitAtPause=h.permit,
+  /\ (Stopped.pauses=0 \/ (Stopped.pauses=1 /\ Stopped.decision="refused-responsive"))
+  /\ h'=[h EXCEPT !.stopped.frozen=TRUE, !.stopped.pauses=@+1, !.stopped.permitAtPause=h.permit,
     !.stopped.startsAtPause=h.targetStarts])
 
 StoppedKeys == {Original, [Original EXCEPT ![1]=2],
@@ -301,42 +306,87 @@ ReadStoppedBinding(key) == HostOnly(Stopped.frozen /\ Stopped.committed /\ Stopp
   /\ (key[3]=h.binding[1][3] \/ Mutation="drain-ignore-revision")
   /\ h'=[h EXCEPT !.stopped.read= <<key,h.bound>>])
 
-\* Publication rechecks the SDK identity independently of the earlier read.
-\* Drain authority is a distinct input; the read never mints it.
-PublishStoppedDrain(scope, authorized) == HostOnly(StartedStoppedScope /\ Stopped.frozen
-  /\ guardianPresent /\ Stopped.read/= <<>> /\ Stopped.request= <<>>
-  /\ (scope=Stopped.read[2] \/ Mutation="drain-ignore-sdk-generation")
-  /\ (authorized \/ Mutation="drain-read-authority")
-  /\ h'=[h EXCEPT !.stopped.request= <<Stopped.read,scope,authorized>>])
-GuardianAcceptStoppedDrain == Stopped.frozen /\ guardianPresent /\ Stopped.request/= <<>>
+\* The envelope describes who may use this exact slot. A marker in a matched
+\* generation can be empty because that generation fixes the entire binding.
+SubmitStoppedDrain(sender, scope, authorized) ==
+  LET offer == <<Stopped.read,scope,authorized>>
+  IN HostOnly(StartedStoppedScope /\ Stopped.frozen /\ guardianPresent /\ Stopped.read/= <<>>
+    /\ sender \notin Stopped.sent
+    /\ (Stopped.offer= <<>> \/ Stopped.offer=offer)
+    /\ h'=[h EXCEPT !.stopped.sent=@ \cup {sender},
+        !.stopped.coalesced=Stopped.offer/= <<>>,
+        !.stopped.inserter=IF Stopped.offer= <<>> THEN sender ELSE @,
+        !.stopped.offer=offer, !.stopped.decision=IF Stopped.offer= <<>> THEN "pending" ELSE @])
+FreezeStoppedSender(sender) == HostOnly(Stopped.decision="pending"
+  /\ sender \in Stopped.sent \ (Stopped.returned \cup Stopped.frozenSenders)
+  /\ h'=[h EXCEPT !.stopped.frozenSenders=@ \cup {sender}])
+ReturnStoppedSubmission(sender) == HostOnly(sender \in Stopped.sent \ (Stopped.returned \cup Stopped.frozenSenders)
+  /\ h'=[h EXCEPT !.stopped.returned=@ \cup {sender}])
+
+\* Only the original guardian samples eligibility and publishes acceptance.
+\* A positive sample can commit across a subsequent parent resume.
+GuardianSampleStoppedDrain ==
+  LET exactScope == Stopped.offer[2]=Stopped.read[2] \/ Mutation="drain-ignore-sdk-generation"
+      authorized == Stopped.offer[3] \/ Mutation="drain-read-authority"
+      decision == IF ~exactScope THEN "refused-stale"
+                  ELSE IF ~authorized THEN "refused-authority"
+                  ELSE IF Stopped.frozen \/ Mutation="drain-ignore-responsive" THEN "eligible"
+                  ELSE "refused-responsive"
+  IN HostOnly(StartedStoppedScope /\ guardianPresent /\ Stopped.decision="pending"
+    /\ h'=[h EXCEPT !.stopped.decision=decision,
+        !.stopped.sampledStopped=Stopped.frozen,
+        !.stopped.responsiveRefusal=@ \/ decision="refused-responsive",
+        !.stopped.offer=IF decision="eligible" THEN @ ELSE <<>>])
+GuardianCommitStoppedDrain == HostOnly(guardianPresent /\ Stopped.decision="eligible"
+  /\ (Mutation/="drain-wait-sender" \/ Stopped.frozenSenders={})
+  /\ h'=[h EXCEPT !.stopped.request=Stopped.offer, !.stopped.decision="accepted"])
+GuardianRequestStoppedDrain == guardianPresent
+  /\ (Stopped.request/= <<>> \/ (Mutation="drain-visible-stop" /\ Stopped.decision="pending"))
   /\ SdkOnly(RequestStop)
 GuardianDrainStoppedScope == Stopped.request/= <<>> /\ guardianPresent
   /\ SdkOnly(CleanupGroup \/ GuardianExitsAfterGroup)
-ObserveStoppedClosure == Stopped.request/= <<>>
+LoseStoppedClosureEvidence == HostOnly(phase="stopping" /\ ~guardianPresent /\ ~Stopped.evidenceUnknown
+  /\ (groupObservation/="absent" \/ guardianObservation/="absent")
+  /\ h'=[h EXCEPT !.stopped.evidenceUnknown=TRUE])
+ObserveStoppedClosure == Stopped.request/= <<>> /\ ~Stopped.evidenceUnknown
   /\ SdkOnly(ObserveGroupAbsent \/ ObserveGuardianAbsent \/ Retire)
-ResumeRecoveryBroker == HostOnly(Stopped.frozen /\ phase="closed"
-  /\ h'=[h EXCEPT !.stopped.frozen=FALSE])
+ResumeRecoveryBroker == HostOnly(Stopped.frozen
+  /\ h'=[h EXCEPT !.stopped.frozen=FALSE,
+      !.stopped.resumedAfterSample=@ \/ Stopped.decision="eligible"])
 
 ReaderStartsStoppedStage == HostOnly(Mutation="drain-read-launch" /\ StartedStoppedScope
   /\ Stopped.frozen /\ Stopped.read/= <<>> /\ h.targetStarts=Stopped.startsAtPause
   /\ h'=[h EXCEPT !.permit="authorized", !.targetStarts=@+1])
-ReaderReleasesStoppedDomains == HostOnly(Mutation="drain-read-release" /\ Stopped.frozen
-  /\ Stopped.read/= <<>> /\ h.domains>0
+ReaderReleasesStoppedDomains == HostOnly(h.domains>0
+  /\ ((Mutation="drain-read-release" /\ Stopped.frozen /\ Stopped.read/= <<>>)
+      \/ (Mutation="drain-unknown-release" /\ Stopped.evidenceUnknown))
   /\ h'=[h EXCEPT !.domains=0, !.closure=h.bound])
+StoppedGuardianFlow == GuardianSampleStoppedDrain \/ GuardianCommitStoppedDrain
+  \/ GuardianRequestStoppedDrain \/ GuardianDrainStoppedScope \/ ObserveStoppedClosure
 StoppedRecoveryNext == StoppedRecoveryPrelude \/ StartOriginalStoppedStage \/ PauseRecoveryBroker
   \/ (\E key \in StoppedKeys: ReadStoppedBinding(key))
-  \/ (\E scope \in {Scope,PreviousScope}, authorized \in BOOLEAN: PublishStoppedDrain(scope,authorized))
-  \/ GuardianAcceptStoppedDrain \/ GuardianDrainStoppedScope \/ ObserveStoppedClosure
+  \/ (\E sender \in Contenders: FreezeStoppedSender(sender) \/ ReturnStoppedSubmission(sender)
+      \/ (\E scope \in {Scope,PreviousScope}, authorized \in BOOLEAN: SubmitStoppedDrain(sender,scope,authorized)))
+  \/ StoppedGuardianFlow \/ LoseStoppedClosureEvidence \/ SdkOnly(WriterAcquire)
   \/ ResumeRecoveryBroker \/ (~Stopped.frozen /\ ReleaseDomains)
   \/ ReaderStartsStoppedStage \/ ReaderReleasesStoppedDomains
-StoppedRecoverySpec == HostInit /\ [][StoppedRecoveryNext]_hv
+StoppedRecoverySpec == HostInit /\ [][StoppedRecoveryNext]_hv /\ WF_hv(StoppedGuardianFlow)
 StoppedDrainExact == Stopped.request/= <<>> =>
-  Stopped.request= << <<Original,Scope>>, Scope, TRUE >>
+  Stopped.sampledStopped /\ Stopped.request= << <<Original,Scope>>, Scope, TRUE >>
+StoppedDrainCommitted == phase \in {"stopping","closed"} => Stopped.request/= <<>>
 StoppedLaunchUnchanged == Stopped.frozen =>
   h.permit=Stopped.permitAtPause /\ h.targetStarts=Stopped.startsAtPause
-StoppedReleaseSafe == Stopped.frozen =>
-  h.domains=2 /\ h.closure= <<>> /\ (phase/="closed" => capacityReserved)
-NoStoppedRecoveryCompletion == ~(Stopped.startsAtPause=1 /\ h.closure=Scope /\ capacityReturns=1)
+StoppedReleaseSafe ==
+  /\ (Stopped.committed /\ phase/="closed" => h.domains=2 /\ h.closure= <<>> /\ capacityReserved)
+  /\ (writerAdmitted => phase="closed" /\ ~capacityReserved /\ ~ofdLocked)
+StoppedSubmissionProgress == (Stopped.decision="pending") ~> (Stopped.decision/="pending")
+StoppedRecoveryProgress == (Stopped.decision \in {"eligible","accepted"})
+  ~> (phase="closed" \/ Stopped.evidenceUnknown)
+NoStoppedRecoveryCompletion == ~(Stopped.startsAtPause=1 /\ Stopped.resumedAfterSample
+  /\ Stopped.coalesced /\ Stopped.inserter \in Stopped.frozenSenders /\ writerAdmitted /\ capacityReturns=1)
+NoStoppedResponsiveRefusal == ~(Stopped.decision="refused-responsive" /\ Stopped.offer= <<>>)
+NoFreshStoppedDecision == ~(Stopped.responsiveRefusal /\ Stopped.pauses=2 /\ Stopped.request/= <<>>)
+NoStoppedStaleRefusal == Stopped.decision/="refused-stale"
 
 \* Opt-in projection: command 1 only warms the single generation. Command 2
 \* has one immutable deadline on a shared logical clock. No guardian loss,

@@ -160,13 +160,18 @@
       "invariants": [
         "TypeOK",
         "StoppedDrainExact",
+        "StoppedDrainCommitted",
         "StoppedLaunchUnchanged",
         "StoppedReleaseSafe",
         "ClosureIdentity",
         "NoEarlyCapacityReturn",
         "CapacityReturnsOnce"
       ],
-      "properties": ["Spec"]
+      "properties": [
+        "Spec",
+        "StoppedSubmissionProgress",
+        "StoppedRecoveryProgress"
+      ]
     },
     {
       "name": "host-stopped-recovery-completes",
@@ -177,6 +182,75 @@
       "properties": [],
       "invariant": "NoStoppedRecoveryCompletion",
       "witness": true
+    },
+    {
+      "name": "host-stopped-responsive-refusal",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "invariants": ["NoStoppedResponsiveRefusal"],
+      "properties": [],
+      "invariant": "NoStoppedResponsiveRefusal",
+      "witness": true
+    },
+    {
+      "name": "host-stopped-fresh-decision",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "invariants": ["NoFreshStoppedDecision"],
+      "properties": [],
+      "invariant": "NoFreshStoppedDecision",
+      "witness": true
+    },
+    {
+      "name": "host-stopped-stale-refusal",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "invariants": ["NoStoppedStaleRefusal"],
+      "properties": [],
+      "invariant": "NoStoppedStaleRefusal",
+      "witness": true
+    },
+    {
+      "name": "host-stopped-drain-ignore-responsive",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": { "Mutation": "\"drain-ignore-responsive\"" },
+      "invariants": ["StoppedDrainExact"],
+      "properties": [],
+      "invariant": "StoppedDrainExact"
+    },
+    {
+      "name": "host-stopped-drain-visible-stop",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": { "Mutation": "\"drain-visible-stop\"" },
+      "invariants": ["StoppedDrainCommitted"],
+      "properties": [],
+      "invariant": "StoppedDrainCommitted"
+    },
+    {
+      "name": "host-stopped-drain-wait-sender",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "liveness",
+      "constants": { "Mutation": "\"drain-wait-sender\"" },
+      "invariants": ["TypeOK"],
+      "properties": ["StoppedRecoveryProgress"]
+    },
+    {
+      "name": "host-stopped-drain-unknown-release",
+      "model": "Stages",
+      "specification": "StoppedRecoverySpec",
+      "expect": "invariant",
+      "constants": { "Mutation": "\"drain-unknown-release\"" },
+      "invariants": ["StoppedReleaseSafe"],
+      "properties": [],
+      "invariant": "StoppedReleaseSafe"
     },
     {
       "name": "host-stopped-drain-ignore-job",

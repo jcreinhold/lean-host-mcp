@@ -43,17 +43,24 @@ case tests a live, responsive old authority and one durable request under two co
 It assumes durable arbitration and a receiver that enforces the fence. Unavailable authority or evidence can
 leave execution uncertain. The model grants recovery no right to signal a PID or issue another GO.
 
-**Stopped broker recovery.** `StoppedRecoverySpec` projects the early O3 lookup (`aa8ec30`) onto one SDK scope
-dedicated to one stage. The original broker commits the stage-to-scope binding before GO. A reader matches the
-original job, stage and execution revision. The case assumes the saved capability, native ID and intent have
-authenticated. An independently authorized drain request must also match the SDK scope under the publication
-lock, so an exact lookup followed by a stale SDK generation still fails. The reader cannot authorize a drain,
-send GO, start a target or release custody by reading the binding. An available, unarmed original guardian
-accepts an authorized request and performs the SDK cleanup. Exact closure returns SDK capacity, and the
-resumed broker releases its domain holds. The controls exercise each mismatched field and each reader
-authority violation. A separate witness reaches release after the original target starts. This models committed
-publication and authentic OS evidence as inputs. It does not qualify SQLite durability, registry discovery,
-OS stop or closure, an armed guardian, or the autonomous drain after actual parent death.
+**Stopped broker recovery.** `StoppedRecoverySpec` projects the early O3 lookup (`aa8ec30`) onto one boot-qualified
+Running generation dedicated to one stage. The original broker commits the complete binding before GO and keeps
+it fixed for that generation. The case assumes authenticated capability, native ID and intent. A reader matches
+the original job, stage and execution revision. A separately authorized sender makes one slot visible without
+holding the SDK admission lock. A second exact sender coalesces. Sending and returning are distinct actions.
+
+The unarmed original guardian samples the exact binding and the parent's stopped state, then durably accepts an
+eligible request. A resume before sampling produces an observable refusal and consumes the old offer. A fresh
+stop and insertion can obtain another decision. A resume after a positive sample leaves acceptance available.
+Only the committed request permits the guardian to stop and drain. Confirmed closure returns SDK capacity and
+permits writer acquisition. The resumed broker releases its domain holds using its exact closure receipt.
+
+The progress checks assume weak fairness of the bounded guardian and OS steps and continued availability of
+authentic closure evidence. They give sender return and broker resume no fairness. The witness reaches writer
+admission with a coalesced duplicate, the inserting sender frozen before return and guardian sampling, and the
+parent resumed between sample and commit. The unavailable-evidence branch keeps custody pending. The model separates
+visibility and durable acceptance as abstract steps. SQLite and filesystem durability, actual process and lock observations, an
+armed guardian's deadline path, and autonomous drain after parent death require their own qualification.
 
 **Managed writer recovery.** `WriterSpec` in `Stages.tla` uses the existing SDK
 reader-closure and conflicting-admission steps. It binds the source handoff to
