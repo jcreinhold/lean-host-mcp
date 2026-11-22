@@ -943,9 +943,65 @@ mod tests {
             call(&service, json!({"op":"get","key":saved_key,"capability":cap})).unwrap(),
             saved
         );
-        {
+        let acknowledged = {
             use crate::native_store::store::{CallerJournal, CallerKey, Capability};
-            let mut journal = CallerJournal::create_new(&path.with_file_name("caller.sqlite3")).unwrap();
+            use tokio::io::{AsyncBufReadExt as _, BufReader, DuplexStream};
+
+            async fn wire(stream: &mut BufReader<DuplexStream>, message: Value) -> Value {
+                stream
+                    .get_mut()
+                    .write_all(format!("{message}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut line = String::new();
+                tokio::time::timeout(Duration::from_secs(5), stream.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                serde_json::from_str(&line).unwrap()
+            }
+            async fn wire_call(stream: &mut BufReader<DuplexStream>, id: u64, command: Value) -> Value {
+                let reply = wire(
+                    stream,
+                    json!({
+                        "jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                            "name":"lean_managed_admission",
+                            "arguments":{"request":json!({"version":1,"command":command}).to_string()}
+                        }
+                    }),
+                )
+                .await;
+                assert_eq!(reply["id"], id);
+                assert!(reply.get("error").is_none(), "{reply}");
+                serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+            }
+            let (server_io, client_io) = tokio::io::duplex(65_536);
+            let mut client = BufReader::new(client_io);
+            let app = service.clone();
+            let listener = tokio::spawn(async move { app.serve(server_io).await.unwrap() });
+            assert!(
+                wire(
+                    &mut client,
+                    json!({
+                        "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                            "protocolVersion":"2025-11-25","capabilities":{},
+                            "clientInfo":{"name":"caller-save-regression","version":"1"}
+                        }
+                    })
+                )
+                .await
+                .get("result")
+                .is_some()
+            );
+            client
+                .get_mut()
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            let running = listener.await.unwrap();
+
+            let caller_path = path.with_file_name("caller.sqlite3");
+            let mut journal = CallerJournal::create_new(&caller_path).unwrap();
             let native_key = serde_json::from_value(saved_key.clone()).unwrap();
             let request = journal
                 .bind(
@@ -967,9 +1023,34 @@ mod tests {
                 .get(native_key)
                 .unwrap()
                 .unwrap();
-            journal.save_result(&request, &source).unwrap();
-        }
-        let acknowledged = call(&service, ack(json!(cap), digest.clone())).unwrap();
+            let get = json!({"op":"get","key":saved_key,"capability":cap});
+            let received = wire_call(&mut client, 2, get.clone()).await;
+            assert_eq!(received, saved);
+            let fault = rusqlite::Connection::open(&caller_path).unwrap();
+            fault
+                .execute_batch(
+                    "CREATE TRIGGER reject_caller_result BEFORE INSERT ON accepted_results
+                 BEGIN SELECT RAISE(ABORT,'caller result insert rejected'); END;",
+                )
+                .unwrap();
+            let error = journal.save_result(&request, &source).unwrap_err();
+            assert!(error.to_string().contains("caller result insert rejected"), "{error}");
+            assert!(journal.saved_result(&request.caller).unwrap().is_none());
+            assert_eq!(wire_call(&mut client, 3, get).await, received);
+
+            fault.execute_batch("DROP TRIGGER reject_caller_result").unwrap();
+            let accepted = journal.save_result(&request, &source).unwrap();
+            let cold = CallerJournal::open(&caller_path).unwrap();
+            assert_eq!(cold.saved_result(&request.caller).unwrap(), Some(accepted.clone()));
+            assert_eq!(json!(accepted.result_id()), received["result"]["id"]);
+            assert_eq!(json!(accepted.hash()), received["result"]["sha256"]);
+            assert_eq!(json!(accepted.body()), received["result"]["body"]);
+            let command = ack(json!(cap), json!(accepted.hash()));
+            let reply = wire_call(&mut client, 4, command.clone()).await;
+            assert_eq!(wire_call(&mut client, 5, command).await, reply);
+            running.cancel().await.unwrap();
+            reply
+        };
         assert_eq!(acknowledged["result"]["state"], "acknowledged");
         assert_eq!(acknowledged["result"]["body"], json!(body));
         assert_eq!(acknowledged["custody"], "open");
