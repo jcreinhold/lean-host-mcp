@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# Validate both ordinary file-backed public endpoints against the packaged pair.
+# Validate ordinary file-backed endpoints and optionally managed release against the packaged pair.
 set -euo pipefail
 CDPATH='' cd -- "$(dirname -- "$0")/.."
+managed_release=false
+if [[ ${1:-} == --managed-release ]]; then
+    managed_release=true
+    shift
+fi
+if [[ $# != 0 ]]; then
+    printf 'Usage: %s [--managed-release]\n' "$0" >&2
+    exit 2
+fi
 toolchain=$(cat fixtures/lean/lean-toolchain)
 id=${toolchain##*:}
 LEAN_SYSROOT=$(scripts/fixture-lean-prefix.sh)
@@ -24,7 +33,13 @@ mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache" "$scratc
 cargo package --locked --workspace
 # Cargo verifies the archives by unpacking them beside the .crate files.
 archives="$CARGO_TARGET_DIR/package"
-cargo build --locked --manifest-path "$archives/lean-host-mcp-$version/Cargo.toml" --bin lean-host-mcp
+parent_manifest="$archives/lean-host-mcp-$version/Cargo.toml"
+if "$managed_release"; then
+    LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1 cargo build --locked --manifest-path "$parent_manifest" \
+        --bin lean-host-mcp --features managed-native-store
+else
+    cargo build --locked --manifest-path "$parent_manifest" --bin lean-host-mcp
+fi
 # The source worker installer expects Cargo's native profile directories.
 export R2_SETUP_PARENT="$CARGO_TARGET_DIR/debug/lean-host-mcp"
 if [[ ! -x $R2_SETUP_PARENT ]]; then
@@ -35,3 +50,13 @@ cargo install --debug --locked --root "$R2_SETUP_ROOT/tools" --version "=$sdk" l
 "$R2_SETUP_PARENT" install-worker --toolchain "$id" --workers-dir "$R2_SETUP_ROOT/workers" \
     --source-dir "$archives/lean-host-mcp-worker-$version" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
 python3 tests/r2-launch-input/module_setup.py
+if "$managed_release"; then
+    # Keep the exact packaged executable while Cargo builds the checkout's
+    # test targets in the same artifact directory.
+    packaged_parent="$scratch/lean-host-mcp"
+    cp "$R2_SETUP_PARENT" "$packaged_parent"
+    scripts/check-parent-link.sh "$packaged_parent"
+    LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$R2_SETUP_ROOT/workers" \
+        LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$packaged_parent" \
+        scripts/test-installed-stdio.sh --all-targets --features managed-native-store
+fi

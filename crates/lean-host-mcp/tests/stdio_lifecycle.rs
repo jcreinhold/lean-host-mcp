@@ -411,6 +411,8 @@ mod launcher_regressions {
     use super::*;
     use std::fs;
 
+    const PACKAGED_LAUNCHER: &str = "LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER";
+
     struct Fixture {
         scratch: tempfile::TempDir,
         project: PathBuf,
@@ -443,7 +445,13 @@ mod launcher_regressions {
         }
 
         fn command(&self) -> Command {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+            let parent =
+                std::env::var_os(PACKAGED_LAUNCHER).unwrap_or_else(|| env!("CARGO_BIN_EXE_lean-host-mcp").into());
+            let mut command = Command::new(parent);
+            // Cargo's test loader paths do not belong to the packaged parent.
+            command
+                .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+                .env_remove("LD_LIBRARY_PATH");
             command
                 .current_dir(&self.project)
                 .env_remove("LEAN_HOST_MCP_PROJECT")
@@ -573,6 +581,11 @@ mod launcher_regressions {
 
     #[tokio::test]
     async fn launcher_cross_project_loaded_request_requires_actual_project_selection() {
+        #[cfg(not(lean_host_cutover_sdk))]
+        assert!(
+            std::env::var_os(PACKAGED_LAUNCHER).is_none(),
+            "managed release requires the SDK cutover API and its transition regressions"
+        );
         let fixture = Fixture::new();
         let (store, id) = fixture.new_store("store").await;
         fixture.enroll(&store, id);

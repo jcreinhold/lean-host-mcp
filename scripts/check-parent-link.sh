@@ -3,7 +3,14 @@
 set -euo pipefail
 CDPATH='' cd -- "$(dirname -- "$0")/.."
 
-binary=$(
+if [[ $# -gt 1 ]]; then
+    printf 'Usage: %s [parent-binary]\n' "$0" >&2
+    exit 2
+fi
+if [[ $# == 1 ]]; then
+    binary=$1
+else
+    binary=$(
     cargo build --locked --release -p lean-host-mcp --bin lean-host-mcp \
         --message-format=json-render-diagnostics |
         python3 -c '
@@ -22,6 +29,7 @@ if len(executables) != 1:
 print(executables[0])
 '
 )
+fi
 if [[ ! -f "$binary" || ! -x "$binary" ]]; then
     printf 'Expected a runnable parent executable at %s\n' "$binary" >&2
     exit 1
