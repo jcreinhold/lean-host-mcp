@@ -9,7 +9,7 @@
 )]
 
 use super::{
-    Answer, Capability, NativeKey, NativeStore, Problem, Reject, ResultKnowledge, Snapshot, authenticate, commit,
+    Answer, Capability, Gate, NativeKey, NativeStore, Problem, Reject, ResultKnowledge, Snapshot, authenticate, commit,
     number, read_stage, reject,
 };
 use rusqlite::{TransactionBehavior, params};
@@ -96,12 +96,14 @@ impl std::fmt::Debug for NativeStore {
 }
 
 impl NativeStore {
-    /// The managed service exposes admission and reconnect only.
+    /// The managed service exposes admission, reconnect and cancellation.
     pub(crate) fn admission(&mut self, bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
         let request = decode(bytes).map_err(|_| "invalid_request")?;
         match &request.command {
             ClientCommand::Discover {} => {}
-            ClientCommand::Create { capability, .. } | ClientCommand::Get { capability, .. } => {
+            ClientCommand::Create { capability, .. }
+            | ClientCommand::Get { capability, .. }
+            | ClientCommand::Cancel { capability, .. } => {
                 if *capability == [0; 32] {
                     return Err("capability_denied");
                 }
@@ -122,9 +124,19 @@ impl NativeStore {
             } => serde_json::json!({
                 "version": 1, "store": store, "acceptance_epoch": acceptance_epoch, "dispatch_enabled": false,
             }),
-            ClientReply::Snapshot(snapshot) => serde_json::json!({
-                "version": 1, "key": snapshot.key, "intent": snapshot.intent, "dispatch_enabled": false,
-            }),
+            ClientReply::Snapshot(snapshot) => {
+                let execution = match snapshot.gate {
+                    Gate::Pending => "admitted",
+                    Gate::Sealed if snapshot.stop_requested => "not_started",
+                    Gate::Sealed => "sealed",
+                    Gate::Consumed => "unknown",
+                };
+                serde_json::json!({
+                    "version": 1, "key": snapshot.key, "intent": snapshot.intent,
+                    "dispatch_enabled": false, "execution": execution,
+                    "cancel_requested": snapshot.stop_requested,
+                })
+            }
         })
     }
 

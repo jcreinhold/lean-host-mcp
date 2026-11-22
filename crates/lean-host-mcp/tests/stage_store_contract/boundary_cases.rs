@@ -100,6 +100,11 @@ fn pre_admission_cancel_survives_reopen_without_scope_or_closure() {
         cancelled
     );
     assert_eq!(snapshot(create(&mut store, &request)), cancelled);
+    let reply = store
+        .admission(command("get", &request).to_string().as_bytes())
+        .unwrap();
+    assert_eq!(reply["execution"], "not_started");
+    assert_eq!(reply["cancel_requested"], true);
     assert!(matches!(
         store.bind_scope(request.key, &request.capability, scope(0)),
         Err(Problem::Rejected(Reject::LaunchSealed))

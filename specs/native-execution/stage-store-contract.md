@@ -1,6 +1,6 @@
 # Saved task identity and launch tests
 
-Status: the host can opt in to durable admission and lookup. Dispatch and production service recovery remain disabled.
+Status: the host can opt in to durable admission, lookup and cancellation. Dispatch and production service recovery remain disabled.
 The contract tests also exercise the [stage kernel](stage-kernel.md) and [one-shot process fixture](stage-runtime-contract.md).
 
 ## Placement and dependency
@@ -23,7 +23,10 @@ values with a fresh 16-byte nonce, stage number, randomly generated 32-byte capa
 Send the store UUID, epoch, nonce and stage as `key`, and the bytes as `capability` and `intent`. Use `get` with the
 same key and capability after an interrupted response. The same `create` returns the original key and intent.
 A different intent or capability for that key is refused. All replies advertise `dispatch_enabled: false`.
-The opt-in route accepts only `discover`, `create` and `get`.
+Use `cancel` with the original key and capability. Its transaction seals an unused launch gate and records the stop
+request together. After a lost cancel reply, either `get` or an equal `cancel` returns `execution: "not_started"` for
+that same unused revision. A consumed gate reports `execution: "unknown"` even after cancellation. The opt-in route
+accepts only `discover`, `create`, `get` and `cancel`.
 
 ## What is saved
 

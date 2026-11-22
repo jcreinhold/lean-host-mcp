@@ -221,7 +221,7 @@ enum RetainedAction {
 #[tool_router(router = managed_tool_router)]
 impl LeanHostService {
     #[tool(
-        description = "Discover the managed store, admit immutable stage intent, or retrieve the original admission. Does not dispatch."
+        description = "Discover the managed store, admit immutable stage intent, retrieve an admission, or cancel it. Does not dispatch."
     )]
     fn lean_managed_admission(
         &self,
@@ -719,8 +719,8 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[cfg(all(unix, feature = "managed-native-store"))]
-    #[test]
-    fn managed_admission_recovers_original_and_keeps_stock_tool_table() {
+    #[tokio::test]
+    async fn managed_admission_recovers_original_and_keeps_stock_tool_table() {
         use serde_json::{Value, json};
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
@@ -783,6 +783,104 @@ mod tests {
             "operation_disabled"
         );
         assert!(stock().get_tool("lean_managed_admission").is_none());
+
+        // Use an ordinary in-memory peer for the real tool router, without
+        // keeping a clone of the admitted store open across restart.
+        let (server_io, mut client_io) = tokio::io::duplex(65_536);
+        client_io.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let peer = stock().serve(server_io).await.unwrap();
+        let context = RequestContext::new(NumberOrString::Number(2), peer.peer().clone());
+        let routed = |command: Value| {
+            CallToolRequestParams::new("lean_managed_admission").with_arguments(
+                serde_json::from_value(json!({"request":json!({"version":1,"command":command}).to_string()})).unwrap(),
+            )
+        };
+        let cancel = |capability: Vec<u8>| routed(json!({"op":"cancel","key":key,"capability":capability}));
+        assert_eq!(
+            service
+                .call_tool(cancel(vec![2; 32]), context.clone())
+                .await
+                .unwrap_err()
+                .message,
+            "capability_denied"
+        );
+        let mut other_revision = key.clone();
+        other_revision["nonce"] = json!(vec![8; 16]);
+        assert_eq!(
+            service
+                .call_tool(
+                    routed(json!({"op":"cancel","key":other_revision,"capability":cap})),
+                    context.clone()
+                )
+                .await
+                .unwrap_err()
+                .message,
+            "unknown_stage"
+        );
+        assert_eq!(
+            call(&service, json!({"op":"get","key":key,"capability":cap})).unwrap(),
+            original
+        );
+        // The commit succeeds, but the caller never observes the cancel reply.
+        drop(service.call_tool(cancel(cap.clone()), context.clone()).await.unwrap());
+        drop(service);
+        let service = stock().with_managed_native_store(&path).unwrap();
+        let saved = call(&service, json!({"op":"get","key":key,"capability":cap})).unwrap();
+        assert_eq!(saved["execution"], "not_started");
+        assert_eq!(saved["cancel_requested"], true);
+        assert_eq!(saved["key"], key);
+        assert_eq!(call(&service, create(vec![42])).unwrap(), saved);
+        let CallToolResponse::Complete(repeat) = service.call_tool(cancel(cap.clone()), context.clone()).await.unwrap()
+        else {
+            unreachable!("cancel must return a synchronous reply");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&repeat.content.first().unwrap().as_text().unwrap().text).unwrap(),
+            saved
+        );
+
+        // A trusted fixture marks another original revision consumed. Public
+        // cancellation can record a stop request without certifying no start.
+        call(
+            &service,
+            json!({"op":"create","key":other_revision,"capability":cap,"intent":[42]}),
+        )
+        .unwrap();
+        {
+            use crate::native_store::store::{Capability, Consume, Scope};
+            let mut store = service.managed_store.as_ref().unwrap().lock();
+            let native_key = serde_json::from_value(other_revision.clone()).unwrap();
+            let cap = Capability([1; 32]);
+            let binding = store
+                .bind_scope(
+                    native_key,
+                    &cap,
+                    Scope {
+                        id: [3; 16],
+                        generation: 1,
+                        owner: [4; 16],
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                store.consume_launch(binding, &cap).unwrap(),
+                Consume::Granted(_)
+            ));
+        }
+        let CallToolResponse::Complete(consumed) = service
+            .call_tool(
+                routed(json!({"op":"cancel","key":other_revision,"capability":cap})),
+                context,
+            )
+            .await
+            .unwrap()
+        else {
+            unreachable!("cancel must return a synchronous reply");
+        };
+        let consumed: Value = serde_json::from_str(&consumed.content.first().unwrap().as_text().unwrap().text).unwrap();
+        assert_eq!(consumed["execution"], "unknown");
+        assert_eq!(consumed["cancel_requested"], true);
+        peer.cancel().await.unwrap();
     }
 
     #[tokio::test]
