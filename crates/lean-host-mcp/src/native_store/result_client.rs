@@ -1,6 +1,7 @@
 //! Client ordering only: two independent commits, no process-custody authority.
-use crate::store::{Binding, CallerJournal, CallerResult, NativeStore, Problem, Reject, SavedRequest};
+use super::store::{Binding, CallerJournal, CallerResult, NativeStore, Problem, Reject, SavedRequest};
 
+/// Complete the trusted caller's save and acknowledgment in that order.
 pub(crate) fn accept_then_ack(
     caller: &mut CallerJournal,
     native: &mut NativeStore,

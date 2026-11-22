@@ -14,13 +14,11 @@
 )]
 #[path = "../src/native_store/mod.rs"]
 mod native_store;
-use native_store::{connection, store};
+use native_store::{connection, result_client, store};
 #[path = "stage_runtime_contract/fixtures.rs"]
 mod fixtures;
 #[path = "../../../specs/native-execution/stage_kernel.rs"]
 mod kernel;
-#[path = "stage_store_contract/result_client.rs"]
-mod result_client;
 #[path = "stage_runtime_contract/runtime.rs"]
 mod runtime;
 use fixtures::{Contender, Dispatch, Fixture, GoFault, ObservedKind};

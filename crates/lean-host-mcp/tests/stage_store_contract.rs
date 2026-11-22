@@ -11,8 +11,6 @@
 
 #[path = "../src/native_store/mod.rs"]
 mod native_store;
-use native_store::{connection, store};
-#[path = "stage_store_contract/result_client.rs"]
-mod result_client;
+use native_store::{connection, result_client, store};
 #[path = "stage_store_contract/cases.rs"]
 mod tests;
