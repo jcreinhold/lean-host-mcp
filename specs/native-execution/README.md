@@ -59,8 +59,13 @@ The progress checks assume weak fairness of the bounded guardian and OS steps an
 authentic closure evidence. They give sender return and broker resume no fairness. The witness reaches writer
 admission with a coalesced duplicate, the inserting sender frozen before return and guardian sampling, and the
 parent resumed between sample and commit. The unavailable-evidence branch keeps custody pending. The model separates
-visibility and durable acceptance as abstract steps. SQLite and filesystem durability, actual process and lock observations, an
-armed guardian's deadline path, and autonomous drain after parent death require their own qualification.
+slot visibility from `GuardianCommitStoppedDrain`, which represents successful sync of the guardian's owner decision.
+The visible owner replacement before sync and the optional `accepted` witness after sync leave the modeled state
+unchanged. Observers report pending or unknown until the witness validates. A failed or absent witness leaves the
+guardian's committed stop and drain enabled. A temporary guardian pause in either gap is a stutter. A permanently
+unavailable guardian falls outside the progress assumption, and reuse still requires authentic closure. SQLite and
+filesystem durability, actual process and lock observations, an armed guardian's deadline path, and autonomous drain
+after parent death require their own qualification.
 
 **Managed writer recovery.** `WriterSpec` in `Stages.tla` uses the existing SDK
 reader-closure and conflicting-admission steps. It binds the source handoff to
