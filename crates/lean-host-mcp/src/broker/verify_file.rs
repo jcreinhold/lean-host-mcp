@@ -83,6 +83,8 @@ impl ProjectBroker {
             return Err(invalid("incomplete prepared selection"));
         }
         let project_domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
+        lean_host_mcp_worker::prepared_project::PreparedGeneration::check_identity(input, &project_domains)
+            .map_err(invalid)?;
         let mut expected: Vec<_> = project_domains.iter().map(|p| p.join(".lake/build/lib/lean")).collect();
         expected.extend(shims.clone());
         expected.push(plan.release.clone());

@@ -13,12 +13,17 @@ version.workspace = true
 [[bin]]
 name = "lean-host-mcp-worker"
 path = "src/main.rs"
+required-features = ["native-worker"]
+
+[features]
+default = ["native-worker"]
+native-worker = ["dep:lean-rs", "dep:lean-rs-host", "dep:lean-rs-worker-child", "dep:lean-rs-worker-protocol"]
 
 [dependencies]
-lean-rs = "0.10.6"
-lean-rs-host = "0.10.6"
-lean-rs-worker-child.workspace = true
-lean-rs-worker-protocol.workspace = true
+lean-rs = { version = "0.10.6", optional = true }
+lean-rs-host = { version = "0.10.6", optional = true }
+lean-rs-worker-child = { workspace = true, optional = true }
+lean-rs-worker-protocol = { workspace = true, optional = true }
 lean-toolchain.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

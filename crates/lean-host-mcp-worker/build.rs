@@ -27,7 +27,7 @@ fn main() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=HOME");
 
-    if env::var_os("DOCS_RS").is_some() {
+    if env::var_os("CARGO_FEATURE_NATIVE_WORKER").is_none() || env::var_os("DOCS_RS").is_some() {
         return Ok(());
     }
 

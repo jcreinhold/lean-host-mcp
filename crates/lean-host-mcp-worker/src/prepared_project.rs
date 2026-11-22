@@ -325,6 +325,24 @@ impl ImportPlan {
     }
 }
 impl PreparedGeneration {
+    /// Verify a captured generation against its producer identity under existing reader custody.
+    ///
+    /// # Errors
+    /// Refuses malformed selections or changes to ordered roots, sources, or products.
+    pub fn check_identity(input: &str, domains: &[PathBuf]) -> io::Result<()> {
+        if input.len() > 4096 {
+            return Err(invalid());
+        }
+        let generation: Self = serde_json::from_str(input)?;
+        if generation.plan.identity(domains)? != generation.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prepared generation identity changed",
+            ));
+        }
+        Ok(())
+    }
+
     /// Project selected by the parent when it bound this record to its configured primary.
     pub fn project(&self) -> &Path {
         &self.plan.project
