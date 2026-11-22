@@ -63,6 +63,7 @@ impl ClientRequest {
                 revision,
                 submit,
                 authorization,
+                claimant,
             } => Some(DrainClaim {
                 key: *key,
                 capability: Capability(*capability),
@@ -70,6 +71,7 @@ impl ClientRequest {
                 revision: *revision,
                 submit: *submit,
                 authorization: *authorization,
+                claimant: *claimant,
             }),
             _ => None,
         }
@@ -84,6 +86,7 @@ pub(crate) struct DrainClaim {
     pub(crate) revision: u64,
     pub(crate) submit: bool,
     pub(crate) authorization: Option<[u8; 32]>,
+    pub(crate) claimant: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for ClientRequest {
@@ -122,6 +125,8 @@ enum ClientCommand {
         submit: bool,
         #[serde(default)]
         authorization: Option<[u8; 32]>,
+        #[serde(default)]
+        claimant: Option<[u8; 32]>,
     },
     Ack {
         key: NativeKey,

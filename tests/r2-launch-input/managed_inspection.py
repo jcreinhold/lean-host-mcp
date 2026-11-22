@@ -28,6 +28,9 @@ def run_check(args):
         (root / name).mkdir(mode=0o700)
     assert not (project / "lean-host-mcp.toml").exists()
     db = root / "stages.sqlite3"
+    entry_trace = args.entry_scratch.resolve(strict=True) / "inspection-entries" if args.entry_scratch else None
+    if entry_trace:
+        assert not entry_trace.exists(), "entry witness must start empty"
     env = {
         key: val for key, val in os.environ.items()
         if not key.startswith(("LEAN_", "LAKE_", "DYLD_", "__XPC_DYLD_"))
@@ -51,10 +54,14 @@ def run_check(args):
     ]
 
     @contextmanager
-    def server(*, stop_before_arm=False):
-        child_env = env
+    def server(*, stop_before_arm=False, stop_after_claim=False):
+        child_env = dict(env)
+        if args.abrupt and entry_trace:
+            child_env["LEAN_RS_WORKER_GUARDIAN_DRAIN_SLOT"] = "1"
         if stop_before_arm:
-            child_env = dict(env, LEAN_HOST_MCP_TEST_STOP_BEFORE_ARM="1", LEAN_RS_WORKER_GUARDIAN_DRAIN_SLOT="1")
+            child_env.update(LEAN_HOST_MCP_TEST_STOP_BEFORE_ARM="1", LEAN_RS_WORKER_GUARDIAN_DRAIN_SLOT="1")
+        if stop_after_claim:
+            child_env["LEAN_HOST_MCP_TEST_STOP_AFTER_CLAIM"] = "1"
         with subprocess.Popen(
             command, cwd=root, env=child_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
         ) as proc:
@@ -77,7 +84,7 @@ def run_check(args):
                 proc.stdin.flush()
                 return message.get("id")
 
-            def receive(ident, *, poll=False, error=None):
+            def receive(ident, *, poll=False, error=None, allow_error=False):
                 end = time.monotonic() + 25
                 while True:
                     answer = replies.get(timeout=max(0, end - time.monotonic()))
@@ -85,6 +92,8 @@ def run_check(args):
                         if error is not None:
                             assert answer.get("error", {}).get("message") == error, answer
                             return None
+                        if allow_error and "error" in answer:
+                            return {"rpc_error": answer["error"]["message"]}
                         if poll and answer.get("error", {}).get("message") == "store_busy":
                             return None
                         assert "error" not in answer, answer
@@ -95,10 +104,10 @@ def run_check(args):
             def tool(name, arguments):
                 return send("tools/call", dict(name=name, arguments=arguments))
 
-            def result(ident, *, poll=False, error=None):
-                reply = receive(ident, poll=poll, error=error)
-                if reply is None:
-                    return None
+            def result(ident, *, poll=False, error=None, allow_error=False):
+                reply = receive(ident, poll=poll, error=error, allow_error=allow_error)
+                if reply is None or "rpc_error" in reply:
+                    return reply
                 assert not reply.get("isError"), reply
                 return json.loads(reply["content"][0]["text"])
 
@@ -122,6 +131,33 @@ def run_check(args):
                         proc.kill()
                         proc.wait()
 
+    def resume_guardian(pid):
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+
+    def wait_stopped(pid, end):
+        while True:
+            state = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True,
+            ).stdout.strip()
+            if state.startswith("T"):
+                return
+            assert state and time.monotonic() < end, (pid, state)
+            time.sleep(0.01)
+
+    def assert_artifact_locks_held(record):
+        domains = json.loads(record.read_bytes())["protected_domains"]
+        assert domains, "original scope had no retained read locks"
+        for domain in domains:
+            with open(domain["lock_path"], "rb") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+            raise AssertionError("exclusive lock acquired while original custody was held")
+
     def bindings():
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
             return conn.execute("SELECT registry_generation FROM recovery_bindings").fetchall()
@@ -143,7 +179,7 @@ def run_check(args):
             )).encode())
             origin = dict(key=key, capability=cap)
             creation = dict(origin, intent=intent)
-            if args.stopped_owner:
+            if args.stopped_owner or (args.abrupt and entry_trace):
                 drain_authorization = list(os.urandom(32))
                 creation["drain_authorization"] = drain_authorization
             assert result(managed("create", **creation))["execution"] == "admitted"
@@ -194,7 +230,33 @@ def run_check(args):
                              error="recovery_claim_changed")
                         assert read(recover("drain", **claim, submit=False))["drain"] == "empty"
                         assert "drain_authorization" not in lookup and "authorization" not in lookup["recovery"]
-                        assert read(recover("drain", **claim, submit=True, authorization=drain_authorization))["drain"] == "offered"
+                        claimant = list(os.urandom(32))
+                        rival = list(os.urandom(32))
+                        with server(stop_after_claim=True) as (offer, _, _, claimant_process):
+                            offer("drain", **claim, submit=True, authorization=drain_authorization,
+                                  claimant=claimant)
+                            end = time.monotonic() + 5
+                            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as observer:
+                                while True:
+                                    claim_state = observer.execute(
+                                        "SELECT recovery_claim_hash,gate,resource_report,result_kind FROM stages"
+                                    ).fetchone()
+                                    if claim_state[0] is not None:
+                                        break
+                                    assert time.monotonic() < end, claim_state[1:]
+                                    time.sleep(0.01)
+                            assert claim_state == (hashlib.sha256(bytes(claimant)).digest(), 1, 1, 0)
+                            read(recover("drain", **claim, submit=True, authorization=drain_authorization,
+                                         claimant=rival), error="recovery_claim_busy")
+                            assert read(recover("drain", **claim, submit=False))["drain"] == "empty"
+                            assert_artifact_locks_held(record)
+                            claimant_process.kill()
+                            assert claimant_process.wait(timeout=5) == -signal.SIGKILL
+                        read(recover("drain", **claim, submit=True, authorization=drain_authorization,
+                                     claimant=rival), error="recovery_claim_busy")
+                        resumed = read(recover("drain", **claim, submit=True, authorization=drain_authorization,
+                                               claimant=claimant))
+                        assert resumed["drain"] == "offered" and resumed["claim"] == "same"
                         end = time.monotonic() + 5
                         while True:
                             decision = read(recover("drain", **claim, submit=False))["drain"]
@@ -236,7 +298,10 @@ def run_check(args):
                         os.kill(proc.pid, signal.SIGCONT)
                         assert result(original_start) == recovered
                         assert len(bindings()) == 1
-                        print("read-only and changed claims refused; competing collector preserved exact closure through broker resume")
+                        if entry_trace:
+                            assert not entry_trace.exists(), "fenced original entered the Lean target"
+                            print("observed zero actual Lean target entries through closure and original retry")
+                        print("winning claim survived claimant death; rival refused and original locks held until guardian closure")
                 finally:
                     proc.kill()
                     proc.wait(timeout=5)
@@ -258,37 +323,50 @@ def run_check(args):
                 scope = json.loads(row[0])
                 guardian = scope["guardian"]["pid"]
                 worker = scope["worker"]["pid"]
+                if entry_trace:
+                    expected_entry = f"{worker} {args.declaration}\n"
+                    while not entry_trace.exists() or entry_trace.read_text() != expected_entry:
+                        assert time.monotonic() < end, "missing exact Lean target entry"
+                        time.sleep(0.01)
+                    with server() as (claim_a, reply_a, _, _), server() as (claim_b, reply_b, _, _):
+                        exact = dict(origin, generation=scope["generation"], revision=1, submit=True,
+                                     authorization=drain_authorization)
+                        offer_a = claim_a("drain", **exact, claimant=list(os.urandom(32)))
+                        offer_b = claim_b("drain", **exact, claimant=list(os.urandom(32)))
+                        decisions = [reply_a(offer_a, allow_error=True), reply_b(offer_b, allow_error=True)]
+                        assert sum(decision.get("claim") == "won" for decision in decisions) == 1, decisions
+                        assert sum(decision.get("rpc_error") == "recovery_claim_busy" for decision in decisions) == 1
+                    os.kill(proc.pid, signal.SIGSTOP)
                 os.kill(guardian, signal.SIGSTOP)
-                stopped.callback(os.kill, guardian, signal.SIGCONT)
+                stopped.callback(resume_guardian, guardian)
+                if entry_trace:
+                    wait_stopped(guardian, end)
+                    wait_stopped(proc.pid, end)
                 os.kill(worker, signal.SIGSTOP)
+                if entry_trace:
+                    wait_stopped(worker, end)
                 proc.kill()
                 proc.wait(timeout=5)
                 original_binding = bindings()
-
-                corrupt = root / "damaged.sqlite3"
-                damaged = b"deliberately invalid managed store"
-                with os.fdopen(os.open(corrupt, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as output:
-                    output.write(damaged)
                 record = root / "owners" / f"worker-{scope['generation']}" / "owner.json"
-                original_owner = record.read_bytes()
-                refused = subprocess.run(
-                    [*command[:-1], corrupt], cwd=root, env=env,
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=8,
-                )
-                assert refused.returncode != 0 and b"file is not a database" in refused.stderr, refused.stderr
-                assert corrupt.read_bytes() == damaged and record.read_bytes() == original_owner
-                os.kill(guardian, 0)
-                os.kill(worker, 0)
-                domains = json.loads(original_owner)["protected_domains"]
-                assert domains, "original scope had no retained read locks"
-                for domain in domains:
-                    with open(domain["lock_path"], "rb") as lock:
-                        try:
-                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        except BlockingIOError:
-                            continue
-                    raise AssertionError("exclusive lock acquired while original custody was held")
-                print("corrupt store refused with original live custody and read locks intact")
+                assert_artifact_locks_held(record)
+
+                if not entry_trace:
+                    corrupt = root / "damaged.sqlite3"
+                    damaged = b"deliberately invalid managed store"
+                    with os.fdopen(os.open(corrupt, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as output:
+                        output.write(damaged)
+                    original_owner = record.read_bytes()
+                    refused = subprocess.run(
+                        [*command[:-1], corrupt], cwd=root, env=env,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=8,
+                    )
+                    assert refused.returncode != 0 and b"file is not a database" in refused.stderr, refused.stderr
+                    assert corrupt.read_bytes() == damaged and record.read_bytes() == original_owner
+                    os.kill(guardian, 0)
+                    os.kill(worker, 0)
+                    assert_artifact_locks_held(record)
+                    print("corrupt store refused with original live custody and read locks intact")
             else:
                 end = time.monotonic() + 25
                 while True:
@@ -323,8 +401,13 @@ def run_check(args):
                 assert completed["custody"] == "closed" and completed["result"]["state"] == "retained"
                 assert json.loads(bytes(completed["result"]["body"]))["declaration"]["name"] == "second_ok"
                 assert result(managed("get", **origin)) == recovered
+                assert_artifact_locks_held(record)
                 two_bindings = bindings()
                 assert len(two_bindings) == 2 and original_binding[0] in two_bindings
+                if entry_trace:
+                    # Killing the worker can auto-resume its now-orphaned guardian group.
+                    # Keep custody frozen through the unrelated-work check first.
+                    os.kill(worker, signal.SIGKILL)
                 stopped.close()
                 end = time.monotonic() + 10
                 while True:
@@ -336,6 +419,9 @@ def run_check(args):
                 assert settled["execution"] == "unknown" and settled["result"]["state"] == "pending"
                 assert result(managed("start", **origin)) == settled
                 assert bindings() == two_bindings
+                if entry_trace:
+                    assert entry_trace.read_text() == expected_entry
+                    print("observed exactly one Lean target entry before receiver death and none on recovery")
                 print("replacement inspected second_ok with original custody held; original closed after guardian resumed without replay")
             else:
                 assert recovered["result"] == saved and retry["result"] == saved
@@ -368,4 +454,8 @@ if __name__ == "__main__":
     mode.add_argument("--abrupt", action="store_true")
     mode.add_argument("--stopped-owner", action="store_true")
     mode.add_argument("--fail-result-save", action="store_true")
-    run_check(parser.parse_args())
+    parser.add_argument("--entry-scratch", type=Path)
+    args = parser.parse_args()
+    if args.entry_scratch and not (args.stopped_owner or args.abrupt):
+        parser.error("--entry-scratch requires a stopped-owner or abrupt case")
+    run_check(args)

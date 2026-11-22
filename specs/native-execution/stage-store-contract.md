@@ -48,7 +48,11 @@ or reissue a launch grant.
 For the matched macOS prepared route, authenticated GET can return a recovery claim with the original revision
 and worker generation. Send the complete claim and original key/capability with `drain`. Set `submit: false`
 to observe the slot. Offering handoff with `submit: true` also requires the independent `authorization` secret
-committed as `drain_authorization` at CREATE. GET and slot observation never disclose that secret. An offer or acceptance
+committed as `drain_authorization` at CREATE, plus a separate nonzero 32-byte `claimant` secret the claimant
+persists before submitting. GET and slot observation never disclose either secret. The transaction binds the claim
+to the original attempt, revision, and exact generation. It seals an unused gate and preserves a spent gate. An equal
+retry recovers the claim, while a rival receives `recovery_claim_busy`. The original guardian retains cleanup authority.
+An offer or acceptance
 does not certify closure. The original guardian decides eligibility and retains the original hard deadline
 when armed. Select the SDK drain-slot mode with `LEAN_RS_WORKER_GUARDIAN_DRAIN_SLOT=1` for the matched
 guardian. The replacement records closure only from the exact SDK witness or independently observed whole-group

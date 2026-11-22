@@ -364,6 +364,7 @@ pub(crate) fn drain(
         revision,
         submit,
         authorization,
+        claimant,
     } = claim;
     if capability.0 == [0; 32] {
         return Err(McpError::invalid_params("capability_denied", None));
@@ -387,7 +388,7 @@ pub(crate) fn drain(
         intent: snapshot.intent,
         capability,
     };
-    let (_, identity) = store
+    let (binding, identity) = store
         .open_stage_recovery(&saved, Some(&generation))
         .map_err(|_| McpError::invalid_params("recovery_claim_changed", None))?;
     let registry = std::path::Path::new(std::ffi::OsStr::from_bytes(&identity.directory));
@@ -396,7 +397,27 @@ pub(crate) fn drain(
     }
     let expected = native_binding(&identity);
     let unavailable = |_| McpError::internal_error("drain_unavailable", None);
+    let mut claim_status = None;
     let disposition = if submit {
+        let won = store
+            .claim_recovery(&saved, binding, &identity, authorization, claimant)
+            .map_err(|error| match error {
+                Problem::Rejected(Reject::RecoveryClaimBusy) => McpError::invalid_params("recovery_claim_busy", None),
+                Problem::Rejected(Reject::CallerBindingChanged | Reject::WrongScope | Reject::IntentChanged) => {
+                    McpError::invalid_params("recovery_claim_changed", None)
+                }
+                other => public_error(other),
+            })?;
+        claim_status = Some(if won { "won" } else { "same" });
+        if won
+            && option_env!("LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT").is_some()
+            && std::env::var_os("LEAN_HOST_MCP_TEST_STOP_AFTER_CLAIM").is_some()
+        {
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)
+                .map_err(std::io::Error::from)
+                .map_err(unavailable)?;
+        }
+        // The durable claim survives any failed delivery or lost response.
         submit_original_guardian_drain(registry, &expected).map_err(unavailable)?;
         "offered"
     } else {
@@ -407,5 +428,5 @@ pub(crate) fn drain(
             NativeGuardianDrainStatus::Accepted => "accepted",
         }
     };
-    Ok(serde_json::json!({"drain":disposition,"key":key}))
+    Ok(serde_json::json!({"drain":disposition,"key":key,"claim":claim_status}))
 }

@@ -223,6 +223,81 @@ impl NativeStore {
         Ok(())
     }
 
+    /// Win or recover one exact durable claim. This never returns a launch
+    /// grant or changes custody; the original guardian still decides cleanup.
+    pub(crate) fn claim_recovery(
+        &mut self,
+        saved: &SavedRequest,
+        binding: Binding,
+        identity: &RegistryIdentity,
+        authorization: Option<[u8; 32]>,
+        claimant: Option<[u8; 32]>,
+    ) -> Answer<bool> {
+        self.checked_key(saved.key)?;
+        let (Some(authorization), Some(claimant)) = (authorization, claimant) else {
+            return reject(Reject::CapabilityDenied);
+        };
+        if claimant == [0; 32] || claimant == authorization || claimant == saved.capability.0 {
+            return reject(Reject::CapabilityDenied);
+        }
+        if binding.key != saved.key || !identity.valid() || !identity.matches_directory() {
+            return reject(Reject::WrongScope);
+        }
+        let encoded = serde_json::to_vec(identity).map_err(|_| Problem::Rejected(Reject::WrongScope))?;
+        self.db.check_profile()?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = bound_stage(&tx, binding, &saved.capability)?;
+        if !old.matches_intent(&saved.intent) {
+            return reject(Reject::IntentChanged);
+        }
+        let key = saved.key;
+        let row = tx
+            .query_row(
+                "SELECT s.drain_auth_hash,s.recovery_claim_hash
+             FROM stages s JOIN recovery_bindings r USING(epoch,nonce,stage)
+             JOIN scope_heads h ON h.scope=s.scope AND h.generation=s.generation AND h.owner=s.owner
+             WHERE s.epoch=?1 AND s.nonce=?2 AND s.stage=?3
+               AND r.job=?4 AND r.caller_stage=?5 AND r.revision=?6
+               AND r.registry_generation=?7 AND r.identity=?8",
+                params![
+                    number(key.epoch)?,
+                    key.nonce,
+                    number(key.stage)?,
+                    saved.caller.job,
+                    number(saved.caller.stage)?,
+                    number(saved.caller.revision)?,
+                    identity.generation,
+                    encoded
+                ],
+                |r| Ok((optional_fixed::<32>(r, 0)?, optional_fixed::<32>(r, 1)?)),
+            )
+            .optional()?
+            .ok_or(Problem::Rejected(Reject::CallerBindingChanged))?;
+        if row.0.as_ref().map(<[u8; 32]>::as_slice) != Some(digest(&authorization).as_slice()) {
+            return reject(Reject::CapabilityDenied);
+        }
+        let hash = digest(&claimant);
+        if let Some(winner) = row.1 {
+            if winner.as_slice() != hash {
+                return reject(Reject::RecoveryClaimBusy);
+            }
+            return Ok(false);
+        }
+        if old.resource_report == ResourceReport::Closed {
+            return reject(Reject::WrongScope);
+        }
+        tx.execute(
+            "UPDATE stages SET recovery_claim_hash=?4,gate=CASE WHEN gate=0 THEN 2 ELSE gate END
+             WHERE epoch=?1 AND nonce=?2 AND stage=?3",
+            params![number(key.epoch)?, key.nonce, number(key.stage)?, hash],
+        )?;
+        commit(tx, "recovery-claim")?;
+        Ok(true)
+    }
+
     /// Read one authenticated binding without opening the service ownership
     /// lock. The SDK must recheck all of it under its publication lock
     /// before acting on a scope. This read confers no process authority.

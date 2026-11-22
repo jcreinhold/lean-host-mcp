@@ -872,6 +872,93 @@ mod caller_results;
 mod boundary_cases;
 
 #[test]
+fn exact_recovery_claim_has_one_durable_winner_and_cannot_restore_launch() {
+    use crate::store::recovery::RegistryIdentity;
+    use lean_toolchain::native_guardian::NativeProcessIdentity;
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt},
+    };
+
+    for spent in [false, true] {
+        let fixture = Fixture::new();
+        let (mut journal, mut store) = fixture.init();
+        let saved = saved(&mut journal, &store, 1);
+        let authorization = [17; 32];
+        let payload = serde_json::json!({"version":1,"command":{
+            "op":"create","key":saved.key,"intent":saved.intent,
+            "capability":saved.capability.0,"drain_authorization":authorization
+        }});
+        store.admission(payload.to_string().as_bytes()).unwrap();
+        let registry = fixture.root.join("registry");
+        fs::DirBuilder::new().mode(0o700).create(&registry).unwrap();
+        let meta = registry.metadata().unwrap();
+        let process = |pid| NativeProcessIdentity {
+            version: 1,
+            pid,
+            start: format!("birth-{pid}"),
+            session: 1,
+            process_group: 2,
+        };
+        let identity = RegistryIdentity {
+            directory: registry.as_os_str().as_bytes().to_vec(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            generation: "a".repeat(48),
+            boot: [9; 16],
+            parent: process(9),
+            worker: process(10),
+            guardian: process(11),
+        };
+        let binding = store.bind_timed_recovery_scope(&saved, scope(0), &identity, 1).unwrap();
+        store
+            .observe_resource(binding, &saved.capability, ResourceReport::Open)
+            .unwrap();
+        if spent {
+            assert!(granted(store.consume_launch(binding, &saved.capability).unwrap()));
+        }
+        let gate = Arc::new(Barrier::new(2));
+        let contenders = [[18; 32], [19; 32]].map(|claimant| {
+            let ready = Arc::clone(&gate);
+            let path = fixture.native();
+            let saved = saved.clone();
+            let identity = identity.clone();
+            thread::spawn(move || {
+                let mut replacement = NativeStore::open(&path).unwrap();
+                ready.wait();
+                (
+                    claimant,
+                    replacement.claim_recovery(&saved, binding, &identity, Some(authorization), Some(claimant)),
+                )
+            })
+        });
+        let [one, two] = contenders.map(|worker| worker.join().unwrap());
+        let winner = match (one, two) {
+            ((id, Ok(true)), (_, Err(Problem::Rejected(Reject::RecoveryClaimBusy))))
+            | ((_, Err(Problem::Rejected(Reject::RecoveryClaimBusy))), (id, Ok(true))) => id,
+            other => panic!("expected one winner and one busy contender, got {other:?}"),
+        };
+        let mut reopened = NativeStore::open(&fixture.native()).unwrap();
+        assert!(
+            !reopened
+                .claim_recovery(&saved, binding, &identity, Some(authorization), Some(winner))
+                .unwrap()
+        );
+        let mut wrong = saved.clone();
+        wrong.caller.revision += 1;
+        assert!(matches!(
+            reopened.claim_recovery(&wrong, binding, &identity, Some(authorization), Some(winner)),
+            Err(Problem::Rejected(Reject::CallerBindingChanged))
+        ));
+        let view = reopened.get(saved.key).unwrap().unwrap();
+        assert_eq!(view.resource_report, ResourceReport::Open);
+        assert_eq!(view.result, ResultKnowledge::Pending);
+        assert_eq!(view.gate, if spent { Gate::Consumed } else { Gate::Sealed });
+        assert!(!granted(reopened.consume_launch(binding, &saved.capability).unwrap()));
+    }
+}
+
+#[test]
 fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
     use crate::store::recovery::RegistryIdentity;
     use lean_toolchain::native_guardian::NativeProcessIdentity;

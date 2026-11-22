@@ -90,6 +90,7 @@ pub(crate) enum Reject {
     InvalidResult,
     LaunchSealed,
     DispatchDisabled,
+    RecoveryClaimBusy,
 }
 type Answer<T> = Result<T, Problem>;
 fn reject<T>(why: Reject) -> Answer<T> {
@@ -528,6 +529,7 @@ impl NativeStore {
             managed_ack INTEGER NOT NULL DEFAULT 0 CHECK(managed_ack IN(0,1)),\n\
             compacted_intent_sha256 BLOB CHECK(length(compacted_intent_sha256)=32),\n\
             drain_auth_hash BLOB CHECK(length(drain_auth_hash)=32),\n\
+            recovery_claim_hash BLOB CHECK(length(recovery_claim_hash)=32),\n\
             PRIMARY KEY(epoch,nonce,stage),UNIQUE(scope,generation),\n\
             CHECK((scope IS NULL AND generation IS NULL AND owner IS NULL) OR (scope IS NOT NULL AND generation IS NOT NULL AND owner IS NOT NULL AND length(scope)=16 AND generation>=0 AND length(owner)=16))) STRICT;"))?;
         tx.execute_batch(recovery::SCHEMA)?;
@@ -574,6 +576,16 @@ impl NativeStore {
         )?;
         if !has_drain_auth {
             tx.execute_batch("ALTER TABLE stages ADD COLUMN drain_auth_hash BLOB CHECK(length(drain_auth_hash)=32)")?;
+        }
+        let has_claim: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('stages') WHERE name='recovery_claim_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_claim {
+            tx.execute_batch(
+                "ALTER TABLE stages ADD COLUMN recovery_claim_hash BLOB CHECK(length(recovery_claim_hash)=32)",
+            )?;
         }
         let store = tx.query_row("SELECT store FROM meta WHERE singleton=1", [], |r| fixed(r, 0))?;
         let prior = {
