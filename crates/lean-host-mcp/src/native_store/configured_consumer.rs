@@ -13,13 +13,13 @@ const MAX_RECEIPT: usize = 60 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SourceIdentity {
-    pub(super) file: PathBuf,
-    pub(super) sha256: [u8; 32],
+pub(crate) struct SourceIdentity {
+    pub(crate) file: PathBuf,
+    pub(crate) sha256: [u8; 32],
 }
 
 impl SourceIdentity {
-    pub(super) fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.file.as_os_str().len() <= 1024
             && self.file.extension().is_some_and(|ext| ext == "lean")
             && self.file.components().all(|part| matches!(part, Component::Normal(_)))

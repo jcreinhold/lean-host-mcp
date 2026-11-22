@@ -58,6 +58,9 @@ enum Command {
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     #[command(hide = true)]
     WriterPrepare { plan: String },
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    #[command(hide = true)]
+    WriterVerifySetup { plan: String },
     /// Internal independent owner for a native worker generation.
     #[command(hide = true)]
     NativeGuardian,
@@ -249,6 +252,14 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("lean-host-mcp writer-prepare: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        Some(Command::WriterVerifySetup { plan }) => match lean_host_mcp::writer_setup_verification::run(&plan) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lean-host-mcp writer-verify-setup: {error}");
                 ExitCode::FAILURE
             }
         },

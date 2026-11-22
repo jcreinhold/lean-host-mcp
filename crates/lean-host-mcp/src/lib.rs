@@ -66,6 +66,10 @@ mod worker_retirement;
 #[doc(hidden)]
 #[path = "native_store/writer_preparation.rs"]
 pub mod writer_preparation;
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+#[doc(hidden)]
+#[path = "native_store/setup_verification.rs"]
+pub mod writer_setup_verification;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
 pub use config_file::ConfigFile;

@@ -27,7 +27,7 @@ use crate::{ProjectBroker, error::ServerError};
 mod trace_snapshot;
 
 #[path = "readiness_writer.rs"]
-mod readiness_writer;
+pub(crate) mod readiness_writer;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -219,6 +219,7 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                         crate::writer_preparation::OPERATION,
                         crate::writer_preparation::VERIFIER_OPERATION,
                         readiness_writer::CONSUMER,
+                        readiness_writer::SETUP_VERIFICATION,
                     ]);
                     if let Ok(root) = broker.native_root(&crate::broker::ProjectHint::Default)
                         && let Some((digest, preview)) = readiness_writer::formatter_approval(&root)

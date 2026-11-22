@@ -135,39 +135,68 @@ impl ProjectBroker {
 
     pub(super) fn installed_reader(root: &Path, meta: &crate::lake_meta::LakeProjectMeta) -> Result<PreparedReader> {
         let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root).map_err(invalid)?;
+        let shims = VerifierShims::select(meta)?;
+        let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&shims.domains)?;
+        shims.validate()?;
+        Ok(PreparedReader {
+            custody,
+            sysroot: shims.sysroot,
+            shims: shims.paths,
+            domains: shims.domains,
+            shim_guards,
+            roots: Vec::new(),
+        })
+    }
+}
+
+pub(crate) struct VerifierShims {
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    pub(crate) worker: PathBuf,
+    pub(crate) sysroot: PathBuf,
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) domains: Vec<PathBuf>,
+    files: std::collections::BTreeMap<PathBuf, String>,
+}
+
+impl VerifierShims {
+    pub(crate) fn select(meta: &crate::lake_meta::LakeProjectMeta) -> Result<Self> {
         let (worker, sysroot, _) = crate::project::resolve_worker(meta)?;
         let generation = worker.parent().ok_or_else(|| invalid("missing worker generation"))?;
         let installed = crate::toolchain::WorkerSidecar::load(generation)
             .and_then(crate::toolchain::WorkerSidecar::into_runtime)
             .ok_or_else(|| invalid("missing installed shim deployment"))?;
-        let domains: Vec<_> = installed.prepared.artifact_roots.iter().map(PathBuf::from).collect();
-        let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&domains)?;
         if installed.sysroot != sysroot {
             return Err(invalid("incomplete prepared import selection"));
         }
-        for (path, hash) in &installed.files {
+        Ok(Self {
+            #[cfg(all(unix, feature = "managed-native-store"))]
+            worker,
+            sysroot,
+            domains: installed.prepared.artifact_roots.iter().map(PathBuf::from).collect(),
+            paths: installed.prepared.shim_search_paths.iter().map(PathBuf::from).collect(),
+            files: installed.files,
+        })
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (path, hash) in &self.files {
             verify_hash(path, hash)?;
         }
-        let shims: Vec<_> = installed.prepared.shim_search_paths.iter().map(PathBuf::from).collect();
         for module in crate::toolchain::VERIFIER_MODULES {
-            let path = lean_toolchain::olean_candidate(&shims, module, |path| fs::metadata(path))
+            let path = lean_toolchain::olean_candidate(&self.paths, module, |path| fs::metadata(path))
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("missing verification driver shim module"))?;
-            if !installed.files.contains_key(&path) {
+            if !self.files.contains_key(&path) {
                 return Err(invalid(
                     "installed generation lacks verification driver module identity",
                 ));
             }
         }
-        Ok(PreparedReader {
-            custody,
-            sysroot,
-            shims,
-            domains,
-            shim_guards,
-            roots: Vec::new(),
-        })
+        Ok(())
     }
+}
+
+impl ProjectBroker {
     pub(crate) async fn verify_file(
         &self,
         hint: ProjectHint,

@@ -22,9 +22,11 @@ use crate::{
 };
 
 #[path = "configured_consumer.rs"]
-mod configured_consumer;
+pub(crate) mod configured_consumer;
 pub(super) const CONSUMER: &str = "lake_configured_consumer_v1";
+use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
+pub(super) use setup::OPERATION as SETUP_VERIFICATION;
 #[path = "formatter_fix.rs"]
 mod formatter_fix;
 pub(super) const FORMAT_FIX: &str = "lean_formatter_fix_v1";
@@ -43,6 +45,7 @@ enum Stage {
     Consumer(SourceIdentity),
     Formatter(formatter_fix::Request),
     FormatterPreview(formatter_fix::Request),
+    SetupVerification(setup::Request),
 }
 
 pub(super) const OPERATION: &str = "lake_mathlib_cache_readiness_v1";
@@ -58,6 +61,7 @@ struct Intent {
     target: Option<Target>,
     source: Option<SourceIdentity>,
     formatter: Option<formatter_fix::Request>,
+    setup_verification: Option<setup::Request>,
 }
 
 pub(super) fn is_operation(intent: &[u8]) -> bool {
@@ -71,6 +75,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | CONSUMER
                     | FORMAT_FIX
                     | FORMAT_PREVIEW
+                    | SETUP_VERIFICATION
             )
         )
     })
@@ -114,23 +119,25 @@ pub(super) async fn run(
         request.target,
         request.source,
         request.formatter,
+        request.setup_verification,
     ) {
-        (OPERATION, None, None, None) => Stage::Cache,
-        (writer_preparation::OPERATION, Some(target), None, None)
+        (OPERATION, None, None, None, None) => Stage::Cache,
+        (writer_preparation::OPERATION, Some(target), None, None, None)
             if !matches!(target, Target::VerifierModules { .. }) && target.validate().is_ok() =>
         {
             Stage::Preparation(target)
         }
-        (writer_preparation::VERIFIER_OPERATION, Some(target @ Target::VerifierModules { .. }), None, None)
+        (writer_preparation::VERIFIER_OPERATION, Some(target @ Target::VerifierModules { .. }), None, None, None)
             if target.validate().is_ok() =>
         {
             Stage::Preparation(target)
         }
-        (CONSUMER, None, Some(source), None) if source.valid() => Stage::Consumer(source),
-        (FORMAT_FIX, None, None, Some(formatter)) if formatter.valid() => Stage::Formatter(formatter),
-        (FORMAT_PREVIEW, None, None, Some(formatter)) if formatter.valid_preview() => {
+        (CONSUMER, None, Some(source), None, None) if source.valid() => Stage::Consumer(source),
+        (FORMAT_FIX, None, None, Some(formatter), None) if formatter.valid() => Stage::Formatter(formatter),
+        (FORMAT_PREVIEW, None, None, Some(formatter), None) if formatter.valid_preview() => {
             Stage::FormatterPreview(formatter)
         }
+        (SETUP_VERIFICATION, None, None, None, Some(request)) if request.valid() => Stage::SetupVerification(request),
         _ => return Err(invalid("invalid_readiness_intent")),
     };
     if request.job.is_empty() || request.revision == 0 {
@@ -150,9 +157,24 @@ pub(super) async fn run(
         .try_acquire()
         .map_err(|_| McpError::internal_error("readiness_busy", None))?;
     let store = Arc::clone(store);
+    let prepared_generation = broker.prepared_generation().map(str::to_owned);
+    if let Stage::SetupVerification(request) = &stage
+        && !request.matches_prepared(prepared_generation.as_deref())
+    {
+        return Err(invalid("setup_verification_prepared_generation_changed"));
+    }
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        execute(&helper, &root, &store, original, &capability, deadline, stage)
+        execute(
+            &helper,
+            &root,
+            &store,
+            original,
+            &capability,
+            deadline,
+            stage,
+            prepared_generation,
+        )
     })
     .await
     .map_err(|_| McpError::internal_error("readiness_writer_unavailable", None))?
@@ -166,11 +188,23 @@ fn execute(
     capability: &Capability,
     deadline: AdmissionDeadline,
     stage: Stage,
+    prepared_generation: Option<String>,
 ) -> Result<(), McpError> {
     let no_start = |_| McpError::invalid_params("readiness_writer_not_started", None);
-    let budget = deadline.remaining().map_err(super::public_error)?;
     let expired = || deadline.remaining().is_err();
-    let mut writer = SharedWriter::open_cancellable(helper, root, budget, &expired).map_err(no_start)?;
+    let shims = if matches!(stage, Stage::SetupVerification(_)) {
+        let meta = crate::LakeProjectMeta::from_explicit(root)
+            .map_err(|_| McpError::invalid_params("setup_verification_not_started", None))?;
+        Some(
+            crate::broker::verify_file::VerifierShims::select(&meta)
+                .map_err(|_| McpError::invalid_params("setup_verification_not_started", None))?,
+        )
+    } else {
+        None
+    };
+    let roots = shims.as_ref().map_or(&[][..], |shims| shims.domains.as_slice());
+    let budget = deadline.remaining().map_err(super::public_error)?;
+    let mut writer = SharedWriter::open_with_write_roots(helper, root, roots, budget, &expired).map_err(no_start)?;
     let cancellation = LeanWorkerCancellationToken::default();
     let prepared = (|| {
         let ready = writer.stage_ready().map_err(no_start)?.clone();
@@ -193,6 +227,35 @@ fn execute(
                     .arg(plan.encode().map_err(no_start)?)
                     .current_dir(root)
                     .env("LAKE_CACHE_DIR", writer.asset_dir())
+                    .env("TMPDIR", writer.asset_dir());
+                command
+            }
+            Stage::SetupVerification(request) => {
+                let shims = shims
+                    .as_ref()
+                    .ok_or_else(|| McpError::invalid_params("setup_verification_not_started", None))?;
+                let plan = setup::Plan {
+                    root: root.to_owned(),
+                    worker: shims.worker.clone(),
+                    domains: writer.write_roots().to_vec(),
+                    prepared: prepared_generation,
+                    request: request.clone(),
+                    boot: deadline.boot,
+                    expires_ns: deadline.expires_ns,
+                };
+                let mut command = Command::new(
+                    std::env::current_exe()
+                        .map_err(no_start)?
+                        .canonicalize()
+                        .map_err(no_start)?,
+                );
+                command
+                    .arg("writer-verify-setup")
+                    .arg(
+                        serde_json::to_string(&plan)
+                            .map_err(|_| McpError::invalid_params("setup_verification_not_started", None))?,
+                    )
+                    .current_dir(root)
                     .env("TMPDIR", writer.asset_dir());
                 command
             }
@@ -254,6 +317,7 @@ fn execute(
             .ok()
             .and_then(|receipt| serde_json::to_value(receipt).ok()),
         Stage::Preparation(_) => None,
+        Stage::SetupVerification(request) => request.receipt(&output),
         Stage::Cache => output
             .status
             .code()

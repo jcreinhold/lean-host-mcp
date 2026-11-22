@@ -58,9 +58,9 @@ impl Identity {
     }
 }
 
-pub(super) struct StagedSetup {
-    pub(super) bytes: Vec<u8>,
-    pub(super) options: BTreeMap<String, lean_toolchain::LeanOptionValue>,
+pub(crate) struct StagedSetup {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) options: BTreeMap<String, lean_toolchain::LeanOptionValue>,
     sysroot: PathBuf,
     domains: Vec<PathBuf>,
     inputs: BTreeMap<PathBuf, Identity>,
@@ -90,6 +90,18 @@ impl StagedSetup {
         }
         Ok(())
     }
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    pub(crate) fn check_exclusive(&self, domains: &[PathBuf]) -> io::Result<()> {
+        if self.domains != domains {
+            return Err(invalid("setup domains changed under writer custody"));
+        }
+        for (path, identity) in &self.inputs {
+            if Identity::read(path)? != *identity {
+                return Err(invalid("setup input changed before driver dispatch"));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
@@ -104,7 +116,13 @@ fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
     Ok(setup)
 }
 
-fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, file: &Path) -> io::Result<StagedSetup> {
+pub(crate) fn stage(
+    bytes: Vec<u8>,
+    domains: &[PathBuf],
+    sysroot: &Path,
+    root: &Path,
+    file: &Path,
+) -> io::Result<StagedSetup> {
     let setup = parse_setup(&bytes)?;
     // These fields pass through byte-for-byte. Only Lake/Lean interprets them.
     let release_lib = sysroot.join("lib");
@@ -113,11 +131,7 @@ fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, fil
         if !p.is_absolute()
             || p.canonicalize()? != p
             || !p.is_file()
-            || !(p.starts_with(&release_lib)
-                || writer
-                    .write_roots()
-                    .iter()
-                    .any(|r| p.starts_with(r.join(".lake/build"))))
+            || !(p.starts_with(&release_lib) || domains.iter().any(|r| p.starts_with(r.join(".lake/build"))))
         {
             return Err(invalid(
                 "Lake setup artifact outside held project outputs or selected release",
@@ -163,7 +177,7 @@ fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, fil
         bytes,
         options: setup.options,
         inputs,
-        domains: writer.write_roots().to_vec(),
+        domains: domains.to_vec(),
         sysroot: sysroot.to_owned(),
     })
 }
@@ -372,7 +386,7 @@ fn run_setup(
     {
         return Err(invalid("Lake module setup exceeds limit or differs from writer receipt").into());
     }
-    Ok(stage(bytes, writer, &sysroot, root, file)?)
+    Ok(stage(bytes, writer.write_roots(), &sysroot, root, file)?)
 }
 
 impl ProjectBroker {

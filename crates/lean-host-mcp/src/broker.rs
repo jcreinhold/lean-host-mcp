@@ -68,11 +68,11 @@ use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
 mod control;
-mod module_setup;
+pub(crate) mod module_setup;
 pub(crate) use module_setup::ChargedWriter;
 mod preparation;
 mod semantic_file;
-mod verify_file;
+pub(crate) mod verify_file;
 pub(crate) use verify_file::FileProjection;
 mod writer_handoff;
 pub(crate) use control::MaintenanceAccess;
