@@ -200,7 +200,81 @@ def run_check(args):
                 print("result save failed; confirmed custody closure was still committed without replay")
                 return
             original_start = managed("start", **origin)
-            if args.stopped_owner:
+            if args.cancel_live:
+                end = time.monotonic() + 15
+                while not entry_trace.exists() or not entry_trace.read_text().endswith("\n"):
+                    assert time.monotonic() < end, "missing actual Lean entry before cancel"
+                    time.sleep(0.01)
+                with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as observer:
+                    identity, = observer.execute("SELECT identity FROM recovery_bindings").fetchone()
+                scope = json.loads(identity)
+                expected_entry = f"{scope['worker']['pid']} {args.declaration}\n"
+                assert entry_trace.read_text() == expected_entry
+                record = root / "owners" / f"worker-{scope['generation']}" / "owner.json"
+                assert_artifact_locks_held(record)
+                domains = json.loads(record.read_bytes())["protected_domains"]
+                assert result(tool("lean_runtime", {"action": "status"}))["pool"]["occupied_slots"] == 1
+                wrong_cap = list(cap)
+                wrong_cap[0] ^= 1
+                result(managed("cancel", **dict(origin, capability=wrong_cap)), error="capability_denied")
+                stale = dict(origin, key=dict(key, nonce=list(os.urandom(16))))
+                result(managed("cancel", **stale), error="unknown_stage")
+                # The deferred constraint rejects COMMIT after a successful UPDATE.
+                with sqlite3.connect(db) as fault:
+                    fault.executescript(
+                        "CREATE TABLE stop_fault_parent(id INTEGER PRIMARY KEY);"
+                        "CREATE TABLE stop_fault_child(id INTEGER REFERENCES stop_fault_parent(id)"
+                        " DEFERRABLE INITIALLY DEFERRED);"
+                        "CREATE TRIGGER reject_stop AFTER UPDATE OF stop_requested ON stages"
+                        " WHEN NEW.stop_requested=1"
+                        " BEGIN INSERT INTO stop_fault_child(id) VALUES(1); END;"
+                    )
+                with sqlite3.connect(db) as control:
+                    control.execute("PRAGMA foreign_keys=ON")
+                    assert control.execute("UPDATE stages SET stop_requested=1").rowcount == 1
+                    try:
+                        control.commit()
+                    except sqlite3.IntegrityError as error:
+                        assert error.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+                        control.rollback()
+                    else:
+                        raise AssertionError("deferred stop control COMMIT unexpectedly succeeded")
+                result(managed("cancel", **origin), error="store_unavailable")
+                pending = result(managed("get", **origin))
+                assert pending["custody"] == "open" and not pending["cancel_requested"], pending
+                assert_artifact_locks_held(record)
+                with sqlite3.connect(db) as fault:
+                    fault.execute("DROP TRIGGER reject_stop")
+
+                cancelled_at = time.monotonic()
+                accepted = result(managed("cancel", **origin))
+                assert accepted["custody"] == "open" and accepted["cancel_requested"], accepted
+                repeated = None
+                while not repeated:
+                    repeated = result(managed("cancel", **origin), poll=True)
+                    assert time.monotonic() < cancelled_at + 10, "exact cancellation retry remained busy"
+                assert repeated["execution"] == "unknown" and repeated["cancel_requested"], repeated
+                while True:
+                    settled = result(managed("get", **origin), poll=True)
+                    assert time.monotonic() < cancelled_at + 10, "cancel did not retire before the Lean hold timeout"
+                    if settled and settled["custody"] == "closed":
+                        break
+                    time.sleep(0.02)
+                assert settled["custody"] == "closed" and settled["execution"] == "unknown", settled
+                assert settled["result"]["state"] == "pending" and settled["cancel_requested"], settled
+                assert not (entry_trace.parent / "release-inspection").exists()
+                assert result(managed("cancel", **origin)) == settled
+                end = time.monotonic() + 5
+                while result(tool("lean_runtime", {"action": "status"}))["pool"]["occupied_slots"] != 0:
+                    assert time.monotonic() < end, "confirmed closure did not return the permit"
+                    time.sleep(0.02)
+                for domain in domains:
+                    with open(domain["lock_path"], "rb") as lock:
+                        stat = os.fstat(lock.fileno())
+                        assert (stat.st_dev, stat.st_ino) == (domain["device"], domain["inode"])
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                original_binding = bindings()
+            elif args.stopped_owner:
                 # Stages: CommitStoppedBinding, ConsumeStoppedPermit, then PauseRecoveryBroker.
                 # The gate below is the durable grant witness. H0's fence-first cut needs zero
                 # entries at the worker's declaration-inspection shim across recovery and retry.
@@ -384,7 +458,7 @@ def run_check(args):
                     os.kill(worker, 0)
                     assert_artifact_locks_held(record)
                     print("corrupt store refused with original live custody and read locks intact")
-            else:
+            elif not args.cancel_live:
                 end = time.monotonic() + 25
                 while True:
                     observed = result(managed("get", **origin), poll=True)
@@ -405,7 +479,13 @@ def run_check(args):
             assert restarted["instance_id"] != before["instance_id"]
             recovered = result(managed("get", **origin))
             retry = result(managed("start", **origin))
-            if args.abrupt:
+            if args.cancel_live:
+                assert recovered == retry == settled
+                assert result(managed("cancel", **origin)) == settled
+                assert bindings() == original_binding and len(original_binding) == 1
+                assert entry_trace.read_text() == expected_entry
+                print("live managed cancel refused wrong and uncommitted stops, then closed one actual Lean entry without replay")
+            elif args.abrupt:
                 assert recovered["execution"] == "unknown" and recovered["custody"] == "open"
                 assert recovered["result"]["state"] == "pending"
                 assert recovered["intent"] == intent and "intent_sha256" not in recovered
@@ -471,8 +551,11 @@ if __name__ == "__main__":
     mode.add_argument("--abrupt", action="store_true")
     mode.add_argument("--stopped-owner", action="store_true")
     mode.add_argument("--fail-result-save", action="store_true")
+    mode.add_argument("--cancel-live", action="store_true")
     parser.add_argument("--entry-scratch", type=Path)
     args = parser.parse_args()
-    if args.entry_scratch and not (args.stopped_owner or args.abrupt):
-        parser.error("--entry-scratch requires a stopped-owner or abrupt case")
+    if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live):
+        parser.error("--entry-scratch requires a stopped-owner, abrupt, or live-cancel case")
+    if args.cancel_live and not args.entry_scratch:
+        parser.error("--cancel-live requires --entry-scratch")
     run_check(args)
