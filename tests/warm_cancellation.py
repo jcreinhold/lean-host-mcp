@@ -4,11 +4,12 @@ Run with PARENT DISPOSABLE_WORKERS_DIR NEW_CHECKOUT_TARGET_CHILD.
 Use the normal install-worker command with --workers-dir under target.
 The smoke project and native registry must be exclusive to this test.
 """
+
+import contextlib
 import ctypes
 import itertools
 import json
 import os
-from pathlib import Path
 import queue
 import shutil
 import signal
@@ -16,22 +17,61 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 
-def pipe_state(pid):
-    # Darwin arm64 sys/proc_info.h: pipe_fdinfo is 184 bytes. Observe
-    # pipeinfo.pipe_status and pipeinfo.pipe_stat.vst_size on fd 0.
-    # Timestamps on a pipe can change on observation alone.
-    raw = ctypes.create_string_buffer(184)
-    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    if lib.proc_pidfdinfo(pid, 0, 6, raw, len(raw)) != len(raw):
-        raise OSError(ctypes.get_errno(), "worker stdin pipe observation failed")
-    return int.from_bytes(raw[176:180], sys.byteorder), int.from_bytes(raw[112:120], sys.byteorder, signed=True)
+def observations(scope):
+    library = scope / "observation.dylib"
+    subprocess.run(
+        [
+            "/usr/bin/clang",
+            "-dynamiclib",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(Path(__file__).with_name("warm_process.c")),
+            "-o",
+            library,
+        ],
+        env=dict(os.environ, TMPDIR=str(scope / "t")),
+        check=True,
+    )
+    lib = ctypes.CDLL(str(library))
+
+    def observe(function, pid, left, right):
+        err = function(pid, ctypes.byref(left), ctypes.byref(right))
+        if err:
+            raise OSError(err, os.strerror(err))
+        return left.value, right.value
+
+    def pipe(pid):
+        return observe(lib.stdin_pipe, pid, ctypes.c_int(), ctypes.c_int64())
+
+    def birth(pid):
+        return observe(lib.birth, pid, ctypes.c_uint64(), ctypes.c_uint64())
+
+    return pipe, birth
+
+
+@contextlib.contextmanager
+def resume_on_exit(pid, identity, birth):
+    try:
+        yield
+    finally:
+        try:
+            if birth(pid) == identity:
+                os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
 
 
 def children(pid):
     rows = subprocess.check_output(["ps", "-axo", "ppid=,pid="], text=True)
-    return [int(child) for parent, child in map(str.split, rows.splitlines()) if int(parent) == pid]
+    return [
+        int(child)
+        for parent, child in map(str.split, rows.splitlines())
+        if int(parent) == pid
+    ]
 
 
 def absent(group):
@@ -74,13 +114,34 @@ def check(parent, workers, scope):
     scope.mkdir(mode=0o700)
     for name in ("s", "t", "owners", "cache", "process"):
         (scope / name).mkdir(mode=0o700)
-    env = dict(os.environ, TMPDIR=str(scope / "t"), LEAN_HOST_MCP_WORKERS_DIR=str(workers),
-               LEAN_HOST_MCP_SOCKET_DIR=str(scope / "s"), LEAN_RS_WORKER_OWNERS_DIRECTORY=str(scope / "owners"),
-               LAKE_CACHE_DIR=str(scope / "cache"), LEAN_HOST_MCP_PROCESS_REGISTRY_DIR=str(scope / "process"),
-               LEAN_HOST_MCP_MAX_WORKERS="1", LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT="1")
-    proc = subprocess.Popen(["sandbox-exec", "-p", '(version 1)(allow default)(deny file-write* (subpath "/private/tmp"))',
-                             parent, "--lake-root", project, "--request-journal", scope / "journal"],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
+    pipe_state, birth = observations(scope)
+    env = dict(
+        os.environ,
+        TMPDIR=str(scope / "t"),
+        LEAN_HOST_MCP_WORKERS_DIR=str(workers),
+        LEAN_HOST_MCP_SOCKET_DIR=str(scope / "s"),
+        LEAN_RS_WORKER_OWNERS_DIRECTORY=str(scope / "owners"),
+        LAKE_CACHE_DIR=str(scope / "cache"),
+        LEAN_HOST_MCP_PROCESS_REGISTRY_DIR=str(scope / "process"),
+        LEAN_HOST_MCP_MAX_WORKERS="1",
+        LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT="1",
+    )
+    proc = subprocess.Popen(
+        [
+            "sandbox-exec",
+            "-p",
+            '(version 1)(allow default)(deny file-write* (subpath "/private/tmp"))',
+            parent,
+            "--lake-root",
+            project,
+            "--request-journal",
+            scope / "journal",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
     events = queue.Queue()
     replies = {}
     ids = itertools.count(1)
@@ -93,7 +154,7 @@ def check(parent, workers, scope):
         events.put(None)
 
     def send(method, params, notification=False):
-        msg = dict(jsonrpc="2.0", method=method, params=params)
+        msg = {"jsonrpc": "2.0", "method": method, "params": params}
         if not notification:
             msg["id"] = next(ids)
         proc.stdin.write(json.dumps(msg) + "\n")
@@ -108,7 +169,7 @@ def check(parent, workers, scope):
         return replies.pop(ident)
 
     def call(method_name, **args):
-        return send("tools/call", dict(name=method_name, arguments=args))
+        return send("tools/call", {"name": method_name, "arguments": args})
 
     def body(ident):
         msg = receive(ident)
@@ -125,74 +186,144 @@ def check(parent, workers, scope):
         assert not result["errors"] and name in json.dumps(result["data"]), result
 
     threading.Thread(target=reader, daemon=True).start()
+    resumes = contextlib.ExitStack()
     try:
-        receive(send("initialize", dict(protocolVersion="2025-03-26", capabilities={},
-                                        clientInfo=dict(name="warm-cancel", version="1"))))
+        receive(
+            send(
+                "initialize",
+                {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "warm-cancel", "version": "1"},
+                },
+            )
+        )
         send("notifications/initialized", {}, True)
         found(body(lookup("Nat.add_comm")), "Nat.add_comm")
-        worker, = children(proc.pid)
-        guardian, = children(worker)
+        (worker,) = children(proc.pid)
+        (guardian,) = children(worker)
         assert os.getpgid(worker) == worker and os.getpgid(guardian) == guardian
-        args = dict(kind="declaration", project=str(project), name="Nat.add_assoc")
-        ticket = body(call("lean_request", action="prepare", tool="lean_lookup", arguments=args))
-        binding = dict(request_id=ticket["taskId"], request_epoch=ticket["request"]["request_epoch"])
+        worker_birth, guardian_birth = birth(worker), birth(guardian)
+        args = {"kind": "declaration", "project": str(project), "name": "Nat.add_assoc"}
+        ticket = body(
+            call("lean_request", action="prepare", tool="lean_lookup", arguments=args)
+        )
+        binding = {
+            "request_id": ticket["taskId"],
+            "request_epoch": ticket["request"]["request_epoch"],
+        }
         before, count = pipe_state(worker)
         assert count == 0
-        submit = call("lean_request", action="submit", tool="lean_lookup", arguments=args, **binding)
+        submit = call(
+            "lean_request",
+            action="submit",
+            tool="lean_lookup",
+            arguments=args,
+            **binding,
+        )
         deadline = time.monotonic() + 5
         while pipe_state(worker) == (before, 0):
             if time.monotonic() >= deadline:
                 raise AssertionError("no command observed on warmed worker stdin")
+        resumes.enter_context(resume_on_exit(worker, worker_birth, birth))
         os.kill(worker, signal.SIGSTOP)
-        until(lambda: "T" in subprocess.check_output(["ps", "-o", "state=", "-p", str(worker)], text=True))
+        until(
+            lambda: (
+                "T"
+                in subprocess.check_output(
+                    ["ps", "-o", "state=", "-p", str(worker)], text=True
+                )
+            )
+        )
         body(submit)
         parked_pipe = pipe_state(worker)
         second = lookup("Nat.mul_comm")
-        state = until(lambda: (s if (s := pool())["outstanding_jobs"] == 2 else None))
-        assert state["occupied_slots"] == 1 and state["projects"][0]["outstanding_jobs"] == 2
+        state = until(lambda: s if (s := pool())["outstanding_jobs"] == 2 else None)
+        assert (
+            state["occupied_slots"] == 1
+            and state["projects"][0]["outstanding_jobs"] == 2
+        )
         assert pipe_state(worker) == parked_pipe
+        guard_resume = resumes.enter_context(contextlib.ExitStack())
+        guard_resume.enter_context(resume_on_exit(guardian, guardian_birth, birth))
         os.kill(guardian, signal.SIGSTOP)
-        until(lambda: "T" in subprocess.check_output(["ps", "-o", "state=", "-p", str(guardian)], text=True))
+        until(
+            lambda: (
+                "T"
+                in subprocess.check_output(
+                    ["ps", "-o", "state=", "-p", str(guardian)], text=True
+                )
+            )
+        )
         try:
             intent = body(call("lean_request", action="cancel", **binding))
             assert intent["cancellation_requested"], intent
             held = pool()
             assert not absent(guardian) and held["occupied_slots"] == 1, held
             assert set(children(proc.pid)) <= {worker}
-            assert second not in replies and pipe_state(worker) == parked_pipe
+            assert second not in replies
+            # Cancellation may already have reaped the worker while its stopped
+            # guardian still holds custody. Only consult the original live pipe.
+            try:
+                if birth(worker) == worker_birth:
+                    assert pipe_state(worker) == parked_pipe
+            except ProcessLookupError:
+                pass
         finally:
-            if not absent(guardian):
-                os.kill(guardian, signal.SIGCONT)
+            guard_resume.close()
         result = body(second)
         if result["errors"]:
-            assert result["errors"][0]["details"]["reason"] == "project_shutting_down", result
+            assert (
+                result["errors"][0]["details"]["reason"] == "project_shutting_down"
+            ), result
             until(lambda: pool()["occupied_slots"] == 0)
             assert absent(worker) and absent(guardian)
             found(body(lookup("Nat.mul_assoc")), "Nat.mul_assoc")
         else:
             found(result, "Nat.mul_comm")
         assert absent(worker) and absent(guardian)
-        replacement, = children(proc.pid)
+        (replacement,) = children(proc.pid)
         assert replacement != worker and os.getpgid(replacement) == replacement
-        replacement_guardian, = children(replacement)
+        (replacement_guardian,) = children(replacement)
         terminal = body(call("lean_request", action="get", **binding))
         assert terminal["execution"]["disposition"] == "stopped", terminal
         receipt = terminal["execution"]["worker_stop_receipt"]
-        assert receipt["cause"] == "cancelled" and receipt["worker_pid"] == worker, receipt
-        assert receipt["worker_generation"] == 1 and receipt["worker_request_id"] > 0, receipt
-        assert receipt["operation"] in {"open_worker_session", "worker_inspect_declaration"}, receipt
+        assert receipt["cause"] == "cancelled" and receipt["worker_pid"] == worker, (
+            receipt
+        )
+        assert receipt["worker_generation"] == 1 and receipt["worker_request_id"] > 0, (
+            receipt
+        )
+        assert receipt["operation"] == "open_worker_session", receipt
         print(receipt, flush=True)
-        print(f"cancelled request {ticket['taskId']}, one occupied slot for two jobs; "
-              f"closed groups {worker}/{guardian}; replacement {replacement}", flush=True)
+        print(
+            f"cancelled request {ticket['taskId']}, one occupied slot for two jobs; "
+            f"closed groups {worker}/{guardian}; replacement {replacement}",
+            flush=True,
+        )
     finally:
+        resumes.close()
         proc.stdin.close()
         assert proc.wait(timeout=30) == 0
     until(lambda: absent(replacement) and absent(replacement_guardian))
     registry = scope / "owners"
     identity = registry.stat()
-    subprocess.run([parent, "doctor", "writer-rollback", "--registry", registry,
-                    "--registry-device", str(identity.st_dev), "--registry-inode", str(identity.st_ino),
-                    "--confirm-launchers-drained"], env=env, check=True)
+    subprocess.run(
+        [
+            parent,
+            "doctor",
+            "writer-rollback",
+            "--registry",
+            registry,
+            "--registry-device",
+            str(identity.st_dev),
+            "--registry-inode",
+            str(identity.st_ino),
+            "--confirm-launchers-drained",
+        ],
+        env=env,
+        check=True,
+    )
     shutil.rmtree(scope)
 
 
