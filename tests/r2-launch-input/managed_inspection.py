@@ -12,6 +12,7 @@ import queue
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 
@@ -56,6 +57,8 @@ def run_check(args):
     @contextmanager
     def server(*, stop_before_arm=False, stop_after_claim=False):
         child_env = dict(env)
+        if args.deadline_while_sql_locked:
+            child_env["LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS"] = "5000"
         if args.abrupt and entry_trace:
             child_env["LEAN_RS_WORKER_GUARDIAN_DRAIN_SLOT"] = "1"
         if stop_before_arm:
@@ -200,6 +203,82 @@ def run_check(args):
                 print("result save failed; confirmed custody closure was still committed without replay")
                 return
             original_start = managed("start", **origin)
+            if args.deadline_while_sql_locked:
+                end = time.monotonic() + 5
+                while not entry_trace.exists() or not entry_trace.read_text().endswith("\n"):
+                    assert time.monotonic() < end, "missing actual Lean entry"
+                    time.sleep(0.01)
+                clock = time.CLOCK_MONOTONIC if sys.platform == "darwin" else time.CLOCK_BOOTTIME
+
+                def state(pid):
+                    return subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True,
+                    ).stdout.strip()
+
+                def assert_database_locked():
+                    with sqlite3.connect(db, timeout=0) as contender:
+                        try:
+                            contender.execute("BEGIN IMMEDIATE")
+                        except sqlite3.OperationalError as error:
+                            assert error.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                        else:
+                            raise AssertionError("competing SQLite writer acquired the lock")
+
+                with sqlite3.connect(db, timeout=0) as holder:
+                    holder.execute("BEGIN IMMEDIATE")
+                    identity, expires_ns = holder.execute(
+                        "SELECT identity,expires_ns FROM recovery_bindings"
+                    ).fetchone()
+                    scope = json.loads(identity)
+                    assert scope["parent"]["pid"] == proc.pid
+                    worker, guardian = (scope[role]["pid"] for role in ("worker", "guardian"))
+                    expected_entry = f"{worker} {args.declaration}\n"
+                    assert entry_trace.read_text() == expected_entry
+                    record = root / "owners" / f"worker-{scope['generation']}" / "owner.json"
+                    domains = json.loads(record.read_bytes())["protected_domains"]
+                    assert_artifact_locks_held(record)
+                    assert_database_locked()
+
+                    os.kill(proc.pid, signal.SIGSTOP)
+                    try:
+                        wait_stopped(proc.pid, end)
+                        worker_state = state(worker)
+                        assert worker_state and not worker_state.startswith("Z")
+                        assert time.clock_gettime_ns(clock) < expires_ns
+                        guardian_state = state(guardian)
+                        assert guardian_state and not guardian_state.startswith(("T", "Z"))
+                        while True:
+                            worker_state = state(worker)
+                            observed_at = time.clock_gettime_ns(clock)
+                            assert observed_at < expires_ns + 1_000_000_000, "guardian missed deadline"
+                            if not worker_state or worker_state.startswith("Z"):
+                                assert observed_at >= expires_ns, "worker exited before deadline"
+                                break
+                            time.sleep(0.01)
+                        assert state(proc.pid).startswith("T")
+                        assert_database_locked()
+                        assert holder.execute("SELECT result_kind FROM stages").fetchone() == (0,)
+                        assert not (entry_trace.parent / "release-inspection").exists()
+                        assert_artifact_locks_held(record)
+                    finally:
+                        holder.rollback()
+                        os.kill(proc.pid, signal.SIGCONT)
+
+                settled = result(original_start)
+                assert settled["custody"] == "closed" and settled["execution"] == "unknown", settled
+                assert settled["result"]["state"] == "pending", settled
+                assert result(managed("start", **origin)) == settled
+                assert len(bindings()) == 1 and entry_trace.read_text() == expected_entry
+                for domain in domains:
+                    with open(domain["lock_path"], "rb") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lag_ms = (observed_at - expires_ns) / 1_000_000
+                print(
+                    f"observed real Lean stop {lag_ms:.1f} ms after the stored deadline "
+                    "with broker stopped and SQLite locked"
+                )
+                print("result stayed pending; confirmed custody returned locks without replay")
+                return
             if args.cancel_live:
                 end = time.monotonic() + 15
                 while not entry_trace.exists() or not entry_trace.read_text().endswith("\n"):
@@ -552,10 +631,11 @@ if __name__ == "__main__":
     mode.add_argument("--stopped-owner", action="store_true")
     mode.add_argument("--fail-result-save", action="store_true")
     mode.add_argument("--cancel-live", action="store_true")
+    mode.add_argument("--deadline-while-sql-locked", action="store_true")
     parser.add_argument("--entry-scratch", type=Path)
     args = parser.parse_args()
-    if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live):
-        parser.error("--entry-scratch requires a stopped-owner, abrupt, or live-cancel case")
-    if args.cancel_live and not args.entry_scratch:
-        parser.error("--cancel-live requires --entry-scratch")
+    if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live or args.deadline_while_sql_locked):
+        parser.error("--entry-scratch requires a stopped-owner, abrupt, live-cancel, or deadline case")
+    if (args.cancel_live or args.deadline_while_sql_locked) and not args.entry_scratch:
+        parser.error("live-cancel and deadline cases require --entry-scratch")
     run_check(args)
