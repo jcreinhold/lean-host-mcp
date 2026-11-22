@@ -54,7 +54,9 @@ HostInit == Init /\ h = [
     rollout |-> [negotiated |-> FALSE, agreed |-> {"standalone"}, drained |-> FALSE,
       selected |-> "older", rollbackDrained |-> FALSE,
       generation |-> 0, enabled |-> FALSE, captured |-> {}, publication |-> <<>>,
-      revocation |-> "none"],
+      revocation |-> "none",
+      launcher |-> [generation |-> 0, confirmed |-> TRUE, live |-> "none",
+        selectorProject |-> "none", observedStore |-> "original", originalStage |-> "settled"]],
     result |-> "none", resultAtLoss |-> "none", outcome |-> "none",
     attestation |-> <<>>, operatorAck |-> <<>>,
     scratch |-> FALSE, cleanup |-> "none", intentBound |-> FALSE, evidence |-> <<>>,
@@ -614,6 +616,52 @@ WriterIdleRecovery == InterruptedCommandOnlyIdle /\ ~Writer.helperWrite /\ ~Writ
 
 \* These inputs attest to a named supported launcher set. Caller negotiation
 \* alone observes only the selected helper. It says nothing about other launchers.
+\* Operator selector projection in the same rollout record. The legacy image is
+\* reachable only through a participating launcher. The project actually served
+\* is fixed here; choosing the enclosing config of another project is a fault.
+LauncherRollout == WriterRollout.launcher
+LauncherProject == "project"
+LauncherMode == IF LauncherRollout.generation=1 THEN "managed" ELSE "ordinary"
+LauncherStoreSettled == LauncherRollout.observedStore="replacement"
+  \/ LauncherRollout.originalStage="settled"
+LaunchFromSelector(project) == HostOnly(LauncherRollout.live="none"
+  /\ (project=LauncherProject \/ Mutation="launcher-wrong-project")
+  /\ (LauncherRollout.confirmed \/ Mutation="launcher-visible-start")
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.live=LauncherMode,
+     !.writer.rollout.launcher.selectorProject=project])
+StopSelectedLauncher == HostOnly(LauncherRollout.live/="none"
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.live="none",
+     !.writer.rollout.launcher.selectorProject="none"])
+QueueLauncherStage == HostOnly(LauncherRollout.live="managed" /\ LauncherRollout.originalStage="settled"
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.originalStage="queued"])
+AdmitLauncherStage == HostOnly(LauncherRollout.live="managed" /\ LauncherRollout.originalStage="queued"
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.originalStage="admitted"])
+SettleLauncherStage == HostOnly(LauncherRollout.originalStage/="settled"
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.originalStage="settled"])
+ObserveReplacementLauncherStore == HostOnly(LauncherRollout.generation=1 /\ LauncherRollout.live="none"
+  /\ LauncherRollout.observedStore="original" /\ LauncherRollout.originalStage/="settled"
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.observedStore="replacement"])
+PublishLauncherSwitch == HostOnly(LauncherRollout.generation<2 /\ LauncherRollout.confirmed
+  /\ LauncherRollout.live="none"
+  /\ (LauncherRollout.generation=0
+      \/ ((LauncherRollout.observedStore="original" \/ Mutation="launcher-wrong-store")
+          /\ (LauncherStoreSettled \/ Mutation="launcher-unsettled-rollback")))
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.generation=@+1,
+     !.writer.rollout.launcher.confirmed=FALSE])
+\* Rename is visible before directory sync. Reconciliation confirms the same
+\* generation without publishing another transition or launching a payload.
+ConfirmLauncherSwitch == HostOnly(~LauncherRollout.confirmed
+  /\ h'=[h EXCEPT !.writer.rollout.launcher.confirmed=TRUE])
+LauncherRolloutNext == (\E p \in {LauncherProject, "other"}: LaunchFromSelector(p))
+  \/ StopSelectedLauncher \/ QueueLauncherStage \/ AdmitLauncherStage \/ SettleLauncherStage
+  \/ ObserveReplacementLauncherStore \/ PublishLauncherSwitch \/ ConfirmLauncherSwitch
+LauncherRolloutSpec == HostInit /\ [][LauncherRolloutNext]_hv
+LauncherProjectSafe == LauncherRollout.live/="none" => LauncherRollout.selectorProject=LauncherProject
+LauncherDurabilitySafe == LauncherRollout.live/="none" => LauncherRollout.confirmed
+LauncherRollbackSafe == LauncherRollout.generation=2 =>
+  LauncherRollout.observedStore="original" /\ LauncherRollout.originalStage="settled"
+NoLauncherRollbackAndRestart == ~(LauncherRollout.generation=2 /\ LauncherRollout.live="ordinary")
+
 NegotiateWriterRollout == HostOnly(WriterRolloutCase /\ ~WriterRollout.negotiated
   /\ h'=[h EXCEPT !.writer.rollout.negotiated=TRUE])
 ObserveWriterLauncherAgreement == HostOnly(WriterRolloutCase /\ WriterRollout.selected="older"

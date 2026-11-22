@@ -1041,6 +1041,97 @@
       "witness": true
     },
     {
+      "name": "host-launcher-rollout",
+      "model": "Stages",
+      "specification": "LauncherRolloutSpec",
+      "constants": {
+        "Fault": "\"launcher-rollout\""
+      },
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "LauncherProjectSafe",
+        "LauncherDurabilitySafe",
+        "LauncherRollbackSafe"
+      ],
+      "properties": []
+    },
+    {
+      "name": "host-launcher-wrong-project",
+      "model": "Stages",
+      "specification": "LauncherRolloutSpec",
+      "constants": {
+        "Fault": "\"launcher-rollout\"",
+        "Mutation": "\"launcher-wrong-project\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "LauncherProjectSafe"
+      ],
+      "properties": [],
+      "invariant": "LauncherProjectSafe"
+    },
+    {
+      "name": "host-launcher-visible-start",
+      "model": "Stages",
+      "specification": "LauncherRolloutSpec",
+      "constants": {
+        "Fault": "\"launcher-rollout\"",
+        "Mutation": "\"launcher-visible-start\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "LauncherDurabilitySafe"
+      ],
+      "properties": [],
+      "invariant": "LauncherDurabilitySafe"
+    },
+    {
+      "name": "host-launcher-wrong-store",
+      "model": "Stages",
+      "specification": "LauncherRolloutSpec",
+      "constants": {
+        "Fault": "\"launcher-rollout\"",
+        "Mutation": "\"launcher-wrong-store\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "LauncherRollbackSafe"
+      ],
+      "properties": [],
+      "invariant": "LauncherRollbackSafe"
+    },
+    {
+      "name": "host-launcher-unsettled-rollback",
+      "model": "Stages",
+      "specification": "LauncherRolloutSpec",
+      "constants": {
+        "Fault": "\"launcher-rollout\"",
+        "Mutation": "\"launcher-unsettled-rollback\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "LauncherRollbackSafe"
+      ],
+      "properties": [],
+      "invariant": "LauncherRollbackSafe"
+    },
+    {
+      "name": "host-launcher-rollback-restart",
+      "model": "Stages",
+      "specification": "LauncherRolloutSpec",
+      "constants": {
+        "Fault": "\"launcher-rollout\""
+      },
+      "expect": "invariant",
+      "invariants": [
+        "NoLauncherRollbackAndRestart"
+      ],
+      "properties": [],
+      "invariant": "NoLauncherRollbackAndRestart",
+      "witness": true
+    },
+    {
       "name": "host-writer-rollout",
       "model": "Stages",
       "specification": "WriterSpec",
