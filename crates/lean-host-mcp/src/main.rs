@@ -355,6 +355,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_verification_input(args.verification_approval)?
         .with_prepared_generation(args.prepared_generation)?
         .with_module_setup_writer(args.module_setup_writer, args.module_setup_storage_request)?;
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    let runtime_config = if args.managed_native_store.is_some() {
+        runtime_config.with_managed_semantic_companion()
+    } else {
+        runtime_config
+    };
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());

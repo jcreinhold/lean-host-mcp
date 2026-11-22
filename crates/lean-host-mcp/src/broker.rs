@@ -758,7 +758,9 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
-        if request.goal.file_label.is_some() || self.prepared_generation().is_some() {
+        if !self.runtime_config.managed_semantic_companion
+            && (request.goal.file_label.is_some() || self.prepared_generation().is_some())
+        {
             return self
                 .semantic_file(
                     hint,

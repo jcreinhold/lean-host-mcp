@@ -8,7 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lean_rs_worker_parent::{LeanWorkerDeclarationInspectionRequest, LeanWorkerHostHandle};
+use lean_rs_worker_parent::{
+    LeanWorkerCancellationToken, LeanWorkerDeclarationInspectionRequest, LeanWorkerHostHandle,
+};
 use lean_toolchain::native_guardian::{NativeGuardianDrainBinding, guardian_deadline_ticks, registry_directory};
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
@@ -16,8 +18,8 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::native_store::store::{
-    CallerKey, Capability, Consume, Gate, NativeKey, NativeStore, Problem, Reject, ResourceReport, SavedRequest, Scope,
-    recovery::RegistryIdentity,
+    Binding, CallerKey, Capability, Consume, Gate, NativeKey, NativeStore, Problem, Reject, ResourceReport,
+    SavedRequest, Scope, recovery::RegistryIdentity,
 };
 use crate::{ProjectBroker, error::ServerError};
 
@@ -36,6 +38,17 @@ pub(crate) struct Job {
     original: SavedRequest,
     intent: Intent,
     expiry: u64,
+}
+
+struct StopRegistration<'a> {
+    store: &'a Mutex<NativeStore>,
+    binding: Binding,
+}
+
+impl Drop for StopRegistration<'_> {
+    fn drop(&mut self) {
+        self.store.lock().detach_active_stop(self.binding);
+    }
 }
 
 fn internal(error: impl std::fmt::Display) -> ServerError {
@@ -94,6 +107,7 @@ impl Job {
             generation: 1,
             owner: uuid::Uuid::new_v4().into_bytes(),
         };
+        let cancellation = LeanWorkerCancellationToken::new();
         let (binding, permit) = {
             let mut store = self.store.lock();
             let current = store
@@ -114,12 +128,17 @@ impl Job {
             else {
                 return Ok(());
             };
-            (
-                binding,
-                permit
-                    .into_deadline_grant()
-                    .ok_or_else(|| internal("timed grant missing"))?,
-            )
+            let permit = permit
+                .into_deadline_grant()
+                .ok_or_else(|| internal("timed grant missing"))?;
+            store
+                .attach_active_stop(binding, cancellation.clone())
+                .map_err(internal)?;
+            (binding, permit)
+        };
+        let _stop = StopRegistration {
+            store: &self.store,
+            binding,
         };
 
         // The ordinary actor lifetime owns the capacity permit until closure.
@@ -138,13 +157,14 @@ impl Job {
                 .map_err(internal)?;
         }
         let outcome = worker
-            .inspect_admitted_declaration_with_imports_once(
+            .inspect_admitted_declaration_with_imports_once_cancellable(
                 &self.intent.imports,
                 LeanWorkerDeclarationInspectionRequest::new(self.intent.declaration),
                 &expected,
                 admitted.key.nonce,
                 admitted.key.stage,
                 expires_ns,
+                Some(&cancellation),
             )
             .map_err(internal)?;
         let mut store = self.store.lock();

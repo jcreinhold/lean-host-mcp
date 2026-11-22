@@ -69,17 +69,18 @@ impl Deployment {
 pub(super) struct Installed {
     record: Deployment,
     launch_input: Option<String>,
+    semantic: Option<crate::semantic_selection::Semantic>,
     held_project: std::sync::OnceLock<lean_host_mcp_worker::prepared_project::PreparedProject>,
     project: PathBuf,
     guards: Vec<fs::File>,
 }
-fn deny() -> lean_rs::LeanError {
+pub(super) fn deny() -> lean_rs::LeanError {
     lean_rs::error::host_internal("request outside installed Init deployment")
 }
-fn invalid(msg: &str) -> io::Error {
+pub(super) fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
-fn digest(path: &Path) -> io::Result<String> {
+pub(super) fn digest(path: &Path) -> io::Result<String> {
     if path.canonicalize()? != path || !path.is_file() {
         return Err(invalid("expected canonical installed file"));
     }
@@ -237,7 +238,20 @@ impl Installed {
         if launch_input.as_ref().is_some_and(|s| s.len() > 4096) {
             return Err(invalid("oversized prepared generation"));
         }
+        let mut semantic = None;
+        let mut launch_input = launch_input;
+        if let Some(input) = launch_input.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(input)?;
+            if value.get("semantic_v1").is_some() {
+                let selected: crate::semantic_selection::Selection = serde_json::from_value(value)?;
+                let (prepared, admitted) =
+                    crate::semantic_selection::Semantic::open(selected.semantic_v1, dir, &record.sysroot, &bytes)?;
+                launch_input = Some(prepared);
+                semantic = Some(admitted);
+            }
+        }
         Ok(Self {
+            semantic,
             launch_input,
             held_project: std::sync::OnceLock::new(),
             record,
@@ -374,8 +388,16 @@ impl WorkerAuthority for Installed {
     fn manifest_read(&self, _: &Path) -> LeanResult<WorkerManifestRead> {
         Err(deny())
     }
-    fn worker(&self, _: &'static LeanRuntime, _: &Path, _: &[u8]) -> LeanResult<AuthorizedWorkerSnapshot<'static>> {
-        Err(deny())
+    fn worker(
+        &self,
+        runtime: &'static LeanRuntime,
+        path: &Path,
+        bytes: &[u8],
+    ) -> LeanResult<AuthorizedWorkerSnapshot<'static>> {
+        self.semantic.as_ref().ok_or_else(deny)?.snapshot(runtime, path, bytes)
+    }
+    fn authorize_worker_string_call(&self, call: lean_rs_worker_child::WorkerStringCall<'_>) -> LeanResult<()> {
+        self.semantic.as_ref().ok_or_else(deny)?.command(&call)
     }
     fn term<'c>(
         &self,

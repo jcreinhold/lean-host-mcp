@@ -1,4 +1,5 @@
 mod authority;
+mod semantic_selection;
 
 fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let deployment = authority::Installed::open()?;

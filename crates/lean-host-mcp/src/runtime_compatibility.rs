@@ -373,7 +373,7 @@ pub fn validate_loaded(
     })
 }
 
-fn digest_hex(bytes: impl IntoIterator<Item = u8>) -> String {
+pub(crate) fn digest_hex(bytes: impl IntoIterator<Item = u8>) -> String {
     let mut digest = String::with_capacity(64);
     for byte in bytes {
         let _ = write!(digest, "{byte:02x}");

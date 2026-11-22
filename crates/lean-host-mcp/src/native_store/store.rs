@@ -146,7 +146,7 @@ pub(crate) struct CallerKey {
     pub(crate) stage: u64,
     pub(crate) revision: u64,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeKey {
     pub(crate) store: Id,
@@ -506,9 +506,17 @@ fn caller_result_get(db: &Connection, key: &CallerKey) -> Answer<Option<CallerRe
     Ok(saved)
 }
 
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+struct ActiveStop {
+    scope: Scope,
+    token: lean_rs_worker_parent::LeanWorkerCancellationToken,
+}
+
 pub(crate) struct NativeStore {
     db: CheckedConnection,
     store: Id,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    active_stops: std::collections::HashMap<NativeKey, ActiveStop>,
 }
 impl NativeStore {
     pub(crate) fn create_new(path: &Path) -> Answer<Self> {
@@ -535,7 +543,12 @@ impl NativeStore {
         tx.execute_batch(recovery::SCHEMA)?;
         tx.execute("INSERT INTO meta VALUES(1,?1,1)", [store.as_slice()])?;
         tx.commit()?;
-        Ok(Self { db, store })
+        Ok(Self {
+            db,
+            store,
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            active_stops: std::collections::HashMap::new(),
+        })
     }
     pub(crate) fn open(path: &Path) -> Answer<Self> {
         let mut db = CheckedConnection::open_existing(path, |db| {
@@ -609,7 +622,12 @@ impl NativeStore {
             compact_closed_acknowledged(&tx, key)?;
         }
         tx.commit()?;
-        Ok(Self { db, store })
+        Ok(Self {
+            db,
+            store,
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            active_stops: std::collections::HashMap::new(),
+        })
     }
     pub(crate) fn identity(&self) -> Id {
         self.store
@@ -750,6 +768,37 @@ impl NativeStore {
         commit(tx, "consume")?;
         Ok(Consume::Granted(LaunchPermit { binding, deadline }))
     }
+    // The store mutex covers consumption, registration and committed cancellation delivery.
+    // This entry routes a stop to the actor; it grants neither launch nor closure.
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn attach_active_stop(
+        &mut self,
+        binding: Binding,
+        token: lean_rs_worker_parent::LeanWorkerCancellationToken,
+    ) -> Answer<()> {
+        use std::collections::hash_map::Entry;
+        match self.active_stops.entry(binding.key) {
+            Entry::Vacant(entry) => {
+                entry.insert(ActiveStop {
+                    scope: binding.scope,
+                    token,
+                });
+                Ok(())
+            }
+            Entry::Occupied(_) => reject(Reject::WrongScope),
+        }
+    }
+
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn detach_active_stop(&mut self, binding: Binding) {
+        use std::collections::hash_map::Entry;
+        if let Entry::Occupied(entry) = self.active_stops.entry(binding.key)
+            && entry.get().scope == binding.scope
+        {
+            entry.remove();
+        }
+    }
+
     pub(crate) fn cancel(&mut self, binding: Binding, capability: &Capability) -> Answer<()> {
         self.cancel_original(binding.key, capability, Some(binding.scope))
             .map(|_| ())
@@ -786,7 +835,15 @@ impl NativeStore {
             ],
         )?;
         let snapshot = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
-        tx.commit()?;
+        commit(tx, "cancel")?;
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        if snapshot.gate == Gate::Consumed
+            && snapshot.resource_report < ResourceReport::Closed
+            && let Some(active) = self.active_stops.get(&snapshot.key)
+            && Some(active.scope) == snapshot.scope
+        {
+            active.token.cancel();
+        }
         Ok(snapshot)
     }
     // Trusted internal observer: capability checks do NOT authenticate a producer.
