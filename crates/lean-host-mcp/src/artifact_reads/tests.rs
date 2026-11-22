@@ -269,3 +269,64 @@ fn individual_artifact_symlink_escape_is_uncacheable() {
     .unwrap();
     assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
 }
+
+#[test]
+fn lake_trace_snapshot_selects_exact_files_and_rejects_incomplete_sets() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap().join("project");
+    let modules = root.join(".lake/build/lib/lean/Demo");
+    let binaries = root.join(".lake/build/bin");
+    std::fs::create_dir_all(&modules).unwrap();
+    std::fs::create_dir_all(&binaries).unwrap();
+    let module = b"{\n  \"synthetic\": false, \"inputs\": [1], \"outputs\": {\"o\": 2}\n}\n";
+    let binary = br#"{"synthetic":false,"inputs":{"build":1},"outputs":[2]}"#;
+    std::fs::write(modules.join("Foo.trace"), module).unwrap();
+    std::fs::write(modules.join("Unused.trace"), b"invalid").unwrap();
+    std::fs::write(binaries.join("runLinter.trace"), binary).unwrap();
+
+    let guard = ArtifactReadGuard::for_project(&root).unwrap();
+    let targets = ["Demo.Foo".to_string(), "runLinter".to_string()];
+    let traces = guard.lake_trace_snapshot(&root, &targets, || Ok(())).unwrap().unwrap();
+    assert_eq!(traces.len(), 2);
+    assert_eq!(
+        traces[".lake/build/lib/lean/Demo/Foo.trace"],
+        "c6365aeb3f74775d590f428379bf6587bfe02593728cc207f4bc601299e426e5"
+    );
+    assert_eq!(
+        traces[".lake/build/bin/runLinter.trace"],
+        "dd996ed0c22a8f3f56996cb9f1472dabc45e53691039b56c4c4c99846dc2abb8"
+    );
+    assert!(
+        guard
+            .lake_trace_snapshot(&root, &["../outside".into()], || Ok(()))
+            .is_err()
+    );
+    assert!(
+        guard
+            .lake_trace_snapshot(&root, &targets, || Err(std::io::ErrorKind::TimedOut.into()))
+            .is_err()
+    );
+    assert!(
+        guard
+            .lake_trace_snapshot(&root, &["Demo.Missing".into()], || Ok(()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        guard
+            .lake_trace_snapshot(&root, &["Demo.Unused".into()], || Ok(()))
+            .unwrap()
+            .is_none()
+    );
+
+    let alias = modules.join("Alias.trace");
+    symlink(modules.join("Foo.trace"), alias).unwrap();
+    assert!(
+        guard
+            .lake_trace_snapshot(&root, &["Demo.Alias".into()], || Ok(()))
+            .unwrap()
+            .is_none()
+    );
+}
