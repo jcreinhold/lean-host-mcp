@@ -67,6 +67,24 @@ unavailable guardian falls outside the progress assumption, and reuse still requ
 filesystem durability, actual process and lock observations, an armed guardian's deadline path, and autonomous drain
 after parent death require their own qualification.
 
+**Scoped shim writer loss.** `ScopedLockSpec` models compatibility of the two package locks with private output
+locks. `ScopedLossSpec` adds a still-running descendant that has closed its inherited lock descriptors. With source
+SH kept by an already-independent cleanup owner, loss of the command helper alone leaves both custody and a stop
+path. Owner-held SH alone fails if both owners are lost. Binding the exact source path, device and inode to the
+original writer scope in the existing registry fences broad clean even after the last descriptor closes. The binding
+must be durable before GO and stay authoritative until the SDK can confirm that exact scope closed. Missing or
+unavailable evidence keeps the fence. A registry reference carries no stop authority. The registry-only control
+can remain fenced without cleanup progress. The combined model admits broad clean after the surviving owner
+confirms closure and keeps it blocked after loss of both owners. These checks assume the recorded binding is
+authentic and durable. They do not qualify a new custody or file publication implementation.
+
+The standalone writer currently writes its group identity to every exclusive lock inode before GO. A source SH
+loan cannot carry that record. Its EX output records are invisible to a legacy broad clean that knows only the
+package union. The existing writer-storage recovery path reacquires EX and requires a matching idle owner record on
+every member. Reusing that format for SH would require mode-aware retention, settlement and an admission fence
+under the existing registry across both helpers. No current mixed-mode handoff supplies that invariant. Direct
+development builds and broad cleanup remain serialized by the existing exclusive package locks.
+
 **Managed writer recovery.** `WriterSpec` in `Stages.tla` uses the existing SDK
 reader-closure and conflicting-admission steps. It binds the source handoff to
 the original store, manifest, audit baseline, and exact ordered lock union.

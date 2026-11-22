@@ -853,6 +853,63 @@
       "invariant": "ScopedCleanExcluded"
     },
     {
+      "name": "host-scoped-loss-fence",
+      "model": "Stages",
+      "specification": "ScopedLossSpec",
+      "expect": "pass",
+      "invariants": ["ScopedCleanRequiresClosure"],
+      "properties": []
+    },
+    {
+      "name": "host-scoped-loss-both-owners",
+      "model": "Stages",
+      "specification": "ScopedLossSpec",
+      "expect": "invariant",
+      "invariants": ["NoScopedBothOwnersLostFence"],
+      "properties": [],
+      "invariant": "NoScopedBothOwnersLostFence",
+      "witness": true
+    },
+    {
+      "name": "host-scoped-loss-guardian-only",
+      "model": "Stages",
+      "specification": "ScopedLossSpec",
+      "constants": {"Mutation": "\"scoped-fence-guardian-only\""},
+      "expect": "invariant",
+      "invariants": ["ScopedCleanRequiresClosure"],
+      "properties": [],
+      "invariant": "ScopedCleanRequiresClosure"
+    },
+    {
+      "name": "host-scoped-loss-registry-only",
+      "model": "Stages",
+      "specification": "ScopedLossSpec",
+      "constants": {"Mutation": "\"scoped-fence-registry-only\""},
+      "expect": "pass",
+      "invariants": ["ScopedCleanRequiresClosure", "NoScopedCleanAfterClosure"],
+      "properties": []
+    },
+    {
+      "name": "host-scoped-loss-forget-binding",
+      "model": "Stages",
+      "specification": "ScopedLossSpec",
+      "constants": {"Mutation": "\"scoped-fence-forget-on-loss\""},
+      "expect": "invariant",
+      "invariants": ["ScopedCleanRequiresClosure"],
+      "properties": [],
+      "invariant": "ScopedCleanRequiresClosure"
+    },
+    {
+      "name": "host-scoped-loss-clean-after-closure",
+      "model": "Stages",
+      "specification": "ScopedLossSpec",
+      "expect": "invariant",
+      "invariants": ["NoScopedCleanAfterClosure"],
+      "properties": [],
+      "invariant": "NoScopedCleanAfterClosure",
+      "witness": true
+    },
+    {
       "name": "host-writer-recovery",
       "model": "Stages",
       "specification": "WriterSpec",

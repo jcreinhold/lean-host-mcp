@@ -60,7 +60,9 @@ HostInit == Init /\ h = [
     oldLocks |-> FALSE, held |-> FALSE, unheldCleanup |-> FALSE,
     cut |-> "none", settlements |-> 0],
   scopedLocks |-> [op \in {"legacy-reader", "private-writer", "same-output-writer", "broad-clean"}
-                  |-> "idle"]]
+                  |-> "idle"],
+  sourceFence |-> [started |-> FALSE, helper |-> FALSE, cleanupOwner |-> FALSE,
+    descendant |-> FALSE, binding |-> FALSE, confirmed |-> FALSE, cleaning |-> FALSE]]
 HostOnly(change) == change /\ UNCHANGED vars
 SdkOnly(action) == action /\ UNCHANGED h
 Submit == HostOnly(~h.submitted /\ h.online /\ h'=[h EXCEPT !.submitted=TRUE, !.binding= <<Original,NativeId,"intent-a">>])
@@ -842,5 +844,38 @@ ScopedWritersExcluded == ~(ScopedHeld("private-writer") /\ ScopedHeld("same-outp
 ScopedCleanExcluded == ScopedHeld("broad-clean") =>
   \A op \in ScopedOps \ {"broad-clean"}: ~ScopedHeld(op)
 NoScopedOverlap == ~(ScopedHeld("legacy-reader") /\ ScopedHeld("private-writer"))
+
+
+\* Failure projection. The descendant has closed its inherited lock aliases
+\* but can still read its inputs. The binding abstracts the existing registry.
+SourceFence == h.sourceFence
+ScopedLossStart == HostOnly(~SourceFence.started
+  /\ h'=[h EXCEPT !.sourceFence.started=TRUE, !.sourceFence.helper=TRUE,
+    !.sourceFence.descendant=TRUE,
+    !.sourceFence.cleanupOwner=Mutation/="scoped-fence-registry-only",
+    !.sourceFence.binding=Mutation/="scoped-fence-guardian-only"])
+ScopedLoseHelper == HostOnly(SourceFence.helper /\ ~SourceFence.confirmed
+  /\ h'=[h EXCEPT !.sourceFence.helper=FALSE])
+ScopedLoseCleanupOwner == HostOnly(~SourceFence.helper /\ SourceFence.cleanupOwner /\ ~SourceFence.confirmed
+  /\ h'=[h EXCEPT !.sourceFence.cleanupOwner=FALSE,
+    !.sourceFence.binding=IF Mutation="scoped-fence-forget-on-loss" THEN FALSE ELSE @])
+ScopedStopDescendant == HostOnly(~SourceFence.helper /\ SourceFence.cleanupOwner /\ SourceFence.descendant
+  /\ h'=[h EXCEPT !.sourceFence.descendant=FALSE])
+\* The surviving owner can witness closure of its exact group. With both
+\* gone, this projection supplies no new stop or closure authority.
+ScopedConfirmClosure == HostOnly(SourceFence.cleanupOwner /\ ~SourceFence.descendant /\ ~SourceFence.confirmed
+  /\ h'=[h EXCEPT !.sourceFence.confirmed=TRUE, !.sourceFence.cleanupOwner=FALSE])
+ScopedSourceLockHeld == SourceFence.helper \/ SourceFence.cleanupOwner
+ScopedSourceFenced == ScopedSourceLockHeld \/ (SourceFence.binding /\ ~SourceFence.confirmed)
+ScopedCleanAfterLoss == HostOnly(SourceFence.started /\ ~SourceFence.cleaning /\ ~ScopedSourceFenced
+  /\ h'=[h EXCEPT !.sourceFence.cleaning=TRUE])
+ScopedLossNext == ScopedLossStart \/ ScopedLoseHelper \/ ScopedLoseCleanupOwner
+  \/ ScopedStopDescendant \/ ScopedConfirmClosure \/ ScopedCleanAfterLoss
+ScopedLossSpec == HostInit /\ [][ScopedLossNext]_hv
+ScopedCleanRequiresClosure == SourceFence.cleaning => SourceFence.confirmed /\ ~SourceFence.descendant
+NoScopedBothOwnersLostFence ==
+  ~(SourceFence.descendant /\ ~SourceFence.helper /\ ~SourceFence.cleanupOwner
+    /\ SourceFence.binding /\ ScopedSourceFenced)
+NoScopedCleanAfterClosure == ~(SourceFence.confirmed /\ SourceFence.cleaning)
 
 =============================================================================
