@@ -798,3 +798,179 @@ mod slot {
         }
     }
 }
+
+#[test]
+fn abrupt_replacement_helper() {
+    use lean_toolchain::native_guardian::collect_closed_owner_records;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Some(base) = std::env::var_os(BASE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let fixture = Fixture::open_in_helper(&base);
+    let owner = File::open(base.join("owner.lock")).unwrap();
+    owner.try_lock().unwrap();
+    let mut journal = CallerJournal::open(&base.join("caller.sqlite3")).unwrap();
+    let database = base.join("native.sqlite3");
+    let mut store = NativeStore::open(&database).unwrap();
+    let original = original_request(&journal);
+    let (binding, identity) = NativeStore::read_recovery_scope(&database, &original, None, None).unwrap();
+    let registry = Path::new(std::ffi::OsStr::from_bytes(&identity.directory));
+    let record = registry
+        .join(format!("worker-{}", identity.generation))
+        .join("owner.json");
+    assert!(!identity.parent.is_live().unwrap());
+    assert!(identity.guardian.is_live().unwrap());
+    assert!(group_present(identity.worker.process_group).unwrap());
+    assert_eq!(
+        collect_closed_owner_records(registry, Duration::from_millis(100))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(record.is_file());
+    let original_status = store.get(original.key).unwrap().unwrap();
+    assert_eq!(original_status.gate, Gate::Consumed);
+    assert_eq!(original_status.result, ResultKnowledge::Pending);
+    assert!(matches!(
+        store.consume_launch(binding, &original.capability).unwrap(),
+        Consume::AlreadyConsumed
+    ));
+    assert_eq!(fixture.root_starts(), 1);
+    fs::write(base.join("replacement-fenced"), b"original custody remains open").unwrap();
+
+    // Only the existing guardian stops the old scope. This replacement
+    // collects closure evidence through the SDK and never signals old PIDs.
+    fixtures::wait(
+        || match collect_closed_owner_records(registry, Duration::from_millis(100)) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("original closure unavailable: {error}"),
+        },
+    );
+    assert!(!record.exists());
+    assert!(!group_present(identity.worker.process_group).unwrap());
+    assert!(!identity.guardian.is_live().unwrap());
+    assert_eq!(store.get(original.key).unwrap().unwrap(), original_status);
+    fs::write(
+        base.join("replacement-observed-closure"),
+        b"same registry retired the original scope",
+    )
+    .unwrap();
+    fixtures::wait(|| base.join("replacement-may-start").exists());
+
+    // An explicit revision is a new attempt. The lost result stays unknown;
+    // the replacement does not retry the old consumed stage.
+    let mut caller = original.caller.clone();
+    caller.revision += 1;
+    let successor = journal
+        .bind(
+            caller,
+            b"explicit successor after confirmed closure",
+            NativeKey {
+                nonce: [10; 16],
+                ..original.key
+            },
+            Capability([8; 32]),
+        )
+        .unwrap();
+    store.create(&successor).unwrap();
+    let scope = Scope {
+        id: [4; 16],
+        generation: 2,
+        owner: [6; 16],
+    };
+    let successor_sql = store.bind_scope(successor.key, &successor.capability, scope).unwrap();
+    let mut runtime = Runtime::new(ScopeBinding::new(
+        u128::from_be_bytes(scope.id),
+        scope.generation,
+        u128::from_be_bytes(scope.owner),
+    ));
+    let prepared = runtime
+        .prepare(&fixture, stage_key(&successor), &successor.intent)
+        .unwrap();
+    assert!(matches!(
+        store.consume_launch(successor_sql, &successor.capability).unwrap(),
+        Consume::Granted(_)
+    ));
+    let packet = runtime.request_start(prepared).unwrap().unwrap();
+    assert_eq!(
+        runtime.deliver_launch(&packet, GoFault::AfterWrite),
+        Dispatch::Unconfirmed
+    );
+    fixtures::wait(|| runtime.native().heartbeat() > 0);
+    assert_eq!(fixture.leaf_starts(stage_key(&successor)).len(), 1);
+    assert_eq!(fixture.leaf_starts(stage_key(&original)).len(), 1);
+    assert_eq!(fixture.root_starts(), 2);
+    stop_original(&mut runtime, prepared);
+    fixtures::wait(|| {
+        runtime
+            .poll(PollFault::None)
+            .observations
+            .iter()
+            .any(|event| event.kind() == ObservedKind::GenerationClosed)
+    });
+    drop(runtime);
+    collect_closed_owner_records(registry, Duration::from_secs(1)).unwrap();
+    assert_eq!(store.get(original.key).unwrap().unwrap(), original_status);
+    drop(owner);
+}
+
+#[test]
+fn abrupt_broker_replacement_waits_for_original_guardian_and_runs_explicit_successor() {
+    use std::os::unix::fs::MetadataExt as _;
+    let fixture = Fixture::new();
+    let base = &fixture.root;
+    let cut = Cut::WitnessedStart;
+    let mut service = TestChild(
+        command(&fixture, "service_loss::bound_drain_service_helper", cut)
+            .spawn()
+            .unwrap(),
+    );
+    let ready = base.join("bound-recovery-ready.json");
+    fixtures::wait(|| ready.exists() || service.0.try_wait().unwrap().is_some());
+    assert!(ready.is_file());
+    let scope_root = PathBuf::from(read_json(&ready)["root"].as_str().unwrap());
+    let request = original_request(&CallerJournal::open(&base.join("caller.sqlite3")).unwrap());
+    let (_, original) = NativeStore::read_recovery_scope(&base.join("native.sqlite3"), &request, None, None).unwrap();
+    assert_eq!(original.parent.pid, service.0.id());
+    let lock_path = lean_toolchain::shared_writer::project_lock_path(&fixture.project).unwrap();
+    let old_lock = lock_path.metadata().unwrap();
+    let contender = Contender::start_at(&scope_root, &original.worker);
+    let stopped = StoppedFixtureGuardian::stop(&original.guardian);
+
+    service.0.kill().unwrap();
+    assert_eq!(service.wait().signal(), Some(9));
+    let mut replacement = TestChild(
+        command(&fixture, "service_loss::abrupt_replacement_helper", cut)
+            .spawn()
+            .unwrap(),
+    );
+    assert_ne!(replacement.0.id(), original.parent.pid);
+    let fenced = base.join("replacement-fenced");
+    fixtures::wait(|| fenced.exists() || replacement.0.try_wait().unwrap().is_some());
+    assert!(fenced.is_file());
+    assert!(fixture_process_stopped(&original.guardian));
+    assert!(group_present(original.worker.process_group).unwrap());
+    assert!(!scope_root.join("contender-acquired.json").exists());
+    assert!(!base.join("replacement-observed-closure").exists());
+    assert_eq!(fixture.root_starts(), 1);
+    let heartbeat = scope_root.join("heartbeat");
+    let before = heartbeat.metadata().unwrap().len();
+    fixtures::wait(|| heartbeat.metadata().unwrap().len() > before);
+    drop(stopped);
+
+    fixtures::wait(|| base.join("replacement-observed-closure").exists());
+    let acquired = contender.finish();
+    assert_eq!(acquired["group_present"], false);
+    assert_eq!(acquired["worker_live"], false);
+    assert_eq!(acquired["readiness_after_closure"], true);
+    assert_eq!(acquired["payload_after_marker"], 0);
+    let new_lock = lock_path.metadata().unwrap();
+    assert_eq!((new_lock.dev(), new_lock.ino()), (old_lock.dev(), old_lock.ino()));
+    fs::write(base.join("replacement-may-start"), b"same-inode writer closed").unwrap();
+    assert!(replacement.wait().success());
+    assert_eq!(fixture.root_starts(), 2);
+    assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), 1);
+    fixture.assert_no_safety_exit();
+}
