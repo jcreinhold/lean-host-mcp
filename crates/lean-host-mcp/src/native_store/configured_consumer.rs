@@ -14,8 +14,8 @@ const MAX_RECEIPT: usize = 60 * 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SourceIdentity {
-    file: PathBuf,
-    sha256: [u8; 32],
+    pub(super) file: PathBuf,
+    pub(super) sha256: [u8; 32],
 }
 
 impl SourceIdentity {
@@ -28,7 +28,7 @@ impl SourceIdentity {
             })
     }
 
-    pub(super) fn check(&self, root: &Path) -> io::Result<()> {
+    pub(super) fn digest(&self, root: &Path) -> io::Result<[u8; 32]> {
         let path = root.join(&self.file);
         if path.canonicalize()?.as_os_str() != path.as_os_str() {
             return Err(io::Error::other("configured consumer source alias"));
@@ -52,7 +52,14 @@ impl SourceIdentity {
             }
             hash.update(&buffer[..count]);
         }
-        if input.limit() == 0 || hash.finalize().as_slice() != self.sha256 {
+        if input.limit() == 0 {
+            return Err(io::Error::other("source exceeds the admitted file limit"));
+        }
+        Ok(hash.finalize().into())
+    }
+
+    pub(super) fn check(&self, root: &Path) -> io::Result<()> {
+        if self.digest(root)? != self.sha256 {
             return Err(io::Error::other("configured consumer source changed"));
         }
         Ok(())

@@ -220,6 +220,12 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                         crate::writer_preparation::VERIFIER_OPERATION,
                         readiness_writer::CONSUMER,
                     ]);
+                    if let Ok(root) = broker.native_root(&crate::broker::ProjectHint::Default)
+                        && let Some(digest) = readiness_writer::formatter_digest(&root)
+                    {
+                        operations.push(readiness_writer::FORMAT_FIX);
+                        fields.insert("formatter_sha256".into(), serde_json::json!(digest));
+                    }
                 }
                 operations
             };

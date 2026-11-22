@@ -25,11 +25,19 @@ use crate::{
 mod configured_consumer;
 pub(super) const CONSUMER: &str = "lake_configured_consumer_v1";
 use configured_consumer::SourceIdentity;
+#[path = "formatter_fix.rs"]
+mod formatter_fix;
+pub(super) const FORMAT_FIX: &str = "lean_formatter_fix_v1";
+
+pub(super) fn formatter_digest(root: &Path) -> Option<[u8; 32]> {
+    formatter_fix::Approval::select(root).ok().map(|pin| pin.sha256)
+}
 
 enum Stage {
     Cache,
     Preparation(Target),
     Consumer(SourceIdentity),
+    Formatter(formatter_fix::Request),
 }
 
 pub(super) const OPERATION: &str = "lake_mathlib_cache_readiness_v1";
@@ -44,13 +52,20 @@ struct Intent {
     project: PathBuf,
     target: Option<Target>,
     source: Option<SourceIdentity>,
+    formatter: Option<formatter_fix::Request>,
 }
 
 pub(super) fn is_operation(intent: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
         matches!(
             value.get("operation").and_then(serde_json::Value::as_str),
-            Some(OPERATION | writer_preparation::OPERATION | writer_preparation::VERIFIER_OPERATION | CONSUMER)
+            Some(
+                OPERATION
+                    | writer_preparation::OPERATION
+                    | writer_preparation::VERIFIER_OPERATION
+                    | CONSUMER
+                    | FORMAT_FIX
+            )
         )
     })
 }
@@ -88,19 +103,25 @@ pub(super) async fn run(
 ) -> Result<(), McpError> {
     let invalid = |reason| McpError::invalid_params(reason, None);
     let request: Intent = serde_json::from_slice(&original.intent).map_err(|_| invalid("invalid_readiness_intent"))?;
-    let stage = match (request.operation.as_str(), request.target, request.source) {
-        (OPERATION, None, None) => Stage::Cache,
-        (writer_preparation::OPERATION, Some(target), None)
+    let stage = match (
+        request.operation.as_str(),
+        request.target,
+        request.source,
+        request.formatter,
+    ) {
+        (OPERATION, None, None, None) => Stage::Cache,
+        (writer_preparation::OPERATION, Some(target), None, None)
             if !matches!(target, Target::VerifierModules { .. }) && target.validate().is_ok() =>
         {
             Stage::Preparation(target)
         }
-        (writer_preparation::VERIFIER_OPERATION, Some(target @ Target::VerifierModules { .. }), None)
+        (writer_preparation::VERIFIER_OPERATION, Some(target @ Target::VerifierModules { .. }), None, None)
             if target.validate().is_ok() =>
         {
             Stage::Preparation(target)
         }
-        (CONSUMER, None, Some(source)) if source.valid() => Stage::Consumer(source),
+        (CONSUMER, None, Some(source), None) if source.valid() => Stage::Consumer(source),
+        (FORMAT_FIX, None, None, Some(formatter)) if formatter.valid() => Stage::Formatter(formatter),
         _ => return Err(invalid("invalid_readiness_intent")),
     };
     if request.job.is_empty() || request.revision == 0 {
@@ -173,6 +194,14 @@ fn execute(
                     .map_err(|_| McpError::invalid_params("configured_consumer_source_changed", None))?;
                 source.command(root, writer.asset_dir()).map_err(no_start)?
             }
+            Stage::Formatter(request) => {
+                request
+                    .check_sources(root)
+                    .map_err(|_| McpError::invalid_params("formatter_source_changed", None))?;
+                request
+                    .command(root, writer.asset_dir())
+                    .map_err(|_| McpError::invalid_params("approved_formatter_unavailable", None))?
+            }
         };
         let permit = WriterStagePermit::new(
             ready.clone(),
@@ -221,6 +250,7 @@ fn execute(
             .code()
             .map(|exit_code| serde_json::json!({"version":1,"stage":"mathlib-cache-check","exit_code":exit_code})),
         Stage::Consumer(source) => Some(source.receipt(root, output)),
+        Stage::Formatter(request) => Some(request.receipt(root, writer.asset_dir(), &output)),
     });
     let saved = body.map_or(Ok(()), |body| {
         store
