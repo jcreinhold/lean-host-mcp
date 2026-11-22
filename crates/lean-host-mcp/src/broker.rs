@@ -69,6 +69,7 @@ use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResu
 
 mod control;
 mod module_setup;
+pub(crate) use module_setup::ChargedWriter;
 mod preparation;
 mod semantic_file;
 mod verify_file;

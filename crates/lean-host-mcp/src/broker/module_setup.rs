@@ -44,7 +44,7 @@ enum Plugin {
     },
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct Identity(u64, u64, u64, i64, i64);
 
 impl Identity {
@@ -170,28 +170,95 @@ fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, fil
 
 /// Supplied only by the managed caller for its approved project. The standalone
 /// writer validates the full request and reserves under its existing admission lock.
-struct ChargedWriter {
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ChargedWriter {
     executable: PathBuf,
+    image: Identity,
+    inherited_temp: PathBuf,
     request: String,
 }
 
 impl ChargedWriter {
-    async fn qualify(&self, root: &Path, timeout: Duration) -> io::Result<Identity> {
-        use tokio::io::AsyncReadExt as _;
-        const LIMIT: usize = 16 * 1024;
-        if self.request.len() > LIMIT {
+    pub(crate) fn new(root: &Path, executable: PathBuf, request: String) -> io::Result<Self> {
+        if request.len() > 16 * 1024 {
             return Err(invalid("oversized module setup storage request"));
         }
-        let request: serde_json::Value = serde_json::from_str(&self.request)?;
-        if request.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-            || request
+        let value: serde_json::Value = serde_json::from_str(&request)?;
+        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || value
                 .get("budget_bytes")
                 .and_then(serde_json::Value::as_u64)
                 .is_none_or(|v| v == 0)
         {
             return Err(invalid("module setup requires an explicit v1 full-turn storage budget"));
         }
+        // The standalone writer owns full root validation and reservation under its admission lock.
+        // Bind this startup approval to the project before the helper can see the request.
+        let roots = value
+            .get("roots")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| invalid("module setup storage request lacks roots"))?;
+        if roots.len() > 48
+            || roots.iter().any(|r| {
+                r["role"].as_str().is_none()
+                    || !r["path"].as_str().is_some_and(|s| Path::new(s).is_absolute())
+                    || r["device"].as_u64().is_none()
+                    || r["inode"].as_u64().is_none()
+            })
+        {
+            return Err(invalid(
+                "module setup requires bounded storage roots with directory identities",
+            ));
+        }
+        if value.get("floor_bytes").and_then(serde_json::Value::as_u64).is_none()
+            || !roots
+                .iter()
+                .any(|r| r["role"] == "project" && r["path"].as_str().map(Path::new) == Some(root))
+            || !["registry", "scratch_parent"]
+                .iter()
+                .all(|role| roots.iter().any(|r| r["role"].as_str() == Some(role)))
+        {
+            return Err(invalid(
+                "module setup requires the approved project, registry, scratch parent and floor",
+            ));
+        }
+        // The setup command inherits the helper's temporary directory. Its v1 command
+        // envelope permits the writer-owned cache selector, but no TMPDIR override.
+        let temp = std::env::temp_dir().canonicalize()?;
+        if !roots
+            .iter()
+            .any(|r| r["path"].as_str().map(Path::new) == Some(temp.as_path()))
+        {
+            return Err(invalid(
+                "module setup storage request must include the inherited temporary directory",
+            ));
+        }
+        // This host sends no source handoff; its caller owns the read and explicit close.
+        if value.get("command_only").is_some_and(|v| v.as_bool() != Some(false))
+            || value.get("handoff_sha256").is_some()
+            || value.get("approval_generation").is_some()
+        {
+            return Err(invalid("unsupported module setup storage handoff"));
+        }
+        let image = Identity::read(&executable)?;
+        Ok(Self {
+            executable,
+            image,
+            inherited_temp: temp,
+            request,
+        })
+    }
+
+    async fn qualify(&self, root: &Path, timeout: Duration) -> io::Result<Identity> {
+        use tokio::io::AsyncReadExt as _;
+        const LIMIT: usize = 16 * 1024;
+        if std::env::temp_dir().canonicalize()? != self.inherited_temp {
+            return Err(invalid("module setup temporary directory changed"));
+        }
         let image = Identity::read(&self.executable)?;
+        if image != self.image {
+            return Err(invalid("configured module setup writer changed"));
+        }
         let lock = lean_toolchain::shared_writer::project_lock_path(root)?;
         tokio::time::timeout(timeout, async {
             use std::process::Stdio;
@@ -324,7 +391,7 @@ impl ProjectBroker {
         if root != meta.canonical_root {
             return Err(ServerError::BadProject("project selection changed".into()));
         }
-        let setup = self.prepare_file_setup(hint, file, source, None).await?;
+        let setup = self.prepare_file_setup(hint, file, source).await?;
         let activity = self.preparation_activity(&root).await?;
         let reader = Self::installed_reader(&root, meta)?;
         setup.check(&root, &reader.sysroot, &reader.custody)?;
@@ -334,20 +401,14 @@ impl ProjectBroker {
         Ok((setup, reader, activity))
     }
 
-    async fn prepare_file_setup(
-        &self,
-        hint: &ProjectHint,
-        file: &str,
-        source: &str,
-        charged: Option<ChargedWriter>,
-    ) -> Result<StagedSetup> {
+    async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
         let root = self.native_root(hint)?;
         let activity = self.preparation_activity(&root).await?;
         let timeout = Duration::from_millis(self.request_timeout_millis());
         let file = PathBuf::from(file);
         let source = source.to_owned();
         let cancel = CallCancellation::current();
-        let selected = match charged {
+        let selected = match self.runtime_config.module_setup_writer.clone() {
             Some(selection) => {
                 let started = Instant::now();
                 let image = tokio::select! {

@@ -6,9 +6,11 @@ use serde_json::json;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 fn request(project: &Path, registry: &Path, scratch: &Path, budget: u64) -> io::Result<String> {
+    let temp = std::env::temp_dir().canonicalize()?;
     let roots = [
         ("project", project),
         ("registry", registry),
+        ("temporary_directory", temp.as_path()),
         ("scratch_parent", scratch),
     ]
     .map(|(role, path)| {
@@ -20,19 +22,17 @@ fn request(project: &Path, registry: &Path, scratch: &Path, budget: u64) -> io::
     Ok(json!({"version":1,"budget_bytes":budget,"floor_bytes":1,"roots":roots}).to_string())
 }
 
-#[tokio::test]
-async fn charged_setup_requires_positive_budget_and_bound_capability() -> io::Result<()> {
+#[test]
+fn charged_setup_requires_positive_budget_and_bound_capability() -> io::Result<()> {
     let root = Path::new("/project");
     let lock = Path::new("/lock");
-    let writer = ChargedWriter {
-        executable: PathBuf::from("/unselected"),
-        request: json!({"version":1, "budget_bytes":0}).to_string(),
-    };
-    let error = writer
-        .qualify(root, Duration::from_secs(1))
-        .await
-        .err()
-        .ok_or_else(|| invalid("zero budget was accepted"))?;
+    let error = ChargedWriter::new(
+        root,
+        PathBuf::from("/unselected"),
+        json!({"version":1,"budget_bytes":0}).to_string(),
+    )
+    .err()
+    .ok_or_else(|| invalid("zero budget was accepted"))?;
     assert!(error.to_string().contains("full-turn storage budget"));
     let descriptor = |project: &str, lock: &str, caps: &[&str]| {
         json!({"protocol":1,"project_root":project,"lock_path":lock,"capabilities":caps}).to_string()
@@ -55,6 +55,11 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
     let target = workspace.join("target");
     let writer = PathBuf::from(std::env::var("LEAN_HOST_MODULE_SETUP_TEST_WRITER")?).canonicalize()?;
+    let workers = PathBuf::from(std::env::var("LEAN_HOST_MODULE_SETUP_TEST_WORKERS_DIR")?).canonicalize()?;
+    assert!(
+        workers.starts_with(&target) && workers != target,
+        "select a disposable installed worker under the host target"
+    );
     let Some(fixture) = std::env::var_os(fixture_name) else {
         let fixture = tempfile::Builder::new().prefix("charged-setup-").tempdir_in(&target)?;
         let registry = fixture.path().join("registry");
@@ -66,6 +71,7 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
                 "--exact",
                 "broker::module_setup::charged_tests::charged_setup_against_peer",
             ])
+            .env(crate::toolchain::WORKERS_DIR_ENV, workers)
             .env(fixture_name, fixture.path())
             .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", registry)
             .env("TMPDIR", fixture.path())
@@ -98,6 +104,52 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
     let file = project.join("Demo.lean");
     fs::write(&file, source)?;
     let file = file.to_str().ok_or_else(|| invalid("non-UTF-8 fixture"))?;
+    let stat = rustix::fs::statvfs(&base)?;
+    let free = stat
+        .f_bavail
+        .checked_mul(stat.f_frsize)
+        .ok_or_else(|| invalid("fixture size overflow"))?;
+    let budget = free - free / 4;
+    let approved = ProjectRuntimeConfig::default().with_operator_primary(Some(&project))?;
+    assert!(approved.module_setup_writer.is_none());
+    let proposal = request(&project, &registry, &scratch, budget)?;
+    assert!(
+        approved
+            .clone()
+            .with_module_setup_writer(None, Some(proposal.clone()))
+            .is_err()
+    );
+    assert!(
+        approved
+            .clone()
+            .with_module_setup_writer(Some(writer.clone()), None)
+            .is_err()
+    );
+    assert!(
+        approved
+            .clone()
+            .with_module_setup_writer(Some(writer.clone()), Some(request(&peer, &registry, &scratch, budget)?))
+            .is_err()
+    );
+    let mut incomplete: serde_json::Value = serde_json::from_str(&proposal)?;
+    incomplete["roots"][0]
+        .as_object_mut()
+        .ok_or_else(|| invalid("missing project entry"))?
+        .remove("inode");
+    assert!(
+        approved
+            .clone()
+            .with_module_setup_writer(Some(writer.clone()), Some(incomplete.to_string()))
+            .is_err()
+    );
+    let managed = approved.with_module_setup_writer(Some(writer.clone()), Some(proposal))?;
+    assert!(
+        managed
+            .clone()
+            .with_operator_primary(Some(&peer))?
+            .module_setup_writer
+            .is_none()
+    );
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {
             config_default: None,
@@ -107,21 +159,10 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         },
-        ProjectRuntimeConfig::default().with_operator_primary(Some(&project))?,
+        managed,
     );
     let hint = ProjectHint::Explicit(project.clone());
-    let stat = rustix::fs::statvfs(&base)?;
-    let free = stat
-        .f_bavail
-        .checked_mul(stat.f_frsize)
-        .ok_or_else(|| invalid("fixture size overflow"))?;
-    let budget = free - free / 4;
-    let selected = || -> io::Result<ChargedWriter> {
-        Ok(ChargedWriter {
-            executable: writer.clone(),
-            request: request(&project, &registry, &scratch, budget)?,
-        })
-    };
+    let meta = crate::lake_meta::LakeProjectMeta::from_explicit(&project)?;
     let timeout = Duration::from_secs(5);
     let holder = SharedWriter::open_with_storage_request(
         &writer,
@@ -134,7 +175,7 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
     let held_scratch = holder.asset_dir().to_owned();
     let before = scratch.metadata()?.modified()?;
     let error = broker
-        .prepare_file_setup(&hint, file, source, Some(selected()?))
+        .file_reader_with_setup(&hint, &meta, file, source)
         .await
         .err()
         .ok_or_else(|| invalid("unexpected setup admission"))?;
@@ -149,9 +190,8 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
     assert_eq!(fs::read_dir(&charges)?.count(), 1);
     holder.close(timeout)?;
     assert!(!held_scratch.exists());
-    let setup = broker
-        .prepare_file_setup(&hint, file, source, Some(selected()?))
-        .await?;
+    let (setup, reader, _activity) = broker.file_reader_with_setup(&hint, &meta, file, source).await?;
+    setup.check(&project, &reader.sysroot, &reader.custody)?;
     assert!((72 * 1024..80 * 1024).contains(&setup.bytes.len()));
     assert_eq!(
         setup.options.get("fixture"),

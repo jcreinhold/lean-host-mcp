@@ -282,6 +282,7 @@ const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectRuntimeConfig {
     operator_primary: Option<PathBuf>,
+    pub(crate) module_setup_writer: Option<Arc<crate::broker::ChargedWriter>>,
     verification_input: Option<String>,
     prepared_generation: Option<String>,
     lean_max_memory_kib: u64,
@@ -319,6 +320,34 @@ impl ProjectRuntimeConfig {
         self.operator_primary = root.map(Path::canonicalize).transpose()?;
         self.verification_input = None;
         self.prepared_generation = None;
+        self.module_setup_writer = None;
+        Ok(self)
+    }
+
+    /// Bind a standalone module setup writer and its v1 storage request to the approved primary project.
+    ///
+    /// # Errors
+    ///
+    /// Incomplete selections, noncanonical executables and requests for another project are refused.
+    pub fn with_module_setup_writer(
+        mut self,
+        executable: Option<PathBuf>,
+        request: Option<String>,
+    ) -> std::io::Result<Self> {
+        self.module_setup_writer = match (executable, request) {
+            (None, None) => None,
+            (Some(path), Some(request)) => {
+                let root = self.operator_primary.as_deref().ok_or_else(|| {
+                    std::io::Error::other("module setup writer requires an operator-approved primary project")
+                })?;
+                Some(Arc::new(crate::broker::ChargedWriter::new(root, path, request)?))
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "module setup writer and storage request must be supplied together",
+                ));
+            }
+        };
         Ok(self)
     }
 
@@ -394,6 +423,7 @@ impl ProjectRuntimeConfig {
         let import_residue_budget_bytes = default_import_residue_budget_bytes(max_projects);
         Self {
             operator_primary: None,
+            module_setup_writer: None,
             verification_input: None,
             prepared_generation: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
@@ -656,6 +686,7 @@ fn parse_runtime_config(
     .saturating_mul(1024 * 1024);
     let config = ProjectRuntimeConfig {
         operator_primary: None,
+        module_setup_writer: None,
         verification_input: None,
         prepared_generation: None,
         lean_max_memory_kib: parse_nonzero_u64(
