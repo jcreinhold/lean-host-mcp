@@ -126,6 +126,11 @@ struct ServeArgs {
     #[arg(long, env = "LEAN_HOST_MCP_REQUEST_JOURNAL")]
     request_journal: Option<PathBuf>,
 
+    /// Enable bounded managed admission on this server using an explicit SQLite path.
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    #[arg(long)]
+    managed_native_store: Option<PathBuf>,
+
     /// Loopback address for Streamable HTTP, e.g. 127.0.0.1:8765.
     /// If omitted, the server uses stdio.
     #[arg(long, env = "LEAN_HOST_MCP_BIND")]
@@ -386,6 +391,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let mut service = LeanHostService::new(Arc::clone(&broker), tool_config);
     if let Some(path) = args.request_journal {
         service = service.with_request_journal(&path)?;
+    }
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    if let Some(path) = args.managed_native_store {
+        service = service.with_managed_native_store(&path)?;
     }
     let result = if let Some(config) = http {
         transport_http::serve(service, config).await

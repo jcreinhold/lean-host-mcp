@@ -1,4 +1,4 @@
-//! Private, inline-only client contract. No listener, dispatch or producer bootstrap.
+//! Bounded client requests for the managed native stage store.
 //!
 //! Only this DTO is decoded from untrusted client bytes. Scope bindings and the
 //! trusted fixture's observe_* calls have no wire representation here. This is
@@ -89,7 +89,45 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ClientRequest, DecodeError> {
         command: request.command,
     })
 }
+impl std::fmt::Debug for NativeStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NativeStore").finish_non_exhaustive()
+    }
+}
+
 impl NativeStore {
+    /// The managed service exposes admission and reconnect only.
+    pub(crate) fn admission(&mut self, bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
+        let request = decode(bytes).map_err(|_| "invalid_request")?;
+        match &request.command {
+            ClientCommand::Discover {} => {}
+            ClientCommand::Create { capability, .. } | ClientCommand::Get { capability, .. } => {
+                if *capability == [0; 32] {
+                    return Err("capability_denied");
+                }
+            }
+            _ => return Err("operation_disabled"),
+        }
+        let reply = self.client(request).map_err(|error| match error {
+            Problem::Rejected(Reject::CapabilityDenied) => "capability_denied",
+            Problem::Rejected(Reject::IntentChanged) => "intent_changed",
+            Problem::Rejected(Reject::UnknownStage) => "unknown_stage",
+            Problem::Rejected(Reject::WrongStore | Reject::ClosedEpoch | Reject::FutureEpoch) => "wrong_store_or_epoch",
+            _ => "store_unavailable",
+        })?;
+        Ok(match reply {
+            ClientReply::Discovery {
+                store,
+                acceptance_epoch,
+            } => serde_json::json!({
+                "version": 1, "store": store, "acceptance_epoch": acceptance_epoch, "dispatch_enabled": false,
+            }),
+            ClientReply::Snapshot(snapshot) => serde_json::json!({
+                "version": 1, "key": snapshot.key, "intent": snapshot.intent, "dispatch_enabled": false,
+            }),
+        })
+    }
+
     pub(crate) fn client(&mut self, request: ClientRequest) -> Answer<ClientReply> {
         match request.command {
             ClientCommand::Discover {} => Ok(ClientReply::Discovery {

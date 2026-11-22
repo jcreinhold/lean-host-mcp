@@ -1,31 +1,29 @@
 # Saved task identity and launch tests
 
-Status: **test-only reference component, not part of the running server**. These tests extend the
-[stage kernel](stage-kernel.md) and [one-shot process tests](stage-runtime-contract.md). They do not complete service
-restart recovery or the proposed execution-service redesign.
+Status: the host can opt in to durable admission and lookup. Dispatch and production service recovery remain disabled.
+The contract tests also exercise the [stage kernel](stage-kernel.md) and [one-shot process fixture](stage-runtime-contract.md).
 
 ## Placement and dependency
 
-The host package owns the tests because it will own native request history. The SDK still owns child processes and the
-guardian; no SQLite API moved into it.
+The internal store and checked SQLite connection live under `crates/lean-host-mcp/src/native_store/`. The
+`stage_store_contract` and `stage_store_runtime_contract` tests use that source. The SDK owns native processes and the
+guardian. The non-default Unix `managed-native-store` feature enables the pinned bundled SQLite runtime. Ordinary
+builds have the same runtime dependencies and tool table.
 
-| File under `crates/lean-host-mcp/tests/` | Purpose |
-| --- | --- |
-| `stage_store_contract.rs` | Database-only test entry on Unix |
-| `stage_store_contract/connection.rs` | Checked SQLite build, format-before-configuration and connection settings |
-| `stage_store_contract/store.rs` | Separate caller journal and native store |
-| `stage_store_contract/store/boundary.rs` | Strict client requests, capability checks and disabled dispatch |
-| `stage_store_contract/boundary_cases.rs` | Client authority, bounded reads and cancellation before admission |
-| `stage_store_contract/result_client.rs` | Save the caller copy before acknowledging its original native result |
-| `stage_store_contract/caller_results.rs` | Result identity, two-commit crash cuts and SQL rejection tests |
-| `stage_store_contract/cases.rs`, `cuts.rs` | Contract tests and disposable process-crash pause points |
-| `stage_store_runtime_contract.rs` | Six macOS cases using the existing process fixture and runtime by relative path |
-| `stage_store_runtime_contract/service_loss_regressions.rs` | Actual service-death cuts and a fresh passive observer |
+## Opt-in admission
 
-The code is private test support. It adds no public library API, production module, actor framework or new crate. A
-Unix-only dev dependency pins `rusqlite 0.41.1` with bundled SQLite; the lockfile selects `libsqlite3-sys 0.39.1`.
-Production builds do not gain a SQLite dependency. Integrating a production store remains a separate review, rather than
-hiding experimental code behind an unused public interface.
+On a disposable server built with `--features managed-native-store`, pass
+`--managed-native-store /absolute/private-directory/stages.sqlite3`. The directory must already exist with mode
+`0700` and belong to the server user. This option creates the database exclusively if absent or reopens the exact
+database if present. It adds `lean_managed_admission` to the existing MCP tool table.
+
+The tool takes a `request` string containing version 1 JSON with a `command` object. Use
+`{"version":1,"command":{"op":"discover"}}` to obtain the store UUID and acceptance epoch. Before `create`, retain those
+values with a fresh 16-byte nonce, stage number, randomly generated 32-byte capability, and the original intent bytes.
+Send the store UUID, epoch, nonce and stage as `key`, and the bytes as `capability` and `intent`. Use `get` with the
+same key and capability after an interrupted response. The same `create` returns the original key and intent.
+A different intent or capability for that key is refused. All replies advertise `dispatch_enabled: false`.
+The opt-in route accepts only `discover`, `create` and `get`.
 
 ## What is saved
 

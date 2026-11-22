@@ -4,9 +4,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 use std::{fmt, path::Path};
 
-// These protocol and crash fixtures are compiled only in tests.
-#[cfg(test)]
-#[path = "../../tests/stage_store_contract/store/boundary.rs"]
+#[path = "store/boundary.rs"]
 pub(crate) mod boundary;
 #[cfg(test)]
 #[path = "../../tests/stage_store_contract/cuts.rs"]
@@ -143,7 +141,7 @@ pub(crate) struct CallerKey {
     pub(crate) stage: u64,
     pub(crate) revision: u64,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeKey {
     pub(crate) store: Id,

@@ -114,6 +114,8 @@ pub struct LeanHostService {
     ctx: ToolContext,
     tool_router: ToolRouter<Self>,
     tasks: RequestTasks,
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    managed_store: Option<Arc<parking_lot::Mutex<crate::native_store::store::NativeStore>>>,
 }
 
 impl LeanHostService {
@@ -123,6 +125,8 @@ impl LeanHostService {
             ctx,
             tool_router: Self::tool_router(),
             tasks: RequestTasks::default(),
+            #[cfg(all(unix, feature = "managed-native-store"))]
+            managed_store: None,
         }
     }
 
@@ -136,6 +140,54 @@ impl LeanHostService {
         self.tasks = RequestTasks::open(path)?;
         Ok(self)
     }
+
+    /// Open the explicitly selected native stage store and advertise admission.
+    ///
+    /// # Errors
+    /// Returns an error if the selected private database cannot be opened or created.
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    pub fn with_managed_native_store(mut self, path: &std::path::Path) -> std::io::Result<Self> {
+        use crate::native_store::store::NativeStore;
+        use std::os::unix::fs::MetadataExt as _;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("managed store parent missing"))?;
+        let metadata = std::fs::symlink_metadata(parent)?;
+        if !parent.is_absolute()
+            || parent.canonicalize()? != parent
+            || !metadata.is_dir()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(std::io::Error::other(
+                "managed store requires a canonical private parent",
+            ));
+        }
+        let store = match std::fs::symlink_metadata(path) {
+            Ok(file)
+                if file.is_file()
+                    && file.nlink() == 1
+                    && file.uid() == metadata.uid()
+                    && file.mode() & 0o777 == 0o600 =>
+            {
+                NativeStore::open(path)
+            }
+            Ok(_) => return Err(std::io::Error::other("managed store requires a private regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => NativeStore::create_new(path),
+            Err(error) => return Err(error),
+        }
+        .map_err(std::io::Error::other)?;
+        self.managed_store = Some(Arc::new(parking_lot::Mutex::new(store)));
+        self.tool_router.merge(Self::managed_tool_router());
+        Ok(self)
+    }
+}
+
+#[cfg(all(unix, feature = "managed-native-store"))]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ManagedAdmission {
+    request: String,
 }
 
 /// A plain-tool bridge for clients without the negotiated MCP Tasks extension.
@@ -163,6 +215,30 @@ enum RetainedAction {
     Get,
     Cancel,
     Acknowledge,
+}
+
+#[cfg(all(unix, feature = "managed-native-store"))]
+#[tool_router(router = managed_tool_router)]
+impl LeanHostService {
+    #[tool(
+        description = "Discover the managed store, admit immutable stage intent, or retrieve the original admission. Does not dispatch."
+    )]
+    fn lean_managed_admission(
+        &self,
+        Parameters(input): Parameters<ManagedAdmission>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self
+            .managed_store
+            .as_ref()
+            .ok_or_else(|| McpError::invalid_params("operation_disabled", None))?;
+        let mut store = store
+            .try_lock()
+            .ok_or_else(|| McpError::internal_error("store_busy", None))?;
+        let reply = store
+            .admission(input.request.as_bytes())
+            .map_err(|reason| McpError::invalid_params(reason, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(reply.to_string())]))
+    }
 }
 
 #[tool_router]
@@ -641,6 +717,73 @@ mod tests {
     use rmcp::ServiceExt;
     use rmcp::model::{ClientCapabilities, NumberOrString, TaskPayload, TaskStatus};
     use tokio::io::AsyncWriteExt;
+
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    #[test]
+    fn managed_admission_recovers_original_and_keeps_stock_tool_table() {
+        use serde_json::{Value, json};
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().canonicalize().unwrap().join("stages.sqlite3");
+        let stock = || {
+            LeanHostService::new(
+                ProjectBroker::new(crate::broker::BrokerConfig {
+                    cwd: dir.path().to_owned(),
+                    config_default: None,
+                    env_default: None,
+                    max_projects: crate::broker::BrokerConfig::default_max_projects(),
+                    max_workers_per_project: std::num::NonZeroUsize::MIN,
+                    idle_timeout: Duration::ZERO,
+                }),
+                ToolConfig::default(),
+            )
+        };
+        let call = |service: &LeanHostService, command: Value| {
+            service
+                .lean_managed_admission(Parameters(ManagedAdmission {
+                    request: json!({"version":1, "command":command}).to_string(),
+                }))
+                .map(|reply| {
+                    serde_json::from_str::<Value>(&reply.content.first().unwrap().as_text().unwrap().text).unwrap()
+                })
+        };
+        assert!(stock().get_tool("lean_managed_admission").is_none());
+        assert!(!path.exists());
+        let service = stock().with_managed_native_store(&path).unwrap();
+        assert!(service.get_tool("lean_managed_admission").is_some());
+        let discovery = call(&service, json!({"op":"discover"})).unwrap();
+        let key =
+            json!({"store":discovery["store"], "epoch":discovery["acceptance_epoch"], "nonce":vec![9;16], "stage":1});
+        let cap = vec![1; 32];
+        let create = |intent| json!({"op":"create","key":key,"capability":cap,"intent":intent});
+        let original = call(&service, create(vec![42])).unwrap();
+        assert_eq!(original["dispatch_enabled"], false);
+        drop(service);
+        let service = stock().with_managed_native_store(&path).unwrap();
+        assert_eq!(call(&service, create(vec![42])).unwrap(), original);
+        assert_eq!(
+            call(&service, json!({"op":"get","key":key,"capability":cap})).unwrap(),
+            original
+        );
+        assert_eq!(call(&service, create(vec![43])).unwrap_err().message, "intent_changed");
+        assert_eq!(
+            call(
+                &service,
+                json!({"op":"create","key":key,"capability":vec![2;32],"intent":[42]})
+            )
+            .unwrap_err()
+            .message,
+            "capability_denied"
+        );
+        assert_eq!(
+            call(&service, json!({"op":"start","key":key,"capability":cap}))
+                .unwrap_err()
+                .message,
+            "operation_disabled"
+        );
+        assert!(stock().get_tool("lean_managed_admission").is_none());
+    }
 
     #[tokio::test]
     async fn retained_duplicate_submissions_and_polls_log_only_actual_execution() {
