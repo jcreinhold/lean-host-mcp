@@ -561,6 +561,7 @@ fn install_one(
                 .map(PathBuf::from)
                 .or_else(|| dirs::home_dir().map(|p| p.join(".cargo")))
                 .ok_or_else(|| anyhow::anyhow!("cannot resolve Cargo home"))?;
+            let sdk_package = format!("lean-rs-host-{}", lean_toolchain::VERSION);
             let package = fs::read_dir(cargo.join("registry/src"))?
                 .filter_map(Result::ok)
                 .map(|e| e.path())
@@ -568,10 +569,10 @@ fn install_one(
                     p.file_name()
                         .and_then(|s| s.to_str())
                         .is_some_and(|s| s.starts_with("index.crates.io-"))
-                        && p.join("lean-rs-host-0.10.6/shims").is_dir()
+                        && p.join(&sdk_package).join("shims").is_dir()
                 })
-                .ok_or_else(|| anyhow::anyhow!("provide --shim-source for published lean-rs-host 0.10.6"))?;
-            package.join("lean-rs-host-0.10.6").canonicalize()?
+                .ok_or_else(|| anyhow::anyhow!("provide --shim-source for published {sdk_package}"))?;
+            package.join(sdk_package).canonicalize()?
         }
     };
     let writer = match &args.standalone_writer {
@@ -810,7 +811,7 @@ fn stage_registry_worker(candidate: &Path, install: impl FnOnce(&Path) -> anyhow
     Ok(())
 }
 
-pub(super) fn sha256_prefix(path: &Path, hex_chars: usize) -> anyhow::Result<String> {
+pub(crate) fn sha256_prefix(path: &Path, hex_chars: usize) -> anyhow::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut buf = [0u8; 8192];
     let mut hasher = Sha256::new();

@@ -1928,10 +1928,9 @@ pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf
             detail,
             install_cmd,
         } => {
+            CallCancellation::current().begin_operation().not_started();
             return Err(ServerError::BadProject(format!(
-                "worker for {toolchain} failed its runtime smoke test ({detail}); the toolchain's \
-                 libleanshared is ABI-incompatible with this lean-rs build and cannot be served. \
-                 Pin a supported toolchain the host can run, or rebuild lean-rs and reinstall: {install_cmd}"
+                "worker for {toolchain} is unusable ({detail}); reinstall it: {install_cmd}"
             )));
         }
         Readiness::NotInstalled { toolchain, install_cmd } => {

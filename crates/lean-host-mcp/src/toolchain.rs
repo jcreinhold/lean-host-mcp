@@ -197,6 +197,10 @@ impl WorkerBinary {
     ///
     /// Same as [`Self::resolve_for`].
     pub fn resolve_with_override(toolchain: &ToolchainId, override_dir: Option<&Path>) -> Result<Self, ToolchainError> {
+        Self::resolve_location(toolchain, override_dir).map(|(worker, _)| worker)
+    }
+
+    fn resolve_location(toolchain: &ToolchainId, override_dir: Option<&Path>) -> Result<(Self, bool), ToolchainError> {
         let root = override_dir.map_or_else(Self::install_root, Path::to_path_buf);
         let direct = override_dir.is_some() && root.join(WORKER_FILE_NAME).is_file();
         let slot = if direct { root } else { root.join(toolchain.as_str()) };
@@ -205,10 +209,13 @@ impl WorkerBinary {
         if !path.is_file() {
             return Err(Self::not_installed(toolchain));
         }
-        Ok(Self {
-            path,
-            toolchain: toolchain.clone(),
-        })
+        Ok((
+            Self {
+                path,
+                toolchain: toolchain.clone(),
+            },
+            generation != slot,
+        ))
     }
 
     /// Resolve the generation once. A malformed selector must not revive an old binary.
@@ -323,7 +330,7 @@ impl WorkerBinary {
         if let WindowVerdict::OutOfWindow { window, nearest } = window {
             return Readiness::Unsupported { window, nearest };
         }
-        let Ok(worker) = Self::resolve_with_override(pin, override_dir) else {
+        let Ok((worker, selected_generation)) = Self::resolve_location(pin, override_dir) else {
             return Readiness::NotInstalled {
                 toolchain: pin.clone(),
                 install_cmd: install_cmd(pin),
@@ -336,7 +343,30 @@ impl WorkerBinary {
         //   4. smoke missing     → Ready + soft note
         //   5. sidecar absent    → Ready + soft note
         let install_dir = worker.path.parent().unwrap_or(&worker.path);
-        let note = match WorkerSidecar::load(install_dir) {
+        let sidecar = WorkerSidecar::load(install_dir);
+        if selected_generation {
+            let valid = sidecar.as_ref().is_some_and(|record| {
+                record.toolchain == pin.as_str()
+                    && matches!(record.smoke(), Some(SmokeOutcome::Passed))
+                    && record.deployment.as_ref().is_some_and(|deployment| {
+                        deployment
+                            .runtime
+                            .as_ref()
+                            .is_some_and(|runtime| runtime.sysroot == lean_sysroot)
+                            && std::fs::symlink_metadata(&worker.path).is_ok_and(|meta| meta.is_file())
+                            && crate::cli::install_worker::sha256_prefix(&worker.path, 64)
+                                .is_ok_and(|digest| digest == deployment.worker_sha256)
+                    })
+            });
+            if !valid {
+                return Readiness::Unusable {
+                    toolchain: pin.clone(),
+                    detail: "selected worker generation is incomplete or differs from its installed deployment".into(),
+                    install_cmd: install_cmd(pin),
+                };
+            }
+        }
+        let note = match sidecar {
             Some(sidecar) => {
                 // A recorded build-time digest that no longer matches the
                 // toolchain's current lean.h means the header drifted under the
@@ -1126,6 +1156,44 @@ mod tests {
         let loaded = WorkerSidecar::load(tmp.path()).expect("legacy sidecar should load");
         assert_eq!(loaded.smoke(), None);
         assert_eq!(loaded.smoke_status(), "untested");
+    }
+
+    #[test]
+    fn selected_generation_requires_the_installed_worker_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let pin = ToolchainId::parse("v4.35.0").unwrap();
+        let slot = root.path().join(pin.as_str());
+        let generation = slot.join("generation-example");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(slot.join("current-generation"), "generation-example").unwrap();
+        let worker = generation.join(WORKER_FILE_NAME);
+        fs::write(&worker, b"qualified worker").unwrap();
+        let ready = || {
+            WorkerBinary::resolve_ready_with_override(&pin, Some(root.path()), root.path().to_owned(), Some("header"))
+        };
+        assert!(matches!(ready(), Readiness::Unusable { .. }));
+        let digest = crate::cli::install_worker::sha256_prefix(&worker, 64).unwrap();
+        let mut record = WorkerSidecar::candidate(&pin, "header".into(), Some(digest.clone()));
+        record
+            .bind_runtime(InstalledRuntime {
+                sysroot: root.path().to_owned(),
+                prepared: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts {
+                    protocol: 1,
+                    shim_manifest_path: "shims/test".into(),
+                    shim_manifest_json: "{}".into(),
+                    artifact_roots: vec![],
+                    shim_search_paths: vec![],
+                },
+                files: Default::default(),
+            })
+            .unwrap();
+        record.complete(&digest, SmokeOutcome::Passed).unwrap();
+        record.write(&generation).unwrap();
+        assert!(matches!(ready(), Readiness::Ready { .. }));
+        fs::write(&worker, b"different worker").unwrap();
+        assert!(matches!(ready(), Readiness::Unusable { .. }));
+        fs::write(&worker, b"qualified worker").unwrap();
+        assert!(matches!(ready(), Readiness::Ready { .. }));
     }
 
     #[test]
