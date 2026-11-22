@@ -163,7 +163,9 @@ def run_check(args):
             return conn.execute("SELECT registry_generation FROM recovery_bindings").fetchall()
 
     with ExitStack() as stopped:
-        with server(stop_before_arm=args.stopped_owner) as (managed, result, tool, proc):
+        with server(stop_before_arm=args.stopped_owner or bool(args.abrupt and entry_trace)) as (
+            managed, result, tool, proc,
+        ):
             before = result(tool("lean_runtime", {"action": "status"}))["pool"]
             assert before["occupied_slots"] == 0 and not before["projects"]
             discovery = result(managed("discover"))
@@ -324,24 +326,39 @@ def run_check(args):
                 guardian = scope["guardian"]["pid"]
                 worker = scope["worker"]["pid"]
                 if entry_trace:
-                    expected_entry = f"{worker} {args.declaration}\n"
-                    while not entry_trace.exists() or entry_trace.read_text() != expected_entry:
-                        assert time.monotonic() < end, "missing exact Lean target entry"
-                        time.sleep(0.01)
-                    with server() as (claim_a, reply_a, _, _), server() as (claim_b, reply_b, _, _):
+                    wait_stopped(proc.pid, end)
+                    assert not entry_trace.exists(), "Lean entered before recovery arbitration"
+                    with server(stop_after_claim=True) as (claim_a, reply_a, _, winner), server() as (
+                        claim_b, reply_b, _, _,
+                    ):
                         exact = dict(origin, generation=scope["generation"], revision=1, submit=True,
                                      authorization=drain_authorization)
-                        offer_a = claim_a("drain", **exact, claimant=list(os.urandom(32)))
-                        offer_b = claim_b("drain", **exact, claimant=list(os.urandom(32)))
-                        decisions = [reply_a(offer_a, allow_error=True), reply_b(offer_b, allow_error=True)]
-                        assert sum(decision.get("claim") == "won" for decision in decisions) == 1, decisions
-                        assert sum(decision.get("rpc_error") == "recovery_claim_busy" for decision in decisions) == 1
-                    os.kill(proc.pid, signal.SIGSTOP)
-                os.kill(guardian, signal.SIGSTOP)
-                stopped.callback(resume_guardian, guardian)
-                if entry_trace:
-                    wait_stopped(guardian, end)
-                    wait_stopped(proc.pid, end)
+                        claimant = os.urandom(32)
+                        offer_a = claim_a("drain", **exact, claimant=list(claimant))
+                        wait_stopped(winner.pid, end)
+                        with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1) as observer:
+                            assert observer.execute(
+                                "SELECT recovery_claim_hash FROM stages"
+                            ).fetchone() == (hashlib.sha256(claimant).digest(),)
+                        rival = claim_b("drain", **exact, claimant=list(os.urandom(32)))
+                        reply_b(rival, error="recovery_claim_busy")
+                        assert not entry_trace.exists(), "Lean entered during recovery arbitration"
+                        os.kill(proc.pid, signal.SIGCONT)
+                        expected_entry = f"{worker} {args.declaration}\n"
+                        while not entry_trace.exists() or entry_trace.read_text() != expected_entry:
+                            assert time.monotonic() < end, "missing exact Lean target entry"
+                            time.sleep(0.01)
+                        os.kill(proc.pid, signal.SIGSTOP)
+                        wait_stopped(proc.pid, end)
+                        os.kill(guardian, signal.SIGSTOP)
+                        stopped.callback(resume_guardian, guardian)
+                        wait_stopped(guardian, end)
+                        os.kill(winner.pid, signal.SIGCONT)
+                        decision = reply_a(offer_a)
+                        assert decision["claim"] == "won" and decision["drain"] == "offered", decision
+                else:
+                    os.kill(guardian, signal.SIGSTOP)
+                    stopped.callback(resume_guardian, guardian)
                 os.kill(worker, signal.SIGSTOP)
                 if entry_trace:
                     wait_stopped(worker, end)
