@@ -359,10 +359,102 @@ fn bound_drain_service_helper() {
     drop(owner);
 }
 
+const RECOVERY_ACTION_ENV: &str = "LEAN_STAGE_RECOVERY_ACTION";
+
+/// A fresh recovering process gets only the private fixture path and its cut.
+/// The caller journal supplies the same original credentials on every open.
 #[test]
-fn bound_drain_reads_original_under_stopped_writer_lock() {
+fn bound_drain_recovery_helper() {
     use lean_toolchain::native_guardian::{NativeGuardianDrainBinding, request_bound_original_guardian_drain};
     use std::os::unix::ffi::OsStrExt;
+
+    let Some(base) = std::env::var_os(BASE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let action = std::env::var(RECOVERY_ACTION_ENV).unwrap();
+    let fixture = Fixture::open_in_helper(&base);
+    let journal = CallerJournal::open(&base.join("caller.sqlite3")).unwrap();
+    let request = original_request(&journal);
+    let (_, read) = NativeStore::read_recovery_scope(&base.join("native.sqlite3"), &request, None, None).unwrap();
+    let owner = File::open(base.join("owner.lock")).unwrap();
+    assert!(matches!(owner.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+    assert_eq!(fixture.root_starts(), 1);
+    assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
+
+    let registry = Path::new(std::ffi::OsStr::from_bytes(&read.directory));
+    let boot = uuid::Uuid::from_bytes(read.boot);
+    let expected = NativeGuardianDrainBinding {
+        registry_device: read.device,
+        registry_inode: read.inode,
+        generation: read.generation,
+        boot: boot.to_string(),
+        parent: read.parent,
+        worker: read.worker,
+        guardian: read.guardian,
+    };
+    let record_path = registry
+        .join(format!("worker-{}", expected.generation))
+        .join("owner.json");
+    let record = read_json(&record_path);
+    assert_eq!(record["generation_id"], expected.generation);
+    assert_eq!(
+        uuid::Uuid::parse_str(record["original_worker_boot"].as_str().unwrap()).unwrap(),
+        boot
+    );
+    assert_eq!(record["parent"], json!(expected.parent));
+    assert_eq!(record["process"], json!(expected.worker));
+    assert_eq!(record["guardian"], json!(expected.guardian));
+
+    match action.as_str() {
+        "read" => assert_eq!(record["guardian_drain"], "available"),
+        "observe-delivery" => assert_eq!(record["guardian_drain"], "requested"),
+        "deliver" => {
+            let stale = NativeGuardianDrainBinding {
+                guardian: NativeProcessIdentity {
+                    start: "different birth for the same guardian PID".to_owned(),
+                    ..expected.guardian.clone()
+                },
+                ..expected.clone()
+            };
+            assert!(request_bound_original_guardian_drain(registry, &stale, Duration::from_millis(100)).is_err());
+            assert_eq!(read_json(&record_path), record);
+            fixtures::wait(|| {
+                match request_bound_original_guardian_drain(registry, &expected, Duration::from_millis(100)) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(error) => panic!("exact SDK recheck refused: {error}"),
+                }
+            });
+            // Exit on a successful publication reply. The next process must
+            // recover the persisted evidence independently of this process.
+        }
+        _ => panic!("invalid recovery fixture action"),
+    }
+}
+
+fn exiting_recoverer(fixture: &Fixture, action: &str) -> u32 {
+    let mut child = TestChild(
+        command(
+            fixture,
+            "service_loss::bound_drain_recovery_helper",
+            Cut::ConsumedBeforeGo,
+        )
+        .env(RECOVERY_ACTION_ENV, action)
+        .spawn()
+        .unwrap(),
+    );
+    let pid = child.0.id();
+    assert!(child.wait().success(), "separate recovery process failed at {action}");
+    pid
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryExit {
+    AfterRead,
+    AfterDelivery,
+}
+
+fn bound_drain_after_recovery_exit(cut: RecoveryExit) {
     let fixture = Fixture::new();
     let base = &fixture.root;
     let mut service = TestChild(
@@ -411,43 +503,45 @@ fn bound_drain_reads_original_under_stopped_writer_lock() {
     assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
     assert!(!scope_root.join("contender-acquired.json").exists());
 
-    let registry = Path::new(std::ffi::OsStr::from_bytes(&read.directory));
-    let expected = NativeGuardianDrainBinding {
-        registry_device: read.device,
-        registry_inode: read.inode,
-        generation: read.generation,
-        boot: uuid::Uuid::from_bytes(read.boot).to_string(),
-        parent: read.parent,
-        worker: read.worker,
-        guardian: read.guardian,
+    let (first, second) = match cut {
+        RecoveryExit::AfterRead => {
+            let reader = exiting_recoverer(&fixture, "read");
+            assert_eq!(read_json(&record_path), original_record);
+            assert!(original.worker.is_live().unwrap());
+            assert!(!scope_root.join("contender-acquired.json").exists());
+            (reader, exiting_recoverer(&fixture, "deliver"))
+        }
+        RecoveryExit::AfterDelivery => (
+            exiting_recoverer(&fixture, "deliver"),
+            exiting_recoverer(&fixture, "observe-delivery"),
+        ),
     };
-    let stale = NativeGuardianDrainBinding {
-        guardian: stale,
-        ..expected.clone()
-    };
-    assert!(request_bound_original_guardian_drain(registry, &stale, Duration::from_millis(100)).is_err());
-    assert_eq!(read_json(&record_path), original_record);
-    fixtures::wait(
-        || match request_bound_original_guardian_drain(registry, &expected, Duration::from_millis(100)) {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(error) => panic!("exact SDK recheck refused: {error}"),
-        },
-    );
+    assert_ne!(first, second);
+    assert_ne!(first, service.0.id());
+    assert_ne!(second, service.0.id());
     assert_eq!(read_json(&record_path)["guardian_drain"], "requested");
-    fixtures::wait(|| !expected.worker.is_live().unwrap());
+    fixtures::wait(|| !original.worker.is_live().unwrap());
     assert!(owner.try_lock().is_err());
     assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
     fs::write(base.join("bound-recovery-reap"), b"allow original custodian to reap").unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
     assert!(service.wait().success());
 
+    fixtures::wait(|| !group_present(original.worker.process_group).unwrap() && !original.guardian.is_live().unwrap());
     let acquired = contender.finish();
     assert_eq!(acquired["readiness_after_closure"], true);
     assert_eq!(acquired["payload_after_marker"], 0);
-    assert!(!group_present(expected.worker.process_group).unwrap());
-    assert!(!expected.guardian.is_live().unwrap());
     assert_eq!(fixture.root_starts(), 1);
     assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
     fixture.assert_no_safety_exit();
+}
+
+#[test]
+fn bound_drain_reads_original_under_stopped_writer_lock() {
+    bound_drain_after_recovery_exit(RecoveryExit::AfterRead);
+}
+
+#[test]
+fn bound_drain_delivery_survives_recoverer_exit() {
+    bound_drain_after_recovery_exit(RecoveryExit::AfterDelivery);
 }
