@@ -217,6 +217,7 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                     operations.extend([
                         readiness_writer::OPERATION,
                         crate::writer_preparation::OPERATION,
+                        crate::writer_preparation::VERIFIER_OPERATION,
                         readiness_writer::CONSUMER,
                     ]);
                 }

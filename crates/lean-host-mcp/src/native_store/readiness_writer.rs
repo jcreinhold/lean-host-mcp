@@ -50,7 +50,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
         matches!(
             value.get("operation").and_then(serde_json::Value::as_str),
-            Some(OPERATION | writer_preparation::OPERATION | CONSUMER)
+            Some(OPERATION | writer_preparation::OPERATION | writer_preparation::VERIFIER_OPERATION | CONSUMER)
         )
     })
 }
@@ -72,7 +72,9 @@ fn lake_command(root: &Path, assets: &Path) -> io::Result<Command> {
     let mut command = Command::new(lake);
     command
         .current_dir(root)
-        .args(["--no-build", "build", "@mathlib/+Mathlib:olean"])
+        .args(["--no-build", "--no-cache", "build", "@mathlib/+Mathlib:olean"])
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("LAKE_CACHE_DIR", assets)
         .env("TMPDIR", assets);
     Ok(command)
@@ -88,7 +90,16 @@ pub(super) async fn run(
     let request: Intent = serde_json::from_slice(&original.intent).map_err(|_| invalid("invalid_readiness_intent"))?;
     let stage = match (request.operation.as_str(), request.target, request.source) {
         (OPERATION, None, None) => Stage::Cache,
-        (writer_preparation::OPERATION, Some(target), None) if target.validate().is_ok() => Stage::Preparation(target),
+        (writer_preparation::OPERATION, Some(target), None)
+            if !matches!(target, Target::VerifierModules { .. }) && target.validate().is_ok() =>
+        {
+            Stage::Preparation(target)
+        }
+        (writer_preparation::VERIFIER_OPERATION, Some(target @ Target::VerifierModules { .. }), None)
+            if target.validate().is_ok() =>
+        {
+            Stage::Preparation(target)
+        }
         (CONSUMER, None, Some(source)) if source.valid() => Stage::Consumer(source),
         _ => return Err(invalid("invalid_readiness_intent")),
     };
