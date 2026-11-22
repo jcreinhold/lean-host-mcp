@@ -584,6 +584,36 @@ fn embedded_writer_fences_extended_storage_charge_without_blocking_disjoint_work
     // Roll back to a matched host with source handoffs disabled. The ordinary
     // 0.16.12 source at 6da1fc4 predates the SDK scratch digest in this record.
     write_marker(&fixture.root, &fixture.domain, &root.join("rollback-dispatched"));
+
+    // Progress-reporting callers use a storage turn without command-only handoff.
+    let caller_request = json!({"version":1, "floor_bytes":0, "budget_bytes":1_048_576, "roots":roots});
+    let mut caller = OwnedHelper::spawn(
+        Command::new(&standalone)
+            .arg("writer")
+            .arg(&fixture.root)
+            .arg(&fixture.domain)
+            .args(["2", "--storage-request", &caller_request.to_string()])
+            .env(REGISTRY_ENV, &registry)
+            .env_remove("LEAN_HOST_MCP_WRITER_LOCK_LOANS"),
+    );
+    let ready = caller.frame();
+    assert_eq!(ready["state"], "locked");
+    let scratch_path = Path::new(ready["asset_dir"].as_str().expect("caller-owned scratch"));
+    caller.send(&marker_command(&root.join("caller-dispatched")));
+    assert_eq!(caller.frame()["state"], "started");
+    let stopped = caller.frame();
+    assert_eq!(stopped["owned_work_stopped"], true);
+    assert_eq!(stopped["exit_code"], 0);
+    caller.send(&json!({"action":"close"}));
+    caller.close_input();
+    assert!(caller.finish().status.success());
+    let record: Value =
+        serde_json::from_slice(&fs::read(&fixture.domain).expect("settled owner")).expect("SDK caller-owned record");
+    let turn = record["storage_turn"].as_str().expect("SDK storage turn");
+    assert_eq!(record.get("process"), Some(&Value::Null));
+    assert!(record.get("command_phase").is_none() && record.get("scratch_identity").is_none());
+    assert!(!scratch_path.exists() && !registry.join(".writer-storage-v1").join(turn).exists());
+    write_marker(&fixture.root, &fixture.domain, &root.join("after-caller-close"));
 }
 
 #[test]

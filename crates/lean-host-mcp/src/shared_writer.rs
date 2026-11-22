@@ -162,15 +162,18 @@ enum OwnerRecordUse {
     EmbeddedLaunch,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 enum SdkIdlePhase {
+    #[default]
+    #[serde(skip)]
+    CallerOwned,
     #[serde(rename = "idle")]
     Idle,
 }
 
-// SDK settlement preserves the project lock's exact Idle record. Decode
-// that shape only for passive admission. An embedded launch still requires
-// the embedded writer's own committed process record.
+// SDK settlement preserves the project lock record: command-only turns carry
+// Idle, caller-owned turns omit the phase. An embedded launch requires the
+// embedded writer's own committed process record.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SdkIdleRecord {
@@ -178,16 +181,17 @@ struct SdkIdleRecord {
     owner: Owner,
     process: (),
     storage_turn: String,
+    #[serde(default)]
     command_phase: SdkIdlePhase,
     #[serde(
         rename = "scratch_identity",
         default,
         deserialize_with = "check_scratch_identity_shape"
     )]
-    _scratch_identity: (),
+    has_scratch_identity: bool,
 }
 
-fn check_scratch_identity_shape<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+fn check_scratch_identity_shape<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
     let digest = String::deserialize(deserializer)?;
     // The SDK verifies the original scratch binding during settlement.
     if digest.len() != 64
@@ -199,7 +203,7 @@ fn check_scratch_identity_shape<'de, D: serde::Deserializer<'de>>(deserializer: 
             "expected a 64-digit lowercase scratch identity",
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -310,12 +314,17 @@ fn decode_owner(bytes: &[u8], use_for: OwnerRecordUse) -> io::Result<Record> {
                 owner,
                 process: (),
                 storage_turn,
-                command_phase: SdkIdlePhase::Idle,
-                _scratch_identity: (),
+                command_phase,
+                has_scratch_identity,
             } = serde_json::from_slice(bytes)
                 .map_err(|error| invalid(format!("invalid embedded or SDK Idle owner record: {error}")))?;
             if storage_turn.len() != 32 || !storage_turn.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(invalid("SDK Idle record has no exact storage turn"));
+            }
+            if matches!(command_phase, SdkIdlePhase::CallerOwned)
+                && (has_scratch_identity || storage_turn.bytes().any(|byte| byte.is_ascii_uppercase()))
+            {
+                return Err(invalid("invalid caller-owned SDK predecessor"));
             }
             Record {
                 version,
@@ -1623,7 +1632,18 @@ mod tests {
         assert!(decode(&bound, OwnerRecordUse::Predecessor).is_ok());
         assert!(decode(&bound, OwnerRecordUse::EmbeddedLaunch).is_err());
 
+        let mut caller = idle.clone();
+        caller.as_object_mut().expect("fixture object").remove("command_phase");
+        assert!(decode(&caller, OwnerRecordUse::Predecessor).is_ok());
+        assert!(decode(&caller, OwnerRecordUse::EmbeddedLaunch).is_err());
+        caller
+            .as_object_mut()
+            .expect("fixture object")
+            .insert("scratch_identity".to_owned(), json!("a1".repeat(32)));
+        assert!(decode(&caller, OwnerRecordUse::Predecessor).is_err());
+
         for (key, value) in [
+            ("command_phase", Some(Value::Null)),
             ("process", None),
             ("process", Some(json!({}))),
             ("storage_turn", None),
