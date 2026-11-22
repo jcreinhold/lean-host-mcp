@@ -208,43 +208,72 @@ pub(super) fn probe(
         .lifetime_socket_directory(crate::native_socket::directory()?)
         .checked_native_loader_environment()
         .prepared_host_artifacts(prepared);
-    let mut handle =
-        LeanWorkerHostHandleBuilder::shims_only(candidate.join("smoke-project"), std::iter::empty::<String>())
-            .require_host_runtime(
-                crate::runtime_compatibility::session_expectation(id.as_str(), None).map_err(anyhow::Error::msg)?,
-            )
-            .worker_child(child)
-            .process_tracker(tracker.clone())
-            .num_threads(2)
-            .startup_timeout(Duration::from_secs(30))
-            .request_timeout(Duration::from_secs(20))
-            .open()?;
-    let result = handle.inspect_declaration_with_imports(
-        vec!["Init".to_owned()],
-        &LeanWorkerDeclarationInspectionRequest::new("Nat.add_zero"),
-        None,
-        None,
-    );
-    #[cfg(all(test, target_os = "macos"))]
-    let images = if std::env::var_os("R2_GENERATION").is_some() {
-        tests::check_loaded_images(candidate, &worker)
-    } else {
+    // A Mac installer must leave a durable generation the SDK can collect after shutdown.
+    #[cfg(target_os = "macos")]
+    let child = child.native_guardian(probe_guardian()?);
+    let run = || -> Result<()> {
+        let mut handle =
+            LeanWorkerHostHandleBuilder::shims_only(candidate.join("smoke-project"), std::iter::empty::<String>())
+                .require_host_runtime(
+                    crate::runtime_compatibility::session_expectation(id.as_str(), None).map_err(anyhow::Error::msg)?,
+                )
+                .worker_child(child)
+                .process_tracker(tracker.clone())
+                .num_threads(2)
+                .startup_timeout(Duration::from_secs(30))
+                .request_timeout(Duration::from_secs(20))
+                .open()?;
+        let result = handle.inspect_declaration_with_imports(
+            vec!["Init".to_owned()],
+            &LeanWorkerDeclarationInspectionRequest::new("Nat.add_zero"),
+            None,
+            None,
+        );
+        #[cfg(all(test, target_os = "macos"))]
+        let images = if std::env::var_os("R2_GENERATION").is_some() {
+            tests::check_loaded_images(candidate, &worker)
+        } else {
+            Ok(())
+        };
+        let cleanup = handle.try_shutdown();
+        ensure!(
+            tracker.active_processes() == 0,
+            "actual worker must retire: {cleanup:?}"
+        );
+        let result = result?;
+        cleanup?;
+        #[cfg(all(test, target_os = "macos"))]
+        images?;
+        ensure!(
+            matches!(result,LeanWorkerDeclarationInspectionResult::Found{declaration} if declaration.name=="Nat.add_zero"),
+            "missing actual declaration"
+        );
         Ok(())
     };
-    let cleanup = handle.try_shutdown();
-    ensure!(
-        tracker.active_processes() == 0,
-        "actual worker must retire: {cleanup:?}"
+    let result = run();
+    #[cfg(target_os = "macos")]
+    {
+        let owners = candidate.join("probe-owners");
+        lean_toolchain::native_guardian::collect_closed_owner_records(&owners, Duration::from_secs(5)).with_context(
+            || match &result {
+                Ok(()) => "installer probe returned; closure unconfirmed".to_owned(),
+                Err(error) => format!("installer probe failed ({error:#}); closure unconfirmed"),
+            },
+        )?;
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn probe_guardian() -> Result<std::path::PathBuf> {
+    // Unit-test executables have a libtest entry point instead of the host CLI.
+    #[cfg(test)]
+    return Ok(
+        std::path::PathBuf::from(std::env::var_os("R2_HOST").context("set R2_HOST to the matching host CLI")?)
+            .canonicalize()?,
     );
-    let result = result?;
-    cleanup?;
-    #[cfg(all(test, target_os = "macos"))]
-    images?;
-    ensure!(
-        matches!(result,LeanWorkerDeclarationInspectionResult::Found{declaration} if declaration.name=="Nat.add_zero"),
-        "missing actual declaration"
-    );
-    Ok(())
+    #[cfg(not(test))]
+    Ok(std::env::current_exe()?.canonicalize()?)
 }
 
 /// Prepare and qualify a worker in its final candidate directory. Absolute image
@@ -337,6 +366,35 @@ mod tests {
             .and_then(crate::toolchain::WorkerSidecar::into_runtime)
             .context("missing installed runtime")?;
         probe(&generation, &id, &id.elan_dir()?.canonicalize()?, runtime.prepared)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a disposable installed generation and matching R2_HOST"]
+    fn rejected_probe_retires_its_generation() -> Result<()> {
+        let generation =
+            std::path::PathBuf::from(std::env::var_os("R2_GENERATION").context("missing disposable generation")?);
+        let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
+        let sysroot = id.elan_dir()?.canonicalize()?;
+        let runtime = crate::toolchain::WorkerSidecar::load(&generation)
+            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
+            .context("missing installed runtime")?;
+        let shadow = generation.join("smoke-project/.lake/build/lib/lean/Init");
+        fs::create_dir(&shadow)?;
+        let refusal = probe(&generation, &id, &sysroot, runtime.prepared);
+        fs::remove_dir(&shadow)?;
+        let error = refusal.expect_err("shadow must refuse the actual smoke request");
+        ensure!(
+            !format!("{error:#}").contains("closure unconfirmed"),
+            "cleanup failed: {error:#}"
+        );
+        let owners = generation.join("probe-owners");
+        lean_toolchain::native_guardian::collect_closed_owner_records(&owners, std::time::Duration::from_secs(5))?;
+        ensure!(
+            fs::read_dir(owners)?.all(|e| e.is_ok_and(|e| e.file_name() == ".admission.lock")),
+            "probe did not retire"
+        );
+        Ok(())
     }
 
     #[test]
