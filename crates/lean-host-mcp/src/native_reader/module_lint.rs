@@ -5,10 +5,11 @@ use std::{ffi::OsString, io, os::unix::fs::PermissionsExt as _, path::Path};
 use serde::{Deserialize, Serialize};
 
 use super::{MAX_NAMES, NativeReaderResult, invalid, qualified_name};
-use crate::lake_meta::RUN_LINTER_REL;
+use crate::lake_meta::{BUILD_LIB_REL, RUN_LINTER_REL};
 
 pub(crate) const OPERATION: &str = "lean_module_lint_v1";
 pub(crate) const CHECKPOINT: &str = "lean_checkpoint_lint_v1";
+pub(crate) const ROOT_ARCHITECTURE: &str = "lean_root_architecture_lint_v1";
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -99,13 +100,35 @@ impl Request<'_> {
             }
             body["checkpoint"] = serde_json::json!(checkpoint);
         }
-        body["verdict"] = match outcome.exit_code {
-            Some(0) => "pass",
-            Some(_) => "fail",
-            None => "unavailable",
-        }
-        .into();
+        record_verdict(body, outcome);
     }
+}
+
+pub(super) fn architecture_command(root: &Path) -> io::Result<Vec<OsString>> {
+    let executable = executable(root)?;
+    let olean = root.join(BUILD_LIB_REL).join("Proofs.olean");
+    if !olean.symlink_metadata()?.is_file() || olean.canonicalize()? != olean {
+        return Err(invalid("canonical prebuilt Proofs root required"));
+    }
+    Ok(vec![executable.into_os_string(), "--no-build".into(), "Proofs".into()])
+}
+
+pub(super) fn record_architecture(body: &mut serde_json::Value, outcome: &NativeReaderResult) {
+    body["output_truncated"] = matches!(
+        outcome.diagnostic_preview,
+        Some(super::super::DiagnosticPreview::Clipped)
+    )
+    .into();
+    record_verdict(body, outcome);
+}
+
+fn record_verdict(body: &mut serde_json::Value, outcome: &NativeReaderResult) {
+    body["verdict"] = match outcome.exit_code {
+        Some(0) => "pass",
+        Some(_) => "fail",
+        None => "unavailable",
+    }
+    .into();
 }
 
 pub(super) fn valid_modules(modules: &[String]) -> bool {
@@ -131,6 +154,48 @@ pub(super) fn executable(root: &Path) -> io::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_architecture_requires_prebuilt_and_preserves_default_severities() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        assert_eq!(architecture_command(&root).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let executable = root.join(RUN_LINTER_REL);
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"fixture executable").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(architecture_command(&root).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let olean = root.join(BUILD_LIB_REL).join("Proofs.olean");
+        std::fs::create_dir_all(olean.parent().unwrap()).unwrap();
+        std::fs::write(olean, b"fixture artifact").unwrap();
+        assert_eq!(
+            architecture_command(&root).unwrap(),
+            [executable.into_os_string(), "--no-build".into(), "Proofs".into()]
+        );
+
+        for (code, verdict) in [(0, "pass"), (1, "fail")] {
+            let outcome = super::super::result(
+                Some(super::super::PayloadResult {
+                    target_started: true,
+                    exit_code: Some(code),
+                    exit_status: Some(format!("exit status: {code}")),
+                    diagnostic_preview: Some(super::super::DiagnosticPreview::Clipped),
+                    ..super::super::PayloadResult::default()
+                }),
+                true,
+                None,
+            );
+            assert_eq!(outcome.state, "completed");
+            let mut receipt = serde_json::json!({"exit_code": outcome.exit_code});
+            record_architecture(&mut receipt, &outcome);
+            assert_eq!(
+                receipt,
+                serde_json::json!({
+                    "exit_code": code, "output_truncated": true, "verdict": verdict
+                })
+            );
+        }
+    }
 
     #[test]
     fn prebuilt_lint_uses_only_fixed_options_and_ordered_modules() {

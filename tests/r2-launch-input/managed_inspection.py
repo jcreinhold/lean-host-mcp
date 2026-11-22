@@ -20,9 +20,10 @@ import time
 def run_check(args):
     scratch = args.scratch.resolve(strict=True)
     project = args.project.resolve(strict=True)
-    prepared = args.prepared.read_text().strip()
-    plan = json.loads(prepared)["plan"]
-    assert Path(plan["project"]).resolve(strict=True) == project
+    prepared = args.prepared.read_text().strip() if args.prepared else None
+    if prepared is not None:
+        plan = json.loads(prepared)["plan"]
+        assert Path(plan["project"]).resolve(strict=True) == project
     root = scratch / "managed"
     root.mkdir(mode=0o700)
     for name in ("config", "owners", "process", "tmp", "cache"):
@@ -51,7 +52,8 @@ def run_check(args):
     (scratch / "s").mkdir(mode=0o700)
     command = [
         args.parent.resolve(strict=True), "--lake-root", project,
-        "--prepared-generation", prepared, "--managed-native-store", db,
+        *([] if prepared is None else ["--prepared-generation", prepared]),
+        "--managed-native-store", db,
     ]
 
     @contextmanager
@@ -164,6 +166,55 @@ def run_check(args):
     def bindings():
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
             return conn.execute("SELECT registry_generation FROM recovery_bindings").fetchall()
+
+    if args.root_architecture is not None:
+        assert project.is_relative_to(scratch), "architecture control requires a disposable project inside scratch"
+        operation = "lean_root_architecture_lint_v1"
+        executable = project / ".lake/build/bin/runLinter"
+        assert executable.resolve(strict=True) == executable
+        expected = int(args.root_architecture == "fail")
+        reference = subprocess.run(
+            ["lake", "--no-build", "--no-cache", "exe", "runLinter", "--no-build", "Proofs"],
+            cwd=project, env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert reference.returncode == expected and args.expected_finding in reference.stdout, reference
+        with server() as (managed, result, tool, _):
+            discovery = result(managed("discover"))
+            assert operation in discovery["operations"], discovery
+            origin = dict(
+                key=dict(store=discovery["store"], epoch=discovery["acceptance_epoch"],
+                         nonce=list(os.urandom(16)), stage=1),
+                capability=list(os.urandom(32)),
+            )
+            intent = list(json.dumps(dict(
+                operation=operation, project=str(project), job=list(os.urandom(16)), revision=1,
+            )).encode())
+            admitted = result(managed("create", intent=intent, **origin))
+            assert admitted["execution"] == "admitted", admitted
+            for prebuilt in (executable, project / ".lake/build/lib/lean/Proofs.olean"):
+                held = prebuilt.with_suffix(".held")
+                assert not held.exists() and prebuilt.resolve(strict=True) == prebuilt
+                prebuilt.rename(held)
+                try:
+                    result(managed("start", **origin), error="prebuilt_architecture_linter_or_root_unavailable")
+                    assert result(managed("get", **origin)) == admitted
+                finally:
+                    held.rename(prebuilt)
+            closed = result(managed("start", **origin))
+            assert closed["custody"] == "closed" and closed["result"]["state"] == "retained", closed
+            saved = closed["result"]
+            body = json.loads(bytes(saved["body"]))
+            assert body["exit_code"] == expected and body["verdict"] == args.root_architecture, body
+            assert args.expected_finding in body["stdout"] and not body["output_truncated"], body
+            lock_path = json.loads(subprocess.check_output(
+                [args.parent, "writer-lock-path", project], cwd=project, env=env, timeout=10,
+            ))["lock_path"]
+            with open(lock_path, "rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                assert result(managed("get", **origin))["result"] == saved
+                assert result(managed("start", **origin))["result"] == saved
+        print(f"root architecture {args.root_architecture}: default imported finding, exact close and retained retry")
+        return
 
     with ExitStack() as stopped:
         with server(stop_before_arm=args.stopped_owner or bool(args.abrupt and entry_trace)) as (
@@ -623,17 +674,26 @@ def run_check(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("parent", "scratch", "project", "prepared", "workers", "writer"):
+    for name in ("parent", "scratch", "project", "workers", "writer"):
         parser.add_argument(f"--{name}", required=True, type=Path)
-    parser.add_argument("--declaration", required=True)
+    parser.add_argument("--prepared", type=Path)
+    parser.add_argument("--declaration")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--abrupt", action="store_true")
     mode.add_argument("--stopped-owner", action="store_true")
     mode.add_argument("--fail-result-save", action="store_true")
     mode.add_argument("--cancel-live", action="store_true")
     mode.add_argument("--deadline-while-sql-locked", action="store_true")
+    mode.add_argument("--root-architecture", choices=("pass", "fail"))
+    parser.add_argument("--expected-finding")
     parser.add_argument("--entry-scratch", type=Path)
     args = parser.parse_args()
+    if args.root_architecture is not None:
+        if not args.expected_finding or args.prepared or args.declaration:
+            parser.error("root architecture requires --expected-finding and no prepared inspection input")
+    elif not args.prepared or not args.declaration or args.expected_finding:
+        parser.error("inspection requires --prepared and --declaration")
+
     if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live or args.deadline_while_sql_locked):
         parser.error("--entry-scratch requires a stopped-owner, abrupt, live-cancel, or deadline case")
     if (args.cancel_live or args.deadline_while_sql_locked) and not args.entry_scratch:

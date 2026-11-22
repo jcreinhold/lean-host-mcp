@@ -413,6 +413,7 @@ fn explicit_domain_input_limit_preserves_deduplication_and_complete_union_bound(
         stdin: false,
         cancel_fd: None,
         stdout_result_frame: false,
+        diagnostic_preview: false,
         max_output_bytes: OUTPUT_LIMIT,
         command: vec![fixture.script.into_os_string()],
     };

@@ -289,6 +289,7 @@ impl LeanHostService {
                         serde_json::json!(crate::native_reader::admitted::AXIOMS),
                         serde_json::json!(crate::native_reader::admitted::MODULE_LINT),
                         serde_json::json!(crate::native_reader::admitted::CHECKPOINT_LINT),
+                        serde_json::json!(crate::native_reader::admitted::ROOT_ARCHITECTURE_LINT),
                     ]);
                 }
             }

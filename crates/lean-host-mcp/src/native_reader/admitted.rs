@@ -30,7 +30,9 @@ use crate::{
 
 #[path = "module_lint.rs"]
 mod module_lint;
-pub(crate) use module_lint::{CHECKPOINT as CHECKPOINT_LINT, OPERATION as MODULE_LINT};
+pub(crate) use module_lint::{
+    CHECKPOINT as CHECKPOINT_LINT, OPERATION as MODULE_LINT, ROOT_ARCHITECTURE as ROOT_ARCHITECTURE_LINT,
+};
 
 pub(crate) const OPERATION: &str = "lean_import_scan_v1";
 pub(crate) const AXIOMS: &str = "lean_declaration_axioms_v1";
@@ -237,7 +239,12 @@ pub(crate) fn operation(intent: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|v| {
         v.get("operation")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|op| matches!(op, OPERATION | AXIOMS | MODULE_LINT | CHECKPOINT_LINT))
+            .is_some_and(|op| {
+                matches!(
+                    op,
+                    OPERATION | AXIOMS | MODULE_LINT | CHECKPOINT_LINT | ROOT_ARCHITECTURE_LINT
+                )
+            })
     })
 }
 
@@ -245,7 +252,7 @@ pub(crate) fn recovery_request(key: NativeKey, intent: Vec<u8>, capability: Capa
     let parsed = serde_json::from_slice::<Intent>(&intent).ok()?;
     if !matches!(
         parsed.operation.as_str(),
-        OPERATION | AXIOMS | MODULE_LINT | CHECKPOINT_LINT
+        OPERATION | AXIOMS | MODULE_LINT | CHECKPOINT_LINT | ROOT_ARCHITECTURE_LINT
     ) {
         return None;
     }
@@ -390,6 +397,7 @@ impl Stage {
         outcome: io::Result<NativeReaderResult>,
         declarations: Option<&[String]>,
         lint: Option<module_lint::Request<'_>>,
+        architecture: bool,
     ) -> io::Result<()> {
         let Some(binding) = self.binding else {
             return outcome.map(|_| ());
@@ -430,6 +438,9 @@ impl Stage {
             }
             if let Some(lint) = lint {
                 lint.record(&mut body, &outcome);
+            }
+            if architecture {
+                module_lint::record_architecture(&mut body, &outcome);
             }
             let body = serde_json::to_vec(&body)?;
             store
@@ -487,6 +498,11 @@ pub(crate) async fn start(
             &intent.checkpoint,
         ) {
             (OPERATION, Some(_), None, None, None, None) => None,
+            (ROOT_ARCHITECTURE_LINT, None, None, None, None, None) => {
+                module_lint::architecture_command(&root)
+                    .map_err(|_| invalid("prebuilt_architecture_linter_or_root_unavailable"))?;
+                None
+            }
             (AXIOMS, None, Some(imports), Some(declarations), None, None) => {
                 Some(axiom_input(imports, declarations).map_err(|_| invalid("invalid_reader_intent"))?)
             }
@@ -522,8 +538,16 @@ pub(crate) async fn start(
                 modules,
                 checkpoint: intent.checkpoint.as_ref(),
             });
-            let result = execute(&mut stage, &root, intent.file.as_deref(), lint, max_workers);
-            stage.finish(result, intent.declarations.as_deref(), lint)
+            let architecture = intent.operation == ROOT_ARCHITECTURE_LINT;
+            let result = execute(
+                &mut stage,
+                &root,
+                intent.file.as_deref(),
+                lint,
+                architecture,
+                max_workers,
+            );
+            stage.finish(result, intent.declarations.as_deref(), lint, architecture)
         })
         .await
         .map_err(|_| McpError::internal_error("reader_task_lost", None))?
@@ -559,6 +583,7 @@ fn execute(
     root: &Path,
     relative: Option<&Path>,
     lint: Option<module_lint::Request<'_>>,
+    architecture: bool,
     capacity_limit: usize,
 ) -> io::Result<NativeReaderResult> {
     let selected = ToolchainId::from_lake_root(root).map_err(io::Error::other)?;
@@ -586,6 +611,7 @@ fn execute(
                 scan_file(root, file)?.into_os_string(),
             ],
             (None, Some(request)) => request.command(root)?,
+            (None, None) if architecture => module_lint::architecture_command(root)?,
             (None, None) => vec![lean.into_os_string(), "--json".into(), "--stdin".into()],
         },
         environment: vec![
@@ -609,7 +635,12 @@ fn execute(
         stdin: stage.generated_input().is_some(),
         cancel_fd: None,
         stdout_result_frame: true,
-        max_output_bytes: if relative.is_some() { 4096 } else { 16 * 1024 },
+        diagnostic_preview: architecture,
+        max_output_bytes: if relative.is_some() || architecture {
+            4096
+        } else {
+            16 * 1024
+        },
         command: program.command.clone(),
     };
     let mut spawned = false;

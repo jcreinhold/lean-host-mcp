@@ -72,6 +72,9 @@ pub struct NativeReaderArgs {
     /// Require complete payload stdout, allowing a clipped stderr diagnostic.
     #[arg(long)]
     stdout_result_frame: bool,
+    /// The payload exit status is the result; stdout and stderr are previews.
+    #[arg(long, hide = true, requires = "stdout_result_frame")]
+    diagnostic_preview: bool,
     #[arg(long, default_value_t = OUTPUT_LIMIT)]
     max_output_bytes: usize,
     #[arg(last = true, required = true)]
@@ -158,6 +161,7 @@ pub(crate) fn run_program_with_contract(
             stdin: false,
             cancel_fd: None,
             stdout_result_frame: false,
+            diagnostic_preview: false,
             max_output_bytes: OUTPUT_LIMIT,
             command: program.command.clone(),
         };
@@ -220,6 +224,13 @@ fn not_started(message: impl std::fmt::Display) -> NativeReaderResult {
     )
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticPreview {
+    Complete,
+    Clipped,
+}
+
 #[derive(Debug, Serialize)]
 pub struct NativeReaderResult {
     pub protocol: u32,
@@ -230,6 +241,8 @@ pub struct NativeReaderResult {
     pub stdout: String,
     pub stderr: String,
     pub output_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_preview: Option<DiagnosticPreview>,
     pub intervened: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdin_sha256: Option<String>,
@@ -253,6 +266,8 @@ struct PayloadResult {
     stdout: String,
     stderr: String,
     output_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostic_preview: Option<DiagnosticPreview>,
     intervened: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stdin_sha256: Option<String>,
@@ -365,6 +380,9 @@ impl NativeReaderArgs {
         }
         if self.stdout_result_frame {
             command.arg("--stdout-result-frame");
+        }
+        if self.diagnostic_preview {
+            command.arg("--diagnostic-preview");
         }
         if self.stdin {
             command.arg("--stdin");
@@ -580,6 +598,7 @@ fn result(payload: Option<PayloadResult>, scope_closed: bool, interrupted: Optio
         stdout: payload.stdout,
         stderr: payload.stderr,
         output_truncated: payload.output_truncated,
+        diagnostic_preview: payload.diagnostic_preview,
         intervened: payload.intervened,
         stdin_sha256: payload.stdin_sha256,
         stdin_bytes: payload.stdin_bytes,
@@ -1254,14 +1273,21 @@ fn measure_payload(
                 diagnostics.poll()?;
                 if let Some(status) = child.get()?.try_wait()? {
                     let stdout_closed = output.poll()?;
-                    diagnostics.poll()?;
+                    let stderr_closed = diagnostics.poll()?;
                     payload.exit_code = status.code();
                     payload.exit_status = Some(status.to_string());
                     payload.payload_usage = child.get()?.usage().and_then(PayloadUsage::from_waited);
                     payload.intervened = !payload_has_no_survivors()?;
-                    if args.stdout_result_frame && !stdout_closed {
+                    if args.stdout_result_frame && (!stdout_closed || (args.diagnostic_preview && !stderr_closed)) {
                         payload.output_truncated = true;
-                        payload.detail = Some("payload stdout incomplete at exit".into());
+                        payload.detail = Some(
+                            if args.diagnostic_preview {
+                                "payload diagnostic streams incomplete at exit"
+                            } else {
+                                "payload stdout incomplete at exit"
+                            }
+                            .into(),
+                        );
                     }
                     if payload.intervened {
                         payload.detail = Some("payload descendant still present at verdict; no usable result".into());
@@ -1273,8 +1299,16 @@ fn measure_payload(
             }
             payload.stdout = output.text();
             payload.stderr = diagnostics.text();
-            payload.output_truncated |= output.truncated || (!args.stdout_result_frame && diagnostics.truncated);
-            if args.stdout_result_frame && payload.detail.is_none() {
+            if args.diagnostic_preview {
+                payload.diagnostic_preview = Some(if output.truncated || diagnostics.truncated {
+                    DiagnosticPreview::Clipped
+                } else {
+                    DiagnosticPreview::Complete
+                });
+            } else {
+                payload.output_truncated |= output.truncated || (!args.stdout_result_frame && diagnostics.truncated);
+            }
+            if args.stdout_result_frame && !args.diagnostic_preview && payload.detail.is_none() {
                 if output.truncated {
                     payload.detail = Some("required payload stdout exceeds capture limit".into());
                 } else if diagnostics.truncated {

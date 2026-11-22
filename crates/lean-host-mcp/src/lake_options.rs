@@ -486,6 +486,7 @@ mod tests {
             stdout: "{\"module\":\"Demo\",\"options\":{}}".into(),
             stderr: String::new(),
             output_truncated: false,
+            diagnostic_preview: None,
             intervened: false,
             scope_closed: true,
             protected_domains: Vec::new(),
