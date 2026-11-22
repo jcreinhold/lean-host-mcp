@@ -168,6 +168,146 @@ fn stage(bytes: Vec<u8>, writer: &SharedWriter, sysroot: &Path, root: &Path, fil
     })
 }
 
+/// Supplied only by the managed caller for its approved project. The standalone
+/// writer validates the full request and reserves under its existing admission lock.
+struct ChargedWriter {
+    executable: PathBuf,
+    request: String,
+}
+
+impl ChargedWriter {
+    async fn qualify(&self, root: &Path, timeout: Duration) -> io::Result<Identity> {
+        use tokio::io::AsyncReadExt as _;
+        const LIMIT: usize = 16 * 1024;
+        if self.request.len() > LIMIT {
+            return Err(invalid("oversized module setup storage request"));
+        }
+        let request: serde_json::Value = serde_json::from_str(&self.request)?;
+        if request.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || request
+                .get("budget_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .is_none_or(|v| v == 0)
+        {
+            return Err(invalid("module setup requires an explicit v1 full-turn storage budget"));
+        }
+        let image = Identity::read(&self.executable)?;
+        let lock = lean_toolchain::shared_writer::project_lock_path(root)?;
+        tokio::time::timeout(timeout, async {
+            use std::process::Stdio;
+            let mut child = tokio::process::Command::new(&self.executable)
+                .arg("writer-lock-path")
+                .arg(root)
+                .arg("--capabilities")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| invalid("writer descriptor unavailable"))?
+                .take((LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > LIMIT || !child.wait().await?.success() {
+                return Err(invalid("writer did not provide its bounded capability descriptor"));
+            }
+            check_capability(&bytes, root, &lock)?;
+            Ok(image)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+
+fn check_capability(bytes: &[u8], root: &Path, lock: &Path) -> io::Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let capabilities = value.get("capabilities").and_then(serde_json::Value::as_array);
+    if value.get("protocol").and_then(serde_json::Value::as_u64) != Some(1)
+        || value.get("project_root").and_then(serde_json::Value::as_str)
+            != Some(root.to_str().ok_or_else(|| invalid("non-UTF-8 writer root"))?)
+        || value.get("lock_path").and_then(serde_json::Value::as_str)
+            != Some(lock.to_str().ok_or_else(|| invalid("non-UTF-8 writer lock"))?)
+        || !capabilities.is_some_and(|caps| caps.iter().any(|v| v == "lake_module_setup_capture_v1"))
+    {
+        return Err(invalid(
+            "expected lake_module_setup_capture_v1 for the selected project lock",
+        ));
+    }
+    Ok(())
+}
+
+fn run_setup(
+    writer: &mut SharedWriter,
+    root: &Path,
+    file: &Path,
+    source: &str,
+    timeout: Duration,
+    started: Instant,
+    cancel: &CallCancellation,
+) -> Result<StagedSetup> {
+    if !file.starts_with(root)
+        || file.canonicalize()? != file
+        || file.extension().is_none_or(|s| s != "lean")
+        || fs::read(file)? != source.as_bytes()
+    {
+        return Err(ServerError::BadProject(
+            "current source differs from selected verification file".into(),
+        ));
+    }
+    let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(|e| ServerError::BadProject(e.to_string()))?;
+    let sysroot = id
+        .elan_dir()
+        .map_err(|e| ServerError::BadProject(e.to_string()))?
+        .canonicalize()?;
+    let mut command = Command::new(sysroot.join("bin/lake"));
+    command
+        .current_dir(root)
+        .args(["--no-build", "--no-cache", "setup-file"])
+        .arg(file)
+        .env("LAKE_CACHE_DIR", writer.asset_dir())
+        .env("LAKE_ARTIFACT_CACHE", "false")
+        .env(crate::shared_writer::MODULE_SETUP_ENV, "1");
+    let result = writer.run_cancellable(&command, timeout.saturating_sub(started.elapsed()), &|| {
+        cancel.is_cancelled()
+    })?;
+    if !result.status.success() {
+        return Err(ServerError::BadProject(format!(
+            "Lake setup-file failed ({}): {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        )));
+    }
+    let path = writer.asset_dir().join(crate::shared_writer::MODULE_SETUP_FILE);
+    let staged = fs::File::from(
+        rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    let meta = staged.metadata()?;
+    let limit = crate::shared_writer::MODULE_SETUP_LIMIT as u64;
+    if !meta.is_file() || meta.len() > limit {
+        return Err(invalid("invalid Lake module setup staging file").into());
+    }
+    let mut bytes = Vec::new();
+    staged.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > crate::shared_writer::MODULE_SETUP_LIMIT
+        || crate::shared_writer::module_setup_digest(&bytes).as_bytes() != result.stdout
+    {
+        return Err(invalid("Lake module setup exceeds limit or differs from writer receipt").into());
+    }
+    Ok(stage(bytes, writer, &sysroot, root, file)?)
+}
+
 impl ProjectBroker {
     pub(super) async fn file_reader_with_setup(
         &self,
@@ -184,7 +324,7 @@ impl ProjectBroker {
         if root != meta.canonical_root {
             return Err(ServerError::BadProject("project selection changed".into()));
         }
-        let setup = self.prepare_file_setup(hint, file, source).await?;
+        let setup = self.prepare_file_setup(hint, file, source, None).await?;
         let activity = self.preparation_activity(&root).await?;
         let reader = Self::installed_reader(&root, meta)?;
         setup.check(&root, &reader.sysroot, &reader.custody)?;
@@ -194,77 +334,68 @@ impl ProjectBroker {
         Ok((setup, reader, activity))
     }
 
-    async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
+    async fn prepare_file_setup(
+        &self,
+        hint: &ProjectHint,
+        file: &str,
+        source: &str,
+        charged: Option<ChargedWriter>,
+    ) -> Result<StagedSetup> {
         let root = self.native_root(hint)?;
         let activity = self.preparation_activity(&root).await?;
         let timeout = Duration::from_millis(self.request_timeout_millis());
         let file = PathBuf::from(file);
         let source = source.to_owned();
         let cancel = CallCancellation::current();
+        let selected = match charged {
+            Some(selection) => {
+                let started = Instant::now();
+                let image = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "module setup cancelled before writer admission").into()),
+                    result = selection.qualify(&root, timeout) => result?,
+                };
+                Some((selection, image, started))
+            }
+            None => None,
+        };
         let mut on_drop = cancel.cancel_on_drop();
         let result = tokio::task::spawn_blocking(move || -> Result<StagedSetup> {
             let _activity = activity;
-            let helper = crate::shared_writer::contract()?.executable;
-            let started = Instant::now();
-            let mut writer = SharedWriter::open_cancellable(&helper, &root, timeout, &|| cancel.is_cancelled())?;
-            if !file.starts_with(&root)
-                || file.canonicalize()? != file
-                || file.extension().is_none_or(|s| s != "lean")
-                || fs::read(&file)? != source.as_bytes()
-            {
-                return Err(ServerError::BadProject(
-                    "current source differs from selected verification file".into(),
-                ));
-            }
-            let id = crate::toolchain::ToolchainId::from_lake_root(&root)
-                .map_err(|e| ServerError::BadProject(e.to_string()))?;
-            let sysroot = id
-                .elan_dir()
-                .map_err(|e| ServerError::BadProject(e.to_string()))?
-                .canonicalize()?;
-            let mut command = Command::new(sysroot.join("bin/lake"));
-            command
-                .current_dir(&root)
-                .args(["--no-build", "--no-cache", "setup-file"])
-                .arg(&file)
-                .env("LAKE_CACHE_DIR", writer.asset_dir())
-                .env("LAKE_ARTIFACT_CACHE", "false")
-                .env(crate::shared_writer::MODULE_SETUP_ENV, "1");
-            let result = writer.run_cancellable(&command, timeout.saturating_sub(started.elapsed()), &|| {
-                cancel.is_cancelled()
-            })?;
-            if !result.status.success() {
-                return Err(ServerError::BadProject(format!(
-                    "Lake setup-file failed ({}): {}",
-                    result.status,
-                    String::from_utf8_lossy(&result.stderr)
-                )));
-            }
-            let path = writer.asset_dir().join(crate::shared_writer::MODULE_SETUP_FILE);
-            let staged = fs::File::from(
-                rustix::fs::open(
-                    &path,
-                    rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::CLOEXEC
-                        | rustix::fs::OFlags::NOFOLLOW
-                        | rustix::fs::OFlags::NONBLOCK,
-                    rustix::fs::Mode::empty(),
+            let cancelled = || cancel.is_cancelled();
+            let (mut writer, started) = if let Some((selection, image, started)) = &selected {
+                if Identity::read(&selection.executable)? != *image {
+                    return Err(invalid("selected module setup writer changed before admission").into());
+                }
+                let writer = SharedWriter::open_with_storage_request(
+                    &selection.executable,
+                    &root,
+                    &[],
+                    &selection.request,
+                    timeout.saturating_sub(started.elapsed()),
+                    &cancelled,
+                )?;
+                (writer, *started)
+            } else {
+                let helper = crate::shared_writer::contract()?.executable;
+                let started = Instant::now();
+                (
+                    SharedWriter::open_cancellable(&helper, &root, timeout, &cancelled)?,
+                    started,
                 )
-                .map_err(io::Error::from)?,
-            );
-            let meta = staged.metadata()?;
-            let limit = crate::shared_writer::MODULE_SETUP_LIMIT as u64;
-            if !meta.is_file() || meta.len() > limit {
-                return Err(invalid("invalid Lake module setup staging file").into());
-            }
-            let mut bytes = Vec::new();
-            staged.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
-            if bytes.len() > crate::shared_writer::MODULE_SETUP_LIMIT
-                || crate::shared_writer::module_setup_digest(&bytes).as_bytes() != result.stdout
+            };
+            let outcome = run_setup(&mut writer, &root, &file, &source, timeout, started, &cancel);
+            if selected.is_some()
+                && let Err(close) = writer.close(timeout.saturating_sub(started.elapsed()))
             {
-                return Err(invalid("Lake module setup exceeds limit or differs from writer receipt").into());
+                return Err(match outcome {
+                    Ok(_) => ServerError::Internal(format!("module setup writer settlement unconfirmed: {close}")),
+                    Err(primary) => {
+                        ServerError::BadProject(format!("{primary}; writer settlement unconfirmed: {close}"))
+                    }
+                });
             }
-            Ok(stage(bytes, &writer, &sysroot, &root, &file)?)
+            outcome
         })
         .await;
         on_drop.disarm();
@@ -311,3 +442,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod charged_tests;
