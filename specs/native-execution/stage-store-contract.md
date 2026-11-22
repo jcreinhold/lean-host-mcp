@@ -26,7 +26,17 @@ A different intent or capability for that key is refused. All replies advertise 
 Use `cancel` with the original key and capability. Its transaction seals an unused launch gate and records the stop
 request together. After a lost cancel reply, either `get` or an equal `cancel` returns `execution: "not_started"` for
 that same unused revision. A consumed gate reports `execution: "unknown"` even after cancellation. The opt-in route
-accepts only `discover`, `create`, `get` and `cancel`. A saved result carries its original ID, SHA-256 digest and retained body.
+accepts `discover`, `create`, `get`, `cancel` and `ack`. A saved result carries its original ID, SHA-256 digest and retained body.
+After saving the bound result durably, send `ack` with the original key and capability plus `result_id` and
+`result_digest`. ACK retains the result body while custody is unresolved. When ACK and confirmed closure are both
+recorded, the store removes the body and keeps its ID and digest, so repeated ACK remains authenticated and idempotent.
+Unacknowledged results remain retrievable. The current inline policy prunes on confirmed closure or ACK, whichever is
+last. It keeps at most 1,024 stage identities and rejects new intents at capacity while existing status, cancellation
+and ACK stay available. At capacity, discovery can reclaim expired stages with durable ACK and confirmed closure.
+The same transaction closes the acceptance epoch before removing any eligible current-epoch identity. Unresolved
+custody and expired rows without positive ACK evidence stay recorded. A missing ID from a closed epoch cannot be
+created again. Existing stores gain an additive ACK marker on checked open. Previously expired rows stay fenced
+until the original caller supplies an authenticated repeat ACK.
 The separate `custody` field reports the last trusted resource observation. Reading a result does not advance custody
 or reissue a launch grant.
 
@@ -109,6 +119,12 @@ An existing file must pass its concrete role, version, required-column and nativ
 helper requests WAL or other profile changes. Only explicit exclusive creation makes a new 0600 file. Validation uses
 bounded metadata reads, not a scan of task history. Its internal callback is reviewed query-only code; Rust's
 `&Connection` does not itself enforce read-only SQL.
+
+The native store also checks SQLite structural integrity with `quick_check(1)` before applying its write profile.
+If the store cannot be opened, stop the managed service and preserve the database and its sidecars together for
+offline quarantine. Keep the SDK ownership registry in place. Selecting a fresh private path is an operator action
+after independently reconciling native custody. It mints a new store UUID and old IDs cannot authorize a launch
+there. The managed route does not import damaged history or automate restore.
 
 The refusal regression starts from clean DELETE-mode wrong-role, unsupported and incomplete databases for both stores,
 plus empty files. It checks unchanged journal mode, schema and bytes. It reproduced the old DELETE-to-WAL change before

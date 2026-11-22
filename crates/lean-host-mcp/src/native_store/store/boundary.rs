@@ -103,16 +103,38 @@ impl NativeStore {
             ClientCommand::Discover {} => {}
             ClientCommand::Create { capability, .. }
             | ClientCommand::Get { capability, .. }
-            | ClientCommand::Cancel { capability, .. } => {
+            | ClientCommand::Start { capability, .. }
+            | ClientCommand::Cancel { capability, .. }
+            | ClientCommand::Ack { capability, .. } => {
                 if *capability == [0; 32] {
                     return Err("capability_denied");
                 }
             }
-            _ => return Err("operation_disabled"),
         }
-        let reply = self.client(request).map_err(|error| match error {
+        let outcome = match request.command {
+            ClientCommand::Discover {} => self
+                .reclaim_spent_stages()
+                .map(|acceptance_epoch| ClientReply::Discovery {
+                    store: self.identity(),
+                    acceptance_epoch,
+                }),
+            ClientCommand::Ack {
+                key,
+                capability,
+                result_id,
+                result_digest,
+            } => self
+                .client_ack(key, &Capability(capability), result_id, &result_digest, true)
+                .map(ClientReply::Snapshot),
+            _ => self.client(request),
+        };
+        let reply = outcome.map_err(|error| match error {
             Problem::Rejected(Reject::CapabilityDenied) => "capability_denied",
             Problem::Rejected(Reject::IntentChanged) => "intent_changed",
+            Problem::Rejected(Reject::StoreFull) => "store_full",
+            Problem::Rejected(Reject::DispatchDisabled) => "operation_disabled",
+            Problem::Rejected(Reject::ConflictingResult) => "result_changed",
+            Problem::Rejected(Reject::ResultUnknown) => "result_unknown",
             Problem::Rejected(Reject::UnknownStage) => "unknown_stage",
             Problem::Rejected(Reject::WrongStore | Reject::ClosedEpoch | Reject::FutureEpoch) => "wrong_store_or_epoch",
             _ => "store_unavailable",
@@ -188,11 +210,11 @@ impl NativeStore {
                 result_id,
                 result_digest,
             } => self
-                .client_ack(key, &Capability(capability), result_id, &result_digest)
+                .client_ack(key, &Capability(capability), result_id, &result_digest, false)
                 .map(ClientReply::Snapshot),
         }
     }
-    fn client_get(&mut self, key: NativeKey, capability: &Capability) -> Answer<Snapshot> {
+    pub(crate) fn client_get(&mut self, key: NativeKey, capability: &Capability) -> Answer<Snapshot> {
         self.checked_key(key)?;
         let tx = self
             .db
@@ -207,6 +229,7 @@ impl NativeStore {
         capability: &Capability,
         result: [u8; 16],
         hash: &[u8; 32],
+        prune_closed: bool,
     ) -> Answer<Snapshot> {
         self.checked_key(key)?;
         self.db.check_profile()?;
@@ -222,14 +245,24 @@ impl NativeStore {
         if original != result || original_hash != hash {
             return reject(Reject::ConflictingResult);
         }
-        let kind = if matches!(old.result, ResultKnowledge::Expired { .. }) {
+        let kind = if matches!(old.result, ResultKnowledge::Expired { .. })
+            || (prune_closed && old.resource_report == ResourceReport::Closed)
+        {
             3
         } else {
             2
         };
         tx.execute(
-            "UPDATE stages SET result_kind=?1 WHERE epoch=?2 AND nonce=?3 AND stage=?4",
-            params![kind, number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?],
+            "UPDATE stages SET result_kind=?1,result_body=CASE WHEN ?1=3 THEN NULL ELSE result_body END,
+             managed_ack=CASE WHEN ?5 THEN 1 ELSE managed_ack END
+             WHERE epoch=?2 AND nonce=?3 AND stage=?4",
+            params![
+                kind,
+                number(key.epoch)?,
+                key.nonce.as_slice(),
+                number(key.stage)?,
+                prune_closed
+            ],
         )?;
         let snapshot = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
         commit(tx, "native-ack")?;

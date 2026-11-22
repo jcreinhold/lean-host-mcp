@@ -221,7 +221,7 @@ enum RetainedAction {
 #[tool_router(router = managed_tool_router)]
 impl LeanHostService {
     #[tool(
-        description = "Discover the managed store, admit immutable stage intent, retrieve an admission, or cancel it. Does not dispatch."
+        description = "Discover the managed store, admit immutable stage intent, retrieve an admission, cancel it, or acknowledge its durably saved result by ID and digest."
     )]
     fn lean_managed_admission(
         &self,
@@ -921,6 +921,194 @@ mod tests {
                 .unwrap_err()
                 .message,
             "operation_disabled"
+        );
+        let ack = |capability, digest| {
+            json!({
+                "op":"ack", "key":saved_key, "capability":capability,
+                "result_id":saved["result"]["id"], "result_digest":digest,
+            })
+        };
+        let digest = saved["result"]["sha256"].clone();
+        assert_eq!(
+            call(&service, ack(json!(vec![2; 32]), digest.clone()))
+                .unwrap_err()
+                .message,
+            "capability_denied"
+        );
+        assert_eq!(
+            call(&service, ack(json!(cap), json!(vec![2; 32]))).unwrap_err().message,
+            "result_changed"
+        );
+        assert_eq!(
+            call(&service, json!({"op":"get","key":saved_key,"capability":cap})).unwrap(),
+            saved
+        );
+        {
+            use crate::native_store::store::{CallerJournal, CallerKey, Capability};
+            let mut journal = CallerJournal::create_new(&path.with_file_name("caller.sqlite3")).unwrap();
+            let native_key = serde_json::from_value(saved_key.clone()).unwrap();
+            let request = journal
+                .bind(
+                    CallerKey {
+                        job: vec![7],
+                        stage: 1,
+                        revision: 1,
+                    },
+                    &[42],
+                    native_key,
+                    Capability([1; 32]),
+                )
+                .unwrap();
+            let source = service
+                .managed_store
+                .as_ref()
+                .unwrap()
+                .lock()
+                .get(native_key)
+                .unwrap()
+                .unwrap();
+            journal.save_result(&request, &source).unwrap();
+        }
+        let acknowledged = call(&service, ack(json!(cap), digest.clone())).unwrap();
+        assert_eq!(acknowledged["result"]["state"], "acknowledged");
+        assert_eq!(acknowledged["result"]["body"], json!(body));
+        assert_eq!(acknowledged["custody"], "open");
+        {
+            use crate::native_store::store::{Capability, ResourceReport};
+            let mut store = service.managed_store.as_ref().unwrap().lock();
+            let key = serde_json::from_value(saved_key.clone()).unwrap();
+            let binding = crate::native_store::store::Binding {
+                key,
+                scope: store.get(key).unwrap().unwrap().scope.unwrap(),
+            };
+            store
+                .observe_resource(binding, &Capability([1; 32]), ResourceReport::Closed)
+                .unwrap();
+        }
+        drop(service);
+        let service = stock().with_managed_native_store(&path).unwrap();
+        let expired = call(&service, ack(json!(cap), digest.clone())).unwrap();
+        assert_eq!(expired["execution"], "unknown");
+        assert_eq!(expired["custody"], "closed");
+        assert_eq!(
+            expired["result"],
+            json!({"state":"expired","id":saved["result"]["id"],"sha256":digest})
+        );
+        assert_eq!(
+            call(&service, json!({"op":"get","key":saved_key,"capability":cap})).unwrap(),
+            expired
+        );
+
+        // Once the operator is offline, preserve the refused bytes and choose a
+        // fresh explicit path. A fresh store does not accept the old ID.
+        drop(service);
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged[0] ^= 0xff;
+        std::fs::write(&path, &damaged).unwrap();
+        assert!(stock().with_managed_native_store(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        let quarantine = path.with_extension("quarantine");
+        std::fs::rename(&path, &quarantine).unwrap();
+        let replacement = stock()
+            .with_managed_native_store(&path.with_file_name("replacement.sqlite3"))
+            .unwrap();
+        assert_ne!(
+            call(&replacement, json!({"op":"discover"})).unwrap()["store"],
+            discovery["store"]
+        );
+        assert_eq!(
+            call(&replacement, json!({"op":"get","key":saved_key,"capability":cap}))
+                .unwrap_err()
+                .message,
+            "wrong_store_or_epoch"
+        );
+        assert_eq!(std::fs::read(quarantine).unwrap(), damaged);
+        let fresh = call(&replacement, json!({"op":"discover"})).unwrap();
+        let replacement_path = path.with_file_name("replacement.sqlite3");
+        let kept = json!({"store":fresh["store"],"epoch":fresh["acceptance_epoch"],"nonce":vec![7;16],"stage":1});
+        let kept_create = json!({"op":"create","key":kept,"capability":cap,"intent":[42]});
+        let kept_status = call(&replacement, kept_create.clone()).unwrap();
+        let seed = rusqlite::Connection::open(replacement_path).unwrap();
+        seed.execute_batch(
+            "WITH RECURSIVE ids(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM ids WHERE i<1023)
+             INSERT INTO stages(epoch,nonce,stage,intent,cap_hash)
+             SELECT 1,CAST(printf('%016d',i) AS BLOB),1,x'2a',zeroblob(32) FROM ids",
+        )
+        .unwrap();
+        let mut excess = kept_create.clone();
+        excess["key"]["nonce"] = json!(vec![8; 16]);
+        assert_eq!(call(&replacement, excess.clone()).unwrap_err().message, "store_full");
+        let seeded_key = |id| {
+            json!({
+                "store":fresh["store"],"epoch":fresh["acceptance_epoch"],
+                "nonce":format!("{id:016}").as_bytes(),"stage":1,
+            })
+        };
+        let spent = seeded_key(1);
+        let still_open = seeded_key(2);
+        let unknown = seeded_key(3);
+        let unacknowledged = seeded_key(4);
+        let proof = [5u8; 16];
+        let hash = [6u8; 32];
+        for (id, report, result, ack) in [(1, 3, 3, 0), (2, 1, 3, 1), (3, 0, 3, 1), (4, 3, 3, 0)] {
+            seed.execute(
+                "UPDATE stages SET gate=1,resource_report=?1,result_kind=?2,managed_ack=?3,
+                 result_id=?4,result_hash=?5,cap_hash=(SELECT cap_hash FROM stages WHERE nonce=?6),
+                 scope=?7,generation=1,owner=x'01010101010101010101010101010101'
+                 WHERE nonce=?7",
+                rusqlite::params![
+                    report,
+                    result,
+                    ack,
+                    proof,
+                    hash,
+                    [7u8; 16],
+                    format!("{id:016}").as_bytes()
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            call(
+                &replacement,
+                json!({"op":"ack","key":spent,"capability":cap,"result_id":proof,"result_digest":hash})
+            )
+            .unwrap()["result"]["state"],
+            "expired"
+        );
+        let next = call(&replacement, json!({"op":"discover"})).unwrap()["acceptance_epoch"].clone();
+        assert_eq!(next, 2);
+        assert_eq!(
+            call(&replacement, json!({"op":"start","key":spent,"capability":cap}))
+                .unwrap_err()
+                .message,
+            "unknown_stage"
+        );
+        assert_eq!(
+            call(
+                &replacement,
+                json!({"op":"create","key":spent,"capability":cap,"intent":[42]})
+            )
+            .unwrap_err()
+            .message,
+            "wrong_store_or_epoch"
+        );
+        for (key, expected) in [
+            (still_open, "open"),
+            (unknown, "unobserved"),
+            (unacknowledged, "closed"),
+        ] {
+            assert_eq!(
+                call(&replacement, json!({"op":"get","key":key,"capability":cap})).unwrap()["custody"],
+                expected
+            );
+        }
+        excess["key"]["epoch"] = next;
+        assert_eq!(call(&replacement, excess).unwrap()["execution"], "admitted");
+        assert_eq!(call(&replacement, kept_create).unwrap(), kept_status);
+        assert_eq!(
+            call(&replacement, json!({"op":"cancel","key":kept,"capability":cap})).unwrap()["execution"],
+            "not_started"
         );
         peer.cancel().await.unwrap();
     }

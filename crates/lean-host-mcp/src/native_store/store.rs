@@ -17,6 +17,7 @@ pub(crate) mod recovery;
 const CALLER_ROLE: i64 = 0x4c53_434a;
 const NATIVE_ROLE: i64 = 0x4c53_4e53;
 const LIMIT: usize = 65_536;
+const MAX_STAGES: i64 = 1_024;
 type Id = [u8; 16];
 
 #[derive(Debug)]
@@ -80,6 +81,7 @@ pub(crate) enum Reject {
     ResultUnknown,
     IdentifierRange,
     Oversized,
+    StoreFull,
     WrongSchema,
     UnknownCaller,
     CallerBindingChanged,
@@ -515,6 +517,7 @@ impl NativeStore {
             spawn INTEGER CHECK(spawn IN(1,2)),stop_requested INTEGER NOT NULL DEFAULT 0 CHECK(stop_requested IN(0,1)),\n\
             resource_report INTEGER NOT NULL DEFAULT 0 CHECK(resource_report IN(0,1,2,3)),\n\
             result_kind INTEGER NOT NULL DEFAULT 0 CHECK(result_kind IN(0,1,2,3)),result_id BLOB,result_hash BLOB,result_body BLOB CHECK(length(result_body)<=65536),\n\
+            managed_ack INTEGER NOT NULL DEFAULT 0 CHECK(managed_ack IN(0,1)),\n\
             PRIMARY KEY(epoch,nonce,stage),UNIQUE(scope,generation),\n\
             CHECK((scope IS NULL AND generation IS NULL AND owner IS NULL) OR (scope IS NOT NULL AND generation IS NOT NULL AND owner IS NOT NULL AND length(scope)=16 AND generation>=0 AND length(owner)=16))) STRICT;"))?;
         tx.execute_batch(recovery::SCHEMA)?;
@@ -523,10 +526,29 @@ impl NativeStore {
         Ok(Self { db, store })
     }
     pub(crate) fn open(path: &Path) -> Answer<Self> {
-        let db = CheckedConnection::open_existing(path, native_schema_valid)?;
-        let store = db
-            .connection()
-            .query_row("SELECT store FROM meta WHERE singleton=1", [], |r| fixed(r, 0))?;
+        let mut db = CheckedConnection::open_existing(path, |db| {
+            if !native_schema_valid(db)? {
+                return Ok(false);
+            }
+            let integrity: String = db.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+            Ok(integrity == "ok")
+        })?;
+        let tx = db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_ack: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('stages') WHERE name='managed_ack')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_ack {
+            // Older expired rows lack affirmative ACK evidence. Keep them fenced.
+            tx.execute_batch(
+                "ALTER TABLE stages ADD COLUMN managed_ack INTEGER NOT NULL DEFAULT 0 CHECK(managed_ack IN(0,1))",
+            )?;
+        }
+        let store = tx.query_row("SELECT store FROM meta WHERE singleton=1", [], |r| fixed(r, 0))?;
+        tx.commit()?;
         Ok(Self { db, store })
     }
     pub(crate) fn identity(&self) -> Id {
@@ -581,6 +603,9 @@ impl NativeStore {
         }
         if key.epoch > epoch {
             return reject(Reject::FutureEpoch);
+        }
+        if tx.query_row("SELECT count(*) FROM stages", [], |row| row.get::<_, i64>(0))? >= MAX_STAGES {
+            return reject(Reject::StoreFull);
         }
         tx.execute(
             "INSERT INTO stages(epoch,nonce,stage,intent,cap_hash) VALUES(?1,?2,?3,?4,?5)",
@@ -698,7 +723,10 @@ impl NativeStore {
                 gate_code(old.gate)
             };
             tx.execute(
-                "UPDATE stages SET resource_report=?1,gate=?2 WHERE epoch=?3 AND nonce=?4 AND stage=?5",
+                "UPDATE stages SET resource_report=?1,gate=?2,
+                 result_body=CASE WHEN ?1=3 AND result_kind=2 THEN NULL ELSE result_body END,
+                 result_kind=CASE WHEN ?1=3 AND result_kind=2 THEN 3 ELSE result_kind END
+                 WHERE epoch=?3 AND nonce=?4 AND stage=?5",
                 params![
                     report_code(report),
                     gate,
@@ -806,6 +834,45 @@ impl NativeStore {
         tx.commit()?;
         Ok(())
     }
+    /// Capacity-pressure maintenance. Close the current acceptance epoch before
+    /// deleting an acknowledged, closed, expired row from that epoch.
+    fn reclaim_spent_stages(&mut self) -> Answer<u64> {
+        const SPENT: &str = "managed_ack=1 AND gate<>0 AND resource_report=3 AND result_kind=3 AND result_body IS NULL";
+        self.db.check_profile()?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let epoch: i64 = tx.query_row("SELECT epoch FROM meta WHERE singleton=1", [], |r| r.get(0))?;
+        let full = tx.query_row("SELECT count(*) FROM stages", [], |row| row.get::<_, i64>(0))? >= MAX_STAGES;
+        let mut next = epoch;
+        if full
+            && tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM stages WHERE {SPENT} AND epoch=?1)"),
+                [epoch],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
+            next = epoch.checked_add(1).ok_or(Problem::Rejected(Reject::IdentifierRange))?;
+            tx.execute("UPDATE meta SET epoch=?1 WHERE singleton=1", [next])?;
+        }
+        if full {
+            tx.execute(
+                &format!(
+                    "DELETE FROM recovery_bindings WHERE (epoch,nonce,stage) IN
+                 (SELECT epoch,nonce,stage FROM stages WHERE {SPENT} AND epoch<?1)"
+                ),
+                [next],
+            )?;
+            let removed = tx.execute(&format!("DELETE FROM stages WHERE {SPENT} AND epoch<?1"), [next])?;
+            if removed != 0 {
+                tx.execute("DELETE FROM scope_heads WHERE NOT EXISTS(SELECT 1 FROM stages WHERE stages.scope=scope_heads.scope)", [])?;
+            }
+        }
+        commit(tx, "reclaim-spent")?;
+        Ok(positive(next)?)
+    }
+
     pub(crate) fn rotate_epoch(&mut self, expected: u64) -> Answer<u64> {
         self.db.check_profile()?;
         let next = number(
