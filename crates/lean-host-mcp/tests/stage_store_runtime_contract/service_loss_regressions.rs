@@ -277,6 +277,7 @@ fn bound_drain_service_helper() {
         return;
     };
     let fixture = Fixture::open_in_helper(&base);
+    let cut = std::env::var(CASE_ENV).unwrap();
     let owner = File::create_new(base.join("owner.lock")).unwrap();
     owner.try_lock().unwrap();
     let mut journal = CallerJournal::create_new(&base.join("caller.sqlite3")).unwrap();
@@ -288,7 +289,7 @@ fn bound_drain_service_helper() {
                 stage: 1,
                 revision: 1,
             },
-            b"disposable exact drain before GO",
+            b"disposable exact drain stage",
             NativeKey {
                 store: store.identity(),
                 epoch: 1,
@@ -309,7 +310,7 @@ fn bound_drain_service_helper() {
         scope.generation,
         u128::from_be_bytes(scope.owner),
     ));
-    runtime.prepare(&fixture, stage_key(&request), &request.intent).unwrap();
+    let prepared = runtime.prepare(&fixture, stage_key(&request), &request.intent).unwrap();
     let native = runtime.native();
     let registry = base.join("owners");
     let metadata = registry.metadata().unwrap();
@@ -340,15 +341,27 @@ fn bound_drain_service_helper() {
         guardian: serde_json::from_value(guardian["birth"].clone()).unwrap(),
     };
     let binding = store.bind_recovery_scope(&request, scope, &identity).unwrap();
-    // Model loss after durable consumption and before sending any GO byte.
+    // Consume the original permit before the optional one-time fixture GO.
     assert!(matches!(
         store.consume_launch(binding, &request.capability).unwrap(),
         Consume::Granted(_)
     ));
+    if cut == Cut::WitnessedStart.name() {
+        let packet = runtime.request_start(prepared).unwrap().unwrap();
+        assert_eq!(
+            runtime.deliver_launch(&packet, GoFault::AfterWrite),
+            Dispatch::Unconfirmed
+        );
+        fixtures::wait(|| {
+            runtime.native().root().join("body-started.json").exists() && runtime.native().heartbeat() > 0
+        });
+    } else {
+        assert_eq!(cut, Cut::ConsumedBeforeGo.name());
+    }
     write_json(
         &base,
         "bound-recovery-ready.json",
-        &json!({"root":native.root(),"record":record_path}),
+        &json!({"root":runtime.native().root(),"record":record_path}),
     );
     fixtures::wait(|| base.join("bound-recovery-reap").exists());
     drop(runtime);
@@ -379,7 +392,8 @@ fn bound_drain_recovery_helper() {
     let owner = File::open(base.join("owner.lock")).unwrap();
     assert!(matches!(owner.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
     assert_eq!(fixture.root_starts(), 1);
-    assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
+    let expected_starts = usize::from(std::env::var(CASE_ENV).unwrap() == Cut::WitnessedStart.name());
+    assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), expected_starts);
 
     let registry = Path::new(std::ffi::OsStr::from_bytes(&read.directory));
     let boot = uuid::Uuid::from_bytes(read.boot);
@@ -432,16 +446,12 @@ fn bound_drain_recovery_helper() {
     }
 }
 
-fn exiting_recoverer(fixture: &Fixture, action: &str) -> u32 {
+fn exiting_recoverer(fixture: &Fixture, cut: Cut, action: &str) -> u32 {
     let mut child = TestChild(
-        command(
-            fixture,
-            "service_loss::bound_drain_recovery_helper",
-            Cut::ConsumedBeforeGo,
-        )
-        .env(RECOVERY_ACTION_ENV, action)
-        .spawn()
-        .unwrap(),
+        command(fixture, "service_loss::bound_drain_recovery_helper", cut)
+            .env(RECOVERY_ACTION_ENV, action)
+            .spawn()
+            .unwrap(),
     );
     let pid = child.0.id();
     assert!(child.wait().success(), "separate recovery process failed at {action}");
@@ -454,17 +464,14 @@ enum RecoveryExit {
     AfterDelivery,
 }
 
-fn bound_drain_after_recovery_exit(cut: RecoveryExit) {
+fn bound_drain_after_recovery_exit(exit: RecoveryExit, cut: Cut) {
+    use std::os::unix::fs::MetadataExt as _;
     let fixture = Fixture::new();
     let base = &fixture.root;
     let mut service = TestChild(
-        command(
-            &fixture,
-            "service_loss::bound_drain_service_helper",
-            Cut::ConsumedBeforeGo,
-        )
-        .spawn()
-        .unwrap(),
+        command(&fixture, "service_loss::bound_drain_service_helper", cut)
+            .spawn()
+            .unwrap(),
     );
     let ready_path = base.join("bound-recovery-ready.json");
     fixtures::wait(|| ready_path.exists() || service.0.try_wait().unwrap().is_some());
@@ -476,6 +483,14 @@ fn bound_drain_after_recovery_exit(cut: RecoveryExit) {
     let scope_root = PathBuf::from(ready["root"].as_str().unwrap());
     let record_path = PathBuf::from(ready["record"].as_str().unwrap());
     let original_record = read_json(&record_path);
+    let lock_path = lean_toolchain::shared_writer::project_lock_path(&fixture.project).unwrap();
+    let lock_metadata = lock_path.metadata().unwrap();
+    let lock_identity = (lock_metadata.dev(), lock_metadata.ino());
+    let loans = original_record["protected_domains"].as_array().unwrap();
+    assert_eq!(loans.len(), 1);
+    assert_eq!(loans[0]["lock_path"], json!(lock_path));
+    assert_eq!(loans[0]["device"], lock_identity.0);
+    assert_eq!(loans[0]["inode"], lock_identity.1);
     let request = original_request(&CallerJournal::open(&base.join("caller.sqlite3")).unwrap());
     let db = base.join("native.sqlite3");
     let (_, original) = NativeStore::read_recovery_scope(&db, &request, None, None).unwrap();
@@ -500,20 +515,29 @@ fn bound_drain_after_recovery_exit(cut: RecoveryExit) {
     assert_eq!(read_json(&record_path), original_record);
     assert!(read.worker.is_live().unwrap() && read.guardian.is_live().unwrap());
     assert_eq!(fixture.root_starts(), 1);
-    assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
+    assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), cut.starts());
     assert!(!scope_root.join("contender-acquired.json").exists());
 
-    let (first, second) = match cut {
+    if cut.starts() == 1 {
+        // Observe actual descendant writes with the broker stopped and EX
+        // still blocked. The contender puts its existing short marker in this
+        // same stream after acquiring EX on the project lock.
+        let heartbeat = scope_root.join("heartbeat");
+        let before = heartbeat.metadata().unwrap().len();
+        fixtures::wait(|| heartbeat.metadata().unwrap().len() > before);
+        assert!(!scope_root.join("contender-acquired.json").exists());
+    }
+    let (first, second) = match exit {
         RecoveryExit::AfterRead => {
-            let reader = exiting_recoverer(&fixture, "read");
+            let reader = exiting_recoverer(&fixture, cut, "read");
             assert_eq!(read_json(&record_path), original_record);
             assert!(original.worker.is_live().unwrap());
             assert!(!scope_root.join("contender-acquired.json").exists());
-            (reader, exiting_recoverer(&fixture, "deliver"))
+            (reader, exiting_recoverer(&fixture, cut, "deliver"))
         }
         RecoveryExit::AfterDelivery => (
-            exiting_recoverer(&fixture, "deliver"),
-            exiting_recoverer(&fixture, "observe-delivery"),
+            exiting_recoverer(&fixture, cut, "deliver"),
+            exiting_recoverer(&fixture, cut, "observe-delivery"),
         ),
     };
     assert_ne!(first, second);
@@ -522,26 +546,35 @@ fn bound_drain_after_recovery_exit(cut: RecoveryExit) {
     assert_eq!(read_json(&record_path)["guardian_drain"], "requested");
     fixtures::wait(|| !original.worker.is_live().unwrap());
     assert!(owner.try_lock().is_err());
-    assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
+    assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), cut.starts());
     fs::write(base.join("bound-recovery-reap"), b"allow original custodian to reap").unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
     assert!(service.wait().success());
 
     fixtures::wait(|| !group_present(original.worker.process_group).unwrap() && !original.guardian.is_live().unwrap());
     let acquired = contender.finish();
+    assert_eq!(acquired["group_present"], false);
+    assert_eq!(acquired["worker_live"], false);
     assert_eq!(acquired["readiness_after_closure"], true);
     assert_eq!(acquired["payload_after_marker"], 0);
+    let final_lock = lock_path.metadata().unwrap();
+    assert_eq!((final_lock.dev(), final_lock.ino()), lock_identity);
     assert_eq!(fixture.root_starts(), 1);
-    assert!(fixture.leaf_starts(stage_key(&request)).is_empty());
+    assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), cut.starts());
     fixture.assert_no_safety_exit();
 }
 
 #[test]
 fn bound_drain_reads_original_under_stopped_writer_lock() {
-    bound_drain_after_recovery_exit(RecoveryExit::AfterRead);
+    bound_drain_after_recovery_exit(RecoveryExit::AfterRead, Cut::ConsumedBeforeGo);
 }
 
 #[test]
 fn bound_drain_delivery_survives_recoverer_exit() {
-    bound_drain_after_recovery_exit(RecoveryExit::AfterDelivery);
+    bound_drain_after_recovery_exit(RecoveryExit::AfterDelivery, Cut::ConsumedBeforeGo);
+}
+
+#[test]
+fn bound_drain_stops_descendant_writes_before_same_inode_handoff() {
+    bound_drain_after_recovery_exit(RecoveryExit::AfterDelivery, Cut::WitnessedStart);
 }
