@@ -68,7 +68,7 @@ pub(super) async fn run(
         let binding = store
             .lock()
             .consume_trace_read(original.key, &capability, &original.intent)
-            .map_err(super::public_error)?;
+            .map_err(|error| super::public_error(&error))?;
         let Some(binding) = binding else { return Ok(()) };
         let body = match snapshot(&root, &intent.targets, deadline) {
             Ok(traces) => serde_json::json!({"version": 1, "traces": traces}),
@@ -87,7 +87,7 @@ pub(super) async fn run(
         let mut store = store.lock();
         store
             .observe_resource(binding, &capability, ResourceReport::Closed)
-            .map_err(super::public_error)?;
+            .map_err(|error| super::public_error(&error))?;
         store
             .observe_result(
                 binding,
@@ -95,7 +95,7 @@ pub(super) async fn run(
                 uuid::Uuid::new_v4().into_bytes(),
                 body.to_string().as_bytes(),
             )
-            .map_err(super::public_error)
+            .map_err(|error| super::public_error(&error))
     })
     .await
     .map_err(|_| McpError::internal_error("trace_reader_unavailable", None))?

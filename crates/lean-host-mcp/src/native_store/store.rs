@@ -312,7 +312,7 @@ impl LaunchPermit {
 }
 #[derive(Debug)]
 pub(crate) enum Consume {
-    Granted(LaunchPermit),
+    Granted(Box<LaunchPermit>),
     AlreadyConsumed,
     Sealed,
 }
@@ -876,7 +876,7 @@ impl NativeStore {
             return reject(Reject::NoConsumedGate);
         }
         commit(tx, "consume")?;
-        Ok(Consume::Granted(LaunchPermit { binding, deadline }))
+        Ok(Consume::Granted(Box::new(LaunchPermit { binding, deadline })))
     }
     // The store mutex covers consumption, registration and committed cancellation delivery.
     // This entry routes a stop to the actor; it grants neither launch nor closure.

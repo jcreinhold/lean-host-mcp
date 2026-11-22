@@ -40,20 +40,31 @@ impl Approval {
             .read_to_end(&mut manifest)?;
         let value: serde_json::Value = serde_json::from_slice(&manifest)?;
         if manifest.len() > 1024 * 1024
-            || value["packagesDir"] != ".lake/packages"
-            || !value["packages"].as_array().is_some_and(|packages| {
-                packages
-                    .iter()
-                    .filter(|entry| matches!(entry["name"].as_str(), Some("lean-fmt" | "«lean-fmt»")))
-                    .count()
-                    == 1
-                    && packages.iter().any(|entry| {
-                        matches!(entry["name"].as_str(), Some("lean-fmt" | "«lean-fmt»"))
-                            && entry["type"] == "git"
-                            && entry["rev"] == approved.dependency_revision
-                            && entry["subDir"].is_null()
-                    })
-            })
+            || value.get("packagesDir").and_then(serde_json::Value::as_str) != Some(".lake/packages")
+            || !value
+                .get("packages")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|packages| {
+                    packages
+                        .iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry.get("name").and_then(serde_json::Value::as_str),
+                                Some("lean-fmt" | "«lean-fmt»")
+                            )
+                        })
+                        .count()
+                        == 1
+                        && packages.iter().any(|entry| {
+                            matches!(
+                                entry.get("name").and_then(serde_json::Value::as_str),
+                                Some("lean-fmt" | "«lean-fmt»")
+                            ) && entry.get("type").and_then(serde_json::Value::as_str) == Some("git")
+                                && entry.get("rev").and_then(serde_json::Value::as_str)
+                                    == Some(&approved.dependency_revision)
+                                && entry.get("subDir").is_none_or(serde_json::Value::is_null)
+                        })
+                })
             || approved.dependency_revision.len() != 40
             || !approved
                 .dependency_revision
@@ -173,7 +184,11 @@ impl Request {
             if count == 0 {
                 break;
             }
-            hash.update(&buffer[..count]);
+            hash.update(
+                buffer
+                    .get(..count)
+                    .ok_or_else(|| io::Error::other("invalid read length"))?,
+            );
         }
         let named = std::fs::symlink_metadata(&bin)?;
         if input.limit() == 0
@@ -250,8 +265,8 @@ impl Request {
             let (report, _) = read_report(assets)?;
             let selected = report.files.len();
             let mut unique = std::collections::BTreeSet::new();
-            let mut changed = 0;
-            let mut findings = 0;
+            let mut changed = 0_usize;
+            let mut findings = 0_u64;
             for row in &report.files {
                 if row.written
                     || row.validation_bypassed != 0
@@ -262,10 +277,16 @@ impl Request {
                 }
                 match row.status.as_str() {
                     "clean" => (),
-                    "would-format" => changed += 1,
+                    "would-format" => {
+                        changed = changed
+                            .checked_add(1)
+                            .ok_or_else(|| invalid("formatter change count overflow"))?;
+                    }
                     _ => return Err(invalid("formatter preview file result is incomplete")),
                 }
-                findings += row.findings.len() as u64;
+                findings = findings
+                    .checked_add(row.findings.len() as u64)
+                    .ok_or_else(|| invalid("formatter finding count overflow"))?;
             }
             let exit = i32::from(changed != 0);
             if report.mode != "format"
@@ -323,7 +344,7 @@ impl Request {
             }
         }
         let mut files = Vec::with_capacity(self.targets.len());
-        let mut written = 0;
+        let mut written = 0_usize;
         for source in &self.targets {
             let row = rows
                 .remove(&source.file)
@@ -341,7 +362,9 @@ impl Request {
             {
                 return Err(invalid("formatter report disagrees with source bytes"));
             }
-            written += usize::from(row.written);
+            written = written
+                .checked_add(usize::from(row.written))
+                .ok_or_else(|| invalid("formatter write count overflow"))?;
             files.push(serde_json::json!({
                 "path":source.file, "before_sha256":source.sha256, "after_sha256":after,
                 "written":row.written, "status":row.status,
@@ -358,12 +381,12 @@ impl Request {
 }
 
 fn hex_digest(digest: [u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    encoded
+    digest
+        .into_iter()
+        .flat_map(|byte| {
+            [byte >> 4, byte & 0x0f].map(|digit| char::from_digit(u32::from(digit), 16).unwrap_or_default())
+        })
+        .collect()
 }
 
 fn read_report(assets: &Path) -> io::Result<(Report, [u8; 32])> {

@@ -72,8 +72,8 @@ impl Job {
         operator_prepared: Option<&str>,
         actor_healthy: &AtomicBool,
     ) -> crate::error::Result<()> {
-        if !operator_prepared
-            .is_some_and(|input| Sha256::digest(input.as_bytes()).as_slice() == self.intent.prepared_sha256)
+        if operator_prepared
+            .is_none_or(|input| Sha256::digest(input.as_bytes()).as_slice() != self.intent.prepared_sha256)
         {
             return Err(internal("prepared generation changed or original admission expired"));
         }
@@ -84,6 +84,7 @@ impl Job {
             let current = store
                 .client_get(self.original.key, &self.original.capability)
                 .map_err(internal)?;
+            drop(store);
             if current.gate != Gate::Pending || current.scope.is_some() {
                 return Ok(());
             }
@@ -140,6 +141,7 @@ impl Job {
             store
                 .attach_active_stop(binding, cancellation.clone())
                 .map_err(internal)?;
+            drop(store);
             (binding, permit)
         };
         let _stop = StopRegistration {
@@ -196,12 +198,12 @@ impl Job {
     }
 }
 
-fn public_error(error: Problem) -> McpError {
+fn public_error(error: &Problem) -> McpError {
     let reason = match error {
         Problem::Rejected(Reject::CapabilityDenied) => "capability_denied",
         Problem::Rejected(Reject::UnknownStage) => "unknown_stage",
         Problem::Rejected(Reject::WrongStore) => "wrong_store_or_epoch",
-        _ => "store_unavailable",
+        Problem::Rejected(_) | Problem::Sql(_) | Problem::Connection(_) => "store_unavailable",
     };
     McpError::invalid_params(reason, None)
 }
@@ -261,7 +263,10 @@ pub(crate) async fn start(
             .map(|reply| advertise(reply, broker))
             .map_err(|reason| McpError::invalid_params(reason, None))
     };
-    let snapshot = store.lock().client_get(key, &capability).map_err(public_error)?;
+    let snapshot = store
+        .lock()
+        .client_get(key, &capability)
+        .map_err(|error| public_error(&error))?;
     if snapshot.gate != Gate::Pending || snapshot.scope.is_some() {
         return get();
     }
@@ -319,7 +324,10 @@ pub(crate) async fn start(
     };
     if let Err(error) = actor.inspect_managed(job, deadline).await {
         tracing::debug!(%error, "managed inspection did not confirm a result");
-        let saved = store.lock().client_get(key, &capability).map_err(public_error)?;
+        let saved = store
+            .lock()
+            .client_get(key, &capability)
+            .map_err(|error| public_error(&error))?;
         if saved.gate == Gate::Pending && saved.scope.is_none() {
             return Err(McpError::internal_error("prepared_inspection_not_started", None));
         }
@@ -449,9 +457,13 @@ pub(crate) fn drain(
     if capability.0 == [0; 32] {
         return Err(McpError::invalid_params("capability_denied", None));
     }
-    let snapshot = store.client_get(key, &capability).map_err(public_error)?;
+    let snapshot = store
+        .client_get(key, &capability)
+        .map_err(|error| public_error(&error))?;
     if submit {
-        store.authorize_drain(key, authorization).map_err(public_error)?;
+        store
+            .authorize_drain(key, authorization)
+            .map_err(|error| public_error(&error))?;
     }
     let intent: Intent = serde_json::from_slice(&snapshot.intent)
         .map_err(|_| McpError::invalid_params("recovery_claim_changed", None))?;
@@ -486,7 +498,7 @@ pub(crate) fn drain(
                 Problem::Rejected(Reject::CallerBindingChanged | Reject::WrongScope | Reject::IntentChanged) => {
                     McpError::invalid_params("recovery_claim_changed", None)
                 }
-                other => public_error(other),
+                Problem::Rejected(_) | Problem::Sql(_) | Problem::Connection(_) => public_error(&error),
             })?;
         claim_status = Some(if won { "won" } else { "same" });
         if won

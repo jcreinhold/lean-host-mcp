@@ -25,7 +25,7 @@ fn create(store: &mut NativeStore, request: &SavedRequest) -> ClientReply {
 }
 fn snapshot(reply: ClientReply) -> Snapshot {
     match reply {
-        ClientReply::Snapshot(snapshot) => snapshot,
+        ClientReply::Snapshot(snapshot) => *snapshot,
         ClientReply::Discovery { .. } => panic!("expected original attempt snapshot"),
     }
 }

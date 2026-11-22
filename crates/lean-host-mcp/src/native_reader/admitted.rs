@@ -1,6 +1,18 @@
 //! Durable launch gate for one fixed external reader.
-use super::*;
+use super::{
+    Capture, NativeReaderArgs, NativeReaderProgram, NativeReaderResult, POLL, invalid, reserve_scope, run_internal,
+    until,
+};
+use lean_rs_worker_parent::LeanWorkerNativeScopeLease;
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+use serde::{Deserialize, Serialize};
 use std::{io::Write as _, os::unix::ffi::OsStrExt as _, sync::Arc};
+use std::{
+    io::{self, Read as _},
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 use lean_rs_worker_parent::LeanWorkerCancellationToken;
 use parking_lot::Mutex;
@@ -336,6 +348,7 @@ impl Stage {
             store
                 .attach_active_stop(binding, self.cancellation.clone())
                 .map_err(io::Error::other)?;
+            drop(store);
             permit
                 .into_deadline_grant()
                 .ok_or_else(|| invalid("external reader deadline missing"))?
@@ -400,13 +413,16 @@ impl Stage {
                 } else {
                     None
                 };
-                if let Some(reports) = reports {
-                    body["declarations"] = serde_json::json!(
-                        declarations
-                            .iter()
-                            .zip(reports)
-                            .map(|(name, axioms)| { serde_json::json!({"declaration":name, "axioms":axioms}) })
-                            .collect::<Vec<_>>()
+                if let (Some(reports), Some(fields)) = (reports, body.as_object_mut()) {
+                    fields.insert(
+                        "declarations".into(),
+                        serde_json::json!(
+                            declarations
+                                .iter()
+                                .zip(reports)
+                                .map(|(name, axioms)| { serde_json::json!({"declaration":name, "axioms":axioms}) })
+                                .collect::<Vec<_>>()
+                        ),
                     );
                 } else {
                     body = serde_json::json!({"version":1, "status":"axiom_reports_unavailable"});
@@ -425,6 +441,7 @@ impl Stage {
                 )
                 .map_err(io::Error::other)?;
         }
+        drop(store);
         Ok(())
     }
 }
@@ -519,6 +536,7 @@ pub(crate) async fn start(
     let mut store = store.lock();
     crate::managed_prepared::reconcile_lookup(&mut store, key, &capability);
     let status = store.admission(query.to_string().as_bytes()).map_err(invalid)?;
+    drop(store);
     Ok(Some(crate::managed_prepared::advertise(status, broker)))
 }
 

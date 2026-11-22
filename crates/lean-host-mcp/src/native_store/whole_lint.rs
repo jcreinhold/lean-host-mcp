@@ -95,7 +95,10 @@ pub(crate) fn read_checked_config(root: &Path, expected: &[u8; 32]) -> io::Resul
 /// never turns a real lint exit into an artificial pipe failure.
 fn diagnostic_preview(mut input: impl io::Read) -> io::Result<(String, bool)> {
     let mut bytes = Vec::new();
-    input.by_ref().take(OUTPUT_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+    input
+        .by_ref()
+        .take((OUTPUT_LIMIT as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
     let clipped = bytes.len() > OUTPUT_LIMIT;
     bytes.truncate(OUTPUT_LIMIT);
     if clipped {

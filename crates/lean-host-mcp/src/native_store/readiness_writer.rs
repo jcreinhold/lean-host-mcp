@@ -205,10 +205,10 @@ pub(super) async fn run(
             &helper,
             &root,
             &store,
-            original,
+            &original,
             &capability,
             deadline,
-            stage,
+            &stage,
             prepared_generation,
         )
     })
@@ -220,18 +220,18 @@ fn execute(
     helper: &Path,
     root: &Path,
     store: &Mutex<NativeStore>,
-    original: Snapshot,
+    original: &Snapshot,
     capability: &Capability,
     deadline: AdmissionDeadline,
-    stage: Stage,
+    stage: &Stage,
     prepared_generation: Option<String>,
 ) -> Result<(), McpError> {
     let no_start = |_| McpError::invalid_params("readiness_writer_not_started", None);
     let invalid_lint_input = || McpError::invalid_params("whole_library_lint_configuration_changed", None);
-    if let Stage::Preparation(Target::WholeLint { lakefile_sha256 }) = &stage {
+    if let Stage::Preparation(Target::WholeLint { lakefile_sha256 }) = stage {
         writer_preparation::whole_lint::check_config(root, lakefile_sha256).map_err(|_| invalid_lint_input())?;
     }
-    if let Stage::Preparation(Target::FirstPartyClean { lakefile_sha256 }) = &stage {
+    if let Stage::Preparation(Target::FirstPartyClean { lakefile_sha256 }) = stage {
         let unsafe_clean = |_| McpError::invalid_params("first_party_clean_input_or_scope_changed", None);
         let build = writer_preparation::first_party_clean::check(root, lakefile_sha256).map_err(unsafe_clean)?;
         if helper.starts_with(&build)
@@ -263,12 +263,12 @@ fn execute(
         None
     };
     let roots = shims.as_ref().map_or(&[][..], |shims| shims.domains.as_slice());
-    let budget = deadline.remaining().map_err(super::public_error)?;
+    let budget = deadline.remaining().map_err(|error| super::public_error(&error))?;
     let mut writer = SharedWriter::open_with_write_roots(helper, root, roots, budget, &expired).map_err(no_start)?;
     let cancellation = LeanWorkerCancellationToken::default();
     let prepared = (|| {
         let ready = writer.stage_ready().map_err(no_start)?.clone();
-        let command = match &stage {
+        let command = match stage {
             Stage::Preparation(target) => {
                 let plan = Plan {
                     root: root.to_owned(),
@@ -345,12 +345,13 @@ fn execute(
         let mut store = store.lock();
         let binding = store
             .consume_readiness_writer(original.key, capability, &original.intent, &ready, deadline)
-            .map_err(super::public_error)?;
+            .map_err(|error| super::public_error(&error))?;
         if let Some(binding) = binding {
             store
                 .attach_active_stop(binding, cancellation.clone())
-                .map_err(super::public_error)?;
+                .map_err(|error| super::public_error(&error))?;
         }
+        drop(store);
         Ok::<_, McpError>(binding.map(|binding| (binding, command, permit)))
     })();
     let (binding, command, permit) = match prepared {
@@ -373,7 +374,7 @@ fn execute(
     let result = writer.run_permitted(&command, permit, &|| cancellation.is_cancelled() || expired());
     // Preserve the primary waited result independently of helper settlement.
     // The caller waits for closed custody before using it.
-    let body = result.ok().and_then(|output| match &stage {
+    let body = result.ok().and_then(|output| match stage {
         Stage::Preparation(Target::FirstPartyClean { .. }) if output.status.success() => {
             writer_preparation::first_party_clean::Receipt::parse(&output.stdout)
                 .ok()
@@ -406,13 +407,13 @@ fn execute(
                 uuid::Uuid::new_v4().into_bytes(),
                 body.to_string().as_bytes(),
             )
-            .map_err(super::public_error)
+            .map_err(|error| super::public_error(&error))
     });
     if writer.close(Duration::from_secs(5)).is_ok() {
         store
             .lock()
             .observe_resource(binding, capability, ResourceReport::Closed)
-            .map_err(super::public_error)?;
+            .map_err(|error| super::public_error(&error))?;
     }
     saved
 }

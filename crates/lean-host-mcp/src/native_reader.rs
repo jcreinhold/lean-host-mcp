@@ -674,7 +674,7 @@ fn run_internal(
     program: Option<&NativeReaderProgram>,
     configured_helper: Option<&crate::shared_writer::WriterContract>,
     prepared_scope: Option<(LeanWorkerNativeScope, Instant)>,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] mut admitted: Option<
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] admitted: Option<
         &mut admitted::Stage,
     >,
     mut keepalive: Option<Box<dyn Send>>,
@@ -852,7 +852,7 @@ fn run_internal(
     }
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     if interrupted.is_none()
-        && let Some(stage) = admitted.as_deref_mut()
+        && let Some(stage) = admitted
         && let Err(error) = stage.release(native.lease()?, &mut output, cancelled)
     {
         interrupted = Some(format!("admitted native reader gate refused: {error}"));

@@ -269,6 +269,7 @@ impl LeanHostService {
         let reply = store
             .admission_with_budget(input.request.as_bytes(), budget)
             .map_err(|reason| McpError::invalid_params(reason, None))?;
+        drop(store);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let reply = {
             let mut reply = crate::managed_prepared::advertise(reply, &self.ctx.broker);
@@ -291,8 +292,8 @@ impl LeanHostService {
                     ]);
                 }
             }
-            if let Some(recovery) = recovery {
-                reply["recovery"] = recovery;
+            if let (Some(recovery), Some(fields)) = (recovery, reply.as_object_mut()) {
+                fields.insert("recovery".into(), recovery);
             }
             reply
         };

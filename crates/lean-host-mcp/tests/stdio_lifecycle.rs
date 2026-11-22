@@ -491,7 +491,8 @@ mod launcher_regressions {
                     .expect("discover reply"),
             )
             .expect("discover JSON");
-            let bytes: [u8; 16] = serde_json::from_value(data["store"].clone()).expect("store UUID bytes");
+            let bytes: [u8; 16] = serde_json::from_value(data.get("store").expect("discover store identity").clone())
+                .expect("store UUID bytes");
             server.close_stdin_and_wait().await;
             (path, uuid::Uuid::from_bytes(bytes))
         }
@@ -683,8 +684,12 @@ mod launcher_regressions {
         );
         let visible = fs::read_to_string(&config).expect("visible selector");
         let selector: toml::Table = toml::from_str(&visible).expect("selector TOML");
-        assert_eq!(selector["launcher"]["generation"].as_integer(), Some(2));
-        assert_eq!(selector["launcher"]["mode"].as_str(), Some("managed"));
+        let launcher = selector
+            .get("launcher")
+            .and_then(toml::Value::as_table)
+            .expect("launcher table");
+        assert_eq!(launcher.get("generation").and_then(toml::Value::as_integer), Some(2));
+        assert_eq!(launcher.get("mode").and_then(toml::Value::as_str), Some("managed"));
         let inode = config.metadata().expect("visible inode").ino();
 
         let retry = fixture

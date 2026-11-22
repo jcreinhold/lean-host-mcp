@@ -98,22 +98,18 @@ impl Request {
             return (receipt.to_string().len() <= MAX_RESULT).then_some(receipt);
         }
         let outcome: Outcome = serde_json::from_slice(&output.stdout).ok()?;
-        match &outcome {
-            Outcome::Ok { results, .. } | Outcome::MissingImports { results, .. } => {
-                if results.len() != self.declarations.len()
-                    || results
-                        .iter()
-                        .zip(&self.declarations)
-                        .enumerate()
-                        .any(|(index, (row, name))| {
-                            row.id != index.to_string()
-                                || !matches!(&row.target, Target::Name { name: actual } if actual == name)
-                        })
-                {
-                    return None;
-                }
-            }
-            _ => (),
+        if let Outcome::Ok { results, .. } | Outcome::MissingImports { results, .. } = &outcome
+            && (results.len() != self.declarations.len()
+                || results
+                    .iter()
+                    .zip(&self.declarations)
+                    .enumerate()
+                    .any(|(index, (row, name))| {
+                        row.id != index.to_string()
+                            || !matches!(&row.target, Target::Name { name: actual } if actual == name)
+                    }))
+        {
+            return None;
         }
         serde_json::from_slice(&output.stdout).ok()
     }
@@ -143,7 +139,9 @@ pub(crate) fn capture(command: &mut Command, limit: usize) -> io::Result<Vec<u8>
         .take()
         .ok_or_else(|| io::Error::other("missing capture pipe"))?;
     let mut bytes = Vec::new();
-    let read = (&mut stdout).take(limit as u64 + 1).read_to_end(&mut bytes);
+    let read = (&mut stdout)
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes);
     if read.is_err() || bytes.len() > limit {
         let _killed = child.kill();
     }
@@ -254,7 +252,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
         "source": source,"file":path,"roots":[],"imports":[],"targets":targets,
         "allowSorry":false,"reportAxioms":true,"perFieldBytes":4096,"totalBytes":32768,
         "namespaceContext":"","optionsJson":lean_toolchain::lean_options_json(&setup.options),
-        "heartbeats":200000,"diagnosticBytes":16384
+        "heartbeats":200_000,"diagnosticBytes":16_384
     });
     let entry = match plan.projection {
         Projection::Diagnostics => concat!(
@@ -332,9 +330,11 @@ impl ManagedCall<'_> {
         let names = request
             .targets
             .iter()
-            .map(|target| match &target.target {
-                Target::Name { name } => Ok(name.as_str()),
-                _ => Err(unavailable("managed verification requires named declarations")),
+            .map(|target| {
+                let Target::Name { name } = &target.target else {
+                    return Err(unavailable("managed verification requires named declarations"));
+                };
+                Ok(name.as_str())
             })
             .collect::<crate::Result<Vec<_>>>()?;
         let body = self
@@ -342,19 +342,16 @@ impl ManagedCall<'_> {
             .await?;
         let mut value: Outcome =
             serde_json::from_slice(&body).map_err(|_| unavailable("invalid managed verification result"))?;
-        match &mut value {
-            Outcome::Ok { results, .. } | Outcome::MissingImports { results, .. } => {
-                if results.len() != request.targets.len() {
-                    return Err(unavailable("incomplete managed verification result"));
-                }
-                for (row, original) in results.iter_mut().zip(request.targets) {
-                    if row.target != original.target {
-                        return Err(unavailable("managed verification result target changed"));
-                    }
-                    row.id = original.id;
-                }
+        if let Outcome::Ok { results, .. } | Outcome::MissingImports { results, .. } = &mut value {
+            if results.len() != request.targets.len() {
+                return Err(unavailable("incomplete managed verification result"));
             }
-            _ => (),
+            for (row, original) in results.iter_mut().zip(request.targets) {
+                if row.target != original.target {
+                    return Err(unavailable("managed verification result target changed"));
+                }
+                row.id = original.id;
+            }
         }
         let identity = broker.project_identity_without_worker(hint, imports)?;
         Ok(crate::broker::BrokerCall {
@@ -447,7 +444,9 @@ impl ManagedCall<'_> {
         }
         match saved.result {
             ResultKnowledge::Retained { body, .. } | ResultKnowledge::Acknowledged { body, .. } => Ok(body),
-            _ => Err(unavailable("managed setup result unavailable")),
+            ResultKnowledge::Pending | ResultKnowledge::Expired { .. } => {
+                Err(unavailable("managed setup result unavailable"))
+            }
         }
     }
 }

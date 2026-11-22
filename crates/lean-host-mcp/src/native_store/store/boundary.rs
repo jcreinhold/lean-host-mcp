@@ -38,43 +38,44 @@ struct WireRequest {
 #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
 impl ClientRequest {
     pub(crate) fn get_identity(&self) -> Option<(NativeKey, Capability)> {
-        match self.command {
-            ClientCommand::Get { key, capability } => Some((key, Capability(capability))),
-            _ => None,
-        }
+        let ClientCommand::Get { key, capability } = self.command else {
+            return None;
+        };
+        Some((key, Capability(capability)))
     }
 
     pub(crate) fn start_identity(&self) -> Option<(NativeKey, Capability)> {
-        match self.command {
-            ClientCommand::Start { key, capability } => Some((key, Capability(capability))),
-            _ => None,
-        }
+        let ClientCommand::Start { key, capability } = self.command else {
+            return None;
+        };
+        Some((key, Capability(capability)))
     }
 }
 
 #[cfg(all(feature = "managed-native-store", target_os = "macos"))]
 impl ClientRequest {
     pub(crate) fn drain_claim(&self) -> Option<DrainClaim> {
-        match &self.command {
-            ClientCommand::Drain {
-                key,
-                capability,
-                generation,
-                revision,
-                submit,
-                authorization,
-                claimant,
-            } => Some(DrainClaim {
-                key: *key,
-                capability: Capability(*capability),
-                generation: generation.clone(),
-                revision: *revision,
-                submit: *submit,
-                authorization: *authorization,
-                claimant: *claimant,
-            }),
-            _ => None,
-        }
+        let ClientCommand::Drain {
+            key,
+            capability,
+            generation,
+            revision,
+            submit,
+            authorization,
+            claimant,
+        } = &self.command
+        else {
+            return None;
+        };
+        Some(DrainClaim {
+            key: *key,
+            capability: Capability(*capability),
+            generation: generation.clone(),
+            revision: *revision,
+            submit: *submit,
+            authorization: *authorization,
+            claimant: *claimant,
+        })
     }
 }
 
@@ -138,7 +139,7 @@ enum ClientCommand {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ClientReply {
     Discovery { store: [u8; 16], acceptance_epoch: u64 },
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
 }
 pub(crate) fn decode(bytes: &[u8]) -> Result<ClientRequest, DecodeError> {
     if bytes.len() > MAX_REQUEST_BYTES {
@@ -201,7 +202,7 @@ impl NativeStore {
                     drain_authorization,
                     budget.map(super::recovery::admission_deadline),
                 )
-                .map(ClientReply::Snapshot),
+                .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
             ClientCommand::Discover {} => self
                 .reclaim_spent_stages()
                 .map(|acceptance_epoch| ClientReply::Discovery {
@@ -215,8 +216,11 @@ impl NativeStore {
                 result_digest,
             } => self
                 .client_ack(key, &Capability(capability), result_id, &result_digest, true)
-                .map(ClientReply::Snapshot),
-            _ => self.client(request),
+                .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
+            ClientCommand::Get { .. }
+            | ClientCommand::Start { .. }
+            | ClientCommand::Cancel { .. }
+            | ClientCommand::Drain { .. } => self.client(request),
         };
         let reply = outcome.map_err(|error| match error {
             Problem::Rejected(Reject::CapabilityDenied) => "capability_denied",
@@ -227,7 +231,7 @@ impl NativeStore {
             Problem::Rejected(Reject::ResultUnknown) => "result_unknown",
             Problem::Rejected(Reject::UnknownStage) => "unknown_stage",
             Problem::Rejected(Reject::WrongStore | Reject::ClosedEpoch | Reject::FutureEpoch) => "wrong_store_or_epoch",
-            _ => "store_unavailable",
+            Problem::Sql(_) | Problem::Connection(_) | Problem::Rejected(_) => "store_unavailable",
         })?;
         Ok(match reply {
             ClientReply::Discovery {
@@ -267,9 +271,9 @@ impl NativeStore {
                     "cancel_requested": snapshot.stop_requested,
                     "result": result, "custody": custody,
                 });
-                if let Some(hash) = snapshot.compacted_intent_sha256 {
-                    reply["intent"] = serde_json::Value::Null;
-                    reply["intent_sha256"] = serde_json::json!(hash);
+                if let (Some(hash), Some(fields)) = (snapshot.compacted_intent_sha256, reply.as_object_mut()) {
+                    fields.insert("intent".into(), serde_json::Value::Null);
+                    fields.insert("intent_sha256".into(), serde_json::json!(hash));
                 }
                 reply
             }
@@ -289,17 +293,17 @@ impl NativeStore {
                 drain_authorization,
             } => self
                 .create_intent(key, &Capability(capability), &intent, drain_authorization, None)
-                .map(ClientReply::Snapshot),
-            ClientCommand::Get { key, capability } => {
-                self.client_get(key, &Capability(capability)).map(ClientReply::Snapshot)
-            }
+                .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
+            ClientCommand::Get { key, capability } => self
+                .client_get(key, &Capability(capability))
+                .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
             ClientCommand::Start { key, capability } => {
                 self.client_get(key, &Capability(capability))?;
                 reject(Reject::DispatchDisabled)
             }
             ClientCommand::Cancel { key, capability } => self
                 .cancel_original(key, &Capability(capability), None)
-                .map(ClientReply::Snapshot),
+                .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
             ClientCommand::Drain { .. } => reject(Reject::DispatchDisabled),
             ClientCommand::Ack {
                 key,
@@ -308,7 +312,7 @@ impl NativeStore {
                 result_digest,
             } => self
                 .client_ack(key, &Capability(capability), result_id, &result_digest, false)
-                .map(ClientReply::Snapshot),
+                .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
         }
     }
     pub(crate) fn client_get(&mut self, key: NativeKey, capability: &Capability) -> Answer<Snapshot> {

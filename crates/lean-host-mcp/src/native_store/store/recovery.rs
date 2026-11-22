@@ -1,5 +1,10 @@
 //! Private one-stage recovery lookup. The registry remains the native authority.
-use super::*;
+use super::{
+    AdmissionDeadline, Answer, Binding, CheckedConnection, Gate, Id, NativeKey, NativeStore, OptionalExtension, Path,
+    Problem, Reject, ResourceReport, SavedRequest, Scope, Transaction, TransactionBehavior, authenticate,
+    bind_scope_transaction, blob, bound_stage, bounded, commit, compact_closed_acknowledged, digest, fixed,
+    native_schema_valid, number, optional_fixed, params, positive, read_stage, read_stage_columns, reject,
+};
 use lean_toolchain::native_guardian::NativeProcessIdentity;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 

@@ -3789,7 +3789,11 @@ fn semantic_launch_input(
             if count == 0 {
                 break;
             }
-            digest.update(&block[..count]);
+            digest.update(
+                block
+                    .get(..count)
+                    .ok_or_else(|| std::io::Error::other("invalid read length"))?,
+            );
         }
         Ok(digest_hex(digest.finalize()))
     }

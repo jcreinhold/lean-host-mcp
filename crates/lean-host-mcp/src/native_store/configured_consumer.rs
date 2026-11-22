@@ -50,7 +50,11 @@ impl SourceIdentity {
             if count == 0 {
                 break;
             }
-            hash.update(&buffer[..count]);
+            hash.update(
+                buffer
+                    .get(..count)
+                    .ok_or_else(|| io::Error::other("invalid read length"))?,
+            );
         }
         if input.limit() == 0 {
             return Err(io::Error::other("source exceeds the admitted file limit"));

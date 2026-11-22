@@ -13,7 +13,7 @@ pub(crate) const CHECKPOINT: &str = "lean_checkpoint_lint_v1";
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Checkpoint {
-    Default {},
+    Default(CheckpointDefault),
     Proof {
         term_objects: i32,
         branch_score: i32,
@@ -21,10 +21,24 @@ pub(super) enum Checkpoint {
     },
 }
 
+#[derive(Serialize)]
+pub(super) struct CheckpointDefault {}
+
+impl<'de> Deserialize<'de> for CheckpointDefault {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = std::collections::BTreeMap::<String, serde::de::IgnoredAny>::deserialize(deserializer)?;
+        if fields.is_empty() {
+            Ok(Self {})
+        } else {
+            Err(serde::de::Error::custom("default checkpoint takes no fields"))
+        }
+    }
+}
+
 impl Checkpoint {
     pub(super) fn valid(&self) -> bool {
         match *self {
-            Self::Default {} => true,
+            Self::Default(_) => true,
             Self::Proof {
                 term_objects,
                 branch_score,
@@ -63,7 +77,7 @@ impl Request<'_> {
                     format!("--proof-branch-depth={branch_depth}").into(),
                 ]);
             }
-            None | Some(Checkpoint::Default {}) => command.push("--deny=all".into()),
+            None | Some(Checkpoint::Default(_)) => command.push("--deny=all".into()),
         }
         command.extend(self.modules.iter().map(OsString::from));
         Ok(command)
@@ -97,9 +111,12 @@ impl Request<'_> {
 pub(super) fn valid_modules(modules: &[String]) -> bool {
     !modules.is_empty()
         && modules.len() <= MAX_NAMES
-        && modules
-            .iter()
-            .all(|module| qualified_name(module) && !module.ends_with(".lean"))
+        && modules.iter().all(|module| {
+            qualified_name(module)
+                && Path::new(module)
+                    .extension()
+                    .is_none_or(|extension| extension != "lean")
+        })
 }
 
 pub(super) fn executable(root: &Path) -> io::Result<std::path::PathBuf> {
@@ -167,6 +184,12 @@ mod tests {
                 "--proof-branch-depth=30",
                 "Z.Second"
             ],
+        );
+        let default = serde_json::from_str::<Checkpoint>(r#"{"kind":"default"}"#).unwrap();
+        assert!(default.valid());
+        assert_eq!(
+            serde_json::to_value(default).unwrap(),
+            serde_json::json!({"kind":"default"})
         );
         assert!(serde_json::from_str::<Checkpoint>(r#"{"kind":"default","flag":"--no-build"}"#).is_err());
     }

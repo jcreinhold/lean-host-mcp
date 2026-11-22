@@ -51,7 +51,8 @@ pub(crate) fn check(root: &Path, expected: &[u8; 32]) -> io::Result<PathBuf> {
         }
     }
     for dependency in lean_toolchain::shared_writer::project_artifact_roots(root)? {
-        if dependency != root && (dependency.starts_with(&build) || build.starts_with(&dependency)) {
+        let overlaps_build = dependency.starts_with(&build) || build.starts_with(&dependency);
+        if dependency != root && overlaps_build {
             return Err(io::Error::other("first-party clean output overlaps dependency custody"));
         }
     }
