@@ -154,6 +154,42 @@ override bundling, so its value matters.
 to `fsync`. A busy timeout limits lock contention, not arbitrary hung OS I/O. See SQLite's
 [PRAGMA documentation](https://sqlite.org/pragma.html).
 
+## O3 source acceptance
+
+Host commit `858648b` used registry-only lean-rs `0.10.10` (signed SDK source
+`c15e80d45efd65c1e6a4ece11e85b67ea0292aac`) on macOS with Lean 4.36. The existing
+`managed_inspection.py` fixture verified the cold result, recovery of the same reply after restart, authenticated
+stopped-broker closure after two collectors, and unrelated work during unresolved custody. The original broker's
+resume and a repeated START did not replay its consumed grant. Exact ACK removed the closed attempt's request
+and result bodies. The ordinary tool table and the installed Init refusal for the same declaration probe matched
+the published 0.10.9 baseline.
+
+- **Linked runtime and open profile.** The checked connection reads SQLite's linked version and source ID,
+  checks compile options, explicitly selects the `unix` VFS, and reads back WAL, FULL (`2`), `fullfsync=1`,
+  foreign keys enabled, and a 1,000 ms busy timeout. The reopen, wrong-runtime and changed-profile tests cover
+  these checks. A VFS selected by name and a requested full-sync setting are distinct from a measured disk flush.
+- **Refused writes.** Persistent trigger cuts exercised caller INSERT refusal, native ACK UPDATE refusal,
+  and native updates before GO and during result publication. The opt-in MCP test verified the caller's failed
+  save left the result retained. A managed declaration cut also verified a rejected result write left the result
+  absent while verified custody closure could still commit.
+- **Corruption and controlled replacement.** The actual broker refused a damaged SQLite file while a separate
+  worker and guardian were alive. The owner record was unchanged and the exact read-lock paths still refused
+  an exclusive lock. The separate offline quarantine test kept the damaged bytes and opened an explicit fresh
+  path with a new UUID. The new store rejected the old ID. This exercise did not restore damaged history.
+- **Retention and assets.** Results are bounded inline SQLite bytes with an ID and SHA-256. External result-asset
+  publication, unavailable external assets, and external asset GC do not apply to this route. Inline digest checks,
+  save-before-ACK, expiry, and closed-epoch pruning were exercised independently of custody.
+
+| Fault category | Evidence and limits |
+| --- | --- |
+| Process crash | Real process kills around SQLite commits, and disposable broker loss with real custody, exercised restart behavior without replay. The pre/post-COMMIT cuts test what survives process loss, rather than a failing COMMIT syscall. |
+| OS crash | Unrun. No kernel crash, VM power cut or filesystem recovery assertion is qualified here. |
+| Physical power loss | Unrun. No evidence establishes physical flush completion or power-loss persistence. |
+
+Trigger refusal is distinct from disk-full, I/O or flush errors, and an ambiguous SQLite COMMIT return. Those
+faults remain unqualified. H0 owns the independently counted target-start and actor/registry capacity checks.
+This is source acceptance, with no managed host publication or live activation.
+
 ## What the tests establish
 
 The database target covers equal/changed retries, concurrent consumption, monotone scope generations, closed acceptance
@@ -243,9 +279,10 @@ a change to server security or a production recovery mechanism.
 The registry-only SDK `0.9.10` pin remained unavailable. These results qualify the local override composition; they do
 not establish registry-only reproducibility.
 
-Unimplemented or untested: replacement-service execution and reattachment, warm-worker request closure, damaged-database
-recovery, pruning, backup restore, authenticated observations, external result assets, real disk/sync errors,
-blocked-I/O cancellation, OS crashes and power loss. See the
+That earlier local-override run did not qualify replacement-service execution and reattachment, warm-worker request
+closure, damaged-database recovery, pruning, backup restore, authenticated observations, external result assets,
+real disk/sync errors, blocked-I/O cancellation, OS crashes or power loss. The registry-backed O3 evidence above
+supersedes that run where it covers the same behavior. See the
 [execution-service design](https://github.com/jcreinhold/proofs/blob/main/docs/projects/lean-tooling/design/native-execution-lifecycle.md) for those separate requirements. No server
 deployment or release follows from these test-only changes.
 
