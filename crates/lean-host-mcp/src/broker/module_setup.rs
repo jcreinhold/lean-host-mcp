@@ -402,6 +402,11 @@ impl ProjectBroker {
     }
 
     async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
+        if self.runtime_config.managed_only {
+            return Err(ServerError::BadProject(
+                "ordinary file setup is unavailable in managed-only mode".into(),
+            ));
+        }
         let root = self.native_root(hint)?;
         let activity = self.preparation_activity(&root).await?;
         let timeout = Duration::from_millis(self.request_timeout_millis());

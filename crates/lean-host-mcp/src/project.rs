@@ -286,6 +286,7 @@ pub struct ProjectRuntimeConfig {
     verification_input: Option<String>,
     prepared_generation: Option<String>,
     pub(crate) managed_semantic_companion: bool,
+    pub(crate) managed_only: bool,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -406,6 +407,14 @@ impl ProjectRuntimeConfig {
         self
     }
 
+    /// Refuse ordinary file setup on a server selected for managed admission only.
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    #[must_use]
+    pub fn with_managed_only(mut self, enabled: bool) -> Self {
+        self.managed_only = enabled;
+        self
+    }
+
     pub(crate) fn prepared_generation(&self) -> Option<&str> {
         self.prepared_generation.as_deref()
     }
@@ -437,6 +446,7 @@ impl ProjectRuntimeConfig {
             verification_input: None,
             prepared_generation: None,
             managed_semantic_companion: false,
+            managed_only: false,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -701,6 +711,7 @@ fn parse_runtime_config(
         verification_input: None,
         prepared_generation: None,
         managed_semantic_companion: false,
+        managed_only: false,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),

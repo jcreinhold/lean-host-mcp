@@ -134,6 +134,11 @@ struct ServeArgs {
     #[arg(long)]
     managed_native_store: Option<PathBuf>,
 
+    /// Require managed admission for file setup. Omit for ordinary file setup.
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    #[arg(long, requires = "managed_native_store", conflicts_with = "module_setup_writer")]
+    managed_only: bool,
+
     /// Loopback address for Streamable HTTP, e.g. 127.0.0.1:8765.
     /// If omitted, the server uses stdio.
     #[arg(long, env = "LEAN_HOST_MCP_BIND")]
@@ -368,7 +373,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_module_setup_writer(args.module_setup_writer, args.module_setup_storage_request)?;
     #[cfg(all(unix, feature = "managed-native-store"))]
     let runtime_config = if args.managed_native_store.is_some() {
-        runtime_config.with_managed_semantic_companion()
+        runtime_config
+            .with_managed_semantic_companion()
+            .with_managed_only(args.managed_only)
     } else {
         runtime_config
     };
@@ -710,6 +717,29 @@ mod tests {
         ]);
         assert_eq!(selected.serve.module_setup_writer, Some(PathBuf::from("/writer")));
         assert_eq!(selected.serve.module_setup_storage_request.as_deref(), Some("{}"));
+    }
+
+    #[cfg(all(unix, feature = "managed-native-store"))]
+    #[test]
+    fn managed_only_requires_store_and_refuses_explicit_ordinary_setup_writer() {
+        assert!(!Cli::parse_from(["lean-host-mcp"]).serve.managed_only);
+        assert!(Cli::try_parse_from(["lean-host-mcp", "--managed-only"]).is_err());
+        let selected = ["lean-host-mcp", "--managed-only", "--managed-native-store", "/stages"];
+        assert!(Cli::parse_from(selected).serve.managed_only);
+        assert!(
+            Cli::try_parse_from(selected.into_iter().chain([
+                "--module-setup-writer",
+                "/writer",
+                "--module-setup-storage-request",
+                "{}",
+            ]))
+            .is_err()
+        );
+        assert!(
+            !Cli::parse_from(["lean-host-mcp", "--managed-native-store", "/stages"])
+                .serve
+                .managed_only
+        );
     }
 
     #[test]
