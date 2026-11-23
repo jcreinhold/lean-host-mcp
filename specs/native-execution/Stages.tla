@@ -49,7 +49,9 @@ HostInit == Init /\ h = [
   reuse |-> [active |-> 0, spent |-> {}, armed |-> {}, armAcks |-> {}, fenced |-> {}, saved |-> {}, accepted |-> {},
     acked |-> {}, ended |-> {}, aborted |-> "none", stale |-> {},
     finishFor |-> [i \in Commands |-> <<>>], ackFor |-> [i \in Commands |-> <<>>],
-    drainKey |-> <<>>, drainFor |-> <<>>, armedAtAbort |-> {}],
+    drainKey |-> <<>>, drainFor |-> <<>>, armedAtAbort |-> {},
+    frozen |-> FALSE, froze |-> FALSE, due |-> "none", dueAt |-> <<>>,
+    refused |-> FALSE, earlyDrain |-> FALSE, closedWhileFrozen |-> FALSE],
   writer |-> [phase |-> "new", handoff |-> <<>>, admittedHandoff |-> <<>>, valid |-> TRUE,
     checked |-> <<>>, starts |-> 0, interrupted |-> FALSE,
     stage |-> "none", stageDigest |-> <<>>, stageAck |-> <<>>,
@@ -483,8 +485,9 @@ NoLostAckRetirement == ~(h.deadline.arm="lost" /\ h.closure=Scope /\ capacityRet
 WarmState == h.reuse
 WarmKeys == {CommandKey(i) : i \in Commands}
 ActiveWarmKey == IF WarmState.active \in Commands THEN CommandKey(WarmState.active) ELSE <<>>
-WarmLive == phase="running" /\ guardianPresent /\ supervisorAlive
-  /\ HostPermitHeld /\ ~h.actorSealed /\ WarmState.aborted="none"
+WarmGuardianReady == phase="running" /\ guardianPresent /\ startupAcked /\ HostPermitHeld
+WarmLive == WarmGuardianReady /\ supervisorAlive /\ ~WarmState.frozen
+  /\ ~h.actorSealed /\ WarmState.due="none"
 WarmSpend(i) == HostOnly(WarmLive /\ startupAcked /\ h.readAdmitted
   /\ (i=1 \/ CommandKey(1) \in WarmState.ended \/ Mutation="warm-before-end")
   /\ CommandKey(i) \notin WarmState.spent
@@ -513,16 +516,33 @@ WarmFinishAck(key) == HostOnly(WarmLive /\ key=ActiveWarmKey
 WarmPersistEnd(key) == HostOnly(WarmLive /\ key=ActiveWarmKey /\ key \in WarmState.saved
   /\ (key \in WarmState.acked \/ (Mutation="warm-without-ack" /\ key \in WarmState.accepted))
   /\ h'=[h EXCEPT !.reuse.ended=@ \cup {key}, !.reuse.active=0])
-\* Expiry is represented by the deadline edge before acceptance. A lost
-\* finish ACK after acceptance still seals the host receiver.
+\* Timers are abstract expiry edges. A successful guardian finish changes
+\* the timeout to idle even if its ACK has not reached the host.
+WarmTimerKind ==
+  IF WarmState.active \in Commands /\ ActiveWarmKey \notin WarmState.accepted THEN "expiry"
+  ELSE IF WarmState.armed={} THEN "initial-idle" ELSE "post-finish-idle"
+WarmTimerDue == HostOnly(WarmGuardianReady /\ WarmState.due="none"
+  /\ h'=[h EXCEPT !.reuse.due=WarmTimerKind, !.reuse.dueAt=ActiveWarmKey])
+WarmStopAs(reason) == RequestStop /\ h'=[h EXCEPT !.reuse.aborted=reason, !.actorSealed=TRUE,
+  !.reuse.drainKey=ActiveWarmKey, !.reuse.drainFor=ActiveWarmKey,
+  !.reuse.armedAtAbort=WarmState.armed]
+WarmGuardianExpiry == WarmGuardianReady /\ WarmState.due/="none"
+  /\ (~WarmState.frozen \/ Mutation/="warm-parent-required")
+  /\ WarmStopAs(WarmState.due)
 WarmAbort(reason) == WarmLive
-  /\ (WarmState.active \in Commands \/ reason \in {"stop","eof"})
-  /\ (CASE reason="expiry" -> ActiveWarmKey \notin WarmState.accepted
-       [] reason="lost-ack" -> ActiveWarmKey \in (WarmState.accepted \ WarmState.acked)
-       [] OTHER -> TRUE)
-  /\ RequestStop /\ h'=[h EXCEPT !.reuse.aborted=reason, !.actorSealed=TRUE,
-    !.reuse.drainKey=ActiveWarmKey, !.reuse.drainFor=ActiveWarmKey,
-    !.reuse.armedAtAbort=WarmState.armed]
+  /\ (reason="stop" \/ (reason="lost-ack" /\ ActiveWarmKey \in (WarmState.accepted \ WarmState.acked)))
+  /\ WarmStopAs(reason)
+WarmLoseBroker == WarmLive /\ SdkOnly(SupervisorCrash)
+WarmGuardianEof == WarmGuardianReady /\ ~supervisorAlive /\ WarmStopAs("eof")
+WarmFreeze == HostOnly(WarmLive /\ ~WarmState.froze
+  /\ h'=[h EXCEPT !.reuse.frozen=TRUE, !.reuse.froze=TRUE])
+WarmResume == HostOnly(WarmState.frozen /\ h'=[h EXCEPT !.reuse.frozen=FALSE])
+\* The replacement can observe the original binding but has no early stop
+\* authority. It leaves the original guardian and its deadline in control.
+WarmReplacementDrain == WarmGuardianReady /\ ~WarmState.refused /\ (WarmState.frozen \/ ~supervisorAlive)
+  /\ IF Mutation="warm-replacement-stops"
+     THEN RequestStop /\ h'=[h EXCEPT !.reuse.earlyDrain=TRUE, !.actorSealed=TRUE]
+     ELSE HostOnly(h'=[h EXCEPT !.reuse.refused=TRUE])
 WarmStale(kind) == WarmLive /\ WarmState.active=2
   /\ CommandKey(1) \in WarmState.ended /\ kind \notin WarmState.stale
   /\ LET staleKey == CommandKey(1)
@@ -539,6 +559,14 @@ WarmStale(kind) == WarmLive /\ WarmState.active=2
           !.actorSealed=IF drain THEN TRUE ELSE @]
 WarmRetire == WarmLive /\ WarmState.active=0 /\ CommandKey(2) \in WarmState.ended
   /\ RequestStop /\ h'=[h EXCEPT !.actorSealed=TRUE]
+\* Weak fairness applies only to recoverable native cleanup with the guardian
+\* and exact OS absence evidence intact. A frozen host cannot return a permit.
+WarmPhysicalProgress == WarmTimerDue \/ WarmGuardianExpiry \/ WarmGuardianEof
+  \/ (h.actorSealed /\ SdkOnly(CleanupGroup \/ GuardianExitsAfterGroup
+       \/ ObserveGroupAbsent \/ ObserveGuardianAbsent))
+  \/ (h.actorSealed /\ Retire /\ h'=[h EXCEPT !.reuse.closedWhileFrozen=WarmState.frozen])
+WarmHostObserve == h.actorSealed /\ ~WarmState.frozen
+  /\ (ReleaseDomains \/ HandleHostClosure(Scope) \/ HandleHostClosure(PreviousScope))
 WarmReuseNext == Submit \/ Accept \/ AcquireDomain \/ TakeHostPermit
   \/ ReserveScope \/ ConsumePermit \/ SendLaunch \/ ReceiveLaunch \/ NativeLaunch \/ LoadReads \/ Boot
   \/ (\E i \in Commands: WarmSpend(i) \/ WarmArm(i) \/ WarmArmAck(i) \/ WarmByte(i)
@@ -546,11 +574,12 @@ WarmReuseNext == Submit \/ Accept \/ AcquireDomain \/ TakeHostPermit
             \/ (\E r \in h.emitted: ReceiveReply(i,r))))
        \/ WarmReceiverFence(i) \/ WarmSave(i))
   \/ (\E key \in WarmKeys: WarmAcceptFinish(key) \/ WarmFinishAck(key) \/ WarmPersistEnd(key))
-  \/ (\E reason \in {"expiry","lost-ack","recovery","stop","eof"}: WarmAbort(reason))
+  \/ (\E reason \in {"lost-ack","stop"}: WarmAbort(reason))
   \/ (\E kind \in {"finish","drain","ack"}: WarmStale(kind))
-  \/ WarmRetire \/ (h.actorSealed /\ (SdkOnly(CleanupGroup \/ GuardianExitsAfterGroup
-       \/ ObserveGroupAbsent \/ ObserveGuardianAbsent \/ Retire) \/ ReleaseDomains \/ HandleHostClosures))
+  \/ WarmRetire \/ WarmLoseBroker \/ WarmFreeze \/ WarmResume \/ WarmReplacementDrain
+  \/ WarmPhysicalProgress \/ WarmHostObserve
 WarmReuseSpec == HostInit /\ [][WarmReuseNext]_hv
+  /\ WF_hv(WarmPhysicalProgress) /\ WF_hv(WarmHostObserve)
 WarmReuseOrdering ==
   /\ WarmState.armed \subseteq WarmState.spent
   /\ \A i \in Commands: h.starts[i]>0 => CommandKey(i) \in WarmState.armAcks
@@ -564,6 +593,10 @@ WarmReuseIsolation ==
     /\ WarmState.ackFor[i] \in {<<>>, CommandKey(i)}
   /\ WarmState.drainKey=WarmState.drainFor
 WarmReuseClosure ==
+  /\ ~WarmState.earlyDrain
+  /\ (WarmState.aborted \in {"expiry","initial-idle","post-finish-idle"} =>
+      WarmState.aborted=WarmState.due /\ WarmState.drainFor=WarmState.dueAt)
+  /\ (WarmState.frozen => h.hostPermitReturns=0)
   /\ (WarmState.aborted /= "none" => WarmState.armed=WarmState.armedAtAbort)
   /\ ((WarmState.aborted /= "none" \/ phase="stopping") => h.actorSealed)
   /\ (h.hostPermitReturns>0 => phase="closed" /\ h.hostClosure=Scope)
@@ -572,6 +605,16 @@ NoWarmReuseWitness == ~(WarmState.ended=WarmKeys /\ h.starts[2]=1
   /\ WarmState.stale={"finish","drain","ack"} /\ h.hostPermitReturns=1)
 NoWarmAbortWitness == ~(WarmState.aborted=Mutation /\ CommandKey(2) \notin WarmState.armed
   /\ CommandKey(1) \in (WarmState.saved \cap WarmState.fenced) /\ h.hostPermitReturns=1)
+NoWarmReplacementWitness == ~(WarmState.refused /\ WarmState.closedWhileFrozen /\ WarmState.aborted="expiry"
+  /\ CommandKey(1) \in WarmState.armed /\ CommandKey(2) \notin WarmState.armed
+  /\ h.hostPermitReturns=1)
+NoWarmIdleWitness == ~(WarmState.refused /\ WarmState.closedWhileFrozen /\ WarmState.aborted=Mutation
+  /\ (IF Mutation="initial-idle" THEN WarmState.armed={} ELSE CommandKey(1) \in WarmState.ended)
+  /\ CommandKey(2) \notin WarmState.armed /\ h.hostPermitReturns=1)
+WarmFrozenRetires == (WarmState.frozen /\ phase="running" /\ guardianPresent /\ startupAcked)
+  ~> (phase="closed")
+WarmConfirmedReturns == (phase="closed" /\ ~WarmState.frozen /\ HostPermitHeld)
+  ~> (h.hostPermitReturns=1)
 
 \* Opt-in writer projection: an exact SDK reader closure releases the host's
 \* domain holds before the old writer turn. The overlapping successor still

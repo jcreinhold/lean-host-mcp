@@ -696,7 +696,7 @@
       "model": "Stages",
       "specification": "WarmReuseSpec",
       "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"" },
-      "properties": [],
+      "properties": ["WarmFrozenRetires", "WarmConfirmedReturns"],
       "invariants": [
         "SafeCommands",
         "ReplyIdentity",
@@ -806,12 +806,12 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"recovery\"" },
+      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"none\"" },
       "properties": [],
-      "invariants": ["NoWarmAbortWitness"],
+      "invariants": ["NoWarmReplacementWitness"],
       "name": "host-warm-reuse-recovery-witness",
       "expect": "invariant",
-      "invariant": "NoWarmAbortWitness",
+      "invariant": "NoWarmReplacementWitness",
       "witness": true
     },
     {
@@ -835,6 +835,57 @@
       "expect": "invariant",
       "invariant": "NoWarmAbortWitness",
       "witness": true
+    },
+    {
+      "name": "host-warm-reuse-initial-idle-witness",
+      "model": "Stages",
+      "specification": "WarmReuseSpec",
+      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"initial-idle\"" },
+      "expect": "invariant",
+      "properties": [],
+      "invariants": ["NoWarmIdleWitness"],
+      "invariant": "NoWarmIdleWitness",
+      "witness": true
+    },
+    {
+      "name": "host-warm-reuse-post-finish-idle-witness",
+      "model": "Stages",
+      "specification": "WarmReuseSpec",
+      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"post-finish-idle\"" },
+      "expect": "invariant",
+      "properties": [],
+      "invariants": ["NoWarmIdleWitness"],
+      "invariant": "NoWarmIdleWitness",
+      "witness": true
+    },
+    {
+      "name": "host-warm-reuse-replacement-cannot-stop",
+      "model": "Stages",
+      "specification": "WarmReuseSpec",
+      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-replacement-stops\"" },
+      "expect": "invariant",
+      "properties": [],
+      "invariants": ["WarmReuseClosure"],
+      "invariant": "WarmReuseClosure"
+    },
+    {
+      "name": "host-warm-reuse-exact-closure-only",
+      "model": "Stages",
+      "specification": "WarmReuseSpec",
+      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"return-stale\"" },
+      "expect": "invariant",
+      "properties": [],
+      "invariants": ["WarmReuseClosure"],
+      "invariant": "WarmReuseClosure"
+    },
+    {
+      "name": "host-warm-reuse-guardian-needs-parent",
+      "model": "Stages",
+      "specification": "WarmReuseSpec",
+      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-parent-required\"" },
+      "expect": "liveness",
+      "properties": ["WarmFrozenRetires"],
+      "invariants": ["WarmReuseClosure"]
     },
     {
       "name": "host-deadline-warm",
