@@ -4,22 +4,10 @@ use super::{
     LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError,
     freshness_from_meta,
 };
+use lean_host_mcp_worker::prepared_project::PreparedGeneration;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{fs, io};
-
-#[derive(Deserialize)]
-struct Selection {
-    plan: Plan,
-    products: Vec<Vec<Option<String>>>,
-}
-#[derive(Deserialize)]
-struct Plan {
-    project: PathBuf,
-    roots: Vec<PathBuf>,
-    release: PathBuf,
-    modules: Vec<(String, PathBuf)>,
-}
 
 fn invalid(message: impl std::fmt::Display) -> ServerError {
     ServerError::BadProject(message.to_string())
@@ -73,63 +61,35 @@ impl ProjectBroker {
         input: &str,
         imports: &[String],
     ) -> Result<PreparedReader> {
-        let selection: Selection = serde_json::from_str(input).map_err(invalid)?;
-        let plan = selection.plan;
-        if plan.project != root {
+        let selection = PreparedGeneration::decode(input).map_err(invalid)?;
+        if selection.project() != root {
             return Err(invalid("unexpected prepared project"));
         }
         let reader = Self::installed_reader(root, meta)?;
         let PreparedReader { sysroot, shims, .. } = &reader;
-        if plan.release != sysroot.join("lib/lean") || selection.products.len() != plan.modules.len() {
+        if selection.release() != sysroot.join("lib/lean") {
             return Err(invalid("incomplete prepared selection"));
         }
         let project_domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
-        lean_host_mcp_worker::prepared_project::PreparedGeneration::check_identity(input, &project_domains)
-            .map_err(invalid)?;
+        PreparedGeneration::check_identity(input, &project_domains).map_err(invalid)?;
         let mut expected: Vec<_> = project_domains.iter().map(|p| p.join(".lake/build/lib/lean")).collect();
         expected.extend(shims.clone());
-        expected.push(plan.release.clone());
-        let mut ordered = plan.roots.clone();
+        expected.push(selection.release().to_owned());
+        let mut ordered = selection.roots().to_vec();
         ordered.sort();
         expected.sort();
         if ordered != expected {
             return Err(invalid("prepared roots differ from installed domains"));
         }
-        if lean_toolchain::olean_candidate(&plan.roots, "Init", |p| fs::metadata(p)).map_err(invalid)?
-            != Some(plan.release.join("Init.olean"))
-        {
-            return Err(invalid("prepared roots shadow builtin Init"));
-        }
-        for ((name, domain), parts) in plan.modules.iter().zip(&selection.products) {
-            let base = domain.join(".lake/build/lib/lean").join(name.replace('.', "/"));
-            if !project_domains.contains(domain)
-                || parts.len() != 5
-                || parts.first().and_then(Option::as_ref).is_none()
-                || lean_toolchain::olean_candidate(&plan.roots, name, |p| fs::metadata(p)).map_err(invalid)?
-                    != Some(base.with_extension("olean"))
-            {
-                return Err(invalid("prepared module resolution changed"));
-            }
-            for (ext, hash) in ["olean", "olean.server", "olean.private", "ir.sig", "ir"]
-                .into_iter()
-                .zip(parts)
-            {
-                let path = base.with_extension(ext);
-                if let Some(hash) = hash {
-                    verify_hash(&path, hash)?;
-                } else if !matches!(fs::symlink_metadata(path),Err(e) if e.kind()==io::ErrorKind::NotFound) {
-                    return Err(invalid("unapproved prepared module part"));
-                }
-            }
-        }
         if imports
             .iter()
-            .any(|n| n != "Init" && !plan.modules.iter().any(|(name, _)| name == n))
+            .any(|n| n != "Init" && !selection.modules().iter().any(|(name, _)| name == n))
         {
             return Err(invalid("unsupported import outside prepared project"));
         }
+        selection.check_products().map_err(invalid)?;
         Ok(PreparedReader {
-            roots: plan.roots,
+            roots: selection.roots().to_vec(),
             ..reader
         })
     }

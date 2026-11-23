@@ -801,7 +801,7 @@ mod tests {
         let runtime = ProjectRuntimeConfig::default()
             .with_operator_primary(Some(&root))
             .unwrap()
-            .with_prepared_generation(Some(serde_json::json!({"plan":{"project":root}}).to_string()))
+            .with_prepared_generation(Some(serde_json::json!({"plan":{"project":root,"roots":[],"release":root,"modules":[]},"identity":vec![0;32]}).to_string()))
             .unwrap();
         let broker = ProjectBroker::new_with_runtime_config(
             BrokerConfig {
@@ -878,7 +878,9 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.join("stages.sqlite3");
-        let prepared = serde_json::json!({"plan":{"project":root}}).to_string();
+        let prepared =
+            serde_json::json!({"plan":{"project":root,"roots":[],"release":root,"modules":[]},"identity":vec![0;32]})
+                .to_string();
         let runtime = ProjectRuntimeConfig::default()
             .with_operator_primary(Some(&root))
             .unwrap()

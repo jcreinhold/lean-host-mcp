@@ -388,12 +388,8 @@ impl ProjectRuntimeConfig {
             if text.len() > 4096 {
                 return Err(invalid());
             }
-            let value: serde_json::Value = serde_json::from_str(text)?;
-            let root = value
-                .pointer("/plan/project")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(invalid)?;
-            if self.operator_primary.as_deref() != Some(Path::new(root)) {
+            let selection = lean_host_mcp_worker::prepared_project::PreparedGeneration::decode(text)?;
+            if self.operator_primary.as_deref() != Some(selection.project()) {
                 return Err(invalid());
             }
         }
@@ -3839,16 +3835,11 @@ fn semantic_launch_input(
     let bad = |message: &str| ServerError::BadProject(message.to_owned());
     let prepared_input = prepared;
     let prepared: serde_json::Value = serde_json::from_str(prepared_input).map_err(|error| bad(&error.to_string()))?;
-    let approved = prepared
-        .pointer("/plan/modules")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|modules| {
-            modules.iter().any(|entry| {
-                entry.get(0).and_then(serde_json::Value::as_str) == Some(request.goal.module.as_str())
-                    && entry.get(1).and_then(serde_json::Value::as_str).map(Path::new)
-                        == Some(config.lake_root.as_path())
-            })
-        });
+    let selection = lean_host_mcp_worker::prepared_project::PreparedGeneration::decode(prepared_input)?;
+    let approved = selection
+        .modules()
+        .iter()
+        .any(|(module, domain)| module == &request.goal.module && domain == &config.lake_root);
     let source = crate::tools::source_input::source_path_for_module(&config.lake_root, &request.goal.module);
     if !approved
         || request.goal.file_label.as_deref().map(Path::new) != Some(source.as_path())

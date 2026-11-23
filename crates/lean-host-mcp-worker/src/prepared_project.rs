@@ -76,9 +76,6 @@ impl PreparedProject {
             ordered,
         })
     }
-    ///
-    /// # Errors
-    /// Refuses absent observations, changed directory identities, or a different root order.
     pub fn check_observed(&self, observed: Option<&[String]>) -> io::Result<()> {
         let roots = observed.ok_or_else(invalid)?;
         self.guards.validate()?;
@@ -114,12 +111,149 @@ pub struct ImportPlan {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "GenerationWire")]
 pub struct PreparedGeneration {
     plan: ImportPlan,
     identity: [u8; 32],
     #[serde(default)]
     products: Vec<Vec<Option<String>>>,
+    #[serde(skip)]
+    compact: bool,
+}
+
+const LAUNCH_INPUT_LIMIT: usize = 4096;
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum GenerationWire {
+    Compact(CompactGeneration),
+    Legacy(LegacyGeneration),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyGeneration {
+    plan: ImportPlan,
+    identity: [u8; 32],
+    #[serde(default)]
+    products: Vec<Vec<Option<String>>>,
+}
+
+/// Paths are stored once relative to the common component prefix with the
+/// project. The aggregate identity already authenticates ordered paths,
+/// sources, and presence and contents of every companion file.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactGeneration {
+    version: u8,
+    project: PathBuf,
+    roots: Vec<(usize, PathBuf)>,
+    release: usize,
+    modules: Vec<(String, usize)>,
+    installed_release: Option<String>,
+    identity: [u8; 32],
+}
+
+fn module_domain(root: &Path) -> io::Result<&Path> {
+    let domain = root.ancestors().nth(4).ok_or_else(invalid)?;
+    if domain.join(".lake/build/lib/lean") != root {
+        return Err(invalid());
+    }
+    Ok(domain)
+}
+
+impl TryFrom<GenerationWire> for PreparedGeneration {
+    type Error = io::Error;
+
+    fn try_from(wire: GenerationWire) -> io::Result<Self> {
+        match wire {
+            GenerationWire::Legacy(record) => Ok(Self {
+                plan: record.plan,
+                identity: record.identity,
+                products: record.products,
+                compact: false,
+            }),
+            GenerationWire::Compact(record) => {
+                if record.version != 2 || !record.project.is_absolute() {
+                    return Err(invalid());
+                }
+                let roots = record
+                    .roots
+                    .into_iter()
+                    .map(|(count, suffix)| {
+                        let mut path = PathBuf::new();
+                        let mut prefix = record.project.components();
+                        for _ in 0..count {
+                            path.push(prefix.next().ok_or_else(invalid)?.as_os_str());
+                        }
+                        if (count == 0) != suffix.is_absolute()
+                            || suffix
+                                .components()
+                                .any(|part| matches!(part, std::path::Component::ParentDir))
+                        {
+                            return Err(invalid());
+                        }
+                        path.push(suffix);
+                        Ok(path)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let release = roots.get(record.release).ok_or_else(invalid)?.clone();
+                let modules = record
+                    .modules
+                    .into_iter()
+                    .map(|(name, index)| {
+                        let root = roots.get(index).ok_or_else(invalid)?;
+                        Ok((name, module_domain(root)?.to_owned()))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                Ok(Self {
+                    plan: ImportPlan {
+                        project: record.project,
+                        roots,
+                        release,
+                        modules,
+                        installed_release: record.installed_release,
+                    },
+                    identity: record.identity,
+                    products: vec![],
+                    compact: true,
+                })
+            }
+        }
+    }
+}
+
+impl CompactGeneration {
+    fn encode(record: &PreparedGeneration) -> io::Result<Self> {
+        let plan = &record.plan;
+        let root_index = |path: &Path| plan.roots.iter().position(|root| root == path).ok_or_else(invalid);
+        Ok(Self {
+            version: 2,
+            project: plan.project.clone(),
+            roots: plan
+                .roots
+                .iter()
+                .map(|root| {
+                    let count = plan
+                        .project
+                        .components()
+                        .zip(root.components())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    let suffix = root.components().skip(count).collect();
+                    (count, suffix)
+                })
+                .collect(),
+            release: root_index(&plan.release)?,
+            modules: plan
+                .modules
+                .iter()
+                .map(|(name, domain)| Ok((name.clone(), root_index(&domain.join(".lake/build/lib/lean"))?)))
+                .collect::<io::Result<Vec<_>>>()?,
+            installed_release: plan.installed_release.clone(),
+            identity: record.identity,
+        })
+    }
 }
 
 fn file_hash(path: &Path) -> io::Result<[u8; 32]> {
@@ -453,6 +587,20 @@ impl ImportPlan {
             return Err(invalid());
         }
         check_dependencies()?;
+        // The reader opens even the pinned domains with no selected objects.
+        // Create only default-layout directories under the held writer.
+        for domain in &domains {
+            let mut directory = domain.clone();
+            for component in [".lake", "build", "lib", "lean"] {
+                directory.push(component);
+                match fs::symlink_metadata(&directory) {
+                    Ok(meta) if meta.is_dir() => (),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => fs::create_dir(&directory)?,
+                    Ok(_) => return Err(invalid()),
+                    Err(err) => return Err(err),
+                }
+            }
+        }
         let identity = self.identity(&domains)?;
         self.finish_generation(identity)
     }
@@ -550,19 +698,82 @@ impl ImportPlan {
             plan: self,
             identity,
             products,
+            compact: false,
         })
     }
 }
 impl PreparedGeneration {
+    /// Decode a bounded operator record, including records written by older hosts.
+    ///
+    /// # Errors
+    /// Refuses invalid encodings and oversized inputs.
+    pub fn decode(input: &str) -> io::Result<Self> {
+        if input.len() > LAUNCH_INPUT_LIMIT {
+            return Err(invalid());
+        }
+        Ok(serde_json::from_str(input)?)
+    }
+
+    /// Ordered artifact search roots.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.plan.roots
+    }
+
+    /// Selected Lean library directory.
+    pub fn release(&self) -> &Path {
+        &self.plan.release
+    }
+
+    /// Selected modules and their owning project domains.
+    pub fn modules(&self) -> &[(String, PathBuf)] {
+        &self.plan.modules
+    }
+
+    /// Verify the legacy per-file hashes used by file verification. Version 2
+    /// already authenticates the exact same file set via the aggregate identity.
+    ///
+    /// # Errors
+    /// Refuses malformed legacy product records and changes to product bytes.
+    pub fn check_products(&self) -> io::Result<()> {
+        if self.compact {
+            return Ok(());
+        }
+        if self.products.len() != self.plan.modules.len() {
+            return Err(invalid());
+        }
+        for ((name, domain), parts) in self.plan.modules.iter().zip(&self.products) {
+            let base = domain.join(".lake/build/lib/lean").join(name.replace('.', "/"));
+            if !valid_module(name) || parts.len() != 5 || parts.first().and_then(Option::as_ref).is_none() {
+                return Err(invalid());
+            }
+            for (ext, expected) in ["olean", "olean.server", "olean.private", "ir.sig", "ir"]
+                .into_iter()
+                .zip(parts)
+            {
+                let path = base.with_extension(ext);
+                if let Some(expected) = expected {
+                    use std::fmt::Write as _;
+                    let mut actual = String::with_capacity(64);
+                    for byte in file_hash(&path)? {
+                        write!(actual, "{byte:02x}").map_err(io::Error::other)?;
+                    }
+                    if actual != *expected {
+                        return Err(invalid());
+                    }
+                } else if !matches!(fs::symlink_metadata(&path), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Verify a captured generation against its producer identity under existing reader custody.
     ///
     /// # Errors
     /// Refuses malformed selections or changes to ordered roots, sources, or products.
     pub fn check_identity(input: &str, domains: &[PathBuf]) -> io::Result<()> {
-        if input.len() > 4096 {
-            return Err(invalid());
-        }
-        let generation: Self = serde_json::from_str(input)?;
+        let generation = Self::decode(input)?;
         if generation.plan.identity(domains)? != generation.identity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -582,9 +793,17 @@ impl PreparedGeneration {
     /// # Errors
     /// Returns an error if the record cannot be encoded within the launch bound.
     pub fn launch_input(&self) -> io::Result<String> {
-        let input = serde_json::to_string(self)?;
-        if input.len() > 4096 {
-            return Err(invalid());
+        if !self.compact {
+            let legacy = serde_json::to_string(self)?;
+            if legacy.len() <= LAUNCH_INPUT_LIMIT {
+                return Ok(legacy);
+            }
+        }
+        let input = serde_json::to_string(&CompactGeneration::encode(self)?)?;
+        if input.len() > LAUNCH_INPUT_LIMIT {
+            return Err(io::Error::other(
+                "prepared generation exceeds the 4096-byte launch limit",
+            ));
         }
         Ok(input)
     }
@@ -601,10 +820,7 @@ impl PreparedGeneration {
         ordered_inputs: &[PathBuf],
         names: &[String],
     ) -> io::Result<PreparedProject> {
-        if input.len() > 4096 {
-            return Err(invalid());
-        }
-        let generation: Self = serde_json::from_str(input)?;
+        let generation = Self::decode(input)?;
         let plan = &generation.plan;
         let pre_import = plan.roots.iter().filter(|path| path.as_path() != release);
         if plan.project != project
@@ -972,4 +1188,43 @@ fn prepare_mini_rat() -> io::Result<()> {
         .build_generation(&mut writer)?
         .launch_input()?;
     fs::write(base.join("installed-input"), record)
+}
+
+#[test]
+fn versioned_launch_encoding_keeps_legacy_and_long_paths() -> io::Result<()> {
+    let legacy = r#"{"plan":{"project":"/fixture","roots":["/fixture/.lake/build/lib/lean","/elan/lib/lean"],"release":"/elan/lib/lean","modules":[["Root","/fixture"]]},"identity":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"products":[]}"#;
+    let record = PreparedGeneration::decode(legacy)?;
+    assert_eq!(record.launch_input()?, legacy);
+
+    let workspace = PathBuf::from("/workspace")
+        .join("long-segment".repeat(16))
+        .join("project");
+    let release = PathBuf::from("/elan/lib/lean");
+    let domains: Vec<_> = (0..12)
+        .map(|i| workspace.join("packages").join(format!("dep{i}")))
+        .collect();
+    let modules = domains
+        .iter()
+        .enumerate()
+        .map(|(i, domain)| (format!("Mod{i}"), domain.clone()))
+        .collect();
+    let roots = domains
+        .iter()
+        .map(|domain| domain.join(".lake/build/lib/lean"))
+        .chain([release.clone()])
+        .collect();
+    let record = PreparedGeneration {
+        plan: ImportPlan::new(workspace, roots, release, modules),
+        identity: [42; 32],
+        products: vec![vec![Some("ab".repeat(32)); 5]; 12],
+        compact: false,
+    };
+    let compact = record.launch_input()?;
+    let decoded = PreparedGeneration::decode(&compact)?;
+    assert!(decoded.compact);
+    assert_eq!(decoded.roots(), record.roots());
+    assert_eq!(decoded.modules(), record.modules());
+    assert_eq!(decoded.identity, record.identity);
+    assert_eq!(decoded.launch_input()?, compact);
+    Ok(())
 }
