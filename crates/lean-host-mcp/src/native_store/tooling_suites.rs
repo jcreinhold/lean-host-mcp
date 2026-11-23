@@ -78,7 +78,11 @@ fn executable(root: &Path, name: &str, expected: &[u8; 32]) -> io::Result<PathBu
         if read == 0 {
             break;
         }
-        hash.update(&buffer[..read]);
+        hash.update(
+            buffer
+                .get(..read)
+                .ok_or_else(|| io::Error::other("invalid executable read size"))?,
+        );
     }
     if hash.finalize().as_slice() != expected {
         return Err(io::Error::other("prebuilt tooling suite changed"));

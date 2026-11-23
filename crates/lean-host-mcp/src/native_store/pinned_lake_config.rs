@@ -94,7 +94,11 @@ fn git(repo: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
         .stderr(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()?;
-    let bytes = read_bounded(child.stdout.take().expect("piped Git stdout"));
+    let bytes = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Git stdout was not piped"))
+        .and_then(read_bounded);
     if !child.wait()?.success() {
         return Err(invalid("required Git object is unavailable locally"));
     }

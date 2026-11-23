@@ -518,7 +518,6 @@ mod launcher_regressions {
             config
         }
 
-        #[cfg(lean_host_cutover_sdk)]
         async fn custody(&self) -> PathBuf {
             use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
             let output = self
@@ -530,10 +529,11 @@ mod launcher_regressions {
                 .expect("lock domain");
             assert!(output.status.success(), "{output:?}");
             let path: Value = serde_json::from_slice(&output.stdout).expect("lock JSON");
-            let path = PathBuf::from(path["lock_path"].as_str().expect("lock path"));
+            let path = PathBuf::from(path.get("lock_path").and_then(Value::as_str).expect("lock path"));
             assert!(
                 path.starts_with(self.project.parent().expect("private fixture root")),
-                "{path:?}"
+                "{}",
+                path.display()
             );
             fs::create_dir_all(path.parent().expect("lock parent")).expect("lock parent directory");
             let create_lock = |path: &Path| {
@@ -565,7 +565,6 @@ mod launcher_regressions {
             pins
         }
 
-        #[cfg(lean_host_cutover_sdk)]
         fn transition(&self, pins: &Path, from: &str, to: &str) -> Command {
             let mut command = self.command();
             command
@@ -581,11 +580,6 @@ mod launcher_regressions {
 
     #[tokio::test]
     async fn launcher_cross_project_loaded_request_requires_actual_project_selection() {
-        #[cfg(not(lean_host_cutover_sdk))]
-        assert!(
-            std::env::var_os(PACKAGED_LAUNCHER).is_none(),
-            "managed release requires the SDK cutover API and its transition regressions"
-        );
         let fixture = Fixture::new();
         let (store, id) = fixture.new_store("store").await;
         fixture.enroll(&store, id);
@@ -617,7 +611,6 @@ mod launcher_regressions {
         server.close_stdin_and_wait().await;
     }
 
-    #[cfg(lean_host_cutover_sdk)]
     async fn managed(server: &mut StdioServer, command: Value) -> Value {
         let reply = server
             .request(
@@ -636,7 +629,6 @@ mod launcher_regressions {
         .expect("managed JSON reply")
     }
 
-    #[cfg(lean_host_cutover_sdk)]
     #[tokio::test]
     async fn packaged_managed_build_recovers_original_result_then_rolls_back() {
         if std::env::var_os(PACKAGED_LAUNCHER).is_none() {
@@ -681,12 +673,13 @@ mod launcher_regressions {
             first.initialize().await;
             let discovered = managed(&mut first, json!({"op":"discover"})).await;
             assert!(
-                discovered["operations"]
-                    .as_array()
+                discovered
+                    .get("operations")
+                    .and_then(Value::as_array)
                     .expect("operation list")
                     .contains(&json!("lake_module_preparation_v1"))
             );
-            let key = json!({"store":discovered["store"],"epoch":discovered["acceptance_epoch"],
+            let key = json!({"store":discovered.get("store").expect("store"),"epoch":discovered.get("acceptance_epoch").expect("epoch"),
                 "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1});
             let capability = [57_u8; 32];
             let intent = json!({"project":fixture.project,"job":[1],"revision":1,
@@ -697,7 +690,11 @@ mod launcher_regressions {
                 "intent":intent.to_string().as_bytes()}),
             )
             .await;
-            assert_eq!(create["execution"], "admitted", "{create}");
+            assert_eq!(
+                create.get("execution").and_then(Value::as_str),
+                Some("admitted"),
+                "{create}"
+            );
             first.close_stdin_and_wait().await;
             let blocked = fixture
                 .transition(&pins, "2", "ordinary")
@@ -714,10 +711,19 @@ mod launcher_regressions {
             let mut dispatched = start_server();
             dispatched.initialize().await;
             let completed = managed(&mut dispatched, command("start")).await;
-            assert_eq!(completed["custody"], "closed", "{completed}");
-            let body: Vec<u8> = serde_json::from_value(completed["result"]["body"].clone()).expect("retained body");
+            assert_eq!(
+                completed.get("custody").and_then(Value::as_str),
+                Some("closed"),
+                "{completed}"
+            );
+            let body: Vec<u8> = serde_json::from_value(completed.pointer("/result/body").expect("result body").clone())
+                .expect("retained body");
             let result: Value = serde_json::from_slice(&body).expect("build receipt");
-            assert_eq!(result["build_exit_code"], 0, "{result}");
+            assert_eq!(
+                result.get("build_exit_code").and_then(Value::as_i64),
+                Some(0),
+                "{result}"
+            );
             dispatched.close_stdin_and_wait().await;
             let olean = fixture.project.join(".lake/build/lib/lean/Probe.olean");
             assert!(olean.is_file());
@@ -731,10 +737,14 @@ mod launcher_regressions {
             let ack = managed(
                 &mut replacement,
                 json!({"op":"ack","key":key,"capability":capability,
-                "result_id":completed["result"]["id"],"result_digest":completed["result"]["sha256"]}),
+                "result_id":completed.pointer("/result/id").expect("result ID"),"result_digest":completed.pointer("/result/sha256").expect("result digest")}),
             )
             .await;
-            assert_eq!(ack["result"]["state"], "expired", "{ack}");
+            assert_eq!(
+                ack.pointer("/result/state").and_then(Value::as_str),
+                Some("expired"),
+                "{ack}"
+            );
             replacement.close_stdin_and_wait().await;
 
             let rollback = fixture
@@ -743,9 +753,14 @@ mod launcher_regressions {
                 .await
                 .expect("settled rollback");
             assert!(rollback.status.success(), "{rollback:?}");
-            let config: toml::Table = toml::from_str(&fs::read_to_string(selector).unwrap()).unwrap();
-            assert_eq!(config["launcher"]["mode"].as_str(), Some("ordinary"));
-            assert_eq!(config["launcher"]["generation"].as_integer(), Some(3));
+            let config: toml::Table =
+                toml::from_str(&fs::read_to_string(selector).expect("read selector")).expect("selector TOML");
+            let launcher = config
+                .get("launcher")
+                .and_then(toml::Value::as_table)
+                .expect("launcher table");
+            assert_eq!(launcher.get("mode").and_then(toml::Value::as_str), Some("ordinary"));
+            assert_eq!(launcher.get("generation").and_then(toml::Value::as_integer), Some(3));
             let mut ordinary = StdioServer::spawn(fixture.command().arg("--lake-root").arg(&fixture.project).args([
                 "--launcher-mode",
                 "ordinary",
@@ -764,7 +779,6 @@ mod launcher_regressions {
         let (substitute, other_id) = fixture.new_store("substitute").await;
         assert_ne!(id, other_id);
         let config = fixture.enroll(&store, id);
-        #[cfg(lean_host_cutover_sdk)]
         let pins = {
             let pins = fixture.custody().await;
             let output = fixture
@@ -781,7 +795,6 @@ mod launcher_regressions {
         fs::rename(substitute, &store).expect("install empty substitute");
         let mut startup = fixture.command();
         startup.arg("--lake-root").arg(&fixture.project);
-        #[cfg(lean_host_cutover_sdk)]
         startup
             .args([
                 "--launcher-mode",
@@ -792,15 +805,12 @@ mod launcher_regressions {
             ])
             .arg("--managed-native-store")
             .arg(&store);
-        #[cfg(not(lean_host_cutover_sdk))]
-        startup.args(["--launcher-mode", "ordinary", "--launcher-generation", "1"]);
         let output = startup.output().await.expect("startup rejection");
         assert!(!output.status.success(), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("original launcher store UUID changed"),
             "{output:?}"
         );
-        #[cfg(lean_host_cutover_sdk)]
         {
             let output = fixture
                 .transition(&pins, "2", "ordinary")
@@ -816,7 +826,6 @@ mod launcher_regressions {
         assert_eq!(fs::read(config).expect("selector after refusal"), before);
     }
 
-    #[cfg(lean_host_cutover_sdk)]
     #[tokio::test]
     async fn launcher_uncertain_publication_reconciles_without_another_generation() {
         use std::os::unix::fs::MetadataExt as _;

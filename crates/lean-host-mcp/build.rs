@@ -26,12 +26,6 @@ fn watch(path: &Path) {
 }
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(lean_host_cutover_sdk)");
-    println!("cargo:rerun-if-env-changed=LEAN_HOST_MCP_LOCAL_CUTOVER_SDK");
-    if std::env::var("LEAN_HOST_MCP_LOCAL_CUTOVER_SDK").as_deref() == Ok("ee0a818a") {
-        println!("cargo:rustc-cfg=lean_host_cutover_sdk");
-    }
-
     let Some(manifest) =
         std::env::var_os("CARGO_MANIFEST_DIR").and_then(|path| PathBuf::from(path).canonicalize().ok())
     else {

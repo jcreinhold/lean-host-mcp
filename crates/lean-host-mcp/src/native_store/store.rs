@@ -563,7 +563,6 @@ impl NativeStore {
             .map_err(std::io::Error::other)
     }
 
-    #[cfg(lean_host_cutover_sdk)]
     pub(crate) fn with_settled_launcher_store<T>(
         path: &std::path::Path,
         expected: Id,

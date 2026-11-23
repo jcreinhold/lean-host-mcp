@@ -157,88 +157,80 @@ impl Transition {
     /// # Errors
     /// Refuses an unavailable guard, active launcher, stale selection or unresolved stage.
     pub fn run(&self) -> io::Result<()> {
-        #[cfg(lean_host_cutover_sdk)]
-        {
-            use lean_toolchain::native_guardian::writer_storage::{StorageRoot, with_drained_project};
-            use std::{fs, io::Write as _, os::unix::fs::PermissionsExt as _};
+        use lean_toolchain::native_guardian::writer_storage::{StorageRoot, with_drained_project};
+        use std::{fs, io::Write as _, os::unix::fs::PermissionsExt as _};
 
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Custody {
-                registry: StorageRoot,
-                locks: Vec<(PathBuf, u64, u64)>,
-            }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Custody {
+            registry: StorageRoot,
+            locks: Vec<(PathBuf, u64, u64)>,
+        }
 
-            let _exclusive = lock_project(&self.project, FlockOperation::NonBlockingLockExclusive)?;
-            let (mut table, mut selected, permissions) = load(&self.project)?;
-            let next = self
-                .from_generation
-                .checked_add(1)
-                .filter(|_| self.from_generation != 0)
-                .ok_or_else(|| invalid("invalid launcher transition generation"))?;
-            let reconcile = selected.generation == next && selected.mode == self.to;
-            if !reconcile && (selected.generation != self.from_generation || selected.mode == self.to) {
-                return Err(invalid("launcher transition source changed"));
-            }
-            let proof = File::from(open(
-                &self.custody,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
-            if !proof.metadata()?.is_file() {
-                return Err(invalid("custody pins must be a regular file"));
-            }
-            let mut bytes = Vec::new();
-            proof.take(65537).read_to_end(&mut bytes)?;
-            if bytes.len() > 65536 {
-                return Err(invalid("custody pins exceed limit"));
-            }
-            let pins: Custody = serde_json::from_slice(&bytes)?;
-            let original_store = selected.managed_store.clone();
-            let expected_store = uuid::Uuid::parse_str(&selected.managed_store_uuid).map_err(io::Error::other)?;
-            with_drained_project(
-                &pins.registry,
-                std::slice::from_ref(&self.project),
-                &pins.locks,
-                std::time::Duration::from_secs(3),
-                || {
-                    crate::native_store::store::NativeStore::with_settled_launcher_store(
-                        &original_store,
-                        *expected_store.as_bytes(),
-                        || {
-                            if reconcile {
-                                return _exclusive.sync_all();
-                            }
-                            selected.mode = self.to;
-                            selected.generation = next;
-                            table.insert(
-                                "launcher".into(),
-                                toml::Value::try_from(&selected).map_err(io::Error::other)?,
-                            );
-                            let mut replacement = tempfile::NamedTempFile::new_in(&self.project)?;
-                            replacement
-                                .as_file()
-                                .set_permissions(fs::Permissions::from_mode(permissions & 0o777))?;
-                            replacement.write_all(toml::to_string(&table).map_err(io::Error::other)?.as_bytes())?;
-                            replacement.as_file().sync_all()?;
-                            replacement
-                                .persist(self.project.join(CONFIG))
-                                .map_err(io::Error::other)?;
-                            if option_env!("LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT").is_some()
-                                && std::env::var_os("LEAN_HOST_MCP_TEST_LAUNCHER_RENAME_CUT").is_some()
-                            {
-                                return Err(invalid("disposable cut after selector rename"));
-                            }
-                            _exclusive.sync_all()
-                        },
-                    )
-                },
-            )
+        let selector_lock = lock_project(&self.project, FlockOperation::NonBlockingLockExclusive)?;
+        let (mut table, mut selected, permissions) = load(&self.project)?;
+        let next = self
+            .from_generation
+            .checked_add(1)
+            .filter(|_| self.from_generation != 0)
+            .ok_or_else(|| invalid("invalid launcher transition generation"))?;
+        let reconcile = selected.generation == next && selected.mode == self.to;
+        if !reconcile && (selected.generation != self.from_generation || selected.mode == self.to) {
+            return Err(invalid("launcher transition source changed"));
         }
-        #[cfg(not(lean_host_cutover_sdk))]
-        {
-            let _ = (&self.project, self.from_generation, self.to, &self.custody);
-            Err(invalid("launcher transition requires the matched cutover SDK"))
+        let proof = File::from(open(
+            &self.custody,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        if !proof.metadata()?.is_file() {
+            return Err(invalid("custody pins must be a regular file"));
         }
+        let mut bytes = Vec::new();
+        proof.take(65537).read_to_end(&mut bytes)?;
+        if bytes.len() > 65536 {
+            return Err(invalid("custody pins exceed limit"));
+        }
+        let pins: Custody = serde_json::from_slice(&bytes)?;
+        let original_store = selected.managed_store.clone();
+        let expected_store = uuid::Uuid::parse_str(&selected.managed_store_uuid).map_err(io::Error::other)?;
+        with_drained_project(
+            &pins.registry,
+            std::slice::from_ref(&self.project),
+            &pins.locks,
+            std::time::Duration::from_secs(3),
+            || {
+                crate::native_store::store::NativeStore::with_settled_launcher_store(
+                    &original_store,
+                    *expected_store.as_bytes(),
+                    || {
+                        if reconcile {
+                            return selector_lock.sync_all();
+                        }
+                        selected.mode = self.to;
+                        selected.generation = next;
+                        table.insert(
+                            "launcher".into(),
+                            toml::Value::try_from(&selected).map_err(io::Error::other)?,
+                        );
+                        let mut replacement = tempfile::NamedTempFile::new_in(&self.project)?;
+                        replacement
+                            .as_file()
+                            .set_permissions(fs::Permissions::from_mode(permissions & 0o777))?;
+                        replacement.write_all(toml::to_string(&table).map_err(io::Error::other)?.as_bytes())?;
+                        replacement.as_file().sync_all()?;
+                        replacement
+                            .persist(self.project.join(CONFIG))
+                            .map_err(io::Error::other)?;
+                        if option_env!("LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT").is_some()
+                            && std::env::var_os("LEAN_HOST_MCP_TEST_LAUNCHER_RENAME_CUT").is_some()
+                        {
+                            return Err(invalid("disposable cut after selector rename"));
+                        }
+                        selector_lock.sync_all()
+                    },
+                )
+            },
+        )
     }
 }
