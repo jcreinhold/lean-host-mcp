@@ -9,6 +9,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.18] - 2026-11-23
+
+### Added
+
+- Opt-in warm managed declaration lookup reuses a verified worker for the same prepared imports. Guarded writes retire the worker, and original results remain recoverable by key.
+- Managed preparation derives the selected import closure, checks pinned cache inputs, and builds first-party modules in dependency order.
+- Managed file-backed proof context, command and tactic trials, proof search, and declaration lookup use admitted inputs. Managed root-library builds, blueprint declaration checks, and read-only regrouping retain bounded results.
+
+### Fixed
+
+- Initialize Lake project discovery patterns before serving requests to avoid a stack overflow during ordinary proof search.
+- Verify installed packages with the matched lean-rs 0.10.15 worker and writer. Run launcher fault injection on a separate executable.
+
 ## [0.16.17] - 2026-11-23
 
 ### Added
@@ -735,7 +748,9 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.16...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.18...HEAD
+[0.16.18]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.17...v0.16.18
+[0.16.17]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.16...v0.16.17
 [0.16.16]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.15...v0.16.16
 [0.16.15]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.14...v0.16.15
 [0.16.14]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.13...v0.16.14
