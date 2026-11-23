@@ -450,26 +450,29 @@ fn failed_bootstrap_preserves_primary_error_and_independent_closure() {
 }
 
 #[test]
-fn guardian_exit_between_probes_preserves_only_a_confirmed_bootstrap_success() {
+fn closed_custody_refreshes_only_an_unconfirmed_bootstrap_exit() {
     use std::os::unix::process::ExitStatusExt as _;
     let mut interrupted = None;
-    let status = recheck_guardian_exit(true, || Ok(Some(ExitStatus::from_raw(0))), &mut interrupted);
+    // The first wait withheld the already reaped child because custody was open.
+    let status = refresh_closed_bootstrap_exit(None, || Ok(Some(ExitStatus::from_raw(0))), &mut interrupted);
     assert!(status.is_some_and(|status| status.success()));
     assert_eq!(interrupted, None);
 
-    let mut interrupted = None;
-    let status = recheck_guardian_exit(false, || panic!("group remains open"), &mut interrupted);
+    let retained = refresh_closed_bootstrap_exit(status, || panic!("status already observed"), &mut interrupted);
+    assert_eq!(retained, status);
+
+    let status = refresh_closed_bootstrap_exit(None, || Ok(None), &mut interrupted);
+    assert!(status.is_none());
+    assert_eq!(
+        interrupted.as_deref(),
+        Some("native bootstrap success unconfirmed after custody closed")
+    );
+
+    interrupted = Some("native guardian exited before owned group closure".into());
+    let status = refresh_closed_bootstrap_exit(None, || panic!("existing interruption"), &mut interrupted);
     assert!(status.is_none());
     assert_eq!(
         interrupted.as_deref(),
         Some("native guardian exited before owned group closure")
-    );
-
-    let mut interrupted = None;
-    let status = recheck_guardian_exit(true, || Ok(None), &mut interrupted);
-    assert!(status.is_none());
-    assert_eq!(
-        interrupted.as_deref(),
-        Some("native bootstrap success unconfirmed after guardian closure")
     );
 }
