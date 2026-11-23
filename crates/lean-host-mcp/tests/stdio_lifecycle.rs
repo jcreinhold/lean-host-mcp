@@ -617,6 +617,146 @@ mod launcher_regressions {
         server.close_stdin_and_wait().await;
     }
 
+    #[cfg(lean_host_cutover_sdk)]
+    async fn managed(server: &mut StdioServer, command: Value) -> Value {
+        let reply = server
+            .request(
+                "tools/call",
+                json!({"name":"lean_managed_admission","arguments":{
+                    "request":json!({"version":1,"command":command}).to_string()
+                }}),
+            )
+            .await;
+        serde_json::from_str(
+            reply
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("expected managed reply: {reply}")),
+        )
+        .expect("managed JSON reply")
+    }
+
+    #[cfg(lean_host_cutover_sdk)]
+    #[tokio::test]
+    async fn packaged_managed_build_recovers_original_result_then_rolls_back() {
+        if std::env::var_os(PACKAGED_LAUNCHER).is_none() {
+            return;
+        }
+        let writer = std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER")
+            .expect("packaged release supplies its installed writer");
+        let fixture = Fixture::new();
+        fs::write(fixture.project.join("Probe.lean"), "def packagedRecovery : Nat := 19\n")
+            .expect("disposable Lean input");
+        let (store, id) = fixture.new_store("store").await;
+        let selector = fixture.enroll(&store, id);
+        let pins = {
+            let pins = fixture.custody().await;
+            let outcome = fixture
+                .transition(&pins, "1", "managed")
+                .output()
+                .await
+                .expect("cutover");
+            assert!(outcome.status.success(), "{outcome:?}");
+            pins
+        };
+        {
+            let start_server = || {
+                let mut command = fixture.command();
+                command
+                    .arg("--lake-root")
+                    .arg(&fixture.project)
+                    .args([
+                        "--launcher-mode",
+                        "managed",
+                        "--launcher-generation",
+                        "2",
+                        "--managed-only",
+                    ])
+                    .arg("--managed-native-store")
+                    .arg(&store)
+                    .env("LEAN_HOST_MCP_MANAGED_READINESS_WRITER", &writer);
+                StdioServer::spawn(&mut command)
+            };
+            let mut first = start_server();
+            first.initialize().await;
+            let discovered = managed(&mut first, json!({"op":"discover"})).await;
+            assert!(
+                discovered["operations"]
+                    .as_array()
+                    .expect("operation list")
+                    .contains(&json!("lake_module_preparation_v1"))
+            );
+            let key = json!({"store":discovered["store"],"epoch":discovered["acceptance_epoch"],
+                "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1});
+            let capability = [57_u8; 32];
+            let intent = json!({"project":fixture.project,"job":[1],"revision":1,
+                "operation":"lake_module_preparation_v1","target":{"kind":"module","name":"Probe"}});
+            let create = managed(
+                &mut first,
+                json!({"op":"create","key":key,"capability":capability,
+                "intent":intent.to_string().as_bytes()}),
+            )
+            .await;
+            assert_eq!(create["execution"], "admitted", "{create}");
+            first.close_stdin_and_wait().await;
+            let blocked = fixture
+                .transition(&pins, "2", "ordinary")
+                .output()
+                .await
+                .expect("rollback with pending admission");
+            assert!(!blocked.status.success(), "{blocked:?}");
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains("unsettled stages"),
+                "{blocked:?}"
+            );
+
+            let command = |op| json!({"op":op,"key":key,"capability":capability});
+            let mut dispatched = start_server();
+            dispatched.initialize().await;
+            let completed = managed(&mut dispatched, command("start")).await;
+            assert_eq!(completed["custody"], "closed", "{completed}");
+            let body: Vec<u8> = serde_json::from_value(completed["result"]["body"].clone()).expect("retained body");
+            let result: Value = serde_json::from_slice(&body).expect("build receipt");
+            assert_eq!(result["build_exit_code"], 0, "{result}");
+            dispatched.close_stdin_and_wait().await;
+            let olean = fixture.project.join(".lake/build/lib/lean/Probe.olean");
+            assert!(olean.is_file());
+            fs::remove_file(&olean).expect("remove disposable build output to witness no replay");
+
+            let mut replacement = start_server();
+            replacement.initialize().await;
+            assert_eq!(managed(&mut replacement, command("get")).await, completed);
+            assert_eq!(managed(&mut replacement, command("start")).await, completed);
+            assert!(!olean.exists(), "original build replayed");
+            let ack = managed(
+                &mut replacement,
+                json!({"op":"ack","key":key,"capability":capability,
+                "result_id":completed["result"]["id"],"result_digest":completed["result"]["sha256"]}),
+            )
+            .await;
+            assert_eq!(ack["result"]["state"], "expired", "{ack}");
+            replacement.close_stdin_and_wait().await;
+
+            let rollback = fixture
+                .transition(&pins, "2", "ordinary")
+                .output()
+                .await
+                .expect("settled rollback");
+            assert!(rollback.status.success(), "{rollback:?}");
+            let config: toml::Table = toml::from_str(&fs::read_to_string(selector).unwrap()).unwrap();
+            assert_eq!(config["launcher"]["mode"].as_str(), Some("ordinary"));
+            assert_eq!(config["launcher"]["generation"].as_integer(), Some(3));
+            let mut ordinary = StdioServer::spawn(fixture.command().arg("--lake-root").arg(&fixture.project).args([
+                "--launcher-mode",
+                "ordinary",
+                "--launcher-generation",
+                "3",
+            ]));
+            ordinary.initialize().await;
+            ordinary.close_stdin_and_wait().await;
+        }
+    }
+
     #[tokio::test]
     async fn launcher_rejects_valid_replacement_store_at_original_path() {
         let fixture = Fixture::new();

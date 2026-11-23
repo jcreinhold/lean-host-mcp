@@ -58,5 +58,6 @@ if "$managed_release"; then
     scripts/check-parent-link.sh "$packaged_parent"
     LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$R2_SETUP_ROOT/workers" \
         LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$packaged_parent" \
+        LEAN_HOST_MCP_STDIO_PACKAGED_WRITER="$R2_SETUP_ROOT/tools/bin/lean-rs-writer" \
         scripts/test-installed-stdio.sh --all-targets --features managed-native-store
 fi
