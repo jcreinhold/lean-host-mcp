@@ -254,7 +254,9 @@ for label, plugin in [("project", True), ("omitted", False)]:
     proof = probe(project)
     if plugin:
         check_reader_frames(project)
+        search_started = time.monotonic()
         lookup = probe(project, search=True)
+        print(f"installed semantic search response in {time.monotonic() - search_started:.1f}s", flush=True)
         for tool, response in [("lean_verify", proof), ("lean_lookup", lookup)]:
             if "error" in response:
                 print(tool, response["error"], flush=True)

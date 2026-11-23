@@ -81,12 +81,12 @@ if (not identities <= published_locks
                for _, _, source, checksum in identities)):
     raise SystemExit("candidate pairing changed external registry identities")
 PY_LOCK
+parent_features=()
 if "$managed_release"; then
-    LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1 cargo build --locked --manifest-path "$parent_manifest" \
-        --bin lean-host-mcp --features managed-native-store
-else
-    cargo build --locked --manifest-path "$parent_manifest" --bin lean-host-mcp
+    parent_features=(--features managed-native-store)
+    export LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1
 fi
+cargo build --locked --manifest-path "$parent_manifest" --bin lean-host-mcp ${parent_features[@]+"${parent_features[@]}"}
 # The source worker installer expects Cargo's native profile directories.
 export R2_SETUP_PARENT="$CARGO_TARGET_DIR/debug/lean-host-mcp"
 if [[ ! -x $R2_SETUP_PARENT ]]; then
@@ -96,6 +96,14 @@ fi
 cargo install --debug --locked --root "$R2_SETUP_ROOT/tools" --version "=$sdk" lean-rs-writer
 "$R2_SETUP_PARENT" install-worker --toolchain "$id" --workers-dir "$R2_SETUP_ROOT/workers" \
     --source-dir "$worker_source" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
+# Build the bundled Lean capability under the same packaged writer before the
+# RPC smoke. Cold compilation has its own existing SDK budget.
+cargo run --locked --manifest-path "$parent_manifest" --example prepare_semantic_smoke \
+    ${parent_features[@]+"${parent_features[@]}"} -- \
+    "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$R2_SETUP_PARENT"
+if "$managed_release"; then
+    unset LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT
+fi
 python3 tests/r2-launch-input/module_setup.py
 if "$managed_release"; then
     # Keep the exact packaged executable while Cargo builds the checkout's
