@@ -360,6 +360,13 @@ pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     )?);
     Ok(true)
 }
+fn launcher_unsettled(db: &Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stages WHERE gate=0 OR resource_report IN (1,2) OR (gate=1 AND (resource_report<>3 OR result_kind=0)))",
+            [], |row| row.get(0),
+        )
+}
+
 pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     // Only a matched development image can open an explicitly promoted store.
     if !(has_role(db, NATIVE_ROLE, 5)?
@@ -608,11 +615,7 @@ impl NativeStore {
         if actual != expected {
             return Err(std::io::Error::other("original launcher store UUID changed"));
         }
-        let unsettled: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM stages WHERE gate=0 OR resource_report IN (1,2) OR (gate=1 AND (resource_report<>3 OR result_kind=0)))",
-            [], |row| row.get(0),
-        ).map_err(std::io::Error::other)?;
-        if unsettled {
+        if launcher_unsettled(&tx).map_err(std::io::Error::other)? {
             return Err(std::io::Error::other("managed store has unsettled stages"));
         }
         switch()

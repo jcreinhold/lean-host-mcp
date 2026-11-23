@@ -614,7 +614,7 @@ impl NativeStore {
         Ok(warm_schema(self.db.connection())?)
     }
 
-    pub(crate) fn promote_warm_contract(&mut self) -> Answer<()> {
+    pub(crate) fn promote_warm_contract(&mut self, require_settled: bool) -> Answer<()> {
         self.db.check_profile()?;
         let tx = self
             .db
@@ -622,6 +622,9 @@ impl NativeStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if warm_schema(&tx)? {
             return Ok(());
+        }
+        if require_settled && super::launcher_unsettled(&tx)? {
+            return reject(Reject::WrongScope);
         }
         tx.execute_batch(PROMOTE_WARM)?;
         tx.pragma_update(None, "user_version", WARM_SCHEMA_VERSION)?;

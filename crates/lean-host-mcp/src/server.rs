@@ -207,10 +207,9 @@ impl LeanHostService {
                             .broker
                             .native_root(&crate::broker::ProjectHint::Default)
                             .is_ok_and(|root| crate::writer_preparation::closure_preparation_configured(&root))))
-                    || expected.is_some()
                 {
                     return Err(std::io::Error::other(
-                        "warm development requires an unenrolled managed-only service",
+                        "warm development requires a managed-only service with prepared input",
                     ));
                 }
                 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary, WorkerSidecar};
@@ -226,7 +225,9 @@ impl LeanHostService {
                     ));
                 };
                 WorkerSidecar::require_warm_worker(&worker.path, &pin).map_err(std::io::Error::other)?;
-                store.promote_warm_contract().map_err(std::io::Error::other)?;
+                store
+                    .promote_warm_contract(expected.is_some())
+                    .map_err(std::io::Error::other)?;
             } else if store.warm_development_store().map_err(std::io::Error::other)? {
                 return Err(std::io::Error::other(
                     "warm development store requires explicit selection",

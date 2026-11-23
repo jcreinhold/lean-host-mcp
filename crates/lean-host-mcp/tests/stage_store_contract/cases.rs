@@ -1205,7 +1205,8 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
     ));
     let identity = store.identity();
     let original_before_promotion = get(&mut store, &first);
-    store.promote_warm_contract().unwrap();
+    assert!(store.promote_warm_contract(true).is_err());
+    store.promote_warm_contract(false).unwrap();
     assert_eq!(store.identity(), identity);
     assert_eq!(get(&mut store, &first), original_before_promotion);
     assert!(NativeStore::with_settled_launcher_store(&fixture.native(), identity, || Ok(())).is_err());

@@ -91,7 +91,16 @@ fn load(root: &Path) -> io::Result<(toml::Table, Selection, u32)> {
 /// # Errors
 /// Returns an error if a transition holds the lock or startup selected stale inputs.
 pub fn admit(root: &Path, mode: LauncherMode, generation: u64, store: Option<&Path>) -> io::Result<(File, [u8; 16])> {
-    let held = lock_project(root, FlockOperation::NonBlockingLockShared)?;
+    // A warm enrolment changes the original store schema. Keep the
+    // selector exclusive so a cold broker cannot have that store open.
+    let operation = FlockOperation::NonBlockingLockShared;
+    #[cfg(lean_host_mcp_development_warm)]
+    let operation = if mode == LauncherMode::Managed && crate::managed_prepared::warm_development_enabled() {
+        FlockOperation::NonBlockingLockExclusive
+    } else {
+        operation
+    };
+    let held = lock_project(root, operation)?;
     let (_, selected, _) = load(root)?;
     if selected.mode != mode
         || selected.generation != generation
