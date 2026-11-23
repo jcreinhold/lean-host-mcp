@@ -30,6 +30,7 @@ use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
 pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION, OUTLINE as SETUP_OUTLINE};
 pub(super) use writer_preparation::first_party_clean::OPERATION as FIRST_PARTY_CLEAN;
+pub(super) use writer_preparation::regroup::OPERATION as REGROUP;
 pub(super) use writer_preparation::tooling_suites::OPERATION as TOOLING_SUITES;
 pub(super) use writer_preparation::whole_lint::OPERATION as WHOLE_LINT;
 #[path = "formatter_fix.rs"]
@@ -102,6 +103,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | SETUP_DIAGNOSTICS
                     | SETUP_OUTLINE
                     | TOOLING_SUITES
+                    | REGROUP
                     | WHOLE_LINT
                     | FIRST_PARTY_CLEAN
             )
@@ -154,6 +156,7 @@ pub(super) async fn run(
             if !matches!(
                 target,
                 Target::VerifierModules { .. }
+                    | Target::Regroup(_)
                     | Target::ToolingSuites { .. }
                     | Target::WholeLint { .. }
                     | Target::FirstPartyClean { .. }
@@ -164,6 +167,9 @@ pub(super) async fn run(
         (writer_preparation::VERIFIER_OPERATION, Some(target @ Target::VerifierModules { .. }), None, None, None)
             if target.validate().is_ok() =>
         {
+            Stage::Preparation(target)
+        }
+        (REGROUP, Some(target @ Target::Regroup(_)), None, None, None) if target.validate().is_ok() => {
             Stage::Preparation(target)
         }
         (FIRST_PARTY_CLEAN, Some(target @ Target::FirstPartyClean { .. }), None, None, None) => {
@@ -270,7 +276,10 @@ fn execute(
     } else {
         None
     };
-    let tooling_root = if matches!(stage, Stage::Preparation(Target::ToolingSuites { .. })) {
+    let tooling_root = if matches!(
+        stage,
+        Stage::Preparation(Target::ToolingSuites { .. } | Target::Regroup(_))
+    ) {
         Some(writer_preparation::tooling_suites::package_root(root).map_err(no_start)?)
     } else {
         None
@@ -429,6 +438,11 @@ fn execute(
     let body = result.ok().and_then(|output| match stage {
         Stage::Preparation(Target::FirstPartyClean { .. }) if output.status.success() => {
             writer_preparation::first_party_clean::Receipt::parse(&output.stdout)
+                .ok()
+                .and_then(|receipt| serde_json::to_value(receipt).ok())
+        }
+        Stage::Preparation(Target::Regroup(_)) if output.status.success() => {
+            writer_preparation::regroup::Receipt::parse(&output.stdout)
                 .ok()
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
         }

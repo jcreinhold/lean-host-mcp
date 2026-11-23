@@ -21,6 +21,8 @@ const MAX_PLAN_BYTES: usize = 32 * 1024;
 mod blueprint_declarations;
 #[path = "pinned_lake_config.rs"]
 mod pinned_lake_config;
+#[path = "regroup.rs"]
+pub(super) mod regroup;
 #[path = "root_library.rs"]
 pub(super) mod root_library;
 pub use pinned_lake_config::validate_pinned_lake_configs;
@@ -56,6 +58,7 @@ pub(crate) enum Target {
         name: String,
         package: Option<String>,
     },
+    Regroup(regroup::Request),
     ToolingSuites {
         lakefile_sha256: [u8; 32],
         manifest_sha256: [u8; 32],
@@ -103,6 +106,7 @@ impl Target {
                     && names.len() <= MAX_MODULES
                     && names.iter().all(|target| module_name(target) && unique.insert(target))
             }
+            Self::Regroup(request) => request.valid(),
             Self::ToolingSuites { .. } | Self::WholeLint { .. } | Self::FirstPartyClean { .. } => true,
             Self::Ready { name: target, package } => name(target) && package.as_deref().is_none_or(name),
         };
@@ -395,8 +399,13 @@ pub fn run(encoded: &str) -> io::Result<()> {
         let receipt = root_library::run(&plan, &lake, command, &authorize, &after_deps)?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
+    if let Target::Regroup(request) = &plan.target {
+        let receipt = request.run(&plan.root, &lake, command, &watched, &authorize, &after_deps)?;
+        return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
+    }
     let receipt = match plan.target {
         Target::RootLibrary { .. }
+        | Target::Regroup(_)
         | Target::ToolingSuites { .. }
         | Target::WholeLint { .. }
         | Target::FirstPartyClean { .. } => {

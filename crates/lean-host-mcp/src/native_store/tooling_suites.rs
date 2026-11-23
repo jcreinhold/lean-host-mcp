@@ -12,7 +12,7 @@ use std::{
 use super::pinned_lake_config;
 
 const CONFIG: &[u8] = include_bytes!("tooling_suites.toml");
-const BUILD_DIR: &str = ".lake/build/tooling-tests";
+pub(super) const BUILD_DIR: &str = ".lake/build/tooling-tests";
 const MAX_ENV_BYTES: u64 = 64 * 1024;
 
 pub(crate) const OPERATION: &str = "lean_tooling_suites_v1";
@@ -129,7 +129,7 @@ pub(super) fn capture(mut command: Command, name: &str) -> io::Result<Check> {
     })
 }
 
-fn lean_path(mut command: Command) -> io::Result<Result<std::ffi::OsString, Check>> {
+pub(super) fn lean_path(mut command: Command) -> io::Result<Result<std::ffi::OsString, Check>> {
     use std::os::unix::ffi::OsStringExt as _;
 
     let mut child = command
