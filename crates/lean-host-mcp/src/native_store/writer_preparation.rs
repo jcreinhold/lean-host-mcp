@@ -281,21 +281,8 @@ fn run_module(
     watched: &impl Fn(&[&str]) -> io::Result<i32>,
     after_deps: &impl Fn() -> io::Result<()>,
 ) -> io::Result<ModuleReceipt> {
-    let mut dependency_exit_code = watched(&["--no-build", "build", &format!("@/+{name}:deps")])?;
-    if dependency_exit_code == 0 {
-        // Elaboration and IR generation both widen transitive imports in setup.
-        dependency_exit_code = watched(&["--no-build", "query", &format!("@/+{name}:setup")])?;
-    }
-    let build_exit_code = if dependency_exit_code == 0 {
-        after_deps()?;
-        Some(watched(&[
-            "--log-level=warning",
-            "build",
-            &format!("@/+{name}:irArts"),
-        ])?)
-    } else {
-        None
-    };
+    let (dependency_exit_code, build_exit_code) =
+        lean_host_mcp_worker::module_preparation::run_module(&name, watched, after_deps)?;
     Ok(ModuleReceipt {
         name,
         dependency_exit_code,

@@ -1,6 +1,7 @@
 """Exercise the operator command with one real path dependency and registered Elan."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,27 @@ def main():
         }
         plan.write_text(json.dumps(selection))
         command = [host, "prepare-generation", "--plan", plan, "--writer", writer]
+        adapter = project / "Missing.lean"
+        adapter.write_text('def main : IO Unit := throw (IO.userError "missing selected archive")\n')
+        scratch = project / "archives"
+        scratch.mkdir()
+        materialization = {
+            "adapter": str(adapter),
+            "adapter_sha256": list(hashlib.sha256(adapter.read_bytes()).digest()),
+            "runtime_roots": [],
+            "source_roots": [str(dep)],
+            "modules": ["Dep"],
+            "archive_scratch": str(scratch),
+        }
+        plan.write_text(json.dumps({**selection, "dependency_materialization": materialization}))
+        refused = subprocess.run(command, cwd=project, env=env, capture_output=True, text=True)
+        assert refused.returncode != 0 and not refused.stdout, refused
+        assert "missing selected archive" in refused.stderr, refused.stderr
+        assert not (project / ".lake/build").exists()
+        assert not (dep / ".lake/build").exists()
+
+        # The successful legacy run must reacquire the same writer roots.
+        plan.write_text(json.dumps(selection))
         result = subprocess.run(command, cwd=project, env=env, check=True, capture_output=True, text=True)
         record = json.loads(result.stdout)
         assert record["plan"] == {**selection, "installed_release": "leanprover/lean4:v4.36.0"}

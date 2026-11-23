@@ -374,6 +374,89 @@ impl ImportPlan {
         }
         Ok(())
     }
+    /// Materialize the operator-selected dependency closure and build one local module.
+    ///
+    /// # Errors
+    /// Refuses incomplete custody, stale outputs, failed readiness, or changed dependency bytes.
+    pub fn build_cached_generation(
+        self,
+        writer: &mut lean_toolchain::shared_writer::SharedWriter,
+        materialize: impl FnOnce(&mut lean_toolchain::shared_writer::SharedWriter) -> io::Result<()>,
+    ) -> io::Result<PreparedGeneration> {
+        use std::{process::Command, time::Duration};
+
+        if self.installed_release.is_none()
+            || writer.project_root() != self.project
+            || !writer.covers_project(&self.project)?
+        {
+            return Err(invalid());
+        }
+        self.installed_identity()?;
+        let (target, domain) = self.modules.first().ok_or_else(invalid)?;
+        if domain != &self.project || !valid_module(target) {
+            return Err(invalid());
+        }
+        let domains = project_artifact_roots(&self.project)?;
+        for domain in &domains {
+            if !writer.write_roots().contains(domain) {
+                return Err(invalid());
+            }
+            match fs::symlink_metadata(domain.join(".lake/build")) {
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                Err(err) => return Err(err),
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "cached preparation requires absent output trees",
+                    ));
+                }
+            }
+        }
+        let mut dependencies = self.clone();
+        dependencies.modules.retain(|(_, domain)| domain != &self.project);
+        if dependencies.modules.is_empty() || dependencies.modules.len() + 1 != self.modules.len() {
+            return Err(invalid());
+        }
+        materialize(writer)?;
+        self.check_edges(writer)?;
+        let expected = dependencies.identity(&domains)?;
+        let check_dependencies = || {
+            if dependencies.identity(&domains)? != expected {
+                return Err(io::Error::other("materialized dependency identity changed"));
+            }
+            Ok(())
+        };
+        let sysroot = self.release.parent().and_then(Path::parent).ok_or_else(invalid)?;
+        let (readiness, build) = crate::module_preparation::run_module(
+            target,
+            |args| {
+                let mut cmd = Command::new(sysroot.join("bin/lake"));
+                cmd.current_dir(&self.project)
+                    .args(["--no-cache"])
+                    .args(args)
+                    .env("LEAN_SYSROOT", sysroot)
+                    .env_remove("LEAN_PATH")
+                    .env_remove("LEAN_SRC_PATH")
+                    .env_remove("ELAN_TOOLCHAIN");
+                let output = writer.run(&cmd, Duration::from_secs(90))?;
+                if !output.status.success() {
+                    return Err(io::Error::other(format!(
+                        "Lake {args:?} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
+                }
+                Ok(0)
+            },
+            check_dependencies,
+        )?;
+        if readiness != 0 || build != Some(0) {
+            return Err(invalid());
+        }
+        check_dependencies()?;
+        let identity = self.identity(&domains)?;
+        self.finish_generation(identity)
+    }
+
     /// Build the selected plugin-free default-layout project from clean output domains
     /// and capture the result before releasing the same writer.
     ///
@@ -434,6 +517,10 @@ impl ImportPlan {
         }
         let identity = self.identity(writer.write_roots())?;
         self.check_edges(writer)?;
+        self.finish_generation(identity)
+    }
+
+    fn finish_generation(self, identity: [u8; 32]) -> io::Result<PreparedGeneration> {
         let products = self
             .modules
             .iter()

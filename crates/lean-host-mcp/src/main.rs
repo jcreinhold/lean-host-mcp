@@ -337,6 +337,18 @@ fn prepare_generation(plan: &std::path::Path, writer: &std::path::Path) -> anyho
         roots: Vec<PathBuf>,
         release: PathBuf,
         modules: Vec<(String, PathBuf)>,
+        dependency_materialization: Option<DependencyMaterialization>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DependencyMaterialization {
+        adapter: PathBuf,
+        adapter_sha256: [u8; 32],
+        runtime_roots: Vec<PathBuf>,
+        source_roots: Vec<PathBuf>,
+        modules: Vec<String>,
+        archive_scratch: PathBuf,
     }
 
     let mut bytes = Vec::new();
@@ -349,17 +361,91 @@ fn prepare_generation(plan: &std::path::Path, writer: &std::path::Path) -> anyho
         roots,
         release,
         modules,
+        dependency_materialization,
     } = serde_json::from_slice(&bytes)?;
     if !project.is_absolute() || project.canonicalize()? != project {
         bail!("prepared generation project must be a canonical absolute path");
     }
+    let sysroot = release
+        .parent()
+        .and_then(std::path::Path::parent)
+        .context("resolve selected toolchain root")?
+        .to_owned();
     let plan = ImportPlan::new(project.clone(), roots, release, modules).with_installed_release()?;
     let writer = writer.canonicalize().context("resolve standalone writer")?;
     let timeout = Duration::from_secs(15);
     let mut writer = SharedWriter::open(&writer, &project, timeout)?;
-    let result = plan
-        .build_generation(&mut writer)
-        .and_then(|generation| generation.launch_input());
+    let result = if let Some(cache) = dependency_materialization {
+        plan.build_cached_generation(&mut writer, |writer| {
+            use sha2::{Digest, Sha256};
+            for path in std::iter::once(&cache.adapter)
+                .chain(&cache.runtime_roots)
+                .chain(&cache.source_roots)
+                .chain(std::iter::once(&cache.archive_scratch))
+            {
+                if !path.is_absolute() || path.canonicalize()? != *path {
+                    return Err(std::io::Error::other(
+                        "materializer inputs must be canonical absolute paths",
+                    ));
+                }
+            }
+            if cache.source_roots.is_empty()
+                || cache
+                    .source_roots
+                    .iter()
+                    .any(|root| !writer.write_roots().contains(root))
+                || writer
+                    .write_roots()
+                    .iter()
+                    .any(|root| root.starts_with(&cache.archive_scratch))
+                || std::fs::read_dir(&cache.archive_scratch)?.next().is_some()
+            {
+                return Err(std::io::Error::other(
+                    "materializer roots are outside custody or scratch is not empty",
+                ));
+            }
+            if cache.modules.is_empty() || cache.modules.iter().any(|module| module.starts_with('-')) {
+                return Err(std::io::Error::other("materializer requires explicit module names"));
+            }
+            let mut contents = Vec::new();
+            std::fs::File::open(&cache.adapter)?
+                .take(65537)
+                .read_to_end(&mut contents)?;
+            if contents.len() > 65536 || <[u8; 32]>::from(Sha256::digest(&contents)) != cache.adapter_sha256 {
+                return Err(std::io::Error::other("materializer adapter digest changed"));
+            }
+            let mut cmd = std::process::Command::new(sysroot.join("bin/lean"));
+            cmd.current_dir(&project)
+                .args(["--run"])
+                .arg(&cache.adapter)
+                .args(&cache.modules)
+                .env("LEAN_SYSROOT", &sysroot)
+                .env(
+                    "LEAN_PATH",
+                    std::env::join_paths(&cache.runtime_roots).map_err(std::io::Error::other)?,
+                )
+                .env(
+                    "LEAN_SRC_PATH",
+                    std::env::join_paths(&cache.source_roots).map_err(std::io::Error::other)?,
+                )
+                .env("MATHLIB_CACHE_DIR", &cache.archive_scratch)
+                .env_remove("MATHLIB_CACHE_GET_URL")
+                .env_remove("MATHLIB_CACHE_BASE_URL");
+            let output = writer.run(&cmd, Duration::from_secs(90))?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "dependency materialization failed ({}): {}{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            Ok(())
+        })
+    } else {
+        plan.build_generation(&mut writer)
+    }
+    .and_then(|generation| generation.launch_input());
     writer.close(timeout).context("confirm standalone writer closure")?;
     Ok(result?)
 }
