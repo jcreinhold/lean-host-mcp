@@ -209,7 +209,7 @@ impl NativeStore {
                     &Capability(capability),
                     &intent,
                     drain_authorization,
-                    budget.map(super::recovery::admission_deadline),
+                    super::StageAdmission::Initial(budget.map(super::recovery::admission_deadline)),
                     validate,
                 )
                 .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
@@ -309,9 +309,14 @@ impl NativeStore {
                 intent,
                 drain_authorization,
             } => self
-                .create_intent(key, &Capability(capability), &intent, drain_authorization, None, |_| {
-                    Ok(())
-                })
+                .create_intent(
+                    key,
+                    &Capability(capability),
+                    &intent,
+                    drain_authorization,
+                    super::StageAdmission::Initial(None),
+                    |_| Ok(()),
+                )
                 .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
             ClientCommand::Get { key, capability } => self
                 .client_get(key, &Capability(capability))

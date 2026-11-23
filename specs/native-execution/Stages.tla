@@ -52,6 +52,9 @@ HostInit == Init /\ h = [
     drainKey |-> <<>>, drainFor |-> <<>>, armedAtAbort |-> {},
     frozen |-> FALSE, froze |-> FALSE, due |-> "none", dueAt |-> <<>>,
     refused |-> FALSE, earlyDrain |-> FALSE, closedWhileFrozen |-> FALSE],
+  preparation |-> [writer |-> "pending", result |-> FALSE, closure |-> <<>>,
+    elapsed |-> FALSE, read |-> "unadmitted", starts |-> 0, recovered |-> FALSE,
+    admittedLate |-> FALSE, dispatchedLate |-> FALSE],
   writer |-> [phase |-> "new", handoff |-> <<>>, admittedHandoff |-> <<>>, valid |-> TRUE,
     checked |-> <<>>, starts |-> 0, interrupted |-> FALSE,
     stage |-> "none", stageDigest |-> <<>>, stageAck |-> <<>>,
@@ -945,6 +948,40 @@ WriterPermitSafe ==
   /\ (WriterPermit.state="refused" => Writer.phase="starting")
   /\ (WriterPermit.state="closed" => Writer.phase="idle" /\ ~Writer.oldLocks)
 WriterPermitProgress == <> (Writer.starts=1 \/ WriterPermit.state="closed")
+
+\* A writer and its read successor occupy distinct rows of the same attempt.
+\* Durable closure and result are separate facts. Recovery observes rows only.
+Preparation == h.preparation
+PreparationWriterStart == HostOnly(Preparation.writer="pending" /\ ~Preparation.elapsed
+  /\ h'=[h EXCEPT !.preparation.writer="spent"])
+PreparationWriterSave == HostOnly(Preparation.writer="spent" /\ ~Preparation.result
+  /\ h'=[h EXCEPT !.preparation.result=TRUE])
+PreparationWriterClose(owner) == HostOnly(Preparation.writer="spent" /\ Preparation.closure= <<>>
+  /\ h'=[h EXCEPT !.preparation.closure=owner])
+PreparationExpired == HostOnly(~Preparation.elapsed
+  /\ h'=[h EXCEPT !.preparation.elapsed=TRUE])
+PreparationReadAdmit == HostOnly(Preparation.read="unadmitted" /\ Preparation.result
+  /\ (Preparation.closure=WriterOwner \/ Mutation="prepared-unclosed")
+  /\ (~Preparation.elapsed \/ Mutation="prepared-fresh-deadline")
+  /\ h'=[h EXCEPT !.preparation.read="pending", !.preparation.admittedLate=Preparation.elapsed])
+PreparationReadStart == HostOnly(Preparation.read="pending"
+  /\ (~Preparation.elapsed \/ Mutation="prepared-late-dispatch")
+  /\ h'=[h EXCEPT !.preparation.read="spent", !.preparation.starts=1,
+    !.preparation.dispatchedLate=Preparation.elapsed])
+PreparationRecover == HostOnly(Preparation.read="spent" /\ ~Preparation.recovered
+  /\ h'=[h EXCEPT !.preparation.recovered=TRUE,
+    !.preparation.starts=IF Mutation="prepared-replay" THEN 2 ELSE @])
+PreparationHandoffNext == PreparationWriterStart \/ PreparationWriterSave
+  \/ (\E owner \in {WriterOwner,PreviousWriterOwner}: PreparationWriterClose(owner))
+  \/ PreparationExpired \/ PreparationReadAdmit \/ PreparationReadStart \/ PreparationRecover
+PreparationHandoffSpec == HostInit /\ [][PreparationHandoffNext]_hv
+PreparationHandoffSafe ==
+  /\ (Preparation.read/="unadmitted" => Preparation.result /\ Preparation.closure=WriterOwner)
+  /\ Preparation.starts<=1
+PreparationNoLateAdmission == ~Preparation.admittedLate
+PreparationNoLateDispatch == ~Preparation.dispatchedLate
+PreparationNoReadWitness == ~(Preparation.recovered /\ Preparation.starts=1)
+
 
 WriterHandoffSafe ==
   /\ (Writer.handoff/= <<>> => Writer.handoff=OriginalHandoff)

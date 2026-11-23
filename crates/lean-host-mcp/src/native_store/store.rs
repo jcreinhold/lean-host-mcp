@@ -214,6 +214,18 @@ impl CallerResult {
     }
 }
 
+struct WriterPredecessor<'a> {
+    binding: Binding,
+    capability: &'a Capability,
+    result: Id,
+    result_digest: &'a [u8; 32],
+}
+
+enum StageAdmission<'a> {
+    Initial(Option<Answer<AdmissionDeadline>>),
+    AfterWriter(WriterPredecessor<'a>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Gate {
     Pending,
@@ -765,7 +777,46 @@ impl NativeStore {
         read_stage(self.db.connection(), key)
     }
     pub(crate) fn create(&mut self, saved: &SavedRequest) -> Answer<Snapshot> {
-        self.create_intent(saved.key, &saved.capability, &saved.intent, None, None, |_| Ok(()))
+        self.create_intent(
+            saved.key,
+            &saved.capability,
+            &saved.intent,
+            None,
+            StageAdmission::Initial(None),
+            |_| Ok(()),
+        )
+    }
+    /// Admit a read successor from an authenticated, settled writer result.
+    /// The caller is the trusted writer/read adapter, which validates the
+    /// preparation result's operation and generation identity before this call.
+    pub(crate) fn create_read_after_writer(
+        &mut self,
+        writer: Binding,
+        writer_capability: &Capability,
+        result: Id,
+        result_digest: &[u8; 32],
+        read: &SavedRequest,
+    ) -> Answer<Snapshot> {
+        self.checked_key(writer.key)?;
+        if read.key.epoch != writer.key.epoch
+            || read.key.nonce != writer.key.nonce
+            || writer.key.stage.checked_add(1) != Some(read.key.stage)
+        {
+            return reject(Reject::WrongScope);
+        }
+        self.create_intent(
+            read.key,
+            &read.capability,
+            &read.intent,
+            None,
+            StageAdmission::AfterWriter(WriterPredecessor {
+                binding: writer,
+                capability: writer_capability,
+                result,
+                result_digest,
+            }),
+            |_| Ok(()),
+        )
     }
     fn create_intent(
         &mut self,
@@ -773,7 +824,7 @@ impl NativeStore {
         capability: &Capability,
         intent: &[u8],
         drain_auth: Option<[u8; 32]>,
-        deadline: Option<Answer<AdmissionDeadline>>,
+        admission: StageAdmission<'_>,
         validate: impl FnOnce(&[u8]) -> Result<(), Reject>,
     ) -> Answer<Snapshot> {
         self.checked_key(key)?;
@@ -792,6 +843,26 @@ impl NativeStore {
             params![number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?],
             |row| row.get(0),
         )?;
+        let inherited = match &admission {
+            StageAdmission::Initial(_) => None,
+            StageAdmission::AfterWriter(writer) => {
+                let original = bound_stage(&tx, writer.binding, writer.capability)?;
+                if original.gate != Gate::Consumed
+                    || original.stop_requested
+                    || original.resource_report != ResourceReport::Closed
+                {
+                    return reject(Reject::WrongScope);
+                }
+                if original.result.identity() != Some((writer.result, writer.result_digest.as_slice())) {
+                    return reject(Reject::ResultUnavailable);
+                }
+                Some(
+                    original
+                        .admission_deadline
+                        .ok_or(Problem::Rejected(Reject::InvalidLaunchDeadline))?,
+                )
+            }
+        };
         if exists {
             authenticate(&tx, key, capability)?;
             if let Some(hash) = drain_hash.as_deref() {
@@ -808,6 +879,9 @@ impl NativeStore {
             if !previous.matches_intent(intent) {
                 return reject(Reject::IntentChanged);
             }
+            if inherited.is_some() && previous.admission_deadline != inherited {
+                return reject(Reject::InvalidLaunchDeadline);
+            }
             return Ok(previous);
         }
         let epoch: u64 = positive(tx.query_row("SELECT epoch FROM meta WHERE singleton=1", [], |r| r.get(0))?)?;
@@ -821,7 +895,15 @@ impl NativeStore {
         if tx.query_row("SELECT count(*) FROM stages", [], |row| row.get::<_, i64>(0))? >= MAX_STAGES {
             return reject(Reject::StoreFull);
         }
-        let deadline = deadline.transpose()?.map(AdmissionDeadline::encode);
+        let deadline = match admission {
+            StageAdmission::Initial(deadline) => deadline.transpose()?,
+            StageAdmission::AfterWriter(_) => {
+                let deadline = inherited.ok_or(Problem::Rejected(Reject::InvalidLaunchDeadline))?;
+                deadline.remaining()?;
+                Some(deadline)
+            }
+        }
+        .map(AdmissionDeadline::encode);
         tx.execute(
             "INSERT INTO stages(epoch,nonce,stage,intent,cap_hash,drain_auth_hash,admission_deadline) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
@@ -1428,4 +1510,146 @@ fn read_stage_columns(db: &Connection, key: NativeKey, include_admission: bool) 
         }
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_successor_requires_closed_writer_and_inherits_deadline() -> Result<(), Box<dyn std::error::Error>> {
+    exercise_prepared_successor(None)
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires the disposable standalone writer and the selected Lean executable"]
+fn prepared_successor_checks_a_real_writer_product() -> Result<(), Box<dyn std::error::Error>> {
+    let writer = std::env::var_os("TEST_PREPARATION_WRITER").ok_or("missing test standalone writer")?;
+    let lean = std::env::var_os("TEST_PREPARATION_LEAN").ok_or("missing test Lean executable")?;
+    exercise_prepared_successor(Some((&writer, &lean)))
+}
+
+#[cfg(test)]
+fn exercise_prepared_successor(
+    tools: Option<(&std::ffi::OsStr, &std::ffi::OsStr)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use lean_toolchain::shared_writer::{LocalArtifactRead, SharedWriter};
+    use std::{fs, process::Command, time::Duration};
+
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().canonicalize()?;
+    let mut helper = if let Some((writer, lean)) = tools {
+        fs::write(project.join("lake-manifest.json"), "{\"packages\":[]}")?;
+        fs::write(
+            project.join("Subject.lean"),
+            "theorem prepared_witness : True := True.intro\n",
+        )?;
+        fs::write(project.join("Read.lean"), "import Subject\n#check prepared_witness\n")?;
+        let mut helper = SharedWriter::open(Path::new(writer), &project, Duration::from_secs(5))?;
+        let output = helper.run(
+            Command::new(lean)
+                .current_dir(&project)
+                .args(["-o", "Subject.olean", "Subject.lean"]),
+            Duration::from_secs(10),
+        )?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        Some(helper)
+    } else {
+        None
+    };
+    let mut store = NativeStore::create_new(&dir.path().join("native.sqlite"))?;
+    let writer_key = NativeKey {
+        store: store.identity(),
+        epoch: 1,
+        nonce: [1; 16],
+        stage: 1,
+    };
+    let cap = Capability([2; 32]);
+    let deadline = recovery::admission_deadline(Duration::from_secs(10))?;
+    store.create_intent(
+        writer_key,
+        &cap,
+        b"prepare",
+        None,
+        StageAdmission::Initial(Some(Ok(deadline))),
+        |_| Ok(()),
+    )?;
+    let binding = store.bind_scope(
+        writer_key,
+        &cap,
+        Scope {
+            id: [3; 16],
+            generation: 1,
+            owner: [4; 16],
+        },
+    )?;
+    // Supply the committed facts of the already-tested writer settlement path.
+    store
+        .db
+        .connection()
+        .execute("UPDATE stages SET gate=1,resource_report=1 WHERE stage=1", [])?;
+    let id = [5; 16];
+    let body = b"prepared closure";
+    let hash: [u8; 32] = Sha256::digest(body).into();
+    store.observe_result(binding, &cap, id, body)?;
+    let successor = SavedRequest {
+        caller: CallerKey {
+            job: vec![1],
+            stage: 2,
+            revision: 1,
+        },
+        key: NativeKey { stage: 2, ..writer_key },
+        intent: b"read".to_vec(),
+        capability: cap.clone(),
+    };
+    let refused = store.create_read_after_writer(binding, &cap, id, &hash, &successor);
+    assert!(matches!(refused, Err(Problem::Rejected(Reject::WrongScope))));
+    assert!(store.get(successor.key)?.is_none());
+    if let Some(helper) = helper.take() {
+        helper.close(Duration::from_secs(5))?;
+    }
+    store.observe_resource(binding, &cap, ResourceReport::Closed)?;
+    assert!(matches!(
+        store.create_read_after_writer(binding, &cap, id, &[0; 32], &successor),
+        Err(Problem::Rejected(Reject::ResultUnavailable))
+    ));
+    let expired = AdmissionDeadline {
+        expires_ns: 1,
+        ..deadline
+    };
+    store.db.connection().execute(
+        "UPDATE stages SET admission_deadline=?1 WHERE stage=1",
+        [expired.encode()],
+    )?;
+    assert!(matches!(
+        store.create_read_after_writer(binding, &cap, id, &hash, &successor),
+        Err(Problem::Rejected(Reject::InvalidLaunchDeadline))
+    ));
+    assert!(store.get(successor.key)?.is_none());
+    store.db.connection().execute(
+        "UPDATE stages SET admission_deadline=?1 WHERE stage=1",
+        [deadline.encode()],
+    )?;
+    let admitted = store.create_read_after_writer(binding, &cap, id, &hash, &successor)?;
+    assert_eq!(admitted.admission_deadline, Some(deadline));
+    assert_eq!(admitted.gate, Gate::Pending);
+    if let Some((_, lean)) = tools {
+        let custody = LocalArtifactRead::try_acquire(std::slice::from_ref(&project))?;
+        deadline.remaining()?;
+        let output = Command::new(lean)
+            .current_dir(&project)
+            .env("LEAN_PATH", &project)
+            .arg("Read.lean")
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("prepared_witness : True"));
+        custody.validate()?;
+    }
+
+    drop(store);
+    let mut replacement = NativeStore::open(&dir.path().join("native.sqlite"))?;
+    assert_eq!(
+        replacement.create_read_after_writer(binding, &cap, id, &hash, &successor)?,
+        admitted
+    );
+    assert_eq!(replacement.get(successor.key)?, Some(admitted));
+    Ok(())
 }

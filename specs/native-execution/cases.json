@@ -153,6 +153,91 @@
   },
   "cases": [
     {
+      "name": "prepared-handoff-safe",
+      "model": "Stages",
+      "specification": "PreparationHandoffSpec",
+      "constants": {
+        "Mutation": "\"none\""
+      },
+      "invariants": [
+        "PreparationHandoffSafe",
+        "PreparationNoLateAdmission",
+        "PreparationNoLateDispatch"
+      ],
+      "properties": [],
+      "expect": "pass"
+    },
+    {
+      "name": "prepared-handoff-writer-exit",
+      "model": "Stages",
+      "specification": "PreparationHandoffSpec",
+      "constants": {
+        "Mutation": "\"prepared-unclosed\""
+      },
+      "invariants": [
+        "PreparationHandoffSafe"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "PreparationHandoffSafe"
+    },
+    {
+      "name": "prepared-handoff-expiry",
+      "model": "Stages",
+      "specification": "PreparationHandoffSpec",
+      "constants": {
+        "Mutation": "\"prepared-fresh-deadline\""
+      },
+      "invariants": [
+        "PreparationNoLateAdmission"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "PreparationNoLateAdmission"
+    },
+    {
+      "name": "prepared-handoff-late-dispatch",
+      "model": "Stages",
+      "specification": "PreparationHandoffSpec",
+      "constants": {
+        "Mutation": "\"prepared-late-dispatch\""
+      },
+      "invariants": [
+        "PreparationNoLateDispatch"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "PreparationNoLateDispatch"
+    },
+    {
+      "name": "prepared-handoff-no-replay",
+      "model": "Stages",
+      "specification": "PreparationHandoffSpec",
+      "constants": {
+        "Mutation": "\"prepared-replay\""
+      },
+      "invariants": [
+        "PreparationHandoffSafe"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "PreparationHandoffSafe"
+    },
+    {
+      "name": "prepared-handoff-witness",
+      "model": "Stages",
+      "specification": "PreparationHandoffSpec",
+      "constants": {
+        "Mutation": "\"none\""
+      },
+      "invariants": [
+        "PreparationNoReadWitness"
+      ],
+      "properties": [],
+      "expect": "invariant",
+      "invariant": "PreparationNoReadWitness"
+    },
+    {
       "name": "host-stopped-recovery",
       "model": "Stages",
       "specification": "StoppedRecoverySpec",
