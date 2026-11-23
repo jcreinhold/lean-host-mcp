@@ -2,8 +2,8 @@
 use super::{
     AdmissionDeadline, Answer, Binding, CheckedConnection, Gate, Id, NativeKey, NativeStore, OptionalExtension, Path,
     Problem, Reject, ResourceReport, SavedRequest, Scope, Transaction, TransactionBehavior, authenticate,
-    bind_scope_transaction, blob, bound_stage, bounded, commit, compact_closed_acknowledged, digest, fixed,
-    native_schema_valid, number, optional_fixed, params, positive, read_stage, read_stage_columns, reject,
+    bind_scope_transaction, blob, bound_stage, bounded, commit, digest, fixed, native_schema_valid, number,
+    optional_fixed, params, positive, read_stage, read_stage_columns, reject,
 };
 use lean_toolchain::native_guardian::NativeProcessIdentity;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
@@ -510,7 +510,7 @@ impl NativeStore {
         if changed != 1 {
             return reject(Reject::WrongScope);
         }
-        compact_closed_acknowledged(&tx, binding.key)?;
+        super::compact_closed_acknowledged(&tx, binding.key)?;
         tx.commit()?;
         Ok(())
     }

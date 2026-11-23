@@ -317,12 +317,14 @@ pub(crate) enum Consume {
     Sealed,
 }
 
-fn commit(tx: Transaction<'_>, _point: &str) -> Answer<()> {
+fn commit(tx: Transaction<'_>, point: &str) -> Answer<()> {
+    #[cfg(not(test))]
+    let _ = point;
     #[cfg(test)]
-    cuts::cut(&format!("{_point}:before"));
+    cuts::cut(&format!("{point}:before"));
     tx.commit()?;
     #[cfg(test)]
-    cuts::cut(&format!("{_point}:after"));
+    cuts::cut(&format!("{point}:after"));
     Ok(())
 }
 fn has_role(db: &Connection, expected: i64, expected_version: i64) -> rusqlite::Result<bool> {

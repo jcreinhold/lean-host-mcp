@@ -890,6 +890,26 @@ fn exact_recovery_claim_has_one_durable_winner_and_cannot_restore_launch() {
             "capability":saved.capability.0,"drain_authorization":authorization
         }});
         store.admission(payload.to_string().as_bytes()).unwrap();
+        assert_eq!(store.database_path(), Some(fixture.native().as_path()));
+        assert!(NativeStore::with_settled_launcher_store(&fixture.native(), saved.key.store, || Ok(())).is_err());
+        assert!(store.authorize_drain(saved.key, None).is_err());
+        assert!(store.authorize_drain(saved.key, Some(authorization)).is_ok());
+        let drain = serde_json::json!({"version":1,"command":{
+            "op":"drain","key":saved.key,"capability":saved.capability.0,"generation":"a".repeat(48),
+            "revision":saved.caller.revision,"submit":true,"authorization":authorization,"claimant":([18_u8; 32])
+        }});
+        let decoded = crate::store::boundary::decode(drain.to_string().as_bytes())
+            .unwrap()
+            .drain_claim()
+            .unwrap();
+        assert_eq!(decoded.key, saved.key);
+        assert_eq!(decoded.capability.0, saved.capability.0);
+        assert_eq!(decoded.generation, "a".repeat(48));
+        assert_eq!(decoded.revision, saved.caller.revision);
+        assert!(decoded.submit);
+        assert_eq!(decoded.authorization, Some(authorization));
+        assert_eq!(decoded.claimant, Some([18; 32]));
+
         let registry = fixture.root.join("registry");
         fs::DirBuilder::new().mode(0o700).create(&registry).unwrap();
         let meta = registry.metadata().unwrap();
@@ -932,10 +952,9 @@ fn exact_recovery_claim_has_one_durable_winner_and_cannot_restore_launch() {
                 )
             })
         });
-        let [one, two] = contenders.map(|worker| worker.join().unwrap());
-        let winner = match (one, two) {
-            ((id, Ok(true)), (_, Err(Problem::Rejected(Reject::RecoveryClaimBusy))))
-            | ((_, Err(Problem::Rejected(Reject::RecoveryClaimBusy))), (id, Ok(true))) => id,
+        let winner = match contenders.map(|worker| worker.join().unwrap()) {
+            [(id, Ok(true)), (_, Err(Problem::Rejected(Reject::RecoveryClaimBusy)))]
+            | [(_, Err(Problem::Rejected(Reject::RecoveryClaimBusy))), (id, Ok(true))] => id,
             other => panic!("expected one winner and one busy contender, got {other:?}"),
         };
         let mut reopened = NativeStore::open(&fixture.native()).unwrap();

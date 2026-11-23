@@ -52,7 +52,7 @@ impl ClientRequest {
     }
 }
 
-#[cfg(all(feature = "managed-native-store", target_os = "macos"))]
+#[cfg(any(test, all(feature = "managed-native-store", target_os = "macos")))]
 impl ClientRequest {
     pub(crate) fn drain_claim(&self) -> Option<DrainClaim> {
         let ClientCommand::Drain {
@@ -79,7 +79,7 @@ impl ClientRequest {
     }
 }
 
-#[cfg(all(feature = "managed-native-store", target_os = "macos"))]
+#[cfg(any(test, all(feature = "managed-native-store", target_os = "macos")))]
 pub(crate) struct DrainClaim {
     pub(crate) key: NativeKey,
     pub(crate) capability: Capability,

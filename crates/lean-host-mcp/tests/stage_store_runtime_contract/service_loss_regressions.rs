@@ -557,7 +557,7 @@ fn bound_drain_case(case: RecoveryCase, cut: Cut) {
     assert!(owner.try_lock().is_err());
     let stale = NativeProcessIdentity {
         start: "wrong parent birth".to_owned(),
-        ..original.parent.clone()
+        ..original.parent
     };
     assert!(matches!(
         NativeStore::read_recovery_scope(&db, &request, None, Some(&stale)),

@@ -1184,7 +1184,7 @@ mod tests {
                     artifact_roots: vec![],
                     shim_search_paths: vec![],
                 },
-                files: Default::default(),
+                files: std::collections::BTreeMap::new(),
             })
             .unwrap();
         record.complete(&digest, SmokeOutcome::Passed).unwrap();

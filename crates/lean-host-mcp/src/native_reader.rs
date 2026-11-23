@@ -1236,9 +1236,13 @@ pub fn run_waiter(args: &NativeReaderArgs) -> io::Result<()> {
     let budget = Duration::from_millis(args.timeout_millis);
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     let budget = admitted::bootstrap_deadline()?.map_or(Ok(budget), |(_, deadline)| deadline.remaining())?;
-    let mut command = payload_command(args)?;
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    command.env_remove(admitted::DEADLINE_ENV);
+    let command = payload_command(args)?;
+    #[cfg(feature = "managed-native-store")]
+    let command = {
+        let mut command = command;
+        command.env_remove(admitted::DEADLINE_ENV);
+        command
+    };
     measure_payload(command, args, until(budget)?, &mut payload)?;
     emit(&payload)
 }

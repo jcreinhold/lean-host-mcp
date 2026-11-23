@@ -383,7 +383,9 @@ mod tests {
         fs::create_dir(&shadow)?;
         let refusal = probe(&generation, &id, &sysroot, runtime.prepared);
         fs::remove_dir(&shadow)?;
-        let error = refusal.expect_err("shadow must refuse the actual smoke request");
+        let Err(error) = refusal else {
+            anyhow::bail!("shadow must refuse the actual smoke request");
+        };
         ensure!(
             !format!("{error:#}").contains("closure unconfirmed"),
             "cleanup failed: {error:#}"

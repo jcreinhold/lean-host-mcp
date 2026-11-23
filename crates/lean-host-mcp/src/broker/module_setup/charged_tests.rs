@@ -132,8 +132,9 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
             .is_err()
     );
     let mut incomplete: serde_json::Value = serde_json::from_str(&proposal)?;
-    incomplete["roots"][0]
-        .as_object_mut()
+    incomplete
+        .pointer_mut("/roots/0")
+        .and_then(serde_json::Value::as_object_mut)
         .ok_or_else(|| invalid("missing project entry"))?
         .remove("inode");
     assert!(

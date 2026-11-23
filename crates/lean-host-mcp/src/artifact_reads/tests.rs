@@ -291,12 +291,12 @@ fn lake_trace_snapshot_selects_exact_files_and_rejects_incomplete_sets() {
     let traces = guard.lake_trace_snapshot(&root, &targets, || Ok(())).unwrap().unwrap();
     assert_eq!(traces.len(), 2);
     assert_eq!(
-        traces[".lake/build/lib/lean/Demo/Foo.trace"],
-        "c6365aeb3f74775d590f428379bf6587bfe02593728cc207f4bc601299e426e5"
+        traces.get(".lake/build/lib/lean/Demo/Foo.trace").map(String::as_str),
+        Some("c6365aeb3f74775d590f428379bf6587bfe02593728cc207f4bc601299e426e5")
     );
     assert_eq!(
-        traces[".lake/build/bin/runLinter.trace"],
-        "dd996ed0c22a8f3f56996cb9f1472dabc45e53691039b56c4c4c99846dc2abb8"
+        traces.get(".lake/build/bin/runLinter.trace").map(String::as_str),
+        Some("dd996ed0c22a8f3f56996cb9f1472dabc45e53691039b56c4c4c99846dc2abb8")
     );
     assert!(
         guard
