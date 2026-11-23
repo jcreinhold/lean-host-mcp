@@ -1041,9 +1041,18 @@ impl ProjectBroker {
     }
 
     async fn acquire_until(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
+        self.acquire_until_with_preparation(root, deadline, None).await
+    }
+
+    async fn acquire_until_with_preparation(
+        &self,
+        root: PathBuf,
+        deadline: tokio::time::Instant,
+        managed_prepared: Option<&str>,
+    ) -> Result<Arc<LeanProject>> {
         let cancellation = CallCancellation::current();
         loop {
-            let result = self.acquire_attempt(root.clone(), deadline).await;
+            let result = self.acquire_attempt(root.clone(), deadline, managed_prepared).await;
             if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if matches!(info.reason.as_str(), "worker_pool_draining" | "artifact_admission_busy"))
             {
                 return result;
@@ -1059,7 +1068,12 @@ impl ProjectBroker {
         }
     }
 
-    async fn acquire_attempt(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
+    async fn acquire_attempt(
+        &self,
+        root: PathBuf,
+        deadline: tokio::time::Instant,
+        managed_prepared: Option<&str>,
+    ) -> Result<Arc<LeanProject>> {
         if CallCancellation::current().is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
@@ -1075,11 +1089,18 @@ impl ProjectBroker {
             .await
             .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
         let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
-        let writer = crate::shared_writer::contract()?.executable;
         let cancellation = CallCancellation::current();
-        let prepared = self
-            .prepare_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
-            .await?;
+        let prepared = if let Some(selection) = managed_prepared {
+            let installed = Self::installed_host_artifacts(&worker, &sysroot)?;
+            // Validate the operator's exact project and product selection before
+            // opening a receiver. The admitted job later retains its own loan.
+            Self::prepared_reader(&root, &meta, selection, &[])?;
+            installed
+        } else {
+            let writer = crate::shared_writer::contract()?.executable;
+            self.prepare_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
+                .await?
+        };
         let open_guard = self.acquire_opening_guard(&root, deadline, &cancellation).await?;
 
         // Root-local startup serialization closes the race between callers that
@@ -1247,16 +1268,21 @@ impl ProjectBroker {
 
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     pub(crate) async fn managed_actor(&self, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
+        let selection = self.prepared_generation().ok_or_else(|| {
+            ServerError::BadProject("managed inspection requires an installed prepared generation".to_owned())
+        })?;
         let root = self.native_root(&ProjectHint::Default)?;
         if let Some(actor) = self.select_existing_worker(&root)? {
             return Ok(actor);
         }
-        // The actor's ordinary bootstrap validates its installed shims and
-        // starts a guarded receiver with an empty import set. There is no
-        // OpenHostSession or target body until the managed job binds it.
-        tokio::time::timeout_at(deadline, self.acquire_until(root.clone(), deadline))
-            .await
-            .map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
+        // The installed-only bootstrap opens a guarded receiver with an empty
+        // import set. The durable job binds the exact receiver and artifact loan.
+        tokio::time::timeout_at(
+            deadline,
+            self.acquire_until_with_preparation(root.clone(), deadline, Some(selection)),
+        )
+        .await
+        .map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
     }
 
     fn select_existing_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
@@ -1610,6 +1636,28 @@ mod tests {
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         }
+    }
+
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    #[tokio::test]
+    async fn cold_managed_actor_requires_installed_preparation() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = make_lake_dir(tree.path(), "managed");
+        let runtime = ProjectRuntimeConfig::default()
+            .with_operator_primary(Some(&root))
+            .unwrap();
+        let broker = ProjectBroker::new_with_runtime_config(cfg(root.clone(), Some(root.clone()), None), runtime);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let error = broker.managed_actor(deadline).await.err().unwrap();
+        assert!(error.to_string().contains("requires an installed prepared generation"));
+        assert!(broker.resident_paths().is_empty());
+
+        let uninstalled = root.join("worker");
+        fs::write(&uninstalled, b"fixture without installed runtime").unwrap();
+        let error = ProjectBroker::installed_host_artifacts(&uninstalled, &root)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("missing matching installed shim deployment"));
     }
 
     #[tokio::test]

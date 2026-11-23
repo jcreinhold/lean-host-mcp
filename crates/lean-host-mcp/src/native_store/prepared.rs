@@ -308,7 +308,10 @@ pub(crate) async fn start(
     let actor = broker
         .managed_actor(deadline.into())
         .await
-        .map_err(|_| McpError::internal_error("prepared_actor_unavailable", None))?;
+        .map_err(|error| {
+            tracing::debug!(%error, "managed inspection could not acquire its prepared actor");
+            McpError::internal_error("prepared_actor_unavailable", None)
+        })?;
     let original = SavedRequest {
         caller: CallerKey {
             job: intent.job.clone(),
