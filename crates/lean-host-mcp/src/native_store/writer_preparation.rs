@@ -198,6 +198,10 @@ impl ModuleReceipt {
 }
 
 impl Receipt {
+    pub(super) fn target_ready(&self) -> bool {
+        self.ready_exit_code == Some(0)
+    }
+
     pub(crate) fn parse(output: &[u8], target: &Target) -> io::Result<Self> {
         let receipt: Self = serde_json::from_slice(output)?;
         let valid = match (&receipt.stage, target) {

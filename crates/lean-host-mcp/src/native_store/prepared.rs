@@ -141,6 +141,28 @@ impl Intent {
     }
 }
 
+pub(crate) fn validate_writer_handoff(writer: &crate::native_store::store::Snapshot, read: &[u8]) -> Option<CallerKey> {
+    let intent: Intent = serde_json::from_slice(read).ok()?;
+    let project = intent.project.as_deref()?;
+    if intent.operation.as_deref() != Some(NAMED_INSPECTION)
+        || intent.request().is_none()
+        || !readiness_writer::supports_prepared_inspection(
+            writer,
+            project,
+            &intent.imports,
+            &intent.job,
+            intent.revision,
+        )
+    {
+        return None;
+    }
+    Some(CallerKey {
+        job: intent.job,
+        stage: writer.key.stage.checked_add(1)?,
+        revision: intent.revision,
+    })
+}
+
 pub(crate) fn validate_create(bytes: &[u8]) -> Result<(), Reject> {
     validate_create_for_mode(bytes, warm_selected())
 }

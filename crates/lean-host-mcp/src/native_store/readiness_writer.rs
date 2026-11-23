@@ -197,6 +197,38 @@ fn parse_intent(intent: &[u8]) -> Option<(PathBuf, Stage)> {
     Some((request.project, stage))
 }
 
+pub(super) fn supports_prepared_inspection(
+    snapshot: &Snapshot,
+    project: &Path,
+    imports: &[String],
+    job: &[u8],
+    revision: u64,
+) -> bool {
+    use crate::native_store::store::ResultKnowledge;
+
+    let Ok(original) = serde_json::from_slice::<Intent>(&snapshot.intent) else {
+        return false;
+    };
+    if original.job != job || original.revision != revision {
+        return false;
+    }
+    let Some((writer_project, Stage::Preparation(target @ Target::Ready { package: None, .. }))) =
+        parse_intent(&snapshot.intent)
+    else {
+        return false;
+    };
+    let Target::Ready { name, .. } = &target else {
+        return false;
+    };
+    if writer_project != project || !imports.contains(name) {
+        return false;
+    }
+    let (ResultKnowledge::Retained { body, .. } | ResultKnowledge::Acknowledged { body, .. }) = &snapshot.result else {
+        return false;
+    };
+    Receipt::parse(body, &target).is_ok_and(|receipt| receipt.target_ready())
+}
+
 pub(crate) fn validate_create(intent: &[u8]) -> Result<(), crate::native_store::store::Reject> {
     let needs_validation = serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
         matches!(

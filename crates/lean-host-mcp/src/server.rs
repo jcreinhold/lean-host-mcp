@@ -291,8 +291,12 @@ impl LeanHostService {
         let validate = crate::managed_prepared::validate_create;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let validate = |_| Ok(());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let allow_handoff = crate::managed_prepared::validate_writer_handoff;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let allow_handoff = |_: &crate::native_store::store::Snapshot, _: &[u8]| None;
         let reply = store
-            .admission_with_validation(input.request.as_bytes(), budget, validate)
+            .admission_with_handoff(input.request.as_bytes(), budget, validate, allow_handoff)
             .map_err(|reason| McpError::invalid_params(reason, None))?;
         drop(store);
         #[cfg(any(target_os = "macos", target_os = "linux"))]

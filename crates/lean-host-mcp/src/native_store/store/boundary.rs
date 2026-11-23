@@ -96,6 +96,13 @@ impl std::fmt::Debug for ClientRequest {
     }
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AfterWriter {
+    result_id: [u8; 16],
+    result_digest: [u8; 32],
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientCommand {
     Discover {},
@@ -105,6 +112,8 @@ enum ClientCommand {
         intent: Vec<u8>,
         #[serde(default)]
         drain_authorization: Option<[u8; 32]>,
+        #[serde(default)]
+        after_writer: Option<AfterWriter>,
     },
     Get {
         key: NativeKey,
@@ -183,6 +192,16 @@ impl NativeStore {
         budget: Option<std::time::Duration>,
         validate: impl FnOnce(&[u8]) -> Result<(), Reject>,
     ) -> Result<serde_json::Value, &'static str> {
+        self.admission_with_handoff(bytes, budget, validate, |_, _| None)
+    }
+
+    pub(crate) fn admission_with_handoff(
+        &mut self,
+        bytes: &[u8],
+        budget: Option<std::time::Duration>,
+        validate: impl FnOnce(&[u8]) -> Result<(), Reject>,
+        allow_handoff: impl FnOnce(&Snapshot, &[u8]) -> Option<super::CallerKey>,
+    ) -> Result<serde_json::Value, &'static str> {
         let request = decode(bytes).map_err(|_| "invalid_request")?;
         match &request.command {
             ClientCommand::Discover {} => {}
@@ -202,7 +221,44 @@ impl NativeStore {
                 key,
                 capability,
                 intent,
+                drain_authorization: None,
+                after_writer: Some(receipt),
+            } => (|| {
+                validate(&intent).map_err(Problem::Rejected)?;
+                let capability = Capability(capability);
+                let stage = key
+                    .stage
+                    .checked_sub(1)
+                    .filter(|stage| *stage > 0)
+                    .ok_or(Problem::Rejected(Reject::WrongScope))?;
+                let writer_key = NativeKey { stage, ..key };
+                let writer = self.client_get(writer_key, &capability)?;
+                let caller =
+                    allow_handoff(&writer, &intent).ok_or(Problem::Rejected(Reject::InvalidReadinessIntent))?;
+                let scope = writer.scope.ok_or(Problem::Rejected(Reject::WrongScope))?;
+                self.create_read_after_writer(
+                    super::Binding { key: writer_key, scope },
+                    &capability,
+                    receipt.result_id,
+                    &receipt.result_digest,
+                    &super::SavedRequest {
+                        caller,
+                        key,
+                        intent,
+                        capability: capability.clone(),
+                    },
+                )
+                .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot)))
+            })(),
+            ClientCommand::Create {
+                after_writer: Some(_), ..
+            } => reject(Reject::InvalidReadinessIntent),
+            ClientCommand::Create {
+                key,
+                capability,
+                intent,
                 drain_authorization,
+                after_writer: None,
             } => self
                 .create_intent(
                     key,
@@ -308,6 +364,7 @@ impl NativeStore {
                 capability,
                 intent,
                 drain_authorization,
+                after_writer: None,
             } => self
                 .create_intent(
                     key,
@@ -318,6 +375,9 @@ impl NativeStore {
                     |_| Ok(()),
                 )
                 .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
+            ClientCommand::Create {
+                after_writer: Some(_), ..
+            } => reject(Reject::DispatchDisabled),
             ClientCommand::Get { key, capability } => self
                 .client_get(key, &Capability(capability))
                 .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
