@@ -448,3 +448,28 @@ fn failed_bootstrap_preserves_primary_error_and_independent_closure() {
         );
     }
 }
+
+#[test]
+fn guardian_exit_between_probes_preserves_only_a_confirmed_bootstrap_success() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut interrupted = None;
+    let status = recheck_guardian_exit(true, || Ok(Some(ExitStatus::from_raw(0))), &mut interrupted);
+    assert!(status.is_some_and(|status| status.success()));
+    assert_eq!(interrupted, None);
+
+    let mut interrupted = None;
+    let status = recheck_guardian_exit(false, || panic!("group remains open"), &mut interrupted);
+    assert!(status.is_none());
+    assert_eq!(
+        interrupted.as_deref(),
+        Some("native guardian exited before owned group closure")
+    );
+
+    let mut interrupted = None;
+    let status = recheck_guardian_exit(true, || Ok(None), &mut interrupted);
+    assert!(status.is_none());
+    assert_eq!(
+        interrupted.as_deref(),
+        Some("native bootstrap success unconfirmed after guardian closure")
+    );
+}

@@ -880,15 +880,18 @@ fn run_internal(
     loop {
         output.poll()?;
         diagnostics.poll()?;
-        let status = match native.lease()?.try_wait() {
+        let mut status = match native.lease()?.try_wait() {
             Ok(status) => status,
             Err(error) => {
                 interrupted.get_or_insert_with(|| format!("native child wait authority lost: {error}"));
                 None
             }
         };
+        let mut closed_after_guardian_exit = false;
         if interrupted.is_none() && status.is_none() && !native.lease()?.guardian_alive()? {
-            interrupted = Some("native guardian exited before owned group closure".into());
+            let lease = native.lease()?;
+            closed_after_guardian_exit = lease.custody_closed()?;
+            status = recheck_guardian_exit(closed_after_guardian_exit, || lease.try_wait(), &mut interrupted);
         }
         if interrupted.is_none() {
             if Instant::now() >= deadline {
@@ -915,7 +918,7 @@ fn run_internal(
         }
         // A lost wait status cannot authorize signals or a usable result, but
         // independently observed group/custody closure still settles capacity.
-        if native.lease()?.custody_closed()? {
+        if closed_after_guardian_exit || native.lease()?.custody_closed()? {
             native.closed = true;
             let _inputs = native.lease()?.cleanup_inputs();
             match output.poll() {
@@ -962,6 +965,30 @@ fn run_internal(
             ));
         }
         thread::sleep(POLL);
+    }
+}
+
+// The first owned wait can withhold an already reaped bootstrap status while
+// the guardian still holds custody. Its exit can be normal between two probes.
+fn recheck_guardian_exit(
+    custody_closed: bool,
+    wait: impl FnOnce() -> io::Result<Option<ExitStatus>>,
+    interrupted: &mut Option<String>,
+) -> Option<ExitStatus> {
+    if !custody_closed {
+        *interrupted = Some("native guardian exited before owned group closure".into());
+        return None;
+    }
+    match wait() {
+        Ok(Some(status)) if status.success() => Some(status),
+        Ok(_) => {
+            *interrupted = Some("native bootstrap success unconfirmed after guardian closure".into());
+            None
+        }
+        Err(error) => {
+            *interrupted = Some(format!("native child wait authority lost: {error}"));
+            None
+        }
     }
 }
 
