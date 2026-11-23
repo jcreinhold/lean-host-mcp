@@ -48,7 +48,9 @@ async fn stdio_shutdown_on_stdin_eof_exits_parent() {
     );
 }
 
+// Both cases share exclusive custody of the installed shim artifact roots.
 #[tokio::test]
+#[serial_test::serial(installed_shim_custody)]
 async fn stdio_shutdown_after_tool_call_exits_worker_child() {
     let project = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_PROJECT")
         .map(PathBuf::from)
@@ -1359,7 +1361,9 @@ unsafe def main (args : List String) : IO UInt32 := do
         assert!(!fixture.project.join(".lake/build").exists());
     }
 
+    // Both cases share exclusive custody of the installed shim artifact roots.
     #[tokio::test]
+    #[serial_test::serial(installed_shim_custody)]
     async fn managed_file_command_trial_uses_original_setup_and_result() {
         let (Some(writer), Some(workers)) = (
             std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER"),

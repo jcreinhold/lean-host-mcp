@@ -913,7 +913,24 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
         try:
             if release is not None:
                 release.touch()
-            result(lookup(first))
+            started = time.monotonic()
+            try:
+                result(lookup(first))
+            except queue.Empty as timeout:
+                key = first["key"]
+                try:
+                    with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.2) as observer:
+                        stage = observer.execute(
+                            "SELECT gate, resource_report, result_kind FROM stages "
+                            "WHERE epoch=? AND nonce=? AND stage=?",
+                            (key["epoch"], bytes(key["nonce"]), key["stage"]),
+                        ).fetchone()
+                except sqlite3.Error as error:
+                    stage = f"unavailable ({error})"
+                raise AssertionError(
+                    f"first warm lookup received no reply after {time.monotonic() - started:.1f}s; "
+                    f"gate, custody, result = {stage}"
+                ) from timeout
             saved = completed(first, 1)
             identity, ordinal, ended = bound(first)
             assert (ordinal, ended) == (1, 1)

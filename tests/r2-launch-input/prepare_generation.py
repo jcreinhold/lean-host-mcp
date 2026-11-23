@@ -34,7 +34,13 @@ def main():
         )
         (dep / "lakefile.toml").write_text("name = 'dep'\n[[lean_lib]]\nname = 'Dep'\n")
         (dep / "Dep.lean").write_text("theorem dependency_ok : True := True.intro\n")
-        (project / "Root.lean").write_text("import Lean\nimport Dep\ntheorem first_ok : True := dependency_ok\n")
+        # Keep the warm lifecycle smoke independent of loading the entire Lean
+        # umbrella on a cold runner. It still uses an installed Lean module and
+        # a compiled declaration from a separate Lake package.
+        installed_import = "Lean.Data.Name" if args.warm_inspection else "Lean"
+        (project / "Root.lean").write_text(
+            f"import {installed_import}\nimport Dep\ntheorem first_ok : True := dependency_ok\n"
+        )
         for root in (dep, project):
             subprocess.run([sysroot / "bin/lake", "--no-cache", "update"], cwd=root, env=env, check=True)
         release = sysroot / "lib/lean"
