@@ -785,6 +785,11 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
+        if self.runtime_config.managed_only {
+            return Err(ServerError::BadProject(
+                "semantic proof search requires an admitted runtime selection".to_owned(),
+            ));
+        }
         if !self.runtime_config.managed_semantic_companion
             && (request.goal.file_label.is_some() || self.prepared_generation().is_some())
         {
