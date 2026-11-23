@@ -174,13 +174,13 @@ mod tests {
         );
 
         for (code, verdict) in [(0, "pass"), (1, "fail")] {
-            let outcome = super::super::result(
-                Some(super::super::PayloadResult {
+            let outcome = crate::native_reader::result(
+                Some(crate::native_reader::PayloadResult {
                     target_started: true,
                     exit_code: Some(code),
                     exit_status: Some(format!("exit status: {code}")),
-                    diagnostic_preview: Some(super::super::DiagnosticPreview::Clipped),
-                    ..super::super::PayloadResult::default()
+                    diagnostic_preview: Some(crate::native_reader::DiagnosticPreview::Clipped),
+                    ..crate::native_reader::PayloadResult::default()
                 }),
                 true,
                 None,

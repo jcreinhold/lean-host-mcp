@@ -28,6 +28,7 @@ use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
 pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION, OUTLINE as SETUP_OUTLINE};
 pub(super) use writer_preparation::first_party_clean::OPERATION as FIRST_PARTY_CLEAN;
+pub(super) use writer_preparation::tooling_suites::OPERATION as TOOLING_SUITES;
 pub(super) use writer_preparation::whole_lint::OPERATION as WHOLE_LINT;
 #[path = "formatter_fix.rs"]
 mod formatter_fix;
@@ -98,6 +99,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | SETUP_VERIFICATION
                     | SETUP_DIAGNOSTICS
                     | SETUP_OUTLINE
+                    | TOOLING_SUITES
                     | WHOLE_LINT
                     | FIRST_PARTY_CLEAN
             )
@@ -149,7 +151,10 @@ pub(super) async fn run(
         (writer_preparation::OPERATION, Some(target), None, None, None)
             if !matches!(
                 target,
-                Target::VerifierModules { .. } | Target::WholeLint { .. } | Target::FirstPartyClean { .. }
+                Target::VerifierModules { .. }
+                    | Target::ToolingSuites { .. }
+                    | Target::WholeLint { .. }
+                    | Target::FirstPartyClean { .. }
             ) && target.validate().is_ok() =>
         {
             Stage::Preparation(target)
@@ -162,6 +167,7 @@ pub(super) async fn run(
         (FIRST_PARTY_CLEAN, Some(target @ Target::FirstPartyClean { .. }), None, None, None) => {
             Stage::Preparation(target)
         }
+        (TOOLING_SUITES, Some(target @ Target::ToolingSuites { .. }), None, None, None) => Stage::Preparation(target),
         (WHOLE_LINT, Some(target @ Target::WholeLint { .. }), None, None, None) => Stage::Preparation(target),
         (CONSUMER, None, Some(source), None, None) if source.valid() => Stage::Consumer(source),
         (FORMAT_FIX, None, None, Some(formatter), None) if formatter.valid() => Stage::Formatter(formatter),
@@ -270,6 +276,12 @@ fn execute(
         let ready = writer.stage_ready().map_err(no_start)?.clone();
         let command = match stage {
             Stage::Preparation(target) => {
+                if let Target::ToolingSuites { executable_sha256 } = target {
+                    writer_preparation::tooling_suites::check(root, executable_sha256, &|| {
+                        deadline.remaining().map_err(io::Error::other)
+                    })
+                    .map_err(|_| McpError::invalid_params("tooling_suite_prebuilt_unavailable_or_changed", None))?;
+                }
                 let plan = Plan {
                     root: root.to_owned(),
                     target: target.clone(),
@@ -377,6 +389,11 @@ fn execute(
     let body = result.ok().and_then(|output| match stage {
         Stage::Preparation(Target::FirstPartyClean { .. }) if output.status.success() => {
             writer_preparation::first_party_clean::Receipt::parse(&output.stdout)
+                .ok()
+                .and_then(|receipt| serde_json::to_value(receipt).ok())
+        }
+        Stage::Preparation(Target::ToolingSuites { .. }) if output.status.success() => {
+            writer_preparation::tooling_suites::Receipt::parse(&output.stdout)
                 .ok()
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
         }

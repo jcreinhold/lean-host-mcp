@@ -93,7 +93,7 @@ pub(crate) fn read_checked_config(root: &Path, expected: &[u8; 32]) -> io::Resul
 
 /// Keep the beginning of the diagnostic stream and drain the rest so its size
 /// never turns a real lint exit into an artificial pipe failure.
-fn diagnostic_preview(mut input: impl io::Read) -> io::Result<(String, bool)> {
+pub(super) fn diagnostic_preview(mut input: impl io::Read) -> io::Result<(String, bool)> {
     let mut bytes = Vec::new();
     input
         .by_ref()

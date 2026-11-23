@@ -468,6 +468,7 @@ mod tests {
     fn runtime_facts_separate_call_restart_from_lifecycle_history() {
         let facts = RuntimeFacts {
             native_compatibility: None,
+            cli_file_verification: None,
             worker_generation: 4,
             worker_restarted: false,
             retry_count: 0,

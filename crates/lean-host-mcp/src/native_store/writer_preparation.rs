@@ -19,6 +19,8 @@ const MAX_PLAN_BYTES: usize = 32 * 1024;
 
 #[path = "first_party_clean.rs"]
 pub(crate) mod first_party_clean;
+#[path = "tooling_suites.rs"]
+pub(crate) mod tooling_suites;
 #[path = "whole_lint.rs"]
 pub(crate) mod whole_lint;
 
@@ -29,6 +31,7 @@ pub(crate) enum Target {
     Modules { names: Vec<String> },
     VerifierModules { names: Vec<String> },
     Ready { name: String, package: Option<String> },
+    ToolingSuites { executable_sha256: [[u8; 32]; 4] },
     WholeLint { lakefile_sha256: [u8; 32] },
     FirstPartyClean { lakefile_sha256: [u8; 32] },
 }
@@ -54,7 +57,7 @@ impl Target {
                     && names.len() <= MAX_MODULES
                     && names.iter().all(|target| module(target) && unique.insert(target))
             }
-            Self::WholeLint { .. } | Self::FirstPartyClean { .. } => true,
+            Self::ToolingSuites { .. } | Self::WholeLint { .. } | Self::FirstPartyClean { .. } => true,
             Self::Ready { name: target, package } => name(target) && package.as_deref().is_none_or(name),
         };
         if !valid {
@@ -308,6 +311,10 @@ pub fn run(encoded: &str) -> io::Result<()> {
     if let Target::FirstPartyClean { lakefile_sha256 } = &plan.target {
         return first_party_clean::run(&plan.root, lakefile_sha256, authorize);
     }
+    if let Target::ToolingSuites { executable_sha256 } = &plan.target {
+        let receipt = tooling_suites::run(&plan.root, executable_sha256, authorize)?;
+        return serde_json::to_writer(std::io::stdout().lock(), &receipt).map_err(io::Error::other);
+    }
     let lake = lake_executable(&plan.root)?;
     if let Target::WholeLint { lakefile_sha256 } = &plan.target {
         return whole_lint::run(&plan.root, &lake, lakefile_sha256, authorize);
@@ -330,7 +337,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
 
     let after_deps = || test_cut_after_dependencies(&authorize);
     let receipt = match plan.target {
-        Target::WholeLint { .. } | Target::FirstPartyClean { .. } => {
+        Target::ToolingSuites { .. } | Target::WholeLint { .. } | Target::FirstPartyClean { .. } => {
             return Err(io::Error::other("fixed writer command already dispatched"));
         }
         Target::Module { name } => {
