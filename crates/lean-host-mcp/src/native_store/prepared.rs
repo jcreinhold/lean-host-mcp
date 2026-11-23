@@ -26,6 +26,33 @@ use crate::{ProjectBroker, broker::ProjectHint, error::ServerError};
 
 pub(crate) const NAMED_INSPECTION: &str = "lean_declaration_inspection_v1";
 
+pub(crate) const WARM_INSPECTION: &str = "lean_declaration_inspection_warm_v1";
+
+#[cfg(lean_host_mcp_development_warm)]
+pub(crate) fn warm_development_enabled() -> bool {
+    std::env::var_os("LEAN_HOST_MCP_DEVELOPMENT_WARM").is_some_and(|value| value == "1")
+}
+
+fn is_warm(operation: Option<&str>) -> bool {
+    if operation != Some(WARM_INSPECTION) {
+        return false;
+    }
+    #[cfg(lean_host_mcp_development_warm)]
+    return warm_development_enabled();
+    #[cfg(not(lean_host_mcp_development_warm))]
+    false
+}
+
+fn is_named(operation: Option<&str>) -> bool {
+    operation == Some(NAMED_INSPECTION) || is_warm(operation)
+}
+
+#[cfg(lean_host_mcp_development_warm)]
+#[path = "warm_inspection.rs"]
+mod warm_inspection;
+#[cfg(lean_host_mcp_development_warm)]
+pub(crate) use warm_inspection::WarmGeneration;
+
 #[path = "trace_snapshot.rs"]
 mod trace_snapshot;
 
@@ -72,8 +99,10 @@ impl Intent {
                 .as_ref()
                 .filter(|name| !name.is_empty())
                 .map(LeanWorkerDeclarationInspectionRequest::new),
-            Some(NAMED_INSPECTION)
-                if self.declaration.is_none() && self.project.as_ref().is_some_and(|p| p.is_absolute()) =>
+            operation
+                if is_named(operation)
+                    && self.declaration.is_none()
+                    && self.project.as_ref().is_some_and(|p| p.is_absolute()) =>
             {
                 let request = self.inspection.as_ref()?;
                 if request.name.trim().is_empty()
@@ -105,9 +134,15 @@ impl Intent {
 
 pub(crate) fn validate_create(bytes: &[u8]) -> Result<(), Reject> {
     readiness_writer::validate_create(bytes)?;
-    let named = serde_json::from_slice::<serde_json::Value>(bytes)
-        .is_ok_and(|value| value.get("operation").and_then(serde_json::Value::as_str) == Some(NAMED_INSPECTION));
-    if named
+    let decoded = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let operation = decoded
+        .as_ref()
+        .and_then(|value| value.get("operation"))
+        .and_then(serde_json::Value::as_str);
+    if operation == Some(WARM_INSPECTION) && !is_warm(operation) {
+        return Err(Reject::DispatchDisabled);
+    }
+    if is_named(operation)
         && serde_json::from_slice::<Intent>(bytes)
             .ok()
             .and_then(|intent| intent.request())
@@ -132,7 +167,7 @@ pub(crate) async fn named_lookup(
     let get = || call.store.lock().client_get(key, &capability).map_err(internal);
     let original = get()?;
     let intent: Intent = serde_json::from_slice(&original.intent).map_err(internal)?;
-    if intent.operation.as_deref() != Some(NAMED_INSPECTION)
+    if !is_named(intent.operation.as_deref())
         || intent.project.as_deref() != Some(root)
         || intent.imports != imports
         || intent.request().as_ref() != Some(request)
@@ -146,7 +181,9 @@ pub(crate) async fn named_lookup(
             .map_err(|error| bad(&error.message))?;
     }
     let saved = get()?;
-    if saved.resource_report != ResourceReport::Closed {
+    if saved.resource_report != ResourceReport::Closed
+        && !(is_warm(intent.operation.as_deref()) && saved.ended_ordinal.is_some())
+    {
         return Err(bad("managed declaration inspection custody is unresolved"));
     }
     match saved.result {
@@ -192,6 +229,7 @@ impl Job {
         worker: &mut LeanWorkerHostHandle,
         operator_prepared: Option<&str>,
         actor_healthy: &AtomicBool,
+        #[cfg(lean_host_mcp_development_warm)] warm: &mut Option<WarmGeneration>,
     ) -> crate::error::Result<()> {
         if operator_prepared
             .is_none_or(|input| Sha256::digest(input.as_bytes()).as_slice() != self.intent.prepared_sha256)
@@ -208,6 +246,15 @@ impl Job {
             drop(store);
             if current.gate != Gate::Pending || current.scope.is_some() {
                 return Ok(());
+            }
+        }
+        #[cfg(lean_host_mcp_development_warm)]
+        {
+            if is_warm(self.intent.operation.as_deref()) {
+                return self.run_warm(worker, actor_healthy, warm);
+            }
+            if warm.is_some() {
+                return Err(internal("ordinary inspection cannot use a managed warm generation"));
             }
         }
         // Loan preparation performs only bounded storage work on this exact
@@ -392,6 +439,10 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                 .as_array_mut()
             {
                 operations.push(serde_json::json!(NAMED_INSPECTION));
+                #[cfg(lean_host_mcp_development_warm)]
+                if warm_development_enabled() && broker.managed_only() {
+                    operations.push(serde_json::json!(WARM_INSPECTION));
+                }
             }
         }
     }
@@ -439,7 +490,7 @@ pub(crate) async fn start(
     let request = intent
         .request()
         .ok_or_else(|| McpError::invalid_params("invalid_inspection_intent", None))?;
-    if intent.operation.as_deref() == Some(NAMED_INSPECTION) {
+    if is_named(intent.operation.as_deref()) {
         let root = broker
             .native_root(&ProjectHint::Default)
             .map_err(|_| McpError::invalid_params("inspection_project_unavailable", None))?;
@@ -540,7 +591,20 @@ pub(crate) fn reconcile_lookup(
             capability: capability.clone(),
         }
     };
-    let Ok((stage, identity)) = store.open_stage_recovery(&saved, None) else {
+    let warm = serde_json::from_slice::<Intent>(&saved.intent).is_ok_and(|intent| is_warm(intent.operation.as_deref()));
+    let scope = if warm {
+        #[cfg(lean_host_mcp_development_warm)]
+        {
+            store.observe_historical_scope(&saved)
+        }
+        #[cfg(not(lean_host_mcp_development_warm))]
+        {
+            return None;
+        }
+    } else {
+        store.open_stage_recovery(&saved, None)
+    };
+    let Ok((stage, identity)) = scope else {
         return None;
     };
     match observe_recovered_closure(&identity).and_then(|closed| {
@@ -555,7 +619,7 @@ pub(crate) fn reconcile_lookup(
         Ok(false) => {}
         Err(error) => tracing::debug!(%error, "original managed scope closure remains unresolved"),
     }
-    if cfg!(target_os = "macos") && !external_reader {
+    if cfg!(target_os = "macos") && !external_reader && !warm {
         return Some(serde_json::json!({
             "generation":identity.generation,"revision":saved.caller.revision,
         }));
@@ -632,6 +696,11 @@ pub(crate) fn drain(
     }
     let intent: Intent = serde_json::from_slice(&snapshot.intent)
         .map_err(|_| McpError::invalid_params("recovery_claim_changed", None))?;
+    // The current SDK drain slot is generation-wide. A warm development
+    // attempt cannot publish one, including before a successor is admitted.
+    if is_warm(intent.operation.as_deref()) {
+        return Err(McpError::invalid_params("warm_attempt_drain_unsupported", None));
+    }
     if intent.revision != revision {
         return Err(McpError::invalid_params("recovery_claim_changed", None));
     }

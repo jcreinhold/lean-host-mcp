@@ -349,9 +349,10 @@ pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
-    // Until the guardian ACK and attempt-scoped recovery contracts ship
-    // together, the service must refuse even an explicitly promoted store.
-    if !has_role(db, NATIVE_ROLE, 5)? && !(cfg!(test) && has_role(db, NATIVE_ROLE, recovery::WARM_SCHEMA_VERSION)?) {
+    // Only a matched development image can open an explicitly promoted store.
+    if !(has_role(db, NATIVE_ROLE, 5)?
+        || cfg!(any(test, lean_host_mcp_development_warm)) && has_role(db, NATIVE_ROLE, recovery::WARM_SCHEMA_VERSION)?)
+    {
         return Ok(false);
     }
     drop(db.prepare("SELECT epoch,nonce,stage,intent,cap_hash,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages LIMIT 0")?);
@@ -1292,7 +1293,7 @@ fn read_stage_columns(db: &Connection, key: NativeKey, include_admission: bool) 
     } else {
         "NULL"
     };
-    let ended = if cfg!(test) && recovery::warm_schema(db)? {
+    let ended = if cfg!(any(test, lean_host_mcp_development_warm)) && recovery::warm_schema(db)? {
         "(SELECT ordinal FROM recovery_bindings r
           WHERE r.epoch=s.epoch AND r.nonce=s.nonce AND r.stage=s.stage AND r.ended=1)"
     } else {

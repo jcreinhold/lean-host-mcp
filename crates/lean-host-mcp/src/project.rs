@@ -2068,6 +2068,8 @@ struct ImportProfileStamp {
 }
 
 struct ProjectActorState {
+    #[cfg(lean_host_mcp_development_warm)]
+    warm_inspection: Option<crate::managed_prepared::WarmGeneration>,
     config: ActorConfig,
     handle: LeanWorkerHostHandle,
     worker_generation_base: u64,
@@ -2112,6 +2114,8 @@ impl ProjectActorState {
                         &mut self.handle,
                         self.config.prepared_generation.as_deref(),
                         &self.config.healthy,
+                        #[cfg(lean_host_mcp_development_warm)]
+                        &mut self.warm_inspection,
                     )
                     .map(|()| ProjectCall::new((), RuntimeFacts::default()))
                 };
@@ -3556,6 +3560,8 @@ fn actor_main(
         }
     };
     let mut state = ProjectActorState {
+        #[cfg(lean_host_mcp_development_warm)]
+        warm_inspection: None,
         config: config.clone(),
         handle,
         worker_generation_base: 1,

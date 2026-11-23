@@ -195,6 +195,27 @@ impl LeanHostService {
         if expected.is_some_and(|uuid| store.identity() != uuid) {
             return Err(std::io::Error::other("original launcher store UUID changed"));
         }
+        #[cfg(lean_host_mcp_development_warm)]
+        let store = {
+            let mut store = store;
+            let selected = crate::managed_prepared::warm_development_enabled();
+            if selected {
+                if !self.ctx.broker.managed_only()
+                    || self.ctx.broker.prepared_generation().is_none()
+                    || expected.is_some()
+                {
+                    return Err(std::io::Error::other(
+                        "warm development requires an unenrolled managed-only service",
+                    ));
+                }
+                store.promote_warm_contract().map_err(std::io::Error::other)?;
+            } else if store.warm_development_store().map_err(std::io::Error::other)? {
+                return Err(std::io::Error::other(
+                    "warm development store requires explicit selection",
+                ));
+            }
+            store
+        };
         self.managed_store = Some(Arc::new(parking_lot::Mutex::new(store)));
         self.tool_router.merge(Self::managed_tool_router());
         Ok(self)

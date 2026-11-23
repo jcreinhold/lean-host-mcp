@@ -26,6 +26,15 @@ fn watch(path: &Path) {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(lean_host_mcp_development_warm)");
+    const WARM: &str = "LEAN_HOST_MCP_COMPILE_DEVELOPMENT_WARM";
+    println!("cargo:rerun-if-env-changed={WARM}");
+    if std::env::var_os("CARGO_FEATURE_MANAGED_NATIVE_STORE").is_some()
+        && matches!(std::env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("macos" | "linux"))
+        && std::env::var(WARM).as_deref() == Ok("65e6f6bd726a9aaedd537333ade2d41ae7809c7e")
+    {
+        println!("cargo:rustc-cfg=lean_host_mcp_development_warm");
+    }
     let Some(manifest) =
         std::env::var_os("CARGO_MANIFEST_DIR").and_then(|path| PathBuf::from(path).canonicalize().ok())
     else {

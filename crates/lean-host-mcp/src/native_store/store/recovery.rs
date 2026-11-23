@@ -30,7 +30,7 @@ pub(super) fn warm_schema(db: &rusqlite::Connection) -> rusqlite::Result<bool> {
         .map(|version| version == WARM_SCHEMA_VERSION)
 }
 
-#[cfg(test)]
+#[cfg(any(test, lean_host_mcp_development_warm))]
 const PROMOTE_WARM: &str = "
     ALTER TABLE recovery_bindings RENAME TO prior_recovery_bindings;
     CREATE TABLE recovery_bindings(
@@ -447,6 +447,16 @@ impl NativeStore {
         expected_generation: Option<&str>,
         expected_parent: Option<&NativeProcessIdentity>,
     ) -> Answer<(Binding, RegistryIdentity)> {
+        Self::read_scope(path, saved, expected_generation, expected_parent, false)
+    }
+
+    fn read_scope(
+        path: &Path,
+        saved: &SavedRequest,
+        expected_generation: Option<&str>,
+        expected_parent: Option<&NativeProcessIdentity>,
+        observe_ended: bool,
+    ) -> Answer<(Binding, RegistryIdentity)> {
         bounded(&saved.caller.job)?;
         bounded(&saved.intent)?;
         if expected_generation.is_some_and(|generation| !valid_generation(generation)) {
@@ -474,7 +484,7 @@ impl NativeStore {
             return reject(Reject::IntentChanged);
         }
         let scope = old.scope.ok_or(Problem::Rejected(Reject::WrongScope))?;
-        if old.resource_report == ResourceReport::Closed || old.ended_ordinal.is_some() {
+        if old.resource_report == ResourceReport::Closed || (!observe_ended && old.ended_ordinal.is_some()) {
             return reject(Reject::WrongScope);
         }
         let head: (i64, Id) = tx.query_row(
@@ -542,6 +552,16 @@ impl NativeStore {
         Self::read_recovery_scope(Path::new(path), saved, generation, None)
     }
 
+    #[cfg(lean_host_mcp_development_warm)]
+    pub(crate) fn observe_historical_scope(&self, saved: &SavedRequest) -> Answer<(Binding, RegistryIdentity)> {
+        let path = self
+            .db
+            .connection()
+            .path()
+            .ok_or(Problem::Rejected(Reject::WrongStore))?;
+        Self::read_scope(Path::new(path), saved, None, None, true)
+    }
+
     /// Record trusted SDK closure without granting launch or inventing a result.
     pub(crate) fn reconcile_closed_scope(&mut self, binding: Binding, identity: &RegistryIdentity) -> Answer<()> {
         self.checked_key(binding.key)?;
@@ -578,7 +598,7 @@ impl NativeStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, lean_host_mcp_development_warm))]
 #[derive(Clone)]
 pub(crate) struct CheckedWarmFinish {
     pub(crate) binding: Binding,
@@ -587,14 +607,22 @@ pub(crate) struct CheckedWarmFinish {
     pub(crate) expires_ns: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, lean_host_mcp_development_warm))]
 impl NativeStore {
+    #[cfg(lean_host_mcp_development_warm)]
+    pub(crate) fn warm_development_store(&self) -> Answer<bool> {
+        Ok(warm_schema(self.db.connection())?)
+    }
+
     pub(crate) fn promote_warm_contract(&mut self) -> Answer<()> {
         self.db.check_profile()?;
         let tx = self
             .db
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if warm_schema(&tx)? {
+            return Ok(());
+        }
         tx.execute_batch(PROMOTE_WARM)?;
         tx.pragma_update(None, "user_version", WARM_SCHEMA_VERSION)?;
         commit(tx, "enable-warm-contract")
@@ -620,8 +648,8 @@ impl NativeStore {
         )
     }
 
-    // Trusted producer seam. Tests inject the acknowledgement only after
-    // constructing the exact tuple. The pending SDK verifier will own it.
+    // Called only by the SDK exact guardian-finish callback in development.
+    // The database-only test supplies the already-checked tuple directly.
     pub(crate) fn end_warm_contract(
         &mut self,
         finish: &CheckedWarmFinish,

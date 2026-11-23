@@ -60,6 +60,8 @@ def run_check(args):
     @contextmanager
     def server(*, stop_before_arm=False, stop_after_claim=False):
         child_env = dict(env)
+        if args.warm_reuse:
+            child_env["LEAN_HOST_MCP_DEVELOPMENT_WARM"] = "1"
         if args.deadline_while_sql_locked:
             child_env["LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS"] = "5000"
         if args.abrupt and entry_trace:
