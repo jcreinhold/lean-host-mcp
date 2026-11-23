@@ -40,7 +40,18 @@ pub(super) fn derive(
     release: &Path,
     domains: &[PathBuf],
     imports: impl IntoIterator<Item = String>,
+    read: impl FnMut(&[PathBuf]) -> io::Result<Vec<u8>>,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    derive_observed(roots, release, domains, imports, read, |_, _| {})
+}
+
+pub(super) fn derive_observed(
+    roots: &[PathBuf],
+    release: &Path,
+    domains: &[PathBuf],
+    imports: impl IntoIterator<Item = String>,
     mut read: impl FnMut(&[PathBuf]) -> io::Result<Vec<u8>>,
+    mut observe: impl FnMut(&str, &[String]),
 ) -> io::Result<Vec<(String, PathBuf)>> {
     let mut seen = BTreeSet::new();
     let mut pending = VecDeque::new();
@@ -71,6 +82,7 @@ pub(super) fn derive(
         .collect::<Vec<_>>();
 
     while !pending.is_empty() {
+        let start = selected.len();
         let mut files = Vec::new();
         while files.len() < HEADER_BATCH {
             let Some(name) = pending.pop_front() else {
@@ -107,12 +119,14 @@ pub(super) fn derive(
         if headers.imports.len() != files.len() {
             return Err(io::Error::other("incomplete compiler import header response"));
         }
-        for header in headers.imports {
+        for ((name, _), header) in selected.iter().skip(start).zip(headers.imports) {
             let Some(result) = header.result.filter(|_| header.errors.is_empty()) else {
                 return Err(io::Error::other("compiler refused a selected import header"));
             };
-            for import in result.imports {
-                enqueue(import.module, &mut pending)?;
+            let imports = result.imports.into_iter().map(|entry| entry.module).collect::<Vec<_>>();
+            observe(name, &imports);
+            for import in imports {
+                enqueue(import, &mut pending)?;
             }
         }
     }

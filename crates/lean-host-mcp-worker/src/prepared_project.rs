@@ -420,12 +420,25 @@ impl ImportPlan {
         domains: &[PathBuf],
         headers: impl FnMut(&[PathBuf]) -> io::Result<Vec<u8>>,
     ) -> io::Result<Vec<(String, PathBuf)>> {
-        let closure = crate::prepared_closure::derive(
+        self.derive_observed(domains, headers, |_, _| {})
+    }
+
+    /// Resolve the same closure and expose its direct source edges in header order.
+    /// # Errors
+    /// Refuses missing, aliased or unapproved sources.
+    pub fn derive_observed(
+        &self,
+        domains: &[PathBuf],
+        headers: impl FnMut(&[PathBuf]) -> io::Result<Vec<u8>>,
+        observe: impl FnMut(&str, &[String]),
+    ) -> io::Result<Vec<(String, PathBuf)>> {
+        let closure = crate::prepared_closure::derive_observed(
             &self.roots,
             &self.release,
             domains,
             self.modules.iter().map(|(name, _)| name.clone()),
             headers,
+            observe,
         )?;
         if !self.modules.iter().all(|selected| closure.contains(selected)) {
             return Err(invalid());

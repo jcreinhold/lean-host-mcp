@@ -1,7 +1,7 @@
 //! Fixed cache materialization and first-party build under the committed writer.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -29,8 +29,6 @@ struct Policy {
     adapter: PathBuf,
     adapter_sha256: [u8; 32],
     runtime_roots: Vec<PathBuf>,
-    cache_imports: Vec<(String, PathBuf)>,
-    build: Vec<String>,
 }
 
 fn checked(command: &mut Command) -> io::Result<Output> {
@@ -50,13 +48,7 @@ fn configured_policy(root: &Path) -> io::Result<Option<Policy>> {
         return Ok(None);
     };
     let policy: Policy = serde_json::from_slice(&pinned_lake_config::file_bytes(&path)?)?;
-    if policy.project != root
-        || policy.build.is_empty()
-        || policy.build.len() > 32
-        || policy.build.iter().any(|name| !super::name(name))
-        || policy.cache_imports.is_empty()
-        || policy.cache_imports.len() > 32
-    {
+    if policy.project != root || policy.runtime_roots.is_empty() || policy.runtime_roots.len() > 64 {
         return Err(io::Error::other("invalid selected closure preparation"));
     }
     Ok(Some(policy))
@@ -75,9 +67,6 @@ pub(super) fn run(
     let Some(policy) = configured_policy(root)? else {
         return Ok(None);
     };
-    if policy.build.last().is_none_or(|name| name != seed) {
-        return Err(io::Error::other("invalid selected closure preparation"));
-    }
     authorize()?;
     pinned_lake_config::validate_root_config(root, &policy.lakefile_sha256)?;
     let package_order = pinned_lake_config::checked_package_order(root, &policy.manifest_sha256)?;
@@ -159,7 +148,11 @@ pub(super) fn run(
         authorize()?;
         Ok(checked(lean_command().arg("--deps-json").args(files))?.stdout)
     };
-    let closure = plan.derive(&domains, read_headers)?;
+    let mut edges = BTreeMap::new();
+    let closure = plan.derive_observed(&domains, read_headers, |name, imports| {
+        edges.insert(name.to_owned(), imports.to_vec());
+    })?;
+
     let mut lake_roots = lake_roots;
     lake_roots.extend(shims.paths.iter().cloned());
     lake_roots.push(release.clone());
@@ -174,54 +167,33 @@ pub(super) fn run(
             "Lake and the worker resolve different source closures",
         ));
     }
-    let first_party = closure
-        .iter()
-        .filter(|(_, owner)| owner == root)
-        .map(|(name, _)| name)
-        .collect::<BTreeSet<_>>();
-    if first_party != policy.build.iter().collect() || first_party.len() != policy.build.len() {
-        return Err(io::Error::other(
-            "approved build does not cover the exact first-party closure",
-        ));
+    let (build, cache) = preparation_order(root, &closure, &edges)?;
+    if !cache.is_empty() {
+        let scratch = tempfile::Builder::new().prefix("closure-cache-").tempdir()?;
+        let archives = scratch.path().join("archives");
+        fs::create_dir(&archives)?;
+        let adapter = scratch.path().join("CacheAdapter.lean");
+        fs::write(&adapter, adapter_source)?;
+        authorize()?;
+        checked(
+            lean_command()
+                .arg("--run")
+                .arg(&adapter)
+                .args(cache)
+                .env(
+                    "LEAN_PATH",
+                    std::env::join_paths(&policy.runtime_roots).map_err(io::Error::other)?,
+                )
+                .env(
+                    "LEAN_SRC_PATH",
+                    std::env::join_paths(&package_order).map_err(io::Error::other)?,
+                )
+                .env("MATHLIB_CACHE_DIR", &archives)
+                .env_remove("MATHLIB_CACHE_GET_URL")
+                .env_remove("MATHLIB_CACHE_BASE_URL"),
+        )?;
     }
-    let cache_plan = ImportPlan::new(root.to_owned(), roots.clone(), release, policy.cache_imports.clone());
-    let cache_closure = cache_plan
-        .derive(&domains, read_headers)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let dependencies = closure
-        .into_iter()
-        .filter(|(_, owner)| owner != root)
-        .collect::<BTreeSet<_>>();
-    if dependencies != cache_closure {
-        return Err(io::Error::other(
-            "approved cache does not cover the exact dependency closure",
-        ));
-    }
-    let scratch = tempfile::Builder::new().prefix("closure-cache-").tempdir()?;
-    let archives = scratch.path().join("archives");
-    fs::create_dir(&archives)?;
-    let adapter = scratch.path().join("CacheAdapter.lean");
-    fs::write(&adapter, adapter_source)?;
-    authorize()?;
-    checked(
-        lean_command()
-            .arg("--run")
-            .arg(&adapter)
-            .args(policy.cache_imports.iter().map(|(module, _)| module))
-            .env(
-                "LEAN_PATH",
-                std::env::join_paths(&policy.runtime_roots).map_err(io::Error::other)?,
-            )
-            .env(
-                "LEAN_SRC_PATH",
-                std::env::join_paths(&domains).map_err(io::Error::other)?,
-            )
-            .env("MATHLIB_CACHE_DIR", &archives)
-            .env_remove("MATHLIB_CACHE_GET_URL")
-            .env_remove("MATHLIB_CACHE_BASE_URL"),
-    )?;
-    for name in policy.build {
+    for name in build {
         let run = |args: &[&str]| {
             authorize()?;
             let status = lake_command().args(args).stdout(Stdio::null()).status()?;
@@ -229,7 +201,7 @@ pub(super) fn run(
                 .code()
                 .ok_or_else(|| io::Error::other("guarded Lake was interrupted"))
         };
-        let receipt = run_module(name, &run, &|| authorize().map(|_| ()))?;
+        let receipt = run_module(name.to_owned(), &run, &|| authorize().map(|_| ()))?;
         if receipt.dependency_exit_code != 0 || receipt.build_exit_code != Some(0) {
             return Err(io::Error::other("first-party closure build did not complete"));
         }
@@ -261,4 +233,58 @@ pub(super) fn run(
         },
         prepared_generation,
     }))
+}
+
+fn preparation_order<'a>(
+    root: &Path,
+    closure: &'a [(String, PathBuf)],
+    edges: &'a BTreeMap<String, Vec<String>>,
+) -> io::Result<(Vec<&'a str>, BTreeSet<&'a str>)> {
+    let mut pending = BTreeMap::new();
+    let mut cache = BTreeSet::new();
+    let owners = closure
+        .iter()
+        .map(|(name, owner)| (name.as_str(), owner.as_path()))
+        .collect::<BTreeMap<_, _>>();
+    for (name, owner) in closure {
+        let imports = edges
+            .get(name)
+            .ok_or_else(|| io::Error::other("missing selected dependency edges"))?;
+        let mut local = BTreeSet::new();
+        for import in imports {
+            match (owner == root, owners.get(import.as_str())) {
+                (true, Some(dependency)) if *dependency == root => {
+                    local.insert(import.as_str());
+                }
+                (true, Some(_)) => {
+                    cache.insert(import.as_str());
+                }
+                (false, Some(dependency)) if *dependency == root => {
+                    return Err(io::Error::other("pinned package imports a first-party module"));
+                }
+                _ => {}
+            }
+        }
+        if owner == root {
+            pending.insert(name.as_str(), local);
+        }
+    }
+    let mut build = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let ready = pending
+            .iter()
+            .filter_map(|(&name, deps)| deps.is_empty().then_some(name))
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return Err(io::Error::other("cycle in first-party preparation closure"));
+        }
+        for name in ready {
+            pending.remove(name);
+            for dependencies in pending.values_mut() {
+                dependencies.remove(name);
+            }
+            build.push(name);
+        }
+    }
+    Ok((build, cache))
 }
