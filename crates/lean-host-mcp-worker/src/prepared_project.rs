@@ -109,6 +109,8 @@ pub struct ImportPlan {
     roots: Vec<PathBuf>,
     release: PathBuf,
     modules: Vec<(String, PathBuf)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed_release: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -152,15 +154,137 @@ impl ImportPlan {
             roots,
             release,
             modules,
+            installed_release: None,
         }
     }
+
+    /// Treat one ordinary, registered Elan release as an installed dependency.
+    /// The installation must remain intact while a prepared generation uses it.
+    /// In-place edits to an installed release are outside this contract.
+    ///
+    /// # Errors
+    /// Refuses a custom or unselected release and an unsupported SDK header.
+    pub fn with_installed_release(mut self) -> io::Result<Self> {
+        self.installed_release = Some(self.toolchain_selection()?);
+        self.installed_identity()?;
+        Ok(self)
+    }
+
+    fn toolchain_selection(&self) -> io::Result<String> {
+        let path = self.project.join("lean-toolchain");
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > 1024 || path.canonicalize()? != path {
+            return Err(invalid());
+        }
+        Ok(fs::read_to_string(path)?.trim().to_owned())
+    }
+
+    fn installed_identity(&self) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let refuse = || io::Error::new(io::ErrorKind::InvalidData, "unapproved installed Elan release");
+        let selection = self.installed_release.as_deref().ok_or_else(refuse)?;
+        let version = selection.strip_prefix("leanprover/lean4:v").ok_or_else(refuse)?;
+        if version.split('.').count() != 3
+            || version
+                .split('.')
+                .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+            || self.toolchain_selection()? != selection
+        {
+            return Err(refuse());
+        }
+        // Match the host's normal registered Elan namespace. Linked/custom
+        // installations and environment-selected overrides are not accepted.
+        let sysroot = std::env::home_dir()
+            .ok_or_else(refuse)?
+            .join(".elan/toolchains")
+            .join(format!("leanprover--lean4---v{version}"));
+        if sysroot.canonicalize()? != sysroot
+            || self.release != sysroot.join("lib/lean")
+            || self.release.canonicalize()? != self.release
+        {
+            return Err(refuse());
+        }
+        let fingerprint = lean_toolchain::ToolchainFingerprint::current();
+        let header = file_hash(&sysroot.join("include/lean/lean.h"))?;
+        let mut header_hex = String::with_capacity(64);
+        for byte in header {
+            use std::fmt::Write as _;
+            write!(header_hex, "{byte:02x}").map_err(io::Error::other)?;
+        }
+        if header_hex != fingerprint.header_sha256 || version != fingerprint.lean_version {
+            return Err(refuse());
+        }
+        let mut hash = Sha256::new();
+        for path in [&sysroot, &self.release] {
+            let metadata = fs::metadata(path)?;
+            hash.update(metadata.dev().to_le_bytes());
+            hash.update(metadata.ino().to_le_bytes());
+        }
+        hash.update(header);
+        for executable in ["bin/lean", "bin/lake"] {
+            hash.update(file_hash(&sysroot.join(executable))?);
+        }
+        let runtime = if cfg!(target_os = "macos") {
+            "libleanshared.dylib"
+        } else {
+            "libleanshared.so"
+        };
+        let runtime = self.release.join(runtime);
+        let metadata = fs::symlink_metadata(&runtime)?;
+        if !metadata.is_file() || runtime.canonicalize()? != runtime {
+            return Err(refuse());
+        }
+        hash.update(metadata.dev().to_le_bytes());
+        hash.update(metadata.ino().to_le_bytes());
+        hash.update(metadata.len().to_le_bytes());
+        Ok(hash.finalize().into())
+    }
+
+    fn check_installed_order(&self) -> io::Result<()> {
+        let (last, earlier) = self.roots.split_last().ok_or_else(invalid)?;
+        if last != &self.release || earlier.contains(last) {
+            return Err(invalid());
+        }
+        for entry in fs::read_dir(last)? {
+            let entry = entry?;
+            let path = entry.path();
+            let base = if entry.file_type()?.is_dir() {
+                path.file_name()
+            } else if path.extension().is_some_and(|part| part == "olean") {
+                path.file_stem()
+            } else {
+                continue;
+            };
+            let Some(name) = base.and_then(std::ffi::OsStr::to_str).filter(|name| valid_module(name)) else {
+                continue;
+            };
+            // Lean assigns a whole package prefix to its first matching root.
+            // Check the prefix, even if the shadow root lacks the requested leaf.
+            let selected =
+                lean_toolchain::olean_candidate(&self.roots, name, |p| fs::metadata(p)).map_err(io::Error::other)?;
+            if selected != Some(last.join(format!("{name}.olean"))) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("installed Lean package is shadowed: {name}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn identity(&self, domains: &[PathBuf]) -> io::Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         if self.modules.is_empty() || self.modules.len() > 32 || self.roots.is_empty() || self.roots.len() > 64 {
             return Err(invalid());
         }
         let mut hash = Sha256::new();
-        hash.update(serde_json::to_vec(&("fresh-built-project-v2", self))?);
+        if self.installed_release.is_some() {
+            self.check_installed_order()?;
+            hash.update(serde_json::to_vec(&("installed-release-project-v1", self))?);
+            hash.update(self.installed_identity()?);
+        } else {
+            hash.update(serde_json::to_vec(&("fresh-built-project-v2", self))?);
+        }
         for (name, domain) in &self.modules {
             let selected = lean_toolchain::olean_candidate(&self.roots, name, |p| fs::metadata(p))
                 .map_err(io::Error::other)?
@@ -201,7 +325,7 @@ impl ImportPlan {
     }
     // Ask the same Lean release to parse each selected source header under the
     // custody and search order used for this generation. Every local edge must
-    // lead to another captured output; the first supported builtin edge is Init.
+    // lead to another captured output or the selected installed release.
     fn check_edges(&self, writer: &mut lean_toolchain::shared_writer::SharedWriter) -> io::Result<()> {
         use std::{process::Command, time::Duration};
         let lean = self
@@ -234,7 +358,12 @@ impl ImportPlan {
             }
             for edge in std::str::from_utf8(&out.stdout).map_err(io::Error::other)?.lines() {
                 let path = Path::new(edge);
-                if !path.is_absolute() || (!local.iter().any(|p| p == path) && path != self.release.join("Init.olean"))
+                let installed = self.installed_release.is_some()
+                    && path.starts_with(&self.release)
+                    && path.extension().is_some_and(|suffix| suffix == "olean")
+                    && path.canonicalize()? == path;
+                if !path.is_absolute()
+                    || (!local.iter().any(|p| p == path) && path != self.release.join("Init.olean") && !installed)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -256,6 +385,10 @@ impl ImportPlan {
     ) -> io::Result<PreparedGeneration> {
         if writer.project_root() != self.project || !writer.covers_project(&self.project)? {
             return Err(invalid());
+        }
+        if self.installed_release.is_some() {
+            self.installed_identity()?;
+            self.check_installed_order()?;
         }
         let (target, domain) = self.modules.first().ok_or_else(invalid)?;
         if domain != &self.project || !valid_module(target) {
@@ -282,10 +415,19 @@ impl ImportPlan {
             .and_then(Path::parent)
             .ok_or_else(invalid)?
             .join("bin/lake");
-        let mut cmd = std::process::Command::new(lake);
+        let mut cmd = std::process::Command::new(&lake);
         cmd.current_dir(&self.project)
             .env("LAKE_ARTIFACT_CACHE", "false")
             .args(["--no-cache", "build", &format!("+{target}")]);
+        if self.installed_release.is_some() {
+            cmd.env(
+                "LEAN_SYSROOT",
+                lake.parent().and_then(Path::parent).ok_or_else(invalid)?,
+            )
+            .env_remove("LEAN_PATH")
+            .env_remove("LEAN_SRC_PATH")
+            .env_remove("ELAN_TOOLCHAIN");
+        }
         let built = writer.run(&cmd, std::time::Duration::from_secs(90))?;
         if !built.status.success() {
             return Err(io::Error::other(String::from_utf8_lossy(&built.stderr).into_owned()));
@@ -388,7 +530,8 @@ impl PreparedGeneration {
             return Err(invalid());
         }
         let held = PreparedProject::capture(project, &plan.roots, shims, release)?;
-        if plan.identity(&held.domains)? != generation.identity {
+        if plan.identity(&held.domains)? != generation.identity
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "prepared module content changed",
@@ -497,6 +640,7 @@ fn build_path_dependency() -> io::Result<()> {
         )
         .canonicalize()?;
     let project = base.join("project");
+    let installed_release = std::env::var_os("TEST_PREPARED_INSTALLED_RELEASE").is_some();
     let lake = PathBuf::from(std::env::var_os("LEAN_SYSROOT").ok_or_else(invalid)?).join("bin/lake");
     // First-time disposable setup: Lake writes the dependency manifests before
     // the SDK writer can resolve and lock the complete graph.
@@ -512,9 +656,14 @@ fn build_path_dependency() -> io::Result<()> {
     )?;
     fs::write(dep.join("lakefile.toml"), "name = 'dep'\n[[lean_lib]]\nname = 'Dep'\n")?;
     fs::write(dep.join("Dep.lean"), "theorem dependency_ok : True := True.intro\n")?;
+    let source = "import Dep\ntheorem first_ok : True := dependency_ok\ntheorem second_ok : True := first_ok\n";
     fs::write(
         project.join("Root.lean"),
-        "import Dep\ntheorem first_ok : True := dependency_ok\ntheorem second_ok : True := first_ok\n",
+        if installed_release {
+            format!("import Lean\n{source}")
+        } else {
+            source.to_owned()
+        },
     )?;
     fs::write(
         project.join("Observe.lean"),
@@ -555,6 +704,12 @@ fn build_path_dependency() -> io::Result<()> {
         }
         roots.push(release.clone());
         roots
+    } else if installed_release {
+        vec![
+            project.join(".lake/build/lib/lean"),
+            dep.join(".lake/build/lib/lean"),
+            release.clone(),
+        ]
     } else {
         vec![
             dep.join(".lake/build/lib/lean"),
@@ -569,12 +724,22 @@ fn build_path_dependency() -> io::Result<()> {
         release,
         vec![("Root".into(), project.clone()), ("Dep".into(), dep.clone())],
     );
+    let plan = if installed_release {
+        plan.with_installed_release()?
+    } else {
+        plan
+    };
     let incomplete = ImportPlan::new(
         project.clone(),
         plan.roots.clone(),
         plan.release.clone(),
         vec![("Root".into(), project.clone())],
     );
+    let incomplete = if installed_release {
+        incomplete.with_installed_release()?
+    } else {
+        incomplete
+    };
     let stale = dep.join(".lake/build/lib/lean/Dep.olean");
     fs::create_dir_all(stale.parent().ok_or_else(invalid)?)?;
     fs::write(&stale, b"untrusted stale fixture leaf")?;
@@ -593,8 +758,34 @@ fn build_path_dependency() -> io::Result<()> {
     } else {
         "launch-input"
     };
-    fs::write(base.join(output), generation.launch_input()?)?;
-    drop(writer);
+    let input = generation.launch_input()?;
+    fs::write(base.join(output), &input)?;
+    writer.close(Duration::from_secs(10))?;
+    if installed_release {
+        let (_, before) = generation.plan.roots.split_last().ok_or_else(invalid)?;
+        let shims = before.get(2..).ok_or_else(invalid)?;
+        let verify = || {
+            PreparedGeneration::verify_before_import(
+                &input,
+                &project,
+                &generation.plan.release,
+                shims,
+                before,
+                &["Root".into()],
+            )
+        };
+        drop(verify()?);
+        let pin = project.join("lean-toolchain");
+        let original = fs::read(&pin)?;
+        fs::write(&pin, "leanprover/lean4:v4.35.0\n")?;
+        assert!(matches!(verify(), Err(e) if e.to_string().contains("unapproved installed Elan release")));
+        fs::write(&pin, original)?;
+        let shadow = before.first().ok_or_else(invalid)?.join("Lean");
+        fs::create_dir(&shadow)?;
+        assert!(matches!(verify(), Err(e) if e.to_string().contains("installed Lean package is shadowed: Lean")));
+        fs::remove_dir(shadow)?;
+        drop(verify()?);
+    }
     Ok(())
 }
 

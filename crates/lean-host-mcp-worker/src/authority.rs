@@ -342,8 +342,9 @@ impl WorkerAuthority for Installed {
             // SAFETY: the operator selects a trusted fresh-build record at server startup.
             // The matched launcher replaces inherited input. The verified digest covers the
             // approved plugin-free modules and their resolved dependencies, and this authority
-            // retains the project and shim read guards for the worker lifetime. The operator
-            // keeps the selected Elan runtime installed. Only default import options reach here.
+            // retains project and shim read custody. Registered-release records also
+            // bind the selected installed Elan release and refuse prior-root shadowing.
+            // The installed release must stay intact. Only default import options reach here.
             return Ok(unsafe { cap.import_scope_with_options(paths, names, options) });
         }
         let expected = std::iter::once(self.project.join(".lake/build/lib/lean"))
