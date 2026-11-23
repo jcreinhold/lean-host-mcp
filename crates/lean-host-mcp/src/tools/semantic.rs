@@ -245,6 +245,7 @@ fn lean_trial_schema() -> Schema {
                 "properties": {
                     "kind": { "const": "command" },
                     "commands": { "type": "string" },
+                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "file": { "type": ["string", "null"], "description": "Optional source file whose contents precede the command." },
                     "imports": { "type": "array", "items": { "type": "string" } },
                     "project": { "type": ["string", "null"] }
@@ -616,6 +617,22 @@ pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
+    lean_trial_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lean_trial_inner(
+    ctx: &ToolContext,
+    req: SemanticToolRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<SemanticResponse<Value>> {
     let kind = req.kind().map(|kind| canonical_kind("lean_trial", kind).to_owned());
     match kind.as_deref() {
         Some("proof_step") => {
@@ -630,7 +647,16 @@ pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<S
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(position::command_trial(ctx, request).await?, ctx.config)
+            from_tool_response(
+                position::command_trial_inner(
+                    ctx,
+                    request,
+                    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+                    managed,
+                )
+                .await?,
+                ctx.config,
+            )
         }
         Some(kind) => Ok(invalid_kind("lean_trial", kind, &["proof_step", "command"])),
         None => Ok(missing_kind("lean_trial", &["proof_step", "command"])),

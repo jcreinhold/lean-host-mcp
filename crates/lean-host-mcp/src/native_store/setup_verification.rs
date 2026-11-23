@@ -19,11 +19,13 @@ use crate::{
 pub(crate) const OPERATION: &str = "lean_registered_module_verify_v1";
 pub(crate) const DIAGNOSTICS: &str = "lean_file_diagnostics_v1";
 pub(crate) const OUTLINE: &str = "lean_file_outline_v1";
+pub(crate) const COMMAND_TRIAL: &str = "lean_file_command_trial_v1";
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum Projection {
     Verify,
     Diagnostics,
+    CommandTrial,
     Outline,
 }
 
@@ -33,6 +35,7 @@ impl Projection {
             OPERATION => Some(Self::Verify),
             DIAGNOSTICS => Some(Self::Diagnostics),
             OUTLINE => Some(Self::Outline),
+            COMMAND_TRIAL => Some(Self::CommandTrial),
             _ => None,
         }
     }
@@ -48,6 +51,19 @@ pub(crate) struct Request {
     #[serde(default)]
     pub(crate) declarations: Vec<String>,
     pub(crate) prepared_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commands: Option<String>,
+}
+
+pub(crate) fn valid_commands(commands: &str) -> bool {
+    !commands.is_empty()
+        && commands.len() <= 4096
+        && !commands.contains('\0')
+        && commands.trim() == commands
+        // Appending to a header-only file must not add header declarations. Refuse
+        // these tokens even inside comments and strings rather than guess Lean lexing.
+        && !commands.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .any(|token| matches!(token, "import" | "prelude" | "module"))
 }
 
 impl Request {
@@ -57,6 +73,7 @@ impl Request {
             sha256: self.sha256,
         }
         .valid()
+            && self.commands.as_deref().is_none_or(valid_commands)
             && self.declarations.len() <= 16
             && self.declarations.iter().collect::<BTreeSet<_>>().len() == self.declarations.len()
             && self.declarations.iter().all(|name| {
@@ -71,6 +88,7 @@ impl Request {
 
     pub(crate) fn matches_projection(&self, projection: Projection) -> bool {
         self.declarations.is_empty() == (projection != Projection::Verify)
+            && self.commands.is_some() == (projection == Projection::CommandTrial)
     }
 
     pub(crate) fn matches_prepared(&self, prepared: Option<&str>) -> bool {
@@ -156,7 +174,7 @@ pub(crate) fn capture(command: &mut Command, limit: usize) -> io::Result<Vec<u8>
     Ok(bytes)
 }
 
-fn read_source(root: &Path, request: &Request) -> io::Result<String> {
+pub(crate) fn read_source(root: &Path, request: &Request) -> io::Result<String> {
     let path = root.join(&request.file);
     let file = fs::File::from(rustix::fs::open(
         &path,
@@ -227,6 +245,11 @@ pub fn run(encoded: &str) -> io::Result<()> {
     }
     shims.validate().map_err(io::Error::other)?;
     let source = read_source(&plan.root, &plan.request)?;
+    let source = if let Some(commands) = &plan.request.commands {
+        format!("{source}\n\n{commands}\n")
+    } else {
+        source
+    };
     let path = plan.root.join(&plan.request.file);
     let assets = tempfile::Builder::new().prefix("setup-verify-").tempdir()?;
     let mut setup_command = Command::new(shims.sysroot.join("bin/lake"));
@@ -255,7 +278,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
         "heartbeats":200_000,"diagnosticBytes":16_384
     });
     let entry = match plan.projection {
-        Projection::Diagnostics => concat!(
+        Projection::Diagnostics | Projection::CommandTrial => concat!(
             include_str!("../lake/VerifyCommon.lean"),
             "private abbrev projectFile := fileDiagnosticsWithSetup\n",
             include_str!("../lake/OutlineSetup.lean")
@@ -338,7 +361,7 @@ impl ManagedCall<'_> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
         let body = self
-            .saved(broker, root, file, &request.source, &names, Projection::Verify)
+            .saved(broker, root, file, &request.source, &names, (Projection::Verify, None))
             .await?;
         let mut value: Outcome =
             serde_json::from_slice(&body).map_err(|_| unavailable("invalid managed verification result"))?;
@@ -370,6 +393,20 @@ impl ManagedCall<'_> {
         imports: Vec<String>,
         projection: Projection,
     ) -> crate::Result<crate::broker::CachedBrokerCall<DiagnosticOutcome>> {
+        self.file_query(broker, hint, root, file, source, imports, (projection, None))
+            .await
+    }
+
+    pub(crate) async fn file_query(
+        &self,
+        broker: &crate::ProjectBroker,
+        hint: &crate::ProjectHint,
+        root: &Path,
+        file: &Path,
+        source: &str,
+        imports: Vec<String>,
+        projection: (Projection, Option<&str>),
+    ) -> crate::Result<crate::broker::CachedBrokerCall<DiagnosticOutcome>> {
         #[derive(Deserialize)]
         struct Receipt {
             source_sha256: [u8; 32],
@@ -399,7 +436,7 @@ impl ManagedCall<'_> {
         file: &Path,
         source: &str,
         names: &[&str],
-        projection: Projection,
+        (projection, commands): (Projection, Option<&str>),
     ) -> crate::Result<Vec<u8>> {
         use crate::native_store::store::{Capability, Gate, ResourceReport, ResultKnowledge};
         let unavailable = |message: &str| crate::ServerError::BadProject(message.to_owned());
@@ -418,6 +455,7 @@ impl ManagedCall<'_> {
             || approved_root != root
             || file.strip_prefix(root).ok() != Some(admitted.file.as_path())
             || digest != admitted.sha256
+            || commands != admitted.commands.as_deref()
             || !admitted
                 .declarations
                 .iter()
@@ -425,7 +463,7 @@ impl ManagedCall<'_> {
                 .eq(names.iter().copied())
         {
             return Err(unavailable(
-                "managed verification differs from the admitted source or targets",
+                "managed setup differs from the admitted source, targets, or commands",
             ));
         }
         let saved = if snapshot.gate == Gate::Pending && snapshot.scope.is_none() {

@@ -1305,7 +1305,7 @@ unsafe def main (args : List String) : IO UInt32 := do
     }
 
     #[tokio::test]
-    async fn managed_semantic_trial_refuses_legacy_lake_option_discovery() {
+    async fn managed_semantic_trial_requires_original_before_legacy_option_discovery() {
         let fixture = Fixture::new();
         fs::write(
             fixture.project.join("Probe.lean"),
@@ -1351,14 +1351,119 @@ unsafe def main (args : List String) : IO UInt32 := do
             response
                 .pointer("/error/message")
                 .and_then(Value::as_str)
-                .is_some_and(|message| {
-                    message.contains("Lake option discovery requires a managed preparation stage")
-                }),
+                .is_some_and(|message| { message == "managed_trial_original_required" }),
             "{response}"
         );
         server.close_stdin_and_wait().await;
         assert!(!fixture.project.join(".lake/config").exists());
         assert!(!fixture.project.join(".lake/build").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_file_command_trial_uses_original_setup_and_result() {
+        let (Some(writer), Some(workers)) = (
+            std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER"),
+            std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR"),
+        ) else {
+            return;
+        };
+        let fixture = Fixture::new();
+        let source = "import Lean\ndef fixtureValue : Nat := 42\n";
+        let path = fixture.project.join("Probe.lean");
+        fs::write(&path, source).expect("real Lean source");
+        let (store, id) = fixture.new_store("store").await;
+        fixture.enroll(&store, id);
+        let pins = fixture.custody().await;
+        let selected = fixture
+            .transition(&pins, "1", "managed")
+            .output()
+            .await
+            .expect("managed selection");
+        assert!(selected.status.success(), "{selected:?}");
+        let mut server = StdioServer::spawn(
+            fixture
+                .command()
+                .arg("--lake-root")
+                .arg(&fixture.project)
+                .args([
+                    "--launcher-mode",
+                    "managed",
+                    "--launcher-generation",
+                    "2",
+                    "--managed-only",
+                ])
+                .arg("--managed-native-store")
+                .arg(store)
+                .env("LEAN_HOST_MCP_MANAGED_READINESS_WRITER", writer)
+                .env("LEAN_HOST_MCP_WORKERS_DIR", workers),
+        );
+        server.initialize().await;
+        let info = managed(&mut server, json!({"op":"discover"})).await;
+        let key = || {
+            json!({"store":info.get("store").expect("store"),"epoch":info.get("acceptance_epoch").expect("epoch"),
+            "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1})
+        };
+        let capability = [57_u8; 32];
+        use sha2::{Digest, Sha256};
+        let sha256: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        let admission = |key: &Value, commands: &str| {
+            let intent = json!({"project":fixture.project,"job":[1],"revision":1,"operation":"lean_file_command_trial_v1",
+                "setup_verification":{"file":"Probe.lean","sha256":sha256,"prepared_sha256":null,"commands":commands}});
+            json!({"op":"create","key":key,"capability":capability,"intent":intent.to_string().as_bytes()})
+        };
+        let trial = |key: &Value, commands: &str| {
+            json!({"name":"lean_trial","arguments":{
+                "kind":"command","file":"Probe.lean","commands":commands,
+                "managed_original":{"key":key,"capability":capability}
+            }})
+        };
+        let invalid = key();
+        let rejected = server
+            .request_allow_error(
+                "tools/call",
+                json!({"name":"lean_managed_admission","arguments":{
+                    "request":json!({"version":1,"command":admission(&invalid, "import/-comment-/Lean")}).to_string()
+                }}),
+            )
+            .await;
+        assert_eq!(
+            rejected.pointer("/error/message").and_then(Value::as_str),
+            Some("invalid_readiness_intent")
+        );
+
+        let original = key();
+        let commands = "#check Nat.succ";
+        managed(&mut server, admission(&original, commands)).await;
+        fs::write(&path, format!("{source}\n-- changed after CREATE\n")).expect("change source");
+        let changed = server
+            .request_allow_error("tools/call", trial(&original, commands))
+            .await;
+        assert!(
+            changed
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("differs from the admitted source")),
+            "{changed}"
+        );
+        let pending = managed(&mut server, json!({"op":"get","key":original,"capability":capability})).await;
+        assert_eq!(pending.get("execution").and_then(Value::as_str), Some("admitted"));
+        assert_eq!(pending.get("custody").and_then(Value::as_str), Some("unobserved"));
+        assert!(!fixture.project.join(".lake/config").exists());
+        fs::write(path, source).expect("restore same source");
+
+        let first = server.request("tools/call", trial(&original, commands)).await;
+        let result = first.get("result").expect("trial result");
+        assert!(result.to_string().contains("Nat.succ"), "{result}");
+        let saved = managed(&mut server, json!({"op":"get","key":original,"capability":capability})).await;
+        assert_eq!(saved.get("custody").and_then(Value::as_str), Some("closed"), "{saved}");
+        assert_eq!(saved.pointer("/result/state").and_then(Value::as_str), Some("retained"));
+        let replay = server.request("tools/call", trial(&original, commands)).await;
+        assert_eq!(replay.get("result"), first.get("result"));
+        assert_eq!(
+            managed(&mut server, json!({"op":"get","key":original,"capability":capability})).await,
+            saved
+        );
+        server.close_stdin_and_wait().await;
     }
 
     #[tokio::test]

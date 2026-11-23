@@ -700,7 +700,22 @@ impl LeanHostService {
         let mut log = call.request_log();
         let result = match call {
             TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
-            TaskCall::Trial(req) => tools::semantic::lean_trial(&self.ctx, req.into_inner()).await,
+            TaskCall::Trial(req) => {
+                let req = req.into_inner();
+                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+                {
+                    let mut req = req;
+                    let command = req
+                        .kind()
+                        .is_some_and(|kind| tools::request_aliases::canonical_kind("lean_trial", kind) == "command");
+                    let original = req.args.remove("managed_original");
+                    let managed =
+                        self.managed_setup_call(original, command.then_some("managed_trial_original_required"))?;
+                    tools::semantic::lean_trial_inner(&self.ctx, req, managed).await
+                }
+                #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+                tools::semantic::lean_trial(&self.ctx, req).await
+            }
             TaskCall::Verify(req) => {
                 #[allow(
                     unused_mut,

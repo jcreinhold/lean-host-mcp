@@ -652,9 +652,57 @@ fn needs_build_context(message: String) -> ProofStateResult {
 /// Returns infrastructure failures only. Invalid Lean commands are returned as
 /// diagnostics in the result.
 pub async fn command_trial(ctx: &ToolContext, req: CommandTrialRequest) -> Result<Response<CommandTrialResult>> {
+    command_trial_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn command_trial_inner(
+    ctx: &ToolContext,
+    req: CommandTrialRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<Response<CommandTrialResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let commands = req.commands.trim();
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if let Some(call) = managed {
+        let file = req
+            .file
+            .filter(|_| req.imports.is_empty() && crate::writer_setup_verification::valid_commands(commands))
+            .ok_or_else(|| {
+                crate::ServerError::BadProject(
+                    "managed trial requires one file and bounded commands without added imports".into(),
+                )
+            })?;
+        let input = read_query_file(&meta.canonical_root, &file)?;
+        let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved, input.hash);
+        let outcome = call
+            .file_query(
+                &ctx.broker,
+                &hint,
+                &meta.canonical_root,
+                &input.resolved,
+                &input.source,
+                input.imports.clone(),
+                (
+                    crate::writer_setup_verification::Projection::CommandTrial,
+                    Some(commands),
+                ),
+            )
+            .await?;
+        let (block, missing_imports) = diagnostics_from_batch_outcome(outcome.value);
+        let response = Response::ok(command_result(block, input.imports), outcome.freshness)
+            .with_runtime(outcome.runtime)
+            .with_trust_artifact(source_fact);
+        return Ok(warn_command_missing_imports(response, missing_imports));
+    }
     if commands.is_empty() {
         let base = ctx.broker.project_identity_without_worker(&hint, req.imports.clone())?;
         return Ok(

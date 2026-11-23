@@ -28,7 +28,10 @@ pub(crate) mod configured_consumer;
 pub(super) const CONSUMER: &str = "lake_configured_consumer_v1";
 use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
-pub(super) use setup::{DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION, OUTLINE as SETUP_OUTLINE};
+pub(super) use setup::{
+    COMMAND_TRIAL as SETUP_TRIAL, DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION,
+    OUTLINE as SETUP_OUTLINE,
+};
 pub(super) use writer_preparation::first_party_clean::OPERATION as FIRST_PARTY_CLEAN;
 pub(super) use writer_preparation::regroup::OPERATION as REGROUP;
 pub(super) use writer_preparation::tooling_suites::OPERATION as TOOLING_SUITES;
@@ -102,6 +105,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | SETUP_VERIFICATION
                     | SETUP_DIAGNOSTICS
                     | SETUP_OUTLINE
+                    | SETUP_TRIAL
                     | TOOLING_SUITES
                     | REGROUP
                     | WHOLE_LINT
@@ -193,7 +197,7 @@ pub(crate) fn validate_create(intent: &[u8]) -> Result<(), crate::native_store::
     let needs_validation = serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
         matches!(
             value.get("operation").and_then(serde_json::Value::as_str),
-            Some(writer_preparation::OPERATION | REGROUP)
+            Some(writer_preparation::OPERATION | REGROUP | SETUP_TRIAL)
         )
     });
     if needs_validation && parse_intent(intent).is_none() {
@@ -362,6 +366,10 @@ fn execute(
                 command
             }
             Stage::SetupVerification(request, projection) => {
+                if *projection == setup::Projection::CommandTrial {
+                    setup::read_source(root, request)
+                        .map_err(|_| McpError::invalid_params("managed_trial_source_changed", None))?;
+                }
                 let shims = shims
                     .as_ref()
                     .ok_or_else(|| McpError::invalid_params("setup_verification_not_started", None))?;

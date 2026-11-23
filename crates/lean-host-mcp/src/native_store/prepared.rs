@@ -224,6 +224,7 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                         readiness_writer::SETUP_VERIFICATION,
                         readiness_writer::SETUP_DIAGNOSTICS,
                         readiness_writer::SETUP_OUTLINE,
+                        readiness_writer::SETUP_TRIAL,
                         readiness_writer::TOOLING_SUITES,
                         readiness_writer::REGROUP,
                         readiness_writer::WHOLE_LINT,
