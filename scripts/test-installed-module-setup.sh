@@ -30,10 +30,57 @@ export R2_SETUP_ROOT="$scratch"
 export TMPDIR="$scratch/tmp" LEAN_RS_WORKER_OWNERS_DIRECTORY="$scratch/owners"
 export LEAN_HOST_MCP_SEMANTIC_CACHE_DIR="$scratch/semantic-cache"
 mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache" "$scratch/server-owners"
-cargo package --locked --workspace
-# Cargo verifies the archives by unpacking them beside the .crate files.
+# Verify the actual archives below with their published dependency locks.
+cargo package --locked --workspace --no-verify
 archives="$CARGO_TARGET_DIR/package"
-parent_manifest="$archives/lean-host-mcp-$version/Cargo.toml"
+pair="$scratch/archives"
+mkdir "$pair"
+for package in lean-host-mcp lean-host-mcp-worker; do
+    tar -xzf "$archives/$package-$version.crate" -C "$pair"
+done
+parent_manifest="$pair/lean-host-mcp-$version/Cargo.toml"
+worker_source="$pair/lean-host-mcp-worker-$version"
+cat >"$pair/Cargo.toml" <<EOF
+[workspace]
+members = ["lean-host-mcp-$version", "lean-host-mcp-worker-$version"]
+resolver = "3"
+
+[patch.crates-io]
+lean-host-mcp-worker = { path = "lean-host-mcp-worker-$version" }
+EOF
+cp "$pair/lean-host-mcp-$version/Cargo.lock" "$pair/Cargo.lock"
+cargo update --offline --manifest-path "$pair/Cargo.toml" -p lean-host-mcp-worker
+python3 - "$pair" "$version" <<'PY_LOCK'
+import pathlib
+import sys
+import tomllib
+
+pair, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+host_names = {"lean-host-mcp", "lean-host-mcp-worker"}
+
+def read_lock(directory):
+    with (directory / "Cargo.lock").open("rb") as stream:
+        return tomllib.load(stream)["package"]
+
+def registry_identities(entries):
+    return {
+        (p["name"], p["version"], p.get("source"), p.get("checksum"))
+        for p in entries if p["name"] not in host_names
+    }
+
+published_locks = set().union(*(
+    registry_identities(read_lock(pair / f"{name}-{version}")) for name in host_names
+))
+actual = read_lock(pair)
+sources = [(p["name"], p["version"], p.get("source")) for p in actual if p["name"] in host_names]
+if sorted(sources) != [(name, version, None) for name in sorted(host_names)]:
+    raise SystemExit(f"expected the exact unpacked candidate pair, found {sources!r}")
+identities = registry_identities(actual)
+if (not identities <= published_locks
+        or any(source != "registry+https://github.com/rust-lang/crates.io-index" or not checksum
+               for _, _, source, checksum in identities)):
+    raise SystemExit("candidate pairing changed external registry identities")
+PY_LOCK
 if "$managed_release"; then
     LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1 cargo build --locked --manifest-path "$parent_manifest" \
         --bin lean-host-mcp --features managed-native-store
@@ -48,7 +95,7 @@ if [[ ! -x $R2_SETUP_PARENT ]]; then
 fi
 cargo install --debug --locked --root "$R2_SETUP_ROOT/tools" --version "=$sdk" lean-rs-writer
 "$R2_SETUP_PARENT" install-worker --toolchain "$id" --workers-dir "$R2_SETUP_ROOT/workers" \
-    --source-dir "$archives/lean-host-mcp-worker-$version" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
+    --source-dir "$worker_source" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
 python3 tests/r2-launch-input/module_setup.py
 if "$managed_release"; then
     # Keep the exact packaged executable while Cargo builds the checkout's

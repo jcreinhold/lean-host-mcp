@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.17] - 2026-11-23
+
+### Added
+
+- Opt-in managed project selection with guarded rollback, original-key result recovery, and verified custody closure.
+- Managed root architecture lint and fixed prebuilt Lean tooling suites, with bounded diagnostics and retained preflight refusals.
+
+### Fixed
+
+- Setup-aware file verification records the executing CLI toolchain and exact inputs separately from worker compatibility.
+- Managed first-party clean checks the effective Lake output layout before deleting build files.
+
 ## [0.16.16] - 2026-11-22
 
 ### Fixed
