@@ -1000,6 +1000,11 @@ impl ProjectBroker {
         meta: &LakeProjectMeta,
         options: LeanWorkerElabOptions,
     ) -> Result<LeanWorkerElabOptions> {
+        if self.runtime_config.managed_only {
+            return Err(ServerError::BadProject(
+                "Lake option discovery requires a managed preparation stage".to_owned(),
+            ));
+        }
         let activity = self.preparation_activity(&meta.canonical_root).await?;
         // Resolve availability before evaluating arbitrary project configuration.
         // This is metadata-only and preserves ordinary missing-worker precedence.

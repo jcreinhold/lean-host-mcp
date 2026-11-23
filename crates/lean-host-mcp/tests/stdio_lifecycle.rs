@@ -1305,6 +1305,63 @@ unsafe def main (args : List String) : IO UInt32 := do
     }
 
     #[tokio::test]
+    async fn managed_semantic_trial_refuses_legacy_lake_option_discovery() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.project.join("Probe.lean"),
+            "import Lean\ndef fixtureValue : Nat := 42\n",
+        )
+        .expect("real Lean source");
+        let (store, id) = fixture.new_store("store").await;
+        fixture.enroll(&store, id);
+        let pins = fixture.custody().await;
+        let selected = fixture
+            .transition(&pins, "1", "managed")
+            .output()
+            .await
+            .expect("managed selection");
+        assert!(selected.status.success(), "{selected:?}");
+
+        let mut server = StdioServer::spawn(
+            fixture
+                .command()
+                .arg("--lake-root")
+                .arg(&fixture.project)
+                .args([
+                    "--launcher-mode",
+                    "managed",
+                    "--launcher-generation",
+                    "2",
+                    "--managed-only",
+                ])
+                .arg("--managed-native-store")
+                .arg(store),
+        );
+        server.initialize().await;
+        let response = server
+            .request_allow_error(
+                "tools/call",
+                json!({
+                    "name":"lean_trial",
+                    "arguments":{"kind":"command","file":"Probe.lean","commands":"#check fixtureValue"}
+                }),
+            )
+            .await;
+        assert!(
+            response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    message.contains("Lake option discovery requires a managed preparation stage")
+                }),
+            "{response}"
+        );
+        server.close_stdin_and_wait().await;
+        assert!(!fixture.project.join(".lake/config").exists());
+        assert!(!fixture.project.join(".lake/build").exists());
+    }
+
+    #[tokio::test]
     async fn launcher_rejects_valid_replacement_store_at_original_path() {
         let fixture = Fixture::new();
         let (store, id) = fixture.new_store("store").await;
