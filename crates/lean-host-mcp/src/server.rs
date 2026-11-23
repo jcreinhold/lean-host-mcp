@@ -315,6 +315,15 @@ impl LeanHostService {
         let task = match request.action {
             RetainedAction::Prepare | RetainedAction::Submit => {
                 let preparing = matches!(request.action, RetainedAction::Prepare);
+                if self.ctx.broker.managed_only() {
+                    let reason = "legacy_request_launch_disabled";
+                    let message = "managed-only mode requires the original managed admission";
+                    return Err(if preparing {
+                        crate::tasks::no_start(reason, message)
+                    } else {
+                        McpError::invalid_params(message, Some(serde_json::json!({"reason": reason})))
+                    });
+                }
                 if !preparing && request.request_id.is_none() {
                     return Err(crate::tasks::no_start(
                         "invalid_submission",
@@ -580,10 +589,12 @@ impl ServerHandler for LeanHostService {
         }
         // Coordination is immediate and must return its lease token directly,
         // even for clients that negotiate asynchronous Lean job handles.
-        if !matches!(
-            request.name.as_ref(),
-            "lean_runtime" | "lean_request" | "lean_compatibility"
-        ) && context.client_capabilities().is_some_and(|caps| caps.supports_tasks())
+        if !self.ctx.broker.managed_only()
+            && !matches!(
+                request.name.as_ref(),
+                "lean_runtime" | "lean_request" | "lean_compatibility"
+            )
+            && context.client_capabilities().is_some_and(|caps| caps.supports_tasks())
         {
             // Parse before acceptance. Task calls use no request-scoped peer or
             // cancellation token, so disconnecting cannot abandon their result.
@@ -649,20 +660,25 @@ impl ServerHandler for LeanHostService {
         // syntax (even with `..default`) is forbidden across crates. Build
         // via Default + field mutation.
         let mut info = ServerConfig::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().enable_tasks().build();
+        let capabilities = ServerCapabilities::builder().enable_tools();
+        info.capabilities = if self.ctx.broker.managed_only() {
+            capabilities.build()
+        } else {
+            capabilities.enable_tasks().build()
+        };
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
-        info.instructions = Some(
-            "MCP server hosting Lean 4 in supervised worker children via lean-rs. \
-             Tools expose five semantic Lean job families: context, trial, \
-             verification, lookup, and status. Context, trial, lookup, and \
-             status select a mode with `kind`; verification takes explicit \
-             target groups. Clients advertising io.modelcontextprotocol/tasks \
-             may receive task handles; results remain available for ten minutes \
-             after completion while this server process lives. Use lean_request to submit, \
-             retrieve or cancel retained requests without task negotiation."
-                .to_owned(),
-        );
+        let common = "MCP server hosting Lean 4 in supervised worker children via lean-rs. \
+             Tools expose five semantic Lean job families: context, trial, verification, lookup, and status. \
+             Context, trial, lookup, and status select a mode with `kind`; verification takes explicit target groups.";
+        let execution = if self.ctx.broker.managed_only() {
+            " Use lean_managed_admission for new jobs. Historical lean_request tickets support retrieval, cancellation, and acknowledgement."
+        } else {
+            " Clients advertising io.modelcontextprotocol/tasks may receive task handles; results remain available for ten minutes \
+             after completion while this server process lives. Use lean_request to submit, retrieve or cancel retained requests \
+             without task negotiation."
+        };
+        info.instructions = Some(format!("{common}{execution}"));
         info
     }
 }
@@ -1525,6 +1541,116 @@ mod tests {
         assert!(output.contains(r#"kind="invalid""#));
         assert!(output.contains(r#"outcome="tool_error""#));
         assert!(!output.contains("SECRET"));
+    }
+
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    #[tokio::test]
+    async fn managed_only_refuses_legacy_launches_and_keeps_historical_tickets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let service = |managed| {
+            LeanHostService::new(
+                ProjectBroker::new_with_runtime_config(
+                    crate::broker::BrokerConfig {
+                        config_default: None,
+                        env_default: None,
+                        cwd: dir.path().to_owned(),
+                        max_projects: std::num::NonZeroUsize::MIN,
+                        max_workers_per_project: std::num::NonZeroUsize::MIN,
+                        idle_timeout: Duration::ZERO,
+                    },
+                    crate::project::ProjectRuntimeConfig::default().with_managed_only(managed),
+                ),
+                ToolConfig::default(),
+            )
+        };
+        let ordinary = service(false);
+        let mut managed = service(true)
+            .with_managed_native_store(&dir.path().canonicalize().unwrap().join("stages.sqlite3"))
+            .unwrap();
+        let (server_io, mut client_io) = tokio::io::duplex(65_536);
+        client_io.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let running = ordinary.clone().serve(server_io).await.unwrap();
+        let mut context = RequestContext::new(NumberOrString::Number(2), running.peer().clone());
+        context
+            .meta
+            .set_client_capabilities(ClientCapabilities::builder().enable_tasks().build());
+        let call = CallToolRequestParams::new("lean_verify")
+            .with_arguments(serde_json::from_value(serde_json::json!({"targets": []})).unwrap());
+        let error = managed.call_tool(call.clone(), context.clone()).await.unwrap_err();
+        assert_eq!(error.message, "managed_verify_original_required");
+        assert!(!managed.get_info().capabilities.supports_tasks());
+        assert_eq!(managed.tasks.status().active, 0);
+        assert_eq!(managed.tasks.status().retained_terminal, 0);
+        assert!(matches!(
+            ordinary.call_tool(call, context).await.unwrap(),
+            CallToolResponse::Task(_)
+        ));
+
+        let request = |action, id, epoch, digest| {
+            Parameters(RetainedRequest {
+                action,
+                request_id: id,
+                request_epoch: epoch,
+                submission_sha256: digest,
+                tool: matches!(action, RetainedAction::Prepare | RetainedAction::Submit)
+                    .then(|| "lean_trial".to_owned()),
+                arguments: matches!(action, RetainedAction::Prepare | RetainedAction::Submit)
+                    .then(|| serde_json::from_value(serde_json::json!({"kind": "invalid"})).unwrap()),
+            })
+        };
+        let err = managed
+            .lean_request(request(RetainedAction::Prepare, None, None, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.data.unwrap()["reason"], "legacy_request_launch_disabled");
+        assert_eq!(managed.tasks.status().active, 0);
+        assert_eq!(managed.tasks.status().retained_terminal, 0);
+
+        let ticket = ordinary
+            .lean_request(request(RetainedAction::Prepare, None, None, None))
+            .await
+            .unwrap();
+        let ticket: serde_json::Value =
+            serde_json::from_str(&ticket.content.first().unwrap().as_text().unwrap().text).unwrap();
+        let id = ticket["taskId"].as_str().unwrap().to_owned();
+        let epoch = ticket["request"]["request_epoch"].as_str().unwrap().to_owned();
+        let digest = ticket["request"]["submission_sha256"].as_str().unwrap().to_owned();
+        managed.tasks = ordinary.tasks.clone();
+        let original = || (Some(id.clone()), Some(epoch.clone()));
+        let (key, epoch_arg) = original();
+        let err = managed
+            .lean_request(request(RetainedAction::Submit, key, epoch_arg, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.data.unwrap()["reason"], "legacy_request_launch_disabled");
+        assert!(err.message.contains("original managed admission"));
+        let (key, epoch_arg) = original();
+        let old = managed
+            .lean_request(request(RetainedAction::Get, key, epoch_arg, None))
+            .await
+            .unwrap();
+        let old: serde_json::Value =
+            serde_json::from_str(&old.content.first().unwrap().as_text().unwrap().text).unwrap();
+        assert_eq!(old["execution"]["reason"], "prepared");
+
+        let (key, epoch_arg) = original();
+        managed
+            .lean_request(request(RetainedAction::Cancel, key, epoch_arg, None))
+            .await
+            .unwrap();
+        let (key, epoch_arg) = original();
+        managed
+            .lean_request(request(RetainedAction::Get, key, epoch_arg, None))
+            .await
+            .unwrap();
+        let (key, epoch_arg) = original();
+        managed
+            .lean_request(request(RetainedAction::Acknowledge, key, epoch_arg, Some(digest)))
+            .await
+            .unwrap();
+        running.cancel().await.unwrap();
     }
 
     #[tokio::test]
