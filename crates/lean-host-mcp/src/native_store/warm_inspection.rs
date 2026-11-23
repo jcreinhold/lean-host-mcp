@@ -12,6 +12,68 @@ pub(crate) struct WarmGeneration {
     command: u64,
 }
 
+pub(super) fn previous_finished(
+    store: &mut NativeStore,
+    key: NativeKey,
+    capability: &Capability,
+    intent: &Intent,
+) -> Result<(NativeGuardianDrainBinding, ManagedInspectionCommand), McpError> {
+    let refused = || McpError::invalid_params("warm_predecessor_unavailable", None);
+    let predecessor = intent.warm_predecessor.as_ref().ok_or_else(refused)?;
+    if predecessor.stage == 0 || predecessor.nonce == key.nonce {
+        return Err(refused());
+    }
+    let stage = predecessor.stage;
+    let key = NativeKey {
+        nonce: predecessor.nonce,
+        stage,
+        ..key
+    };
+    let previous = store.client_get(key, capability).map_err(|_| refused())?;
+    let ordinal = previous.ended_ordinal.ok_or_else(refused)?;
+    let old: Intent = serde_json::from_slice(&previous.intent).map_err(|_| refused())?;
+    if previous.gate != Gate::Consumed
+        || previous.resource_report != ResourceReport::Open
+        || previous.stop_requested
+        || !matches!(
+            old.operation.as_deref(),
+            Some(WARM_WRITER_INSPECTION | WARM_REUSE_INSPECTION)
+        )
+        || old.project != intent.project
+        || old.imports != intent.imports
+        || old.prepared_sha256 != intent.prepared_sha256
+        || old.job != intent.job
+        || old.revision != intent.revision
+    {
+        return Err(refused());
+    }
+    let original = SavedRequest {
+        caller: CallerKey {
+            job: old.job,
+            stage,
+            revision: old.revision,
+        },
+        key,
+        intent: previous.intent,
+        capability: capability.clone(),
+    };
+    let (_, identity) = store.observe_historical_scope(&original).map_err(|_| refused())?;
+    let binding = native_binding(&identity);
+    if !identity.matches_directory()
+        || !binding.worker.is_live().map_err(|_| refused())?
+        || !binding.guardian.is_live().map_err(|_| refused())?
+    {
+        return Err(refused());
+    }
+    let command = ManagedInspectionCommand {
+        generation: binding.generation.clone(),
+        attempt: key.nonce,
+        stage,
+        command: ordinal,
+    };
+    Ok((binding, command))
+}
+
 fn callback_error(error: impl std::fmt::Display) -> LeanWorkerError {
     LeanWorkerError::Setup {
         message: error.to_string(),
@@ -32,6 +94,29 @@ impl Job {
             .is_none_or(|root| !self.intent.source_matches(root))
         {
             return Err(internal("warm inspection source changed"));
+        }
+        if let Some((expected, predecessor)) = &self.reuse {
+            let prior = warm
+                .as_ref()
+                .filter(|prior| prior.command == predecessor.command)
+                .ok_or_else(|| internal("warm predecessor generation retired or changed"))?;
+            // SQLite stores the boot UUID as bytes. Compare its canonical
+            // spelling, then pass the original SDK binding back unchanged.
+            let mut stored = expected.clone();
+            if uuid::Uuid::parse_str(&prior.expected.boot)
+                .map_err(internal)?
+                .to_string()
+                != stored.boot
+            {
+                return Err(internal("warm predecessor boot changed"));
+            }
+            stored.boot.clone_from(&prior.expected.boot);
+            if stored != prior.expected {
+                return Err(internal("warm predecessor generation retired or changed"));
+            }
+            worker
+                .validate_managed_warm_continuation(&prior.expected, predecessor)
+                .map_err(internal)?;
         }
         let (expected, ordinal) = if let Some(prior) = warm.as_ref() {
             if prior.imports != self.intent.imports {

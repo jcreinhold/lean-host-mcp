@@ -417,10 +417,7 @@ impl ProjectRuntimeConfig {
     /// Carry the resolved broker idle limit into a selected warm development generation.
     #[must_use]
     pub fn with_managed_warm_idle(mut self, seconds: u64) -> Self {
-        if self.managed_only
-            && self.prepared_generation.is_some()
-            && crate::managed_prepared::warm_development_enabled()
-        {
+        if self.managed_only && crate::managed_prepared::warm_development_enabled() {
             self.managed_warm_idle_seconds = Some(seconds);
         }
         self
@@ -1401,6 +1398,14 @@ impl LeanProject {
 
     pub(crate) fn accepts_prepared_generation(&self, required: Option<&str>) -> bool {
         required.is_none_or(|record| self.prepared_generation.as_deref() == Some(record))
+    }
+
+    #[cfg(lean_host_mcp_development_warm)]
+    pub(crate) fn has_prepared_digest(&self, digest: &[u8; 32]) -> bool {
+        use sha2::{Digest as _, Sha256};
+        self.prepared_generation
+            .as_deref()
+            .is_some_and(|record| Sha256::digest(record.as_bytes()).as_slice() == digest)
     }
 
     /// A test controller whose real shared-lock owner exits with its mailbox.

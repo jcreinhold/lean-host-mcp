@@ -44,6 +44,21 @@ impl ClientRequest {
         Some((key, Capability(capability)))
     }
 
+    #[cfg(lean_host_mcp_development_warm)]
+    pub(crate) fn create_identity(&self) -> Option<(NativeKey, Capability, &[u8])> {
+        let ClientCommand::Create {
+            key,
+            capability,
+            intent,
+            after_writer: None,
+            ..
+        } = &self.command
+        else {
+            return None;
+        };
+        Some((*key, Capability(*capability), intent))
+    }
+
     pub(crate) fn start_identity(&self) -> Option<(NativeKey, Capability)> {
         let ClientCommand::Start { key, capability } = self.command else {
             return None;

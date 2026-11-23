@@ -1309,6 +1309,20 @@ impl ProjectBroker {
         .map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
     }
 
+    #[cfg(lean_host_mcp_development_warm)]
+    pub(crate) fn existing_managed_actor_for_digest(&self, digest: &[u8; 32]) -> Result<Arc<LeanProject>> {
+        let root = self.native_root(&ProjectHint::Default)?;
+        let mut inner = self.inner.lock();
+        Self::check_runtime_admission(&mut inner, &root)?;
+        let _artifact_admission = Self::check_artifact_admission(&inner, &root)?;
+        inner
+            .registry
+            .iter()
+            .find(|(key, actor)| key.root == root && actor.is_healthy() && actor.has_prepared_digest(digest))
+            .map(|(_, actor)| Arc::clone(actor))
+            .ok_or_else(|| ServerError::BadProject("warm prepared generation is unavailable".to_owned()))
+    }
+
     fn select_existing_worker(&self, root: &Path, prepared: Option<&str>) -> Result<Option<Arc<LeanProject>>> {
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;

@@ -201,7 +201,12 @@ impl LeanHostService {
             let selected = crate::managed_prepared::warm_development_enabled();
             if selected {
                 if !self.ctx.broker.managed_only()
-                    || self.ctx.broker.prepared_generation().is_none()
+                    || (self.ctx.broker.prepared_generation().is_none()
+                        && !(self
+                            .ctx
+                            .broker
+                            .native_root(&crate::broker::ProjectHint::Default)
+                            .is_ok_and(|root| crate::writer_preparation::closure_preparation_configured(&root))))
                     || expected.is_some()
                 {
                     return Err(std::io::Error::other(
@@ -284,6 +289,18 @@ impl LeanHostService {
         {
             let reply = crate::managed_prepared::drain(&mut store, claim)?;
             return Ok(CallToolResult::success(vec![ContentBlock::text(reply.to_string())]));
+        }
+        #[cfg(lean_host_mcp_development_warm)]
+        if let Ok(command) = crate::native_store::store::boundary::decode(input.request.as_bytes())
+            && let Some((key, capability, intent)) = command.create_identity()
+        {
+            crate::managed_prepared::validate_warm_reuse_create(
+                &self.ctx.broker,
+                &mut store,
+                key,
+                &capability,
+                intent,
+            )?;
         }
         let budget = cfg!(any(target_os = "macos", target_os = "linux"))
             .then(|| Duration::from_millis(self.ctx.broker.request_timeout_millis()));

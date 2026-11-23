@@ -28,6 +28,8 @@ pub(crate) const NAMED_INSPECTION: &str = "lean_declaration_inspection_v1";
 const WRITER_INSPECTION: &str = "lean_declaration_inspection_from_writer_v1";
 
 pub(crate) const WARM_INSPECTION: &str = "lean_declaration_inspection_warm_v1";
+const WARM_WRITER_INSPECTION: &str = "lean_declaration_inspection_warm_from_writer_v1";
+const WARM_REUSE_INSPECTION: &str = "lean_declaration_inspection_warm_reuse_v1";
 
 #[cfg(lean_host_mcp_development_warm)]
 pub(crate) fn warm_development_enabled() -> bool {
@@ -42,11 +44,14 @@ fn warm_selected() -> bool {
 }
 
 fn is_warm(operation: Option<&str>) -> bool {
-    operation == Some(WARM_INSPECTION)
+    matches!(
+        operation,
+        Some(WARM_INSPECTION | WARM_WRITER_INSPECTION | WARM_REUSE_INSPECTION)
+    )
 }
 
 fn is_named(operation: Option<&str>) -> bool {
-    matches!(operation, Some(NAMED_INSPECTION | WARM_INSPECTION | WRITER_INSPECTION))
+    is_warm(operation) || matches!(operation, Some(NAMED_INSPECTION | WRITER_INSPECTION))
 }
 
 fn selected_inspection(warm: bool) -> &'static str {
@@ -54,7 +59,11 @@ fn selected_inspection(warm: bool) -> &'static str {
 }
 
 fn inspection_allowed(operation: Option<&str>, warm: bool) -> bool {
-    operation == Some(selected_inspection(warm)) || (!warm && matches!(operation, None | Some(WRITER_INSPECTION)))
+    if warm {
+        is_warm(operation)
+    } else {
+        matches!(operation, None | Some(NAMED_INSPECTION | WRITER_INSPECTION))
+    }
 }
 
 #[cfg(lean_host_mcp_development_warm)]
@@ -81,6 +90,14 @@ struct Intent {
     project: Option<std::path::PathBuf>,
     inspection: Option<LeanWorkerDeclarationInspectionRequest>,
     source: Option<InspectionSource>,
+    warm_predecessor: Option<WarmPredecessor>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WarmPredecessor {
+    nonce: [u8; 16],
+    stage: u64,
 }
 
 #[derive(Deserialize, Eq, PartialEq, Serialize)]
@@ -100,7 +117,15 @@ impl Intent {
     }
 
     fn request(&self) -> Option<LeanWorkerDeclarationInspectionRequest> {
-        if self.job.is_empty() || self.revision == 0 || self.imports.is_empty() {
+        if self.job.is_empty()
+            || self.revision == 0
+            || self.imports.is_empty()
+            || (self.operation.as_deref() == Some(WARM_REUSE_INSPECTION)) != self.warm_predecessor.is_some()
+            || self
+                .warm_predecessor
+                .as_ref()
+                .is_some_and(|previous| previous.nonce == [0; 16] || previous.stage == 0)
+        {
             return None;
         }
         match self.operation.as_deref() {
@@ -144,7 +169,10 @@ impl Intent {
 
 fn selected_writer_record(writer: &crate::native_store::store::Snapshot, intent: &Intent) -> Option<Option<String>> {
     let project = intent.project.as_deref()?;
-    if !matches!(intent.operation.as_deref(), Some(NAMED_INSPECTION | WRITER_INSPECTION)) || intent.request().is_none()
+    if !matches!(
+        intent.operation.as_deref(),
+        Some(NAMED_INSPECTION | WRITER_INSPECTION | WARM_WRITER_INSPECTION)
+    ) || intent.request().is_none()
     {
         return None;
     }
@@ -152,7 +180,7 @@ fn selected_writer_record(writer: &crate::native_store::store::Snapshot, intent:
         readiness_writer::prepared_inspection_receipt(writer, project, &intent.imports, &intent.job, intent.revision)?;
     match (intent.operation.as_deref(), record) {
         (Some(NAMED_INSPECTION), None) => Some(None),
-        (Some(WRITER_INSPECTION), Some(record))
+        (Some(WRITER_INSPECTION | WARM_WRITER_INSPECTION), Some(record))
             if Sha256::digest(record.as_bytes()).as_slice() == intent.prepared_sha256 =>
         {
             Some(Some(record))
@@ -173,16 +201,40 @@ pub(crate) fn validate_writer_handoff(writer: &crate::native_store::store::Snaps
 
 pub(crate) fn validate_create_at_boundary(bytes: &[u8], after_writer: bool) -> Result<(), Reject> {
     let operation = serde_json::from_slice::<serde_json::Value>(bytes).ok();
-    if !after_writer
-        && operation
-            .as_ref()
-            .and_then(|value| value.get("operation"))
-            .and_then(serde_json::Value::as_str)
-            == Some(WRITER_INSPECTION)
-    {
+    let operation = operation
+        .as_ref()
+        .and_then(|value| value.get("operation"))
+        .and_then(serde_json::Value::as_str);
+    if !after_writer && matches!(operation, Some(WRITER_INSPECTION | WARM_WRITER_INSPECTION)) {
         return Err(Reject::InvalidReadinessIntent);
     }
     validate_create(bytes)
+}
+
+#[cfg(lean_host_mcp_development_warm)]
+pub(crate) fn validate_warm_reuse_create(
+    broker: &ProjectBroker,
+    store: &mut NativeStore,
+    key: NativeKey,
+    capability: &Capability,
+    bytes: &[u8],
+) -> Result<(), McpError> {
+    let Ok(intent) = serde_json::from_slice::<Intent>(bytes) else {
+        return Ok(());
+    };
+    if intent.operation.as_deref() != Some(WARM_REUSE_INSPECTION) {
+        return Ok(());
+    }
+    // Let existing rows keep their ordinary exact idempotency and GET behavior.
+    if store.client_get(key, capability).is_ok() {
+        return Ok(());
+    }
+    validate_create(bytes).map_err(|_| McpError::invalid_params("operation_disabled", None))?;
+    warm_inspection::previous_finished(store, key, capability, &intent)?;
+    broker
+        .existing_managed_actor_for_digest(&intent.prepared_sha256)
+        .map_err(|_| McpError::invalid_params("warm_predecessor_unavailable", None))?;
+    Ok(())
 }
 
 pub(crate) fn validate_create(bytes: &[u8]) -> Result<(), Reject> {
@@ -263,6 +315,11 @@ pub(crate) struct Job {
     intent: Box<Intent>,
     request: LeanWorkerDeclarationInspectionRequest,
     deadline: AdmissionDeadline,
+    #[cfg(lean_host_mcp_development_warm)]
+    reuse: Option<(
+        NativeGuardianDrainBinding,
+        lean_rs_worker_protocol::protocol::ManagedInspectionCommand,
+    )>,
 }
 
 struct StopRegistration<'a> {
@@ -471,12 +528,15 @@ fn advertise_for_mode(mut reply: serde_json::Value, broker: &ProjectBroker, warm
                         readiness_writer::WHOLE_LINT,
                         readiness_writer::FIRST_PARTY_CLEAN,
                     ]);
-                    if !warm
-                        && broker.managed_only()
+                    if broker.managed_only()
                         && let Ok(root) = broker.native_root(&crate::broker::ProjectHint::Default)
                         && crate::writer_preparation::closure_preparation_configured(&root)
                     {
-                        operations.push(WRITER_INSPECTION);
+                        if warm {
+                            operations.extend([WARM_WRITER_INSPECTION, WARM_REUSE_INSPECTION]);
+                        } else {
+                            operations.push(WRITER_INSPECTION);
+                        }
                     }
                     if broker.managed_only()
                         && let Ok(runtime) = crate::tools::proof_search::RuntimeSelection::configured()
@@ -562,8 +622,12 @@ async fn start_for_mode(
     }
     let intent: Intent = serde_json::from_slice(&snapshot.intent)
         .map_err(|_| McpError::invalid_params("invalid_inspection_intent", None))?;
-    let from_writer = intent.operation.as_deref() == Some(WRITER_INSPECTION);
-    if !from_writer && broker.prepared_generation().is_none() {
+    let from_writer = matches!(
+        intent.operation.as_deref(),
+        Some(WRITER_INSPECTION | WARM_WRITER_INSPECTION)
+    );
+    let reuse_requested = intent.operation.as_deref() == Some(WARM_REUSE_INSPECTION);
+    if !from_writer && !reuse_requested && broker.prepared_generation().is_none() {
         return Err(McpError::invalid_params("operation_disabled", None));
     }
     if !inspection_allowed(intent.operation.as_deref(), warm) {
@@ -586,6 +650,17 @@ async fn start_for_mode(
     let admitted = snapshot
         .admission_deadline
         .ok_or_else(|| McpError::invalid_params("missing_admission_deadline", None))?;
+    #[cfg(lean_host_mcp_development_warm)]
+    let reuse = if reuse_requested {
+        Some(warm_inspection::previous_finished(
+            &mut store.lock(),
+            key,
+            &capability,
+            &intent,
+        )?)
+    } else {
+        None
+    };
     let configured = if from_writer {
         let refusal = || McpError::invalid_params("prepared_predecessor_unavailable", None);
         let stage = key
@@ -607,13 +682,20 @@ async fn start_for_mode(
         selected_writer_record(&predecessor, &intent)
             .flatten()
             .ok_or_else(refusal)?
+    } else if reuse_requested {
+        #[cfg(lean_host_mcp_development_warm)]
+        {
+            String::new()
+        }
+        #[cfg(not(lean_host_mcp_development_warm))]
+        return Err(McpError::invalid_params("operation_disabled", None));
     } else {
         broker
             .prepared_generation()
             .ok_or_else(|| McpError::invalid_params("no_prepared_project", None))?
             .to_owned()
     };
-    if Sha256::digest(configured.as_bytes()).as_slice() != intent.prepared_sha256 {
+    if !reuse_requested && Sha256::digest(configured.as_bytes()).as_slice() != intent.prepared_sha256 {
         return Err(McpError::invalid_params("prepared_generation_changed", None));
     }
     let now = Instant::now();
@@ -623,7 +705,14 @@ async fn start_for_mode(
     let deadline = now
         .checked_add(remaining)
         .ok_or_else(|| McpError::internal_error("deadline_overflow", None))?;
-    let actor = if from_writer {
+    let actor = if reuse_requested {
+        #[cfg(lean_host_mcp_development_warm)]
+        {
+            broker.existing_managed_actor_for_digest(&intent.prepared_sha256)
+        }
+        #[cfg(not(lean_host_mcp_development_warm))]
+        return Err(McpError::invalid_params("operation_disabled", None));
+    } else if from_writer {
         broker.managed_actor_for_record(&configured, deadline.into()).await
     } else {
         broker.managed_actor(deadline.into()).await
@@ -648,6 +737,8 @@ async fn start_for_mode(
         intent: Box::new(intent),
         request,
         deadline: admitted,
+        #[cfg(lean_host_mcp_development_warm)]
+        reuse,
     };
     if let Err(error) = actor.inspect_managed(job, deadline).await {
         tracing::debug!(%error, "managed inspection did not confirm a result");
