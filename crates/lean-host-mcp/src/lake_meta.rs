@@ -250,6 +250,12 @@ static LEAN_LIB_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?m)^\s*lean_lib\s+«?([A-Za-z_][A-Za-z0-9_]*)»?").expect("lean_lib regex is a valid literal")
 });
 
+/// Compile the fixed project discovery patterns before polling nested tool futures.
+pub(crate) fn prepare_project_discovery() {
+    LazyLock::force(&PACKAGE_RE);
+    LazyLock::force(&LEAN_LIB_RE);
+}
+
 fn parse_lakefile_lean(path: &Path) -> Result<LakefileParsed> {
     let contents =
         std::fs::read_to_string(path).map_err(|e| ServerError::BadProject(format!("read {}: {e}", path.display())))?;

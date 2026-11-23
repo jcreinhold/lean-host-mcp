@@ -49,7 +49,7 @@ jobs:
       - name: clippy
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo clippy --locked -p lean-host-mcp --features managed-native-store --test stdio_lifecycle -- -D warnings
+          cargo clippy --locked -p lean-host-mcp --features managed-warm-inspections --test stdio_lifecycle -- -D warnings
       # rustdoc per member: a broken or private intra-doc link ships to docs.rs
       # as dead text, so fail on it here.
       - name: rustdoc

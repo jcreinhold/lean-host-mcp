@@ -52,6 +52,7 @@ harness = false
 name = "ilean_reference_scan"
 
 [features]
+managed-warm-inspections = ["managed-native-store"]
 managed-native-store = ["dep:rusqlite"]
 
 [dependencies]
