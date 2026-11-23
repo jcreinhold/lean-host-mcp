@@ -287,6 +287,8 @@ pub struct ProjectRuntimeConfig {
     prepared_generation: Option<String>,
     pub(crate) managed_semantic_companion: bool,
     pub(crate) managed_only: bool,
+    #[cfg(lean_host_mcp_development_warm)]
+    managed_warm_idle_seconds: Option<u64>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -415,6 +417,19 @@ impl ProjectRuntimeConfig {
         self
     }
 
+    #[cfg(lean_host_mcp_development_warm)]
+    /// Carry the resolved broker idle limit into a selected warm development generation.
+    #[must_use]
+    pub fn with_managed_warm_idle(mut self, seconds: u64) -> Self {
+        if self.managed_only
+            && self.prepared_generation.is_some()
+            && crate::managed_prepared::warm_development_enabled()
+        {
+            self.managed_warm_idle_seconds = Some(seconds);
+        }
+        self
+    }
+
     pub(crate) fn prepared_generation(&self) -> Option<&str> {
         self.prepared_generation.as_deref()
     }
@@ -447,6 +462,8 @@ impl ProjectRuntimeConfig {
             prepared_generation: None,
             managed_semantic_companion: false,
             managed_only: false,
+            #[cfg(lean_host_mcp_development_warm)]
+            managed_warm_idle_seconds: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -712,6 +729,8 @@ fn parse_runtime_config(
         prepared_generation: None,
         managed_semantic_companion: false,
         managed_only: false,
+        #[cfg(lean_host_mcp_development_warm)]
+        managed_warm_idle_seconds: None,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),
@@ -1887,6 +1906,8 @@ impl Drop for LeanProject {
 #[derive(Clone)]
 struct ActorConfig {
     prepared_generation: Option<String>,
+    #[cfg(lean_host_mcp_development_warm)]
+    managed_warm_idle_seconds: Option<u64>,
     maintenance: crate::broker::MaintenanceAccess,
     lake_root: PathBuf,
     manifest_hash: String,
@@ -2024,6 +2045,8 @@ impl ActorConfig {
                 .prepared_generation
                 .clone()
                 .filter(|_| runtime_config.operator_primary.as_ref() == Some(&meta.canonical_root)),
+            #[cfg(lean_host_mcp_development_warm)]
+            managed_warm_idle_seconds: runtime_config.managed_warm_idle_seconds,
             manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
             worker_path,
@@ -3749,6 +3772,11 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
     if scope == "main"
         && let Some(input) = &config.prepared_generation
     {
+        #[cfg(lean_host_mcp_development_warm)]
+        if let Some(seconds) = config.managed_warm_idle_seconds {
+            child = child.managed_warm_idle_seconds(seconds);
+        }
+
         child = child
             .application_launch_input(input)
             .map_err(|e| ServerError::BadProject(e.to_string()))?;
@@ -4594,6 +4622,8 @@ mod tests {
         }));
         let mut config = ActorConfig {
             prepared_generation: None,
+            #[cfg(lean_host_mcp_development_warm)]
+            managed_warm_idle_seconds: None,
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: tmp.path().join("consumer"),
             manifest_hash: "sha256-test".to_owned(),

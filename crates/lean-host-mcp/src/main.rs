@@ -439,6 +439,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     } else {
         runtime_config
     };
+    #[cfg(lean_host_mcp_development_warm)]
+    let runtime_config = runtime_config.with_managed_warm_idle(idle_timeout.as_secs());
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());

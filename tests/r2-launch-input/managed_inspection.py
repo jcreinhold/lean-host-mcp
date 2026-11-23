@@ -61,7 +61,10 @@ def run_check(args):
     def server(*, stop_before_arm=False, stop_after_claim=False):
         child_env = dict(env)
         if args.warm_reuse:
-            child_env["LEAN_HOST_MCP_DEVELOPMENT_WARM"] = "1"
+            child_env.update(
+                LEAN_HOST_MCP_DEVELOPMENT_WARM="1",
+                LEAN_HOST_MCP_IDLE_TIMEOUT_SECS="30",
+            )
         if args.deadline_while_sql_locked:
             child_env["LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS"] = "5000"
         if args.abrupt and entry_trace:
