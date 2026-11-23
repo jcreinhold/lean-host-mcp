@@ -17,7 +17,9 @@ use tokio::sync::Semaphore;
 use crate::{
     ProjectBroker,
     broker::ProjectHint,
-    native_store::store::{AdmissionDeadline, Capability, NativeStore, ResourceReport, Snapshot},
+    native_store::store::{
+        AdmissionDeadline, Capability, NativeStore, ResourceReport, Snapshot, readiness_writer::ReadinessDecision,
+    },
     writer_preparation::{self, Plan, Receipt, Target},
 };
 
@@ -271,17 +273,41 @@ fn execute(
     let roots = shims.as_ref().map_or(&[][..], |shims| shims.domains.as_slice());
     let budget = deadline.remaining().map_err(|error| super::public_error(&error))?;
     let mut writer = SharedWriter::open_with_write_roots(helper, root, roots, budget, &expired).map_err(no_start)?;
+    if let Stage::Preparation(Target::ToolingSuites { executable_sha256 }) = stage
+        && writer_preparation::tooling_suites::check(root, executable_sha256, &|| {
+            deadline.remaining().map_err(io::Error::other)
+        })
+        .is_err()
+    {
+        let binding = writer.stage_ready().map_err(no_start).and_then(|ready| {
+            store
+                .lock()
+                .bind_readiness_writer(
+                    original.key,
+                    capability,
+                    &original.intent,
+                    ready,
+                    deadline,
+                    ReadinessDecision::RejectPrebuilt,
+                )
+                .map_err(|error| super::public_error(&error))
+        });
+        writer
+            .close(Duration::from_secs(5))
+            .map_err(|_| McpError::internal_error("readiness_custody_unresolved", None))?;
+        if let Some(binding) = binding? {
+            store
+                .lock()
+                .finish_prebuilt_refusal(binding, capability)
+                .map_err(|error| super::public_error(&error))?;
+        }
+        return Ok(());
+    }
     let cancellation = LeanWorkerCancellationToken::default();
     let prepared = (|| {
         let ready = writer.stage_ready().map_err(no_start)?.clone();
         let command = match stage {
             Stage::Preparation(target) => {
-                if let Target::ToolingSuites { executable_sha256 } = target {
-                    writer_preparation::tooling_suites::check(root, executable_sha256, &|| {
-                        deadline.remaining().map_err(io::Error::other)
-                    })
-                    .map_err(|_| McpError::invalid_params("tooling_suite_prebuilt_unavailable_or_changed", None))?;
-                }
                 let plan = Plan {
                     root: root.to_owned(),
                     target: target.clone(),
@@ -356,7 +382,14 @@ fn execute(
         .map_err(no_start)?;
         let mut store = store.lock();
         let binding = store
-            .consume_readiness_writer(original.key, capability, &original.intent, &ready, deadline)
+            .bind_readiness_writer(
+                original.key,
+                capability,
+                &original.intent,
+                &ready,
+                deadline,
+                ReadinessDecision::Launch,
+            )
             .map_err(|error| super::public_error(&error))?;
         if let Some(binding) = binding {
             store

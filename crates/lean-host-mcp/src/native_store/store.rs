@@ -19,7 +19,7 @@ mod trace_read;
 
 #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
 #[path = "store/readiness_writer.rs"]
-mod readiness_writer;
+pub(crate) mod readiness_writer;
 
 const CALLER_ROLE: i64 = 0x4c53_434a;
 const NATIVE_ROLE: i64 = 0x4c53_4e53;

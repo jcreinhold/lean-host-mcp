@@ -2,20 +2,30 @@ use lean_toolchain::shared_writer::WriterStageReady;
 use rusqlite::{TransactionBehavior, params};
 
 use super::{
-    AdmissionDeadline, Answer, Binding, Capability, Gate, NativeKey, NativeStore, Problem, Reject, Scope, authenticate,
-    bind_scope_transaction, commit, digest, number, read_stage, reject,
+    AdmissionDeadline, Answer, Binding, Capability, Gate, NativeKey, NativeStore, Problem, Reject, ResourceReport,
+    ResultKnowledge, Scope, authenticate, bind_scope_transaction, commit, digest, number, read_stage, reject,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadinessDecision {
+    Launch,
+    RejectPrebuilt,
+}
+
+const PREBUILT_REFUSAL: &[u8] =
+    br#"{"version":1,"stage":"lean-tooling-suites","status":"not_started","reason":"tooling_suite_prebuilt_unavailable_or_changed","checks":[]}"#;
 
 impl NativeStore {
     /// Atomically record the Ready helper and spend the caller's original
     /// attempt. No uncommitted or ambiguous write can authorize dispatch.
-    pub(crate) fn consume_readiness_writer(
+    pub(crate) fn bind_readiness_writer(
         &mut self,
         key: NativeKey,
         capability: &Capability,
         intent: &[u8],
         ready: &WriterStageReady,
         deadline: AdmissionDeadline,
+        decision: ReadinessDecision,
     ) -> Answer<Option<Binding>> {
         self.checked_key(key)?;
         self.db.check_profile()?;
@@ -42,7 +52,9 @@ impl NativeStore {
         if stage.admission_deadline != Some(deadline) {
             return reject(Reject::InvalidLaunchDeadline);
         }
-        deadline.remaining()?;
+        if decision == ReadinessDecision::Launch {
+            deadline.remaining()?;
+        }
         // Content-address the owner under a fresh scope ID. The entire
         // receipt and its original stage remain independently inspectable.
         let owner = digest(&identity)
@@ -72,11 +84,43 @@ impl NativeStore {
             "INSERT INTO readiness_writer_bindings VALUES(?1,?2,?3,?4)",
             params![number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?, identity],
         )?;
+        let (gate, stop) = match decision {
+            ReadinessDecision::Launch => (1, false),
+            ReadinessDecision::RejectPrebuilt => (2, true),
+        };
         tx.execute(
-            "UPDATE stages SET gate=1,resource_report=1 WHERE epoch=?1 AND nonce=?2 AND stage=?3",
-            params![number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?],
+            "UPDATE stages SET gate=?4,stop_requested=?5,resource_report=1
+             WHERE epoch=?1 AND nonce=?2 AND stage=?3",
+            params![number(key.epoch)?, key.nonce.as_slice(), number(key.stage)?, gate, stop],
         )?;
         commit(tx, "consume")?;
         Ok(Some(binding))
+    }
+
+    /// The caller must have observed exact closure of the bound preflight writer.
+    pub(crate) fn finish_prebuilt_refusal(&mut self, binding: Binding, capability: &Capability) -> Answer<()> {
+        self.mutate_bound(binding, capability, |tx, old| {
+            if old.gate != Gate::Sealed
+                || !old.stop_requested
+                || old.spawn.is_some()
+                || old.resource_report != ResourceReport::Open
+                || old.result != ResultKnowledge::Pending
+            {
+                return reject(Reject::WrongScope);
+            }
+            tx.execute(
+                "UPDATE stages SET resource_report=3,result_kind=1,result_id=?1,result_hash=?2,result_body=?3
+                 WHERE epoch=?4 AND nonce=?5 AND stage=?6",
+                params![
+                    uuid::Uuid::new_v4().as_bytes(),
+                    digest(PREBUILT_REFUSAL),
+                    PREBUILT_REFUSAL,
+                    number(binding.key.epoch)?,
+                    binding.key.nonce.as_slice(),
+                    number(binding.key.stage)?
+                ],
+            )?;
+            Ok(())
+        })
     }
 }
