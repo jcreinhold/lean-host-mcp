@@ -202,6 +202,7 @@ fn lean_context_schema() -> Schema {
                 "file": { "type": "string", "description": "Path to a .lean file, relative to the project root unless absolute." },
                 "declaration": { "type": "string", "description": "Fully-qualified or file-local declaration name." },
                 "proof_position": proof_position_selector_schema(),
+                "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                 "include_boundaries": { "type": "boolean", "default": false, "description": "Opt in to the proof-boundary list (proof_boundaries). Default false: boundaries are navigation metadata; request them once per declaration to pick a position selector, then drive steps with self-contained lean_trial calls." },
                 "include_expected_type": { "type": "boolean", "default": false, "description": "Opt in to the goal's expected type (expected_type). Default false." },
                 "project": { "type": ["string", "null"], "description": "Optional project-root override." }
@@ -596,6 +597,22 @@ impl StatusInclude {
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
+    lean_context_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn lean_context_inner(
+    ctx: &ToolContext,
+    req: SemanticToolRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<SemanticResponse<Value>> {
     let kind = req.kind().map(|kind| canonical_kind("lean_context", kind).to_owned());
     match kind.as_deref() {
         Some("proof_position") => {
@@ -603,7 +620,15 @@ pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(position::proof_state(ctx, request).await?, ctx.config)
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            let response = if managed.is_some() {
+                position::proof_state_inner(ctx, request, managed).await?
+            } else {
+                position::proof_state(ctx, request).await?
+            };
+            #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+            let response = position::proof_state(ctx, request).await?;
+            from_tool_response(response, ctx.config)
         }
         Some(kind) => Ok(invalid_kind("lean_context", kind, &["proof_position"])),
         None => Ok(missing_kind("lean_context", &["proof_position"])),

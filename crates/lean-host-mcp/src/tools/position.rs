@@ -408,9 +408,57 @@ enum BatchProjection {
 /// Returns `ServerError::Io` when the file cannot be read and
 /// `ServerError::Lean` for worker infrastructure failures.
 pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Response<ProofStateResult>> {
+    proof_state_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn proof_state_inner(
+    ctx: &ToolContext,
+    req: ProofStateRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<Response<ProofStateResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let source = read_query_file(&meta.canonical_root, &req.file)?;
+    let position = worker_proof_position(req.proof_position);
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if let Some(call) = managed {
+        use crate::writer_setup_verification::{FileQuery, ProofPosition};
+        let selector = ProofPosition {
+            declaration: req.declaration,
+            position,
+        };
+        let reply = call
+            .file_query(
+                &ctx.broker,
+                &hint,
+                &meta.canonical_root,
+                &source.resolved,
+                &source.source,
+                source.imports.clone(),
+                FileQuery::Proof(&selector),
+            )
+            .await?;
+        let run = BatchRun {
+            outcome: route_batch_outcome(reply.value),
+            runtime: reply.runtime,
+            freshness: reply.freshness,
+            source_fact: ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &source.resolved, source.hash),
+        };
+        return Ok(proof_state_response(
+            run,
+            ctx.config.verbosity.is_full(),
+            req.include_boundaries,
+            req.include_expected_type,
+        ));
+    }
     let selectors = vec![
         LeanWorkerModuleQuerySelector::Diagnostics {
             id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
@@ -418,7 +466,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
         LeanWorkerModuleQuerySelector::ProofStateInDeclaration {
             id: PROOF_STATE_CONTEXT_ID.to_owned(),
             declaration: req.declaration,
-            position: worker_proof_position(req.proof_position),
+            position,
             // Pretty, notation-aware locals (the worker default); the raw
             // `Expr` form is an expert-only opt-in we do not surface here.
             locals_raw: false,
@@ -439,6 +487,20 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
             return Ok(response);
         }
     };
+    Ok(proof_state_response(
+        run,
+        ctx.config.verbosity.is_full(),
+        req.include_boundaries,
+        req.include_expected_type,
+    ))
+}
+
+fn proof_state_response(
+    run: BatchRun,
+    full_verbosity: bool,
+    include_boundaries: bool,
+    include_expected_type: bool,
+) -> Response<ProofStateResult> {
     let freshness = run.freshness.clone();
 
     match run.outcome {
@@ -449,7 +511,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
         } => {
             // `ModuleQueryFacts` is pure operational telemetry; build it only
             // when the agent opted into `full` verbosity.
-            let query_facts = ctx.config.verbosity.is_full().then(|| project_query_facts(facts));
+            let query_facts = full_verbosity.then(|| project_query_facts(facts));
             let mut diagnostics = DiagnosticsBlock {
                 summary: DiagnosticSummary::default(),
                 diagnostics: Vec::new(),
@@ -483,11 +545,11 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                                 // Skip the projection, not just the
                                 // serialization: the opt-out path never
                                 // materializes these fields into the response.
-                                if req.include_expected_type {
+                                if include_expected_type {
                                     expected_type = info.expected_type;
                                 }
                                 truncated = info.truncated;
-                                if req.include_boundaries {
+                                if include_boundaries {
                                     proof_boundaries = info.proof_boundaries;
                                     proof_boundaries_truncated = info.proof_boundaries_truncated;
                                 }
@@ -497,7 +559,7 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                                 proof_boundaries: candidates,
                                 proof_boundaries_truncated: candidates_truncated,
                             } => {
-                                if req.include_boundaries {
+                                if include_boundaries {
                                     proof_boundaries = candidates;
                                     proof_boundaries_truncated = candidates_truncated;
                                 }
@@ -574,24 +636,22 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
                 Some(event) => crate::diagnosis::warn_execution_taint(response, event),
                 None => response,
             };
-            Ok(warn_session_missing_imports(response, &missing_imports))
+            warn_session_missing_imports(response, &missing_imports)
         }
         BatchQueryRun::HeaderParseFailed { diagnostics, facts } => {
             let block = diagnostics_block(diagnostics);
-            Ok(Response::ok(
+            Response::ok(
                 ProofStateResult::HeaderParseFailed {
                     summary: block.summary,
                     diagnostics: block.diagnostics,
                     truncated: block.truncated,
-                    query_facts: ctx.config.verbosity.is_full().then(|| project_query_facts(facts)),
+                    query_facts: full_verbosity.then(|| project_query_facts(facts)),
                 },
                 freshness,
             )
-            .with_runtime(run.runtime))
+            .with_runtime(run.runtime)
         }
-        BatchQueryRun::Unsupported => {
-            Ok(Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime))
-        }
+        BatchQueryRun::Unsupported => Response::ok(ProofStateResult::Unsupported, freshness).with_runtime(run.runtime),
     }
 }
 
@@ -691,10 +751,7 @@ pub(crate) async fn command_trial_inner(
                 &input.resolved,
                 &input.source,
                 input.imports.clone(),
-                (
-                    crate::writer_setup_verification::Projection::CommandTrial,
-                    Some(commands),
-                ),
+                crate::writer_setup_verification::FileQuery::Command(commands),
             )
             .await?;
         let (block, missing_imports) = diagnostics_from_batch_outcome(outcome.value);

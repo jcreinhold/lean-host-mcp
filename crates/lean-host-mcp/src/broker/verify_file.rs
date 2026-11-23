@@ -443,8 +443,8 @@ impl ProjectBroker {
         let entry = [
             include_str!("../lake/VerifyCommon.lean"),
             match projection {
-                FileProjection::Outline => "private abbrev projectFile := declarationOutlineWithSetup\n",
-                FileProjection::Diagnostics => "private abbrev projectFile := fileDiagnosticsWithSetup\n",
+                FileProjection::Outline => "private def projectFile (_ : Option Json) := declarationOutlineWithSetup\nprivate def extraItem (_ : ModuleQueryBatchItem) : Option Json := none\n",
+                FileProjection::Diagnostics => "private def projectFile (_ : Option Json) := fileDiagnosticsWithSetup\nprivate def extraItem (_ : ModuleQueryBatchItem) : Option Json := none\n",
             },
             include_str!("../lake/OutlineSetup.lean"),
         ]

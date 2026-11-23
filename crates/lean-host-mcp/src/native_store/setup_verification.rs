@@ -7,6 +7,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+use lean_rs_worker_protocol::types::LeanWorkerProofPositionSelector;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -19,6 +20,7 @@ use crate::{
 pub(crate) const OPERATION: &str = "lean_registered_module_verify_v1";
 pub(crate) const DIAGNOSTICS: &str = "lean_file_diagnostics_v1";
 pub(crate) const OUTLINE: &str = "lean_file_outline_v1";
+pub(crate) const PROOF_POSITION: &str = "lean_file_proof_position_v1";
 pub(crate) const COMMAND_TRIAL: &str = "lean_file_command_trial_v1";
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,6 +28,7 @@ pub(crate) enum Projection {
     Verify,
     Diagnostics,
     CommandTrial,
+    ProofPosition,
     Outline,
 }
 
@@ -35,6 +38,7 @@ impl Projection {
             OPERATION => Some(Self::Verify),
             DIAGNOSTICS => Some(Self::Diagnostics),
             OUTLINE => Some(Self::Outline),
+            PROOF_POSITION => Some(Self::ProofPosition),
             COMMAND_TRIAL => Some(Self::CommandTrial),
             _ => None,
         }
@@ -53,6 +57,54 @@ pub(crate) struct Request {
     pub(crate) prepared_sha256: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     commands: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof_position: Option<ProofPosition>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProofPosition {
+    pub(crate) declaration: String,
+    pub(crate) position: LeanWorkerProofPositionSelector,
+}
+
+impl ProofPosition {
+    fn valid(&self) -> bool {
+        !self.declaration.is_empty()
+            && self.declaration.len() <= 256
+            && !self.declaration.chars().any(char::is_control)
+            && match &self.position {
+                LeanWorkerProofPositionSelector::Entry | LeanWorkerProofPositionSelector::Index { .. } => true,
+                LeanWorkerProofPositionSelector::AfterText { text, .. } => {
+                    !text.is_empty() && text.len() <= 4096 && !text.contains('\0')
+                }
+                _ => false,
+            }
+    }
+}
+
+pub(crate) enum FileQuery<'a> {
+    Projection(Projection),
+    Command(&'a str),
+    Proof(&'a ProofPosition),
+}
+
+impl FileQuery<'_> {
+    fn projection(&self) -> Projection {
+        match self {
+            Self::Projection(projection) => *projection,
+            Self::Command(_) => Projection::CommandTrial,
+            Self::Proof(_) => Projection::ProofPosition,
+        }
+    }
+
+    fn matches(&self, request: &Request) -> bool {
+        match self {
+            Self::Projection(_) => request.commands.is_none() && request.proof_position.is_none(),
+            Self::Command(commands) => request.commands.as_deref() == Some(*commands),
+            Self::Proof(position) => request.proof_position.as_ref() == Some(*position),
+        }
+    }
 }
 
 pub(crate) fn valid_commands(commands: &str) -> bool {
@@ -74,6 +126,7 @@ impl Request {
         }
         .valid()
             && self.commands.as_deref().is_none_or(valid_commands)
+            && self.proof_position.as_ref().is_none_or(ProofPosition::valid)
             && self.declarations.len() <= 16
             && self.declarations.iter().collect::<BTreeSet<_>>().len() == self.declarations.len()
             && self.declarations.iter().all(|name| {
@@ -89,6 +142,7 @@ impl Request {
     pub(crate) fn matches_projection(&self, projection: Projection) -> bool {
         self.declarations.is_empty() == (projection != Projection::Verify)
             && self.commands.is_some() == (projection == Projection::CommandTrial)
+            && self.proof_position.is_some() == (projection == Projection::ProofPosition)
     }
 
     pub(crate) fn matches_prepared(&self, prepared: Option<&str>) -> bool {
@@ -272,7 +326,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
         .map(|(i, name)| serde_json::json!({"id":i.to_string(),"name":name}))
         .collect::<Vec<_>>();
     let input = serde_json::json!({
-        "source": source,"file":path,"roots":[],"imports":[],"targets":targets,
+        "source": source,"file":path,"proofPosition":plan.request.proof_position,"roots":[],"imports":[],"targets":targets,
         "allowSorry":false,"reportAxioms":true,"perFieldBytes":4096,"totalBytes":32768,
         "namespaceContext":"","optionsJson":lean_toolchain::lean_options_json(&setup.options),
         "heartbeats":200_000,"diagnosticBytes":16_384
@@ -280,12 +334,17 @@ pub fn run(encoded: &str) -> io::Result<()> {
     let entry = match plan.projection {
         Projection::Diagnostics | Projection::CommandTrial => concat!(
             include_str!("../lake/VerifyCommon.lean"),
-            "private abbrev projectFile := fileDiagnosticsWithSetup\n",
+            "private def projectFile (_ : Option Json) := fileDiagnosticsWithSetup\nprivate def extraItem (_ : ModuleQueryBatchItem) : Option Json := none\n",
             include_str!("../lake/OutlineSetup.lean")
         ),
         Projection::Outline => concat!(
             include_str!("../lake/VerifyCommon.lean"),
-            "private abbrev projectFile := declarationOutlineWithSetup\n",
+            "private def projectFile (_ : Option Json) := declarationOutlineWithSetup\nprivate def extraItem (_ : ModuleQueryBatchItem) : Option Json := none\n",
+            include_str!("../lake/OutlineSetup.lean")
+        ),
+        Projection::ProofPosition => concat!(
+            include_str!("../lake/VerifyCommon.lean"),
+            include_str!("../lake/ProofPositionSetup.lean"),
             include_str!("../lake/OutlineSetup.lean")
         ),
         Projection::Verify => concat!(
@@ -361,7 +420,14 @@ impl ManagedCall<'_> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
         let body = self
-            .saved(broker, root, file, &request.source, &names, (Projection::Verify, None))
+            .saved(
+                broker,
+                root,
+                file,
+                &request.source,
+                &names,
+                FileQuery::Projection(Projection::Verify),
+            )
             .await?;
         let mut value: Outcome =
             serde_json::from_slice(&body).map_err(|_| unavailable("invalid managed verification result"))?;
@@ -393,8 +459,16 @@ impl ManagedCall<'_> {
         imports: Vec<String>,
         projection: Projection,
     ) -> crate::Result<crate::broker::CachedBrokerCall<DiagnosticOutcome>> {
-        self.file_query(broker, hint, root, file, source, imports, (projection, None))
-            .await
+        self.file_query(
+            broker,
+            hint,
+            root,
+            file,
+            source,
+            imports,
+            FileQuery::Projection(projection),
+        )
+        .await
     }
 
     pub(crate) async fn file_query(
@@ -405,7 +479,7 @@ impl ManagedCall<'_> {
         file: &Path,
         source: &str,
         imports: Vec<String>,
-        projection: (Projection, Option<&str>),
+        projection: FileQuery<'_>,
     ) -> crate::Result<crate::broker::CachedBrokerCall<DiagnosticOutcome>> {
         #[derive(Deserialize)]
         struct Receipt {
@@ -436,7 +510,7 @@ impl ManagedCall<'_> {
         file: &Path,
         source: &str,
         names: &[&str],
-        (projection, commands): (Projection, Option<&str>),
+        query: FileQuery<'_>,
     ) -> crate::Result<Vec<u8>> {
         use crate::native_store::store::{Capability, Gate, ResourceReport, ResultKnowledge};
         let unavailable = |message: &str| crate::ServerError::BadProject(message.to_owned());
@@ -451,11 +525,11 @@ impl ManagedCall<'_> {
             crate::managed_prepared::readiness_writer::setup_intent(&snapshot.intent)
                 .ok_or_else(|| unavailable("managed verification intent unavailable"))?;
         let digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
-        if approved_projection != projection
+        if approved_projection != query.projection()
             || approved_root != root
             || file.strip_prefix(root).ok() != Some(admitted.file.as_path())
             || digest != admitted.sha256
-            || commands != admitted.commands.as_deref()
+            || !query.matches(&admitted)
             || !admitted
                 .declarations
                 .iter()

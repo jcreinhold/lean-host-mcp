@@ -1,4 +1,5 @@
 structure OutlineInput where
+  proofPosition : Option Json := none
   source : String
   file : String
   perFieldBytes : Nat
@@ -17,7 +18,9 @@ private def outlineItem : ModuleQueryBatchItem → IO Json
       ("status", "ok"), ("id", id), ("result", obj [("result", "diagnostics"), ("body", failure f)])]
   | .unavailable id message => pure <| obj [("status", "unavailable"), ("id", id), ("message", message)]
   | .budgetExceeded id message => pure <| obj [("status", "budget_exceeded"), ("id", id), ("message", message)]
-  | _ => throw (IO.userError "unexpected supervised file selector")
+  | item => match extraItem item with
+    | some value => pure value
+    | none => throw (IO.userError "unexpected supervised file selector")
 
 private def outlineEnvelope (e : ModuleQueryBatchEnvelope) : IO Json := do
   return obj [("items", .arr (← e.items.mapM outlineItem)), ("total_truncated", toJson e.totalTruncated)]
@@ -26,7 +29,7 @@ unsafe def runOutline (path : String) : IO String := do
   let i : OutlineInput ← IO.ofExcept <| (Json.parse (← IO.FS.readFile path)).bind fromJson?
   let setup ← ModuleSetup.load "module.setup.json"
   Lean.enableInitializersExecution
-  let outcome ← projectFile setup i.source ⟨i.perFieldBytes, i.totalBytes⟩
+  let outcome ← projectFile i.proofPosition setup i.source ⟨i.perFieldBytes, i.totalBytes⟩
     i.namespaceContext i.file i.heartbeats.toUInt64 i.diagnosticBytes.toUSize i.optionsJson
   let value ← match outcome with
     | .ok e imports => pure <| obj [("status", "ok"), ("result", ← outlineEnvelope e), ("imports", toJson imports)]

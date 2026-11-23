@@ -440,6 +440,10 @@ optional proof-position selector:
 }
 ```
 
+The managed implementation binds the file digest, declaration, and exact proof selector to the original
+admission. Its `lean_file_proof_position_v1` capability stays unadvertised on normal installations pending the
+matching SDK release and verification of the updated installer shim inventory.
+
 The response omits echoed declaration and namespace names. Two fields are opt-in, both defaulting to `false`:
 
 - `include_boundaries: true` returns the `proof_boundaries` navigation list (and `proof_boundaries_truncated`). Request

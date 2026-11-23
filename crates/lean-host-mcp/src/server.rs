@@ -699,7 +699,26 @@ impl LeanHostService {
     async fn run_task(&self, call: TaskCall) -> Result<CallToolResult, McpError> {
         let mut log = call.request_log();
         let result = match call {
-            TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
+            TaskCall::Context(req) => {
+                let req = req.into_inner();
+                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+                {
+                    let mut req = req;
+                    let position = req.kind().is_some_and(|kind| {
+                        tools::request_aliases::canonical_kind("lean_context", kind) == "proof_position"
+                    });
+                    let original = req.args.remove("managed_original");
+                    let managed = self
+                        .managed_setup_call(original, position.then_some("managed_proof_position_original_required"))?;
+                    if managed.is_some() {
+                        tools::semantic::lean_context_inner(&self.ctx, req, managed).await
+                    } else {
+                        tools::semantic::lean_context(&self.ctx, req).await
+                    }
+                }
+                #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+                tools::semantic::lean_context(&self.ctx, req).await
+            }
             TaskCall::Trial(req) => {
                 let req = req.into_inner();
                 #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
