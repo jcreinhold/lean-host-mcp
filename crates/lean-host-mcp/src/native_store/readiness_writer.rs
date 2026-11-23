@@ -332,6 +332,12 @@ pub(super) async fn run(
         return Err(invalid("readiness_project_changed"));
     }
     let helper = selection().map_err(|_| invalid("operation_disabled"))?;
+    if matches!(&stage, Stage::Preparation(Target::Ready { package: None, .. }))
+        && std::env::var_os(writer_preparation::PLAN_ENV).is_some()
+    {
+        // Validate the successor's IPC path before consuming the preparation budget or opening a writer.
+        crate::native_socket::directory().map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+    }
     let deadline = original
         .admission_deadline
         .ok_or_else(|| invalid("missing_admission_deadline"))?;
