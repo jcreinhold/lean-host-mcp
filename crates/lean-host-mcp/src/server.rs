@@ -213,6 +213,19 @@ impl LeanHostService {
                         "warm development requires an unenrolled managed-only service",
                     ));
                 }
+                use crate::toolchain::{Readiness, ToolchainId, WorkerBinary, WorkerSidecar};
+                let root = self
+                    .ctx
+                    .broker
+                    .native_root(&crate::broker::ProjectHint::Default)
+                    .map_err(std::io::Error::other)?;
+                let pin = ToolchainId::from_lake_root(&root).map_err(std::io::Error::other)?;
+                let Readiness::Ready { worker, note: None, .. } = WorkerBinary::resolve_ready_for(&pin) else {
+                    return Err(std::io::Error::other(
+                        "warm selection requires a verified installed worker",
+                    ));
+                };
+                WorkerSidecar::require_warm_worker(&worker.path, &pin).map_err(std::io::Error::other)?;
                 store.promote_warm_contract().map_err(std::io::Error::other)?;
             } else if store.warm_development_store().map_err(std::io::Error::other)? {
                 return Err(std::io::Error::other(

@@ -31,7 +31,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={WARM}");
     if std::env::var_os("CARGO_FEATURE_MANAGED_NATIVE_STORE").is_some()
         && matches!(std::env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("macos" | "linux"))
-        && std::env::var(WARM).as_deref() == Ok("209ae5a72aa634e9ebfb7a92d63e3c52be292031")
+        && std::env::var(WARM).as_deref() == Ok("71c996c91ace9a062f69507faf023da7bb710030")
     {
         println!("cargo:rustc-cfg=lean_host_mcp_development_warm");
     }

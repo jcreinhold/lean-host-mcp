@@ -87,6 +87,10 @@ impl Job {
         actor_healthy: &AtomicBool,
         warm: &mut Option<WarmGeneration>,
     ) -> crate::error::Result<()> {
+        if worker.runtime_metadata().worker_version != crate::toolchain::WARM_WORKER_VERSION {
+            actor_healthy.store(false, Ordering::Release);
+            return Err(internal("worker handshake differs from the warm SDK version"));
+        }
         if self
             .intent
             .project

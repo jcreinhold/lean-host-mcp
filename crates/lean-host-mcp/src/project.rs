@@ -3768,6 +3768,13 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
             "native actor requires prepared host artifacts".to_owned(),
         ));
     }
+    #[cfg(lean_host_mcp_development_warm)]
+    if scope == "main" && config.managed_warm_idle_seconds.is_some() {
+        let pin =
+            ToolchainId::parse(&config.toolchain_label).map_err(|error| ServerError::BadProject(error.to_string()))?;
+        crate::toolchain::WorkerSidecar::require_warm_worker(&config.worker_path, &pin)
+            .map_err(|error| ServerError::BadProject(error.to_string()))?;
+    }
     let mut child = LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
         .shared_writer_executable(writer.executable.clone())
         .native_guardian(writer.executable)

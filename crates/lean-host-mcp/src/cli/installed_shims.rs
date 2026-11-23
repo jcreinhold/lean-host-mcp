@@ -223,6 +223,8 @@ pub(super) fn probe(
                 .startup_timeout(Duration::from_secs(30))
                 .request_timeout(Duration::from_secs(20))
                 .open()?;
+        #[cfg(lean_host_mcp_development_warm)]
+        let version_matches = handle.runtime_metadata().worker_version == crate::toolchain::WARM_WORKER_VERSION;
         let result = handle.inspect_declaration_with_imports(
             vec!["Init".to_owned()],
             &LeanWorkerDeclarationInspectionRequest::new("Nat.add_zero"),
@@ -242,6 +244,11 @@ pub(super) fn probe(
         );
         let result = result?;
         cleanup?;
+        #[cfg(lean_host_mcp_development_warm)]
+        ensure!(
+            version_matches,
+            "installed worker handshake lacks the exact warm SDK version"
+        );
         #[cfg(all(test, target_os = "macos"))]
         images?;
         ensure!(
@@ -305,6 +312,8 @@ pub(super) fn qualify(
         &super::install_worker::sha256_prefix(&candidate.join(crate::toolchain::WORKER_FILE_NAME), 64)?,
         crate::smoke::SmokeOutcome::Passed,
     )?;
+    #[cfg(lean_host_mcp_development_warm)]
+    record.qualify_warm()?;
     record.write(candidate)?;
     Ok(())
 }
