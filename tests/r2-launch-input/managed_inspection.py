@@ -33,6 +33,9 @@ def run_check(args):
     entry_trace = args.entry_scratch.resolve(strict=True) / "inspection-entries" if args.entry_scratch else None
     if entry_trace:
         assert not entry_trace.exists(), "entry witness must start empty"
+    socket_dir = scratch if args.warm_reuse and entry_trace is None else scratch / "s"
+    if socket_dir != scratch:
+        socket_dir.mkdir(mode=0o700)
     env = {
         key: val for key, val in os.environ.items()
         if not key.startswith(("LEAN_", "LAKE_", "DYLD_", "__XPC_DYLD_"))
@@ -41,7 +44,7 @@ def run_check(args):
         TMPDIR=str(root / "tmp"),
         LEAN_HOST_MCP_CONFIG_DIR=str(root / "config"),
         LEAN_HOST_MCP_PROCESS_REGISTRY_DIR=str(root / "process"),
-        LEAN_HOST_MCP_SOCKET_DIR=str(scratch / "s"),
+        LEAN_HOST_MCP_SOCKET_DIR=str(socket_dir),
         LEAN_HOST_MCP_WORKERS_DIR=str(args.workers.resolve(strict=True)),
         LEAN_HOST_MCP_WRITER_EXECUTABLE=str(args.writer.resolve(strict=True)),
         LEAN_RS_WORKER_OWNERS_DIRECTORY=str(root / "owners"),
@@ -49,7 +52,6 @@ def run_check(args):
         LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT="2" if args.abrupt else "1",
         LAKE_CACHE_DIR=str(root / "cache"),
     )
-    (scratch / "s").mkdir(mode=0o700)
     command = [
         args.parent.resolve(strict=True), "--lake-root", project,
         *([] if prepared is None else ["--prepared-generation", prepared]),
@@ -180,13 +182,15 @@ def run_check(args):
 
     if args.warm_reuse:
         assert project.is_relative_to(scratch), "warm fixture must use a disposable prepared project"
-        release = entry_trace.with_name("release-inspection")
-        assert not release.exists()
+        release = entry_trace.with_name("release-inspection") if entry_trace else None
+        if release is not None:
+            assert not release.exists()
         try:
             run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_stopped,
                            resume_guardian, assert_artifact_locks_held)
         finally:
-            release.unlink(missing_ok=True)
+            if release is not None:
+                release.unlink(missing_ok=True)
         return
 
     if args.root_architecture is not None:
@@ -827,9 +831,9 @@ def run_check(args):
 
 def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_stopped,
                    resume_guardian, assert_artifact_locks_held):
-    release = entry_trace.with_name("release-inspection")
+    release = entry_trace.with_name("release-inspection") if entry_trace else None
     saved_copy = root / "warm-caller-result"
-    late_write = entry_trace.with_name("inspection-writes")
+    late_write = entry_trace.with_name("inspection-writes") if entry_trace else None
     if args.warm_expiry:
         assert not late_write.exists()
     imports = [module for module, _ in plan["modules"]]
@@ -845,6 +849,8 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
         return json.loads(identity), ordinal, ended
 
     def wait_entries(expected):
+        if entry_trace is None:
+            return
         end = time.monotonic() + 8
         while True:
             trace = entry_trace.read_text() if entry_trace.exists() else ""
@@ -905,7 +911,8 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
         assert pool()["occupied_slots"] == 0
         first, authorization = admit()
         try:
-            release.touch()
+            if release is not None:
+                release.touch()
             result(lookup(first))
             saved = completed(first, 1)
             identity, ordinal, ended = bound(first)
@@ -939,41 +946,44 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             assert acked["result"]["state"] == "acknowledged", acked
             assert (acked["result"]["id"], acked["result"]["sha256"]) == (saved["id"], saved["sha256"])
 
-            release.unlink()
+            if release is not None:
+                release.unlink()
             second, _ = admit()
             assert second["key"] != first["key"]
             active = lookup(second)
             wait_entries(entry * 2)
-            assert bound(second) == (identity, 2, 0), "B changed receiver or guardian birth"
-            before = result(managed("get", **second))
-            assert before["custody"] == "open" and before["result"]["state"] == "pending", before
-            assert "attempt_completion" not in before
-            assert result(managed("ack", **ack_fields)) == acked
-            stale = result(managed("drain", **first, generation=identity["generation"], revision=1,
-                                   submit=True, authorization=authorization, claimant=list(os.urandom(32))),
-                           allow_error=True)
-            assert "rpc_error" in stale or stale.get("drain") == "refused", stale
-            assert result(managed("get", **second)) == before
-            assert bound(second) == (identity, 2, 0)
-            assert_artifact_locks_held(record)
-            assert pool()["occupied_slots"] == 1
+            if entry_trace is not None:
+                assert bound(second) == (identity, 2, 0), "B changed receiver or guardian birth"
+                before = result(managed("get", **second))
+                assert before["custody"] == "open" and before["result"]["state"] == "pending", before
+                assert "attempt_completion" not in before
+                assert result(managed("ack", **ack_fields)) == acked
+                stale = result(managed("drain", **first, generation=identity["generation"], revision=1,
+                                       submit=True, authorization=authorization, claimant=list(os.urandom(32))),
+                               allow_error=True)
+                assert "rpc_error" in stale or stale.get("drain") == "refused", stale
+                assert result(managed("get", **second)) == before
+                assert bound(second) == (identity, 2, 0)
+                assert_artifact_locks_held(record)
+                assert pool()["occupied_slots"] == 1
 
-            if args.warm_expiry == "active":
-                observe_frozen_warm_expiry(proc, record, identity, owned, release, late_write, "",
-                                           wait_stopped, resume_guardian)
-                assert "rpc_error" in result(active, allow_error=True)
-                expired = result(managed("get", **second))
-                assert expired["custody"] == "closed" and expired["result"]["state"] == "pending", expired
-                assert result(managed("get", **second)) == expired
-                capacity_returned()
-                assert not late_write.exists()
-                wait_entries(entry * 2)
-                print("Active expiry closed exact custody while the broker stayed frozen; no late Lean write")
-                return
+                if args.warm_expiry == "active":
+                    observe_frozen_warm_expiry(proc, record, identity, owned, release, late_write, "",
+                                               wait_stopped, resume_guardian)
+                    assert "rpc_error" in result(active, allow_error=True)
+                    expired = result(managed("get", **second))
+                    assert expired["custody"] == "closed" and expired["result"]["state"] == "pending", expired
+                    assert result(managed("get", **second)) == expired
+                    capacity_returned()
+                    assert not late_write.exists()
+                    wait_entries(entry * 2)
+                    print("Active expiry closed exact custody while the broker stayed frozen; no late Lean write")
+                    return
 
-            release.touch()
+            if release is not None:
+                release.touch()
             result(active)
-            completed(second, 2)
+            second_saved = completed(second, 2)
             assert bound(second) == (identity, 2, 1)
             assert pool()["occupied_slots"] == 1
             if args.warm_expiry == "idle":
@@ -1019,11 +1029,18 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
                 assert remaining.returncode == 1 and not remaining.stdout.strip(), (pid, remaining.stdout)
             wait_entries(entry * 2)
             assert pool()["occupied_slots"] == 0
-            print("Two exact warm lookups shared worker and guardian births; stale A requests left B unchanged")
+            if entry_trace is None:
+                recovered = result(managed("get", **second))
+                assert recovered["custody"] == "closed" and recovered["result"]["state"] == "retained", recovered
+                assert recovered["result"] == second_saved, recovered
+                print("Shipping warm lookups shared worker and guardian births; original GET survived retirement")
+            else:
+                print("Two exact warm lookups shared worker and guardian births; stale A requests left B unchanged")
             print("One occupied slot through paused guardian retirement, then zero and same-inode locks reusable")
         finally:
             # Release a held Lean entry before closing the disposable server.
-            release.touch()
+            if release is not None:
+                release.touch()
             saved_copy.unlink(missing_ok=True)
 
 
@@ -1102,6 +1119,6 @@ if __name__ == "__main__":
 
     if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live or args.deadline_while_sql_locked or args.warm_reuse):
         parser.error("--entry-scratch requires a stopped-owner, abrupt, live-cancel, deadline, or warm case")
-    if (args.cancel_live or args.deadline_while_sql_locked or args.warm_reuse) and not args.entry_scratch:
-        parser.error("live-cancel, deadline, and warm cases require --entry-scratch")
+    if (args.cancel_live or args.deadline_while_sql_locked or args.warm_expiry) and not args.entry_scratch:
+        parser.error("live-cancel, deadline, and frozen warm expiry cases require --entry-scratch")
     run_check(args)

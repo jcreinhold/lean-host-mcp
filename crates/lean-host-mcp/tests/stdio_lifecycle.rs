@@ -1521,6 +1521,7 @@ unsafe def main (args : List String) : IO UInt32 := do
     }
 
     #[tokio::test]
+    #[ignore = "requires the separately compiled launcher rename fault binary"]
     async fn launcher_uncertain_publication_reconciles_without_another_generation() {
         use std::os::unix::fs::MetadataExt as _;
         let fixture = Fixture::new();

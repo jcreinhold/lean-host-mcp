@@ -81,18 +81,25 @@ if (not identities <= published_locks
                for _, _, source, checksum in identities)):
     raise SystemExit("candidate pairing changed external registry identities")
 PY_LOCK
+unset LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT
 parent_features=()
+warm_release=false
 if "$managed_release"; then
     parent_features=(--features managed-native-store)
-    export LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1
+    if python3 -c 'import sys,tomllib; sys.exit("managed-warm-inspections" not in tomllib.load(open(sys.argv[1],"rb"))["features"])' "$parent_manifest"; then
+        parent_features=(--features managed-warm-inspections)
+        warm_release=true
+    fi
 fi
 cargo build --locked --manifest-path "$parent_manifest" --bin lean-host-mcp ${parent_features[@]+"${parent_features[@]}"}
 # The source worker installer expects Cargo's native profile directories.
-export R2_SETUP_PARENT="$CARGO_TARGET_DIR/debug/lean-host-mcp"
-if [[ ! -x $R2_SETUP_PARENT ]]; then
-    printf 'Expected native parent binary at %s\n' "$R2_SETUP_PARENT" >&2
+built_parent="$CARGO_TARGET_DIR/debug/lean-host-mcp"
+if [[ ! -x $built_parent ]]; then
+    printf 'Expected native parent binary at %s\n' "$built_parent" >&2
     exit 1
 fi
+export R2_SETUP_PARENT="$scratch/shipping-lean-host-mcp"
+cp "$built_parent" "$R2_SETUP_PARENT"
 cargo install --debug --locked --root "$R2_SETUP_ROOT/tools" --version "=$sdk" lean-rs-writer
 "$R2_SETUP_PARENT" install-worker --toolchain "$id" --workers-dir "$R2_SETUP_ROOT/workers" \
     --source-dir "$worker_source" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
@@ -101,18 +108,27 @@ cargo install --debug --locked --root "$R2_SETUP_ROOT/tools" --version "=$sdk" l
 cargo run --locked --manifest-path "$parent_manifest" --example prepare_semantic_smoke \
     ${parent_features[@]+"${parent_features[@]}"} -- \
     "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$R2_SETUP_PARENT"
-if "$managed_release"; then
-    unset LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT
-fi
 python3 tests/r2-launch-input/module_setup.py
 if "$managed_release"; then
-    # Keep the exact packaged executable while Cargo builds the checkout's
-    # test targets in the same artifact directory.
-    packaged_parent="$scratch/lean-host-mcp"
-    cp "$R2_SETUP_PARENT" "$packaged_parent"
-    scripts/check-parent-link.sh "$packaged_parent"
-    LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$R2_SETUP_ROOT/workers" \
-        LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$packaged_parent" \
-        LEAN_HOST_MCP_STDIO_PACKAGED_WRITER="$R2_SETUP_ROOT/tools/bin/lean-rs-writer" \
-        scripts/test-installed-stdio.sh --all-targets --features managed-native-store
+    scripts/check-parent-link.sh "$R2_SETUP_PARENT"
+    if "$warm_release"; then
+        warm_scratch=$(mktemp -d "${RUNNER_TEMP:-$CARGO_TARGET_DIR}/w.XXXXXX")
+        python3 tests/r2-launch-input/prepare_generation.py --warm-inspection \
+            --host "$R2_SETUP_PARENT" --writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer" \
+            --sysroot "$LEAN_SYSROOT" --scratch "$warm_scratch" --workers "$R2_SETUP_ROOT/workers"
+        rm -rf -- "$warm_scratch"
+    fi
+    export LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$R2_SETUP_ROOT/workers"
+    export LEAN_HOST_MCP_STDIO_PACKAGED_WRITER="$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
+    LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$R2_SETUP_PARENT" \
+        scripts/test-installed-stdio.sh --all-targets "${parent_features[@]}"
+
+    # Only the injected rename fault uses this separately compiled executable.
+    LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1 \
+        cargo build --locked --manifest-path "$parent_manifest" --bin lean-host-mcp "${parent_features[@]}"
+    fault_parent="$scratch/fault-only-lean-host-mcp"
+    cp "$built_parent" "$fault_parent"
+    LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$fault_parent" \
+        scripts/test-installed-stdio.sh "${parent_features[@]}" --test stdio_lifecycle -- \
+        --ignored --exact launcher_regressions::launcher_uncertain_publication_reconciles_without_another_generation
 fi
