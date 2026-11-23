@@ -450,11 +450,7 @@ impl ImportPlan {
         self.identity_for(domains, None)
     }
 
-    fn identity_for(
-        &self,
-        domains: &[PathBuf],
-        closure: Option<&[(String, PathBuf)]>,
-    ) -> io::Result<[u8; 32]> {
+    fn identity_for(&self, domains: &[PathBuf], closure: Option<&[(String, PathBuf)]>) -> io::Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         if self.modules.is_empty() || self.modules.len() > 32 || self.roots.is_empty() || self.roots.len() > 64 {
             return Err(invalid());
@@ -958,8 +954,7 @@ impl PreparedGeneration {
         generation.check_import_selection(project, release, ordered_inputs, names)?;
         let plan = &generation.plan;
         let held = PreparedProject::capture(project, &plan.roots, shims, release)?;
-        if generation.observed_identity(&held.domains)? != generation.identity
-        {
+        if generation.observed_identity(&held.domains)? != generation.identity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "prepared module content changed",
