@@ -1,4 +1,4 @@
-"""Check one cold managed inspection against a matched disposable installation."""
+"""Check managed inspection against a matched disposable installation."""
 
 import argparse
 import fcntl
@@ -54,7 +54,7 @@ def run_check(args):
         args.parent.resolve(strict=True), "--lake-root", project,
         *([] if prepared is None else ["--prepared-generation", prepared]),
         "--managed-native-store", db,
-        *(["--managed-only"] if args.proof_position or args.proof_step or args.proof_search else []),
+        *(["--managed-only"] if args.proof_position or args.proof_step or args.proof_search or args.warm_reuse else []),
     ]
 
     @contextmanager
@@ -167,6 +167,17 @@ def run_check(args):
     def bindings():
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
             return conn.execute("SELECT registry_generation FROM recovery_bindings").fetchall()
+
+    if args.warm_reuse:
+        assert project.is_relative_to(scratch), "warm fixture must use a disposable prepared project"
+        release = entry_trace.with_name("release-inspection")
+        assert not release.exists()
+        try:
+            run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_stopped,
+                           resume_guardian, assert_artifact_locks_held)
+        finally:
+            release.unlink(missing_ok=True)
+        return
 
     if args.root_architecture is not None:
         assert project.is_relative_to(scratch), "architecture control requires a disposable project inside scratch"
@@ -804,6 +815,171 @@ def run_check(args):
             assert after["occupied_slots"] == 0
 
 
+def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_stopped,
+                   resume_guardian, assert_artifact_locks_held):
+    release = entry_trace.with_name("release-inspection")
+    saved_copy = root / "warm-caller-result"
+    imports = [module for module, _ in plan["modules"]]
+    if "Init" not in imports:
+        imports.insert(0, "Init")
+
+    def bound(origin):
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as observer:
+            identity, ordinal, ended = observer.execute(
+                "SELECT identity,ordinal,ended FROM recovery_bindings WHERE epoch=? AND nonce=? AND stage=?",
+                (origin["key"]["epoch"], bytes(origin["key"]["nonce"]), origin["key"]["stage"]),
+            ).fetchone()
+        return json.loads(identity), ordinal, ended
+
+    def wait_entries(expected):
+        end = time.monotonic() + 8
+        while True:
+            trace = entry_trace.read_text() if entry_trace.exists() else ""
+            if trace == expected:
+                return
+            assert expected.startswith(trace) and time.monotonic() < end, (expected, trace)
+            time.sleep(0.01)
+
+    with server() as (managed, result, tool, _):
+        discovery = result(managed("discover"))
+        assert args.warm_reuse in discovery["operations"], "candidate does not advertise matched warm inspection"
+
+        def pool():
+            return result(tool("lean_runtime", {"action": "status"}))["pool"]
+
+        def admit():
+            origin = dict(
+                key=dict(store=discovery["store"], epoch=discovery["acceptance_epoch"],
+                         nonce=list(os.urandom(16)), stage=1),
+                capability=list(os.urandom(32)),
+            )
+            authorization = list(os.urandom(32))
+            intent = dict(
+                operation=args.warm_reuse, project=str(plan["project"]), job=list(os.urandom(16)), revision=1,
+                prepared_sha256=list(hashlib.sha256(prepared.encode()).digest()), imports=imports,
+                inspection=dict(
+                    name=args.declaration,
+                    fields=dict(source=True, statement=True, docstring=True, attributes=True, flags=True,
+                                rendering="pretty", proof_search=False),
+                    budgets=dict(per_field_bytes=8192, total_bytes=65536),
+                ),
+            )
+            admitted = result(managed("create", intent=list(json.dumps(intent).encode()),
+                                      drain_authorization=authorization, **origin))
+            assert admitted["execution"] == "admitted", admitted
+            return origin, authorization
+
+        def lookup(origin):
+            return tool("lean_lookup", dict(kind="declaration", name=args.declaration,
+                                            project=plan["project"], imports=imports, managed_original=origin))
+
+        def completed(origin, ordinal):
+            done = result(managed("get", **origin))
+            assert done["key"] == origin["key"] and done["custody"] == "open", done
+            assert done["attempt_completion"] == dict(version=1, state="confirmed_ended", ordinal=ordinal), done
+            assert done["result"]["state"] == "retained", done
+            payload = bytes(done["result"]["body"])
+            assert hashlib.sha256(payload).digest() == bytes(done["result"]["sha256"])
+            assert json.loads(payload)["declaration"]["name"] == args.declaration
+            return done["result"]
+
+        assert pool()["occupied_slots"] == 0
+        first, authorization = admit()
+        try:
+            release.touch()
+            result(lookup(first))
+            saved = completed(first, 1)
+            identity, ordinal, ended = bound(first)
+            assert (ordinal, ended) == (1, 1)
+            worker = identity["worker"]["pid"]
+            guardian = identity["guardian"]["pid"]
+            record = root / "owners" / f"worker-{identity['generation']}" / "owner.json"
+            owned = json.loads(record.read_bytes())
+            assert owned["process"] == identity["worker"] and owned["guardian"] == identity["guardian"], owned
+            entry = f"{worker} {args.declaration}\n"
+            wait_entries(entry)
+            assert_artifact_locks_held(record)
+            assert pool()["occupied_slots"] == 1
+
+            # Save the exact existing receipt before ACK and before B can start.
+            with saved_copy.open("xb") as stream:
+                stream.write(json.dumps(dict(key=first["key"], result=saved)).encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            ack_fields = dict(first, result_id=saved["id"], result_digest=saved["sha256"])
+            acked = result(managed("ack", **ack_fields))
+            assert acked["custody"] == "open" and acked["attempt_completion"]["ordinal"] == 1, acked
+            assert acked["result"]["state"] == "acknowledged", acked
+            assert (acked["result"]["id"], acked["result"]["sha256"]) == (saved["id"], saved["sha256"])
+
+            release.unlink()
+            second, _ = admit()
+            assert second["key"] != first["key"]
+            active = lookup(second)
+            wait_entries(entry * 2)
+            assert bound(second) == (identity, 2, 0), "B changed receiver or guardian birth"
+            before = result(managed("get", **second))
+            assert before["custody"] == "open" and before["result"]["state"] == "pending", before
+            assert "attempt_completion" not in before
+            assert result(managed("ack", **ack_fields)) == acked
+            stale = result(managed("drain", **first, generation=identity["generation"], revision=1,
+                                   submit=True, authorization=authorization, claimant=list(os.urandom(32))),
+                           allow_error=True)
+            assert "rpc_error" in stale or stale.get("drain") == "refused", stale
+            assert result(managed("get", **second)) == before
+            assert bound(second) == (identity, 2, 0)
+            assert_artifact_locks_held(record)
+            assert pool()["occupied_slots"] == 1
+
+            release.touch()
+            result(active)
+            completed(second, 2)
+            assert bound(second) == (identity, 2, 1)
+            assert pool()["occupied_slots"] == 1
+            # Make confirmed physical retirement independently observable.
+            os.kill(guardian, signal.SIGSTOP)
+            try:
+                wait_stopped(guardian, time.monotonic() + 2)
+                draining = result(tool("lean_runtime", {"action": "drain", "retire_idle": True}))
+                assert draining["pool"]["occupied_slots"] == 1 and not draining["pool"]["workers_stopped"], draining
+                lease = draining["lease_id"]
+                assert lease
+            finally:
+                resume_guardian(guardian)
+            end = time.monotonic() + 10
+            while True:
+                stopped = result(tool("lean_runtime", {"action": "renew", "lease_id": lease}))["pool"]
+                if stopped["workers_stopped"]:
+                    assert stopped["occupied_slots"] == 0, stopped
+                    break
+                assert stopped["occupied_slots"] == 1 and time.monotonic() < end, stopped
+                time.sleep(0.04)
+            with ExitStack() as locks:
+                for domain in owned["protected_domains"]:
+                    handle = locks.enter_context(open(domain["lock_path"], "rb"))
+                    physical = os.fstat(handle.fileno())
+                    assert (physical.st_dev, physical.st_ino) == (domain["device"], domain["inode"])
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for pid in (worker, guardian):
+                remaining = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, check=False,
+                )
+                assert remaining.returncode == 1 and not remaining.stdout.strip(), (pid, remaining.stdout)
+            wait_entries(entry * 2)
+            assert pool()["occupied_slots"] == 0
+            print("Two exact warm lookups shared worker and guardian births; stale A requests left B unchanged")
+            print("One occupied slot through paused guardian retirement, then zero and same-inode locks reusable")
+        finally:
+            # Release a held Lean entry before closing the disposable server.
+            release.touch()
+            saved_copy.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("parent", "scratch", "project", "workers", "writer"):
@@ -813,6 +989,7 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--abrupt", action="store_true")
     mode.add_argument("--stopped-owner", action="store_true")
+    mode.add_argument("--warm-reuse", metavar="OPERATION", help="require the matched advertised warm lookup operation")
     mode.add_argument("--fail-result-save", action="store_true")
     mode.add_argument("--cancel-live", action="store_true")
     mode.add_argument("--deadline-while-sql-locked", action="store_true")
@@ -830,8 +1007,8 @@ if __name__ == "__main__":
     elif not (args.proof_position or args.proof_step or args.proof_search) and (not args.prepared or not args.declaration or args.expected_finding):
         parser.error("inspection requires --prepared and --declaration")
 
-    if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live or args.deadline_while_sql_locked):
-        parser.error("--entry-scratch requires a stopped-owner, abrupt, live-cancel, or deadline case")
-    if (args.cancel_live or args.deadline_while_sql_locked) and not args.entry_scratch:
-        parser.error("live-cancel and deadline cases require --entry-scratch")
+    if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live or args.deadline_while_sql_locked or args.warm_reuse):
+        parser.error("--entry-scratch requires a stopped-owner, abrupt, live-cancel, deadline, or warm case")
+    if (args.cancel_live or args.deadline_while_sql_locked or args.warm_reuse) and not args.entry_scratch:
+        parser.error("live-cancel, deadline, and warm cases require --entry-scratch")
     run_check(args)
