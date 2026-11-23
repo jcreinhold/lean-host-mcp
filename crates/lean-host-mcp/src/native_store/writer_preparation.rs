@@ -39,6 +39,8 @@ pub(crate) enum Target {
         name: String,
         module_count: usize,
         module_names_sha256: [u8; 32],
+        lakefile_sha256: [u8; 32],
+        manifest_sha256: [u8; 32],
     },
     Modules {
         names: Vec<String>,
@@ -373,20 +375,8 @@ pub fn run(encoded: &str) -> io::Result<()> {
     };
 
     let after_deps = || test_cut_after_dependencies(&authorize);
-    if let Target::RootLibrary {
-        name,
-        module_count,
-        module_names_sha256,
-    } = &plan.target
-    {
-        let receipt = root_library::run(
-            name,
-            *module_count,
-            module_names_sha256,
-            command,
-            &authorize,
-            &after_deps,
-        )?;
+    if let Target::RootLibrary { .. } = &plan.target {
+        let receipt = root_library::run(&plan, command, &authorize, &after_deps)?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     let receipt = match plan.target {

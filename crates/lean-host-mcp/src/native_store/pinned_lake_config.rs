@@ -169,6 +169,15 @@ fn check(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn validate_root_config(root: &Path, expected: &[u8; 32]) -> io::Result<()> {
+    absent(&root.join("lakefile.toml"))?;
+    let actual: [u8; 32] = Sha256::digest(file_bytes(&root.join("lakefile.lean"))?).into();
+    if &actual != expected {
+        return Err(invalid("admitted root Lake configuration changed"));
+    }
+    Ok(())
+}
+
 /// Check the exact admitted manifest and each explicitly selected package configuration
 /// against locally available pinned Git objects while the existing writer holds custody.
 ///

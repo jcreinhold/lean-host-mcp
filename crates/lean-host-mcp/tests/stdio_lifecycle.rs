@@ -777,37 +777,70 @@ mod launcher_regressions {
         let writer = std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER");
         let Some(writer) = writer else { return };
         let fixture = Fixture::new();
-        let dep = fixture.project.join("ext");
-        fs::create_dir(&dep).expect("external package");
+        let dep_source = fixture.scratch.path().join("ext");
+        fs::create_dir(&dep_source).expect("external package");
         fs::create_dir(fixture.project.join("Probe")).expect("module directory");
         for (path, source) in [
-            (
-                "lakefile.lean",
-                "import Lake\nopen Lake DSL\npackage Probe\nrequire ext from \"./ext\"\nlean_lib Probe\n",
-            ),
             (
                 "ext/lakefile.lean",
                 "import Lake\nopen Lake DSL\npackage ext\nlean_lib Ext\n",
             ),
             ("ext/Ext.lean", "def extValue : Nat := 42\n"),
-            ("Probe/A.lean", "import Ext\ndef a : Nat := extValue\n"),
-            ("Probe/B.lean", "def b : Nat := 5\n"),
-            ("Probe.lean", "import Probe.A\nimport Probe.B\n"),
+            (
+                "ext/lake-manifest.json",
+                r#"{"version":"1.2.0","packagesDir":".lake/packages","packages":[],"name":"ext","lakeDir":".lake"}"#,
+            ),
+            ("project/Probe/A.lean", "import Ext\ndef a : Nat := extValue\n"),
+            ("project/Probe/B.lean", "def b : Nat := 5\n"),
+            ("project/Probe.lean", "import Probe.A\nimport Probe.B\n"),
         ] {
-            fs::write(fixture.project.join(path), source).expect("disposable source");
+            fs::write(fixture.scratch.path().join(path), source).expect("disposable source");
         }
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&dep_source)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .expect("fixture Git");
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).expect("fixture Git stdout")
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "lakefile.lean", "Ext.lean", "lake-manifest.json"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        let root_config = format!(
+            "import Lake\nopen Lake DSL\npackage Probe\nrequire ext from git \"file://{}\" @ \"{}\"\nlean_lib Probe\n",
+            dep_source.display(),
+            revision.trim()
+        );
+        let root_config_path = fixture.project.join("lakefile.lean");
+        fs::write(&root_config_path, &root_config).expect("root config");
         let lake = PathBuf::from(std::env::var_os("LEAN_SYSROOT").expect("fixture toolchain")).join("bin/lake");
         let lake_command = |cwd: &std::path::Path, args: &[&str]| {
             let output = std::process::Command::new(&lake)
                 .current_dir(cwd)
+                .env("GIT_ALLOW_PROTOCOL", "file")
                 .arg("--no-cache")
                 .args(args)
                 .output()
                 .expect("fixture Lake");
             assert!(output.status.success(), "{output:?}");
         };
-        lake_command(&dep, &["update"]);
         lake_command(&fixture.project, &["update"]);
+        let dep = fixture.project.join(".lake/packages/ext");
+        let dep_config_path = dep.join("lakefile.lean");
+        let dep_config = fs::read(&dep_config_path).expect("locked package config");
         let (store, _) = fixture.new_store("store").await;
         let mut server = StdioServer::spawn(
             fixture
@@ -825,7 +858,10 @@ mod launcher_regressions {
         let root_object = fixture.project.join(".lake/build/lib/lean/Probe.olean");
         use sha2::{Digest, Sha256};
         let digest: [u8; 32] = Sha256::digest(b"Probe\0Probe.A\0Probe.B\0").into();
-        for (revision, expected_modules) in [(1, 0), (2, 0), (3, 3)] {
+        let lakefile_sha256: [u8; 32] = Sha256::digest(root_config.as_bytes()).into();
+        let manifest_sha256: [u8; 32] =
+            Sha256::digest(fs::read(fixture.project.join("lake-manifest.json")).expect("admitted manifest")).into();
+        for (revision, expected_modules) in [(1, 0), (2, 0), (3, 0), (4, 0), (5, 3)] {
             if revision == 2 {
                 lake_command(&fixture.project, &["build", "@ext/+Ext:irArts"]);
             }
@@ -835,7 +871,8 @@ mod launcher_regressions {
                 "nonce":uuid::Uuid::new_v4().into_bytes(), "stage":1});
             let intent = json!({"project":fixture.project, "job":[revision], "revision":revision,
                 "operation":"lake_module_preparation_v1", "target":{"kind":"root_library","name":"Probe",
-                    "module_count":3, "module_names_sha256":digest}});
+                    "module_count":3, "module_names_sha256":digest,
+                    "lakefile_sha256":lakefile_sha256, "manifest_sha256":manifest_sha256}});
             let create = managed(
                 &mut server,
                 json!({"op":"create","key":key,
@@ -854,6 +891,16 @@ mod launcher_regressions {
                 fs::rename(&module_b, &module_c).expect("substitute one collected module");
                 fs::write(&source, "import Probe.A\nimport Probe.C\n").expect("update root imports");
             }
+            match revision {
+                3 => fs::write(&root_config_path, format!("{root_config}\n-- changed after CREATE\n"))
+                    .expect("change root config"),
+                4 => fs::write(
+                    &dep_config_path,
+                    b"import Lake\nopen Lake DSL\npackage ext\nlean_lib Ext\n-- dirty\n",
+                )
+                .expect("dirty locked config"),
+                _ => {}
+            }
             let completed = managed(&mut server, json!({"op":"start","key":key,"capability":capability})).await;
             assert_eq!(
                 completed.get("custody").and_then(Value::as_str),
@@ -865,7 +912,7 @@ mod launcher_regressions {
             let receipt: Value = serde_json::from_slice(&body).expect("root-library receipt");
             assert_eq!(
                 receipt.get("module_count").and_then(Value::as_u64),
-                Some(3),
+                Some(if (3..=4).contains(&revision) { 0 } else { 3 }),
                 "{receipt}"
             );
             assert_eq!(
@@ -897,6 +944,18 @@ mod launcher_regressions {
                 }
                 fs::rename(&module_c, &module_b).expect("restore original module");
                 fs::write(&source, "import Probe.A\nimport Probe.B\n").expect("restore root imports");
+            } else if (3..=4).contains(&revision) {
+                assert_eq!(
+                    receipt.pointer("/first_failure/phase").and_then(Value::as_str),
+                    Some("configuration"),
+                    "{receipt}"
+                );
+                assert!(!fixture.project.join(".lake/build/lib/lean/Probe/B.olean").exists());
+                match revision {
+                    3 => fs::write(&root_config_path, &root_config).expect("restore root config"),
+                    4 => fs::write(&dep_config_path, &dep_config).expect("restore package config"),
+                    _ => {}
+                }
             } else {
                 assert!(receipt.get("first_failure").is_some_and(Value::is_null), "{receipt}");
                 assert_eq!(

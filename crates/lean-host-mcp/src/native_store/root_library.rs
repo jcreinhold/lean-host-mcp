@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::module_name;
+use super::{Plan, Target, module_name, pinned_lake_config};
 
 pub(super) const MAX_MODULES: usize = 16_384;
 const BATCH: usize = 16;
@@ -36,6 +36,7 @@ enum Stage {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
+    Configuration,
     Inventory,
     InventoryMismatch,
     Imports,
@@ -61,7 +62,7 @@ impl Receipt {
             || receipt.completed_batches > receipt.completed_modules
             || match &receipt.first_failure {
                 Some(Failure {
-                    phase: Phase::InventoryMismatch,
+                    phase: Phase::Configuration | Phase::InventoryMismatch,
                     exit_code,
                 }) => exit_code.is_some() || receipt.completed_modules != 0,
                 Some(Failure {
@@ -124,24 +125,45 @@ fn query(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<Vec<
 }
 
 pub(super) fn run(
-    name: &str,
-    expected_count: usize,
-    expected_sha256: &[u8; 32],
+    plan: &Plan,
     command: impl Fn() -> Command,
     authorize: &impl Fn() -> io::Result<Duration>,
     after_deps: &impl Fn() -> io::Result<()>,
 ) -> io::Result<Receipt> {
+    let Target::RootLibrary {
+        name,
+        module_count,
+        module_names_sha256,
+        lakefile_sha256,
+        manifest_sha256,
+    } = &plan.target
+    else {
+        return Err(invalid_inventory());
+    };
     let mut receipt = Receipt {
         version: 1,
         stage: Stage::RootLibrary,
-        name: name.to_owned(),
+        name: name.clone(),
         module_count: 0,
         completed_modules: 0,
         completed_batches: 0,
         first_failure: None,
     };
     authorize()?;
-    let inventory = query(command(), &[format!("@/{name}:modules")])?;
+    if pinned_lake_config::validate_root_config(&plan.root, lakefile_sha256)
+        .and_then(|()| pinned_lake_config::validate_pinned_lake_configs(&plan.root, manifest_sha256))
+        .is_err()
+    {
+        receipt.first_failure = Some(Failure {
+            phase: Phase::Configuration,
+            exit_code: None,
+        });
+        return Ok(receipt);
+    }
+    authorize()?;
+    let mut configure = command();
+    configure.arg("--reconfigure");
+    let inventory = query(configure, &[format!("@/{name}:modules")])?;
     let names = match inventory {
         Ok(mut rows) => rows.pop().ok_or_else(invalid_inventory)?,
         Err(code) => {
@@ -172,7 +194,7 @@ pub(super) fn run(
         digest.update([0]);
     }
     let actual_sha256: [u8; 32] = digest.finalize().into();
-    if names.len() != expected_count || &actual_sha256 != expected_sha256 {
+    if names.len() != *module_count || &actual_sha256 != module_names_sha256 {
         receipt.first_failure = Some(Failure {
             phase: Phase::InventoryMismatch,
             exit_code: None,
