@@ -53,7 +53,8 @@ pub(crate) enum Target {
         package: Option<String>,
     },
     ToolingSuites {
-        executable_sha256: [[u8; 32]; 4],
+        lakefile_sha256: [u8; 32],
+        manifest_sha256: [u8; 32],
     },
     WholeLint {
         lakefile_sha256: [u8; 32],
@@ -345,8 +346,12 @@ pub fn run(encoded: &str) -> io::Result<()> {
     if let Target::FirstPartyClean { lakefile_sha256 } = &plan.target {
         return first_party_clean::run(&plan.root, lakefile_sha256, authorize);
     }
-    if let Target::ToolingSuites { executable_sha256 } = &plan.target {
-        let receipt = tooling_suites::run(&plan.root, executable_sha256, authorize)?;
+    if let Target::ToolingSuites {
+        lakefile_sha256,
+        manifest_sha256,
+    } = &plan.target
+    {
+        let receipt = tooling_suites::run(&plan.root, lakefile_sha256, manifest_sha256, authorize)?;
         return serde_json::to_writer(std::io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     let lake = lake_executable(&plan.root)?;

@@ -9,11 +9,11 @@ use super::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadinessDecision {
     Launch,
-    RejectPrebuilt,
+    RejectToolingInputs,
 }
 
-const PREBUILT_REFUSAL: &[u8] =
-    br#"{"version":1,"stage":"lean-tooling-suites","status":"not_started","reason":"tooling_suite_prebuilt_unavailable_or_changed","checks":[]}"#;
+const TOOLING_INPUT_REFUSAL: &[u8] =
+    br#"{"version":1,"stage":"lean-tooling-suites","status":"not_started","reason":"tooling_suite_inputs_unavailable_or_changed","checks":[]}"#;
 
 impl NativeStore {
     /// Atomically record the Ready helper and spend the caller's original
@@ -86,7 +86,7 @@ impl NativeStore {
         )?;
         let (gate, stop) = match decision {
             ReadinessDecision::Launch => (1, false),
-            ReadinessDecision::RejectPrebuilt => (2, true),
+            ReadinessDecision::RejectToolingInputs => (2, true),
         };
         tx.execute(
             "UPDATE stages SET gate=?4,stop_requested=?5,resource_report=1
@@ -98,7 +98,7 @@ impl NativeStore {
     }
 
     /// The caller must have observed exact closure of the bound preflight writer.
-    pub(crate) fn finish_prebuilt_refusal(&mut self, binding: Binding, capability: &Capability) -> Answer<()> {
+    pub(crate) fn finish_tooling_input_refusal(&mut self, binding: Binding, capability: &Capability) -> Answer<()> {
         self.mutate_bound(binding, capability, |tx, old| {
             if old.gate != Gate::Sealed
                 || !old.stop_requested
@@ -113,8 +113,8 @@ impl NativeStore {
                  WHERE epoch=?4 AND nonce=?5 AND stage=?6",
                 params![
                     uuid::Uuid::new_v4().as_bytes(),
-                    digest(PREBUILT_REFUSAL),
-                    PREBUILT_REFUSAL,
+                    digest(TOOLING_INPUT_REFUSAL),
+                    TOOLING_INPUT_REFUSAL,
                     number(binding.key.epoch)?,
                     binding.key.nonce.as_slice(),
                     number(binding.key.stage)?

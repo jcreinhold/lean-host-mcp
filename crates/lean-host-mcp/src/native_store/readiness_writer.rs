@@ -270,14 +270,21 @@ fn execute(
     } else {
         None
     };
-    let roots = shims.as_ref().map_or(&[][..], |shims| shims.domains.as_slice());
+    let tooling_root = if matches!(stage, Stage::Preparation(Target::ToolingSuites { .. })) {
+        Some(writer_preparation::tooling_suites::package_root(root).map_err(no_start)?)
+    } else {
+        None
+    };
+    let roots = shims
+        .as_ref()
+        .map_or(tooling_root.as_slice(), |shims| shims.domains.as_slice());
     let budget = deadline.remaining().map_err(|error| super::public_error(&error))?;
     let mut writer = SharedWriter::open_with_write_roots(helper, root, roots, budget, &expired).map_err(no_start)?;
-    if let Stage::Preparation(Target::ToolingSuites { executable_sha256 }) = stage
-        && writer_preparation::tooling_suites::check(root, executable_sha256, &|| {
-            deadline.remaining().map_err(io::Error::other)
-        })
-        .is_err()
+    if let Stage::Preparation(Target::ToolingSuites {
+        lakefile_sha256,
+        manifest_sha256,
+    }) = stage
+        && writer_preparation::tooling_suites::check(root, lakefile_sha256, manifest_sha256).is_err()
     {
         let binding = writer.stage_ready().map_err(no_start).and_then(|ready| {
             store
@@ -288,7 +295,7 @@ fn execute(
                     &original.intent,
                     ready,
                     deadline,
-                    ReadinessDecision::RejectPrebuilt,
+                    ReadinessDecision::RejectToolingInputs,
                 )
                 .map_err(|error| super::public_error(&error))
         });
@@ -298,7 +305,7 @@ fn execute(
         if let Some(binding) = binding? {
             store
                 .lock()
-                .finish_prebuilt_refusal(binding, capability)
+                .finish_tooling_input_refusal(binding, capability)
                 .map_err(|error| super::public_error(&error))?;
         }
         return Ok(());

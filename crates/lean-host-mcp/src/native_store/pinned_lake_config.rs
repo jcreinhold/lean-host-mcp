@@ -33,7 +33,7 @@ fn invalid(reason: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason.into())
 }
 
-fn absent(path: &Path) -> io::Result<()> {
+pub(super) fn absent(path: &Path) -> io::Result<()> {
     match path.symlink_metadata() {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -44,7 +44,7 @@ fn absent(path: &Path) -> io::Result<()> {
     }
 }
 
-fn file_bytes(path: &Path) -> io::Result<Vec<u8>> {
+pub(super) fn file_bytes(path: &Path) -> io::Result<Vec<u8>> {
     let file = fs::File::from(rustix::fs::open(
         path,
         rustix::fs::OFlags::RDONLY
@@ -105,7 +105,7 @@ fn git(repo: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
     bytes
 }
 
-fn check(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<()> {
+pub(super) fn check(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<()> {
     absent(&root.join(".lake/package-overrides.json"))?;
     let bytes = file_bytes(&root.join("lake-manifest.json"))?;
     if <[u8; 32]>::from(Sha256::digest(&bytes)) != *expected_manifest {
@@ -166,6 +166,15 @@ fn check(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<()> {
         }
     }
     absent(&root.join(".lake/package-overrides.json"))?;
+    Ok(())
+}
+
+pub(super) fn check_dependency_free(root: &Path) -> io::Result<()> {
+    absent(&root.join(".lake/package-overrides.json"))?;
+    let manifest: Manifest = serde_json::from_slice(&file_bytes(&root.join("lake-manifest.json"))?)?;
+    if manifest.packages_dir != ".lake/packages" || !manifest.packages.is_empty() {
+        return Err(invalid("tooling workspace must have an empty dependency manifest"));
+    }
     Ok(())
 }
 

@@ -981,6 +981,137 @@ mod launcher_regressions {
     }
 
     #[tokio::test]
+    async fn managed_tooling_suites_build_once_and_use_target_cache() {
+        let Some(writer) = std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER") else {
+            return;
+        };
+        let fixture = Fixture::new();
+        let tooling = fixture.project.join("scripts/lean");
+        fs::create_dir_all(&tooling).expect("tooling workspace");
+        fs::write(
+            tooling.join("lakefile.toml"),
+            include_bytes!("../src/native_store/tooling_suites.toml"),
+        )
+        .expect("fixed config");
+        fs::write(
+            tooling.join("lake-manifest.json"),
+            r#"{"version":"1.2.0","packagesDir":".lake/packages","packages":[],"name":"«proofs-tooling-tests»","lakeDir":".lake"}"#,
+        ).expect("tooling lock");
+        for suite in ["ShakeSafe", "StyleLint", "ProbeUses", "RegroupVariables"] {
+            let directory = tooling.join(suite);
+            fs::create_dir(&directory).expect("suite directory");
+            let content = if suite == "RegroupVariables" {
+                r#"import Lean
+open Lean
+unsafe def main (args : List String) : IO UInt32 := do
+  if args == ["--child"] then
+    initSearchPath (← findSysroot)
+    enableInitializersExecution
+    let input := Parser.mkInputContext "import CacheProbe" "probe.lean"
+    let (header, _, messages) ← Parser.parseHeader input
+    let (env, messages) ← Elab.processHeader header .empty messages input
+    if messages.hasErrors || !env.contains `fixtureValue then
+      IO.eprintln "missing dynamic import"
+      return 3
+    IO.println "loaded cached import"
+    return 0
+  let child ← IO.Process.output { cmd := (← IO.appPath).toString, args := #["--child"] }
+  IO.print child.stdout
+  IO.eprint child.stderr
+  return child.exitCode
+"#
+            } else {
+                "def main : IO Unit := IO.println \"fixed suite\"\n"
+            };
+            fs::write(directory.join("Tests.lean"), content).expect("suite source");
+        }
+        use sha2::{Digest, Sha256};
+        let digest = |name| -> [u8; 32] {
+            Sha256::digest(fs::read(fixture.project.join(name)).expect("admitted config")).into()
+        };
+        let (store, _) = fixture.new_store("store").await;
+        let mut server = StdioServer::spawn(
+            fixture
+                .command()
+                .arg("--lake-root")
+                .arg(&fixture.project)
+                .arg("--managed-native-store")
+                .arg(store)
+                .env("LEAN_HOST_MCP_MANAGED_READINESS_WRITER", writer),
+        );
+        server.initialize().await;
+        let info = managed(&mut server, json!({"op":"discover"})).await;
+        let capability = [57_u8; 32];
+        let cache_object = fixture.project.join(".lake/build/lib/lean/CacheProbe.olean");
+        for (revision, expected_code) in [(1, 3), (2, 0)] {
+            if revision == 2 {
+                fs::create_dir_all(cache_object.parent().expect("cache directory")).expect("cache directory");
+                fs::write(
+                    fixture.project.join("CacheProbe.lean"),
+                    "def fixtureValue : Nat := 42\n",
+                )
+                .expect("cache source");
+                let lean = PathBuf::from(std::env::var_os("LEAN_SYSROOT").expect("fixture toolchain")).join("bin/lean");
+                let output = std::process::Command::new(lean)
+                    .current_dir(&fixture.project)
+                    .arg("-o")
+                    .arg(&cache_object)
+                    .arg("CacheProbe.lean")
+                    .output()
+                    .expect("prime fixture cache");
+                assert!(output.status.success(), "{output:?}");
+            }
+            let cached = fs::read(&cache_object).ok();
+            let key = json!({"store":info.get("store").expect("store"),"epoch":info.get("acceptance_epoch").expect("epoch"),
+                "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1});
+            let intent = json!({"project":fixture.project,"job":[revision],"revision":revision,
+                "operation":"lean_tooling_suites_v1","target":{"kind":"tooling_suites",
+                    "lakefile_sha256":digest("lakefile.lean"),"manifest_sha256":digest("lake-manifest.json")}});
+            let request = |op| json!({"op":op,"key":key,"capability":capability});
+            let create = managed(
+                &mut server,
+                json!({"op":"create","key":key,"capability":capability,
+                "intent":intent.to_string().as_bytes()}),
+            )
+            .await;
+            assert_eq!(
+                create.get("execution").and_then(Value::as_str),
+                Some("admitted"),
+                "{create}"
+            );
+            let finished = managed(&mut server, request("start")).await;
+            assert_eq!(
+                finished.get("custody").and_then(Value::as_str),
+                Some("closed"),
+                "{finished}"
+            );
+            let body: Vec<u8> = serde_json::from_value(finished.pointer("/result/body").expect("result body").clone())
+                .expect("result bytes");
+            let receipt: Value = serde_json::from_slice(&body).expect("suite receipt");
+            let checks = receipt.get("checks").and_then(Value::as_array).expect("suite checks");
+            assert_eq!(checks.len(), 4, "{receipt}");
+            let child = checks.last().expect("dynamic import suite");
+            assert_eq!(
+                child.get("exit_code").and_then(Value::as_i64),
+                Some(expected_code),
+                "{receipt}"
+            );
+            let output = child.get("output").and_then(Value::as_str).expect("diagnostics");
+            assert!(
+                output.contains(if revision == 1 {
+                    "missing dynamic import"
+                } else {
+                    "loaded cached import"
+                }),
+                "{receipt}"
+            );
+            assert_eq!(fs::read(&cache_object).ok(), cached);
+            assert_eq!(managed(&mut server, request("get")).await, finished);
+        }
+        server.close_stdin_and_wait().await;
+    }
+
+    #[tokio::test]
     async fn launcher_rejects_valid_replacement_store_at_original_path() {
         let fixture = Fixture::new();
         let (store, id) = fixture.new_store("store").await;

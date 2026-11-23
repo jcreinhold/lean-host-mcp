@@ -1,0 +1,36 @@
+name = "proofs-tooling-tests"
+buildDir = "../../.lake/build/tooling-tests"
+
+[[lean_lib]]
+name = "ShakeSafe"
+globs = ["ShakeSafe.*"]
+
+[[lean_lib]]
+name = "StyleLint"
+globs = ["StyleLint.*"]
+
+[[lean_lib]]
+name = "ProbeUses"
+globs = ["ProbeUses.*"]
+
+[[lean_lib]]
+name = "RegroupVariables"
+globs = ["RegroupVariables.*"]
+
+[[lean_exe]]
+name = "shake-safe-tests"
+root = "ShakeSafe.Tests"
+
+[[lean_exe]]
+name = "style-lint-tests"
+root = "StyleLint.Tests"
+
+[[lean_exe]]
+name = "probe-uses-tests"
+root = "ProbeUses.Tests"
+supportInterpreter = true
+
+[[lean_exe]]
+name = "regroup-variables-tests"
+root = "RegroupVariables.Tests"
+supportInterpreter = true
