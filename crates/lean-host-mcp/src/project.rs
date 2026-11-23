@@ -1257,6 +1257,7 @@ fn retain_artifact_domains(
 /// Cheap to clone via `Arc`.
 pub(crate) struct LeanProject {
     canonical_root: PathBuf,
+    prepared_generation: Option<String>,
     toolchain: String,
     package: Option<String>,
     library: Option<String>,
@@ -1351,6 +1352,7 @@ impl LeanProject {
         config.prepared_host_artifacts = Some(prepared_host_artifacts);
         config.native_capacity_limit = native_capacity_limit;
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
+        let prepared_generation = config.prepared_generation.clone();
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
 
@@ -1381,6 +1383,7 @@ impl LeanProject {
         let cache_cap = NonZeroUsize::new(MODULE_QUERY_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         Ok(Arc::new(Self {
             canonical_root: meta.canonical_root,
+            prepared_generation,
             toolchain: runtime_toolchain,
             package: meta.package,
             library: meta.library,
@@ -1394,6 +1397,10 @@ impl LeanProject {
             runtime,
             module_queries: ModuleQueryCache::with_capacity(cache_cap),
         }))
+    }
+
+    pub(crate) fn accepts_prepared_generation(&self, required: Option<&str>) -> bool {
+        required.is_none_or(|record| self.prepared_generation.as_deref() == Some(record))
     }
 
     /// A test controller whose real shared-lock owner exits with its mailbox.
@@ -1411,6 +1418,7 @@ impl LeanProject {
         });
         Arc::new(Self {
             canonical_root: root.to_path_buf(),
+            prepared_generation: None,
             toolchain: "test".into(),
             package: None,
             library: None,
@@ -4835,6 +4843,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(2);
         let project = LeanProject {
             canonical_root: PathBuf::from("/test"),
+            prepared_generation: None,
             toolchain: "test".into(),
             package: None,
             library: None,

@@ -1082,7 +1082,7 @@ impl ProjectBroker {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
         let epoch = self.inner.lock().shutdown_epoch;
-        if let Some(project) = self.select_worker(&root)? {
+        if let Some(project) = self.select_worker_for_preparation(&root, managed_prepared)? {
             return Ok(project);
         }
 
@@ -1109,7 +1109,7 @@ impl ProjectBroker {
 
         // Root-local startup serialization closes the race between callers that
         // both saw spare capacity. Selection pins the returned actor with an Arc.
-        if let Some(project) = self.select_worker(&root)? {
+        if let Some(project) = self.select_worker_for_preparation(&root, managed_prepared)? {
             return Ok(project);
         }
         let (lane, growing) = {
@@ -1133,14 +1133,14 @@ impl ProjectBroker {
         let slot = if growing {
             let Ok(_turn) = self.capacity_admission.try_lock() else {
                 return self
-                    .select_existing_worker(&root)?
+                    .select_existing_worker(&root, managed_prepared)?
                     .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
             };
             match Arc::clone(&self.worker_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
                     return self
-                        .select_existing_worker(&root)?
+                        .select_existing_worker(&root, managed_prepared)?
                         .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
                 }
             }
@@ -1152,7 +1152,13 @@ impl ProjectBroker {
         if cancellation.is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
-        let runtime_config = self.runtime_config.clone();
+        let runtime_config = if let Some(selection) = managed_prepared {
+            self.runtime_config
+                .clone()
+                .with_prepared_generation(Some(selection.to_owned()))?
+        } else {
+            self.runtime_config.clone()
+        };
         let inner = Arc::clone(&self.inner);
         let maintenance = MaintenanceAccess::new(&self.inner);
         let native_capacity_limit = self.config.max_projects.get();
@@ -1218,7 +1224,12 @@ impl ProjectBroker {
 
     /// Prefer a free actor; grow only while the global pool has spare capacity.
     /// A busy actor remains a valid queue, not a reason to refuse a request.
+    #[cfg(test)]
     fn select_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
+        self.select_worker_for_preparation(root, None)
+    }
+
+    fn select_worker_for_preparation(&self, root: &Path, prepared: Option<&str>) -> Result<Option<Arc<LeanProject>>> {
         {
             let mut inner = self.inner.lock();
             Self::check_runtime_admission(&mut inner, root)?;
@@ -1246,7 +1257,7 @@ impl ProjectBroker {
         let candidates: Vec<_> = inner
             .registry
             .iter()
-            .filter(|(key, _)| key.root == root)
+            .filter(|(key, actor)| key.root == root && actor.accepts_prepared_generation(prepared))
             .map(|(key, actor)| {
                 (
                     key.clone(),
@@ -1275,8 +1286,17 @@ impl ProjectBroker {
         let selection = self.prepared_generation().ok_or_else(|| {
             ServerError::BadProject("managed inspection requires an installed prepared generation".to_owned())
         })?;
+        self.managed_actor_for_record(selection, deadline).await
+    }
+
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) async fn managed_actor_for_record(
+        &self,
+        selection: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<LeanProject>> {
         let root = self.native_root(&ProjectHint::Default)?;
-        if let Some(actor) = self.select_existing_worker(&root)? {
+        if let Some(actor) = self.select_existing_worker(&root, Some(selection))? {
             return Ok(actor);
         }
         // The installed-only bootstrap opens a guarded receiver with an empty
@@ -1289,14 +1309,16 @@ impl ProjectBroker {
         .map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
     }
 
-    fn select_existing_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
+    fn select_existing_worker(&self, root: &Path, prepared: Option<&str>) -> Result<Option<Arc<LeanProject>>> {
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;
         let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         let key = inner
             .registry
             .iter()
-            .filter(|(key, actor)| key.root == root && actor.is_healthy())
+            .filter(|(key, actor)| {
+                key.root == root && actor.is_healthy() && actor.accepts_prepared_generation(prepared)
+            })
             .min_by_key(|(_, actor)| {
                 actor
                     .outstanding_jobs()

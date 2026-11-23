@@ -100,6 +100,7 @@ fn mailbox_project() -> (Arc<LeanProject>, mpsc::Receiver<ProjectMessage>) {
     let (tx, rx) = mpsc::channel(1);
     let project = LeanProject {
         canonical_root: PathBuf::from("/unused-semantic-project"),
+        prepared_generation: None,
         toolchain: "unused-test-toolchain".to_owned(),
         package: None,
         library: None,
