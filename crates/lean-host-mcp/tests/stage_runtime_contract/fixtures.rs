@@ -452,7 +452,23 @@ fn guardian_helper() {
         fs::write(root.join("guardian-error"), error.to_string()).unwrap();
         panic!("real guardian failed: {error}");
     }
-    assert!(!group_present(u32::try_from(worker).unwrap()).unwrap());
+    if group_present(u32::try_from(worker).unwrap()).unwrap() {
+        // The requested-drain path can return before the original owner reaps
+        // its sole zombie. Only the SDK's published exact closure permits it.
+        let nonce = std::env::var("LEAN_RS_WORKER_PARENT_NONCE").unwrap();
+        let record = read_json(
+            &root
+                .parent()
+                .unwrap()
+                .join("owners")
+                .join(format!("worker-{nonce}"))
+                .join("owner.json"),
+        )
+        .unwrap();
+        assert_eq!(record["guardian"], json!(birth));
+        assert_eq!(record["process"]["pid"], worker);
+        assert_eq!(record["guardian_zombie_closure"], true);
+    }
     fs::write(root.join("guardian-returned"), b"real guardian drain returned").unwrap();
 }
 #[test]
@@ -636,7 +652,8 @@ fn contender_helper() {
     write_json(
         &root,
         "contender-acquired.json",
-        &json!({"group_present":present,"worker_live":worker_live,"managed_writer_ready":managed_writer_ready}),
+        &json!({"group_present":present,"worker_live":worker_live,"managed_writer_ready":managed_writer_ready,
+            "lock_device":metadata.dev(),"lock_inode":metadata.ino()}),
     );
     wait(|| root.join("scope-closed").exists());
     let readiness_after_closure = readiness();

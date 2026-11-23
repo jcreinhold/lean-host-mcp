@@ -641,13 +641,45 @@ fn bound_drain_case(case: RecoveryCase, cut: Cut) {
     fixtures::wait(|| !original.worker.is_live().unwrap());
     assert!(owner.try_lock().is_err());
     assert_eq!(fixture.leaf_starts(stage_key(&request)).len(), cut.starts());
+    // Keep the broker stopped until EX has actually been acquired and the SDK
+    // confirms closure on the original retained record. Otherwise reaping can
+    // race the contender's census and conceal the supported sole-zombie path.
+    let expected = lean_toolchain::native_guardian::NativeGuardianDrainBinding {
+        registry_device: original.device,
+        registry_inode: original.inode,
+        generation: original.generation,
+        boot: uuid::Uuid::from_bytes(original.boot).to_string(),
+        parent: original.parent,
+        worker: original.worker,
+        guardian: original.guardian,
+    };
+    fixtures::wait(|| {
+        lean_toolchain::native_guardian::observe_original_guardian_closure(
+            &base.join("owners"),
+            &expected,
+            Duration::from_secs(1),
+        )
+        .unwrap()
+    });
+    assert_eq!(read_json(&record_path)["guardian_zombie_closure"], true);
+    assert!(group_present(expected.worker.process_group).unwrap());
+    assert!(!expected.worker.is_live().unwrap());
+    assert!(scope_root.join("guardian-returned").is_file());
+    let acquired_path = scope_root.join("contender-acquired.json");
+    fixtures::wait(|| acquired_path.exists());
+    let before_reap = read_json(&acquired_path);
+    assert_eq!(before_reap["group_present"], true, "{before_reap}");
+    assert_eq!(before_reap["worker_live"], false, "{before_reap}");
+    assert_eq!(before_reap["lock_device"], lock_identity.0);
+    assert_eq!(before_reap["lock_inode"], lock_identity.1);
+    assert!(owner.try_lock().is_err());
     fs::write(base.join("bound-recovery-reap"), b"allow original custodian to reap").unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
     assert!(service.wait().success());
 
-    fixtures::wait(|| !group_present(original.worker.process_group).unwrap() && !original.guardian.is_live().unwrap());
+    fixtures::wait(|| !group_present(expected.worker.process_group).unwrap() && !expected.guardian.is_live().unwrap());
     let acquired = contender.finish();
-    assert_eq!(acquired["group_present"], false);
+    assert_eq!(acquired["group_present"], before_reap["group_present"]);
     assert_eq!(acquired["worker_live"], false);
     assert_eq!(acquired["readiness_after_closure"], true);
     assert_eq!(acquired["payload_after_marker"], 0);
