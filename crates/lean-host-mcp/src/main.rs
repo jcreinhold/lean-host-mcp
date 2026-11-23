@@ -75,6 +75,16 @@ enum Command {
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
     NativeReaderWait(lean_host_mcp::native_reader::NativeReaderArgs),
+    /// Build a clean registered-Elan project under the writer and print its prepared generation.
+    #[cfg(unix)]
+    PrepareGeneration {
+        /// Operator-owned JSON with project, roots, release, and ordered module/domain pairs.
+        #[arg(long)]
+        plan: PathBuf,
+        /// Path to the installed standalone lean-rs-writer.
+        #[arg(long)]
+        writer: PathBuf,
+    },
     /// Build and install a per-toolchain worker binary.
     InstallWorker(InstallWorkerArgs),
     /// Generate and manage the configuration file.
@@ -297,9 +307,61 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        #[cfg(unix)]
+        Some(Command::PrepareGeneration { plan, writer }) => match prepare_generation(&plan, &writer) {
+            Ok(record) => {
+                println!("{record}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("lean-host-mcp prepare-generation: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
         Some(Command::Serve(args)) => run_serve(args),
         None => run_serve(cli.serve),
     }
+}
+
+#[cfg(unix)]
+fn prepare_generation(plan: &std::path::Path, writer: &std::path::Path) -> anyhow::Result<String> {
+    use std::io::Read as _;
+
+    use lean_host_mcp_worker::prepared_project::ImportPlan;
+    use lean_toolchain::shared_writer::SharedWriter;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Selection {
+        project: PathBuf,
+        roots: Vec<PathBuf>,
+        release: PathBuf,
+        modules: Vec<(String, PathBuf)>,
+    }
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(plan)?.take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
+        bail!("prepared generation plan exceeds 4096 bytes");
+    }
+    let Selection {
+        project,
+        roots,
+        release,
+        modules,
+    } = serde_json::from_slice(&bytes)?;
+    if !project.is_absolute() || project.canonicalize()? != project {
+        bail!("prepared generation project must be a canonical absolute path");
+    }
+    let plan = ImportPlan::new(project.clone(), roots, release, modules).with_installed_release()?;
+    let writer = writer.canonicalize().context("resolve standalone writer")?;
+    let timeout = Duration::from_secs(15);
+    let mut writer = SharedWriter::open(&writer, &project, timeout)?;
+    let result = plan
+        .build_generation(&mut writer)
+        .and_then(|generation| generation.launch_input());
+    writer.close(timeout).context("confirm standalone writer closure")?;
+    Ok(result?)
 }
 
 #[cfg(unix)]
