@@ -192,14 +192,14 @@ impl NativeStore {
         budget: Option<std::time::Duration>,
         validate: impl FnOnce(&[u8]) -> Result<(), Reject>,
     ) -> Result<serde_json::Value, &'static str> {
-        self.admission_with_handoff(bytes, budget, validate, |_, _| None)
+        self.admission_with_handoff(bytes, budget, |intent, _| validate(intent), |_, _| None)
     }
 
     pub(crate) fn admission_with_handoff(
         &mut self,
         bytes: &[u8],
         budget: Option<std::time::Duration>,
-        validate: impl FnOnce(&[u8]) -> Result<(), Reject>,
+        validate: impl FnOnce(&[u8], bool) -> Result<(), Reject>,
         allow_handoff: impl FnOnce(&Snapshot, &[u8]) -> Option<super::CallerKey>,
     ) -> Result<serde_json::Value, &'static str> {
         let request = decode(bytes).map_err(|_| "invalid_request")?;
@@ -224,7 +224,7 @@ impl NativeStore {
                 drain_authorization: None,
                 after_writer: Some(receipt),
             } => (|| {
-                validate(&intent).map_err(Problem::Rejected)?;
+                validate(&intent, true).map_err(Problem::Rejected)?;
                 let capability = Capability(capability);
                 let stage = key
                     .stage
@@ -266,7 +266,7 @@ impl NativeStore {
                     &intent,
                     drain_authorization,
                     super::StageAdmission::Initial(budget.map(super::recovery::admission_deadline)),
-                    validate,
+                    |intent| validate(intent, false),
                 )
                 .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
             ClientCommand::Discover {} => self

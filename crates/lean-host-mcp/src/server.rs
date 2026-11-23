@@ -288,9 +288,9 @@ impl LeanHostService {
         let budget = cfg!(any(target_os = "macos", target_os = "linux"))
             .then(|| Duration::from_millis(self.ctx.broker.request_timeout_millis()));
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let validate = crate::managed_prepared::validate_create;
+        let validate = crate::managed_prepared::validate_create_at_boundary;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let validate = |_| Ok(());
+        let validate = |_: &[u8], _| Ok(());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let allow_handoff = crate::managed_prepared::validate_writer_handoff;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]

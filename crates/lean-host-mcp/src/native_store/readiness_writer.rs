@@ -197,36 +197,104 @@ fn parse_intent(intent: &[u8]) -> Option<(PathBuf, Stage)> {
     Some((request.project, stage))
 }
 
-pub(super) fn supports_prepared_inspection(
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedReadiness {
+    readiness: Receipt,
+    prepared_generation: String,
+}
+
+pub(super) fn prepared_inspection_receipt(
     snapshot: &Snapshot,
     project: &Path,
     imports: &[String],
     job: &[u8],
     revision: u64,
-) -> bool {
+) -> Option<Option<String>> {
     use crate::native_store::store::ResultKnowledge;
 
-    let Ok(original) = serde_json::from_slice::<Intent>(&snapshot.intent) else {
-        return false;
-    };
+    let original = serde_json::from_slice::<Intent>(&snapshot.intent).ok()?;
     if original.job != job || original.revision != revision {
-        return false;
+        return None;
     }
-    let Some((writer_project, Stage::Preparation(target @ Target::Ready { package: None, .. }))) =
-        parse_intent(&snapshot.intent)
+    let (writer_project, Stage::Preparation(target @ Target::Ready { package: None, .. })) =
+        parse_intent(&snapshot.intent)?
     else {
-        return false;
+        return None;
     };
     let Target::Ready { name, .. } = &target else {
-        return false;
+        return None;
     };
     if writer_project != project || !imports.contains(name) {
-        return false;
+        return None;
     }
     let (ResultKnowledge::Retained { body, .. } | ResultKnowledge::Acknowledged { body, .. }) = &snapshot.result else {
-        return false;
+        return None;
     };
-    Receipt::parse(body, &target).is_ok_and(|receipt| receipt.target_ready())
+    if let Ok(bound) = serde_json::from_slice::<PreparedReadiness>(body) {
+        let receipt = Receipt::parse(&serde_json::to_vec(&bound.readiness).ok()?, &target).ok()?;
+        return receipt.target_ready().then_some(Some(bound.prepared_generation));
+    }
+    Receipt::parse(body, &target).ok()?.target_ready().then_some(None)
+}
+
+// Opt-in, operator-owned output of the existing guarded generation producer.
+// The readiness writer validates it under the same exclusive artifact union
+// before putting its bytes into the sealed stage receipt.
+fn bind_ready_record(
+    receipt: Receipt,
+    target: &Target,
+    root: &Path,
+    domains: &[PathBuf],
+) -> io::Result<serde_json::Value> {
+    use lean_host_mcp_worker::prepared_project::PreparedGeneration;
+    use std::{io::Read as _, os::unix::fs::MetadataExt as _};
+
+    if let Target::Ready { name, package: None } = target
+        && receipt.target_ready()
+        && let Some(path) = std::env::var_os("LEAN_HOST_MCP_MANAGED_READY_RECORD").map(PathBuf::from)
+    {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o022 != 0
+            || path.canonicalize()? != path
+        {
+            return Err(io::Error::other(
+                "managed preparation record is not a canonical operator-owned file",
+            ));
+        }
+        let file = std::fs::File::open(&path)?;
+        let opened = file.metadata()?;
+        if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
+            return Err(io::Error::other("managed preparation record changed while opening"));
+        }
+        let mut record = String::new();
+        file.take(4098).read_to_string(&mut record)?;
+        if record.len() > 4097 {
+            return Err(io::Error::other("managed preparation record exceeds its input bound"));
+        }
+        let record = record.trim().to_owned();
+        let approved = PreparedGeneration::decode(&record)?;
+        if approved.project() != root
+            || !approved
+                .modules()
+                .iter()
+                .any(|(module, owner)| module == name && owner == root)
+        {
+            return Err(io::Error::other(
+                "managed preparation record does not bind the selected root module",
+            ));
+        }
+        PreparedGeneration::check_identity(&record, domains)?;
+        approved.check_products()?;
+        return Ok(serde_json::to_value(PreparedReadiness {
+            readiness: receipt,
+            prepared_generation: record,
+        })?);
+    }
+    Ok(serde_json::to_value(receipt)?)
 }
 
 pub(crate) fn validate_create(intent: &[u8]) -> Result<(), crate::native_store::store::Reject> {
@@ -565,8 +633,9 @@ fn execute(
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
         }
         Stage::Preparation(target) if output.status.success() => Receipt::parse(&output.stdout, target)
-            .ok()
-            .and_then(|receipt| serde_json::to_value(receipt).ok()),
+            .and_then(|receipt| bind_ready_record(receipt, target, root, writer.write_roots()))
+            .map_err(|error| tracing::debug!(%error, "managed preparation result unavailable"))
+            .ok(),
         Stage::Preparation(_) => None,
         Stage::SetupVerification(request, projection) => request.receipt(*projection, &output),
         Stage::Cache => output
