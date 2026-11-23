@@ -618,18 +618,19 @@ os._exit(0)
         .arg(&fixture.root)
         .arg(serde_json::to_string(&argv).unwrap())
         .stdin(Stdio::from(std::fs::File::from(reader)));
-    let started = Instant::now();
     let mut caller = OwnedChild::spawn(caller_command);
     rustix::io::write(&writer, b"import partial input").unwrap();
     assert!(caller.child().wait().unwrap().success());
     let output = fixture.root.join("reader-result");
     wait_for(|| fs::read(&output).is_ok_and(|bytes| serde_json::from_slice::<Value>(&bytes).is_ok()));
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "caller loss must resolve before the five-second deadline"
-    );
     // The test driver still owns the only writer. EOF cannot explain the result.
     let result: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    // Caller loss has its own refusal detail. The open pipe cannot produce EOF,
+    // and a deadline refusal must fail this assertion even if nothing started.
+    assert_eq!(
+        result["detail"],
+        "native utility refused before bootstrap spawn: native stdin caller ended or cancelled"
+    );
     assert_eq!(result["state"], "not_started");
     assert_eq!(result["target_started"], false);
     assert_eq!(result["scope_closed"], true);
