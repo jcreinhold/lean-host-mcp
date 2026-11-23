@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::{Plan, Target, blueprint_declarations, module_name, pinned_lake_config};
 
 pub(super) use lean_host_mcp_worker::module_preparation::MAX_PROJECT_MODULES as MAX_MODULES;
-const BATCH: usize = 16;
+pub(super) const BATCH: usize = 16;
 const MAX_QUERY_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -177,6 +177,38 @@ fn source_files(
     Ok(sources)
 }
 
+pub(super) fn run_ir_batch(
+    modules: &[&str],
+    command: &impl Fn() -> Command,
+    authorize: &impl Fn() -> io::Result<Duration>,
+    after_deps: &impl Fn() -> io::Result<()>,
+) -> io::Result<Option<Failure>> {
+    for (phase, flags, facet) in [
+        (Phase::Dependencies, ["--no-build", "build"], "deps"),
+        (Phase::Setup, ["--no-build", "query"], "setup"),
+        (Phase::Build, ["--log-level=warning", "build"], "irArts"),
+    ] {
+        if matches!(phase, Phase::Build) {
+            after_deps()?;
+        }
+        authorize()?;
+        let status = command()
+            .args(flags)
+            .args(modules.iter().map(|name| format!("@/+{name}:{facet}")))
+            .status()?;
+        let code = status
+            .code()
+            .ok_or_else(|| io::Error::other("fixed Lake batch was interrupted"))?;
+        if code != 0 {
+            return Ok(Some(Failure {
+                phase,
+                exit_code: Some(code),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn run(
     plan: &Plan,
     lake: &Path,
@@ -316,29 +348,9 @@ pub(super) fn run(
         }
     }
     for modules in batches.values().flat_map(|level| level.chunks(BATCH)) {
-        for (phase, flags, facet) in [
-            (Phase::Dependencies, ["--no-build", "build"], "deps"),
-            (Phase::Setup, ["--no-build", "query"], "setup"),
-            (Phase::Build, ["--log-level=warning", "build"], "irArts"),
-        ] {
-            if matches!(phase, Phase::Build) {
-                after_deps()?;
-            }
-            authorize()?;
-            let status = command()
-                .args(flags)
-                .args(modules.iter().map(|name| format!("@/+{name}:{facet}")))
-                .status()?;
-            let code = status
-                .code()
-                .ok_or_else(|| io::Error::other("fixed Lake batch was interrupted"))?;
-            if code != 0 {
-                receipt.first_failure = Some(Failure {
-                    phase,
-                    exit_code: Some(code),
-                });
-                return Ok(receipt);
-            }
+        if let Some(failure) = run_ir_batch(modules, &command, authorize, after_deps)? {
+            receipt.first_failure = Some(failure);
+            return Ok(receipt);
         }
         receipt.completed_modules = receipt
             .completed_modules

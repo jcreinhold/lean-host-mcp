@@ -12,7 +12,7 @@ use lean_host_mcp_worker::prepared_project::{ImportPlan, PreparedGeneration};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{Receipt, Stage, pinned_lake_config, run_module};
+use super::{Receipt, Stage, pinned_lake_config, root_library};
 use crate::{
     broker::verify_file::VerifierShims, lake_meta::LakeProjectMeta,
     managed_prepared::readiness_writer::PreparedReadiness,
@@ -193,17 +193,32 @@ pub(super) fn run(
                 .env_remove("MATHLIB_CACHE_BASE_URL"),
         )?;
     }
-    for name in build {
-        let run = |args: &[&str]| {
-            authorize()?;
-            let status = lake_command().args(args).stdout(Stdio::null()).status()?;
-            status
-                .code()
-                .ok_or_else(|| io::Error::other("guarded Lake was interrupted"))
-        };
-        let receipt = run_module(name.to_owned(), &run, &|| authorize().map(|_| ()))?;
-        if receipt.dependency_exit_code != 0 || receipt.build_exit_code != Some(0) {
-            return Err(io::Error::other("first-party closure build did not complete"));
+    let quiet_lake = || {
+        let mut command = lake_command();
+        command.stdout(Stdio::null());
+        command
+    };
+    authorize()?;
+    let current = quiet_lake()
+        .args(["--no-build", "build", &format!("@/+{seed}:irArts")])
+        .status()?;
+    match current.code() {
+        Some(0) => {}
+        // Lake.NoBuildCode: the selected facet needs rebuilding.
+        Some(3) => {
+            for modules in build.iter().flat_map(|level| level.chunks(root_library::BATCH)) {
+                if let Some(failure) = root_library::run_ir_batch(modules, &quiet_lake, authorize, &|| Ok(()))? {
+                    return Err(io::Error::other(format!(
+                        "first-party closure batch did not complete: {}",
+                        serde_json::to_string(&failure)?
+                    )));
+                }
+            }
+        }
+        _ => {
+            return Err(io::Error::other(format!(
+                "selected first-party readiness failed: {current}"
+            )));
         }
     }
     for domain in &domains {
@@ -239,7 +254,7 @@ fn preparation_order<'a>(
     root: &Path,
     closure: &'a [(String, PathBuf)],
     edges: &'a BTreeMap<String, Vec<String>>,
-) -> io::Result<(Vec<&'a str>, BTreeSet<&'a str>)> {
+) -> io::Result<(Vec<Vec<&'a str>>, BTreeSet<&'a str>)> {
     let mut pending = BTreeMap::new();
     let mut cache = BTreeSet::new();
     let owners = closure
@@ -269,7 +284,7 @@ fn preparation_order<'a>(
             pending.insert(name.as_str(), local);
         }
     }
-    let mut build = Vec::with_capacity(pending.len());
+    let mut build = Vec::new();
     while !pending.is_empty() {
         let ready = pending
             .iter()
@@ -278,13 +293,13 @@ fn preparation_order<'a>(
         if ready.is_empty() {
             return Err(io::Error::other("cycle in first-party preparation closure"));
         }
-        for name in ready {
+        for name in &ready {
             pending.remove(name);
             for dependencies in pending.values_mut() {
                 dependencies.remove(name);
             }
-            build.push(name);
         }
+        build.push(ready);
     }
     Ok((build, cache))
 }
