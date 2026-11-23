@@ -13,7 +13,7 @@ pub struct PreparedProject {
     guards: LocalArtifactRead,
     ordered: Vec<(PathBuf, File)>,
 }
-fn valid_module(name: &str) -> bool {
+pub(super) fn valid_module(name: &str) -> bool {
     name.split('.').all(|part| {
         part.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
             && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -551,6 +551,37 @@ impl ImportPlan {
         if dependencies.modules.is_empty() || dependencies.modules.len() + 1 != self.modules.len() {
             return Err(invalid());
         }
+        let sysroot = self.release.parent().and_then(Path::parent).ok_or_else(invalid)?;
+        let selected = crate::prepared_closure::derive(
+            &self.roots,
+            &self.release,
+            &domains,
+            self.modules
+                .iter()
+                .filter(|(_, domain)| domain == &self.project)
+                .map(|(name, _)| name.clone()),
+            |files| {
+                let mut command = Command::new(sysroot.join("bin/lean"));
+                command
+                    .current_dir(&self.project)
+                    .arg("--deps-json")
+                    .args(files)
+                    .env("LEAN_SYSROOT", sysroot)
+                    .env_remove("LEAN_PATH")
+                    .env_remove("LEAN_SRC_PATH");
+                let output = writer.run(&command, Duration::from_secs(30))?;
+                if output.status.success() {
+                    Ok(output.stdout)
+                } else {
+                    Err(io::Error::other(String::from_utf8_lossy(&output.stderr).into_owned()))
+                }
+            },
+        )?;
+        if selected.into_iter().collect::<std::collections::BTreeSet<_>>() != self.modules.iter().cloned().collect() {
+            return Err(io::Error::other(
+                "prepared roster does not match the selected source closure",
+            ));
+        }
         materialize(writer)?;
         self.check_edges(writer)?;
         let expected = dependencies.identity(&domains)?;
@@ -560,7 +591,6 @@ impl ImportPlan {
             }
             Ok(())
         };
-        let sysroot = self.release.parent().and_then(Path::parent).ok_or_else(invalid)?;
         let (readiness, build) = crate::module_preparation::run_module(
             target,
             |args| {
