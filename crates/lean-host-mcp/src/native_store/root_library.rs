@@ -2,12 +2,12 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::{self, BufRead, BufReader, Read},
-    path::Path,
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use super::{Plan, Target, blueprint_declarations, module_name, pinned_lake_config};
@@ -43,6 +43,7 @@ pub(super) enum Phase {
     BlueprintInputs,
     Inventory,
     InventoryMismatch,
+    Sources,
     Imports,
     Dependencies,
     Setup,
@@ -68,7 +69,7 @@ impl Receipt {
             || receipt.blueprint.as_ref().is_some_and(|outcome| !outcome.valid())
             || match &receipt.first_failure {
                 Some(Failure {
-                    phase: Phase::Configuration | Phase::InventoryMismatch | Phase::BlueprintInputs,
+                    phase: Phase::Configuration | Phase::InventoryMismatch | Phase::BlueprintInputs | Phase::Sources,
                     exit_code,
                 }) => exit_code.is_some() || receipt.completed_modules != 0,
                 Some(Failure {
@@ -94,7 +95,7 @@ fn invalid_inventory() -> io::Error {
     )
 }
 
-fn query(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<Vec<String>>, i32>> {
+fn query<T: DeserializeOwned>(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<T>, i32>> {
     let mut child = command
         .args(["--no-build", "query", "--json"])
         .args(targets)
@@ -130,18 +131,65 @@ fn query(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<Vec<
     Ok(Ok(rows))
 }
 
+pub(super) fn verify_sources(root: &Path, files: &[String], expected: &[u8; 32]) -> io::Result<()> {
+    let mut sorted: Vec<_> = files.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    if sorted
+        .windows(2)
+        .any(|pair| matches!(pair, [left, right] if left == right))
+    {
+        return Err(invalid_inventory());
+    }
+    let mut digest = Sha256::new();
+    for file in sorted {
+        digest.update(file.as_bytes());
+        digest.update([0]);
+        digest.update(Sha256::digest(pinned_lake_config::file_bytes(&root.join(file))?));
+    }
+    if <[u8; 32]>::from(digest.finalize()) != *expected {
+        return Err(io::Error::other("admitted library sources changed"));
+    }
+    Ok(())
+}
+
+fn source_files(
+    root: &Path,
+    names: &[String],
+    command: &impl Fn() -> Command,
+    authorize: &impl Fn() -> io::Result<Duration>,
+) -> io::Result<Vec<String>> {
+    let mut sources = Vec::with_capacity(names.len());
+    for modules in names.chunks(BATCH) {
+        authorize()?;
+        let targets: Vec<_> = modules.iter().map(|name| format!("@/+{name}:lean")).collect();
+        let paths = query::<PathBuf>(command(), &targets)?.map_err(|_| invalid_inventory())?;
+        for path in paths {
+            let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+            if relative.extension().is_none_or(|extension| extension != "lean")
+                || !relative.components().all(|part| matches!(part, Component::Normal(_)))
+                || path.canonicalize()? != path
+            {
+                return Err(invalid_inventory());
+            }
+            sources.push(relative.to_str().ok_or_else(invalid_inventory)?.to_owned());
+        }
+    }
+    Ok(sources)
+}
+
 pub(super) fn run(
     plan: &Plan,
     lake: &Path,
     command: impl Fn() -> Command,
     authorize: &impl Fn() -> io::Result<Duration>,
     after_deps: &impl Fn() -> io::Result<()>,
-    mut inspect_inventory: impl FnMut(&[String]) -> io::Result<()>,
+    mut inspect_inventory: impl FnMut(&[String], &[String]) -> io::Result<()>,
 ) -> io::Result<Receipt> {
     let Target::RootLibrary {
         name,
         module_count,
         module_names_sha256,
+        sources_sha256,
         lakefile_sha256,
         manifest_sha256,
         blueprint,
@@ -184,7 +232,7 @@ pub(super) fn run(
     authorize()?;
     let mut configure = command();
     configure.arg("--reconfigure");
-    let inventory = query(configure, &[format!("@/{name}:modules")])?;
+    let inventory = query::<Vec<String>>(configure, &[format!("@/{name}:modules")])?;
     let names = match inventory {
         Ok(mut rows) => rows.pop().ok_or_else(invalid_inventory)?,
         Err(code) => {
@@ -215,9 +263,23 @@ pub(super) fn run(
         digest.update([0]);
     }
     let actual_sha256: [u8; 32] = digest.finalize().into();
-    if names.len() != *module_count || &actual_sha256 != module_names_sha256 || inspect_inventory(&names).is_err() {
+    if names.len() != *module_count || &actual_sha256 != module_names_sha256 {
         receipt.first_failure = Some(Failure {
             phase: Phase::InventoryMismatch,
+            exit_code: None,
+        });
+        return Ok(receipt);
+    }
+    let sources = source_files(&plan.root, &names, &command, authorize);
+    if sources
+        .and_then(|files| {
+            verify_sources(&plan.root, &files, sources_sha256)?;
+            inspect_inventory(&names, &files)
+        })
+        .is_err()
+    {
+        receipt.first_failure = Some(Failure {
+            phase: Phase::Sources,
             exit_code: None,
         });
         return Ok(receipt);
@@ -228,7 +290,7 @@ pub(super) fn run(
         authorize()?;
         // @/+ requires the module to resolve in the root package, with no workspace fallback.
         let targets: Vec<_> = modules.iter().map(|name| format!("@/+{name}:imports")).collect();
-        let imports = match query(command(), &targets)? {
+        let imports = match query::<Vec<String>>(command(), &targets)? {
             Ok(rows) => rows,
             Err(code) => {
                 receipt.first_failure = Some(Failure {

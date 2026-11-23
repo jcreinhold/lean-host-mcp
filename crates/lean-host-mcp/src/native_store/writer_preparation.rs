@@ -43,6 +43,7 @@ pub(crate) enum Target {
         name: String,
         module_count: usize,
         module_names_sha256: [u8; 32],
+        sources_sha256: [u8; 32],
         #[serde(default)]
         blueprint: Option<blueprint_declarations::Inputs>,
         lakefile_sha256: [u8; 32],
@@ -396,7 +397,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
 
     let after_deps = || test_cut_after_dependencies(&authorize);
     if let Target::RootLibrary { .. } = &plan.target {
-        let receipt = root_library::run(&plan, &lake, command, &authorize, &after_deps, |_| Ok(()))?;
+        let receipt = root_library::run(&plan, &lake, command, &authorize, &after_deps, |_, _| Ok(()))?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     if let Target::Regroup(request) = &plan.target {

@@ -57,35 +57,18 @@ struct Library {
 }
 
 impl Library {
-    fn verify_sources(&self, root: &Path, files: &[String]) -> io::Result<()> {
-        let mut digest = Sha256::new();
-        // Lexicographically sorted canonical paths, each followed by NUL and its raw SHA-256.
-        for file in files {
-            digest.update(file.as_bytes());
-            digest.update([0]);
-            digest.update(Sha256::digest(file_bytes(&root.join(file))?));
+    fn files(modules: &[String], sources: &[String]) -> io::Result<Vec<String>> {
+        if modules.len() < 2
+            || !modules.iter().any(|module| module == "Proofs")
+            || !modules.iter().zip(sources).all(|(module, source)| {
+                (module == "Proofs" || module.starts_with("Proofs."))
+                    && *source == format!("{}.lean", module.replace('.', "/"))
+            })
+        {
+            return Err(io::Error::other("regroup requires the canonical Proofs source layout"));
         }
-        if <[u8; 32]>::from(digest.finalize()) != self.sources_sha256 {
-            return Err(io::Error::other("admitted regroup library sources changed"));
-        }
-        Ok(())
-    }
-
-    fn files(&self, root: &Path, modules: &[String]) -> io::Result<Vec<String>> {
-        let mut files = Vec::with_capacity(modules.len());
-        for module in modules {
-            if module != "Proofs" && !module.starts_with("Proofs.") {
-                return Err(io::Error::other("regroup inventory contains a non-Proofs module"));
-            }
-            files.push(format!("{}.lean", module.replace('.', "/")));
-        }
+        let mut files = sources.to_vec();
         files.sort_unstable();
-        if files.len() < 2 || !files.iter().any(|file| file == "Proofs.lean") {
-            return Err(io::Error::other(
-                "regroup requires the root and at least one Proofs module",
-            ));
-        }
-        self.verify_sources(root, &files)?;
         Ok(files)
     }
 }
@@ -251,6 +234,7 @@ impl Request {
                     name: "Proofs".into(),
                     module_count: library.module_count,
                     module_names_sha256: library.module_names_sha256,
+                    sources_sha256: library.sources_sha256,
                     blueprint: None,
                     lakefile_sha256: self.lakefile_sha256,
                     manifest_sha256: self.manifest_sha256,
@@ -258,12 +242,22 @@ impl Request {
                 boot: plan.boot,
                 expires_ns: plan.expires_ns,
             };
-            let receipt = root_library::run(&preparation, lake, tool_command, authorize, after_deps, |modules| {
-                library_files = library.files(root, modules)?;
-                Ok(())
-            })?;
+            let receipt = root_library::run(
+                &preparation,
+                lake,
+                tool_command,
+                authorize,
+                after_deps,
+                |modules, sources| {
+                    library_files = Library::files(modules, sources)?;
+                    Ok(())
+                },
+            )?;
             if let Some(failure) = receipt.first_failure {
-                let phase = if matches!(failure.phase, root_library::Phase::InventoryMismatch) {
+                let phase = if matches!(
+                    failure.phase,
+                    root_library::Phase::InventoryMismatch | root_library::Phase::Sources
+                ) {
                     Phase::Inventory
                 } else {
                     Phase::Preparation
@@ -297,10 +291,9 @@ impl Request {
         }
         authorize()?;
         if self.check_files(root).is_err()
-            || self
-                .library
-                .as_ref()
-                .is_some_and(|library| library.verify_sources(root, &library_files).is_err())
+            || self.library.as_ref().is_some_and(|library| {
+                root_library::verify_sources(root, &library_files, &library.sources_sha256).is_err()
+            })
         {
             return Ok(Receipt::new(Phase::Inputs, None));
         }
@@ -353,10 +346,9 @@ impl Request {
         }
         authorize()?;
         if self.check_files(root).is_err()
-            || self
-                .library
-                .as_ref()
-                .is_some_and(|library| library.verify_sources(root, &library_files).is_err())
+            || self.library.as_ref().is_some_and(|library| {
+                root_library::verify_sources(root, &library_files, &library.sources_sha256).is_err()
+            })
         {
             return Ok(Receipt::new(Phase::Inputs, None));
         }

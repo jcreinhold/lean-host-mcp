@@ -779,7 +779,7 @@ mod launcher_regressions {
         let fixture = Fixture::new();
         let dep_source = fixture.scratch.path().join("ext");
         fs::create_dir(&dep_source).expect("external package");
-        fs::create_dir(fixture.project.join("Probe")).expect("module directory");
+        fs::create_dir_all(fixture.project.join("src/Probe")).expect("module directory");
         for (path, source) in [
             (
                 "ext/lakefile.lean",
@@ -790,9 +790,9 @@ mod launcher_regressions {
                 "ext/lake-manifest.json",
                 r#"{"version":"1.2.0","packagesDir":".lake/packages","packages":[],"name":"ext","lakeDir":".lake"}"#,
             ),
-            ("project/Probe/A.lean", "import Ext\ndef a : Nat := extValue\n"),
-            ("project/Probe/B.lean", "def b : Nat := 5\n"),
-            ("project/Probe.lean", "import Probe.A\nimport Probe.B\n"),
+            ("project/src/Probe/A.lean", "import Ext\ndef a : Nat := extValue\n"),
+            ("project/src/Probe/B.lean", "def b : Nat := 5\n"),
+            ("project/src/Probe.lean", "import Probe.A\nimport Probe.B\n"),
         ] {
             fs::write(fixture.scratch.path().join(path), source).expect("disposable source");
         }
@@ -820,7 +820,7 @@ mod launcher_regressions {
         git(&["commit", "--quiet", "-m", "fixture"]);
         let revision = git(&["rev-parse", "HEAD"]);
         let root_config = format!(
-            "import Lake\nopen Lake DSL\npackage Probe\nrequire ext from git \"file://{}\" @ \"{}\"\nlean_lib Probe\n",
+            "import Lake\nopen Lake DSL\npackage Probe\nrequire ext from git \"file://{}\" @ \"{}\"\nlean_lib Probe where\n  srcDir := \"src\"\n",
             dep_source.display(),
             revision.trim()
         );
@@ -861,7 +861,16 @@ mod launcher_regressions {
         let lakefile_sha256: [u8; 32] = Sha256::digest(root_config.as_bytes()).into();
         let manifest_sha256: [u8; 32] =
             Sha256::digest(fs::read(fixture.project.join("lake-manifest.json")).expect("admitted manifest")).into();
-        for (revision, expected_modules) in [(1, 0), (2, 0), (3, 0), (4, 0), (5, 3)] {
+        let mut source_digest = Sha256::new();
+        for path in ["src/Probe.lean", "src/Probe/A.lean", "src/Probe/B.lean"] {
+            source_digest.update(path.as_bytes());
+            source_digest.update([0]);
+            source_digest.update(Sha256::digest(
+                fs::read(fixture.project.join(path)).expect("admitted source"),
+            ));
+        }
+        let sources_sha256: [u8; 32] = source_digest.finalize().into();
+        for (revision, expected_modules) in [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 3)] {
             if revision == 2 {
                 lake_command(&fixture.project, &["build", "@ext/+Ext:irArts"]);
             }
@@ -871,7 +880,7 @@ mod launcher_regressions {
                 "nonce":uuid::Uuid::new_v4().into_bytes(), "stage":1});
             let intent = json!({"project":fixture.project, "job":[revision], "revision":revision,
                 "operation":"lake_module_preparation_v1", "target":{"kind":"root_library","name":"Probe",
-                    "module_count":3, "module_names_sha256":digest,
+                    "module_count":3, "module_names_sha256":digest, "sources_sha256":sources_sha256,
                     "lakefile_sha256":lakefile_sha256, "manifest_sha256":manifest_sha256}});
             let create = managed(
                 &mut server,
@@ -884,9 +893,9 @@ mod launcher_regressions {
                 Some("admitted"),
                 "{create}"
             );
-            let module_b = fixture.project.join("Probe/B.lean");
-            let module_c = fixture.project.join("Probe/C.lean");
-            let source = fixture.project.join("Probe.lean");
+            let module_b = fixture.project.join("src/Probe/B.lean");
+            let module_c = fixture.project.join("src/Probe/C.lean");
+            let source = fixture.project.join("src/Probe.lean");
             if revision == 2 {
                 fs::rename(&module_b, &module_c).expect("substitute one collected module");
                 fs::write(&source, "import Probe.A\nimport Probe.C\n").expect("update root imports");
@@ -899,6 +908,7 @@ mod launcher_regressions {
                     b"import Lake\nopen Lake DSL\npackage ext\nlean_lib Ext\n-- dirty\n",
                 )
                 .expect("dirty locked config"),
+                5 => fs::write(&module_b, "def b : Nat := 6\n").expect("edit source without changing its name"),
                 _ => {}
             }
             let completed = managed(&mut server, json!({"op":"start","key":key,"capability":capability})).await;
@@ -956,6 +966,15 @@ mod launcher_regressions {
                     4 => fs::write(&dep_config_path, &dep_config).expect("restore package config"),
                     _ => {}
                 }
+            } else if revision == 5 {
+                assert_eq!(
+                    receipt.pointer("/first_failure/phase").and_then(Value::as_str),
+                    Some("sources"),
+                    "{receipt}"
+                );
+                assert!(!fixture.project.join(".lake/build/lib/lean/Probe/A.olean").exists());
+                assert!(!fixture.project.join(".lake/build/lib/lean/Probe/B.olean").exists());
+                fs::write(&module_b, "def b : Nat := 5\n").expect("restore admitted bytes");
             } else {
                 assert!(receipt.get("first_failure").is_some_and(Value::is_null), "{receipt}");
                 assert_eq!(
@@ -1168,6 +1187,10 @@ unsafe def main (args : List String) : IO UInt32 := do
         use sha2::{Digest, Sha256};
         let digest = |name| -> [u8; 32] { Sha256::digest(fs::read(root.join(name)).expect("fixture input")).into() };
         let inventory: [u8; 32] = Sha256::digest(b"Proofs\0").into();
+        let mut source_digest = Sha256::new();
+        source_digest.update(b"Proofs.lean\0");
+        source_digest.update(digest("Proofs.lean"));
+        let sources_sha256: [u8; 32] = source_digest.finalize().into();
         let long_name = format!("present\n{}\n", "x".repeat(2300));
         for (revision, declarations, verdict) in [
             (1, "present\n", None),
@@ -1184,7 +1207,7 @@ unsafe def main (args : List String) : IO UInt32 := do
                 "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1});
             let intent = json!({"project":root,"job":[revision],"revision":revision,
                 "operation":"lake_module_preparation_v1","target":{"kind":"root_library","name":"Proofs",
-                    "module_count":1,"module_names_sha256":inventory,"lakefile_sha256":digest("lakefile.lean"),
+                    "module_count":1,"module_names_sha256":inventory,"sources_sha256":sources_sha256,"lakefile_sha256":digest("lakefile.lean"),
                     "manifest_sha256":digest("lake-manifest.json"),"blueprint":{"checker_sha256":digest("scripts/lean/check-decls.lean"),
                     "declarations_sha256":digest("blueprint/lean_decls")}}});
             let create = managed(
