@@ -26,11 +26,11 @@ const SUITES: [&str; 4] = [
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Check {
+pub(super) struct Check {
     name: String,
-    exit_code: i32,
-    output: String,
-    output_truncated: bool,
+    pub(super) exit_code: i32,
+    pub(super) output: String,
+    pub(super) output_truncated: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -107,7 +107,7 @@ pub(crate) fn check(root: &Path, config: &[u8; 32], manifest: &[u8; 32]) -> io::
     Ok(())
 }
 
-fn capture(mut command: Command, name: &str) -> io::Result<Check> {
+pub(super) fn capture(mut command: Command, name: &str) -> io::Result<Check> {
     let (input, output) = UnixStream::pair()?;
     let output: std::os::fd::OwnedFd = output.into();
     let mut child = command

@@ -1112,6 +1112,110 @@ unsafe def main (args : List String) : IO UInt32 := do
     }
 
     #[tokio::test]
+    async fn managed_blueprint_tail_keeps_missing_names_distinct_from_changed_input() {
+        let (Some(writer), Some(checker)) = (
+            std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER"),
+            std::env::var_os("LEAN_HOST_MCP_BLUEPRINT_TEST_CHECKER"),
+        ) else {
+            return;
+        };
+        let fixture = Fixture::new();
+        let root = &fixture.project;
+        fs::write(
+            root.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage Proofs\n@[default_target] lean_lib Proofs\n",
+        )
+        .expect("config");
+        fs::write(
+            root.join("lake-manifest.json"),
+            r#"{"version":"1.2.0","packagesDir":".lake/packages","name":"Proofs","lakeDir":".lake","packages":[]}"#,
+        )
+        .expect("lockfile");
+        fs::write(root.join("Proofs.lean"), "def present : Nat := 42\n").expect("root");
+        fs::create_dir_all(root.join("scripts/lean")).expect("checker directory");
+        fs::copy(checker, root.join("scripts/lean/check-decls.lean")).expect("actual checker");
+        fs::create_dir(root.join("blueprint")).expect("blueprint directory");
+        let list = root.join("blueprint/lean_decls");
+        let (store, _) = fixture.new_store("store").await;
+        let mut server = StdioServer::spawn(
+            fixture
+                .command()
+                .arg("--lake-root")
+                .arg(root)
+                .arg("--managed-native-store")
+                .arg(store)
+                .env("LEAN_HOST_MCP_MANAGED_READINESS_WRITER", writer),
+        );
+        server.initialize().await;
+        let info = managed(&mut server, json!({"op":"discover"})).await;
+        let capability = [57_u8; 32];
+        use sha2::{Digest, Sha256};
+        let digest = |name| -> [u8; 32] { Sha256::digest(fs::read(root.join(name)).expect("fixture input")).into() };
+        let inventory: [u8; 32] = Sha256::digest(b"Proofs\0").into();
+        for (revision, declarations, verdict) in [
+            (1, "present\n", None),
+            (2, "present\n", Some("present")),
+            (3, "present\nmissingNested.name\n", Some("missing")),
+        ] {
+            fs::write(&list, declarations).expect("admitted list");
+            let key = json!({"store":info.get("store").expect("store"),"epoch":info.get("acceptance_epoch").expect("epoch"),
+                "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1});
+            let intent = json!({"project":root,"job":[revision],"revision":revision,
+                "operation":"lake_module_preparation_v1","target":{"kind":"root_library","name":"Proofs",
+                    "module_count":1,"module_names_sha256":inventory,"lakefile_sha256":digest("lakefile.lean"),
+                    "manifest_sha256":digest("lake-manifest.json"),"blueprint":{"checker_sha256":digest("scripts/lean/check-decls.lean"),
+                    "declarations_sha256":digest("blueprint/lean_decls")}}});
+            let create = managed(
+                &mut server,
+                json!({"op":"create","key":key,"capability":capability,
+                "intent":intent.to_string().as_bytes()}),
+            )
+            .await;
+            assert_eq!(
+                create.get("execution").and_then(Value::as_str),
+                Some("admitted"),
+                "{create}"
+            );
+            if verdict.is_none() {
+                fs::write(&list, "changed\n").expect("edit admitted list before start");
+            }
+            let finished = managed(&mut server, json!({"op":"start","key":key,"capability":capability})).await;
+            assert_eq!(
+                finished.get("custody").and_then(Value::as_str),
+                Some("closed"),
+                "{finished}"
+            );
+            let body: Vec<u8> =
+                serde_json::from_value(finished.pointer("/result/body").expect("body").clone()).expect("body bytes");
+            let receipt: Value = serde_json::from_slice(&body).expect("blueprint receipt");
+            assert_eq!(
+                receipt.pointer("/blueprint/verdict").and_then(Value::as_str),
+                verdict,
+                "{receipt}"
+            );
+            if verdict.is_none() {
+                assert_eq!(
+                    receipt.pointer("/first_failure/phase").and_then(Value::as_str),
+                    Some("blueprint_inputs")
+                );
+                assert!(!root.join(".lake/build/lib/lean/Proofs.olean").exists());
+            }
+            if verdict == Some("missing") {
+                assert_eq!(receipt.pointer("/blueprint/exit_code").and_then(Value::as_u64), Some(1));
+                assert_eq!(
+                    receipt.pointer("/blueprint/output").and_then(Value::as_str),
+                    Some("missingNested.name is missing.\n")
+                );
+            }
+            assert_eq!(
+                managed(&mut server, json!({"op":"get","key":key,"capability":capability})).await,
+                finished
+            );
+        }
+        server.close_stdin_and_wait().await;
+    }
+
+    #[tokio::test]
     async fn launcher_rejects_valid_replacement_store_at_original_path() {
         let fixture = Fixture::new();
         let (store, id) = fixture.new_store("store").await;

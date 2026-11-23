@@ -442,8 +442,13 @@ fn execute(
                 .ok()
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
         }
-        Stage::Preparation(Target::RootLibrary { name, module_count, .. }) if output.status.success() => {
-            writer_preparation::root_library::Receipt::parse(&output.stdout, name, *module_count)
+        Stage::Preparation(Target::RootLibrary {
+            name,
+            module_count,
+            blueprint,
+            ..
+        }) if output.status.success() => {
+            writer_preparation::root_library::Receipt::parse(&output.stdout, name, *module_count, blueprint.is_some())
                 .ok()
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
         }

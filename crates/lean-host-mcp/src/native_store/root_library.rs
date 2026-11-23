@@ -2,6 +2,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::{self, BufRead, BufReader, Read},
+    path::Path,
     process::{Command, Stdio},
     time::Duration,
 };
@@ -9,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Plan, Target, module_name, pinned_lake_config};
+use super::{Plan, Target, blueprint_declarations, module_name, pinned_lake_config};
 
 pub(super) const MAX_MODULES: usize = 16_384;
 const BATCH: usize = 16;
@@ -25,6 +26,8 @@ pub(crate) struct Receipt {
     completed_modules: usize,
     completed_batches: usize,
     first_failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blueprint: Option<blueprint_declarations::Receipt>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,6 +40,7 @@ enum Stage {
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Configuration,
+    BlueprintInputs,
     Inventory,
     InventoryMismatch,
     Imports,
@@ -53,16 +57,18 @@ struct Failure {
 }
 
 impl Receipt {
-    pub(crate) fn parse(output: &[u8], name: &str, expected_count: usize) -> io::Result<Self> {
+    pub(crate) fn parse(output: &[u8], name: &str, expected_count: usize, expect_blueprint: bool) -> io::Result<Self> {
         let receipt: Self = serde_json::from_slice(output)?;
         if receipt.version != 1
             || receipt.name != name
             || receipt.module_count > MAX_MODULES
             || receipt.completed_modules > receipt.module_count
             || receipt.completed_batches > receipt.completed_modules
+            || receipt.blueprint.is_some() != (expect_blueprint && receipt.first_failure.is_none())
+            || receipt.blueprint.as_ref().is_some_and(|outcome| !outcome.valid())
             || match &receipt.first_failure {
                 Some(Failure {
-                    phase: Phase::Configuration | Phase::InventoryMismatch,
+                    phase: Phase::Configuration | Phase::InventoryMismatch | Phase::BlueprintInputs,
                     exit_code,
                 }) => exit_code.is_some() || receipt.completed_modules != 0,
                 Some(Failure {
@@ -126,6 +132,7 @@ fn query(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<Vec<
 
 pub(super) fn run(
     plan: &Plan,
+    lake: &Path,
     command: impl Fn() -> Command,
     authorize: &impl Fn() -> io::Result<Duration>,
     after_deps: &impl Fn() -> io::Result<()>,
@@ -136,6 +143,7 @@ pub(super) fn run(
         module_names_sha256,
         lakefile_sha256,
         manifest_sha256,
+        blueprint,
     } = &plan.target
     else {
         return Err(invalid_inventory());
@@ -148,6 +156,7 @@ pub(super) fn run(
         completed_modules: 0,
         completed_batches: 0,
         first_failure: None,
+        blueprint: None,
     };
     authorize()?;
     if pinned_lake_config::validate_root_config(&plan.root, lakefile_sha256)
@@ -156,6 +165,17 @@ pub(super) fn run(
     {
         receipt.first_failure = Some(Failure {
             phase: Phase::Configuration,
+            exit_code: None,
+        });
+        return Ok(receipt);
+    }
+    authorize()?;
+    if blueprint
+        .as_ref()
+        .is_some_and(|inputs| inputs.check(&plan.root).is_err())
+    {
+        receipt.first_failure = Some(Failure {
+            phase: Phase::BlueprintInputs,
             exit_code: None,
         });
         return Ok(receipt);
@@ -262,6 +282,10 @@ pub(super) fn run(
             .checked_add(modules.len())
             .ok_or_else(invalid_inventory)?;
         receipt.completed_batches = receipt.completed_batches.checked_add(1).ok_or_else(invalid_inventory)?;
+    }
+    if let Some(inputs) = blueprint {
+        authorize()?;
+        receipt.blueprint = Some(inputs.run(&plan.root, lake, command())?);
     }
     Ok(receipt)
 }

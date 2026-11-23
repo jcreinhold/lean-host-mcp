@@ -17,6 +17,8 @@ pub(crate) const VERIFIER_OPERATION: &str = "lake_verifier_preparation_v1";
 const MAX_MODULES: usize = 64;
 const MAX_PLAN_BYTES: usize = 32 * 1024;
 
+#[path = "blueprint_declarations.rs"]
+mod blueprint_declarations;
 #[path = "pinned_lake_config.rs"]
 mod pinned_lake_config;
 #[path = "root_library.rs"]
@@ -39,6 +41,8 @@ pub(crate) enum Target {
         name: String,
         module_count: usize,
         module_names_sha256: [u8; 32],
+        #[serde(default)]
+        blueprint: Option<blueprint_declarations::Inputs>,
         lakefile_sha256: [u8; 32],
         manifest_sha256: [u8; 32],
     },
@@ -83,8 +87,15 @@ impl Target {
     pub(crate) fn validate(&self) -> io::Result<()> {
         let valid = match self {
             Self::Module { name: target } => module_name(target),
-            Self::RootLibrary { name, module_count, .. } => {
-                module_name(name) && *module_count <= root_library::MAX_MODULES
+            Self::RootLibrary {
+                name,
+                module_count,
+                blueprint,
+                ..
+            } => {
+                module_name(name)
+                    && *module_count <= root_library::MAX_MODULES
+                    && (blueprint.is_none() || name == "Proofs")
             }
             Self::Modules { names } | Self::VerifierModules { names } => {
                 let mut unique = std::collections::BTreeSet::new();
@@ -381,7 +392,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
 
     let after_deps = || test_cut_after_dependencies(&authorize);
     if let Target::RootLibrary { .. } = &plan.target {
-        let receipt = root_library::run(&plan, command, &authorize, &after_deps)?;
+        let receipt = root_library::run(&plan, &lake, command, &authorize, &after_deps)?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     let receipt = match plan.target {
