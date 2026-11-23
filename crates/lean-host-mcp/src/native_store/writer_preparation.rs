@@ -19,6 +19,8 @@ const MAX_PLAN_BYTES: usize = 32 * 1024;
 
 #[path = "pinned_lake_config.rs"]
 mod pinned_lake_config;
+#[path = "root_library.rs"]
+pub(super) mod root_library;
 pub use pinned_lake_config::validate_pinned_lake_configs;
 #[path = "first_party_clean.rs"]
 pub(crate) mod first_party_clean;
@@ -31,6 +33,7 @@ pub(crate) mod whole_lint;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Target {
     Module { name: String },
+    RootLibrary { name: String },
     Modules { names: Vec<String> },
     VerifierModules { names: Vec<String> },
     Ready { name: String, package: Option<String> },
@@ -39,26 +42,30 @@ pub(crate) enum Target {
     FirstPartyClean { lakefile_sha256: [u8; 32] },
 }
 
+fn name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '-')
+        })
+}
+
+fn module_name(target: &str) -> bool {
+    name(target) && !target.contains('-')
+}
+
 impl Target {
     pub(crate) fn validate(&self) -> io::Result<()> {
-        fn name(value: &str) -> bool {
-            !value.is_empty()
-                && value.len() <= 255
-                && value.split('.').all(|part| {
-                    !part.is_empty()
-                        && part
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '\'' || c == '-')
-                })
-        }
-        let module = |target: &str| name(target) && !target.contains('-');
         let valid = match self {
-            Self::Module { name: target } => module(target),
+            Self::Module { name: target } | Self::RootLibrary { name: target } => module_name(target),
             Self::Modules { names } | Self::VerifierModules { names } => {
                 let mut unique = std::collections::BTreeSet::new();
                 !names.is_empty()
                     && names.len() <= MAX_MODULES
-                    && names.iter().all(|target| module(target) && unique.insert(target))
+                    && names.iter().all(|target| module_name(target) && unique.insert(target))
             }
             Self::ToolingSuites { .. } | Self::WholeLint { .. } | Self::FirstPartyClean { .. } => true,
             Self::Ready { name: target, package } => name(target) && package.as_deref().is_none_or(name),
@@ -322,25 +329,37 @@ pub fn run(encoded: &str) -> io::Result<()> {
     if let Target::WholeLint { lakefile_sha256 } = &plan.target {
         return whole_lint::run(&plan.root, &lake, lakefile_sha256, authorize);
     }
-    let watched = |args: &[&str]| -> io::Result<i32> {
-        authorize()?;
-        Command::new(&lake)
+    let command = || {
+        let mut command = Command::new(&lake);
+        command
             .current_dir(&plan.root)
             .arg("--no-cache")
-            .args(args)
             .env("GIT_ALLOW_PROTOCOL", "")
             .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    };
+    let watched = |args: &[&str]| -> io::Result<i32> {
+        authorize()?;
+        command()
+            .args(args)
             .status()?
             .code()
             .ok_or_else(|| io::Error::other("fixed Lake command was interrupted"))
     };
 
     let after_deps = || test_cut_after_dependencies(&authorize);
+    if let Target::RootLibrary { name } = &plan.target {
+        let receipt = root_library::run(name, command, &authorize, &after_deps)?;
+        return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
+    }
     let receipt = match plan.target {
-        Target::ToolingSuites { .. } | Target::WholeLint { .. } | Target::FirstPartyClean { .. } => {
+        Target::RootLibrary { .. }
+        | Target::ToolingSuites { .. }
+        | Target::WholeLint { .. }
+        | Target::FirstPartyClean { .. } => {
             return Err(io::Error::other("fixed writer command already dispatched"));
         }
         Target::Module { name } => {

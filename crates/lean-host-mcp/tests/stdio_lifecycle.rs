@@ -773,6 +773,129 @@ mod launcher_regressions {
     }
 
     #[tokio::test]
+    async fn managed_root_library_batches_guard_cold_external_inputs() {
+        let writer = std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER");
+        let Some(writer) = writer else { return };
+        let fixture = Fixture::new();
+        let dep = fixture.project.join("ext");
+        fs::create_dir(&dep).expect("external package");
+        fs::create_dir(fixture.project.join("Probe")).expect("module directory");
+        for (path, source) in [
+            (
+                "lakefile.lean",
+                "import Lake\nopen Lake DSL\npackage Probe\nrequire ext from \"./ext\"\nlean_lib Probe\n",
+            ),
+            (
+                "ext/lakefile.lean",
+                "import Lake\nopen Lake DSL\npackage ext\nlean_lib Ext\n",
+            ),
+            ("ext/Ext.lean", "def extValue : Nat := 42\n"),
+            ("Probe/A.lean", "import Ext\ndef a : Nat := extValue\n"),
+            ("Probe/B.lean", "def b : Nat := 5\n"),
+            ("Probe.lean", "import Probe.A\nimport Probe.B\n"),
+        ] {
+            fs::write(fixture.project.join(path), source).expect("disposable source");
+        }
+        let lake = PathBuf::from(std::env::var_os("LEAN_SYSROOT").expect("fixture toolchain")).join("bin/lake");
+        let lake_command = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new(&lake)
+                .current_dir(cwd)
+                .arg("--no-cache")
+                .args(args)
+                .output()
+                .expect("fixture Lake");
+            assert!(output.status.success(), "{output:?}");
+        };
+        lake_command(&dep, &["update"]);
+        lake_command(&fixture.project, &["update"]);
+        let (store, _) = fixture.new_store("store").await;
+        let mut server = StdioServer::spawn(
+            fixture
+                .command()
+                .arg("--lake-root")
+                .arg(&fixture.project)
+                .arg("--managed-native-store")
+                .arg(store)
+                .env("LEAN_HOST_MCP_MANAGED_READINESS_WRITER", writer),
+        );
+        server.initialize().await;
+        let info = managed(&mut server, json!({"op":"discover"})).await;
+        let capability = [57_u8; 32];
+        let ext_object = dep.join(".lake/build/lib/lean/Ext.olean");
+        let root_object = fixture.project.join(".lake/build/lib/lean/Probe.olean");
+        for (revision, expected_modules) in [(1, 0), (2, 3)] {
+            if revision == 2 {
+                lake_command(&fixture.project, &["build", "@ext/+Ext:irArts"]);
+            }
+            let before = ext_object.metadata().and_then(|meta| meta.modified()).ok();
+            assert!(!root_object.exists());
+            let key = json!({"store":info.get("store").expect("store"), "epoch":info.get("acceptance_epoch").expect("epoch"),
+                "nonce":uuid::Uuid::new_v4().into_bytes(), "stage":1});
+            let intent = json!({"project":fixture.project, "job":[revision], "revision":revision,
+                "operation":"lake_module_preparation_v1", "target":{"kind":"root_library","name":"Probe"}});
+            let create = managed(
+                &mut server,
+                json!({"op":"create","key":key,
+                "capability":capability,"intent":intent.to_string().as_bytes()}),
+            )
+            .await;
+            assert_eq!(
+                create.get("execution").and_then(Value::as_str),
+                Some("admitted"),
+                "{create}"
+            );
+            let completed = managed(&mut server, json!({"op":"start","key":key,"capability":capability})).await;
+            assert_eq!(
+                completed.get("custody").and_then(Value::as_str),
+                Some("closed"),
+                "{completed}"
+            );
+            let body: Vec<u8> = serde_json::from_value(completed.pointer("/result/body").expect("result body").clone())
+                .expect("retained result");
+            let receipt: Value = serde_json::from_slice(&body).expect("root-library receipt");
+            assert_eq!(
+                receipt.get("module_count").and_then(Value::as_u64),
+                Some(3),
+                "{receipt}"
+            );
+            assert_eq!(
+                receipt.get("completed_modules").and_then(Value::as_u64),
+                Some(expected_modules),
+                "{receipt}"
+            );
+            if revision == 1 {
+                assert_eq!(
+                    receipt.pointer("/first_failure/phase").and_then(Value::as_str),
+                    Some("dependencies"),
+                    "{receipt}"
+                );
+                assert!(!fixture.project.join(".lake/build/lib/lean/Probe/B.olean").exists());
+                assert!(!ext_object.exists());
+            } else {
+                assert!(receipt.get("first_failure").is_some_and(Value::is_null), "{receipt}");
+                assert_eq!(
+                    receipt.get("completed_batches").and_then(Value::as_u64),
+                    Some(2),
+                    "{receipt}"
+                );
+                assert!(root_object.is_file());
+                fs::remove_file(&root_object).expect("remove disposable object to witness no replay");
+            }
+            assert_eq!(ext_object.metadata().and_then(|meta| meta.modified()).ok(), before);
+            assert_eq!(
+                managed(&mut server, json!({"op":"get","key":key,"capability":capability})).await,
+                completed
+            );
+            assert_eq!(
+                managed(&mut server, json!({"op":"start","key":key,"capability":capability})).await,
+                completed
+            );
+            assert!(!root_object.exists());
+        }
+        server.close_stdin_and_wait().await;
+    }
+
+    #[tokio::test]
     async fn launcher_rejects_valid_replacement_store_at_original_path() {
         let fixture = Fixture::new();
         let (store, id) = fixture.new_store("store").await;
