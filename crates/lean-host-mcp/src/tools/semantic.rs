@@ -227,6 +227,7 @@ fn lean_trial_schema() -> Schema {
                     "file": { "type": "string" },
                     "declaration": { "type": "string" },
                     "proof_position": proof_position_selector_schema(),
+                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "snippet": { "type": ["string", "null"] },
                     "snippets": { "type": "array", "items": { "type": "string" } },
                     "retry_tainted_non_positive": {
@@ -666,7 +667,15 @@ pub(crate) async fn lean_trial_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(proof_action::try_proof_step(ctx, request).await?, ctx.config)
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            let response = if managed.is_some() {
+                proof_action::try_proof_step_inner(ctx, request, managed).await?
+            } else {
+                proof_action::try_proof_step(ctx, request).await?
+            };
+            #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
+            let response = proof_action::try_proof_step(ctx, request).await?;
+            from_tool_response(response, ctx.config)
         }
         Some("command") => {
             let request = match decode_kind::<CommandTrialRequest>("lean_trial", "command", req) {

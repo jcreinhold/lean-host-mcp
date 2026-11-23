@@ -20,6 +20,7 @@ use crate::{
 pub(crate) const OPERATION: &str = "lean_registered_module_verify_v1";
 pub(crate) const DIAGNOSTICS: &str = "lean_file_diagnostics_v1";
 pub(crate) const OUTLINE: &str = "lean_file_outline_v1";
+pub(crate) const PROOF_STEP: &str = "lean_file_proof_step_v1";
 pub(crate) const PROOF_POSITION: &str = "lean_file_proof_position_v1";
 pub(crate) const COMMAND_TRIAL: &str = "lean_file_command_trial_v1";
 
@@ -29,6 +30,7 @@ pub(crate) enum Projection {
     Diagnostics,
     CommandTrial,
     ProofPosition,
+    ProofStep,
     Outline,
 }
 
@@ -38,6 +40,7 @@ impl Projection {
             OPERATION => Some(Self::Verify),
             DIAGNOSTICS => Some(Self::Diagnostics),
             OUTLINE => Some(Self::Outline),
+            PROOF_STEP => Some(Self::ProofStep),
             PROOF_POSITION => Some(Self::ProofPosition),
             COMMAND_TRIAL => Some(Self::CommandTrial),
             _ => None,
@@ -59,6 +62,8 @@ pub(crate) struct Request {
     commands: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proof_position: Option<ProofPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snippets: Option<Vec<String>>,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,7 +83,7 @@ impl ProofPosition {
                 LeanWorkerProofPositionSelector::AfterText { text, .. } => {
                     !text.is_empty() && text.len() <= 4096 && !text.contains('\0')
                 }
-                _ => false,
+                LeanWorkerProofPositionSelector::Default | _ => false,
             }
     }
 }
@@ -87,6 +92,7 @@ pub(crate) enum FileQuery<'a> {
     Projection(Projection),
     Command(&'a str),
     Proof(&'a ProofPosition),
+    ProofStep(&'a ProofPosition, &'a [String]),
 }
 
 impl FileQuery<'_> {
@@ -95,6 +101,7 @@ impl FileQuery<'_> {
             Self::Projection(projection) => *projection,
             Self::Command(_) => Projection::CommandTrial,
             Self::Proof(_) => Projection::ProofPosition,
+            Self::ProofStep(..) => Projection::ProofStep,
         }
     }
 
@@ -103,6 +110,9 @@ impl FileQuery<'_> {
             Self::Projection(_) => request.commands.is_none() && request.proof_position.is_none(),
             Self::Command(commands) => request.commands.as_deref() == Some(*commands),
             Self::Proof(position) => request.proof_position.as_ref() == Some(*position),
+            Self::ProofStep(position, snippets) => {
+                request.proof_position.as_ref() == Some(*position) && request.snippets.as_deref() == Some(*snippets)
+            }
         }
     }
 }
@@ -118,6 +128,15 @@ pub(crate) fn valid_commands(commands: &str) -> bool {
             .any(|token| matches!(token, "import" | "prelude" | "module"))
 }
 
+pub(crate) fn valid_snippets(snippets: &[String]) -> bool {
+    !snippets.is_empty()
+        && snippets.len() <= 16
+        && snippets
+            .iter()
+            .all(|text| text.len() <= 4096 && !text.trim().is_empty() && !text.contains('\0'))
+        && snippets.iter().map(String::len).sum::<usize>() <= 8192
+}
+
 impl Request {
     pub(crate) fn valid(&self) -> bool {
         crate::managed_prepared::readiness_writer::configured_consumer::SourceIdentity {
@@ -127,6 +146,7 @@ impl Request {
         .valid()
             && self.commands.as_deref().is_none_or(valid_commands)
             && self.proof_position.as_ref().is_none_or(ProofPosition::valid)
+            && self.snippets.as_deref().is_none_or(valid_snippets)
             && self.declarations.len() <= 16
             && self.declarations.iter().collect::<BTreeSet<_>>().len() == self.declarations.len()
             && self.declarations.iter().all(|name| {
@@ -142,7 +162,8 @@ impl Request {
     pub(crate) fn matches_projection(&self, projection: Projection) -> bool {
         self.declarations.is_empty() == (projection != Projection::Verify)
             && self.commands.is_some() == (projection == Projection::CommandTrial)
-            && self.proof_position.is_some() == (projection == Projection::ProofPosition)
+            && self.proof_position.is_some() == matches!(projection, Projection::ProofPosition | Projection::ProofStep)
+            && self.snippets.is_some() == (projection == Projection::ProofStep)
     }
 
     pub(crate) fn matches_prepared(&self, prepared: Option<&str>) -> bool {
@@ -155,6 +176,31 @@ impl Request {
         };
         if !output.status.success() || output.stdout.len() > MAX_RESULT {
             return None;
+        }
+        if projection == Projection::ProofStep {
+            use lean_rs_worker_protocol::types::LeanWorkerProofAttemptResult;
+            let outcome: LeanWorkerProofAttemptResult = serde_json::from_slice(&output.stdout).ok()?;
+            if let LeanWorkerProofAttemptResult::Ok { result, .. }
+            | LeanWorkerProofAttemptResult::MissingImports { result, .. } = &outcome
+            {
+                let snippets = self.snippets.as_ref()?;
+                if result.candidates.len() != snippets.len()
+                    || result.candidates_truncated
+                    || result
+                        .candidates
+                        .iter()
+                        .zip(snippets)
+                        .enumerate()
+                        .any(|(index, (row, text))| {
+                            row.id != format!("candidate_{}", index.saturating_add(1))
+                                || (!row.candidate_text.truncated && row.candidate_text.value != *text)
+                        })
+                {
+                    return None;
+                }
+            }
+            let receipt = serde_json::json!({"source_sha256": self.sha256, "outcome": outcome});
+            return (receipt.to_string().len() <= MAX_RESULT).then_some(receipt);
         }
         if projection != Projection::Verify {
             let mut body: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
@@ -326,7 +372,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
         .map(|(i, name)| serde_json::json!({"id":i.to_string(),"name":name}))
         .collect::<Vec<_>>();
     let input = serde_json::json!({
-        "source": source,"file":path,"proofPosition":plan.request.proof_position,"roots":[],"imports":[],"targets":targets,
+        "source": source,"file":path,"proofPosition":plan.request.proof_position,"snippets":plan.request.snippets,"roots":[],"imports":[],"targets":targets,
         "allowSorry":false,"reportAxioms":true,"perFieldBytes":4096,"totalBytes":32768,
         "namespaceContext":"","optionsJson":lean_toolchain::lean_options_json(&setup.options),
         "heartbeats":200_000,"diagnosticBytes":16_384
@@ -344,8 +390,14 @@ pub fn run(encoded: &str) -> io::Result<()> {
         ),
         Projection::ProofPosition => concat!(
             include_str!("../lake/VerifyCommon.lean"),
+            include_str!("../lake/ProofSetupCommon.lean"),
             include_str!("../lake/ProofPositionSetup.lean"),
             include_str!("../lake/OutlineSetup.lean")
+        ),
+        Projection::ProofStep => concat!(
+            include_str!("../lake/VerifyCommon.lean"),
+            include_str!("../lake/ProofSetupCommon.lean"),
+            include_str!("../lake/ProofStepSetup.lean")
         ),
         Projection::Verify => concat!(
             include_str!("../lake/VerifyCommon.lean"),
@@ -482,7 +534,7 @@ impl ManagedCall<'_> {
         .await
     }
 
-    pub(crate) async fn file_query(
+    pub(crate) async fn file_query<T: serde::de::DeserializeOwned>(
         &self,
         broker: &crate::ProjectBroker,
         hint: &crate::ProjectHint,
@@ -491,14 +543,14 @@ impl ManagedCall<'_> {
         source: &str,
         imports: Vec<String>,
         projection: FileQuery<'_>,
-    ) -> crate::Result<crate::broker::CachedBrokerCall<DiagnosticOutcome>> {
+    ) -> crate::Result<crate::broker::CachedBrokerCall<T>> {
         #[derive(Deserialize)]
-        struct Receipt {
+        struct Receipt<T> {
             source_sha256: [u8; 32],
-            outcome: DiagnosticOutcome,
+            outcome: T,
         }
         let body = self.saved(broker, root, file, source, &[], projection).await?;
-        let receipt: Receipt = serde_json::from_slice(&body)
+        let receipt: Receipt<T> = serde_json::from_slice(&body)
             .map_err(|_| crate::ServerError::BadProject("invalid managed file projection result".into()))?;
         if Sha256::digest(source.as_bytes()).as_slice() != receipt.source_sha256 {
             return Err(crate::ServerError::BadProject(
@@ -547,7 +599,7 @@ impl ManagedCall<'_> {
                 .eq(names.iter().copied())
         {
             return Err(unavailable(
-                "managed setup differs from the admitted source, targets, or commands",
+                "managed setup differs from the admitted source or operation inputs",
             ));
         }
         let saved = if snapshot.gate == Gate::Pending && snapshot.scope.is_none() {
@@ -570,5 +622,40 @@ impl ManagedCall<'_> {
                 Err(unavailable("managed setup result unavailable"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileQuery, Projection, Request, valid_snippets};
+
+    #[test]
+    fn proof_step_requires_exact_ordered_admitted_snippets() {
+        let sha256 = [7u8; 32];
+        let intent = serde_json::json!({
+            "file": "Proofs/Probe.lean",
+            "sha256": sha256,
+            "proof_position": {
+                "declaration": "probe",
+                "position": {"kind": "entry"}
+            },
+            "snippets": ["exact True.intro", "  contradiction"]
+        });
+        let request: Request = serde_json::from_value(intent).unwrap();
+        assert!(request.valid());
+        assert!(request.matches_projection(Projection::ProofStep));
+        assert!(!request.matches_projection(Projection::ProofPosition));
+        let position = request.proof_position.as_ref().unwrap();
+        let original = request.snippets.as_ref().unwrap();
+        assert!(FileQuery::ProofStep(position, original).matches(&request));
+        let mut changed = original.clone();
+        changed.swap(0, 1);
+        assert!(!FileQuery::ProofStep(position, &changed).matches(&request));
+        changed.reverse();
+        changed[1] = changed[1].trim().to_owned();
+        assert!(!FileQuery::ProofStep(position, &changed).matches(&request));
+        assert!(!valid_snippets(&[String::new()]));
+        let oversized = std::array::from_fn::<_, 3, _>(|_| "x".repeat(4096));
+        assert!(!valid_snippets(&oversized));
     }
 }

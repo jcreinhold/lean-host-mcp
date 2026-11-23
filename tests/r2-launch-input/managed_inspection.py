@@ -54,7 +54,7 @@ def run_check(args):
         args.parent.resolve(strict=True), "--lake-root", project,
         *([] if prepared is None else ["--prepared-generation", prepared]),
         "--managed-native-store", db,
-        *(["--managed-only"] if args.proof_position else []),
+        *(["--managed-only"] if args.proof_position or args.proof_step else []),
     ]
 
     @contextmanager
@@ -217,12 +217,16 @@ def run_check(args):
         print(f"root architecture {args.root_architecture}: default imported finding, exact close and retained retry")
         return
 
-    if args.proof_position:
+    if args.proof_position or args.proof_step:
         env["LEAN_HOST_MCP_MANAGED_READINESS_WRITER"] = str(args.writer.resolve(strict=True))
         source = project / "Positioned.lean"
         original = source.read_bytes()
-        selector = dict(kind="after_text", text="skip", occurrence=1)
-        operation = "lean_file_proof_position_v1"
+        selector = dict(kind="entry") if args.proof_step else dict(kind="after_text", text="skip", occurrence=1)
+        snippets = ["exact supported", "exact Nat.zero"]
+        operation = "lean_file_proof_step_v1" if args.proof_step else "lean_file_proof_position_v1"
+        if args.proof_step:
+            assert b"import ProbeSupport" in original
+
         with server() as (managed, result, tool, _):
             discovery = result(managed("discover"))
 
@@ -233,6 +237,8 @@ def run_check(args):
                 intent = dict(operation=operation, project=str(project), job=list(os.urandom(16)), revision=1,
                               setup_verification=dict(file=source.name, sha256=list(hashlib.sha256(original).digest()),
                                                       proof_position=dict(declaration="positioned", position=selector)))
+                if args.proof_step:
+                    intent["setup_verification"]["snippets"] = snippets
                 admitted = result(managed("create", intent=list(json.dumps(intent).encode()), **origin))
                 assert admitted["execution"] == "admitted", admitted
                 return origin, admitted
@@ -240,26 +246,50 @@ def run_check(args):
             changed, pending = admit()
             try:
                 source.write_bytes(original + b"\n-- changed after admission\n")
-                result(managed("start", **changed), error="managed_proof_position_source_changed")
+                reason = "managed_proof_step_source_changed" if args.proof_step else "managed_proof_position_source_changed"
+                result(managed("start", **changed), error=reason)
                 assert result(managed("get", **changed)) == pending
             finally:
                 source.write_bytes(original)
 
             origin, _ = admit()
-            request = dict(kind="proof_position", file=source.name, declaration="positioned",
-                           proof_position=selector, managed_original=origin)
-            public = result(tool("lean_context", request))
-            context = public["data"]
-            assert context.get("goals_before") == context.get("goals_after") == ["⊢ True"], public
-            assert not context.get("unavailable"), public
-            different = dict(request, proof_position=dict(kind="index", index=0))
-            refused = result(tool("lean_context", different), allow_error=True)
-            assert "rpc_error" in refused or refused.get("errors"), refused
+            if args.proof_step:
+                request = dict(kind="proof_step", file=source.name, declaration="positioned",
+                               snippet=snippets[0], snippets=snippets[1:], managed_original=origin)
+                for changed_request in (
+                    dict(request, retry_tainted_non_positive=True),
+                    dict(request, snippet=snippets[1], snippets=snippets[:1]),
+                    dict(request, proof_position=dict(kind="index", index=0)),
+                ):
+                    refusal = result(tool("lean_trial", changed_request), allow_error=True)
+                    assert "rpc_error" in refusal, refusal
+                    assert result(managed("get", **origin))["execution"] == "admitted"
+                public = result(tool("lean_trial", request))
+                rows = public["data"]["result"]["candidates"]
+                assert [(row["id"], row["status"]) for row in rows] == [
+                    ("candidate_1", "closed"), ("candidate_2", "failed"),
+                ], public
+                assert [row["snippet"]["value"] for row in rows] == snippets, public
+                assert rows[1]["diagnostics"]["diagnostics"], public
+                assert source.read_bytes() == original
+            else:
+                request = dict(kind="proof_position", file=source.name, declaration="positioned",
+                               proof_position=selector, managed_original=origin)
+                public = result(tool("lean_context", request))
+                context = public["data"]
+                assert context.get("goals_before") == context.get("goals_after") == ["⊢ True"], public
+                assert not context.get("unavailable"), public
+                different = dict(request, proof_position=dict(kind="index", index=0))
+                refused = result(tool("lean_context", different), allow_error=True)
+                assert "rpc_error" in refused or refused.get("errors"), refused
             saved = result(managed("get", **origin))
             assert saved["custody"] == "closed" and saved["result"]["state"] == "retained", saved
         with server() as (managed, result, _, _):
             assert result(managed("get", **origin)) == saved
-        print("managed proof position: second occurrence selected the remaining goal; changed source/selector refused; original GET recovered")
+        if args.proof_step:
+            print("managed proof step: setup import retained; ordered closed/failed candidates; original GET recovered")
+        else:
+            print("managed proof position: second occurrence selected the remaining goal; changed source/selector refused; original GET recovered")
         return
 
     with ExitStack() as stopped:
@@ -731,6 +761,8 @@ if __name__ == "__main__":
     mode.add_argument("--cancel-live", action="store_true")
     mode.add_argument("--deadline-while-sql-locked", action="store_true")
     mode.add_argument("--proof-position", action="store_true")
+    mode.add_argument("--proof-step", action="store_true",
+                      help="requires Positioned.lean and prebuilt ProbeSupport exposing supported : True")
     mode.add_argument("--root-architecture", choices=("pass", "fail"))
     parser.add_argument("--expected-finding")
     parser.add_argument("--entry-scratch", type=Path)
@@ -738,7 +770,7 @@ if __name__ == "__main__":
     if args.root_architecture is not None:
         if not args.expected_finding or args.prepared or args.declaration:
             parser.error("root architecture requires --expected-finding and no prepared inspection input")
-    elif not args.proof_position and (not args.prepared or not args.declaration or args.expected_finding):
+    elif not (args.proof_position or args.proof_step) and (not args.prepared or not args.declaration or args.expected_finding):
         parser.error("inspection requires --prepared and --declaration")
 
     if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live or args.deadline_while_sql_locked):

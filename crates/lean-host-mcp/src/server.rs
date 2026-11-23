@@ -724,12 +724,15 @@ impl LeanHostService {
                 #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
                 {
                     let mut req = req;
-                    let command = req
-                        .kind()
-                        .is_some_and(|kind| tools::request_aliases::canonical_kind("lean_trial", kind) == "command");
+                    let candidate = req.kind().is_some_and(|kind| {
+                        matches!(
+                            tools::request_aliases::canonical_kind("lean_trial", kind),
+                            "command" | "proof_step"
+                        )
+                    });
                     let original = req.args.remove("managed_original");
                     let managed =
-                        self.managed_setup_call(original, command.then_some("managed_trial_original_required"))?;
+                        self.managed_setup_call(original, candidate.then_some("managed_trial_original_required"))?;
                     tools::semantic::lean_trial_inner(&self.ctx, req, managed).await
                 }
                 #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]

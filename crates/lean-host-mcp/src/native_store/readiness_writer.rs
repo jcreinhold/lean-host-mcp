@@ -30,7 +30,7 @@ use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
 pub(super) use setup::{
     COMMAND_TRIAL as SETUP_TRIAL, DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION,
-    OUTLINE as SETUP_OUTLINE, PROOF_POSITION as SETUP_PROOF_POSITION,
+    OUTLINE as SETUP_OUTLINE, PROOF_POSITION as SETUP_PROOF_POSITION, PROOF_STEP as SETUP_PROOF_STEP,
 };
 pub(super) use writer_preparation::first_party_clean::OPERATION as FIRST_PARTY_CLEAN;
 pub(super) use writer_preparation::regroup::OPERATION as REGROUP;
@@ -107,6 +107,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | SETUP_OUTLINE
                     | SETUP_TRIAL
                     | SETUP_PROOF_POSITION
+                    | SETUP_PROOF_STEP
                     | TOOLING_SUITES
                     | REGROUP
                     | WHOLE_LINT
@@ -198,7 +199,7 @@ pub(crate) fn validate_create(intent: &[u8]) -> Result<(), crate::native_store::
     let needs_validation = serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
         matches!(
             value.get("operation").and_then(serde_json::Value::as_str),
-            Some(writer_preparation::OPERATION | REGROUP | SETUP_TRIAL | SETUP_PROOF_POSITION)
+            Some(writer_preparation::OPERATION | REGROUP | SETUP_TRIAL | SETUP_PROOF_POSITION | SETUP_PROOF_STEP)
         )
     });
     if needs_validation && parse_intent(intent).is_none() {
@@ -367,20 +368,14 @@ fn execute(
                 command
             }
             Stage::SetupVerification(request, projection) => {
-                if matches!(
-                    projection,
-                    setup::Projection::CommandTrial | setup::Projection::ProofPosition
-                ) {
-                    setup::read_source(root, request).map_err(|_| {
-                        McpError::invalid_params(
-                            if *projection == setup::Projection::CommandTrial {
-                                "managed_trial_source_changed"
-                            } else {
-                                "managed_proof_position_source_changed"
-                            },
-                            None,
-                        )
-                    })?;
+                let source_changed = match projection {
+                    setup::Projection::CommandTrial => Some("managed_trial_source_changed"),
+                    setup::Projection::ProofStep => Some("managed_proof_step_source_changed"),
+                    setup::Projection::ProofPosition => Some("managed_proof_position_source_changed"),
+                    setup::Projection::Verify | setup::Projection::Diagnostics | setup::Projection::Outline => None,
+                };
+                if let Some(reason) = source_changed {
+                    setup::read_source(root, request).map_err(|_| McpError::invalid_params(reason, None))?;
                 }
                 let shims = shims
                     .as_ref()

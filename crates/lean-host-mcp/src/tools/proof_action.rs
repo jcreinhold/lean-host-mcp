@@ -254,10 +254,55 @@ pub struct LeanVerifyRow {
 /// Returns infrastructure failures only. Failed proof candidates and
 /// unsupported worker shims are normal result statuses.
 pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Result<Response<ProofAttemptResult>> {
+    try_proof_step_inner(
+        ctx,
+        req,
+        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn try_proof_step_inner(
+    ctx: &ToolContext,
+    req: TryProofStepRequest,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
+        crate::writer_setup_verification::ManagedCall<'_>,
+    >,
+) -> Result<Response<ProofAttemptResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let input = read_query_file(&meta.canonical_root, &req.file)?;
     let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved, input.hash);
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    if let Some(call) = managed {
+        use crate::writer_setup_verification::{FileQuery, ProofPosition, valid_snippets};
+        let snippets = requested_snippets(&req);
+        if req.retry_tainted_non_positive || !valid_snippets(&snippets) {
+            return Err(crate::ServerError::BadProject(
+                "managed proof step requires bounded snippets without retry".into(),
+            ));
+        }
+        let selector = ProofPosition {
+            declaration: req.declaration,
+            position: worker_proof_position(req.proof_position),
+        };
+        let outcome = call
+            .file_query(
+                &ctx.broker,
+                &hint,
+                &meta.canonical_root,
+                &input.resolved,
+                &input.source,
+                input.imports,
+                FileQuery::ProofStep(&selector, &snippets),
+            )
+            .await?;
+        let result = refresh_proof_attempt_summary(project_proof_attempt(outcome.value), snippets.len());
+        let response = Response::ok(result, outcome.freshness).with_runtime(outcome.runtime);
+        return Ok(proof_step_response(response, source_fact, None));
+    }
+
     let file_label = input.resolved.to_string_lossy().into_owned();
     let budgets = proof_action_budgets(&ctx.config.output);
     let candidates = proof_candidates(&req);
@@ -344,7 +389,15 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
             }
         }
     }
-    let mut response = Response::ok(result, freshness).with_runtime(runtime);
+    let response = Response::ok(result, freshness).with_runtime(runtime);
+    Ok(proof_step_response(response, source_fact, taint.as_ref()))
+}
+
+fn proof_step_response(
+    mut response: Response<ProofAttemptResult>,
+    source_fact: ArtifactTrust,
+    taint: Option<&crate::envelope::RuntimeRestartEvent>,
+) -> Response<ProofAttemptResult> {
     response.trust_artifacts.push(source_fact);
     response
         .next_actions
@@ -360,7 +413,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
     }
     // A recycle mid-attempt can turn a closing tactic into a spurious `failed`;
     // there is no single verdict to relabel, so flag the whole attempt.
-    if let Some(event) = &taint {
+    if let Some(event) = taint {
         response = warn_execution_taint(response, event);
     }
     warn_partial_proof_attempt(&mut response);
@@ -381,7 +434,7 @@ pub async fn try_proof_step(ctx: &ToolContext, req: TryProofStepRequest) -> Resu
                 .to_owned(),
         );
     }
-    Ok(response)
+    response
 }
 
 /// Lean diagnostics for a tactic that tried to introduce binders no longer
