@@ -136,14 +136,8 @@ fn lake_command(root: &Path, assets: &Path) -> io::Result<Command> {
     Ok(command)
 }
 
-pub(super) async fn run(
-    broker: &ProjectBroker,
-    store: &Arc<Mutex<NativeStore>>,
-    original: Snapshot,
-    capability: Capability,
-) -> Result<(), McpError> {
-    let invalid = |reason| McpError::invalid_params(reason, None);
-    let request: Intent = serde_json::from_slice(&original.intent).map_err(|_| invalid("invalid_readiness_intent"))?;
+fn parse_intent(intent: &[u8]) -> Option<(PathBuf, Stage)> {
+    let request: Intent = serde_json::from_slice(intent).ok()?;
     let stage = match (
         request.operation.as_str(),
         request.target,
@@ -184,19 +178,42 @@ pub(super) async fn run(
         }
         (operation, None, None, None, Some(request)) if request.valid() => {
             let projection = setup::Projection::from_operation(operation)
-                .filter(|projection| request.matches_projection(*projection))
-                .ok_or_else(|| invalid("invalid_readiness_intent"))?;
+                .filter(|projection| request.matches_projection(*projection))?;
             Stage::SetupVerification(request, projection)
         }
-        _ => return Err(invalid("invalid_readiness_intent")),
+        _ => return None,
     };
     if request.job.is_empty() || request.revision == 0 {
-        return Err(invalid("invalid_readiness_intent"));
+        return None;
     }
+    Some((request.project, stage))
+}
+
+pub(crate) fn validate_create(intent: &[u8]) -> Result<(), crate::native_store::store::Reject> {
+    let needs_validation = serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
+        matches!(
+            value.get("operation").and_then(serde_json::Value::as_str),
+            Some(writer_preparation::OPERATION | REGROUP)
+        )
+    });
+    if needs_validation && parse_intent(intent).is_none() {
+        return Err(crate::native_store::store::Reject::InvalidReadinessIntent);
+    }
+    Ok(())
+}
+
+pub(super) async fn run(
+    broker: &ProjectBroker,
+    store: &Arc<Mutex<NativeStore>>,
+    original: Snapshot,
+    capability: Capability,
+) -> Result<(), McpError> {
+    let invalid = |reason| McpError::invalid_params(reason, None);
+    let (project, stage) = parse_intent(&original.intent).ok_or_else(|| invalid("invalid_readiness_intent"))?;
     let root = broker
         .native_root(&ProjectHint::Default)
         .map_err(|_| invalid("readiness_project_unavailable"))?;
-    if root.as_os_str() != request.project.as_os_str() {
+    if root.as_os_str() != project.as_os_str() {
         return Err(invalid("readiness_project_changed"));
     }
     let helper = selection().map_err(|_| invalid("operation_disabled"))?;

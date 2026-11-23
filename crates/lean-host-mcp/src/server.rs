@@ -266,8 +266,12 @@ impl LeanHostService {
         }
         let budget = cfg!(any(target_os = "macos", target_os = "linux"))
             .then(|| Duration::from_millis(self.ctx.broker.request_timeout_millis()));
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let validate = crate::managed_prepared::readiness_writer::validate_create;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let validate = |_| Ok(());
         let reply = store
-            .admission_with_budget(input.request.as_bytes(), budget)
+            .admission_with_validation(input.request.as_bytes(), budget, validate)
             .map_err(|reason| McpError::invalid_params(reason, None))?;
         drop(store);
         #[cfg(any(target_os = "macos", target_os = "linux"))]

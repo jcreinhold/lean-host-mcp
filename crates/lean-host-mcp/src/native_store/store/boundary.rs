@@ -174,6 +174,15 @@ impl NativeStore {
         bytes: &[u8],
         budget: Option<std::time::Duration>,
     ) -> Result<serde_json::Value, &'static str> {
+        self.admission_with_validation(bytes, budget, |_| Ok(()))
+    }
+
+    pub(crate) fn admission_with_validation(
+        &mut self,
+        bytes: &[u8],
+        budget: Option<std::time::Duration>,
+        validate: impl FnOnce(&[u8]) -> Result<(), Reject>,
+    ) -> Result<serde_json::Value, &'static str> {
         let request = decode(bytes).map_err(|_| "invalid_request")?;
         match &request.command {
             ClientCommand::Discover {} => {}
@@ -201,6 +210,7 @@ impl NativeStore {
                     &intent,
                     drain_authorization,
                     budget.map(super::recovery::admission_deadline),
+                    validate,
                 )
                 .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
             ClientCommand::Discover {} => self
@@ -225,6 +235,7 @@ impl NativeStore {
         let reply = outcome.map_err(|error| match error {
             Problem::Rejected(Reject::CapabilityDenied) => "capability_denied",
             Problem::Rejected(Reject::IntentChanged) => "intent_changed",
+            Problem::Rejected(Reject::InvalidReadinessIntent) => "invalid_readiness_intent",
             Problem::Rejected(Reject::StoreFull) => "store_full",
             Problem::Rejected(Reject::DispatchDisabled) => "operation_disabled",
             Problem::Rejected(Reject::ConflictingResult) => "result_changed",
@@ -292,7 +303,9 @@ impl NativeStore {
                 intent,
                 drain_authorization,
             } => self
-                .create_intent(key, &Capability(capability), &intent, drain_authorization, None)
+                .create_intent(key, &Capability(capability), &intent, drain_authorization, None, |_| {
+                    Ok(())
+                })
                 .map(|snapshot| ClientReply::Snapshot(Box::new(snapshot))),
             ClientCommand::Get { key, capability } => self
                 .client_get(key, &Capability(capability))

@@ -83,6 +83,7 @@ pub(crate) enum Reject {
     StaleGeneration,
     NoConsumedGate,
     InvalidLaunchDeadline,
+    InvalidReadinessIntent,
     ConflictingSpawn,
     ConflictingResult,
     ResultUnknown,
@@ -757,7 +758,7 @@ impl NativeStore {
         read_stage(self.db.connection(), key)
     }
     pub(crate) fn create(&mut self, saved: &SavedRequest) -> Answer<Snapshot> {
-        self.create_intent(saved.key, &saved.capability, &saved.intent, None, None)
+        self.create_intent(saved.key, &saved.capability, &saved.intent, None, None, |_| Ok(()))
     }
     fn create_intent(
         &mut self,
@@ -766,6 +767,7 @@ impl NativeStore {
         intent: &[u8],
         drain_auth: Option<[u8; 32]>,
         deadline: Option<Answer<AdmissionDeadline>>,
+        validate: impl FnOnce(&[u8]) -> Result<(), Reject>,
     ) -> Answer<Snapshot> {
         self.checked_key(key)?;
         bounded(intent)?;
@@ -808,6 +810,7 @@ impl NativeStore {
         if key.epoch > epoch {
             return reject(Reject::FutureEpoch);
         }
+        validate(intent).map_err(Problem::Rejected)?;
         if tx.query_row("SELECT count(*) FROM stages", [], |row| row.get::<_, i64>(0))? >= MAX_STAGES {
             return reject(Reject::StoreFull);
         }

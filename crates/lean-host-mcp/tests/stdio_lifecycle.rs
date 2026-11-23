@@ -882,6 +882,38 @@ mod launcher_regressions {
                 "operation":"lake_module_preparation_v1", "target":{"kind":"root_library","name":"Probe",
                     "module_count":3, "module_names_sha256":digest, "sources_sha256":sources_sha256,
                     "lakefile_sha256":lakefile_sha256, "manifest_sha256":manifest_sha256}});
+            if revision == 1 {
+                let mut legacy = intent.clone();
+                legacy
+                    .pointer_mut("/target")
+                    .and_then(Value::as_object_mut)
+                    .expect("root target")
+                    .remove("sources_sha256");
+                for (command, expected) in [
+                    (
+                        json!({"op":"create","key":key,"capability":capability,
+                        "intent":legacy.to_string().as_bytes()}),
+                        "invalid_readiness_intent",
+                    ),
+                    (json!({"op":"get","key":key,"capability":capability}), "unknown_stage"),
+                ] {
+                    let response = server
+                        .request_allow_error(
+                            "tools/call",
+                            json!({
+                                "name":"lean_managed_admission","arguments":{
+                                    "request":json!({"version":1,"command":command}).to_string()
+                                }
+                            }),
+                        )
+                        .await;
+                    assert_eq!(
+                        response.pointer("/error/message").and_then(Value::as_str),
+                        Some(expected),
+                        "{response}"
+                    );
+                }
+            }
             let create = managed(
                 &mut server,
                 json!({"op":"create","key":key,
