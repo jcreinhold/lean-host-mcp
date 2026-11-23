@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Plan, Target, blueprint_declarations, module_name, pinned_lake_config};
 
-pub(super) const MAX_MODULES: usize = 16_384;
+pub(super) use lean_host_mcp_worker::module_preparation::MAX_PROJECT_MODULES as MAX_MODULES;
 const BATCH: usize = 16;
 const MAX_QUERY_BYTES: u64 = 8 * 1024 * 1024;
 

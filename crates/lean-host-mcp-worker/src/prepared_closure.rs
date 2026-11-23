@@ -8,7 +8,7 @@ use std::{
 
 use serde::Deserialize;
 
-const MAX_MODULES: usize = 4096;
+use crate::module_preparation::MAX_PROJECT_MODULES;
 const HEADER_BATCH: usize = 32;
 
 #[derive(Deserialize)]
@@ -60,8 +60,10 @@ pub(super) fn derive_observed(
             return Err(io::Error::other("invalid prepared closure module name"));
         }
         if seen.insert(module.clone()) {
-            if seen.len() > MAX_MODULES {
-                return Err(io::Error::other("prepared import closure exceeds 4096 modules"));
+            if seen.len() > MAX_PROJECT_MODULES {
+                return Err(io::Error::other(format!(
+                    "prepared import closure exceeds {MAX_PROJECT_MODULES} modules"
+                )));
             }
             pending.push_back(module);
         }
@@ -165,4 +167,65 @@ fn selects_real_mathlib_source_closure() -> Result<(), Box<dyn std::error::Error
     assert_eq!(selected.iter().filter(|(_, owner)| owner == &root).count(), 2);
     assert!(selected.iter().any(|(name, _)| name == "Mathlib.Data.Nat.Basic"));
     Ok(())
+}
+
+#[cfg(test)]
+mod bounds {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn shared_module_ceiling_allows_large_batched_closures_and_refuses_overflow() -> io::Result<()> {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                drop(fs::remove_dir_all(&self.0));
+            }
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lean-closure-{}-{unique}", std::process::id()));
+        fs::create_dir(&path)?;
+        let scratch = Scratch(path);
+        let project = scratch.0.canonicalize()?;
+        let sources = project.join("Root");
+        let release = project.join("release");
+        fs::create_dir(&sources)?;
+        fs::create_dir(&release)?;
+        fs::write(project.join("Root.lean"), "")?;
+        let roots = [project.join(".lake/build/lib/lean")];
+        let domains = [project.clone()];
+        let walk = |total: usize, create_sources: bool| {
+            if create_sources {
+                for number in 1..total {
+                    fs::write(sources.join(format!("M{number}.lean")), "")?;
+                }
+            }
+            derive(&roots, &release, &domains, ["Root".to_owned()], |files| {
+                assert!(files.len() <= HEADER_BATCH);
+                let imports = files
+                    .iter()
+                    .map(|file| {
+                        let imports = if *file == project.join("Root.lean") {
+                            (1..total).map(|n| json!({"module":format!("Root.M{n}")})).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        json!({"errors": [], "result": {"imports": imports}})
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::to_vec(&json!({"imports": imports}))?)
+            })
+        };
+        let allowed = walk(4_653, true)?;
+        assert_eq!(allowed.len(), 4_653);
+        let refused = walk(MAX_PROJECT_MODULES + 1, false).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!("prepared import closure exceeds {MAX_PROJECT_MODULES} modules")
+        );
+        Ok(())
+    }
 }

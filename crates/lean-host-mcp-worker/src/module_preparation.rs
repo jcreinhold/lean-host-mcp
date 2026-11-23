@@ -1,6 +1,8 @@
 //! Shared Lake sequencing for a first-party module with prebuilt dependencies.
 
 use std::io;
+/// Maximum number of modules supported in a project build or selected import closure.
+pub const MAX_PROJECT_MODULES: usize = 16_384;
 
 /// Check dependency and setup readiness before allowing the selected module to build.
 ///
