@@ -1154,10 +1154,12 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
         command.env_remove(name);
     }
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    if let Some((_encoded, original)) = admitted {
+    if let Some((encoded, original)) = admitted {
         original.remaining()?;
         #[cfg(target_os = "linux")]
-        command.env(admitted::DEADLINE_ENV, _encoded);
+        command.env(admitted::DEADLINE_ENV, encoded);
+        #[cfg(not(target_os = "linux"))]
+        drop(encoded);
     }
     #[cfg(not(target_os = "linux"))]
     measure_payload(command, args, deadline, &mut payload)?;
