@@ -92,6 +92,37 @@ def inventory(p):
     }
 
 
+# The packaged search uses the server's normal two-minute request budget.
+# Give the response a bounded transport margin without extending other probes.
+SEARCH_REQUEST_MILLIS = 120_000
+TRANSPORT_MARGIN_SECONDS = 10
+MAX_RESPONSE_BYTES = 1_048_576
+
+
+def receive_rpc(stdout, pending, request_id, label, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{label} did not reply within {timeout}s")
+        newline = pending.find(b"\n")
+        if newline >= 0:
+            line = pending[:newline]
+            del pending[:newline + 1]
+            reply = json.loads(line)
+            if reply.get("id") == request_id:
+                return reply
+            continue
+        if len(pending) >= MAX_RESPONSE_BYTES:
+            raise ValueError(f"{label} received an oversized JSON-RPC frame")
+        if not select.select([stdout], [], [], remaining)[0]:
+            raise TimeoutError(f"{label} did not reply within {timeout}s")
+        chunk = os.read(stdout.fileno(), min(65536, MAX_RESPONSE_BYTES - len(pending)))
+        if not chunk:
+            raise EOFError(f"{label} closed stdout before its response")
+        pending.extend(chunk)
+
+
 def probe(p, *, search=False, diagnostics=False, retained=False):
     proc = s.Popen(
         [
@@ -101,12 +132,16 @@ def probe(p, *, search=False, diagnostics=False, retained=False):
             "--request-journal",
             b / "journal",
         ],
-        env=env,
+        env=(
+            dict(env, LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS=str(SEARCH_REQUEST_MILLIS))
+            if search else env
+        ),
         stdin=s.PIPE,
         stdout=s.PIPE,
     )
+    pending = bytearray()
 
-    def rpc(i, m, params):
+    def rpc(i, m, params, *, timeout=40):
         msg = dict(jsonrpc="2.0", method=m, params=params)
         if i:
             msg["id"] = i
@@ -114,11 +149,9 @@ def probe(p, *, search=False, diagnostics=False, retained=False):
         proc.stdin.flush()
         if not i:
             return
-        while select.select([proc.stdout], [], [], 40)[0]:
-            v = json.loads(proc.stdout.readline(1048576))
-            if v.get("id") == i:
-                return v
-        raise TimeoutError
+        tool = params.get("name", m)
+        label = f"{tool} (JSON-RPC id {i})"
+        return receive_rpc(proc.stdout, pending, i, label, timeout)
 
     try:
         rpc(
@@ -145,6 +178,7 @@ def probe(p, *, search=False, diagnostics=False, retained=False):
                         kind="proof_search", file="Demo.lean", declaration="demo"
                     ),
                 ),
+                timeout=SEARCH_REQUEST_MILLIS / 1000 + TRANSPORT_MARGIN_SECONDS,
             )
         arguments = {"targets": [{"kind": "explicit", "file": "Demo.lean", "declarations": ["demo"]}]}
         if not retained:
