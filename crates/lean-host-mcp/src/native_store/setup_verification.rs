@@ -388,6 +388,17 @@ pub(crate) struct Reference {
     capability: [u8; 32],
 }
 
+impl Reference {
+    pub(crate) fn identity(
+        &self,
+    ) -> (
+        crate::native_store::store::NativeKey,
+        crate::native_store::store::Capability,
+    ) {
+        (self.key, crate::native_store::store::Capability(self.capability))
+    }
+}
+
 pub(crate) struct ManagedCall<'a> {
     pub(crate) reference: Reference,
     pub(crate) store: &'a std::sync::Arc<parking_lot::Mutex<crate::native_store::store::NativeStore>>,
@@ -512,10 +523,9 @@ impl ManagedCall<'_> {
         names: &[&str],
         query: FileQuery<'_>,
     ) -> crate::Result<Vec<u8>> {
-        use crate::native_store::store::{Capability, Gate, ResourceReport, ResultKnowledge};
+        use crate::native_store::store::{Gate, ResourceReport, ResultKnowledge};
         let unavailable = |message: &str| crate::ServerError::BadProject(message.to_owned());
-        let key = self.reference.key;
-        let capability = Capability(self.reference.capability);
+        let (key, capability) = self.reference.identity();
         let snapshot = self
             .store
             .lock()

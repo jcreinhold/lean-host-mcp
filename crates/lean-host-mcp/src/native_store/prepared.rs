@@ -9,19 +9,22 @@ use std::{
 };
 
 use lean_rs_worker_parent::{
-    LeanWorkerCancellationToken, LeanWorkerDeclarationInspectionRequest, LeanWorkerHostHandle,
+    LeanWorkerCancellationToken, LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationInspectionResult,
+    LeanWorkerHostHandle, LeanWorkerOutputBudgets,
 };
 use lean_toolchain::native_guardian::{NativeGuardianDrainBinding, registry_directory};
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::native_store::store::{
     AdmissionDeadline, Binding, CallerKey, Capability, Consume, Gate, NativeKey, NativeStore, Problem, Reject,
     ResourceReport, SavedRequest, Scope, recovery::RegistryIdentity,
 };
-use crate::{ProjectBroker, error::ServerError};
+use crate::{ProjectBroker, broker::ProjectHint, error::ServerError};
+
+pub(crate) const NAMED_INSPECTION: &str = "lean_declaration_inspection_v1";
 
 #[path = "trace_snapshot.rs"]
 mod trace_snapshot;
@@ -36,13 +39,131 @@ struct Intent {
     revision: u64,
     prepared_sha256: [u8; 32],
     imports: Vec<String>,
-    declaration: String,
+    declaration: Option<String>,
+    operation: Option<String>,
+    project: Option<std::path::PathBuf>,
+    inspection: Option<LeanWorkerDeclarationInspectionRequest>,
+    source: Option<InspectionSource>,
+}
+
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InspectionSource {
+    pub(crate) file: std::path::PathBuf,
+    pub(crate) sha256: [u8; 32],
+}
+
+impl Intent {
+    fn source_matches(&self, root: &std::path::Path) -> bool {
+        self.source.as_ref().is_none_or(|source| {
+            crate::tools::source_input::read_query_file(root, &source.file).is_ok_and(|file| {
+                file.resolved.strip_prefix(root).ok() == Some(source.file.as_path()) && file.hash == source.sha256
+            })
+        })
+    }
+
+    fn request(&self) -> Option<LeanWorkerDeclarationInspectionRequest> {
+        if self.job.is_empty() || self.revision == 0 || self.imports.is_empty() {
+            return None;
+        }
+        match self.operation.as_deref() {
+            None if self.inspection.is_none() && self.project.is_none() && self.source.is_none() => self
+                .declaration
+                .as_ref()
+                .filter(|name| !name.is_empty())
+                .map(LeanWorkerDeclarationInspectionRequest::new),
+            Some(NAMED_INSPECTION)
+                if self.declaration.is_none() && self.project.as_ref().is_some_and(|p| p.is_absolute()) =>
+            {
+                let request = self.inspection.as_ref()?;
+                if request.name.trim().is_empty()
+                    || request.name.len() > 256
+                    || request.name.chars().any(char::is_control)
+                    || request.fields.proof_search
+                    || request.budgets != LeanWorkerOutputBudgets::default()
+                    || self.imports.len() > 33
+                    || self
+                        .imports
+                        .iter()
+                        .any(|name| name.is_empty() || name.len() > 256 || name.chars().any(char::is_control))
+                    || self.source.as_ref().is_some_and(|source| {
+                        !crate::managed_prepared::readiness_writer::configured_consumer::SourceIdentity {
+                            file: source.file.clone(),
+                            sha256: source.sha256,
+                        }
+                        .valid()
+                    })
+                {
+                    return None;
+                }
+                Some(request.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn validate_create(bytes: &[u8]) -> Result<(), Reject> {
+    readiness_writer::validate_create(bytes)?;
+    let named = serde_json::from_slice::<serde_json::Value>(bytes)
+        .is_ok_and(|value| value.get("operation").and_then(serde_json::Value::as_str) == Some(NAMED_INSPECTION));
+    if named
+        && serde_json::from_slice::<Intent>(bytes)
+            .ok()
+            .and_then(|intent| intent.request())
+            .is_none()
+    {
+        return Err(Reject::InvalidReadinessIntent);
+    }
+    Ok(())
+}
+
+pub(crate) async fn named_lookup(
+    call: crate::writer_setup_verification::ManagedCall<'_>,
+    broker: &ProjectBroker,
+    root: &std::path::Path,
+    imports: &[String],
+    request: &LeanWorkerDeclarationInspectionRequest,
+    source: Option<&InspectionSource>,
+) -> crate::error::Result<LeanWorkerDeclarationInspectionResult> {
+    use crate::native_store::store::ResultKnowledge;
+    let bad = |reason: &str| ServerError::BadProject(reason.to_owned());
+    let (key, capability) = call.reference.identity();
+    let get = || call.store.lock().client_get(key, &capability).map_err(internal);
+    let original = get()?;
+    let intent: Intent = serde_json::from_slice(&original.intent).map_err(internal)?;
+    if intent.operation.as_deref() != Some(NAMED_INSPECTION)
+        || intent.project.as_deref() != Some(root)
+        || intent.imports != imports
+        || intent.request().as_ref() != Some(request)
+        || intent.source.as_ref() != source
+    {
+        return Err(bad("managed declaration lookup differs from the admitted inspection"));
+    }
+    if original.gate == Gate::Pending && original.scope.is_none() {
+        start(broker, call.store, key, capability.clone())
+            .await
+            .map_err(|error| bad(&error.message))?;
+    }
+    let saved = get()?;
+    if saved.resource_report != ResourceReport::Closed {
+        return Err(bad("managed declaration inspection custody is unresolved"));
+    }
+    match saved.result {
+        ResultKnowledge::Retained { body, .. } | ResultKnowledge::Acknowledged { body, .. } => {
+            serde_json::from_slice(&body).map_err(internal)
+        }
+        ResultKnowledge::Pending | ResultKnowledge::Expired { .. } => {
+            Err(bad("managed declaration inspection result unavailable"))
+        }
+    }
 }
 
 pub(crate) struct Job {
     store: Arc<Mutex<NativeStore>>,
     original: SavedRequest,
-    intent: Intent,
+    intent: Box<Intent>,
+    request: LeanWorkerDeclarationInspectionRequest,
     deadline: AdmissionDeadline,
 }
 
@@ -98,6 +219,14 @@ impl Job {
             .map_err(internal)?;
         if expected != original {
             return Err(internal("prepared receiver changed or original deadline elapsed"));
+        }
+        if self
+            .intent
+            .project
+            .as_deref()
+            .is_some_and(|root| !self.intent.source_matches(root))
+        {
+            return Err(internal("inspection source changed before consuming launch"));
         }
         let registry = RegistryIdentity {
             directory: registry_directory().map_err(internal)?.as_os_str().as_bytes().to_vec(),
@@ -167,7 +296,7 @@ impl Job {
         let outcome = worker
             .inspect_admitted_declaration_with_imports_once_cancellable(
                 &self.intent.imports,
-                LeanWorkerDeclarationInspectionRequest::new(self.intent.declaration),
+                self.request,
                 &expected,
                 admitted.key.nonce,
                 admitted.key.stage,
@@ -244,6 +373,21 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
             };
             fields.insert("operations".into(), serde_json::json!(operations));
         }
+        if fields.contains_key("acceptance_epoch")
+            && let Some(prepared) = broker.prepared_generation()
+        {
+            fields.insert(
+                "prepared_sha256".into(),
+                serde_json::json!(Sha256::digest(prepared.as_bytes()).to_vec()),
+            );
+            if let Some(operations) = fields
+                .entry("operations")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+            {
+                operations.push(serde_json::json!(NAMED_INSPECTION));
+            }
+        }
     }
     reply
 }
@@ -286,8 +430,19 @@ pub(crate) async fn start(
     }
     let intent: Intent = serde_json::from_slice(&snapshot.intent)
         .map_err(|_| McpError::invalid_params("invalid_inspection_intent", None))?;
-    if intent.job.is_empty() || intent.imports.is_empty() || intent.declaration.is_empty() {
-        return Err(McpError::invalid_params("invalid_inspection_intent", None));
+    let request = intent
+        .request()
+        .ok_or_else(|| McpError::invalid_params("invalid_inspection_intent", None))?;
+    if intent.operation.as_deref() == Some(NAMED_INSPECTION) {
+        let root = broker
+            .native_root(&ProjectHint::Default)
+            .map_err(|_| McpError::invalid_params("inspection_project_unavailable", None))?;
+        if intent.project.as_deref() != Some(root.as_path()) {
+            return Err(McpError::invalid_params("inspection_project_changed", None));
+        }
+        if !intent.source_matches(&root) {
+            return Err(McpError::invalid_params("inspection_source_changed", None));
+        }
     }
     let configured = broker
         .prepared_generation()
@@ -305,13 +460,10 @@ pub(crate) async fn start(
     let deadline = now
         .checked_add(remaining)
         .ok_or_else(|| McpError::internal_error("deadline_overflow", None))?;
-    let actor = broker
-        .managed_actor(deadline.into())
-        .await
-        .map_err(|error| {
-            tracing::debug!(%error, "managed inspection could not acquire its prepared actor");
-            McpError::internal_error("prepared_actor_unavailable", None)
-        })?;
+    let actor = broker.managed_actor(deadline.into()).await.map_err(|error| {
+        tracing::debug!(%error, "managed inspection could not acquire its prepared actor");
+        McpError::internal_error("prepared_actor_unavailable", None)
+    })?;
     let original = SavedRequest {
         caller: CallerKey {
             job: intent.job.clone(),
@@ -325,7 +477,8 @@ pub(crate) async fn start(
     let job = Job {
         store: Arc::clone(store),
         original,
-        intent,
+        intent: Box::new(intent),
+        request,
         deadline: admitted,
     };
     if let Err(error) = actor.inspect_managed(job, deadline).await {

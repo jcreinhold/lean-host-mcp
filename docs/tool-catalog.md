@@ -766,6 +766,10 @@ explicit import context.
 Optional `fields` can select `source`, `statement`, `docstring`, `attributes`, and `flags`; `raw_statement` asks for the
 raw elaborated term.
 
+Managed named lookup requires an installed prepared generation. The admission binds the normalized
+inspection fields and default output budgets, the ordered resolved imports, and the file digest when a file
+is supplied. Retrieve a lost result using its original key after custody closes.
+
 ### `kind: "declarations"`
 
 Lists declarations in one source file or module. File targets use the current source snapshot and the worker's

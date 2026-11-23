@@ -267,7 +267,7 @@ impl LeanHostService {
         let budget = cfg!(any(target_os = "macos", target_os = "linux"))
             .then(|| Duration::from_millis(self.ctx.broker.request_timeout_millis()));
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let validate = crate::managed_prepared::readiness_writer::validate_create;
+        let validate = crate::managed_prepared::validate_create;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let validate = |_| Ok(());
         let reply = store
@@ -757,12 +757,16 @@ impl LeanHostService {
                 #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
                 {
                     let mut req = req;
-                    let outline = req.kind().is_some_and(|kind| {
-                        tools::request_aliases::canonical_kind("lean_lookup", kind) == "declarations"
-                    });
+                    let required =
+                        req.kind().and_then(
+                            |kind| match tools::request_aliases::canonical_kind("lean_lookup", kind) {
+                                "declarations" => Some("managed_outline_original_required"),
+                                "declaration" => Some("managed_declaration_original_required"),
+                                _ => None,
+                            },
+                        );
                     let original = req.args.remove("managed_original");
-                    let managed =
-                        self.managed_setup_call(original, outline.then_some("managed_outline_original_required"))?;
+                    let managed = self.managed_setup_call(original, required)?;
                     tools::semantic::lean_lookup_inner(&self.ctx, req, managed).await
                 }
                 #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]

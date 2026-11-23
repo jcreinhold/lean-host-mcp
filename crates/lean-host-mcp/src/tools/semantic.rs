@@ -269,6 +269,7 @@ fn lean_lookup_schema() -> Schema {
                 "required": ["kind", "name"],
                 "properties": {
                     "kind": { "const": "declaration" },
+                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "name": { "type": "string" },
                     "file": { "type": ["string", "null"] },
                     "imports": { "type": "array", "items": { "type": "string" } },
@@ -798,6 +799,13 @@ pub(crate) async fn lean_lookup_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            if managed.is_some() {
+                return from_tool_response(
+                    declaration::inspect_declaration_inner(ctx, request, managed).await?,
+                    ctx.config,
+                );
+            }
             from_tool_response(declaration::inspect_declaration(ctx, request).await?, ctx.config)
         }
         Some("declarations") => {
