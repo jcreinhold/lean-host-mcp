@@ -17,6 +17,9 @@ pub(crate) const VERIFIER_OPERATION: &str = "lake_verifier_preparation_v1";
 const MAX_MODULES: usize = 64;
 const MAX_PLAN_BYTES: usize = 32 * 1024;
 
+#[path = "pinned_lake_config.rs"]
+mod pinned_lake_config;
+pub use pinned_lake_config::validate_pinned_lake_configs;
 #[path = "first_party_clean.rs"]
 pub(crate) mod first_party_clean;
 #[path = "tooling_suites.rs"]
