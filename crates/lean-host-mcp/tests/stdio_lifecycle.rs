@@ -1372,7 +1372,7 @@ unsafe def main (args : List String) : IO UInt32 := do
             return;
         };
         let fixture = Fixture::new();
-        let source = "import Lean\ndef fixtureValue : Nat := 42\n";
+        let source = "import Init\ndef fixtureValue : Nat := 42\n";
         let path = fixture.project.join("Probe.lean");
         fs::write(&path, source).expect("real Lean source");
         let (store, id) = fixture.new_store("store").await;
@@ -1397,7 +1397,7 @@ unsafe def main (args : List String) : IO UInt32 := do
                     "--managed-only",
                 ])
                 .arg("--managed-native-store")
-                .arg(store)
+                .arg(&store)
                 .env("LEAN_HOST_MCP_MANAGED_READINESS_WRITER", writer)
                 .env("LEAN_HOST_MCP_WORKERS_DIR", workers),
         );
@@ -1436,7 +1436,7 @@ unsafe def main (args : List String) : IO UInt32 := do
         );
 
         let original = key();
-        let commands = "#check Nat.succ";
+        let commands = "#check Nat.succ\n#check fixtureValue";
         managed(&mut server, admission(&original, commands)).await;
         fs::write(&path, format!("{source}\n-- changed after CREATE\n")).expect("change source");
         let changed = server
@@ -1455,9 +1455,39 @@ unsafe def main (args : List String) : IO UInt32 := do
         assert!(!fixture.project.join(".lake/config").exists());
         fs::write(path, source).expect("restore same source");
 
-        let first = server.request("tools/call", trial(&original, commands)).await;
+        let first = {
+            let request = server.request("tools/call", trial(&original, commands));
+            tokio::pin!(request);
+            tokio::select! {
+                first = &mut request => first,
+                () = tokio::time::sleep(Duration::from_secs(25)) => {
+                    let phase = rusqlite::Connection::open_with_flags(
+                        &store,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    ).and_then(|observer| {
+                        observer.busy_timeout(Duration::ZERO)?;
+                        let nonce: Vec<u8> = serde_json::from_value(original["nonce"].clone()).expect("original nonce");
+                        observer.query_row(
+                            "SELECT gate, spawn, resource_report, result_kind FROM stages
+                             WHERE epoch=?1 AND nonce=?2 AND stage=1",
+                            rusqlite::params![original["epoch"].as_i64().expect("original epoch"), nonce],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+                        )
+                    });
+                    eprintln!(
+                        "first admitted lean_trial still pending: Lake config exists={}, original gate/spawn/custody/result={phase:?}",
+                        fixture.project.join(".lake/config").exists()
+                    );
+                    request.await
+                }
+            }
+        };
         let result = first.get("result").expect("trial result");
-        assert!(result.to_string().contains("Nat.succ"), "{result}");
+        let rendered = result.to_string();
+        assert!(
+            rendered.contains("Nat.succ") && rendered.contains("fixtureValue"),
+            "{result}"
+        );
         let saved = managed(&mut server, json!({"op":"get","key":original,"capability":capability})).await;
         assert_eq!(saved.get("custody").and_then(Value::as_str), Some("closed"), "{saved}");
         assert_eq!(saved.pointer("/result/state").and_then(Value::as_str), Some("retained"));
