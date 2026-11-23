@@ -33,18 +33,27 @@ pub(crate) fn warm_development_enabled() -> bool {
     std::env::var_os("LEAN_HOST_MCP_DEVELOPMENT_WARM").is_some_and(|value| value == "1")
 }
 
-fn is_warm(operation: Option<&str>) -> bool {
-    if operation != Some(WARM_INSPECTION) {
-        return false;
-    }
+fn warm_selected() -> bool {
     #[cfg(lean_host_mcp_development_warm)]
     return warm_development_enabled();
     #[cfg(not(lean_host_mcp_development_warm))]
     false
 }
 
+fn is_warm(operation: Option<&str>) -> bool {
+    operation == Some(WARM_INSPECTION)
+}
+
 fn is_named(operation: Option<&str>) -> bool {
-    operation == Some(NAMED_INSPECTION) || is_warm(operation)
+    matches!(operation, Some(NAMED_INSPECTION | WARM_INSPECTION))
+}
+
+fn selected_inspection(warm: bool) -> &'static str {
+    if warm { WARM_INSPECTION } else { NAMED_INSPECTION }
+}
+
+fn inspection_allowed(operation: Option<&str>, warm: bool) -> bool {
+    operation == Some(selected_inspection(warm)) || (!warm && operation.is_none())
 }
 
 #[cfg(lean_host_mcp_development_warm)]
@@ -133,21 +142,28 @@ impl Intent {
 }
 
 pub(crate) fn validate_create(bytes: &[u8]) -> Result<(), Reject> {
+    validate_create_for_mode(bytes, warm_selected())
+}
+
+fn validate_create_for_mode(bytes: &[u8], warm: bool) -> Result<(), Reject> {
     readiness_writer::validate_create(bytes)?;
     let decoded = serde_json::from_slice::<serde_json::Value>(bytes).ok();
     let operation = decoded
         .as_ref()
         .and_then(|value| value.get("operation"))
         .and_then(serde_json::Value::as_str);
-    if operation == Some(WARM_INSPECTION) && !is_warm(operation) {
+    let named = is_named(operation);
+    let parsed = (named || (warm && operation.is_none()))
+        .then(|| {
+            serde_json::from_slice::<Intent>(bytes)
+                .ok()
+                .and_then(|intent| intent.request())
+        })
+        .flatten();
+    if (named || parsed.is_some()) && !inspection_allowed(operation, warm) {
         return Err(Reject::DispatchDisabled);
     }
-    if is_named(operation)
-        && serde_json::from_slice::<Intent>(bytes)
-            .ok()
-            .and_then(|intent| intent.request())
-            .is_none()
-    {
+    if named && parsed.is_none() {
         return Err(Reject::InvalidReadinessIntent);
     }
     Ok(())
@@ -168,6 +184,7 @@ pub(crate) async fn named_lookup(
     let original = get()?;
     let intent: Intent = serde_json::from_slice(&original.intent).map_err(internal)?;
     if !is_named(intent.operation.as_deref())
+        || !inspection_allowed(intent.operation.as_deref(), warm_selected())
         || intent.project.as_deref() != Some(root)
         || intent.imports != imports
         || intent.request().as_ref() != Some(request)
@@ -384,7 +401,11 @@ fn public_error(error: &Problem) -> McpError {
     McpError::invalid_params(reason, None)
 }
 
-pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) -> serde_json::Value {
+pub(crate) fn advertise(reply: serde_json::Value, broker: &ProjectBroker) -> serde_json::Value {
+    advertise_for_mode(reply, broker, warm_selected())
+}
+
+fn advertise_for_mode(mut reply: serde_json::Value, broker: &ProjectBroker, warm: bool) -> serde_json::Value {
     if let Some(fields) = reply.as_object_mut() {
         fields.insert("dispatch_enabled".into(), broker.prepared_generation().is_some().into());
         if fields.contains_key("acceptance_epoch") && trace_snapshot::available(broker) {
@@ -438,11 +459,7 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                 .or_insert_with(|| serde_json::json!([]))
                 .as_array_mut()
             {
-                operations.push(serde_json::json!(NAMED_INSPECTION));
-                #[cfg(lean_host_mcp_development_warm)]
-                if warm_development_enabled() && broker.managed_only() {
-                    operations.push(serde_json::json!(WARM_INSPECTION));
-                }
+                operations.push(serde_json::json!(selected_inspection(warm)));
             }
         }
     }
@@ -454,6 +471,16 @@ pub(crate) async fn start(
     store: &Arc<Mutex<NativeStore>>,
     key: NativeKey,
     capability: Capability,
+) -> Result<serde_json::Value, McpError> {
+    start_for_mode(broker, store, key, capability, warm_selected()).await
+}
+
+async fn start_for_mode(
+    broker: &ProjectBroker,
+    store: &Arc<Mutex<NativeStore>>,
+    key: NativeKey,
+    capability: Capability,
+    warm: bool,
 ) -> Result<serde_json::Value, McpError> {
     if capability.0 == [0; 32] {
         return Err(McpError::invalid_params("capability_denied", None));
@@ -487,6 +514,9 @@ pub(crate) async fn start(
     }
     let intent: Intent = serde_json::from_slice(&snapshot.intent)
         .map_err(|_| McpError::invalid_params("invalid_inspection_intent", None))?;
+    if !inspection_allowed(intent.operation.as_deref(), warm) {
+        return Err(McpError::invalid_params("operation_disabled", None));
+    }
     let request = intent
         .request()
         .ok_or_else(|| McpError::invalid_params("invalid_inspection_intent", None))?;
@@ -763,6 +793,84 @@ mod tests {
     use crate::{broker::BrokerConfig, project::ProjectRuntimeConfig};
     use lean_toolchain::native_guardian::NativeProcessIdentity;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[tokio::test]
+    async fn inspection_discovery_and_create_select_only_the_configured_mode() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let runtime = ProjectRuntimeConfig::default()
+            .with_operator_primary(Some(&root))
+            .unwrap()
+            .with_prepared_generation(Some(serde_json::json!({"plan":{"project":root}}).to_string()))
+            .unwrap();
+        let broker = ProjectBroker::new_with_runtime_config(
+            BrokerConfig {
+                env_default: Some(root.clone()),
+                config_default: None,
+                cwd: root.clone(),
+                max_projects: std::num::NonZeroUsize::MIN,
+                max_workers_per_project: std::num::NonZeroUsize::MIN,
+                idle_timeout: Duration::ZERO,
+            },
+            runtime,
+        );
+        let store = Arc::new(Mutex::new(
+            NativeStore::create_new(&root.join("stages.sqlite3")).unwrap(),
+        ));
+        for (index, warm) in [false, true].into_iter().enumerate() {
+            let discovery = advertise_for_mode(serde_json::json!({"acceptance_epoch":1}), &broker, warm);
+            let allowed = selected_inspection(warm);
+            let refused = selected_inspection(!warm);
+            let operations = discovery["operations"].as_array().unwrap();
+            assert!(operations.iter().any(|operation| operation == allowed));
+            assert!(operations.iter().all(|operation| operation != refused));
+            let key = NativeKey {
+                store: store.lock().identity(),
+                epoch: 1,
+                nonce: [u8::try_from(index).unwrap(); 16],
+                stage: 1,
+            };
+            let make = |operation| {
+                let intent = serde_json::to_vec(&serde_json::json!({
+                    "operation":operation, "project":root, "job":[1],"revision":1,"prepared_sha256":vec![0;32],
+                    "imports":["Init"],"inspection":LeanWorkerDeclarationInspectionRequest::new("Nat.add_zero"),
+                }))
+                .unwrap();
+                serde_json::to_vec(&serde_json::json!({"version":1,"command":{
+                    "op":"create","key":key,"capability":vec![1;32],"intent":intent
+                }}))
+                .unwrap()
+            };
+            let validate = |bytes: &[u8]| validate_create_for_mode(bytes, warm);
+            assert_eq!(
+                store
+                    .lock()
+                    .admission_with_validation(&make(refused), Some(Duration::from_secs(15)), validate),
+                Err("operation_disabled")
+            );
+            assert!(store.lock().get(key).unwrap().is_none());
+            assert_eq!(
+                store
+                    .lock()
+                    .admission_with_validation(&make(allowed), Some(Duration::from_secs(15)), validate)
+                    .unwrap()["execution"],
+                "admitted"
+            );
+            assert_eq!(
+                start_for_mode(&broker, &store, key, Capability([1; 32]), !warm)
+                    .await
+                    .unwrap_err()
+                    .message,
+                "operation_disabled",
+            );
+            let pending = store.lock().get(key).unwrap().unwrap();
+            assert_eq!(pending.gate, Gate::Pending);
+            assert!(pending.scope.is_none());
+            assert_eq!(broker.runtime_control(&Default::default()).pool.occupied_slots, 0);
+        }
+        assert!(!inspection_allowed(None, true));
+        assert!(inspection_allowed(None, false));
+    }
 
     #[tokio::test]
     async fn original_admission_deadline_survives_retry_restart_and_binding_contention() {

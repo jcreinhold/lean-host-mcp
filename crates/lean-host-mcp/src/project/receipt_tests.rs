@@ -264,6 +264,8 @@ fn fixture_config(
 ) -> ActorConfig {
     let defaults = ProjectRuntimeConfig::default();
     ActorConfig {
+        #[cfg(lean_host_mcp_development_warm)]
+        managed_warm_idle_seconds: None,
         maintenance: crate::broker::MaintenanceAccess::default(),
         lake_root: root.to_path_buf(),
         manifest_hash: "fixture".into(),
@@ -306,6 +308,8 @@ fn ordinary_state(root: &Path, tracker: &LeanWorkerProcessTracker) -> (Arc<LeanP
     let config = fixture_config(root, fake_worker(root, false), &project, tracker);
     let (handle, _) = open_worker(&config).expect("ordinary worker bootstrap");
     let state = ProjectActorState {
+        #[cfg(lean_host_mcp_development_warm)]
+        warm_inspection: None,
         runtime: Arc::clone(&config.runtime),
         config,
         handle,

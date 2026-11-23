@@ -65,6 +65,11 @@ def run_check(args):
                 LEAN_HOST_MCP_DEVELOPMENT_WARM="1",
                 LEAN_HOST_MCP_IDLE_TIMEOUT_SECS="30",
             )
+            if args.warm_expiry:
+                child_env.update(
+                    LEAN_HOST_MCP_IDLE_TIMEOUT_SECS="8" if args.warm_expiry == "idle" else "30",
+                    LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS="12000",
+                )
         if args.deadline_while_sql_locked:
             child_env["LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS"] = "5000"
         if args.abrupt and entry_trace:
@@ -824,6 +829,9 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
                    resume_guardian, assert_artifact_locks_held):
     release = entry_trace.with_name("release-inspection")
     saved_copy = root / "warm-caller-result"
+    late_write = entry_trace.with_name("inspection-writes")
+    if args.warm_expiry:
+        assert not late_write.exists()
     imports = [module for module, _ in plan["modules"]]
     if "Init" not in imports:
         imports.insert(0, "Init")
@@ -845,12 +853,18 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             assert expected.startswith(trace) and time.monotonic() < end, (expected, trace)
             time.sleep(0.01)
 
-    with server() as (managed, result, tool, _):
+    with server() as (managed, result, tool, proc):
         discovery = result(managed("discover"))
         assert args.warm_reuse in discovery["operations"], "candidate does not advertise matched warm inspection"
 
         def pool():
             return result(tool("lean_runtime", {"action": "status"}))["pool"]
+
+        def capacity_returned():
+            end = time.monotonic() + 10
+            while pool()["occupied_slots"] != 0:
+                assert time.monotonic() < end, "exact expiry closure did not return host capacity"
+                time.sleep(0.04)
 
         def admit():
             origin = dict(
@@ -905,6 +919,9 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             wait_entries(entry)
             assert_artifact_locks_held(record)
             assert pool()["occupied_slots"] == 1
+            if args.warm_expiry:
+                assert late_write.read_text() == entry, "rebuild the private probe with --late-write"
+                late_write.unlink()
 
             # Save the exact existing receipt before ACK and before B can start.
             with saved_copy.open("xb") as stream:
@@ -941,11 +958,36 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             assert_artifact_locks_held(record)
             assert pool()["occupied_slots"] == 1
 
+            if args.warm_expiry == "active":
+                observe_frozen_warm_expiry(proc, record, identity, owned, release, late_write, "",
+                                           wait_stopped, resume_guardian)
+                assert "rpc_error" in result(active, allow_error=True)
+                expired = result(managed("get", **second))
+                assert expired["custody"] == "closed" and expired["result"]["state"] == "pending", expired
+                assert result(managed("get", **second)) == expired
+                capacity_returned()
+                assert not late_write.exists()
+                wait_entries(entry * 2)
+                print("Active expiry closed exact custody while the broker stayed frozen; no late Lean write")
+                return
+
             release.touch()
             result(active)
             completed(second, 2)
             assert bound(second) == (identity, 2, 1)
             assert pool()["occupied_slots"] == 1
+            if args.warm_expiry == "idle":
+                assert late_write.read_text() == entry
+                observe_frozen_warm_expiry(proc, record, identity, owned, release, late_write, entry,
+                                           wait_stopped, resume_guardian)
+                settled = result(managed("get", **second))
+                assert settled["custody"] == "closed" and settled["result"]["state"] == "retained", settled
+                assert result(managed("get", **second)) == settled
+                capacity_returned()
+                assert late_write.read_text() == entry
+                wait_entries(entry * 2)
+                print("Idle expiry closed exact custody while the broker stayed frozen; original result retained")
+                return
             # Make confirmed physical retirement independently observable.
             os.kill(guardian, signal.SIGSTOP)
             try:
@@ -985,6 +1027,49 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             saved_copy.unlink(missing_ok=True)
 
 
+def observe_frozen_warm_expiry(proc, record, identity, owned, release, marker, baseline,
+                               wait_stopped, resume_guardian):
+    def stat(pid):
+        return subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                              capture_output=True, text=True, check=False).stdout.strip()
+
+    def exact_closure():
+        guardian_state = stat(identity["guardian"]["pid"])
+        if guardian_state and not guardian_state.startswith("Z"):
+            return False
+        try:
+            current = json.loads(record.read_bytes())
+        except FileNotFoundError:
+            # Absence of the record alone never certifies closure.
+            try:
+                os.killpg(identity["worker"]["process_group"], 0)
+            except ProcessLookupError:
+                return not stat(identity["worker"]["pid"])
+            return False
+        assert current["process"] == identity["worker"] and current["guardian"] == identity["guardian"]
+        return current.get("guardian_zombie_closure") is True and stat(identity["worker"]["pid"]).startswith("Z")
+
+    os.kill(proc.pid, signal.SIGSTOP)
+    try:
+        wait_stopped(proc.pid, time.monotonic() + 2)
+        end = time.monotonic() + 17
+        while not exact_closure():
+            assert time.monotonic() < end, "guardian did not confirm exact expiry closure with broker frozen"
+            time.sleep(0.04)
+        assert stat(proc.pid).startswith("T")
+        with ExitStack() as writer:
+            for domain in owned["protected_domains"]:
+                handle = writer.enter_context(open(domain["lock_path"], "rb"))
+                physical = os.fstat(handle.fileno())
+                assert (physical.st_dev, physical.st_ino) == (domain["device"], domain["inode"])
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release.touch()
+            assert (marker.read_text() if marker.exists() else "") == baseline
+    finally:
+        resume_guardian(proc.pid)
+    assert (marker.read_text() if marker.exists() else "") == baseline
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("parent", "scratch", "project", "workers", "writer"):
@@ -1005,7 +1090,10 @@ if __name__ == "__main__":
     mode.add_argument("--root-architecture", choices=("pass", "fail"))
     parser.add_argument("--expected-finding")
     parser.add_argument("--entry-scratch", type=Path)
+    parser.add_argument("--warm-expiry", choices=("active", "idle"), help="freeze the real broker; requires a --late-write probe")
     args = parser.parse_args()
+    if args.warm_expiry and (not args.warm_reuse or sys.platform != "darwin"):
+        parser.error("--warm-expiry requires --warm-reuse on macOS")
     if args.root_architecture is not None:
         if not args.expected_finding or args.prepared or args.declaration:
             parser.error("root architecture requires --expected-finding and no prepared inspection input")
