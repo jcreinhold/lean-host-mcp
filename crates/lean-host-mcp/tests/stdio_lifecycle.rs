@@ -1466,11 +1466,11 @@ unsafe def main (args : List String) : IO UInt32 := do
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                     ).and_then(|observer| {
                         observer.busy_timeout(Duration::ZERO)?;
-                        let nonce: Vec<u8> = serde_json::from_value(original["nonce"].clone()).expect("original nonce");
+                        let nonce: Vec<u8> = serde_json::from_value(original.get("nonce").expect("original nonce").clone()).expect("nonce bytes");
                         observer.query_row(
                             "SELECT gate, spawn, resource_report, result_kind FROM stages
                              WHERE epoch=?1 AND nonce=?2 AND stage=1",
-                            rusqlite::params![original["epoch"].as_i64().expect("original epoch"), nonce],
+                            rusqlite::params![original.get("epoch").and_then(Value::as_i64).expect("original epoch"), nonce],
                             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
                         )
                     });
