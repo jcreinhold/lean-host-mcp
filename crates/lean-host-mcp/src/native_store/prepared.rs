@@ -31,18 +31,6 @@ pub(crate) const WARM_INSPECTION: &str = "lean_declaration_inspection_warm_v1";
 const WARM_WRITER_INSPECTION: &str = "lean_declaration_inspection_warm_from_writer_v1";
 const WARM_REUSE_INSPECTION: &str = "lean_declaration_inspection_warm_reuse_v1";
 
-#[cfg(lean_host_mcp_development_warm)]
-pub(crate) fn warm_development_enabled() -> bool {
-    std::env::var_os("LEAN_HOST_MCP_DEVELOPMENT_WARM").is_some_and(|value| value == "1")
-}
-
-fn warm_selected() -> bool {
-    #[cfg(lean_host_mcp_development_warm)]
-    return warm_development_enabled();
-    #[cfg(not(lean_host_mcp_development_warm))]
-    false
-}
-
 fn is_warm(operation: Option<&str>) -> bool {
     matches!(
         operation,
@@ -199,7 +187,7 @@ pub(crate) fn validate_writer_handoff(writer: &crate::native_store::store::Snaps
     })
 }
 
-pub(crate) fn validate_create_at_boundary(bytes: &[u8], after_writer: bool) -> Result<(), Reject> {
+pub(crate) fn validate_create_at_boundary(bytes: &[u8], after_writer: bool, warm: bool) -> Result<(), Reject> {
     let operation = serde_json::from_slice::<serde_json::Value>(bytes).ok();
     let operation = operation
         .as_ref()
@@ -208,7 +196,7 @@ pub(crate) fn validate_create_at_boundary(bytes: &[u8], after_writer: bool) -> R
     if !after_writer && matches!(operation, Some(WRITER_INSPECTION | WARM_WRITER_INSPECTION)) {
         return Err(Reject::InvalidReadinessIntent);
     }
-    validate_create(bytes)
+    validate_create_for_mode(bytes, warm)
 }
 
 #[cfg(lean_host_mcp_development_warm)]
@@ -229,16 +217,13 @@ pub(crate) fn validate_warm_reuse_create(
     if store.client_get(key, capability).is_ok() {
         return Ok(());
     }
-    validate_create(bytes).map_err(|_| McpError::invalid_params("operation_disabled", None))?;
+    validate_create_for_mode(bytes, broker.managed_warm())
+        .map_err(|_| McpError::invalid_params("operation_disabled", None))?;
     warm_inspection::previous_finished(store, key, capability, &intent)?;
     broker
         .existing_managed_actor_for_digest(&intent.prepared_sha256)
         .map_err(|_| McpError::invalid_params("warm_predecessor_unavailable", None))?;
     Ok(())
-}
-
-pub(crate) fn validate_create(bytes: &[u8]) -> Result<(), Reject> {
-    validate_create_for_mode(bytes, warm_selected())
 }
 
 fn validate_create_for_mode(bytes: &[u8], warm: bool) -> Result<(), Reject> {
@@ -280,7 +265,7 @@ pub(crate) async fn named_lookup(
     let original = get()?;
     let intent: Intent = serde_json::from_slice(&original.intent).map_err(internal)?;
     if !is_named(intent.operation.as_deref())
-        || !inspection_allowed(intent.operation.as_deref(), warm_selected())
+        || !inspection_allowed(intent.operation.as_deref(), broker.managed_warm())
         || intent.project.as_deref() != Some(root)
         || intent.imports != imports
         || intent.request().as_ref() != Some(request)
@@ -503,7 +488,7 @@ fn public_error(error: &Problem) -> McpError {
 }
 
 pub(crate) fn advertise(reply: serde_json::Value, broker: &ProjectBroker) -> serde_json::Value {
-    advertise_for_mode(reply, broker, warm_selected())
+    advertise_for_mode(reply, broker, broker.managed_warm())
 }
 
 fn advertise_for_mode(mut reply: serde_json::Value, broker: &ProjectBroker, warm: bool) -> serde_json::Value {
@@ -583,7 +568,7 @@ pub(crate) async fn start(
     key: NativeKey,
     capability: Capability,
 ) -> Result<serde_json::Value, McpError> {
-    start_for_mode(broker, store, key, capability, warm_selected()).await
+    start_for_mode(broker, store, key, capability, broker.managed_warm()).await
 }
 
 async fn start_for_mode(

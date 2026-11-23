@@ -866,6 +866,14 @@ impl ProjectBroker {
 
     pub(crate) fn prepared_generation(&self) -> Option<&str> {
         self.runtime_config.prepared_generation()
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn managed_warm(&self) -> bool {
+        #[cfg(lean_host_mcp_development_warm)]
+        return self.runtime_config.managed_warm_idle_seconds.is_some();
+        #[cfg(not(lean_host_mcp_development_warm))]
+        false
+    }
+
     }
 
     /// Verify several declarations in one source snapshot through the project runtime.

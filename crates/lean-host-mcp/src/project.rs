@@ -288,7 +288,7 @@ pub struct ProjectRuntimeConfig {
     pub(crate) managed_semantic_companion: bool,
     pub(crate) managed_only: bool,
     #[cfg(lean_host_mcp_development_warm)]
-    managed_warm_idle_seconds: Option<u64>,
+    pub(crate) managed_warm_idle_seconds: Option<u64>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -414,12 +414,10 @@ impl ProjectRuntimeConfig {
     }
 
     #[cfg(lean_host_mcp_development_warm)]
-    /// Carry the resolved broker idle limit into a selected warm development generation.
+    /// Carry the resolved broker idle limit into a selected warm managed generation.
     #[must_use]
-    pub fn with_managed_warm_idle(mut self, seconds: u64) -> Self {
-        if self.managed_only && crate::managed_prepared::warm_development_enabled() {
-            self.managed_warm_idle_seconds = Some(seconds);
-        }
+    pub fn with_managed_warm_idle(mut self, enabled: bool, seconds: u64) -> Self {
+        self.managed_warm_idle_seconds = (enabled && self.managed_only).then_some(seconds);
         self
     }
 

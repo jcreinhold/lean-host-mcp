@@ -55,6 +55,7 @@ def run_check(args):
         *([] if prepared is None else ["--prepared-generation", prepared]),
         "--managed-native-store", db,
         *(["--managed-only"] if args.proof_position or args.proof_step or args.proof_search or args.warm_reuse else []),
+        *(["--managed-warm-inspections"] if args.warm_reuse else []),
     ]
 
     @contextmanager
@@ -62,7 +63,6 @@ def run_check(args):
         child_env = dict(env)
         if args.warm_reuse:
             child_env.update(
-                LEAN_HOST_MCP_DEVELOPMENT_WARM="1",
                 LEAN_HOST_MCP_IDLE_TIMEOUT_SECS="30",
             )
             if args.warm_expiry:

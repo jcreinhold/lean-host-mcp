@@ -164,6 +164,11 @@ struct ServeArgs {
     #[arg(long, requires = "managed_native_store", conflicts_with = "module_setup_writer")]
     managed_only: bool,
 
+    /// Explicitly retain a matched managed named-inspection generation between lookups.
+    #[cfg(lean_host_mcp_development_warm)]
+    #[arg(long, requires = "managed_only")]
+    managed_warm_inspections: bool,
+
     /// Loopback address for Streamable HTTP, e.g. 127.0.0.1:8765.
     /// If omitted, the server uses stdio.
     #[arg(long, env = "LEAN_HOST_MCP_BIND")]
@@ -517,6 +522,14 @@ fn logging_filter(directives: Option<&str>) -> EnvFilter {
 
 #[allow(clippy::significant_drop_tightening)]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    #[cfg(lean_host_mcp_development_warm)]
+    let warm = args.managed_warm_inspections;
+    #[cfg(all(
+        feature = "managed-native-store",
+        any(target_os = "macos", target_os = "linux"),
+        not(lean_host_mcp_development_warm)
+    ))]
+    let warm = false;
     let cwd = std::env::current_dir()?;
     // Merged config file (project-local `lean-host-mcp.toml` over the home
     // file). It is the layer beneath env/CLI: each knob is CLI > env > file >
@@ -535,6 +548,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 mode,
                 args.launcher_generation.context("launcher generation required")?,
                 args.managed_native_store.as_deref(),
+                warm,
             )?;
             Some((root.to_owned(), guard, (mode == LauncherMode::Managed).then_some(store)))
         } else {
@@ -588,7 +602,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         runtime_config
     };
     #[cfg(lean_host_mcp_development_warm)]
-    let runtime_config = runtime_config.with_managed_warm_idle(idle_timeout.as_secs());
+    let runtime_config = runtime_config.with_managed_warm_idle(warm, idle_timeout.as_secs());
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -938,6 +952,24 @@ mod tests {
         ]);
         assert_eq!(selected.serve.module_setup_writer, Some(PathBuf::from("/writer")));
         assert_eq!(selected.serve.module_setup_storage_request.as_deref(), Some("{}"));
+    }
+
+    #[cfg(lean_host_mcp_development_warm)]
+    #[test]
+    fn managed_warm_requires_explicit_managed_only_selection() {
+        assert!(!Cli::parse_from(["lean-host-mcp"]).serve.managed_warm_inspections);
+        assert!(Cli::try_parse_from(["lean-host-mcp", "--managed-warm-inspections"]).is_err());
+        assert!(
+            Cli::parse_from([
+                "lean-host-mcp",
+                "--managed-native-store",
+                "store.sqlite3",
+                "--managed-only",
+                "--managed-warm-inspections",
+            ])
+            .serve
+            .managed_warm_inspections
+        );
     }
 
     #[cfg(all(unix, feature = "managed-native-store"))]

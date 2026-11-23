@@ -27,11 +27,11 @@ fn watch(path: &Path) {
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(lean_host_mcp_development_warm)");
-    const WARM: &str = "LEAN_HOST_MCP_COMPILE_DEVELOPMENT_WARM";
-    println!("cargo:rerun-if-env-changed={WARM}");
-    if std::env::var_os("CARGO_FEATURE_MANAGED_NATIVE_STORE").is_some()
+    // Declare the Cargo feature alongside the exact registry SDK pin.
+    // Only the matched optional build may compile the warm SDK calls.
+    if std::env::var_os("CARGO_FEATURE_MANAGED_WARM_INSPECTIONS").is_some()
+        && std::env::var_os("CARGO_FEATURE_MANAGED_NATIVE_STORE").is_some()
         && matches!(std::env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("macos" | "linux"))
-        && std::env::var(WARM).as_deref() == Ok("71c996c91ace9a062f69507faf023da7bb710030")
     {
         println!("cargo:rustc-cfg=lean_host_mcp_development_warm");
     }

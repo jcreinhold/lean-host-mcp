@@ -198,7 +198,7 @@ impl LeanHostService {
         #[cfg(lean_host_mcp_development_warm)]
         let store = {
             let mut store = store;
-            let selected = crate::managed_prepared::warm_development_enabled();
+            let selected = self.ctx.broker.managed_warm();
             if selected {
                 if !self.ctx.broker.managed_only()
                     || (self.ctx.broker.prepared_generation().is_none()
@@ -209,7 +209,7 @@ impl LeanHostService {
                             .is_ok_and(|root| crate::writer_preparation::closure_preparation_configured(&root))))
                 {
                     return Err(std::io::Error::other(
-                        "warm development requires a managed-only service with prepared input",
+                        "warm inspection requires a managed-only service with prepared input",
                     ));
                 }
                 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary, WorkerSidecar};
@@ -229,9 +229,7 @@ impl LeanHostService {
                     .promote_warm_contract(expected.is_some())
                     .map_err(std::io::Error::other)?;
             } else if store.warm_development_store().map_err(std::io::Error::other)? {
-                return Err(std::io::Error::other(
-                    "warm development store requires explicit selection",
-                ));
+                return Err(std::io::Error::other("warm store requires --managed-warm-inspections"));
             }
             store
         };
@@ -319,7 +317,9 @@ impl LeanHostService {
         let budget = cfg!(any(target_os = "macos", target_os = "linux"))
             .then(|| Duration::from_millis(self.ctx.broker.request_timeout_millis()));
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let validate = crate::managed_prepared::validate_create_at_boundary;
+        let validate = |bytes: &[u8], after_writer| {
+            crate::managed_prepared::validate_create_at_boundary(bytes, after_writer, self.ctx.broker.managed_warm())
+        };
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let validate = |_: &[u8], _| Ok(());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
