@@ -221,7 +221,9 @@ mod bounds {
         };
         let allowed = walk(4_653, true)?;
         assert_eq!(allowed.len(), 4_653);
-        let refused = walk(MAX_PROJECT_MODULES + 1, false).unwrap_err();
+        let refused = walk(MAX_PROJECT_MODULES + 1, false)
+            .err()
+            .ok_or_else(|| io::Error::other("accepted a closure over the module limit"))?;
         assert_eq!(
             refused.to_string(),
             format!("prepared import closure exceeds {MAX_PROJECT_MODULES} modules")

@@ -77,6 +77,10 @@ impl PreparedProject {
         })
     }
     /// Revalidate the held roots and their observed import order.
+    ///
+    /// # Errors
+    /// Returns an error if the guards or roots cannot be checked, or if the
+    /// observed order or directory identities differ from the held roots.
     pub fn check_observed(&self, observed: Option<&[String]>) -> io::Result<()> {
         let roots = observed.ok_or_else(invalid)?;
         self.guards.validate()?;
@@ -598,7 +602,7 @@ impl ImportPlan {
         }
         let mut dependencies = self.clone();
         dependencies.modules.retain(|(_, domain)| domain != &self.project);
-        if dependencies.modules.is_empty() || dependencies.modules.len() + 1 != self.modules.len() {
+        if dependencies.modules.is_empty() || self.modules.len().checked_sub(1) != Some(dependencies.modules.len()) {
             return Err(invalid());
         }
         let sysroot = self.release.parent().and_then(Path::parent).ok_or_else(invalid)?;

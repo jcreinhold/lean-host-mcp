@@ -561,7 +561,13 @@ impl NativeStore {
             .ok_or(Problem::Rejected(Reject::WrongStore))?;
         Self::read_scope(Path::new(path), saved, None, None, true)
     }
+}
 
+#[cfg(any(
+    test,
+    all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))
+))]
+impl NativeStore {
     /// Record trusted SDK closure without granting launch or inventing a result.
     pub(crate) fn reconcile_closed_scope(&mut self, binding: Binding, identity: &RegistryIdentity) -> Answer<()> {
         self.checked_key(binding.key)?;

@@ -897,7 +897,7 @@ enum ProjectMessage {
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     ManagedInspection {
         meta: JobMeta,
-        job: crate::managed_prepared::Job,
+        job: Box<crate::managed_prepared::Job>,
         reply: oneshot::Sender<Result<ProjectCall<()>>>,
     },
 
@@ -1505,7 +1505,7 @@ impl LeanProject {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ManagedInspection {
             meta: self.job_meta(job.imports().to_vec(), RetryPolicy::Never, deadline),
-            job,
+            job: Box::new(job),
             reply,
         };
         self.enqueue(message, rx).await.map(|_| ())

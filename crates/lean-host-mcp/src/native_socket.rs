@@ -62,15 +62,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_socket_path_accepts_maximum_and_refuses_one_byte_more() {
+    fn worker_socket_path_accepts_maximum_and_refuses_one_byte_more() -> io::Result<()> {
         let max_path = if cfg!(target_os = "macos") { 103 } else { 107 };
         let root = |length: usize| PathBuf::from(format!("/{}", "a".repeat(length - PARENT_SOCKET.len() - 2)));
-        validate_length(&root(max_path)).unwrap();
-        let too_long = validate_length(&root(max_path + 1)).unwrap_err();
+        validate_length(&root(max_path))?;
+        let too_long = validate_length(&root(max_path + 1))
+            .err()
+            .ok_or_else(|| io::Error::other("accepted a socket path over the length limit"))?;
         assert!(
             too_long
                 .to_string()
                 .contains("set LEAN_HOST_MCP_SOCKET_DIR to a shorter")
         );
+        Ok(())
     }
 }

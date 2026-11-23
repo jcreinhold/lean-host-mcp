@@ -155,7 +155,11 @@ impl Intent {
     }
 }
 
-fn selected_writer_record(writer: &crate::native_store::store::Snapshot, intent: &Intent) -> Option<Option<String>> {
+fn selected_writer_record(
+    writer: &crate::native_store::store::Snapshot,
+    intent: &Intent,
+) -> Option<readiness_writer::InspectionReadiness> {
+    use readiness_writer::InspectionReadiness;
     let project = intent.project.as_deref()?;
     if !matches!(
         intent.operation.as_deref(),
@@ -167,11 +171,11 @@ fn selected_writer_record(writer: &crate::native_store::store::Snapshot, intent:
     let record =
         readiness_writer::prepared_inspection_receipt(writer, project, &intent.imports, &intent.job, intent.revision)?;
     match (intent.operation.as_deref(), record) {
-        (Some(NAMED_INSPECTION), None) => Some(None),
-        (Some(WRITER_INSPECTION | WARM_WRITER_INSPECTION), Some(record))
+        (Some(NAMED_INSPECTION), InspectionReadiness::Ready) => Some(InspectionReadiness::Ready),
+        (Some(WRITER_INSPECTION | WARM_WRITER_INSPECTION), InspectionReadiness::Prepared(record))
             if Sha256::digest(record.as_bytes()).as_slice() == intent.prepared_sha256 =>
         {
-            Some(Some(record))
+            Some(InspectionReadiness::Prepared(record))
         }
         _ => None,
     }
@@ -664,9 +668,12 @@ async fn start_for_mode(
         {
             return Err(refusal());
         }
-        selected_writer_record(&predecessor, &intent)
-            .flatten()
-            .ok_or_else(refusal)?
+        let Some(readiness_writer::InspectionReadiness::Prepared(record)) =
+            selected_writer_record(&predecessor, &intent)
+        else {
+            return Err(refusal());
+        };
+        record
     } else if reuse_requested {
         #[cfg(lean_host_mcp_development_warm)]
         {

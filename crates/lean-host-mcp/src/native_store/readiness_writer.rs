@@ -204,13 +204,18 @@ pub(crate) struct PreparedReadiness {
     pub(crate) prepared_generation: String,
 }
 
+pub(super) enum InspectionReadiness {
+    Ready,
+    Prepared(String),
+}
+
 pub(super) fn prepared_inspection_receipt(
     snapshot: &Snapshot,
     project: &Path,
     imports: &[String],
     job: &[u8],
     revision: u64,
-) -> Option<Option<String>> {
+) -> Option<InspectionReadiness> {
     use crate::native_store::store::ResultKnowledge;
 
     let original = serde_json::from_slice::<Intent>(&snapshot.intent).ok()?;
@@ -233,9 +238,14 @@ pub(super) fn prepared_inspection_receipt(
     };
     if let Ok(bound) = serde_json::from_slice::<PreparedReadiness>(body) {
         let receipt = Receipt::parse(&serde_json::to_vec(&bound.readiness).ok()?, &target).ok()?;
-        return receipt.target_ready().then_some(Some(bound.prepared_generation));
+        return receipt
+            .target_ready()
+            .then_some(InspectionReadiness::Prepared(bound.prepared_generation));
     }
-    Receipt::parse(body, &target).ok()?.target_ready().then_some(None)
+    Receipt::parse(body, &target)
+        .ok()?
+        .target_ready()
+        .then_some(InspectionReadiness::Ready)
 }
 
 // Opt-in, operator-owned output of the existing guarded generation producer.

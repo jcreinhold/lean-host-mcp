@@ -159,7 +159,7 @@ pub(super) fn run(
     let lake_plan = ImportPlan::new(
         root.to_owned(),
         lake_roots,
-        release.clone(),
+        release,
         vec![(seed.to_owned(), root.to_owned())],
     );
     if lake_plan.derive(&domains, read_headers)? != closure {
