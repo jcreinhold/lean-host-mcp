@@ -25,7 +25,7 @@ pub(crate) struct Receipt {
     module_count: usize,
     completed_modules: usize,
     completed_batches: usize,
-    first_failure: Option<Failure>,
+    pub(super) first_failure: Option<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blueprint: Option<blueprint_declarations::Receipt>,
 }
@@ -38,7 +38,7 @@ enum Stage {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Phase {
+pub(super) enum Phase {
     Configuration,
     BlueprintInputs,
     Inventory,
@@ -51,9 +51,9 @@ enum Phase {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Failure {
-    phase: Phase,
-    exit_code: Option<i32>,
+pub(super) struct Failure {
+    pub(super) phase: Phase,
+    pub(super) exit_code: Option<i32>,
 }
 
 impl Receipt {
@@ -136,6 +136,7 @@ pub(super) fn run(
     command: impl Fn() -> Command,
     authorize: &impl Fn() -> io::Result<Duration>,
     after_deps: &impl Fn() -> io::Result<()>,
+    mut inspect_inventory: impl FnMut(&[String]) -> io::Result<()>,
 ) -> io::Result<Receipt> {
     let Target::RootLibrary {
         name,
@@ -214,7 +215,7 @@ pub(super) fn run(
         digest.update([0]);
     }
     let actual_sha256: [u8; 32] = digest.finalize().into();
-    if names.len() != *module_count || &actual_sha256 != module_names_sha256 {
+    if names.len() != *module_count || &actual_sha256 != module_names_sha256 || inspect_inventory(&names).is_err() {
         receipt.first_failure = Some(Failure {
             phase: Phase::InventoryMismatch,
             exit_code: None,

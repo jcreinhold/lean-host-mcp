@@ -129,11 +129,14 @@ pub(super) fn capture(mut command: Command, name: &str) -> io::Result<Check> {
     })
 }
 
-pub(super) fn lean_path(mut command: Command) -> io::Result<Result<std::ffi::OsString, Check>> {
+pub(super) fn lean_path(mut command: Command, reconfigure: bool) -> io::Result<Result<std::ffi::OsString, Check>> {
     use std::os::unix::ffi::OsStringExt as _;
 
+    if reconfigure {
+        command.arg("--reconfigure");
+    }
     let mut child = command
-        .args(["--reconfigure", "--no-build", "env", "/usr/bin/printenv", "LEAN_PATH"])
+        .args(["--no-build", "env", "/usr/bin/printenv", "LEAN_PATH"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -203,7 +206,7 @@ pub(super) fn run(
         preparation_failure: None,
     };
     authorize()?;
-    let paths = match lean_path(lake_command(root))? {
+    let paths = match lean_path(lake_command(root), true)? {
         Ok(paths) => paths,
         Err(failure) => {
             receipt.preparation_failure = Some(failure);

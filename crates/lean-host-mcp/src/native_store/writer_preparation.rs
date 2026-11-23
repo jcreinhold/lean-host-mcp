@@ -396,11 +396,11 @@ pub fn run(encoded: &str) -> io::Result<()> {
 
     let after_deps = || test_cut_after_dependencies(&authorize);
     if let Target::RootLibrary { .. } = &plan.target {
-        let receipt = root_library::run(&plan, &lake, command, &authorize, &after_deps)?;
+        let receipt = root_library::run(&plan, &lake, command, &authorize, &after_deps, |_| Ok(()))?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     if let Target::Regroup(request) = &plan.target {
-        let receipt = request.run(&plan.root, &lake, command, &watched, &authorize, &after_deps)?;
+        let receipt = request.run(&plan, &lake, command, &watched, &authorize, &after_deps)?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     let receipt = match plan.target {
