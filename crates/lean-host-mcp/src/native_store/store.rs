@@ -348,12 +348,17 @@ pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 pub(crate) fn native_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
-    if !has_role(db, NATIVE_ROLE, 5)? {
+    // Until the guardian ACK and attempt-scoped recovery contracts ship
+    // together, the service must refuse even an explicitly promoted store.
+    if !has_role(db, NATIVE_ROLE, 5)? && !(cfg!(test) && has_role(db, NATIVE_ROLE, recovery::WARM_SCHEMA_VERSION)?) {
         return Ok(false);
     }
     drop(db.prepare("SELECT epoch,nonce,stage,intent,cap_hash,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,result_id,result_hash,result_body FROM stages LIMIT 0")?);
     drop(db.prepare("SELECT scope,generation,owner FROM scope_heads LIMIT 0")?);
     drop(db.prepare("SELECT epoch,nonce,stage,job,caller_stage,revision,registry_generation,identity,expires_ns FROM recovery_bindings LIMIT 0")?);
+    if recovery::warm_schema(db)? {
+        drop(db.prepare("SELECT ordinal,ended FROM recovery_bindings LIMIT 0")?);
+    }
     let meta: Option<(Id, i64)> = db
         .query_row("SELECT store,epoch FROM meta WHERE singleton=1", [], |r| {
             Ok((fixed(r, 0)?, r.get(1)?))
@@ -933,6 +938,9 @@ impl NativeStore {
         let old = read_stage(&tx, key)?.ok_or(Problem::Rejected(Reject::UnknownStage))?;
         if expected.is_some_and(|scope| old.scope != Some(scope)) {
             return reject(Reject::WrongScope);
+        }
+        if recovery::attempt_ended(&tx, key)? {
+            return Ok(old);
         }
         let gate = if old.gate == Gate::Pending {
             Gate::Sealed

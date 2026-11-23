@@ -1148,3 +1148,142 @@ fn recovery_binding_is_authenticated_and_readable_under_writer_lock() {
         Err(Problem::Rejected(Reject::StaleGeneration))
     ));
 }
+
+#[test]
+fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() {
+    use crate::store::recovery::{CheckedWarmFinish, RegistryIdentity};
+    use lean_toolchain::native_guardian::NativeProcessIdentity;
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt},
+    };
+
+    let fixture = Fixture::new();
+    let (mut journal, mut store) = fixture.init();
+    let first = saved(&mut journal, &store, 1);
+    let second = saved(&mut journal, &store, 2);
+    let authorization = [27; 32];
+    let claimant = [28; 32];
+    let admit = |store: &mut NativeStore, original: &SavedRequest| {
+        let request = serde_json::json!({"version":1,"command":{"op":"create","key":original.key,
+            "intent":original.intent,"capability":original.capability.0,"drain_authorization":authorization}});
+        store
+            .admission_with_budget(request.to_string().as_bytes(), Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        store.get(original.key).unwrap().unwrap().admission_deadline.unwrap()
+    };
+    let deadline_a = admit(&mut store, &first);
+    let deadline_b = admit(&mut store, &second);
+    let root = fixture.root.join("registry");
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let meta = root.metadata().unwrap();
+    let process = |pid| NativeProcessIdentity {
+        version: 1,
+        pid,
+        start: format!("birth-{pid}"),
+        session: 1,
+        process_group: 2,
+    };
+    let registry = RegistryIdentity {
+        directory: root.as_os_str().as_bytes().to_vec(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        generation: "a".repeat(48),
+        boot: deadline_a.boot,
+        parent: process(9),
+        worker: process(10),
+        guardian: process(11),
+    };
+    assert!(matches!(
+        store.bind_warm_contract(&first, scope(1), &registry, deadline_a.expires_ns, 1),
+        Err(Problem::Rejected(Reject::WrongSchema))
+    ));
+    store.promote_warm_contract().unwrap();
+    let a = store
+        .bind_warm_contract(&first, scope(1), &registry, deadline_a.expires_ns, 1)
+        .unwrap();
+    let scope_b = Scope {
+        id: [5; 16],
+        ..scope(1)
+    };
+    let mut finish = CheckedWarmFinish {
+        binding: a,
+        registry: registry.clone(),
+        ordinal: 1,
+        expires_ns: deadline_a.expires_ns,
+    };
+    store
+        .observe_resource(a, &first.capability, ResourceReport::Open)
+        .unwrap();
+    assert!(granted(store.consume_launch(a, &first.capability).unwrap()));
+    assert!(store.end_warm_contract(&finish, &first.capability).is_err());
+    store
+        .observe_result(a, &first.capability, [20; 16], b"first result")
+        .unwrap();
+    assert!(
+        store
+            .bind_warm_contract(&second, scope_b, &registry, deadline_b.expires_ns, 2)
+            .is_err()
+    );
+    finish.ordinal = 2;
+    assert!(store.end_warm_contract(&finish, &first.capability).is_err());
+    finish.ordinal = 1;
+    store.end_warm_contract(&finish, &first.capability).unwrap();
+    drop(store);
+    let mut store = NativeStore::open(&fixture.native()).unwrap();
+    assert!(
+        store
+            .bind_warm_contract(&second, scope_b, &registry, deadline_b.expires_ns, 3)
+            .is_err()
+    );
+    let b = store
+        .bind_warm_contract(&second, scope_b, &registry, deadline_b.expires_ns, 2)
+        .unwrap();
+    store
+        .observe_resource(b, &second.capability, ResourceReport::Open)
+        .unwrap();
+    assert!(granted(store.consume_launch(b, &second.capability).unwrap()));
+    assert!(NativeStore::read_recovery_scope(&fixture.native(), &first, Some(&registry.generation), None).is_err());
+    assert_eq!(
+        NativeStore::read_recovery_scope(&fixture.native(), &second, Some(&registry.generation), None)
+            .unwrap()
+            .0,
+        b
+    );
+    assert!(
+        store
+            .claim_recovery(&first, a, &registry, Some(authorization), Some(claimant))
+            .is_err()
+    );
+    assert!(store.end_warm_contract(&finish, &first.capability).is_err());
+    store.cancel(a, &first.capability).unwrap();
+    store.ack(a, &first.capability, [20; 16]).unwrap();
+    let old = store.get(first.key).unwrap().unwrap();
+    assert_eq!(old.resource_report, ResourceReport::Open);
+    assert!(!old.stop_requested);
+    let current = store.get(second.key).unwrap().unwrap();
+    assert_eq!(current.result, ResultKnowledge::Pending);
+    assert!(!current.stop_requested);
+    assert!(!granted(store.consume_launch(b, &second.capability).unwrap()));
+    assert!(
+        store
+            .claim_recovery(&second, b, &registry, Some(authorization), Some(claimant))
+            .unwrap()
+    );
+    store
+        .observe_result(b, &second.capability, [21; 16], b"second result")
+        .unwrap();
+    assert!(
+        store
+            .end_warm_contract(
+                &CheckedWarmFinish {
+                    binding: b,
+                    registry,
+                    ordinal: 2,
+                    expires_ns: deadline_b.expires_ns,
+                },
+                &second.capability
+            )
+            .is_err()
+    );
+}

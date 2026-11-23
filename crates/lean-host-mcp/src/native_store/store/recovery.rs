@@ -21,6 +21,39 @@ pub(super) const SCHEMA: &str = "
         PRIMARY KEY(epoch,nonce,stage), UNIQUE(job,caller_stage,revision),
         FOREIGN KEY(epoch,nonce,stage) REFERENCES stages(epoch,nonce,stage)
     ) STRICT;";
+// A warm store must refuse older binaries: their recovery lookup has only
+// generation identity and would let a historical attempt drain its successor.
+pub(super) const WARM_SCHEMA_VERSION: i64 = 6;
+
+pub(super) fn warm_schema(db: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map(|version| version == WARM_SCHEMA_VERSION)
+}
+
+#[cfg(test)]
+const PROMOTE_WARM: &str = "
+    ALTER TABLE recovery_bindings RENAME TO prior_recovery_bindings;
+    CREATE TABLE recovery_bindings(
+        epoch INTEGER NOT NULL, nonce BLOB NOT NULL, stage INTEGER NOT NULL,
+        job BLOB NOT NULL CHECK(length(job) BETWEEN 1 AND 65536),
+        caller_stage INTEGER NOT NULL, revision INTEGER NOT NULL,
+        registry_generation TEXT NOT NULL CHECK(
+            length(CAST(registry_generation AS BLOB))=48 AND registry_generation NOT GLOB '*[^0-9a-f]*'
+        ),
+        identity BLOB NOT NULL CHECK(length(identity) BETWEEN 1 AND 32768),
+        expires_ns INTEGER CHECK(expires_ns > 0),
+        ordinal INTEGER CHECK(ordinal > 0),
+        ended INTEGER NOT NULL DEFAULT 0 CHECK(ended IN (0,1) AND (ended=0 OR ordinal IS NOT NULL)),
+        PRIMARY KEY(epoch,nonce,stage), UNIQUE(job,caller_stage,revision),
+        UNIQUE(registry_generation,ordinal),
+        FOREIGN KEY(epoch,nonce,stage) REFERENCES stages(epoch,nonce,stage)
+    ) STRICT;
+    INSERT INTO recovery_bindings
+        SELECT epoch,nonce,stage,job,caller_stage,revision,registry_generation,identity,expires_ns,NULL,0
+        FROM prior_recovery_bindings;
+    DROP TABLE prior_recovery_bindings;
+    CREATE UNIQUE INDEX recovery_unfinished ON recovery_bindings(registry_generation) WHERE ended=0;";
+
 const IDENTITY_LIMIT: usize = 32_768;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -204,6 +237,17 @@ pub(super) fn launch_deadline(
     }))
 }
 
+pub(super) fn attempt_ended(db: &rusqlite::Connection, key: NativeKey) -> Answer<bool> {
+    if !warm_schema(db)? {
+        return Ok(false);
+    }
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_bindings WHERE epoch=?1 AND nonce=?2 AND stage=?3 AND ended=1)",
+        params![number(key.epoch)?, key.nonce, number(key.stage)?],
+        |row| row.get(0),
+    )?)
+}
+
 impl NativeStore {
     /// The trusted adapter supplies SDK observations under its publication
     /// lock. Seal the exact stage and registry reference in one transaction.
@@ -213,7 +257,7 @@ impl NativeStore {
         scope: Scope,
         identity: &RegistryIdentity,
     ) -> Answer<Binding> {
-        self.bind_exact_scope(saved, scope, identity, None)
+        self.bind_exact_scope(saved, scope, identity, None, None)
     }
 
     /// Admit an absolute nanosecond tick from the trusted guardian boot clock.
@@ -229,7 +273,7 @@ impl NativeStore {
             .ok()
             .filter(|tick| *tick > 0)
             .ok_or(Problem::Rejected(Reject::InvalidLaunchDeadline))?;
-        self.bind_exact_scope(saved, scope, identity, Some(expires_ns))
+        self.bind_exact_scope(saved, scope, identity, Some(expires_ns), None)
     }
 
     fn bind_exact_scope(
@@ -238,6 +282,7 @@ impl NativeStore {
         scope: Scope,
         identity: &RegistryIdentity,
         expires_ns: Option<i64>,
+        ordinal: Option<i64>,
     ) -> Answer<Binding> {
         self.checked_key(saved.key)?;
         bounded(&saved.caller.job)?;
@@ -266,21 +311,46 @@ impl NativeStore {
         if let Some(admitted) = old.admission_deadline {
             admitted.matches(identity, expires_ns.and_then(|ticks| u64::try_from(ticks).ok()))?;
         }
+        let warm = warm_schema(&tx)?;
+        if warm {
+            let prior = tx
+                .query_row(
+                    "SELECT ordinal,ended,identity=?2,s.resource_report FROM recovery_bindings r
+                 JOIN stages s USING(epoch,nonce,stage) WHERE registry_generation=?1 ORDER BY ordinal DESC LIMIT 1",
+                    params![identity.generation, encoded],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match (ordinal, prior) {
+                (None | Some(1), None) => {}
+                (Some(next), Some((Some(previous), true, true, 1))) if previous.checked_add(1) == Some(next) => {}
+                _ => return reject(Reject::ScopeAlreadyBound),
+            }
+        } else if ordinal.is_some() {
+            return reject(Reject::WrongSchema);
+        }
         let binding = bind_scope_transaction(&tx, key, &saved.capability, scope)?;
         tx.execute(
-            "INSERT INTO recovery_bindings VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO recovery_bindings(epoch,nonce,stage,job,caller_stage,revision,registry_generation,identity,expires_ns)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                number(key.epoch)?,
-                key.nonce,
-                number(key.stage)?,
-                saved.caller.job,
-                number(saved.caller.stage)?,
-                number(saved.caller.revision)?,
-                identity.generation,
-                encoded,
-                expires_ns
+                number(key.epoch)?, key.nonce, number(key.stage)?, saved.caller.job,
+                number(saved.caller.stage)?, number(saved.caller.revision)?, identity.generation, encoded, expires_ns
             ],
         )?;
+        if let Some(ordinal) = ordinal {
+            tx.execute(
+                "UPDATE recovery_bindings SET ordinal=?4 WHERE epoch=?1 AND nonce=?2 AND stage=?3",
+                params![number(key.epoch)?, key.nonce, number(key.stage)?, ordinal],
+            )?;
+        }
         commit(tx, "bind-recovery-scope")?;
         Ok(binding)
     }
@@ -328,6 +398,9 @@ impl NativeStore {
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = bound_stage(&tx, binding, &saved.capability)?;
+        if attempt_ended(&tx, saved.key)? {
+            return reject(Reject::WrongScope);
+        }
         if !old.matches_intent(&saved.intent) {
             return reject(Reject::IntentChanged);
         }
@@ -412,7 +485,7 @@ impl NativeStore {
             return reject(Reject::IntentChanged);
         }
         let scope = old.scope.ok_or(Problem::Rejected(Reject::WrongScope))?;
-        if old.resource_report == ResourceReport::Closed {
+        if old.resource_report == ResourceReport::Closed || attempt_ended(&tx, key)? {
             return reject(Reject::WrongScope);
         }
         let head: (i64, Id) = tx.query_row(
@@ -513,5 +586,97 @@ impl NativeStore {
         super::compact_closed_acknowledged(&tx, binding.key)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CheckedWarmFinish {
+    pub(crate) binding: Binding,
+    pub(crate) registry: RegistryIdentity,
+    pub(crate) ordinal: u64,
+    pub(crate) expires_ns: u64,
+}
+
+#[cfg(test)]
+impl NativeStore {
+    pub(crate) fn promote_warm_contract(&mut self) -> Answer<()> {
+        self.db.check_profile()?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(PROMOTE_WARM)?;
+        tx.pragma_update(None, "user_version", WARM_SCHEMA_VERSION)?;
+        commit(tx, "enable-warm-contract")
+    }
+
+    pub(crate) fn bind_warm_contract(
+        &mut self,
+        saved: &SavedRequest,
+        scope: Scope,
+        registry: &RegistryIdentity,
+        expires_ns: u64,
+        ordinal: u64,
+    ) -> Answer<Binding> {
+        if ordinal == 0 || expires_ns == 0 {
+            return reject(Reject::InvalidLaunchDeadline);
+        }
+        self.bind_exact_scope(
+            saved,
+            scope,
+            registry,
+            Some(number(expires_ns)?),
+            Some(number(ordinal)?),
+        )
+    }
+
+    // Trusted producer seam. Tests inject the acknowledgement only after
+    // constructing the exact tuple. The pending SDK verifier will own it.
+    pub(crate) fn end_warm_contract(
+        &mut self,
+        finish: &CheckedWarmFinish,
+        capability: &super::Capability,
+    ) -> Answer<()> {
+        let binding = finish.binding;
+        self.checked_key(binding.key)?;
+        self.db.check_profile()?;
+        let encoded = serde_json::to_vec(&finish.registry).map_err(|_| Problem::Rejected(Reject::WrongScope))?;
+        let tx = self
+            .db
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !warm_schema(&tx)? {
+            return reject(Reject::WrongSchema);
+        }
+        let old = bound_stage(&tx, binding, capability)?;
+        let key = binding.key;
+        if old.gate != Gate::Consumed
+            || old.resource_report != ResourceReport::Open
+            || !matches!(
+                old.result,
+                super::ResultKnowledge::Retained { .. } | super::ResultKnowledge::Acknowledged { .. }
+            )
+        {
+            return reject(Reject::WrongScope);
+        }
+        let changed = tx.execute(
+            "UPDATE recovery_bindings SET ended=1 WHERE epoch=?1 AND nonce=?2 AND stage=?3
+             AND identity=?4 AND ordinal=?5 AND expires_ns=?6 AND ended=0
+             AND EXISTS(SELECT 1 FROM stages s WHERE s.epoch=?1 AND s.nonce=?2 AND s.stage=?3
+                        AND s.recovery_claim_hash IS NULL AND s.stop_requested=0)",
+            params![
+                number(key.epoch)?,
+                key.nonce,
+                number(key.stage)?,
+                encoded,
+                number(finish.ordinal)?,
+                number(finish.expires_ns)?
+            ],
+        )?;
+        if changed != 1 {
+            return reject(Reject::WrongScope);
+        }
+        commit(tx, "end-warm-attempt")
     }
 }
