@@ -46,6 +46,10 @@ HostInit == Init /\ h = [
     evidenceUnknown |-> FALSE, permitAtPause |-> "unused", startsAtPause |-> 0],
   deadline |-> [tick |-> 0, arm |-> "idle", armedKey |-> <<>>, finishedKey |-> <<>>,
     sentAt |-> <<>>, frozen |-> FALSE, paused |-> FALSE, expired |-> FALSE],
+  reuse |-> [active |-> 0, spent |-> {}, armed |-> {}, armAcks |-> {}, fenced |-> {}, saved |-> {}, accepted |-> {},
+    acked |-> {}, ended |-> {}, aborted |-> "none", stale |-> {},
+    finishFor |-> [i \in Commands |-> <<>>], ackFor |-> [i \in Commands |-> <<>>],
+    drainKey |-> <<>>, drainFor |-> <<>>, armedAtAbort |-> {}],
   writer |-> [phase |-> "new", handoff |-> <<>>, admittedHandoff |-> <<>>, valid |-> TRUE,
     checked |-> <<>>, starts |-> 0, interrupted |-> FALSE,
     stage |-> "none", stageDigest |-> <<>>, stageAck |-> <<>>,
@@ -472,6 +476,102 @@ FrozenGuardianRetires == h.deadline.paused ~> (h.closure=Scope /\ capacityReturn
 LostAckRetires == (h.deadline.arm="lost") ~> (h.closure=Scope /\ capacityReturns=1)
 NoFrozenDrain == ~(h.deadline.frozen /\ h.deadline.expired /\ ~groupPresent)
 NoLostAckRetirement == ~(h.deadline.arm="lost" /\ h.closure=Scope /\ capacityReturns=1)
+
+\* Sequential warm attempts share a physical scope, with one immutable key
+\* and one hard deadline arm per attempt. The one-shot deadline spec above
+\* deliberately keeps its original transitions.
+WarmState == h.reuse
+WarmKeys == {CommandKey(i) : i \in Commands}
+ActiveWarmKey == IF WarmState.active \in Commands THEN CommandKey(WarmState.active) ELSE <<>>
+WarmLive == phase="running" /\ guardianPresent /\ supervisorAlive
+  /\ HostPermitHeld /\ ~h.actorSealed /\ WarmState.aborted="none"
+WarmSpend(i) == HostOnly(WarmLive /\ startupAcked /\ h.readAdmitted
+  /\ (i=1 \/ CommandKey(1) \in WarmState.ended \/ Mutation="warm-before-end")
+  /\ CommandKey(i) \notin WarmState.spent
+  /\ h'=[h EXCEPT !.reuse.spent=@ \cup {CommandKey(i)}])
+WarmArm(i) == HostOnly(WarmLive /\ startupAcked /\ h.readAdmitted
+  /\ WarmState.active=0 /\ CommandKey(i) \in (WarmState.spent \ WarmState.armed)
+  /\ (i=1 \/ CommandKey(1) \in WarmState.ended \/ Mutation="warm-before-end")
+  /\ h'=[h EXCEPT !.reuse.active=i, !.reuse.armed=@ \cup {CommandKey(i)}])
+WarmArmAck(i) == HostOnly(WarmLive /\ WarmState.active=i
+  /\ CommandKey(i) \notin WarmState.armAcks
+  /\ h'=[h EXCEPT !.reuse.armAcks=@ \cup {CommandKey(i)}])
+WarmByte(i) == WarmLive /\ WarmState.active=i /\ CommandKey(i) \in WarmState.armAcks /\ Send(i)
+WarmReceiverFence(i) == HostOnly(WarmLive /\ WarmState.active=i /\ h.cmd[i] \in {"running","valid"}
+  /\ CommandKey(i) \notin WarmState.fenced
+  /\ h'=[h EXCEPT !.reuse.fenced=@ \cup {CommandKey(i)}])
+WarmSave(i) == HostOnly(WarmLive /\ WarmState.active=i /\ h.acceptedReply[i]=CommandKey(i)
+  /\ CommandKey(i) \notin WarmState.saved
+  /\ h'=[h EXCEPT !.reuse.saved=@ \cup {CommandKey(i)}, !.warmSaved=TRUE])
+WarmAcceptFinish(key) == HostOnly(WarmLive /\ key=ActiveWarmKey
+  /\ (key \in WarmState.fenced \/ Mutation="warm-no-fence")
+  /\ key \in WarmState.saved /\ key \notin WarmState.accepted
+  /\ h'=[h EXCEPT !.reuse.accepted=@ \cup {key}, !.reuse.finishFor[WarmState.active]=key])
+WarmFinishAck(key) == HostOnly(WarmLive /\ key=ActiveWarmKey
+  /\ key \in WarmState.accepted /\ key \notin WarmState.acked
+  /\ h'=[h EXCEPT !.reuse.acked=@ \cup {key}, !.reuse.ackFor[WarmState.active]=key])
+WarmPersistEnd(key) == HostOnly(WarmLive /\ key=ActiveWarmKey /\ key \in WarmState.saved
+  /\ (key \in WarmState.acked \/ (Mutation="warm-without-ack" /\ key \in WarmState.accepted))
+  /\ h'=[h EXCEPT !.reuse.ended=@ \cup {key}, !.reuse.active=0])
+\* Expiry is represented by the deadline edge before acceptance. A lost
+\* finish ACK after acceptance still seals the host receiver.
+WarmAbort(reason) == WarmLive
+  /\ (WarmState.active \in Commands \/ reason \in {"stop","eof"})
+  /\ (CASE reason="expiry" -> ActiveWarmKey \notin WarmState.accepted
+       [] reason="lost-ack" -> ActiveWarmKey \in (WarmState.accepted \ WarmState.acked)
+       [] OTHER -> TRUE)
+  /\ RequestStop /\ h'=[h EXCEPT !.reuse.aborted=reason, !.actorSealed=TRUE,
+    !.reuse.drainKey=ActiveWarmKey, !.reuse.drainFor=ActiveWarmKey,
+    !.reuse.armedAtAbort=WarmState.armed]
+WarmStale(kind) == WarmLive /\ WarmState.active=2
+  /\ CommandKey(1) \in WarmState.ended /\ kind \notin WarmState.stale
+  /\ LET staleKey == CommandKey(1)
+         effect == CASE kind="finish" -> Mutation="warm-stale-finish"
+                     [] kind="ack" -> Mutation="warm-stale-ack"
+                     [] OTHER -> Mutation="warm-stale-drain"
+         drain == effect /\ kind="drain"
+     IN /\ (IF drain THEN RequestStop ELSE UNCHANGED vars)
+        /\ h'=[h EXCEPT !.reuse.stale=@ \cup {kind},
+          !.reuse.finishFor[2]=IF effect /\ kind="finish" THEN staleKey ELSE @,
+          !.reuse.ackFor[2]=IF effect /\ kind="ack" THEN staleKey ELSE @,
+          !.reuse.drainKey=IF drain THEN staleKey ELSE @,
+          !.reuse.drainFor=IF drain THEN ActiveWarmKey ELSE @,
+          !.actorSealed=IF drain THEN TRUE ELSE @]
+WarmRetire == WarmLive /\ WarmState.active=0 /\ CommandKey(2) \in WarmState.ended
+  /\ RequestStop /\ h'=[h EXCEPT !.actorSealed=TRUE]
+WarmReuseNext == Submit \/ Accept \/ AcquireDomain \/ TakeHostPermit
+  \/ ReserveScope \/ ConsumePermit \/ SendLaunch \/ ReceiveLaunch \/ NativeLaunch \/ LoadReads \/ Boot
+  \/ (\E i \in Commands: WarmSpend(i) \/ WarmArm(i) \/ WarmArmAck(i) \/ WarmByte(i)
+       \/ (WarmLive /\ WarmState.active=i /\ (Execute(i) \/ EmitReply(i,TRUE)
+            \/ (\E r \in h.emitted: ReceiveReply(i,r))))
+       \/ WarmReceiverFence(i) \/ WarmSave(i))
+  \/ (\E key \in WarmKeys: WarmAcceptFinish(key) \/ WarmFinishAck(key) \/ WarmPersistEnd(key))
+  \/ (\E reason \in {"expiry","lost-ack","recovery","stop","eof"}: WarmAbort(reason))
+  \/ (\E kind \in {"finish","drain","ack"}: WarmStale(kind))
+  \/ WarmRetire \/ (h.actorSealed /\ (SdkOnly(CleanupGroup \/ GuardianExitsAfterGroup
+       \/ ObserveGroupAbsent \/ ObserveGuardianAbsent \/ Retire) \/ ReleaseDomains \/ HandleHostClosures))
+WarmReuseSpec == HostInit /\ [][WarmReuseNext]_hv
+WarmReuseOrdering ==
+  /\ WarmState.armed \subseteq WarmState.spent
+  /\ \A i \in Commands: h.starts[i]>0 => CommandKey(i) \in WarmState.armAcks
+  /\ WarmState.accepted \subseteq (WarmState.fenced \cap WarmState.saved)
+  /\ WarmState.acked \subseteq WarmState.accepted
+  /\ WarmState.ended \subseteq WarmState.acked
+  /\ (CommandKey(2) \in WarmState.armed => CommandKey(1) \in WarmState.ended)
+WarmReuseIsolation ==
+  /\ \A i \in Commands:
+    /\ WarmState.finishFor[i] \in {<<>>, CommandKey(i)}
+    /\ WarmState.ackFor[i] \in {<<>>, CommandKey(i)}
+  /\ WarmState.drainKey=WarmState.drainFor
+WarmReuseClosure ==
+  /\ (WarmState.aborted /= "none" => WarmState.armed=WarmState.armedAtAbort)
+  /\ ((WarmState.aborted /= "none" \/ phase="stopping") => h.actorSealed)
+  /\ (h.hostPermitReturns>0 => phase="closed" /\ h.hostClosure=Scope)
+  /\ (phase="running" /\ WarmState.armed/={} => HostPermitHeld)
+NoWarmReuseWitness == ~(WarmState.ended=WarmKeys /\ h.starts[2]=1
+  /\ WarmState.stale={"finish","drain","ack"} /\ h.hostPermitReturns=1)
+NoWarmAbortWitness == ~(WarmState.aborted=Mutation /\ CommandKey(2) \notin WarmState.armed
+  /\ CommandKey(1) \in (WarmState.saved \cap WarmState.fenced) /\ h.hostPermitReturns=1)
 
 \* Opt-in writer projection: an exact SDK reader closure releases the host's
 \* domain holds before the old writer turn. The overlapping successor still
