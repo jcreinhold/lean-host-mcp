@@ -45,23 +45,37 @@ fn checked(command: &mut Command) -> io::Result<Output> {
     Ok(output)
 }
 
+fn configured_policy(root: &Path) -> io::Result<Option<Policy>> {
+    let Some(path) = std::env::var_os(PLAN_ENV).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let policy: Policy = serde_json::from_slice(&pinned_lake_config::file_bytes(&path)?)?;
+    if policy.project != root
+        || policy.build.is_empty()
+        || policy.build.len() > 32
+        || policy.build.iter().any(|name| !super::name(name))
+        || policy.cache_imports.is_empty()
+        || policy.cache_imports.len() > 32
+    {
+        return Err(io::Error::other("invalid selected closure preparation"));
+    }
+    Ok(Some(policy))
+}
+
+pub(crate) fn configured_for(root: &Path) -> bool {
+    configured_policy(root).is_ok_and(|policy| policy.is_some())
+}
+
 pub(super) fn run(
     root: &Path,
     lake: &Path,
     seed: &str,
     authorize: &impl Fn() -> io::Result<Duration>,
 ) -> io::Result<Option<PreparedReadiness>> {
-    let Some(path) = std::env::var_os(PLAN_ENV).map(PathBuf::from) else {
+    let Some(policy) = configured_policy(root)? else {
         return Ok(None);
     };
-    let policy: Policy = serde_json::from_slice(&pinned_lake_config::file_bytes(&path)?)?;
-    if policy.project != root
-        || policy.build.last().is_none_or(|name| name != seed)
-        || policy.build.len() > 32
-        || policy.build.iter().any(|name| !super::name(name))
-        || policy.cache_imports.is_empty()
-        || policy.cache_imports.len() > 32
-    {
+    if policy.build.last().is_none_or(|name| name != seed) {
         return Err(io::Error::other("invalid selected closure preparation"));
     }
     authorize()?;

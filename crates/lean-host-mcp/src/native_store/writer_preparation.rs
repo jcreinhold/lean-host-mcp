@@ -19,7 +19,7 @@ const MAX_PLAN_BYTES: usize = 32 * 1024;
 
 #[path = "closure_preparation.rs"]
 mod closure_preparation;
-pub(crate) use closure_preparation::PLAN_ENV;
+pub(crate) use closure_preparation::{PLAN_ENV, configured_for as closure_preparation_configured};
 
 #[path = "blueprint_declarations.rs"]
 mod blueprint_declarations;

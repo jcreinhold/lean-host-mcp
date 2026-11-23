@@ -471,6 +471,13 @@ fn advertise_for_mode(mut reply: serde_json::Value, broker: &ProjectBroker, warm
                         readiness_writer::WHOLE_LINT,
                         readiness_writer::FIRST_PARTY_CLEAN,
                     ]);
+                    if !warm
+                        && broker.managed_only()
+                        && let Ok(root) = broker.native_root(&crate::broker::ProjectHint::Default)
+                        && crate::writer_preparation::closure_preparation_configured(&root)
+                    {
+                        operations.push(WRITER_INSPECTION);
+                    }
                     if broker.managed_only()
                         && let Ok(runtime) = crate::tools::proof_search::RuntimeSelection::configured()
                     {
