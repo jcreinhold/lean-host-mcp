@@ -6,7 +6,7 @@ use super::{
 };
 use crate::cancellation::CallCancellation;
 use lean_semantic_search_runtime::SemanticSearchRuntimeProvenance;
-use lean_toolchain::shared_writer::LocalArtifactRead;
+
 use std::{
     fs,
     io::{self, Read as _},
@@ -96,7 +96,7 @@ impl ProjectBroker {
         };
         let image = runtime.built.dylib_path().map_err(invalid)?.canonicalize()?;
         let bootstrap = select_semantic_runtime(
-            &runtime_guard,
+            || Ok(runtime_guard.validate()?),
             &package,
             &path,
             &image,
@@ -166,7 +166,7 @@ struct RuntimeProvenance<'a> {
 }
 
 fn select_semantic_runtime(
-    custody: &LocalArtifactRead,
+    validate_custody: impl Fn() -> Result<()>,
     package: &Path,
     path: &Path,
     image: &Path,
@@ -174,7 +174,7 @@ fn select_semantic_runtime(
     toolchain: &str,
     approval: RuntimeProvenance<'_>,
 ) -> Result<PathBuf> {
-    custody.validate()?;
+    validate_custody()?;
     let pinned_bytes = if let Some(expected) = approval.pinned {
         let selected = snapshot_semantic_runtime(package, path, image)?;
         if selected.digest != *expected {
@@ -221,7 +221,7 @@ fn select_semantic_runtime(
             return Err(invalid("approved semantic runtime toolchain or dependencies changed"));
         }
     }
-    custody.validate()?;
+    validate_custody()?;
     Ok(bootstrap)
 }
 
@@ -328,6 +328,7 @@ fn snapshot_semantic_runtime(package: &Path, manifest: &Path, image: &Path) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lean_toolchain::shared_writer::LocalArtifactRead;
 
     #[test]
     #[ignore = "requires an existing provisioned semantic runtime; never builds it"]
@@ -359,7 +360,7 @@ mod tests {
         let expected = snapshot_semantic_runtime(package, &path, image)?.digest;
         let select = |path: &Path, expected| {
             select_semantic_runtime(
-                &guard,
+                || Ok(guard.validate()?),
                 package,
                 path,
                 image,
@@ -378,4 +379,28 @@ mod tests {
         assert_eq!(snapshot_semantic_runtime(package, &path, image)?.digest, expected);
         Ok(())
     }
+}
+
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn select_pinned_semantic_runtime(
+    package: &Path,
+    manifest: &Path,
+    image: &Path,
+    sysroot: &Path,
+    toolchain: &str,
+    digest: &[u8; 32],
+    check_custody: impl Fn() -> Result<()>,
+) -> Result<PathBuf> {
+    select_semantic_runtime(
+        check_custody,
+        package,
+        manifest,
+        image,
+        sysroot,
+        toolchain,
+        RuntimeProvenance {
+            built: None,
+            pinned: Some(digest),
+        },
+    )
 }

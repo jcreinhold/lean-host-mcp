@@ -301,7 +301,7 @@ pub struct ProofStateRequest {
 /// `after_text` selects a worker-recognized proof-state boundary matching a
 /// source fragment; read the returned `goals_before`/`goals_after` rather than
 /// assuming every substring maps to a post-tactic state.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProofPositionSelector {
     #[default]

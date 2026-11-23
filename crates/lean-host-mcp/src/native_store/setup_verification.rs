@@ -20,6 +20,7 @@ use crate::{
 pub(crate) const OPERATION: &str = "lean_registered_module_verify_v1";
 pub(crate) const DIAGNOSTICS: &str = "lean_file_diagnostics_v1";
 pub(crate) const OUTLINE: &str = "lean_file_outline_v1";
+pub(crate) const PROOF_SEARCH: &str = "lean_file_proof_search_v1";
 pub(crate) const PROOF_STEP: &str = "lean_file_proof_step_v1";
 pub(crate) const PROOF_POSITION: &str = "lean_file_proof_position_v1";
 pub(crate) const COMMAND_TRIAL: &str = "lean_file_command_trial_v1";
@@ -31,6 +32,7 @@ pub(crate) enum Projection {
     CommandTrial,
     ProofPosition,
     ProofStep,
+    ProofSearch,
     Outline,
 }
 
@@ -40,6 +42,7 @@ impl Projection {
             OPERATION => Some(Self::Verify),
             DIAGNOSTICS => Some(Self::Diagnostics),
             OUTLINE => Some(Self::Outline),
+            PROOF_SEARCH => Some(Self::ProofSearch),
             PROOF_STEP => Some(Self::ProofStep),
             PROOF_POSITION => Some(Self::ProofPosition),
             COMMAND_TRIAL => Some(Self::CommandTrial),
@@ -64,6 +67,8 @@ pub(crate) struct Request {
     proof_position: Option<ProofPosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snippets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proof_search: Option<crate::tools::proof_search::AdmittedSearch>,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,6 +98,7 @@ pub(crate) enum FileQuery<'a> {
     Command(&'a str),
     Proof(&'a ProofPosition),
     ProofStep(&'a ProofPosition, &'a [String]),
+    Search(&'a crate::tools::proof_search::AdmittedSearch),
 }
 
 impl FileQuery<'_> {
@@ -102,11 +108,13 @@ impl FileQuery<'_> {
             Self::Command(_) => Projection::CommandTrial,
             Self::Proof(_) => Projection::ProofPosition,
             Self::ProofStep(..) => Projection::ProofStep,
+            Self::Search(_) => Projection::ProofSearch,
         }
     }
 
     fn matches(&self, request: &Request) -> bool {
         match self {
+            Self::Search(search) => request.proof_search.as_ref() == Some(*search),
             Self::Projection(_) => request.commands.is_none() && request.proof_position.is_none(),
             Self::Command(commands) => request.commands.as_deref() == Some(*commands),
             Self::Proof(position) => request.proof_position.as_ref() == Some(*position),
@@ -147,6 +155,10 @@ impl Request {
             && self.commands.as_deref().is_none_or(valid_commands)
             && self.proof_position.as_ref().is_none_or(ProofPosition::valid)
             && self.snippets.as_deref().is_none_or(valid_snippets)
+            && self
+                .proof_search
+                .as_ref()
+                .is_none_or(crate::tools::proof_search::AdmittedSearch::valid)
             && self.declarations.len() <= 16
             && self.declarations.iter().collect::<BTreeSet<_>>().len() == self.declarations.len()
             && self.declarations.iter().all(|name| {
@@ -164,6 +176,7 @@ impl Request {
             && self.commands.is_some() == (projection == Projection::CommandTrial)
             && self.proof_position.is_some() == matches!(projection, Projection::ProofPosition | Projection::ProofStep)
             && self.snippets.is_some() == (projection == Projection::ProofStep)
+            && self.proof_search.is_some() == (projection == Projection::ProofSearch)
     }
 
     pub(crate) fn matches_prepared(&self, prepared: Option<&str>) -> bool {
@@ -176,6 +189,14 @@ impl Request {
         };
         if !output.status.success() || output.stdout.len() > MAX_RESULT {
             return None;
+        }
+        if projection == Projection::ProofSearch {
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+            if !body.get("candidates")?.is_array() || !body.get("diagnostics")?.is_object() {
+                return None;
+            }
+            let receipt = serde_json::json!({"source_sha256": self.sha256, "outcome": body});
+            return (receipt.to_string().len() <= MAX_RESULT).then_some(receipt);
         }
         if projection == Projection::ProofStep {
             use lean_rs_worker_protocol::types::LeanWorkerProofAttemptResult;
@@ -244,6 +265,8 @@ pub(crate) struct Plan {
     pub(crate) projection: Projection,
     pub(crate) boot: [u8; 16],
     pub(crate) expires_ns: u64,
+    #[serde(default)]
+    pub(crate) semantic_runtime: Option<crate::tools::proof_search::RuntimeSelection>,
 }
 
 pub(crate) fn capture(command: &mut Command, limit: usize) -> io::Result<Vec<u8>> {
@@ -350,6 +373,36 @@ pub fn run(encoded: &str) -> io::Result<()> {
     } else {
         source
     };
+    let semantic_bootstrap = if let Some(search) = &plan.request.proof_search {
+        let runtime = plan
+            .semantic_runtime
+            .as_ref()
+            .filter(|runtime| runtime.sha256 == search.runtime_sha256)
+            .ok_or_else(|| io::Error::other("semantic runtime is outside its admitted selection"))?;
+        let package = runtime.package().map_err(io::Error::other)?;
+        if !plan.domains.iter().any(|domain| domain == package) {
+            return Err(io::Error::other(
+                "semantic runtime is outside its original writer scope",
+            ));
+        }
+        let toolchain = LakeProjectMeta::from_explicit(&plan.root)
+            .map_err(io::Error::other)?
+            .toolchain;
+        Some(
+            crate::broker::semantic_file::select_pinned_semantic_runtime(
+                package,
+                &runtime.manifest,
+                &runtime.image,
+                &shims.sysroot,
+                &toolchain,
+                &search.runtime_sha256,
+                || Ok(authorize(&plan.domains)?),
+            )
+            .map_err(io::Error::other)?,
+        )
+    } else {
+        None
+    };
     let path = plan.root.join(&plan.request.file);
     let assets = tempfile::Builder::new().prefix("setup-verify-").tempdir()?;
     let mut setup_command = Command::new(shims.sysroot.join("bin/lake"));
@@ -364,6 +417,33 @@ pub fn run(encoded: &str) -> io::Result<()> {
     authorize(&plan.domains)?;
     let bytes = capture(&mut setup_command, crate::shared_writer::MODULE_SETUP_LIMIT)?;
     let setup = module_setup::stage(bytes, &project_domains, &shims.sysroot, &plan.root, &path)?;
+    if let Some(search) = &plan.request.proof_search {
+        use io::Write as _;
+        let bootstrap = semantic_bootstrap.ok_or_else(|| io::Error::other("missing admitted semantic runtime"))?;
+        let input =
+            crate::tools::source_input::read_query_file(&plan.root, &plan.request.file).map_err(io::Error::other)?;
+        if input.hash != plan.request.sha256 || input.resolved != path {
+            return Err(io::Error::other("managed proof search source changed"));
+        }
+        fs::write(assets.path().join("module.setup.json"), &setup.bytes)?;
+        setup.check_exclusive(&project_domains)?;
+        let ranked = search.execute(
+            &plan.root,
+            &input,
+            &shims,
+            assets.path(),
+            &project_domains,
+            bootstrap,
+            || {
+                authorize(&plan.domains)?;
+                read_source(&plan.root, &plan.request)?;
+                Ok(())
+            },
+        )?;
+        authorize(&plan.domains)?;
+        return io::stdout().lock().write_all(&ranked);
+    }
+
     let targets = plan
         .request
         .declarations
@@ -399,6 +479,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
             include_str!("../lake/ProofSetupCommon.lean"),
             include_str!("../lake/ProofStepSetup.lean")
         ),
+        Projection::ProofSearch => return Err(io::Error::other("missing admitted proof search")),
         Projection::Verify => concat!(
             include_str!("../lake/VerifyCommon.lean"),
             "private abbrev verifySetup := verifyDeclarationBatchWithSetup\nprivate abbrev verifySetupReportRuntime := false\n",

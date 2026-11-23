@@ -765,6 +765,7 @@ impl LeanHostService {
                             |kind| match tools::request_aliases::canonical_kind("lean_lookup", kind) {
                                 "declarations" => Some("managed_outline_original_required"),
                                 "declaration" => Some("managed_declaration_original_required"),
+                                "proof_search" => Some("managed_proof_search_original_required"),
                                 _ => None,
                             },
                         );

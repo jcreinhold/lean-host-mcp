@@ -71,7 +71,7 @@ mod control;
 pub(crate) mod module_setup;
 pub(crate) use module_setup::ChargedWriter;
 mod preparation;
-mod semantic_file;
+pub(crate) mod semantic_file;
 pub(crate) mod verify_file;
 pub(crate) use verify_file::FileProjection;
 mod writer_handoff;

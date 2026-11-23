@@ -827,6 +827,18 @@ or from explicit goal/type text:
 
 Modes are `next_step`, `exact`, `apply`, `rewrite`, and `simp`. `limit` is clamped to the tool cap.
 
+Managed proof search requires a file, declaration and a prebuilt semantic runtime approved by the server operator.
+Set `LEAN_HOST_MCP_PREBUILT_SEMANTIC_RUNTIME` to a JSON object with the canonical `manifest` and `image` paths
+and the approved `sha256` as 32 bytes. The digest binds the manifest, image, runtime provenance and loadable module
+files. Compute it over sorted package-relative UTF-8 paths, each followed by NUL and the file's 32 raw SHA-256
+bytes. Discovery returns that digest as `semantic_runtime_sha256`.
+
+For `lean_file_proof_search_v1`, send the admitted file and source SHA-256 under `setup_verification`, with
+`prepared_sha256` from discovery if a prepared project is selected. Its `proof_search` object binds the
+`declaration`, public `proof_position` selector, `goal`, `type_text`, ordered `imports`, normalized `mode` and
+`limit`, and the discovery digest as `runtime_sha256`. The public call carries `managed_original`. Both retrieval
+paths run under one writer and its original deadline. Original-key GET returns the ranked result after closure.
+
 ### `kind: "references"`
 
 Finds semantic references to a fully-qualified Lean name.

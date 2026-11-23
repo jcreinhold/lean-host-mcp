@@ -359,6 +359,12 @@ pub(crate) fn advertise(mut reply: serde_json::Value, broker: &ProjectBroker) ->
                         readiness_writer::WHOLE_LINT,
                         readiness_writer::FIRST_PARTY_CLEAN,
                     ]);
+                    if broker.managed_only()
+                        && let Ok(runtime) = crate::tools::proof_search::RuntimeSelection::configured()
+                    {
+                        operations.push(crate::writer_setup_verification::PROOF_SEARCH);
+                        fields.insert("semantic_runtime_sha256".into(), serde_json::json!(runtime.sha256));
+                    }
                     if let Ok(root) = broker.native_root(&crate::broker::ProjectHint::Default)
                         && let Some((digest, preview)) = readiness_writer::formatter_approval(&root)
                     {

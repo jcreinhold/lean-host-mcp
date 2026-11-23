@@ -30,7 +30,8 @@ use crate::writer_setup_verification as setup;
 use configured_consumer::SourceIdentity;
 pub(super) use setup::{
     COMMAND_TRIAL as SETUP_TRIAL, DIAGNOSTICS as SETUP_DIAGNOSTICS, OPERATION as SETUP_VERIFICATION,
-    OUTLINE as SETUP_OUTLINE, PROOF_POSITION as SETUP_PROOF_POSITION, PROOF_STEP as SETUP_PROOF_STEP,
+    OUTLINE as SETUP_OUTLINE, PROOF_POSITION as SETUP_PROOF_POSITION, PROOF_SEARCH as SETUP_PROOF_SEARCH,
+    PROOF_STEP as SETUP_PROOF_STEP,
 };
 pub(super) use writer_preparation::first_party_clean::OPERATION as FIRST_PARTY_CLEAN;
 pub(super) use writer_preparation::regroup::OPERATION as REGROUP;
@@ -108,6 +109,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                     | SETUP_TRIAL
                     | SETUP_PROOF_POSITION
                     | SETUP_PROOF_STEP
+                    | SETUP_PROOF_SEARCH
                     | TOOLING_SUITES
                     | REGROUP
                     | WHOLE_LINT
@@ -199,7 +201,14 @@ pub(crate) fn validate_create(intent: &[u8]) -> Result<(), crate::native_store::
     let needs_validation = serde_json::from_slice::<serde_json::Value>(intent).is_ok_and(|value| {
         matches!(
             value.get("operation").and_then(serde_json::Value::as_str),
-            Some(writer_preparation::OPERATION | REGROUP | SETUP_TRIAL | SETUP_PROOF_POSITION | SETUP_PROOF_STEP)
+            Some(
+                writer_preparation::OPERATION
+                    | REGROUP
+                    | SETUP_TRIAL
+                    | SETUP_PROOF_POSITION
+                    | SETUP_PROOF_STEP
+                    | SETUP_PROOF_SEARCH
+            )
         )
     });
     if needs_validation && parse_intent(intent).is_none() {
@@ -307,11 +316,34 @@ fn execute(
     } else {
         None
     };
-    let roots = shims
+    let runtime = if let Stage::SetupVerification(request, setup::Projection::ProofSearch) = stage {
+        let proposed = request
+            .proof_search
+            .as_ref()
+            .ok_or_else(|| no_start(io::Error::other("missing proof search")))?;
+        let runtime = crate::tools::proof_search::RuntimeSelection::configured()
+            .map_err(|_| McpError::invalid_params("semantic_runtime_unavailable", None))?;
+        if runtime.sha256 != proposed.runtime_sha256 {
+            return Err(McpError::invalid_params("semantic_runtime_changed", None));
+        }
+        Some(runtime)
+    } else {
+        None
+    };
+    let mut roots = shims
         .as_ref()
-        .map_or(tooling_root.as_slice(), |shims| shims.domains.as_slice());
+        .map_or(tooling_root.as_slice(), |shims| shims.domains.as_slice())
+        .to_vec();
+    if let Some(runtime) = &runtime {
+        roots.push(
+            runtime
+                .package()
+                .map_err(|_| McpError::invalid_params("semantic_runtime_unavailable", None))?
+                .to_owned(),
+        );
+    }
     let budget = deadline.remaining().map_err(|error| super::public_error(&error))?;
-    let mut writer = SharedWriter::open_with_write_roots(helper, root, roots, budget, &expired).map_err(no_start)?;
+    let mut writer = SharedWriter::open_with_write_roots(helper, root, &roots, budget, &expired).map_err(no_start)?;
     if let Stage::Preparation(Target::ToolingSuites {
         lakefile_sha256,
         manifest_sha256,
@@ -371,6 +403,7 @@ fn execute(
                 let source_changed = match projection {
                     setup::Projection::CommandTrial => Some("managed_trial_source_changed"),
                     setup::Projection::ProofStep => Some("managed_proof_step_source_changed"),
+                    setup::Projection::ProofSearch => Some("managed_proof_search_source_changed"),
                     setup::Projection::ProofPosition => Some("managed_proof_position_source_changed"),
                     setup::Projection::Verify | setup::Projection::Diagnostics | setup::Projection::Outline => None,
                 };
@@ -389,6 +422,7 @@ fn execute(
                     projection: *projection,
                     boot: deadline.boot,
                     expires_ns: deadline.expires_ns,
+                    semantic_runtime: runtime,
                 };
                 let mut command = Command::new(
                     std::env::current_exe()

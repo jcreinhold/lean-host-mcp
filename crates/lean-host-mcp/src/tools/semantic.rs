@@ -317,6 +317,7 @@ fn lean_lookup_schema() -> Schema {
                 "required": ["kind"],
                 "properties": {
                     "kind": { "const": "proof_search" },
+                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "file": { "type": ["string", "null"] },
                     "declaration": { "type": ["string", "null"] },
                     "proof_position": proof_position_selector_schema(),
@@ -839,6 +840,10 @@ pub(crate) async fn lean_lookup_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            if let Some(call) = managed {
+                return from_tool_response(proof_search::managed_search(ctx, request, call).await?, ctx.config);
+            }
             from_tool_response(proof_search::search_for_proof(ctx, request).await?, ctx.config)
         }
         Some("references") => {

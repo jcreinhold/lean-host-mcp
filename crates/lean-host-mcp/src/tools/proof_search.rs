@@ -83,6 +83,11 @@ pub struct SearchForProofRequest {
     pub project: Option<String>,
 }
 
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+pub(crate) use self::managed::{AdmittedSearch, RuntimeSelection};
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+mod managed;
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ProofSearchCandidate {
     pub name: String,
@@ -259,6 +264,46 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     Ok(Response::ok(result, identity.freshness).with_runtime(runtime))
 }
 
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+pub(crate) async fn managed_search(
+    ctx: &ToolContext,
+    req: SearchForProofRequest,
+    call: crate::writer_setup_verification::ManagedCall<'_>,
+) -> Result<Response<serde_json::Value>> {
+    let runtime = RuntimeSelection::configured()?;
+    let admitted = AdmittedSearch::from_public(&req, runtime.sha256)?;
+    let hint = ProjectHint::from_request(req.project);
+    let root = ctx.broker.native_root(&hint)?;
+    let file = req
+        .file
+        .ok_or_else(|| ServerError::BadProject("managed proof search requires a file".into()))?;
+    let input = crate::tools::source_input::read_query_file(&root, &file)?;
+    let reply = call
+        .file_query::<serde_json::Value>(
+            &ctx.broker,
+            &hint,
+            &root,
+            &input.resolved,
+            &input.source,
+            input.imports.clone(),
+            crate::writer_setup_verification::FileQuery::Search(&admitted),
+        )
+        .await?;
+    let mut value = reply.value;
+    if !ctx.config.verbosity.is_full()
+        && let Some(diag) = value.get_mut("diagnostics").and_then(serde_json::Value::as_object_mut)
+    {
+        diag.remove("funnel");
+    }
+    Ok(Response::ok(value, reply.freshness)
+        .with_runtime(reply.runtime)
+        .with_trust_artifact(crate::trust::ArtifactTrust::source_file_edit_fresh(
+            &root,
+            &input.resolved,
+            input.hash,
+        )))
+}
+
 fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -> Result<TargetProfile> {
     let explicit_text = [req.goal.as_deref(), req.type_text.as_deref()]
         .into_iter()
@@ -274,26 +319,15 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
         let hint = ProjectHint::from_request(req.project.clone());
         let root = ctx.broker.native_root(&hint)?;
         let input = crate::tools::source_input::read_query_file(&root, &file)?;
-        let mut imports = input.imports.clone();
-        for module in &req.imports {
-            if !imports.contains(module) {
-                imports.push(module.clone());
-            }
-        }
-        let semantic =
-            semantic_request_for_source(&root, &input, &declaration, &req.proof_position, None, &imports, limit)
-                .ok_or_else(|| ServerError::BadProject("cannot select semantic source module".into()))?;
-        let mut profile = profile_from_text(
+        return source_profile(
+            &root,
+            &input,
+            &declaration,
+            &req.proof_position,
+            &req.imports,
             explicit_text,
-            None,
-            imports,
-            "semantic_frontend".into(),
-            None,
-            Vec::new(),
-            Some(semantic),
+            limit,
         );
-        profile.source_declaration = Some(declaration);
-        return Ok(profile);
     }
 
     Ok(profile_from_text(
@@ -305,6 +339,36 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
         Vec::new(),
         None,
     ))
+}
+
+fn source_profile(
+    root: &std::path::Path,
+    input: &crate::tools::source_input::QueryFile,
+    declaration: &str,
+    position: &ProofPositionSelector,
+    requested_imports: &[String],
+    explicit_text: String,
+    limit: usize,
+) -> Result<TargetProfile> {
+    let mut imports = input.imports.clone();
+    for module in requested_imports {
+        if !imports.contains(module) {
+            imports.push(module.clone());
+        }
+    }
+    let semantic = semantic_request_for_source(root, input, declaration, position, None, &imports, limit)
+        .ok_or_else(|| ServerError::BadProject("cannot select semantic source module".into()))?;
+    let mut profile = profile_from_text(
+        explicit_text,
+        None,
+        imports,
+        "semantic_frontend".into(),
+        None,
+        Vec::new(),
+        Some(semantic),
+    );
+    profile.source_declaration = Some(declaration.to_owned());
+    Ok(profile)
 }
 
 fn profile_from_text(

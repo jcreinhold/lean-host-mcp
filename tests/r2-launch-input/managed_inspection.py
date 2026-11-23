@@ -54,7 +54,7 @@ def run_check(args):
         args.parent.resolve(strict=True), "--lake-root", project,
         *([] if prepared is None else ["--prepared-generation", prepared]),
         "--managed-native-store", db,
-        *(["--managed-only"] if args.proof_position or args.proof_step else []),
+        *(["--managed-only"] if args.proof_position or args.proof_step or args.proof_search else []),
     ]
 
     @contextmanager
@@ -290,6 +290,62 @@ def run_check(args):
             print("managed proof step: setup import retained; ordered closed/failed candidates; original GET recovered")
         else:
             print("managed proof position: second occurrence selected the remaining goal; changed source/selector refused; original GET recovered")
+        return
+
+    if args.proof_search:
+        spec = json.loads(args.proof_search.read_text())
+        env["LEAN_HOST_MCP_PREBUILT_SEMANTIC_RUNTIME"] = json.dumps(spec)
+        env["LEAN_HOST_MCP_MANAGED_READINESS_WRITER"] = str(args.writer.resolve(strict=True))
+        anchor = project / "Demo.lean"
+        source = anchor.read_bytes()
+        options = dict(declaration="demo", mode="exact", limit=10, goal="⊢ MiniRat.cast", runtime_sha256=spec["sha256"])
+        with server() as (managed, result, tool, _):
+            discover = result(managed("discover"))
+            assert "lean_file_proof_search_v1" in discover["operations"], discover
+            assert discover["semantic_runtime_sha256"] == spec["sha256"], discover
+
+            def admit(selection=options):
+                origin=dict(key=dict(store=discover["store"], epoch=discover["acceptance_epoch"], nonce=list(os.urandom(16)), stage=1),
+                            capability=list(os.urandom(32)))
+                intent=dict(operation="lean_file_proof_search_v1", project=str(project), job=list(os.urandom(16)), revision=1,
+                            setup_verification=dict(file=anchor.name, sha256=list(hashlib.sha256(source).digest()), proof_search=selection))
+                pending=result(managed("create", intent=list(json.dumps(intent).encode()), **origin))
+                assert pending["execution"]=="admitted",pending
+                return origin,pending
+
+            wrong = dict(options, runtime_sha256=[byte ^ 255 for byte in spec["sha256"]])
+            changed,pending=admit(wrong)
+            result(managed("start", **changed), error="semantic_runtime_changed")
+            assert result(managed("get", **changed))==pending
+            changed,pending=admit()
+            try:
+                anchor.write_bytes(source + bytes([10]) + b"-- changed after admission" + bytes([10]))
+                result(managed("start", **changed), error="managed_proof_search_source_changed")
+                assert result(managed("get", **changed))==pending
+            finally:
+                anchor.write_bytes(source)
+            origin,pending=admit()
+            request=dict(kind="proof_search",file=anchor.name,declaration="demo",mode="exact",limit=10,goal=options["goal"],managed_original=origin)
+            mismatch=result(tool("lean_lookup",dict(request,mode="simp")),allow_error=True)
+            assert "admitted source or operation inputs" in mismatch["rpc_error"],mismatch
+            assert result(managed("get", **origin))==pending
+            reply=result(tool("lean_lookup",request),allow_error=True)
+            assert "rpc_error" not in reply,reply
+            data=reply["data"]
+            assert data["diagnostics"]["proof_state_status"]=="semantic_frontend",reply
+            assert any("semantic:" in str(candidate["match_reason"]) for candidate in data["candidates"]),data
+            assert data["candidates"][0]["name"].endswith(".cast_num_den_helper"),data
+            assert any("name_fragment" in str(candidate["match_reason"]) for candidate in data["candidates"]),data
+            saved=result(managed("get",**origin))
+            assert saved["custody"]=="closed" and saved["result"]["state"]=="retained",saved
+            retained=json.loads(bytes(saved["result"]["body"]))["outcome"]
+            assert retained["diagnostics"]["funnel"]["search_count"]>=2,retained
+            assert result(tool("lean_runtime",{"action":"status"}))["pool"]["occupied_slots"]==0
+        with server() as (managed, result, _, _):
+            assert result(managed("get", **origin)) == saved
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as audit:
+            assert audit.execute("SELECT count(*) FROM readiness_writer_bindings").fetchone() == (1,)
+        print("One admitted source-backed search ranked both semantic and lexical candidates; source, runtime identity and mode changes refused; closed result recovered")
         return
 
     with ExitStack() as stopped:
@@ -761,6 +817,7 @@ if __name__ == "__main__":
     mode.add_argument("--cancel-live", action="store_true")
     mode.add_argument("--deadline-while-sql-locked", action="store_true")
     mode.add_argument("--proof-position", action="store_true")
+    mode.add_argument("--proof-search", type=Path, help="operator pin JSON for a prebuilt semantic runtime")
     mode.add_argument("--proof-step", action="store_true",
                       help="requires Positioned.lean and prebuilt ProbeSupport exposing supported : True")
     mode.add_argument("--root-architecture", choices=("pass", "fail"))
@@ -770,7 +827,7 @@ if __name__ == "__main__":
     if args.root_architecture is not None:
         if not args.expected_finding or args.prepared or args.declaration:
             parser.error("root architecture requires --expected-finding and no prepared inspection input")
-    elif not (args.proof_position or args.proof_step) and (not args.prepared or not args.declaration or args.expected_finding):
+    elif not (args.proof_position or args.proof_step or args.proof_search) and (not args.prepared or not args.declaration or args.expected_finding):
         parser.error("inspection requires --prepared and --declaration")
 
     if args.entry_scratch and not (args.stopped_owner or args.abrupt or args.cancel_live or args.deadline_while_sql_locked):
