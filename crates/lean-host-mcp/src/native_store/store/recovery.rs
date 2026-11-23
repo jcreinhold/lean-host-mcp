@@ -237,17 +237,6 @@ pub(super) fn launch_deadline(
     }))
 }
 
-pub(super) fn attempt_ended(db: &rusqlite::Connection, key: NativeKey) -> Answer<bool> {
-    if !warm_schema(db)? {
-        return Ok(false);
-    }
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM recovery_bindings WHERE epoch=?1 AND nonce=?2 AND stage=?3 AND ended=1)",
-        params![number(key.epoch)?, key.nonce, number(key.stage)?],
-        |row| row.get(0),
-    )?)
-}
-
 impl NativeStore {
     /// The trusted adapter supplies SDK observations under its publication
     /// lock. Seal the exact stage and registry reference in one transaction.
@@ -398,7 +387,7 @@ impl NativeStore {
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = bound_stage(&tx, binding, &saved.capability)?;
-        if attempt_ended(&tx, saved.key)? {
+        if old.ended_ordinal.is_some() {
             return reject(Reject::WrongScope);
         }
         if !old.matches_intent(&saved.intent) {
@@ -485,7 +474,7 @@ impl NativeStore {
             return reject(Reject::IntentChanged);
         }
         let scope = old.scope.ok_or(Problem::Rejected(Reject::WrongScope))?;
-        if old.resource_report == ResourceReport::Closed || attempt_ended(&tx, key)? {
+        if old.resource_report == ResourceReport::Closed || old.ended_ordinal.is_some() {
             return reject(Reject::WrongScope);
         }
         let head: (i64, Id) = tx.query_row(

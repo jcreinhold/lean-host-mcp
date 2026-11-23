@@ -286,6 +286,12 @@ impl NativeStore {
                     fields.insert("intent".into(), serde_json::Value::Null);
                     fields.insert("intent_sha256".into(), serde_json::json!(hash));
                 }
+                if let (Some(ordinal), Some(fields)) = (snapshot.ended_ordinal, reply.as_object_mut()) {
+                    fields.insert(
+                        "attempt_completion".into(),
+                        serde_json::json!({"version":1,"state":"confirmed_ended","ordinal":ordinal}),
+                    );
+                }
                 reply
             }
         })

@@ -1172,6 +1172,11 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
             .unwrap();
         store.get(original.key).unwrap().unwrap().admission_deadline.unwrap()
     };
+    let get = |store: &mut NativeStore, original: &SavedRequest| {
+        let request = serde_json::json!({"version":1,"command":{"op":"get","key":original.key,
+            "capability":original.capability.0}});
+        store.admission(request.to_string().as_bytes()).unwrap()
+    };
     let deadline_a = admit(&mut store, &first);
     let deadline_b = admit(&mut store, &second);
     let root = fixture.root.join("registry");
@@ -1217,6 +1222,7 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
         .unwrap();
     assert!(granted(store.consume_launch(a, &first.capability).unwrap()));
     assert!(store.end_warm_contract(&finish, &first.capability).is_err());
+    assert!(get(&mut store, &first).get("attempt_completion").is_none());
     store
         .observe_result(a, &first.capability, [20; 16], b"first result")
         .unwrap();
@@ -1225,6 +1231,7 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
             .bind_warm_contract(&second, scope_b, &registry, deadline_b.expires_ns, 2)
             .is_err()
     );
+    assert!(get(&mut store, &first).get("attempt_completion").is_none());
     finish.ordinal = 2;
     assert!(store.end_warm_contract(&finish, &first.capability).is_err());
     finish.ordinal = 1;
@@ -1257,7 +1264,29 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
     );
     assert!(store.end_warm_contract(&finish, &first.capability).is_err());
     store.cancel(a, &first.capability).unwrap();
-    store.ack(a, &first.capability, [20; 16]).unwrap();
+    let successor_before = get(&mut store, &second);
+    let retained = get(&mut store, &first);
+    let completion = serde_json::json!({"version":1,"state":"confirmed_ended","ordinal":1});
+    assert_eq!(retained["key"], serde_json::json!(first.key));
+    assert_eq!(retained["attempt_completion"], completion);
+    assert_eq!(retained["result"]["state"], "retained");
+    assert_eq!(retained["custody"], "open");
+    let ack = |original: &SavedRequest| {
+        serde_json::json!({"version":1,"command":{
+        "op":"ack","key":original.key,"capability":original.capability.0,
+        "result_id":retained["result"]["id"],"result_digest":retained["result"]["sha256"]}})
+    };
+    let acknowledged = store.admission(ack(&first).to_string().as_bytes()).unwrap();
+    assert_eq!(acknowledged["result"]["state"], "acknowledged");
+    assert_eq!(acknowledged["attempt_completion"], completion);
+    assert_eq!(acknowledged["custody"], "open");
+    assert_eq!(
+        store.admission(ack(&second).to_string().as_bytes()),
+        Err("result_unknown")
+    );
+    assert_eq!(get(&mut store, &second), successor_before);
+    assert_eq!(successor_before["custody"], "open");
+    assert!(successor_before.get("attempt_completion").is_none());
     let old = store.get(first.key).unwrap().unwrap();
     assert_eq!(old.resource_report, ResourceReport::Open);
     assert!(!old.stop_requested);

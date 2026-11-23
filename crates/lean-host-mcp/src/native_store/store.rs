@@ -287,6 +287,7 @@ pub(crate) struct Snapshot {
     pub(crate) stop_requested: bool,
     pub(crate) resource_report: ResourceReport,
     pub(crate) result: ResultKnowledge,
+    pub(crate) ended_ordinal: Option<u64>,
 }
 impl Snapshot {
     pub(crate) fn matches_intent(&self, intent: &[u8]) -> bool {
@@ -939,7 +940,7 @@ impl NativeStore {
         if expected.is_some_and(|scope| old.scope != Some(scope)) {
             return reject(Reject::WrongScope);
         }
-        if recovery::attempt_ended(&tx, key)? {
+        if old.ended_ordinal.is_some() {
             return Ok(old);
         }
         let gate = if old.gate == Gate::Pending {
@@ -1291,10 +1292,16 @@ fn read_stage_columns(db: &Connection, key: NativeKey, include_admission: bool) 
     } else {
         "NULL"
     };
+    let ended = if cfg!(test) && recovery::warm_schema(db)? {
+        "(SELECT ordinal FROM recovery_bindings r
+          WHERE r.epoch=s.epoch AND r.nonce=s.nonce AND r.stage=s.stage AND r.ended=1)"
+    } else {
+        "NULL"
+    };
     let query = format!(
         "SELECT intent,scope,generation,owner,gate,spawn,stop_requested,resource_report,result_kind,
-        result_id,result_hash,result_body,compacted_intent_sha256,managed_ack,{deadline}
-        FROM stages WHERE epoch=?1 AND nonce=?2 AND stage=?3"
+        result_id,result_hash,result_body,compacted_intent_sha256,managed_ack,{deadline},{ended}
+        FROM stages s WHERE epoch=?1 AND nonce=?2 AND stage=?3"
     );
     let snapshot = db
         .query_row(
@@ -1389,6 +1396,10 @@ fn read_stage_columns(db: &Connection, key: NativeKey, include_admission: bool) 
                     return Err(rusqlite::Error::InvalidQuery);
                 }
                 let admission_deadline = optional_fixed(r, 14)?.map(AdmissionDeadline::decode).transpose()?;
+                let ended_ordinal = r.get::<_, Option<i64>>(15)?.map(positive).transpose()?;
+                if ended_ordinal.is_some() && (gate != Gate::Consumed || result == ResultKnowledge::Pending) {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
                 Ok(Snapshot {
                     key,
                     intent: intent.to_vec(),
@@ -1400,6 +1411,7 @@ fn read_stage_columns(db: &Connection, key: NativeKey, include_admission: bool) 
                     stop_requested,
                     resource_report,
                     result,
+                    ended_ordinal,
                 })
             },
         )
