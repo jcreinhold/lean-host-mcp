@@ -32,14 +32,33 @@ pub(crate) mod whole_lint;
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Target {
-    Module { name: String },
-    RootLibrary { name: String },
-    Modules { names: Vec<String> },
-    VerifierModules { names: Vec<String> },
-    Ready { name: String, package: Option<String> },
-    ToolingSuites { executable_sha256: [[u8; 32]; 4] },
-    WholeLint { lakefile_sha256: [u8; 32] },
-    FirstPartyClean { lakefile_sha256: [u8; 32] },
+    Module {
+        name: String,
+    },
+    RootLibrary {
+        name: String,
+        module_count: usize,
+        module_names_sha256: [u8; 32],
+    },
+    Modules {
+        names: Vec<String>,
+    },
+    VerifierModules {
+        names: Vec<String>,
+    },
+    Ready {
+        name: String,
+        package: Option<String>,
+    },
+    ToolingSuites {
+        executable_sha256: [[u8; 32]; 4],
+    },
+    WholeLint {
+        lakefile_sha256: [u8; 32],
+    },
+    FirstPartyClean {
+        lakefile_sha256: [u8; 32],
+    },
 }
 
 fn name(value: &str) -> bool {
@@ -60,7 +79,10 @@ fn module_name(target: &str) -> bool {
 impl Target {
     pub(crate) fn validate(&self) -> io::Result<()> {
         let valid = match self {
-            Self::Module { name: target } | Self::RootLibrary { name: target } => module_name(target),
+            Self::Module { name: target } => module_name(target),
+            Self::RootLibrary { name, module_count, .. } => {
+                module_name(name) && *module_count <= root_library::MAX_MODULES
+            }
             Self::Modules { names } | Self::VerifierModules { names } => {
                 let mut unique = std::collections::BTreeSet::new();
                 !names.is_empty()
@@ -351,8 +373,20 @@ pub fn run(encoded: &str) -> io::Result<()> {
     };
 
     let after_deps = || test_cut_after_dependencies(&authorize);
-    if let Target::RootLibrary { name } = &plan.target {
-        let receipt = root_library::run(name, command, &authorize, &after_deps)?;
+    if let Target::RootLibrary {
+        name,
+        module_count,
+        module_names_sha256,
+    } = &plan.target
+    {
+        let receipt = root_library::run(
+            name,
+            *module_count,
+            module_names_sha256,
+            command,
+            &authorize,
+            &after_deps,
+        )?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     let receipt = match plan.target {

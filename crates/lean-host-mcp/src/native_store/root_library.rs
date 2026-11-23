@@ -7,10 +7,11 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::module_name;
 
-const MAX_MODULES: usize = 16_384;
+pub(super) const MAX_MODULES: usize = 16_384;
 const BATCH: usize = 16;
 const MAX_QUERY_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -36,6 +37,7 @@ enum Stage {
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Inventory,
+    InventoryMismatch,
     Imports,
     Dependencies,
     Setup,
@@ -46,11 +48,11 @@ enum Phase {
 #[serde(deny_unknown_fields)]
 struct Failure {
     phase: Phase,
-    exit_code: i32,
+    exit_code: Option<i32>,
 }
 
 impl Receipt {
-    pub(crate) fn parse(output: &[u8], name: &str) -> io::Result<Self> {
+    pub(crate) fn parse(output: &[u8], name: &str, expected_count: usize) -> io::Result<Self> {
         let receipt: Self = serde_json::from_slice(output)?;
         if receipt.version != 1
             || receipt.name != name
@@ -58,8 +60,18 @@ impl Receipt {
             || receipt.completed_modules > receipt.module_count
             || receipt.completed_batches > receipt.completed_modules
             || match &receipt.first_failure {
-                Some(failure) => failure.exit_code <= 0,
-                None => receipt.completed_modules != receipt.module_count,
+                Some(Failure {
+                    phase: Phase::InventoryMismatch,
+                    exit_code,
+                }) => exit_code.is_some() || receipt.completed_modules != 0,
+                Some(Failure {
+                    phase: Phase::Inventory,
+                    exit_code,
+                }) => exit_code.is_none_or(|code| code <= 0) || receipt.module_count != 0,
+                Some(failure) => {
+                    failure.exit_code.is_none_or(|code| code <= 0) || receipt.module_count != expected_count
+                }
+                None => receipt.completed_modules != expected_count || receipt.module_count != expected_count,
             }
         {
             return Err(invalid_inventory());
@@ -113,6 +125,8 @@ fn query(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<Vec<
 
 pub(super) fn run(
     name: &str,
+    expected_count: usize,
+    expected_sha256: &[u8; 32],
     command: impl Fn() -> Command,
     authorize: &impl Fn() -> io::Result<Duration>,
     after_deps: &impl Fn() -> io::Result<()>,
@@ -133,7 +147,7 @@ pub(super) fn run(
         Err(code) => {
             receipt.first_failure = Some(Failure {
                 phase: Phase::Inventory,
-                exit_code: code,
+                exit_code: Some(code),
             });
             return Ok(receipt);
         }
@@ -150,6 +164,21 @@ pub(super) fn run(
     if positions.len() != names.len() {
         return Err(invalid_inventory());
     }
+    let mut canonical_names: Vec<_> = positions.keys().copied().collect();
+    canonical_names.sort_unstable();
+    let mut digest = Sha256::new();
+    for module in canonical_names {
+        digest.update(module.as_bytes());
+        digest.update([0]);
+    }
+    let actual_sha256: [u8; 32] = digest.finalize().into();
+    if names.len() != expected_count || &actual_sha256 != expected_sha256 {
+        receipt.first_failure = Some(Failure {
+            phase: Phase::InventoryMismatch,
+            exit_code: None,
+        });
+        return Ok(receipt);
+    }
     let mut levels: Vec<usize> = Vec::with_capacity(names.len());
     let mut batches = BTreeMap::<usize, Vec<&str>>::new();
     for modules in names.chunks(BATCH) {
@@ -161,7 +190,7 @@ pub(super) fn run(
             Err(code) => {
                 receipt.first_failure = Some(Failure {
                     phase: Phase::Imports,
-                    exit_code: code,
+                    exit_code: Some(code),
                 });
                 return Ok(receipt);
             }
@@ -199,7 +228,10 @@ pub(super) fn run(
                 .code()
                 .ok_or_else(|| io::Error::other("fixed Lake batch was interrupted"))?;
             if code != 0 {
-                receipt.first_failure = Some(Failure { phase, exit_code: code });
+                receipt.first_failure = Some(Failure {
+                    phase,
+                    exit_code: Some(code),
+                });
                 return Ok(receipt);
             }
         }

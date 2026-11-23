@@ -823,7 +823,9 @@ mod launcher_regressions {
         let capability = [57_u8; 32];
         let ext_object = dep.join(".lake/build/lib/lean/Ext.olean");
         let root_object = fixture.project.join(".lake/build/lib/lean/Probe.olean");
-        for (revision, expected_modules) in [(1, 0), (2, 3)] {
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(b"Probe\0Probe.A\0Probe.B\0").into();
+        for (revision, expected_modules) in [(1, 0), (2, 0), (3, 3)] {
             if revision == 2 {
                 lake_command(&fixture.project, &["build", "@ext/+Ext:irArts"]);
             }
@@ -832,7 +834,8 @@ mod launcher_regressions {
             let key = json!({"store":info.get("store").expect("store"), "epoch":info.get("acceptance_epoch").expect("epoch"),
                 "nonce":uuid::Uuid::new_v4().into_bytes(), "stage":1});
             let intent = json!({"project":fixture.project, "job":[revision], "revision":revision,
-                "operation":"lake_module_preparation_v1", "target":{"kind":"root_library","name":"Probe"}});
+                "operation":"lake_module_preparation_v1", "target":{"kind":"root_library","name":"Probe",
+                    "module_count":3, "module_names_sha256":digest}});
             let create = managed(
                 &mut server,
                 json!({"op":"create","key":key,
@@ -844,6 +847,13 @@ mod launcher_regressions {
                 Some("admitted"),
                 "{create}"
             );
+            let module_b = fixture.project.join("Probe/B.lean");
+            let module_c = fixture.project.join("Probe/C.lean");
+            let source = fixture.project.join("Probe.lean");
+            if revision == 2 {
+                fs::rename(&module_b, &module_c).expect("substitute one collected module");
+                fs::write(&source, "import Probe.A\nimport Probe.C\n").expect("update root imports");
+            }
             let completed = managed(&mut server, json!({"op":"start","key":key,"capability":capability})).await;
             assert_eq!(
                 completed.get("custody").and_then(Value::as_str),
@@ -871,6 +881,22 @@ mod launcher_regressions {
                 );
                 assert!(!fixture.project.join(".lake/build/lib/lean/Probe/B.olean").exists());
                 assert!(!ext_object.exists());
+            } else if revision == 2 {
+                assert_eq!(
+                    receipt.pointer("/first_failure/phase").and_then(Value::as_str),
+                    Some("inventory_mismatch"),
+                    "{receipt}"
+                );
+                for module in ["A", "B", "C"] {
+                    assert!(
+                        !fixture
+                            .project
+                            .join(format!(".lake/build/lib/lean/Probe/{module}.olean"))
+                            .exists()
+                    );
+                }
+                fs::rename(&module_c, &module_b).expect("restore original module");
+                fs::write(&source, "import Probe.A\nimport Probe.B\n").expect("restore root imports");
             } else {
                 assert!(receipt.get("first_failure").is_some_and(Value::is_null), "{receipt}");
                 assert_eq!(

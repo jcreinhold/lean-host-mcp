@@ -435,8 +435,8 @@ fn execute(
                 .ok()
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
         }
-        Stage::Preparation(Target::RootLibrary { name }) if output.status.success() => {
-            writer_preparation::root_library::Receipt::parse(&output.stdout, name)
+        Stage::Preparation(Target::RootLibrary { name, module_count, .. }) if output.status.success() => {
+            writer_preparation::root_library::Receipt::parse(&output.stdout, name, *module_count)
                 .ok()
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
         }
