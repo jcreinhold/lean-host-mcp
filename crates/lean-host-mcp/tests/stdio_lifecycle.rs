@@ -1113,10 +1113,7 @@ unsafe def main (args : List String) : IO UInt32 := do
 
     #[tokio::test]
     async fn managed_blueprint_tail_keeps_missing_names_distinct_from_changed_input() {
-        let (Some(writer), Some(checker)) = (
-            std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER"),
-            std::env::var_os("LEAN_HOST_MCP_BLUEPRINT_TEST_CHECKER"),
-        ) else {
+        let Some(writer) = std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER") else {
             return;
         };
         let fixture = Fixture::new();
@@ -1133,7 +1130,26 @@ unsafe def main (args : List String) : IO UInt32 := do
         .expect("lockfile");
         fs::write(root.join("Proofs.lean"), "def present : Nat := 42\n").expect("root");
         fs::create_dir_all(root.join("scripts/lean")).expect("checker directory");
-        fs::copy(checker, root.join("scripts/lean/check-decls.lean")).expect("actual checker");
+        let checker = root.join("scripts/lean/check-decls.lean");
+        fs::write(
+            &checker,
+            r#"import Lean
+open Lean
+
+unsafe def main (args : List String) : IO UInt32 := do
+  let ["--managed", path] := args | return 2
+  initSearchPath (← findSysroot)
+  enableInitializersExecution
+  let env ← importModules #[{module := `Proofs}] {}
+  let mut missing := false
+  for name in ← IO.FS.lines path do
+    unless env.contains name.toName do
+      IO.println s!"{name} is missing."
+      missing := true
+  return if missing then 10 else 0
+"#,
+        )
+        .expect("managed Lean checker fixture");
         fs::create_dir(root.join("blueprint")).expect("blueprint directory");
         let list = root.join("blueprint/lean_decls");
         let (store, _) = fixture.new_store("store").await;
@@ -1152,11 +1168,17 @@ unsafe def main (args : List String) : IO UInt32 := do
         use sha2::{Digest, Sha256};
         let digest = |name| -> [u8; 32] { Sha256::digest(fs::read(root.join(name)).expect("fixture input")).into() };
         let inventory: [u8; 32] = Sha256::digest(b"Proofs\0").into();
+        let long_name = format!("present\n{}\n", "x".repeat(2300));
         for (revision, declarations, verdict) in [
             (1, "present\n", None),
             (2, "present\n", Some("present")),
             (3, "present\nmissingNested.name\n", Some("missing")),
+            (4, long_name.as_str(), Some("missing")),
+            (5, "present\n", Some("unavailable")),
         ] {
+            if revision == 5 {
+                fs::write(&checker, "def main : IO Nat := nosuchdefinition\n").expect("pre-main failure");
+            }
             fs::write(&list, declarations).expect("admitted list");
             let key = json!({"store":info.get("store").expect("store"),"epoch":info.get("acceptance_epoch").expect("epoch"),
                 "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1});
@@ -1202,10 +1224,22 @@ unsafe def main (args : List String) : IO UInt32 := do
             }
             if verdict == Some("missing") {
                 assert_eq!(receipt.pointer("/blueprint/exit_code").and_then(Value::as_u64), Some(1));
-                assert_eq!(
-                    receipt.pointer("/blueprint/output").and_then(Value::as_str),
-                    Some("missingNested.name is missing.\n")
-                );
+                let output = receipt
+                    .pointer("/blueprint/output")
+                    .and_then(Value::as_str)
+                    .expect("preview");
+                if revision == 3 {
+                    assert_eq!(output, "missingNested.name is missing.\n");
+                } else {
+                    assert!(!output.contains(" is missing."));
+                    assert_eq!(
+                        receipt.pointer("/blueprint/output_truncated").and_then(Value::as_bool),
+                        Some(true)
+                    );
+                }
+            }
+            if verdict == Some("unavailable") {
+                assert_eq!(receipt.pointer("/blueprint/exit_code").and_then(Value::as_u64), Some(1));
             }
             assert_eq!(
                 managed(&mut server, json!({"op":"get","key":key,"capability":capability})).await,

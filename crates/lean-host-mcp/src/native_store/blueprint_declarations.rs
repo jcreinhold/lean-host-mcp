@@ -1,5 +1,5 @@
 //! Fixed declaration checker tail of the admitted root library writer.
-use std::{collections::HashSet, io, path::Path, process::Command};
+use std::{io, path::Path, process::Command};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -54,7 +54,7 @@ impl Receipt {
 }
 
 impl Inputs {
-    pub(super) fn check(&self, root: &Path) -> io::Result<String> {
+    pub(super) fn check(&self, root: &Path) -> io::Result<()> {
         let checked = |path, expected: &[u8; 32]| {
             let bytes = file_bytes(&root.join(path))?;
             if <[u8; 32]>::from(Sha256::digest(&bytes)) != *expected {
@@ -63,13 +63,15 @@ impl Inputs {
             Ok(bytes)
         };
         checked(CHECKER, &self.checker_sha256)?;
-        String::from_utf8(checked(LIST, &self.declarations_sha256)?).map_err(io::Error::other)
+        std::str::from_utf8(&checked(LIST, &self.declarations_sha256)?)
+            .map(|_| ())
+            .map_err(io::Error::other)
     }
 
     pub(super) fn run(&self, root: &Path, lake: &Path, mut command: Command) -> io::Result<Receipt> {
-        let Ok(declarations) = self.check(root) else {
+        if self.check(root).is_err() {
             return Ok(Receipt::unavailable());
-        };
+        }
         let sysroot = lake
             .parent()
             .and_then(Path::parent)
@@ -87,26 +89,21 @@ impl Inputs {
             .args(["--no-build", "env"])
             .arg(lean)
             .arg(load)
-            .args(["--run", CHECKER, LIST])
+            .args(["--run", CHECKER, "--managed", LIST])
             .env("LEAN_SYSROOT", sysroot)
             .env_remove("LEAN_PATH")
             .env_remove("LEAN_SRC_PATH");
         let outcome = capture(command, "blueprint-declarations")?;
-        let names: HashSet<_> = declarations.lines().collect();
-        let verdict = match outcome.exit_code {
-            0 => Verdict::Present,
-            1 if outcome.output.split_inclusive('\n').any(|line| {
-                line.strip_suffix(" is missing.\n")
-                    .is_some_and(|name| names.contains(name))
-            }) =>
-            {
-                Verdict::Missing
-            }
-            _ => Verdict::Unavailable,
+        let (verdict, exit_code) = match outcome.exit_code {
+            0 => (Verdict::Present, 0),
+            // Only the managed checker emits 10. Lake and Lean can fail with
+            // status 1 before the checker enters main.
+            10 => (Verdict::Missing, 1),
+            code => (Verdict::Unavailable, code),
         };
         Ok(Receipt {
             verdict,
-            exit_code: Some(outcome.exit_code),
+            exit_code: Some(exit_code),
             output: outcome.output,
             output_truncated: outcome.output_truncated,
         })
