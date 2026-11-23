@@ -76,6 +76,7 @@ impl PreparedProject {
             ordered,
         })
     }
+    /// Revalidate the held roots and their observed import order.
     pub fn check_observed(&self, observed: Option<&[String]>) -> io::Result<()> {
         let roots = observed.ok_or_else(invalid)?;
         self.guards.validate()?;
@@ -119,6 +120,8 @@ pub struct PreparedGeneration {
     products: Vec<Vec<Option<String>>>,
     #[serde(skip)]
     compact: bool,
+    #[serde(skip)]
+    derived: bool,
 }
 
 const LAUNCH_INPUT_LIMIT: usize = 4096;
@@ -172,9 +175,10 @@ impl TryFrom<GenerationWire> for PreparedGeneration {
                 identity: record.identity,
                 products: record.products,
                 compact: false,
+                derived: false,
             }),
             GenerationWire::Compact(record) => {
-                if record.version != 2 || !record.project.is_absolute() {
+                if !matches!(record.version, 2 | 3) || !record.project.is_absolute() {
                     return Err(invalid());
                 }
                 let roots = record
@@ -217,6 +221,7 @@ impl TryFrom<GenerationWire> for PreparedGeneration {
                     identity: record.identity,
                     products: vec![],
                     compact: true,
+                    derived: record.version == 3,
                 })
             }
         }
@@ -228,7 +233,7 @@ impl CompactGeneration {
         let plan = &record.plan;
         let root_index = |path: &Path| plan.roots.iter().position(|root| root == path).ok_or_else(invalid);
         Ok(Self {
-            version: 2,
+            version: if record.derived { 3 } else { 2 },
             project: plan.project.clone(),
             roots: plan
                 .roots
@@ -406,7 +411,37 @@ impl ImportPlan {
         Ok(())
     }
 
+    /// Resolve the transitive source headers in the selected project search order.
+    ///
+    /// # Errors
+    /// Refuses missing, aliased or unapproved sources.
+    pub fn derive(
+        &self,
+        domains: &[PathBuf],
+        headers: impl FnMut(&[PathBuf]) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Vec<(String, PathBuf)>> {
+        let closure = crate::prepared_closure::derive(
+            &self.roots,
+            &self.release,
+            domains,
+            self.modules.iter().map(|(name, _)| name.clone()),
+            headers,
+        )?;
+        if !self.modules.iter().all(|selected| closure.contains(selected)) {
+            return Err(invalid());
+        }
+        Ok(closure)
+    }
+
     fn identity(&self, domains: &[PathBuf]) -> io::Result<[u8; 32]> {
+        self.identity_for(domains, None)
+    }
+
+    fn identity_for(
+        &self,
+        domains: &[PathBuf],
+        closure: Option<&[(String, PathBuf)]>,
+    ) -> io::Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         if self.modules.is_empty() || self.modules.len() > 32 || self.roots.is_empty() || self.roots.len() > 64 {
             return Err(invalid());
@@ -419,7 +454,13 @@ impl ImportPlan {
         } else {
             hash.update(serde_json::to_vec(&("fresh-built-project-v2", self))?);
         }
-        for (name, domain) in &self.modules {
+        if let Some(closure) = closure {
+            if self.installed_release.is_none() {
+                return Err(invalid());
+            }
+            hash.update(serde_json::to_vec(&("derived-import-closure-v3", closure))?);
+        }
+        for (name, domain) in closure.unwrap_or(&self.modules) {
             let selected = lean_toolchain::olean_candidate(&self.roots, name, |p| fs::metadata(p))
                 .map_err(io::Error::other)?
                 .ok_or_else(invalid)?;
@@ -729,10 +770,60 @@ impl ImportPlan {
             identity,
             products,
             compact: false,
+            derived: false,
         })
     }
 }
 impl PreparedGeneration {
+    /// Bind a derived closure while holding the complete, exclusive producer union.
+    ///
+    /// # Errors
+    /// Refuses unresolved sources, aliases, unexpected paths or absent artifacts.
+    pub fn capture_derived(
+        plan: ImportPlan,
+        domains: &[PathBuf],
+        headers: impl FnMut(&[PathBuf]) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Self> {
+        let plan = plan.with_installed_release()?;
+        let closure = plan.derive(domains, headers)?;
+        let identity = plan.identity_for(domains, Some(&closure))?;
+        Ok(Self {
+            plan,
+            identity,
+            products: vec![],
+            compact: true,
+            derived: true,
+        })
+    }
+
+    /// True for a generation whose exact closure is recomputed under custody.
+    pub fn is_derived(&self) -> bool {
+        self.derived
+    }
+
+    fn observed_identity(&self, domains: &[PathBuf]) -> io::Result<[u8; 32]> {
+        if self.derived {
+            let sysroot = self.plan.release.parent().and_then(Path::parent).ok_or_else(invalid)?;
+            let closure = self.plan.derive(domains, |files| {
+                let output = std::process::Command::new(sysroot.join("bin/lean"))
+                    .current_dir(&self.plan.project)
+                    .arg("--deps-json")
+                    .args(files)
+                    .env("LEAN_SYSROOT", sysroot)
+                    .env_remove("LEAN_PATH")
+                    .env_remove("LEAN_SRC_PATH")
+                    .output()?;
+                if !output.status.success() {
+                    return Err(invalid());
+                }
+                Ok(output.stdout)
+            })?;
+            self.plan.identity_for(domains, Some(&closure))
+        } else {
+            self.plan.identity(domains)
+        }
+    }
+
     /// Decode a bounded operator record, including records written by older hosts.
     ///
     /// # Errors
@@ -804,7 +895,7 @@ impl PreparedGeneration {
     /// Refuses malformed selections or changes to ordered roots, sources, or products.
     pub fn check_identity(input: &str, domains: &[PathBuf]) -> io::Result<()> {
         let generation = Self::decode(input)?;
-        if generation.plan.identity(domains)? != generation.identity {
+        if generation.observed_identity(domains)? != generation.identity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "prepared generation identity changed",
@@ -851,19 +942,10 @@ impl PreparedGeneration {
         names: &[String],
     ) -> io::Result<PreparedProject> {
         let generation = Self::decode(input)?;
+        generation.check_import_selection(project, release, ordered_inputs, names)?;
         let plan = &generation.plan;
-        let pre_import = plan.roots.iter().filter(|path| path.as_path() != release);
-        if plan.project != project
-            || plan.release != release
-            || pre_import.ne(ordered_inputs.iter())
-            || names
-                .iter()
-                .any(|name| name != "Init" && !plan.modules.iter().any(|(approved, _)| approved == name))
-        {
-            return Err(invalid());
-        }
         let held = PreparedProject::capture(project, &plan.roots, shims, release)?;
-        if plan.identity(&held.domains)? != generation.identity
+        if generation.observed_identity(&held.domains)? != generation.identity
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -871,6 +953,45 @@ impl PreparedGeneration {
             ));
         }
         Ok(held)
+    }
+
+    /// Check the immutable requested imports against a verified selection.
+    ///
+    /// # Errors
+    /// Refuses another project, release, root order, or unapproved import.
+    pub fn check_import_selection(
+        &self,
+        project: &Path,
+        release: &Path,
+        ordered_inputs: &[PathBuf],
+        names: &[String],
+    ) -> io::Result<()> {
+        let plan = &self.plan;
+        let pre_import = plan.roots.iter().filter(|path| path.as_path() != release);
+        if plan.project != project || plan.release != release {
+            return Err(io::Error::other("prepared project or release differs"));
+        }
+        if pre_import.ne(ordered_inputs.iter()) {
+            return Err(io::Error::other(format!(
+                "prepared order differs: expected {:?}, got {:?}",
+                plan.roots, ordered_inputs
+            )));
+        }
+        if names
+            .iter()
+            .any(|name| name != "Init" && !plan.modules.iter().any(|(approved, _)| approved == name))
+        {
+            return Err(io::Error::other(format!("unapproved prepared imports: {names:?}")));
+        }
+        if self.derived
+            && names
+                .iter()
+                .filter(|name| name.as_str() != "Init")
+                .ne(plan.modules.iter().map(|(name, _)| name))
+        {
+            return Err(io::Error::other(format!("derived prepared imports differ: {names:?}")));
+        }
+        Ok(())
     }
 }
 
@@ -1248,6 +1369,7 @@ fn versioned_launch_encoding_keeps_legacy_and_long_paths() -> io::Result<()> {
         identity: [42; 32],
         products: vec![vec![Some("ab".repeat(32)); 5]; 12],
         compact: false,
+        derived: false,
     };
     let compact = record.launch_input()?;
     let decoded = PreparedGeneration::decode(&compact)?;

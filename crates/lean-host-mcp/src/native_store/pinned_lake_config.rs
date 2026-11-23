@@ -106,6 +106,10 @@ fn git(repo: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
 }
 
 pub(super) fn check(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<()> {
+    checked_package_order(root, expected_manifest).map(|_| ())
+}
+
+pub(super) fn checked_package_order(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<Vec<PathBuf>> {
     absent(&root.join(".lake/package-overrides.json"))?;
     let bytes = file_bytes(&root.join("lake-manifest.json"))?;
     if <[u8; 32]>::from(Sha256::digest(&bytes)) != *expected_manifest {
@@ -116,6 +120,7 @@ pub(super) fn check(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<()>
         return Err(invalid("unsupported Lake package layout"));
     }
     let mut seen = BTreeSet::new();
+    let mut ordered = vec![root.to_owned()];
     for package in manifest.packages {
         // Lake decodes the Name and materializes it with escape := false.
         let name = package
@@ -164,9 +169,10 @@ pub(super) fn check(root: &Path, expected_manifest: &[u8; 32]) -> io::Result<()>
         if file_bytes(&repo.join(&package.config_file))? != expected {
             return Err(invalid(format!("locked package configuration changed: {name}")));
         }
+        ordered.push(repo);
     }
     absent(&root.join(".lake/package-overrides.json"))?;
-    Ok(())
+    Ok(ordered)
 }
 
 pub(super) fn check_dependency_free(root: &Path) -> io::Result<()> {

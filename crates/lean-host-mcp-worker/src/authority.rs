@@ -329,16 +329,33 @@ impl WorkerAuthority for Installed {
             if options != HostImportOptions::default() {
                 return Err(deny());
             }
-            let held = PreparedGeneration::verify_before_import(
-                input,
-                generation.project(),
-                &self.record.sysroot.join("lib/lean"),
-                &expected_roots(&self.record).collect::<Vec<_>>(),
-                &ordered,
-                &names,
-            )
-            .map_err(|e| lean_rs::error::host_internal(format!("prepared generation refused before import: {e}")))?;
-            self.held_project.get_or_init(|| held);
+            let release = self.record.sysroot.join("lib/lean");
+            let deny_changed =
+                |error| lean_rs::error::host_internal(format!("prepared generation refused before import: {error}"));
+            if generation.is_derived()
+                && let Some(held) = self.held_project.get()
+            {
+                generation
+                    .check_import_selection(generation.project(), &release, &ordered, &names)
+                    .map_err(deny_changed)?;
+                let roots = generation
+                    .roots()
+                    .iter()
+                    .map(|path| path.to_str().map(str::to_owned).ok_or_else(deny))
+                    .collect::<LeanResult<Vec<_>>>()?;
+                held.check_observed(Some(&roots)).map_err(deny_changed)?;
+            } else {
+                let held = PreparedGeneration::verify_before_import(
+                    input,
+                    generation.project(),
+                    &release,
+                    &expected_roots(&self.record).collect::<Vec<_>>(),
+                    &ordered,
+                    &names,
+                )
+                .map_err(deny_changed)?;
+                self.held_project.get_or_init(|| held);
+            }
             // SAFETY: the operator selects a trusted fresh-build record at server startup.
             // The matched launcher replaces inherited input. The verified digest covers the
             // approved plugin-free modules and their resolved dependencies, and this authority

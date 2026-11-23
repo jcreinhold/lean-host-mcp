@@ -1098,7 +1098,7 @@ impl ProjectBroker {
             let installed = Self::installed_host_artifacts(&worker, &sysroot)?;
             // Validate the operator's exact project and product selection before
             // opening a receiver. The admitted job later retains its own loan.
-            Self::prepared_reader(&root, &meta, selection, &[])?;
+            Self::prepared_reader_for_actor(&root, &meta, selection)?;
             installed
         } else {
             let writer = crate::shared_writer::contract()?.executable;

@@ -17,6 +17,10 @@ pub(crate) const VERIFIER_OPERATION: &str = "lake_verifier_preparation_v1";
 const MAX_MODULES: usize = 64;
 const MAX_PLAN_BYTES: usize = 32 * 1024;
 
+#[path = "closure_preparation.rs"]
+mod closure_preparation;
+pub(crate) use closure_preparation::PLAN_ENV;
+
 #[path = "blueprint_declarations.rs"]
 mod blueprint_declarations;
 #[path = "pinned_lake_config.rs"]
@@ -362,6 +366,11 @@ pub fn run(encoded: &str) -> io::Result<()> {
         return serde_json::to_writer(std::io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
     let lake = lake_executable(&plan.root)?;
+    if let Target::Ready { name, package: None } = &plan.target
+        && let Some(receipt) = closure_preparation::run(&plan.root, &lake, name, &authorize)?
+    {
+        return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
+    }
     if let Target::WholeLint { lakefile_sha256 } = &plan.target {
         return whole_lint::run(&plan.root, &lake, lakefile_sha256, authorize);
     }

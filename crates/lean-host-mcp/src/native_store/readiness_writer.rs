@@ -199,9 +199,9 @@ fn parse_intent(intent: &[u8]) -> Option<(PathBuf, Stage)> {
 
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct PreparedReadiness {
-    readiness: Receipt,
-    prepared_generation: String,
+pub(crate) struct PreparedReadiness {
+    pub(crate) readiness: Receipt,
+    pub(crate) prepared_generation: String,
 }
 
 pub(super) fn prepared_inspection_receipt(
@@ -497,6 +497,9 @@ fn execute(
                     .current_dir(root)
                     .env("LAKE_CACHE_DIR", writer.asset_dir())
                     .env("TMPDIR", writer.asset_dir());
+                if let Some(policy) = std::env::var_os(writer_preparation::PLAN_ENV) {
+                    command.env(writer_preparation::PLAN_ENV, policy);
+                }
                 command
             }
             Stage::SetupVerification(request, projection) => {
@@ -631,6 +634,22 @@ fn execute(
             writer_preparation::root_library::Receipt::parse(&output.stdout, name, *module_count, blueprint.is_some())
                 .ok()
                 .and_then(|receipt| serde_json::to_value(receipt).ok())
+        }
+        Stage::Preparation(target @ Target::Ready { package: None, .. })
+            if output.status.success() && std::env::var_os(writer_preparation::PLAN_ENV).is_some() =>
+        {
+            serde_json::from_slice::<PreparedReadiness>(&output.stdout)
+                .ok()
+                .and_then(|bound| {
+                    let bytes = serde_json::to_vec(&bound.readiness).ok()?;
+                    let receipt = Receipt::parse(&bytes, target).ok()?;
+                    let record =
+                        lean_host_mcp_worker::prepared_project::PreparedGeneration::decode(&bound.prepared_generation)
+                            .ok()?;
+                    (receipt.target_ready() && record.is_derived() && record.project() == root)
+                        .then(|| serde_json::to_value(bound).ok())
+                        .flatten()
+                })
         }
         Stage::Preparation(target) if output.status.success() => Receipt::parse(&output.stdout, target)
             .and_then(|receipt| bind_ready_record(receipt, target, root, writer.write_roots()))
