@@ -399,12 +399,30 @@ fn clean_in(root: &Path, target: Option<&ToolchainId>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// A concurrent fork can inherit the open file description until exec, even
+// with close-on-exec set. End these local locks explicitly when the guard drops.
+struct InstallationLock(fs::File);
+
+impl InstallationLock {
+    fn acquire(file: fs::File) -> std::io::Result<Self> {
+        file.try_lock().map_err(std::io::Error::from)?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for InstallationLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to unlock worker installation");
+        }
+    }
+}
+
 /// Serialize candidate construction, activation and retirement on the slot directory itself.
-fn lock_slot(slot: &Path) -> anyhow::Result<fs::File> {
-    let file = fs::File::open(slot)?;
-    file.try_lock().map_err(std::io::Error::from)?;
-    verify_named_handle(slot, &file, true)?;
-    Ok(file)
+fn lock_slot(slot: &Path) -> anyhow::Result<InstallationLock> {
+    let guard = InstallationLock::acquire(fs::File::open(slot)?)?;
+    verify_named_handle(slot, &guard.0, true)?;
+    Ok(guard)
 }
 
 fn verify_named_handle(path: &Path, file: &fs::File, directory: bool) -> anyhow::Result<()> {
@@ -445,14 +463,13 @@ fn retire_slot(slot: &Path, expected: &Path) -> anyhow::Result<()> {
                 "invalid installed artifact domain"
             );
             let path = lean_toolchain::shared_writer::project_lock_path(&root)?;
-            let file = fs::File::open(&path)?;
-            file.try_lock().map_err(std::io::Error::from)?;
-            verify_named_handle(&path, &file, false)?;
+            let guard = InstallationLock::acquire(fs::File::open(&path)?)?;
+            verify_named_handle(&path, &guard.0, false)?;
             anyhow::ensure!(
-                lean_toolchain::shared_writer::previous_writer_stopped(&file)?,
+                lean_toolchain::shared_writer::previous_writer_stopped(&guard.0)?,
                 "installed artifact writer still active"
             );
-            guards.push(file);
+            guards.push(guard);
         }
     }
     anyhow::ensure!(
@@ -1013,6 +1030,25 @@ mod tests {
         assert!(old.is_file());
         std::fs::write(slot.join("current-generation"), "../outside")?;
         assert!(resolve().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn installation_lock_releases_with_an_inherited_descriptor() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let path = temp.path().join("lock");
+        let guard = super::InstallationLock::acquire(std::fs::File::create_new(&path)?)?;
+        // Like a forked child's descriptor, this shares the open file description.
+        let inherited = guard.0.try_clone()?;
+        let reader = std::fs::File::open(&path)?;
+        assert!(matches!(
+            reader.try_lock_shared(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(guard);
+        reader.try_lock_shared().map_err(std::io::Error::from)?;
+        reader.unlock()?;
+        drop(inherited);
         Ok(())
     }
 
