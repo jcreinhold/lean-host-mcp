@@ -10,6 +10,26 @@ pub(crate) struct WarmGeneration {
     expected: NativeGuardianDrainBinding,
     imports: Vec<String>,
     command: u64,
+    finish: CheckedWarmFinish,
+    store: Arc<Mutex<NativeStore>>,
+}
+
+impl WarmGeneration {
+    /// Settle this generation only after verifying its exact native retirement.
+    pub(crate) fn reconcile_retirement(self) {
+        let result = observe_recovered_closure(&self.finish.registry).and_then(|closed| {
+            if !closed {
+                return Err(std::io::Error::other("warm generation closure remains unresolved"));
+            }
+            self.store
+                .lock()
+                .reconcile_closed_scope(self.finish.binding, &self.finish.registry)
+                .map_err(std::io::Error::other)
+        });
+        if let Err(error) = result {
+            tracing::debug!(%error, "warm actor retirement could not settle the original stage");
+        }
+    }
 }
 
 pub(super) fn previous_finished(
@@ -242,6 +262,8 @@ impl Job {
                     expected,
                     imports: self.intent.imports,
                     command: ordinal,
+                    finish,
+                    store: Arc::clone(&self.store),
                 });
                 actor_healthy.store(true, Ordering::Release);
             }

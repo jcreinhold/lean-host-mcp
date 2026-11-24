@@ -421,10 +421,11 @@ results. Start the matching managed host with `--managed-warm-inspections` after
 Cold transitions omit `--promote-warm-store`. For ordinary rollback, drain both broker and callers, verify the store
 has settled, and switch with `--to ordinary` on the same matching host. The store schema remains at its promoted version.
 
-A warm attempt can report `confirmed_ended` while its generation still holds custody for reuse. After a drain,
-an original-key GET that verifies exact generation retirement also settles that generation's eligible ended
-attempts in the store. This preserves saved result identities and applies normal acknowledged-result compaction.
-The pool's stopped status alone does not reconcile the durable stage rows.
+A warm attempt can report `confirmed_ended` while its generation still holds custody for reuse. On normal drain,
+the actor verifies exact retirement and settles the generation's eligible ended attempts before returning its slot.
+If the broker was lost or settlement failed, use one authenticated original-key GET per affected retired
+generation to verify closure and settle its eligible ended attempts. This preserves saved result identities and
+applies normal acknowledged-result compaction. The pool's stopped status alone is not a durable closure receipt.
 
 ## Build, test, lint
 

@@ -3671,6 +3671,11 @@ fn actor_main(
 
     match state.handle.shutdown() {
         Ok(report) => {
+            // The actor still owns its broker permit while settling exact custody.
+            #[cfg(lean_host_mcp_development_warm)]
+            if let Some(warm) = state.warm_inspection.take() {
+                warm.reconcile_retirement();
+            }
             tracing::debug!(
                 outcome = ?report.outcome,
                 elapsed_millis = millis_u64(report.elapsed),

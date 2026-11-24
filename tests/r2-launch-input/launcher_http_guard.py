@@ -1,6 +1,7 @@
 """Check enrolled launcher custody against the packaged warm HTTP server."""
 
 import contextlib
+import hashlib
 import errno
 import fcntl
 import importlib.util
@@ -236,10 +237,64 @@ def check(host, project, workers, prepared, scratch):
                 assert admission(5, op="get", **auth) == cancelled
                 for flags in ([], warm):
                     refused_broker(flags)
+
+                # Exercise real warm reuse on the enrolled store. The transition
+                # must succeed without any original-key reads after the drain.
+                def tool(number, tool_name, **arguments):
+                    reply = call("tools/call", {"name": tool_name, "arguments": arguments}, number)
+                    assert not reply.get("isError"), reply
+                    return json.loads(reply["content"][0]["text"])
+
+                prepared_bytes = prepared.read_bytes().strip()
+                imports = ["Init", *[module for module, _ in json.loads(prepared_bytes)["plan"]["modules"]]]
+                originals = []
+                for ordinal, offset in enumerate((10, 20), start=1):
+                    warm_key = {**key, "nonce": list(uuid.uuid4().bytes)}
+                    original_auth = {"key": warm_key, "capability": list(os.urandom(32))}
+                    fields = dict(source=True, statement=True, docstring=True, attributes=True, flags=True,
+                                  rendering="pretty", proof_search=False)
+                    warm_intent = dict(
+                        operation="lean_declaration_inspection_warm_v1", project=str(project),
+                        job=list(uuid.uuid4().bytes), revision=1, imports=imports,
+                        prepared_sha256=list(hashlib.sha256(prepared_bytes).digest()),
+                        inspection=dict(name="first_ok", fields=fields, budgets=dict(per_field_bytes=8192, total_bytes=65536)),
+                    )
+                    created = admission(offset, op="create", **original_auth, intent=list(json.dumps(warm_intent).encode()))
+                    assert created["execution"] == "admitted", created
+                    tool(offset + 1, "lean_lookup", kind="declaration", name="first_ok",
+                         project=str(project), imports=imports, managed_original=original_auth)
+                    looked_up = admission(offset + 2, op="get", **original_auth)
+                    assert looked_up["attempt_completion"]["ordinal"] == ordinal and looked_up["custody"] == "open"
+                    saved = looked_up["result"]
+                    assert json.loads(bytes(saved["body"]))["declaration"]["name"] == "first_ok"
+                    acknowledged = admission(offset + 3, op="ack", **original_auth, result_id=saved["id"],
+                                             result_digest=saved["sha256"])
+                    assert acknowledged["result"]["state"] == "acknowledged"
+                    originals.append((warm_key, bytes(saved["id"]), bytes(saved["sha256"])))
+
+                draining = tool(30, "lean_runtime", action="drain", retire_idle=True)
+                token = draining["lease_id"]
+                end = time.monotonic() + 10
+                number = 30
+                while not draining["pool"]["workers_stopped"]:
+                    assert time.monotonic() < end, draining
+                    time.sleep(0.04)
+                    number += 1
+                    draining = tool(number, "lean_runtime", action="renew", lease_id=token)
+                with contextlib.closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as db:
+                    for warm_key, wanted_id, wanted_sha in originals:
+                        row = db.execute(
+                            "SELECT resource_report,result_kind,result_id,result_hash FROM stages "
+                            "WHERE (epoch,nonce,stage)=(?,?,?)",
+                            (warm_key["epoch"], bytes(warm_key["nonce"]), warm_key["stage"]),
+                        ).fetchone()
+                        assert row == (3, 3, wanted_id, wanted_sha), row
                 broker.send_signal(signal.SIGTERM)
                 assert broker.wait(timeout=10) == 0
                 transition(4, "ordinary", blocked=True)
             transition(4, "ordinary")
+            assert schema_version() == 6
+            print("Normal drain settled both acknowledged warm keys; same-store rollback needed no client GET")
             if real:
                 try:
                     with real.guard(project, expected=selection):
