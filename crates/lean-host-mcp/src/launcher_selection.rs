@@ -149,10 +149,14 @@ pub struct Transition {
     /// JSON path with the original registry identity and exact lock inode union.
     #[arg(long)]
     custody: PathBuf,
+    /// Promote the enrolled store for a warm managed transition.
+    #[cfg(lean_host_mcp_development_warm)]
+    #[arg(long)]
+    promote_warm_store: bool,
 }
 
 impl Transition {
-    /// Update selectors only, while physical and durable admission are fenced.
+    /// Update the selector and optionally promote its store under exclusive custody.
     ///
     /// # Errors
     /// Refuses an unavailable guard, active launcher, stale selection or unresolved stage.
@@ -167,6 +171,13 @@ impl Transition {
             locks: Vec<(PathBuf, u64, u64)>,
         }
 
+        #[cfg(lean_host_mcp_development_warm)]
+        let promote_warm_store = self.promote_warm_store;
+        #[cfg(not(lean_host_mcp_development_warm))]
+        let promote_warm_store = false;
+        if promote_warm_store && self.to != LauncherMode::Managed {
+            return Err(invalid("warm store promotion requires a managed transition"));
+        }
         let selector_lock = lock_project(&self.project, FlockOperation::NonBlockingLockExclusive)?;
         let (mut table, mut selected, permissions) = load(&self.project)?;
         let next = self
@@ -178,6 +189,14 @@ impl Transition {
         if !reconcile && (selected.generation != self.from_generation || selected.mode == self.to) {
             return Err(invalid("launcher transition source changed"));
         }
+        #[cfg(lean_host_mcp_development_warm)]
+        let warm_transition = promote_warm_store.then_some(if reconcile {
+            crate::native_store::store::LauncherWarmTransition::Confirm
+        } else {
+            crate::native_store::store::LauncherWarmTransition::Promote
+        });
+        #[cfg(not(lean_host_mcp_development_warm))]
+        let warm_transition = None;
         let proof = File::from(open(
             &self.custody,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -203,7 +222,14 @@ impl Transition {
                 crate::native_store::store::NativeStore::with_settled_launcher_store(
                     &original_store,
                     *expected_store.as_bytes(),
+                    warm_transition,
                     || {
+                        if promote_warm_store
+                            && option_env!("LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT").is_some()
+                            && std::env::var_os("LEAN_HOST_MCP_TEST_WARM_PROMOTION_CUT").is_some()
+                        {
+                            return Err(invalid("disposable cut after warm store promotion"));
+                        }
                         if reconcile {
                             return selector_lock.sync_all();
                         }

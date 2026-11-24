@@ -891,7 +891,7 @@ fn exact_recovery_claim_has_one_durable_winner_and_cannot_restore_launch() {
         }});
         store.admission(payload.to_string().as_bytes()).unwrap();
         assert_eq!(store.database_path(), Some(fixture.native().as_path()));
-        assert!(NativeStore::with_settled_launcher_store(&fixture.native(), saved.key.store, || Ok(())).is_err());
+        assert!(NativeStore::with_settled_launcher_store(&fixture.native(), saved.key.store, None, || Ok(())).is_err());
         assert!(store.authorize_drain(saved.key, None).is_err());
         assert!(store.authorize_drain(saved.key, Some(authorization)).is_ok());
         let drain = serde_json::json!({"version":1,"command":{
@@ -1209,7 +1209,7 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
     store.promote_warm_contract(false).unwrap();
     assert_eq!(store.identity(), identity);
     assert_eq!(get(&mut store, &first), original_before_promotion);
-    assert!(NativeStore::with_settled_launcher_store(&fixture.native(), identity, || Ok(())).is_err());
+    assert!(NativeStore::with_settled_launcher_store(&fixture.native(), identity, None, || Ok(())).is_err());
     let a = store
         .bind_warm_contract(&first, scope(1), &registry, deadline_a.expires_ns, 1)
         .unwrap();
@@ -1323,12 +1323,12 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
     );
     let before_closure = get(&mut store, &second);
     assert_eq!(before_closure["result"]["state"], "retained");
-    assert!(NativeStore::with_settled_launcher_store(&fixture.native(), identity, || Ok(())).is_err());
+    assert!(NativeStore::with_settled_launcher_store(&fixture.native(), identity, None, || Ok(())).is_err());
     store.reconcile_closed_scope(a, &registry).unwrap();
     store.reconcile_closed_scope(b, &registry).unwrap();
     drop(store);
-    assert!(NativeStore::with_settled_launcher_store(&fixture.native(), [0; 16], || Ok(())).is_err());
-    NativeStore::with_settled_launcher_store(&fixture.native(), identity, || Ok(())).unwrap();
+    assert!(NativeStore::with_settled_launcher_store(&fixture.native(), [0; 16], None, || Ok(())).is_err());
+    NativeStore::with_settled_launcher_store(&fixture.native(), identity, None, || Ok(())).unwrap();
     let mut reopened = NativeStore::open(&fixture.native()).unwrap();
     assert_eq!(reopened.identity(), identity);
     let after_closure = get(&mut reopened, &second);

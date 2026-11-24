@@ -105,11 +105,18 @@ def check(host, project, workers, prepared, scratch):
         "locks": artifact_locks,
     }))
 
-    def transition(generation, mode, *, blocked=False):
-        result = subprocess.run([
-            host, "launcher-transition", "--project", project, "--from-generation", str(generation),
-            "--to", mode, "--custody", custody,
-        ], **opts)
+    def transition(generation, mode, *, blocked=False, promote=False, cut_host=None):
+        args = [cut_host or host, "launcher-transition", "--project", project, "--from-generation", str(generation),
+                "--to", mode, "--custody", custody]
+        if promote:
+            args.append("--promote-warm-store")
+        options = opts
+        if cut_host:
+            options = {**opts, "env": {**env, "LEAN_HOST_MCP_TEST_WARM_PROMOTION_CUT": "1"}}
+        result = subprocess.run(args, **options)
+        if cut_host:
+            assert result.returncode != 0 and b"disposable cut after warm store promotion" in result.stderr, result
+            return
         if blocked:
             assert result.returncode != 0 and (
                 os.strerror(errno.EAGAIN).encode() in result.stderr
@@ -126,7 +133,6 @@ def check(host, project, workers, prepared, scratch):
         sys.modules[spec.name] = real
         spec.loader.exec_module(real)
     guard = real.guard if real else selector_reader
-    selection = real.capture(project) if real else None
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -154,11 +160,14 @@ def check(host, project, workers, prepared, scratch):
             return db.execute("PRAGMA user_version").fetchone()[0]
 
     bind = ["--bind", f"127.0.0.1:{port}"]
-    with subprocess.Popen([*managed, *bind], cwd=project, env=env) as cold:
+    previous = os.environ.get("LEAN_HOST_MCP_PREVIOUS_COLD_HOST")
+    cold_args = [previous, *managed[1:]] if previous else managed
+    with subprocess.Popen([*cold_args, *bind], cwd=project, env=env) as cold:
         try:
             listening(cold)
-            refused_broker(warm)
-            assert schema_version() == 5, "warm startup changed the cold broker's schema"
+            transition(2, "ordinary", blocked=True)
+            transition(3, "managed", blocked=True, promote=True)
+            assert schema_version() == 5, "blocked transition changed the cold broker's schema"
         finally:
             if cold.poll() is None:
                 cold.terminate()
@@ -168,11 +177,38 @@ def check(host, project, workers, prepared, scratch):
                     cold.kill()
                     cold.wait()
                     raise
+    unpromoted = subprocess.run([*managed, *warm], input=b"", **opts)
+    assert unpromoted.returncode != 0 and b"requires launcher-transition --promote-warm-store" in unpromoted.stderr, unpromoted
+    assert schema_version() == 5
+    stale_promotion = subprocess.run([
+        host, "launcher-transition", "--project", project, "--from-generation", "1", "--to", "managed",
+        "--custody", custody, "--promote-warm-store",
+    ], **opts)
+    assert stale_promotion.returncode != 0 and b"existing managed selector was not promoted" in stale_promotion.stderr
+    assert schema_version() == 5
+    transition(2, "ordinary")
+    if cut_host := os.environ.get("LEAN_HOST_MCP_WARM_PROMOTION_CUT_HOST"):
+        before = selector.read_bytes()
+        transition(3, "managed", promote=True, cut_host=cut_host)
+        assert schema_version() == 6 and selector.read_bytes() == before
+        retry_ordinary = subprocess.run(
+            [*base, "--launcher-mode", "ordinary", "--launcher-generation", "3"], input=b"", **opts
+        )
+        assert retry_ordinary.returncode == 0, retry_ordinary.stderr
+    transition(3, "managed", promote=True)
+    managed[managed.index("--launcher-generation") + 1] = "4"
+    if previous:
+        old = subprocess.run([previous, *managed[1:]], input=b"", **opts)
+        assert old.returncode != 0 and (
+            b"warm store requires --managed-warm-inspections" in old.stderr
+            or b"original launcher store schema changed" in old.stderr
+        ), old
+    selection = real.capture(project) if real else None
     with subprocess.Popen([*managed, *warm, *bind], cwd=project, env=env) as broker:
         try:
             listening(broker)
             assert schema_version() == 6
-            transition(2, "ordinary", blocked=True)
+            transition(4, "ordinary", blocked=True)
             with guard(project):
                 call = rpc(f"http://127.0.0.1:{port}/mcp")
 
@@ -202,8 +238,8 @@ def check(host, project, workers, prepared, scratch):
                     refused_broker(flags)
                 broker.send_signal(signal.SIGTERM)
                 assert broker.wait(timeout=10) == 0
-                transition(2, "ordinary", blocked=True)
-            transition(2, "ordinary")
+                transition(4, "ordinary", blocked=True)
+            transition(4, "ordinary")
             if real:
                 try:
                     with real.guard(project, expected=selection):
@@ -213,7 +249,7 @@ def check(host, project, workers, prepared, scratch):
             stale = subprocess.run([*managed, *warm], input=b"", **opts)
             assert stale.returncode != 0 and b"selection or generation changed" in stale.stderr, stale
             ordinary = subprocess.run(
-                [*base, "--launcher-mode", "ordinary", "--launcher-generation", "3"], input=b"", **opts
+                [*base, "--launcher-mode", "ordinary", "--launcher-generation", "5"], input=b"", **opts
             )
             assert ordinary.returncode == 0, ordinary.stderr
         finally:

@@ -240,9 +240,15 @@ impl LeanHostService {
                     ));
                 };
                 WorkerSidecar::require_warm_worker(&worker.path, &pin).map_err(std::io::Error::other)?;
-                store
-                    .promote_warm_contract(expected.is_some())
-                    .map_err(std::io::Error::other)?;
+                if expected.is_some() {
+                    if !store.warm_development_store().map_err(std::io::Error::other)? {
+                        return Err(std::io::Error::other(
+                            "enrolled warm store requires launcher-transition --promote-warm-store",
+                        ));
+                    }
+                } else {
+                    store.promote_warm_contract(false).map_err(std::io::Error::other)?;
+                }
             } else if store.warm_development_store().map_err(std::io::Error::other)? {
                 return Err(std::io::Error::other("warm store requires --managed-warm-inspections"));
             }

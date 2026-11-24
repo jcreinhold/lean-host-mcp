@@ -614,6 +614,15 @@ pub(crate) struct CheckedWarmFinish {
 }
 
 #[cfg(any(test, lean_host_mcp_development_warm))]
+pub(super) fn promote_warm_schema(tx: &Transaction<'_>) -> Answer<()> {
+    if !warm_schema(tx)? {
+        tx.execute_batch(PROMOTE_WARM)?;
+        tx.pragma_update(None, "user_version", WARM_SCHEMA_VERSION)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, lean_host_mcp_development_warm))]
 impl NativeStore {
     #[cfg(lean_host_mcp_development_warm)]
     pub(crate) fn warm_development_store(&self) -> Answer<bool> {
@@ -632,8 +641,7 @@ impl NativeStore {
         if require_settled && super::launcher_unsettled(&tx)? {
             return reject(Reject::WrongScope);
         }
-        tx.execute_batch(PROMOTE_WARM)?;
-        tx.pragma_update(None, "user_version", WARM_SCHEMA_VERSION)?;
+        promote_warm_schema(&tx)?;
         commit(tx, "enable-warm-contract")
     }
 

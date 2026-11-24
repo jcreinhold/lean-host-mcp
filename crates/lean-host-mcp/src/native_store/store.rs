@@ -575,6 +575,13 @@ struct ActiveStop {
     token: lean_rs_worker_parent::LeanWorkerCancellationToken,
 }
 
+pub(crate) enum LauncherWarmTransition {
+    #[cfg(lean_host_mcp_development_warm)]
+    Promote,
+    #[cfg(lean_host_mcp_development_warm)]
+    Confirm,
+}
+
 pub(crate) struct NativeStore {
     db: CheckedConnection,
     store: Id,
@@ -597,6 +604,7 @@ impl NativeStore {
     pub(crate) fn with_settled_launcher_store<T>(
         path: &std::path::Path,
         expected: Id,
+        warm_transition: Option<LauncherWarmTransition>,
         switch: impl FnOnce() -> std::io::Result<T>,
     ) -> std::io::Result<T> {
         let mut db = CheckedConnection::open_existing(path, |db| {
@@ -619,6 +627,22 @@ impl NativeStore {
         }
         if launcher_unsettled(&tx).map_err(std::io::Error::other)? {
             return Err(std::io::Error::other("managed store has unsettled stages"));
+        }
+        if let Some(warm_transition) = warm_transition {
+            #[cfg(lean_host_mcp_development_warm)]
+            match warm_transition {
+                LauncherWarmTransition::Promote => {
+                    recovery::promote_warm_schema(&tx).map_err(std::io::Error::other)?;
+                    // Exclusive project custody remains held across the store commit and selector publication.
+                    commit(tx, "promote-enrolled-warm-store").map_err(std::io::Error::other)?;
+                }
+                LauncherWarmTransition::Confirm if !recovery::warm_schema(&tx).map_err(std::io::Error::other)? => {
+                    return Err(std::io::Error::other("existing managed selector was not promoted"));
+                }
+                LauncherWarmTransition::Confirm => (),
+            }
+            #[cfg(not(lean_host_mcp_development_warm))]
+            match warm_transition {}
         }
         switch()
     }
