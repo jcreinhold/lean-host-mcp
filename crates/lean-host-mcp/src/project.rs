@@ -2140,6 +2140,13 @@ impl ProjectActorState {
                 let result = if meta.cancellation.is_cancelled() {
                     Err(self.shutdown_unavailable(&meta, "request_cancelled"))
                 } else {
+                    tracing::debug!(
+                        session_id = %self.config.session_id,
+                        correlation_id = %meta.correlation_id,
+                        imports = meta.imports.len(),
+                        queue_wait_millis = millis_u64(meta.queued_at.elapsed()),
+                        "managed inspection actor dispatch"
+                    );
                     job.run(
                         &mut self.handle,
                         self.config.prepared_generation.as_deref(),
