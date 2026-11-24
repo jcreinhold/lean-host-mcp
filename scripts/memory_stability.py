@@ -376,7 +376,9 @@ def call_record(
     runtime = nested_get(content, "telemetry", "runtime")
     if not isinstance(runtime, dict):
         runtime = {}
-    telemetry = content.get("telemetry") if isinstance(content.get("telemetry"), dict) else {}
+    telemetry = (
+        content.get("telemetry") if isinstance(content.get("telemetry"), dict) else {}
+    )
     trust = content.get("trust") if isinstance(content.get("trust"), dict) else {}
     query_facts = nested_get(content, "data", "query_facts")
     if not isinstance(query_facts, dict):
@@ -511,8 +513,12 @@ def summarize(
         # observation; this is the input. A workload that repeats one import
         # profile must leave it flat, because a reused session is not an import.
         "peak_import_residue_mib": peak_residue // (1024 * 1024),
-        "final_import_residue_mib": (final_residue // (1024 * 1024)) if isinstance(final_residue, int) else None,
-        "import_residue_budget_mib": (residue_budget // (1024 * 1024)) if isinstance(residue_budget, int) else None,
+        "final_import_residue_mib": (final_residue // (1024 * 1024))
+        if isinstance(final_residue, int)
+        else None,
+        "import_residue_budget_mib": (residue_budget // (1024 * 1024))
+        if isinstance(residue_budget, int)
+        else None,
         "max_worker_generation": max_generation,
         "final_worker_generation": final_generation,
         "worker_restarted_true_count": worker_restarted_true,
