@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.21] - 2026-11-24
+
+### Fixed
+
+- Group independent verifier modules under one admitted writer and retain bounded readiness failures and artifact trace results.
+- Bind SDK helpers to the existing ownership registry and enforce the original deadline before cold inspection dispatch.
+- Settle acknowledged warm attempts after exact generation retirement so a normal drain permits rollback without replay.
+
 ## [0.16.20] - 2026-11-24
 
 ### Fixed

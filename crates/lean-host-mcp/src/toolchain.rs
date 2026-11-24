@@ -673,7 +673,7 @@ pub(crate) struct WorkerSidecar {
 }
 
 #[cfg(lean_host_mcp_development_warm)]
-pub(crate) const WARM_WORKER_VERSION: &str = "0.10.16";
+pub(crate) const WARM_WORKER_VERSION: &str = "0.10.17";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WarmInstallation {
