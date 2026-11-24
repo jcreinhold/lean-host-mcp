@@ -174,9 +174,7 @@
       "constants": {
         "Mutation": "\"prepared-unclosed\""
       },
-      "invariants": [
-        "PreparationHandoffSafe"
-      ],
+      "invariants": ["PreparationHandoffSafe"],
       "properties": [],
       "expect": "invariant",
       "invariant": "PreparationHandoffSafe"
@@ -188,9 +186,7 @@
       "constants": {
         "Mutation": "\"prepared-fresh-deadline\""
       },
-      "invariants": [
-        "PreparationNoLateAdmission"
-      ],
+      "invariants": ["PreparationNoLateAdmission"],
       "properties": [],
       "expect": "invariant",
       "invariant": "PreparationNoLateAdmission"
@@ -202,9 +198,7 @@
       "constants": {
         "Mutation": "\"prepared-late-dispatch\""
       },
-      "invariants": [
-        "PreparationNoLateDispatch"
-      ],
+      "invariants": ["PreparationNoLateDispatch"],
       "properties": [],
       "expect": "invariant",
       "invariant": "PreparationNoLateDispatch"
@@ -216,9 +210,7 @@
       "constants": {
         "Mutation": "\"prepared-replay\""
       },
-      "invariants": [
-        "PreparationHandoffSafe"
-      ],
+      "invariants": ["PreparationHandoffSafe"],
       "properties": [],
       "expect": "invariant",
       "invariant": "PreparationHandoffSafe"
@@ -230,9 +222,7 @@
       "constants": {
         "Mutation": "\"none\""
       },
-      "invariants": [
-        "PreparationNoReadWitness"
-      ],
+      "invariants": ["PreparationNoReadWitness"],
       "properties": [],
       "expect": "invariant",
       "invariant": "PreparationNoReadWitness"
@@ -798,7 +788,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"none\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"none\""
+      },
       "properties": [],
       "invariants": ["NoWarmReuseWitness"],
       "name": "host-warm-reuse-completion-witness",
@@ -809,7 +803,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-before-end\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-before-end\""
+      },
       "properties": [],
       "invariants": ["WarmReuseOrdering"],
       "name": "host-warm-reuse-before-end",
@@ -819,7 +817,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-without-ack\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-without-ack\""
+      },
       "properties": [],
       "invariants": ["WarmReuseOrdering"],
       "name": "host-warm-reuse-without-ack",
@@ -829,7 +831,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-no-fence\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-no-fence\""
+      },
       "properties": [],
       "invariants": ["WarmReuseOrdering"],
       "name": "host-warm-reuse-no-fence",
@@ -839,7 +845,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-stale-finish\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-stale-finish\""
+      },
       "properties": [],
       "invariants": ["WarmReuseIsolation"],
       "name": "host-warm-reuse-stale-finish",
@@ -849,7 +859,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-stale-drain\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-stale-drain\""
+      },
       "properties": [],
       "invariants": ["WarmReuseIsolation"],
       "name": "host-warm-reuse-stale-drain",
@@ -859,7 +873,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-stale-ack\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-stale-ack\""
+      },
       "properties": [],
       "invariants": ["WarmReuseIsolation"],
       "name": "host-warm-reuse-stale-ack",
@@ -869,7 +887,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"expiry\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"expiry\""
+      },
       "properties": [],
       "invariants": ["NoWarmAbortWitness"],
       "name": "host-warm-reuse-expiry-witness",
@@ -880,7 +902,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"lost-ack\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"lost-ack\""
+      },
       "properties": [],
       "invariants": ["NoWarmAbortWitness"],
       "name": "host-warm-reuse-lost-ack-witness",
@@ -891,7 +917,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"none\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"none\""
+      },
       "properties": [],
       "invariants": ["NoWarmReplacementWitness"],
       "name": "host-warm-reuse-recovery-witness",
@@ -902,7 +932,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"stop\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"stop\""
+      },
       "properties": [],
       "invariants": ["NoWarmAbortWitness"],
       "name": "host-warm-reuse-stop-witness",
@@ -913,7 +947,11 @@
     {
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"eof\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"eof\""
+      },
       "properties": [],
       "invariants": ["NoWarmAbortWitness"],
       "name": "host-warm-reuse-eof-witness",
@@ -925,7 +963,11 @@
       "name": "host-warm-reuse-initial-idle-witness",
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"initial-idle\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"initial-idle\""
+      },
       "expect": "invariant",
       "properties": [],
       "invariants": ["NoWarmIdleWitness"],
@@ -936,7 +978,11 @@
       "name": "host-warm-reuse-post-finish-idle-witness",
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"post-finish-idle\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"post-finish-idle\""
+      },
       "expect": "invariant",
       "properties": [],
       "invariants": ["NoWarmIdleWitness"],
@@ -947,7 +993,11 @@
       "name": "host-warm-reuse-replacement-cannot-stop",
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-replacement-stops\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-replacement-stops\""
+      },
       "expect": "invariant",
       "properties": [],
       "invariants": ["WarmReuseClosure"],
@@ -957,7 +1007,11 @@
       "name": "host-warm-reuse-exact-closure-only",
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"return-stale\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"return-stale\""
+      },
       "expect": "invariant",
       "properties": [],
       "invariants": ["WarmReuseClosure"],
@@ -967,7 +1021,11 @@
       "name": "host-warm-reuse-guardian-needs-parent",
       "model": "Stages",
       "specification": "WarmReuseSpec",
-      "constants": { "Profile": "\"warm\"", "Fault": "\"host-permit\"", "Mutation": "\"warm-parent-required\"" },
+      "constants": {
+        "Profile": "\"warm\"",
+        "Fault": "\"host-permit\"",
+        "Mutation": "\"warm-parent-required\""
+      },
       "expect": "liveness",
       "properties": ["WarmFrozenRetires"],
       "invariants": ["WarmReuseClosure"]
@@ -1108,7 +1166,7 @@
       "name": "host-scoped-shim-legacy-exclusive",
       "model": "Stages",
       "specification": "ScopedLockSpec",
-      "constants": {"Mutation": "\"scoped-legacy-ex\""},
+      "constants": { "Mutation": "\"scoped-legacy-ex\"" },
       "expect": "pass",
       "invariants": ["NoScopedOverlap"],
       "properties": []
@@ -1117,7 +1175,7 @@
       "name": "host-scoped-shim-missing-output",
       "model": "Stages",
       "specification": "ScopedLockSpec",
-      "constants": {"Mutation": "\"scoped-omit-output\""},
+      "constants": { "Mutation": "\"scoped-omit-output\"" },
       "expect": "invariant",
       "invariants": ["ScopedWritersExcluded"],
       "properties": [],
@@ -1127,7 +1185,7 @@
       "name": "host-scoped-shim-clean-shared",
       "model": "Stages",
       "specification": "ScopedLockSpec",
-      "constants": {"Mutation": "\"scoped-clean-sh\""},
+      "constants": { "Mutation": "\"scoped-clean-sh\"" },
       "expect": "invariant",
       "invariants": ["ScopedCleanExcluded"],
       "properties": [],
@@ -1155,7 +1213,7 @@
       "name": "host-scoped-loss-guardian-only",
       "model": "Stages",
       "specification": "ScopedLossSpec",
-      "constants": {"Mutation": "\"scoped-fence-guardian-only\""},
+      "constants": { "Mutation": "\"scoped-fence-guardian-only\"" },
       "expect": "invariant",
       "invariants": ["ScopedCleanRequiresClosure"],
       "properties": [],
@@ -1165,7 +1223,7 @@
       "name": "host-scoped-loss-registry-only",
       "model": "Stages",
       "specification": "ScopedLossSpec",
-      "constants": {"Mutation": "\"scoped-fence-registry-only\""},
+      "constants": { "Mutation": "\"scoped-fence-registry-only\"" },
       "expect": "pass",
       "invariants": ["ScopedCleanRequiresClosure", "NoScopedCleanAfterClosure"],
       "properties": []
@@ -1174,7 +1232,7 @@
       "name": "host-scoped-loss-forget-binding",
       "model": "Stages",
       "specification": "ScopedLossSpec",
-      "constants": {"Mutation": "\"scoped-fence-forget-on-loss\""},
+      "constants": { "Mutation": "\"scoped-fence-forget-on-loss\"" },
       "expect": "invariant",
       "invariants": ["ScopedCleanRequiresClosure"],
       "properties": [],
@@ -1240,7 +1298,12 @@
         "Profile": "\"writer-helper-staging\""
       },
       "expect": "pass",
-      "invariants": ["TypeOK", "WriterExclusion", "ClosureIdentity", "WriterPermitSafe"],
+      "invariants": [
+        "TypeOK",
+        "WriterExclusion",
+        "ClosureIdentity",
+        "WriterPermitSafe"
+      ],
       "properties": ["WriterPermitProgress"]
     },
     {
@@ -1346,9 +1409,7 @@
         "Mutation": "\"launcher-wrong-project\""
       },
       "expect": "invariant",
-      "invariants": [
-        "LauncherProjectSafe"
-      ],
+      "invariants": ["LauncherProjectSafe"],
       "properties": [],
       "invariant": "LauncherProjectSafe"
     },
@@ -1361,9 +1422,7 @@
         "Mutation": "\"launcher-visible-start\""
       },
       "expect": "invariant",
-      "invariants": [
-        "LauncherDurabilitySafe"
-      ],
+      "invariants": ["LauncherDurabilitySafe"],
       "properties": [],
       "invariant": "LauncherDurabilitySafe"
     },
@@ -1376,9 +1435,7 @@
         "Mutation": "\"launcher-wrong-store\""
       },
       "expect": "invariant",
-      "invariants": [
-        "LauncherRollbackSafe"
-      ],
+      "invariants": ["LauncherRollbackSafe"],
       "properties": [],
       "invariant": "LauncherRollbackSafe"
     },
@@ -1391,9 +1448,7 @@
         "Mutation": "\"launcher-unsettled-rollback\""
       },
       "expect": "invariant",
-      "invariants": [
-        "LauncherRollbackSafe"
-      ],
+      "invariants": ["LauncherRollbackSafe"],
       "properties": [],
       "invariant": "LauncherRollbackSafe"
     },
@@ -1405,9 +1460,7 @@
         "Fault": "\"launcher-rollout\""
       },
       "expect": "invariant",
-      "invariants": [
-        "NoLauncherRollbackAndRestart"
-      ],
+      "invariants": ["NoLauncherRollbackAndRestart"],
       "properties": [],
       "invariant": "NoLauncherRollbackAndRestart",
       "witness": true

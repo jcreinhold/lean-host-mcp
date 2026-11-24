@@ -1,21 +1,21 @@
-name = "proofs-tooling-tests"
 buildDir = "../../.lake/build/tooling-tests"
+name = "proofs-tooling-tests"
 
 [[lean_lib]]
-name = "ShakeSafe"
 globs = ["ShakeSafe.*"]
+name = "ShakeSafe"
 
 [[lean_lib]]
-name = "StyleLint"
 globs = ["StyleLint.*"]
+name = "StyleLint"
 
 [[lean_lib]]
-name = "ProbeUses"
 globs = ["ProbeUses.*"]
+name = "ProbeUses"
 
 [[lean_lib]]
-name = "RegroupVariables"
 globs = ["RegroupVariables.*"]
+name = "RegroupVariables"
 
 [[lean_exe]]
 name = "shake-safe-tests"
