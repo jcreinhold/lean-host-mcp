@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.20] - 2026-11-24
+
+### Fixed
+
+- Use one broker capacity limit for managed readiness, trace snapshots, utility readers, and warm workers. Keep slots charged until the exact execution scope closes.
+- Transfer managed readiness locks to the verified writer helper. If the helper fails before dispatch, return capacity only after exact exit and reacquisition of every original lock.
+- Allow launcher rollback after confirmed custody closure when the original result is unknown. Preserve the original key and refuse replay.
+
 ## [0.16.19] - 2026-11-24
 
 ### Fixed

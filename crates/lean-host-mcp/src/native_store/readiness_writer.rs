@@ -370,7 +370,7 @@ pub(super) async fn run(
             deadline,
             &stage,
             prepared_generation,
-            slot.observation(),
+            &mut slot,
         )
     })
     .await
@@ -386,7 +386,7 @@ fn execute(
     deadline: AdmissionDeadline,
     stage: &Stage,
     prepared_generation: Option<String>,
-    observation: &mut Option<lean_toolchain::shared_writer::WriterExitObservation>,
+    slot: &mut crate::worker_retirement::ManagedWriterSlot,
 ) -> Result<(), McpError> {
     let no_start = |_| McpError::invalid_params("readiness_writer_not_started", None);
     let invalid_lint_input = || McpError::invalid_params("whole_library_lint_configuration_changed", None);
@@ -459,8 +459,15 @@ fn execute(
         );
     }
     let budget = deadline.remaining().map_err(|error| super::public_error(&error))?;
-    let mut writer = SharedWriter::open_with_write_roots_observed(helper, root, &roots, budget, &expired, observation)
-        .map_err(no_start)?;
+    let mut writer = SharedWriter::open_with_write_roots_handoff_observed(
+        helper,
+        root,
+        &roots,
+        budget,
+        &expired,
+        slot.observation(),
+    )
+    .map_err(no_start)?;
     if let Stage::Preparation(Target::ToolingSuites {
         lakefile_sha256,
         manifest_sha256,
@@ -618,6 +625,8 @@ fn execute(
         let _ = rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP);
     }
 
+    // A partial or failed send cannot certify that the helper saw no command.
+    slot.begin_dispatch();
     let result = writer.run_permitted(&command, permit, &|| cancellation.is_cancelled() || expired());
     // Preserve the primary waited result independently of helper settlement.
     // The caller waits for closed custody before using it.

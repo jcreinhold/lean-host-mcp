@@ -247,11 +247,27 @@ fn late_cleanup_after_unknown_reaps_and_reclaims_inputs_without_controller_exit(
             self.dropped.store(true, Ordering::SeqCst);
         }
     }
-    let keepalive: Box<dyn Send> = Box::new(Probe {
+    let probe = Probe {
         dropped: Arc::clone(&dropped),
         premature: Arc::clone(&premature),
         record: Arc::clone(&record),
+    };
+    #[cfg(feature = "managed-native-store")]
+    let broker = crate::ProjectBroker::new(crate::broker::BrokerConfig {
+        config_default: None,
+        env_default: None,
+        cwd: fixture.project.clone(),
+        max_projects: std::num::NonZeroUsize::MIN,
+        max_workers_per_project: std::num::NonZeroUsize::MIN,
+        idle_timeout: Duration::ZERO,
     });
+    #[cfg(feature = "managed-native-store")]
+    let keepalive: Box<dyn Send> = {
+        let permit = broker.try_managed_stage_slot(&fixture.project).unwrap();
+        Box::new((probe, permit))
+    };
+    #[cfg(not(feature = "managed-native-store"))]
+    let keepalive: Box<dyn Send> = Box::new(probe);
     let controller_pid = std::process::id();
     let result = run_program_with_contract(
         &contract,
@@ -263,6 +279,8 @@ fn late_cleanup_after_unknown_reaps_and_reclaims_inputs_without_controller_exit(
                 let path = inputs.lock().unwrap().clone().unwrap();
                 assert!(path.join("input").exists());
                 assert!(!dropped.load(Ordering::SeqCst));
+                #[cfg(feature = "managed-native-store")]
+                assert!(broker.try_managed_stage_slot(&fixture.root.join("readiness")).is_err());
                 *record.lock().unwrap() = Some(path.parent().unwrap().join("owner.json"));
                 panic!("injected owner failure after native payload admission");
             }
@@ -297,6 +315,8 @@ fn late_cleanup_after_unknown_reaps_and_reclaims_inputs_without_controller_exit(
         !premature.load(Ordering::SeqCst),
         "admission/source custody dropped before actual native scope closure"
     );
+    #[cfg(feature = "managed-native-store")]
+    wait_for(|| broker.try_managed_stage_slot(&fixture.root.join("readiness")).is_ok());
     fixture.assert_exclusive_available();
     fs::write(fixture.root.join("go-next"), "go").unwrap();
     let result = run_program_with_contract(

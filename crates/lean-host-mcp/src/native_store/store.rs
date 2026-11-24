@@ -360,9 +360,11 @@ pub(crate) fn caller_schema_valid(db: &Connection) -> rusqlite::Result<bool> {
     )?);
     Ok(true)
 }
+// A consumed grant cannot replay. Once its exact scope is closed, missing
+// result evidence remains unknown but cannot retain launcher custody.
 fn launcher_unsettled(db: &Connection) -> rusqlite::Result<bool> {
     db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM stages WHERE gate=0 OR resource_report IN (1,2) OR (gate=1 AND (resource_report<>3 OR result_kind=0)))",
+            "SELECT EXISTS(SELECT 1 FROM stages WHERE gate=0 OR resource_report IN (1,2) OR (gate=1 AND resource_report<>3))",
             [], |row| row.get(0),
         )
 }
@@ -1550,6 +1552,57 @@ fn read_stage_columns(db: &Connection, key: NativeKey, include_admission: bool) 
         }
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+#[test]
+fn launcher_rollback_accepts_closed_unknown_without_resurrecting_consumed_grant()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().canonicalize()?.join("stages.sqlite3");
+    let mut store = NativeStore::create_new(&path)?;
+    let id = store.identity();
+    let key = NativeKey {
+        store: id,
+        epoch: 1,
+        nonce: [23; 16],
+        stage: 1,
+    };
+    let cap = Capability([24; 32]);
+    store.create_intent(key, &cap, b"diagnostics", None, StageAdmission::Initial(None), |_| {
+        Ok(())
+    })?;
+    let binding = store.bind_scope(
+        key,
+        &cap,
+        Scope {
+            id: [25; 16],
+            generation: 1,
+            owner: [26; 16],
+        },
+    )?;
+    assert!(matches!(store.consume_launch(binding, &cap)?, Consume::Granted(_)));
+
+    let rollback = || NativeStore::with_settled_launcher_store(&path, id, None, || Ok("ordinary"));
+    for report in [ResourceReport::None, ResourceReport::Open, ResourceReport::Stopping] {
+        store.observe_resource(binding, &cap, report)?;
+        let error = rollback().err().ok_or("rollback accepted unresolved custody")?;
+        assert_eq!(error.to_string(), "managed store has unsettled stages");
+    }
+    store.observe_resource(binding, &cap, ResourceReport::Closed)?;
+    drop(store);
+    assert_eq!(rollback()?, "ordinary");
+
+    let mut store = NativeStore::open(&path)?;
+    let get = serde_json::json!({"version":1,"command":{"op":"get","key":key,"capability":cap.0}});
+    let reply = store.admission(get.to_string().as_bytes())?;
+    assert_eq!(reply["key"], serde_json::to_value(key)?);
+    assert_eq!(reply["custody"], "closed");
+    assert_eq!(reply["execution"], "unknown");
+    assert_eq!(reply["result"], serde_json::json!({"state":"pending"}));
+    assert!(matches!(store.consume_launch(binding, &cap)?, Consume::AlreadyConsumed));
+    assert_eq!(store.admission(get.to_string().as_bytes())?, reply);
+    Ok(())
 }
 
 #[cfg(test)]

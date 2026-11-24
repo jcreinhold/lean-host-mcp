@@ -520,6 +520,9 @@ pub(crate) async fn start(
         };
         let request = recovery_request(key, original.intent, capability.clone())
             .ok_or_else(|| invalid("invalid_reader_intent"))?;
+        let slot = broker
+            .try_managed_stage_slot(&root)
+            .map_err(|_| McpError::internal_error("utility_reader_busy", None))?;
         let store = Arc::clone(store);
         let max_workers = broker.config_snapshot().max_workers;
         tokio::task::spawn_blocking(move || {
@@ -546,6 +549,7 @@ pub(crate) async fn start(
                 lint,
                 architecture,
                 max_workers,
+                slot,
             );
             stage.finish(result, intent.declarations.as_deref(), lint, architecture)
         })
@@ -585,6 +589,7 @@ fn execute(
     lint: Option<module_lint::Request<'_>>,
     architecture: bool,
     capacity_limit: usize,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<NativeReaderResult> {
     let selected = ToolchainId::from_lake_root(root).map_err(io::Error::other)?;
     if selected.window_verdict() != WindowVerdict::Supported {
@@ -650,7 +655,9 @@ fn execute(
         Some(&helper),
         Some((scope, deadline)),
         Some(stage),
-        None,
+        // The existing reader owner transfers this permit to its reaper on
+        // an uncertain return. The SDK still owns physical scope admission.
+        Some(Box::new(slot)),
         &cancelled,
         &mut spawned,
     )
