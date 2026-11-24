@@ -406,6 +406,20 @@ mod tests {
     }
 
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    fn wait_for_writer_locks(mut settled: impl FnMut() -> bool) {
+        // A concurrent fork may retain a copy of a loaned file description
+        // until exec. Exact helper exit alone does not prove lock closure.
+        let started = Instant::now();
+        while !settled() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "original writer locks did not settle"
+            );
+            thread::sleep(RETIREMENT_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn failed_ready_returns_capacity_after_exact_lock_contention_clears() {
         let root = tempfile::tempdir().expect("disposable writer directory");
@@ -416,7 +430,11 @@ mod tests {
             .write(true)
             .open(&identity.path)
             .expect("open exact original lock");
-        contender.try_lock().expect("hold original lock during retirement poll");
+        wait_for_writer_locks(|| match contender.try_lock() {
+            Ok(()) => true,
+            Err(fs::TryLockError::WouldBlock) => false,
+            Err(error) => panic!("could not lock original inode: {error}"),
+        });
         let slots = Arc::new(Semaphore::new(1));
         let mut state = RetirementState::default();
         state.pending.push(RetiringWorker {
@@ -428,8 +446,11 @@ mod tests {
         });
         state.reap();
         assert_eq!(slots.available_permits(), 0);
-        drop(contender);
-        state.reap();
+        contender.unlock().expect("release the fixture's original lock");
+        wait_for_writer_locks(|| {
+            state.reap();
+            state.pending.is_empty()
+        });
         assert_eq!(slots.available_permits(), 1);
         assert!(state.pending.is_empty());
         state.reap();
@@ -441,7 +462,7 @@ mod tests {
     fn dispatch_uncertainty_keeps_capacity_after_exact_failed_exit_and_free_locks() {
         let root = tempfile::tempdir().expect("disposable writer directory");
         let observation = failed_ready_observation(&root.path().canonicalize().expect("canonical fixture"));
-        assert!(writer_locks_released(observation.lock_identities()));
+        wait_for_writer_locks(|| writer_locks_released(observation.lock_identities()));
         let slots = Arc::new(Semaphore::new(1));
         let mut state = RetirementState::default();
         state.pending.push(RetiringWorker {
