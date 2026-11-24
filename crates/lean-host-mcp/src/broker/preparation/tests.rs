@@ -25,7 +25,9 @@ if sys.argv[1] == '--lean-rs-ready-host-artifacts':
     if not (root / 'ready').exists():
         sys.exit(75)
 elif sys.argv[1] == '--lean-rs-prepare-host-artifacts':
-    (root / 'preparing').write_text(str(os.getpid()))
+    # Publish readiness only after the PID file is complete.
+    (root / 'preparing.tmp').write_text(str(os.getpid()))
+    (root / 'preparing.tmp').replace(root / 'preparing')
     while not (root / 'go').exists():
         time.sleep(0.01)
     (root / 'ready').write_text('ready')
@@ -214,7 +216,7 @@ async fn cancelled_preparation_stops_actual_child_releases_pause_and_does_not_re
     assert_eq!(evidence.pending, 0);
     assert_eq!(evidence.target_check.unwrap().disposition, "not_started");
     let pid = rustix::process::Pid::from_raw(pid).unwrap();
-    wait_for(|| rustix::process::test_kill_process(pid).is_err()).await;
+    wait_for(|| rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)).await;
     assert!(
         !broker
             .runtime_control(&RuntimeControlRequest::default())
@@ -298,7 +300,7 @@ async fn dropped_preparation_waiter_cancels_owned_child_without_replay() {
     drop(prepare);
     assert!(cancellation.is_cancelled());
     let pid = rustix::process::Pid::from_raw(pid).unwrap();
-    wait_for(|| rustix::process::test_kill_process(pid).is_err()).await;
+    wait_for(|| rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)).await;
     assert!(
         !broker
             .runtime_control(&RuntimeControlRequest::default())
