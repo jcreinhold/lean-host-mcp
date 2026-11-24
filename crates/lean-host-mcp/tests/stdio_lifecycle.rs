@@ -236,6 +236,20 @@ impl StdioServer {
     }
 
     async fn request_with_notifications(&mut self, method: &str, params: Value) -> (Value, Vec<Value>) {
+        self.request_with_budget(method, params, Duration::from_secs(30)).await
+    }
+
+    async fn request_with_budget(&mut self, method: &str, params: Value, budget: Duration) -> (Value, Vec<Value>) {
+        let tool = params.get("name").and_then(Value::as_str).unwrap_or(method);
+        let managed_op = params
+            .pointer("/arguments/request")
+            .and_then(Value::as_str)
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        let op = managed_op
+            .as_ref()
+            .and_then(|value| value.pointer("/command/op"))
+            .and_then(Value::as_str);
+        let label = op.map_or_else(|| tool.to_owned(), |op| format!("{tool}/{op}"));
         let id = self.next_id;
         self.next_id = self.next_id.checked_add(1).expect("request id overflow");
         let message = json!({
@@ -245,9 +259,12 @@ impl StdioServer {
             "params": params
         });
         self.write_message(&message).await;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(budget)
+            .expect("MCP receive deadline");
         let mut notifications = Vec::new();
         loop {
-            let response = self.read_response().await;
+            let response = self.read_response(deadline, &label, id).await;
             if response.get("id").and_then(Value::as_u64) == Some(id) {
                 return (response, notifications);
             }
@@ -272,15 +289,15 @@ impl StdioServer {
         stdin.flush().await.expect("flush request");
     }
 
-    async fn read_response(&mut self) -> Value {
-        tokio::time::timeout(Duration::from_secs(30), async {
+    async fn read_response(&mut self, deadline: tokio::time::Instant, label: &str, id: u64) -> Value {
+        tokio::time::timeout_at(deadline, async {
             let mut line = String::new();
             let bytes = self.stdout.read_line(&mut line).await.expect("read response");
-            assert!(bytes > 0, "server stdout closed before response");
+            assert!(bytes > 0, "server stdout closed before response to {label} (id {id})");
             serde_json::from_str(line.trim_end()).expect("parse response")
         })
         .await
-        .expect("timed out waiting for MCP response")
+        .unwrap_or_else(|_| panic!("timed out waiting for MCP response to {label} (id {id})"))
     }
 
     async fn close_stdin_and_wait(mut self) {
@@ -613,15 +630,25 @@ mod launcher_regressions {
         server.close_stdin_and_wait().await;
     }
 
+    fn managed_execution_budget() -> Duration {
+        // Let a cold execution return its own managed admission deadline result.
+        Duration::from_millis(lean_host_mcp::ProjectRuntimeConfig::default().request_timeout_millis())
+            .saturating_add(Duration::from_secs(15))
+    }
+
     async fn managed(server: &mut StdioServer, command: Value) -> Value {
-        let reply = server
-            .request(
-                "tools/call",
-                json!({"name":"lean_managed_admission","arguments":{
-                    "request":json!({"version":1,"command":command}).to_string()
-                }}),
-            )
-            .await;
+        let params = json!({"name":"lean_managed_admission","arguments":{
+            "request":json!({"version":1,"command":command}).to_string()
+        }});
+        let reply = if command.get("op").and_then(Value::as_str) == Some("start") {
+            let (reply, _) = server
+                .request_with_budget("tools/call", params, managed_execution_budget())
+                .await;
+            assert!(reply.get("error").is_none(), "MCP request failed: {reply:?}");
+            reply
+        } else {
+            server.request("tools/call", params).await
+        };
         serde_json::from_str(
             reply
                 .pointer("/result/content/0/text")
@@ -1186,7 +1213,8 @@ unsafe def main (args : List String) : IO UInt32 := do
         let checker = root.join("scripts/lean/check-decls.lean");
         fs::write(
             &checker,
-            r#"import Lean
+            r#"import Lean.Environment
+import Lean.ImportingFlag
 open Lean
 
 unsafe def main (args : List String) : IO UInt32 := do
@@ -1456,9 +1484,10 @@ unsafe def main (args : List String) : IO UInt32 := do
         fs::write(path, source).expect("restore same source");
 
         let first = {
-            let request = server.request("tools/call", trial(&original, commands));
+            let request =
+                server.request_with_budget("tools/call", trial(&original, commands), managed_execution_budget());
             tokio::pin!(request);
-            tokio::select! {
+            let (first, _) = tokio::select! {
                 first = &mut request => first,
                 () = tokio::time::sleep(Duration::from_secs(25)) => {
                     let phase = rusqlite::Connection::open_with_flags(
@@ -1471,7 +1500,7 @@ unsafe def main (args : List String) : IO UInt32 := do
                             "SELECT gate, spawn, resource_report, result_kind FROM stages
                              WHERE epoch=?1 AND nonce=?2 AND stage=1",
                             rusqlite::params![original.get("epoch").and_then(Value::as_i64).expect("original epoch"), nonce],
-                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
                         )
                     });
                     eprintln!(
@@ -1480,7 +1509,9 @@ unsafe def main (args : List String) : IO UInt32 := do
                     );
                     request.await
                 }
-            }
+            };
+            assert!(first.get("error").is_none(), "MCP request failed: {first:?}");
+            first
         };
         let result = first.get("result").expect("trial result");
         let rendered = result.to_string();
