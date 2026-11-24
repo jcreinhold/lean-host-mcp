@@ -112,6 +112,13 @@ python3 tests/r2-launch-input/module_setup.py
 if "$managed_release"; then
     scripts/check-parent-link.sh "$R2_SETUP_PARENT"
     if "$warm_release"; then
+        # Public hosted verification can install the prior registry image.
+        # Local paired runs may instead supply an existing exact executable.
+        if [[ ${GITHUB_ACTIONS:-} == true && -z ${LEAN_HOST_MCP_PREVIOUS_COLD_HOST:-} ]]; then
+            cargo install --debug --locked --root "$scratch/previous-cold" \
+                --version '=0.16.18' --features managed-native-store lean-host-mcp
+            export LEAN_HOST_MCP_PREVIOUS_COLD_HOST="$scratch/previous-cold/bin/lean-host-mcp"
+        fi
         warm_scratch=$(mktemp -d "${RUNNER_TEMP:-$CARGO_TARGET_DIR}/w.XXXXXX")
         python3 tests/r2-launch-input/prepare_generation.py --warm-inspection \
             --host "$R2_SETUP_PARENT" --writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer" \

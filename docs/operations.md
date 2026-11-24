@@ -396,6 +396,22 @@ digest-aware host with `LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` unset. Keep the sa
 Use `make mcp-rollback` for the supported Proofs launcher. This procedure has been qualified with source-built
 images. Published package identities require a repeat with the installed artifacts.
 
+### Enrolled warm launcher transition
+
+After draining the selected project, use the installed host built with `managed-warm-inspections` and the original
+custody descriptor to switch an enrolled ordinary project to warm managed serving.
+
+```sh
+lean-host-mcp launcher-transition --project "$PROJECT" --from-generation "$GENERATION" \
+  --to managed --promote-warm-store --custody "$CUSTODY"
+```
+
+The transition durably promotes the original store before publishing the managed selector. If interrupted, retry the
+same command and retain the original store and custody descriptor. An already promoted store keeps its UUID and
+results. Start the matching managed host with `--managed-warm-inspections` after the selector transition succeeds.
+Cold transitions omit `--promote-warm-store`. For ordinary rollback, drain both broker and callers, verify the store
+has settled, and switch with `--to ordinary` on the same matching host. The store schema remains at its promoted version.
+
 ## Build, test, lint
 
 ```sh

@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.19] - 2026-11-24
+
+### Fixed
+
+- Let managed HTTP callers share the project selector lock while one broker owns the private store directory.
+- Promote enrolled warm stores only during an exclusive launcher transition, so a running cold broker cannot share a store during promotion.
+
 ## [0.16.18] - 2026-11-23
 
 ### Added
@@ -748,7 +755,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.18...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.19...HEAD
+[0.16.19]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.18...v0.16.19
 [0.16.18]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.17...v0.16.18
 [0.16.17]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.16...v0.16.17
 [0.16.16]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.15...v0.16.16
