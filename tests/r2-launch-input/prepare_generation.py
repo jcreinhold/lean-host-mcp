@@ -25,7 +25,9 @@ def main():
     host, writer, sysroot = (p.resolve(strict=True) for p in (args.host, args.writer, args.sysroot))
     with tempfile.TemporaryDirectory(prefix="pg.", dir=args.scratch.resolve(strict=True)) as directory:
         project = Path(directory)
-        dep = project / "dep"
+        # The source-closure resolver searches the project first. On a
+        # case-insensitive volume, "dep" shadows the Dep module prefix.
+        dep = project / ("dep" if args.warm_inspection else "dependency")
         dep.mkdir()
         env = {**os.environ, "TMPDIR": directory, "LEAN_SYSROOT": str(sysroot)}
         for key in ("LEAN_PATH", "LEAN_SRC_PATH", "ELAN_TOOLCHAIN"):
@@ -33,7 +35,7 @@ def main():
         for root in (project, dep):
             (root / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n")
         (project / "lakefile.toml").write_text(
-            "name = 'root'\n[[require]]\nname = 'dep'\npath = 'dep'\n[[lean_lib]]\nname = 'Root'\n"
+            f"name = 'root'\n[[require]]\nname = 'dep'\npath = '{dep.name}'\n[[lean_lib]]\nname = 'Root'\n"
         )
         (dep / "lakefile.toml").write_text("name = 'dep'\n[[lean_lib]]\nname = 'Dep'\n")
         (dep / "Dep.lean").write_text("theorem dependency_ok : True := True.intro\n")
