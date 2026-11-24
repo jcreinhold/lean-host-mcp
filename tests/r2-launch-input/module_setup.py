@@ -92,9 +92,9 @@ def inventory(p):
     }
 
 
-# The packaged search uses the server's normal two-minute request budget.
+# Packaged search and retained verification use the normal two-minute request budget.
 # Give the response a bounded transport margin without extending other probes.
-SEARCH_REQUEST_MILLIS = 120_000
+COLD_REQUEST_MILLIS = 120_000
 TRANSPORT_MARGIN_SECONDS = 10
 MAX_RESPONSE_BYTES = 1_048_576
 
@@ -133,8 +133,8 @@ def probe(p, *, search=False, diagnostics=False, retained=False):
             b / "journal",
         ],
         env=(
-            dict(env, LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS=str(SEARCH_REQUEST_MILLIS))
-            if search else env
+            dict(env, LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS=str(COLD_REQUEST_MILLIS))
+            if search or retained else env
         ),
         stdin=s.PIPE,
         stdout=s.PIPE,
@@ -178,23 +178,28 @@ def probe(p, *, search=False, diagnostics=False, retained=False):
                         kind="proof_search", file="Demo.lean", declaration="demo"
                     ),
                 ),
-                timeout=SEARCH_REQUEST_MILLIS / 1000 + TRANSPORT_MARGIN_SECONDS,
+                timeout=COLD_REQUEST_MILLIS / 1000 + TRANSPORT_MARGIN_SECONDS,
             )
         arguments = {"targets": [{"kind": "explicit", "file": "Demo.lean", "declarations": ["demo"]}]}
         if not retained:
             return rpc(2, "tools/call", {"name": "lean_verify", "arguments": arguments})
 
-        def request(i, **fields):
-            return tool_payload(rpc(i, "tools/call", {"name": "lean_request", "arguments": fields}))
+        def request(i, *, timeout=40, **fields):
+            return tool_payload(rpc(i, "tools/call", {"name": "lean_request", "arguments": fields}, timeout=timeout))
 
         ticket = request(2, action="prepare", tool="lean_verify", arguments=arguments)
         key = {"request_id": ticket["taskId"], "request_epoch": ticket["request"]["request_epoch"]}
+        deadline = time.monotonic() + COLD_REQUEST_MILLIS / 1000 + TRANSPORT_MARGIN_SECONDS
         task = request(3, action="submit", tool="lean_verify", arguments=arguments, **key)
-        deadline = time.monotonic() + 30
         while task["execution"]["disposition"] == "pending":
-            assert time.monotonic() < deadline, task
-            time.sleep(0.1)
-            task = request(4, action="get", **key)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"retained lean_verify exceeded its receive budget: {task}")
+            time.sleep(min(0.1, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"retained lean_verify exceeded its receive budget: {task}")
+            task = request(4, action="get", timeout=min(40, remaining), **key)
         assert task["status"] == "completed" and task["result_available"], task
         envelope = tool_payload({"result": task["result"]})
         assert envelope["trust"]["cli_file_verification"]["server_instance_id"] == ticket["request"]["server_instance_id"]
