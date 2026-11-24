@@ -12,7 +12,6 @@ use lean_toolchain::shared_writer::{SharedWriter, WriterStagePermit};
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
 use serde::Deserialize;
-use tokio::sync::Semaphore;
 
 use crate::{
     ProjectBroker,
@@ -59,7 +58,6 @@ enum Stage {
 }
 
 pub(super) const OPERATION: &str = "lake_mathlib_cache_readiness_v1";
-static SLOT: Semaphore = Semaphore::const_new(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -351,8 +349,8 @@ pub(super) async fn run(
     let deadline = original
         .admission_deadline
         .ok_or_else(|| invalid("missing_admission_deadline"))?;
-    let slot = SLOT
-        .try_acquire()
+    let slot = broker
+        .try_managed_stage_slot(&root)
         .map_err(|_| McpError::internal_error("readiness_busy", None))?;
     let store = Arc::clone(store);
     let prepared_generation = broker.prepared_generation().map(str::to_owned);
@@ -362,7 +360,7 @@ pub(super) async fn run(
         return Err(invalid("setup_verification_prepared_generation_changed"));
     }
     tokio::task::spawn_blocking(move || {
-        let _slot = slot;
+        let mut slot = crate::worker_retirement::ManagedWriterSlot::new(slot);
         execute(
             &helper,
             &root,
@@ -372,6 +370,7 @@ pub(super) async fn run(
             deadline,
             &stage,
             prepared_generation,
+            slot.observation(),
         )
     })
     .await
@@ -387,6 +386,7 @@ fn execute(
     deadline: AdmissionDeadline,
     stage: &Stage,
     prepared_generation: Option<String>,
+    observation: &mut Option<lean_toolchain::shared_writer::WriterExitObservation>,
 ) -> Result<(), McpError> {
     let no_start = |_| McpError::invalid_params("readiness_writer_not_started", None);
     let invalid_lint_input = || McpError::invalid_params("whole_library_lint_configuration_changed", None);
@@ -459,7 +459,8 @@ fn execute(
         );
     }
     let budget = deadline.remaining().map_err(|error| super::public_error(&error))?;
-    let mut writer = SharedWriter::open_with_write_roots(helper, root, &roots, budget, &expired).map_err(no_start)?;
+    let mut writer = SharedWriter::open_with_write_roots_observed(helper, root, &roots, budget, &expired, observation)
+        .map_err(no_start)?;
     if let Stage::Preparation(Target::ToolingSuites {
         lakefile_sha256,
         manifest_sha256,

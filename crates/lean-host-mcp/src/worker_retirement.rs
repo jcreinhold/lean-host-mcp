@@ -31,7 +31,7 @@ impl WorkerSlot {
         Self {
             retirement: Some(RetiringWorker {
                 _permit: permit,
-                tracker,
+                scope: RetiringScope::Worker(tracker),
             }),
             registry: Arc::clone(&RETIREMENTS),
         }
@@ -54,7 +54,48 @@ pub(crate) fn poll_retirements() {
 
 struct RetiringWorker {
     _permit: OwnedSemaphorePermit,
-    tracker: LeanWorkerProcessTracker,
+    scope: RetiringScope,
+}
+
+enum RetiringScope {
+    Worker(LeanWorkerProcessTracker),
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    Writer(lean_toolchain::shared_writer::WriterExitObservation),
+}
+
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+pub(crate) struct ManagedWriterSlot {
+    permit: Option<OwnedSemaphorePermit>,
+    observation: Option<lean_toolchain::shared_writer::WriterExitObservation>,
+}
+
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+impl ManagedWriterSlot {
+    pub(crate) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            permit: Some(permit),
+            observation: None,
+        }
+    }
+
+    pub(crate) fn observation(&mut self) -> &mut Option<lean_toolchain::shared_writer::WriterExitObservation> {
+        &mut self.observation
+    }
+}
+
+#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+impl Drop for ManagedWriterSlot {
+    fn drop(&mut self) {
+        // The SDK sets the observer at spawn, including on a failed Ready.
+        // Once spawned, only successful exact helper exit proves settlement.
+        if let (Some(permit), Some(observation)) = (self.permit.take(), self.observation.take()) {
+            RETIREMENTS.state.lock().pending.push(RetiringWorker {
+                _permit: permit,
+                scope: RetiringScope::Writer(observation),
+            });
+            RETIREMENTS.poll();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -68,7 +109,11 @@ impl RetirementState {
         // This also drives the upstream tracker's pending-Child cleanup when
         // its own best-effort reaper thread could not be created. Only a
         // confirmed wait/try_wait result decreases the tracker count.
-        self.pending.retain(|worker| worker.tracker.active_processes() != 0);
+        self.pending.retain(|worker| match &worker.scope {
+            RetiringScope::Worker(tracker) => tracker.active_processes() != 0,
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            RetiringScope::Writer(observation) => !observation.status().is_some_and(|status| status.success()),
+        });
     }
 }
 
@@ -270,7 +315,7 @@ mod tests {
         let registry = Arc::new(RetirementRegistry::default());
         registry.state.lock().pending.push(RetiringWorker {
             _permit: Arc::clone(&semaphore).try_acquire_owned().expect("reserve actor slot"),
-            tracker: tracker.clone(),
+            scope: RetiringScope::Worker(tracker.clone()),
         });
         registry.poll_with(|_registry| Err(io::Error::other("injected thread creation failure")));
         assert_eq!(registry.state.lock().pending.len(), 1);

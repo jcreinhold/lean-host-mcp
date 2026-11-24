@@ -1384,6 +1384,21 @@ impl ProjectBroker {
         Ok(())
     }
 
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn try_managed_stage_slot(&self, root: &Path) -> Result<OwnedSemaphorePermit> {
+        crate::worker_retirement::poll_retirements();
+        let mut inner = self.inner.lock();
+        Self::check_runtime_admission(&mut inner, root)?;
+        // Do not jump a cold worker already waiting for a released slot.
+        let _turn = self
+            .capacity_admission
+            .try_lock()
+            .map_err(|_| Self::pool_unavailable(root, "worker_pool_busy", true))?;
+        Arc::clone(&self.worker_slots)
+            .try_acquire_owned()
+            .map_err(|_| Self::pool_unavailable(root, "worker_pool_busy", true))
+    }
+
     async fn reserve_worker_slot(&self, root: &Path, deadline: tokio::time::Instant) -> Result<OwnedSemaphorePermit> {
         crate::worker_retirement::poll_retirements();
         let cancellation = CallCancellation::current();

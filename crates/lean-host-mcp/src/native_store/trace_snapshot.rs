@@ -4,7 +4,6 @@ use std::{io, path::PathBuf, sync::Arc, time::Duration};
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
 use serde::Deserialize;
-use tokio::sync::Semaphore;
 
 use crate::{
     ProjectBroker,
@@ -14,7 +13,6 @@ use crate::{
 };
 
 pub(super) const OPERATION: &str = "lake_artifact_traces_v1";
-static TRACE_READER: Semaphore = Semaphore::const_new(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,8 +57,8 @@ pub(super) async fn run(
     let deadline = original
         .admission_deadline
         .ok_or_else(|| invalid("missing_admission_deadline"))?;
-    let slot = TRACE_READER
-        .try_acquire()
+    let slot = broker
+        .try_managed_stage_slot(&root)
         .map_err(|_| McpError::internal_error("trace_reader_busy", None))?;
     let store = Arc::clone(store);
     tokio::task::spawn_blocking(move || {
@@ -128,7 +126,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     #[tokio::test]
-    async fn retained_trace_result_reopens_without_reading_changed_artifacts() {
+    async fn managed_trace_shares_capacity_and_reopens_without_rereading_artifacts() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().canonicalize().unwrap();
         let root = directory.join("project");
@@ -149,7 +147,7 @@ mod tests {
                 env_default: Some(root.clone()),
                 config_default: None,
                 cwd: root.clone(),
-                max_projects: NonZeroUsize::MIN,
+                max_projects: NonZeroUsize::new(3).unwrap(),
                 max_workers_per_project: NonZeroUsize::MIN,
                 idle_timeout: Duration::ZERO,
             },
@@ -178,7 +176,35 @@ mod tests {
             .lock()
             .admission_with_budget(create.as_bytes(), Some(Duration::from_secs(10)))
             .unwrap();
+        // Keep one warm actor permit and an independent readiness turn
+        // charged while exercising the actual trace admission path.
+        let warm = crate::worker_retirement::WorkerSlot::new(
+            broker.try_managed_stage_slot(&directory.join("warm")).unwrap(),
+            lean_rs_worker_parent::LeanWorkerProcessTracker::new(),
+        );
+        let readiness = crate::worker_retirement::ManagedWriterSlot::new(
+            broker.try_managed_stage_slot(&directory.join("readiness")).unwrap(),
+        );
+        let occupied = broker.try_managed_stage_slot(&directory.join("other")).unwrap();
+        assert_eq!(
+            start(&broker, &store, key, capability.clone())
+                .await
+                .unwrap_err()
+                .message,
+            "trace_reader_busy"
+        );
+        drop(occupied);
         let result = start(&broker, &store, key, capability.clone()).await.unwrap();
+        let status = broker.runtime_control(&crate::broker::RuntimeControlRequest::default());
+        assert_eq!(status.pool.occupied_slots, 2);
+        drop(readiness);
+        drop(warm);
+        assert!(
+            broker
+                .runtime_control(&crate::broker::RuntimeControlRequest::default())
+                .pool
+                .workers_stopped
+        );
         assert_eq!(result["custody"], "closed");
         assert_eq!(result["result"]["state"], "retained");
         drop(store);
