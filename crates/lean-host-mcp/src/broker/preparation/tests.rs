@@ -309,29 +309,40 @@ async fn dropped_preparation_waiter_cancels_owned_child_without_replay() {
     assert!(!fixture.root.join("ready").exists());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cold_preparation_deadline_releases_lease_without_cancelling_existing_work() {
+    use std::future::{Future as _, poll_fn};
+
     let broker = broker();
-    let fixture = Fixture::new();
+    let directory = tempfile::tempdir().unwrap();
     let _earlier_slot = Arc::clone(&broker.worker_slots).acquire_owned().await.unwrap();
     let cancellation = CallCancellation::default();
-    let result = broker
-        .prepare_host_artifacts(
-            &fixture.root,
-            &fixture.worker,
-            &fixture.sysroot,
-            &fixture.writer,
-            tokio::time::Instant::now()
-                .checked_add(Duration::from_millis(150))
-                .unwrap(),
-            &cancellation,
-        )
-        .await;
+    let budget = Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now().checked_add(budget).unwrap();
+    // Exercise the drain after a cold readiness result. The helper's process
+    // startup time cannot decide whether this test reaches lease acquisition.
+    let drain = broker.preparation_drain(directory.path(), deadline, &cancellation);
+    tokio::pin!(drain);
+    poll_fn(|cx| {
+        assert!(
+            drain.as_mut().poll(cx).is_pending(),
+            "drain must wait for the earlier slot"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(
+        broker
+            .runtime_control(&RuntimeControlRequest::default())
+            .pool
+            .admission_paused
+    );
+    tokio::time::advance(budget).await;
+    let result = drain.await;
     assert!(matches!(result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "project_admission_timeout"));
     let snapshot = broker.runtime_control(&RuntimeControlRequest::default());
     assert!(!snapshot.pool.admission_paused);
     assert_eq!(snapshot.pool.occupied_slots, 1);
-    assert_eq!(fixture.preparation_count(), 0);
     assert!(!cancellation.is_cancelled());
 }
 
