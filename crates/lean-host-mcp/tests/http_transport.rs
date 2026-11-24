@@ -15,7 +15,6 @@ use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStderr, Command};
 
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
@@ -1837,17 +1836,17 @@ impl HttpMcpServer {
     }
 
     async fn start_with_env(args: &[(&str, &str)], envs: &[(&str, &str)]) -> Self {
-        let bind = reserve_loopback_addr();
         let config_dir = tempfile::tempdir().expect("temp config dir").keep();
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command
             .kill_on_drop(true)
             .arg("--bind")
-            .arg(bind.to_string())
+            .arg("127.0.0.1:0")
             .env_remove(WRITER_ENV)
             .env_remove(LEGACY_WRITER_ENV)
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
-            .env("RUST_LOG", "warn")
+            .env("RUST_LOG", "warn,lean_host_mcp::transport_http=info")
+            .env("NO_COLOR", "1")
             // These tests read `structuredContent` and full telemetry; opt into both.
             .env("LEAN_HOST_MCP_RESPONSE_CARRIER", "both")
             .env("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full")
@@ -1868,8 +1867,27 @@ impl HttpMcpServer {
 
         let mut child = command.spawn().expect("spawn lean-host-mcp HTTP server");
         let stderr = child.stderr.take().expect("server stderr");
-        let stderr_task = tokio::spawn(read_stderr(stderr));
-        wait_for_listen(bind).await;
+        let mut stderr = BufReader::new(stderr);
+        let mut startup = String::new();
+        let bind: SocketAddr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                let bytes = stderr.read_line(&mut line).await.expect("read server startup");
+                assert!(bytes > 0, "HTTP server exited before listening:\n{startup}");
+                startup.push_str(&line);
+                if line.contains("Streamable HTTP transport listening") {
+                    return line
+                        .split_whitespace()
+                        .find_map(|field| field.strip_prefix("bind="))
+                        .expect("actual HTTP bind address")
+                        .parse()
+                        .expect("valid HTTP bind address");
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("HTTP server did not announce its listening address:\n{startup}"));
+        let stderr_task = tokio::spawn(read_stderr(stderr, startup));
 
         Self {
             child,
@@ -2064,25 +2082,7 @@ fn reserve_loopback_addr() -> SocketAddr {
     addr
 }
 
-async fn wait_for_listen(addr: SocketAddr) {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_secs(5))
-        .expect("deadline should fit in tokio Instant range");
-    loop {
-        if TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "HTTP server did not start listening at {addr}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn read_stderr(stderr: ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr);
-    let mut out = String::new();
+async fn read_stderr(mut reader: BufReader<ChildStderr>, mut out: String) -> String {
     let mut line = String::new();
     loop {
         line.clear();
