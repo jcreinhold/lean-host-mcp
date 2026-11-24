@@ -43,6 +43,14 @@ Run targeted checks for the changed behavior. Before tagging, run the full `scri
 cargo-deny and is for iteration. Release and toolchain-bump procedures live in `.claude/skills/`, with discovery aliases
 under `.agents/skills/`.
 
+## Release rule
+
+Test changes spanning the SDK and this repo together locally before pushing or tagging. Use temporary Cargo
+`[patch.crates-io]` overrides. Check the resolved crates with `cargo metadata --format-version 1`, then run the
+affected real Lean operation and this repo's required `scripts/prerelease.sh` checks. Do not publish an SDK crate just
+to test it here. Do not commit local paths or an override lockfile. When the whole change passes locally, release the
+batch upstream first, resolve the published pins, and keep the required release checks.
+
 ## Runtime boundaries
 
 - Only `crates/lean-host-mcp-worker` links `libleanshared`. The parent uses the link-free worker-parent/protocol and
