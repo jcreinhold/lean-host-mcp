@@ -345,7 +345,11 @@ impl GroupedVerifierReceipt {
                         && first.group_index == Some(receipt.completed_groups)
                         && first.exit_code.is_some_and(|code| code != 0)
                 }
-                _ => false,
+                Phase::Configuration
+                | Phase::BlueprintInputs
+                | Phase::Inventory
+                | Phase::InventoryMismatch
+                | Phase::Sources => false,
             }
         } else {
             receipt.completed_groups == expected_groups
