@@ -14,6 +14,7 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| anyhow::anyhow!("expected cache, toolchain label, sysroot and packaged host"))?;
+    lean_host_mcp::shared_writer::configure_native_startup()?;
     let started = Instant::now();
     let runtime = build_cached_with_writer(
         SemanticSearchRuntimeBuild {

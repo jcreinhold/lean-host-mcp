@@ -368,6 +368,7 @@ mod tests {
     fn failed_ready_observation(root: &Path) -> lean_toolchain::shared_writer::WriterExitObservation {
         use lean_toolchain::shared_writer::SharedWriter;
 
+        crate::shared_writer::ownership_registry().expect("test host ownership registry");
         let project = root.join("demo");
         fs::create_dir(&project).expect("create disposable project");
         fs::write(project.join("lakefile.toml"), "name = 'demo'\n").expect("write Lake project");

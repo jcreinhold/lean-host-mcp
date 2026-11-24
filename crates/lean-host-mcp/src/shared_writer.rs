@@ -13,6 +13,7 @@
 //! and cannot safely signal a surviving or late-forked descendant.
 
 use std::cell::Cell;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, IoSlice, Read, Seek, Write};
 use std::mem::MaybeUninit;
@@ -26,7 +27,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lean_toolchain::native_guardian::{OWNERS_DIRECTORY_ENV, bind_registry_directory};
 use lean_toolchain::process_group::OwnedCommandGroup;
+use lean_toolchain::shared_writer::{LEGACY_MODULE_SETUP_CAPTURE_ENV, MODULE_SETUP_CAPTURE_ENV};
 use lean_toolchain::writer_demand::{ReadAdmission, WriterDemand};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{FdFlags, fcntl_setfd};
@@ -50,6 +53,33 @@ pub struct WriterContract {
     pub ownership_registry: PathBuf,
 }
 
+/// Check the writer settings and bind the host registry before native startup.
+///
+/// # Errors
+/// Refuses conflicting writer aliases or an unavailable ownership registry.
+pub fn configure_native_startup() -> io::Result<()> {
+    lean_toolchain::shared_writer::writer_executable_from_env()?;
+    ownership_registry()?;
+    Ok(())
+}
+
+/// Bind the SDK to the host's existing worker and writer ownership directory.
+///
+/// # Errors
+/// Returns an error if the directory cannot be resolved or bound to the SDK.
+pub fn ownership_registry() -> io::Result<PathBuf> {
+    let directory = if let Some(path) = std::env::var_os(OWNERS_DIRECTORY_ENV) {
+        PathBuf::from(path)
+    } else {
+        dirs::data_local_dir()
+            .ok_or_else(|| io::Error::other("local data directory unavailable"))?
+            .join("lean-host-mcp")
+            .join("native-generations")
+    };
+    bind_registry_directory(&directory)?;
+    Ok(directory)
+}
+
 /// Report the current executable, without a path-specific compatibility pin.
 ///
 /// # Errors
@@ -58,7 +88,7 @@ pub fn contract() -> io::Result<WriterContract> {
     Ok(WriterContract {
         protocol: PROTOCOL,
         executable: std::env::current_exe()?.canonicalize()?,
-        ownership_registry: lean_toolchain::native_guardian::registry_directory()?,
+        ownership_registry: ownership_registry()?,
     })
 }
 
@@ -505,7 +535,7 @@ fn acquire_while_until(
         if !lean_toolchain::shared_writer::previous_writer_stopped(&file)?
             || (!shared
                 && !lean_toolchain::native_guardian::protected_native_reads_stopped(
-                    &lean_toolchain::native_guardian::registry_directory()?,
+                    &ownership_registry()?,
                     path,
                     (opened.dev(), opened.ino()),
                 )?)
@@ -548,7 +578,7 @@ fn validate_workspace_custody(workspaces: &[PathBuf], locks: &[(PathBuf, File)])
             return Err(invalid("writer domain inode changed after admission"));
         }
         if !lean_toolchain::native_guardian::protected_native_reads_stopped(
-            &lean_toolchain::native_guardian::registry_directory()?,
+            &ownership_registry()?,
             path,
             (opened.dev(), opened.ino()),
         )? {
@@ -952,18 +982,34 @@ const CAPTURE_BYTES: usize = 64 * 1024;
 
 // The required setup is temporary input for the broker. Only its digest crosses the control frame.
 pub(crate) const MODULE_SETUP_LIMIT: usize = 16 * 1024 * 1024;
-pub(crate) const MODULE_SETUP_ENV: &str = "LEAN_HOST_MCP_CAPTURE_MODULE_SETUP";
 pub(crate) const MODULE_SETUP_FILE: &str = "module-setup.json";
 
 fn module_setup_path(message: &Value, root: &Path, assets: &Path) -> io::Result<Option<PathBuf>> {
     let env = field(message, "env");
-    if env.get(MODULE_SETUP_ENV).is_none() {
+    let current = env.get(MODULE_SETUP_CAPTURE_ENV);
+    let former = env.get(LEGACY_MODULE_SETUP_CAPTURE_ENV);
+    if current.is_none() && former.is_none() {
         return Ok(None);
     }
-    let refused = || invalid("marked writer stage requires selected Lake no-build setup-file for this project");
-    if env != &json!({(MODULE_SETUP_ENV): "1", "LAKE_CACHE_DIR": assets, "LAKE_ARTIFACT_CACHE": "false"})
-        || field(message, "cwd").as_str() != root.to_str()
+    if let (Some(current), Some(former)) = (current, former)
+        && current != former
     {
+        return Err(invalid(format!(
+            "conflicting {MODULE_SETUP_CAPTURE_ENV} and {LEGACY_MODULE_SETUP_CAPTURE_ENV}"
+        )));
+    }
+    let refused = || invalid("marked writer stage requires selected Lake no-build setup-file for this project");
+    let mut expected = serde_json::Map::from_iter([
+        ("LAKE_CACHE_DIR".to_owned(), json!(assets)),
+        ("LAKE_ARTIFACT_CACHE".to_owned(), json!("false")),
+    ]);
+    if current.is_some() {
+        expected.insert(MODULE_SETUP_CAPTURE_ENV.to_owned(), json!("1"));
+    }
+    if former.is_some() {
+        expected.insert(LEGACY_MODULE_SETUP_CAPTURE_ENV.to_owned(), json!("1"));
+    }
+    if env.as_object() != Some(&expected) || field(message, "cwd").as_str() != root.to_str() {
         return Err(refused());
     }
     let args = field(message, "command").as_array().ok_or_else(refused)?;
@@ -1161,6 +1207,7 @@ fn execute_with_launcher(
     record: &Owner,
     input: &Receiver<io::Result<Value>>,
     launcher: &Path,
+    registry: &Path,
     setup_path: Option<&Path>,
     mut emit: impl FnMut(&Value) -> io::Result<()>,
 ) -> io::Result<bool> {
@@ -1187,6 +1234,7 @@ fn execute_with_launcher(
     let mut command = Command::new(launcher);
     command
         .arg("writer-exec")
+        .env(OWNERS_DIRECTORY_ENV, registry)
         .stdin(Stdio::piped())
         .stdout(child_stdout)
         .stderr(child_stderr);
@@ -1357,6 +1405,7 @@ fn execute_with_launcher(
 /// # Errors
 /// Returns admission, protocol, process-observation, or child-launch failures.
 pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
+    let registry = ownership_registry()?;
     if args.lock != lean_toolchain::shared_writer::project_lock_path(&args.root)? {
         return Err(invalid("writer lock differs from canonical project domain"));
     }
@@ -1444,9 +1493,18 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         send(&json!({"state":"locked","owner":record,"lock_loans":receipt,"asset_dir":asset_dir}))?;
         while let Ok(message) = input.recv() {
-            let message = message?;
+            let mut message = message?;
             match field(&message, "action").as_str() {
                 Some("run") => {
+                    // The launcher supplies this value. Keep it out of the stage's own environment schema.
+                    if message
+                        .get_mut("env")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|env| env.remove(OWNERS_DIRECTORY_ENV))
+                        .is_some_and(|value| value.as_str().map(OsStr::new) != Some(registry.as_os_str()))
+                    {
+                        return Err(invalid(format!("writer stage cannot change {OWNERS_DIRECTORY_ENV}")));
+                    }
                     // Re-derive the declared graph immediately before this stage.
                     // Unknown or expanded graphs never release a command body.
                     for required in workspace_domains(&workspaces)? {
@@ -1464,7 +1522,7 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                             return Err(invalid("writer domain inode changed before GO"));
                         }
                         if !lean_toolchain::native_guardian::protected_native_reads_stopped(
-                            &lean_toolchain::native_guardian::registry_directory()?,
+                            &registry,
                             path,
                             (opened.dev(), opened.ino()),
                         )? {
@@ -1481,6 +1539,7 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                         &record,
                         &input,
                         &std::env::current_exe()?,
+                        &registry,
                         setup_path.as_deref(),
                         send,
                     )? {

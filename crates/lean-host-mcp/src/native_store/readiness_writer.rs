@@ -441,6 +441,7 @@ fn execute(
     slot: &mut crate::worker_retirement::ManagedWriterSlot,
 ) -> Result<(), McpError> {
     let no_start = |_| McpError::invalid_params("readiness_writer_not_started", None);
+    let ownership_registry = crate::shared_writer::ownership_registry().map_err(no_start)?;
     let invalid_lint_input = || McpError::invalid_params("whole_library_lint_configuration_changed", None);
     if let Stage::Preparation(Target::WholeLint { lakefile_sha256 }) = stage {
         writer_preparation::whole_lint::check_config(root, lakefile_sha256).map_err(|_| invalid_lint_input())?;
@@ -454,9 +455,7 @@ fn execute(
                 .lock()
                 .database_path()
                 .is_some_and(|path| path.starts_with(&build))
-            || lean_toolchain::native_guardian::registry_directory()
-                .map_err(unsafe_clean)?
-                .starts_with(&build)
+            || ownership_registry.starts_with(&build)
             || std::env::temp_dir().starts_with(&build)
         {
             return Err(McpError::invalid_params(

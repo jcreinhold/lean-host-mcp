@@ -92,7 +92,7 @@ impl Fixture {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.worker);
-        configure(&mut command, &self.sysroot, &self.writer, Mode::Prepare);
+        configure(&mut command, &self.sysroot, &self.writer, &self.root, Mode::Prepare).unwrap();
         command
     }
 }
@@ -119,29 +119,34 @@ fn success_requires_real_child_exit_and_exact_disk_snapshot() {
 
 #[test]
 fn actual_preparation_command_scrubs_inherited_native_ownership() {
+    use lean_toolchain::shared_writer::SHARED_WRITER_EXECUTABLE_ENV;
+
     let fixture = Fixture::new("success");
     let mut command = Command::new(&fixture.worker);
-    for key in SCRUB_ENV {
+    for key in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
         command.env(key, "must-not-reach-preparation");
     }
     command
-        .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", "shared-registry-kept")
-        .env("LEAN_SYSROOT", "wrong")
-        .env("LEAN_HOST_MCP_WRITER_EXECUTABLE", "wrong");
-    configure(&mut command, &fixture.sysroot, &fixture.writer, Mode::Prepare);
+        .env(OWNERS_DIRECTORY_ENV, "ignored-registry")
+        .env("LEAN_SYSROOT", "wrong");
+    configure(
+        &mut command,
+        &fixture.sysroot,
+        &fixture.writer,
+        &fixture.root,
+        Mode::Prepare,
+    )
+    .unwrap();
     start(command, LIMIT, Mode::Prepare).unwrap().wait().unwrap();
     let environment: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.root.join("environment")).unwrap()).unwrap();
-    for key in SCRUB_ENV {
+    for key in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
         assert!(environment.get(*key).is_none(), "inherited {key} must be removed");
     }
-    assert_eq!(
-        environment["LEAN_RS_WORKER_OWNERS_DIRECTORY"].as_str(),
-        Some("shared-registry-kept")
-    );
+    assert_eq!(environment[OWNERS_DIRECTORY_ENV].as_str(), fixture.root.to_str());
     assert_eq!(environment["LEAN_SYSROOT"].as_str(), fixture.sysroot.to_str());
     assert_eq!(
-        environment["LEAN_HOST_MCP_WRITER_EXECUTABLE"].as_str(),
+        environment[SHARED_WRITER_EXECUTABLE_ENV].as_str(),
         fixture.writer.to_str()
     );
 }

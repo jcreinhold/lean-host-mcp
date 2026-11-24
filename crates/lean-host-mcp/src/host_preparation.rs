@@ -16,7 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts;
-use lean_toolchain::shared_writer::WriterDisposition;
+use lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV;
+use lean_toolchain::shared_writer::{WRITER_HANDOFF_ENV, WriterDisposition, configure_writer_executable};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 const STDOUT_LIMIT: usize = 64 * 1024;
@@ -37,7 +38,6 @@ const SCRUB_ENV: &[&str] = &[
     "LEAN_RS_NATIVE_GUARDIAN_WORKER_PID",
     "LEAN_RS_WORKER_SHARED_ARTIFACT_READS",
     "LEAN_RS_PREPARED_HOST_ARTIFACTS",
-    "LEAN_HOST_MCP_WRITER_LOCK_LOANS",
 ];
 
 /// Failed preparation supplies no native check result or independent-H exit proof.
@@ -142,25 +142,27 @@ fn run(
     if cancelled() {
         return Err(PreparationFailure::no_spawn("host preparation cancelled before launch"));
     }
+    let registry = crate::shared_writer::ownership_registry().map_err(PreparationFailure::no_spawn)?;
     let mut command = Command::new(worker);
-    configure(&mut command, sysroot, writer, mode);
+    configure(&mut command, sysroot, writer, &registry, mode).map_err(PreparationFailure::no_spawn)?;
     start(command, timeout, mode)?.wait_cancellable(cancelled)
 }
 
-fn configure(command: &mut Command, sysroot: &Path, writer: &Path, mode: Mode) {
+fn configure(command: &mut Command, sysroot: &Path, writer: &Path, registry: &Path, mode: Mode) -> io::Result<()> {
     command
         .arg(match mode {
             Mode::Prepare => "--lean-rs-prepare-host-artifacts",
             Mode::Ready => "--lean-rs-ready-host-artifacts",
         })
         .env("LEAN_SYSROOT", sysroot)
-        .env("LEAN_HOST_MCP_WRITER_EXECUTABLE", writer)
+        .env(OWNERS_DIRECTORY_ENV, registry)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for name in SCRUB_ENV {
+    for name in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
         command.env_remove(name);
     }
+    configure_writer_executable(command, Some(writer))
 }
 
 #[derive(Default)]

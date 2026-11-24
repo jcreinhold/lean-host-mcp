@@ -128,6 +128,7 @@ mod macos {
         let [sdk, toolchain, destination, writer] = arguments.as_slice() else {
             anyhow::bail!("usage: build_development_shims SDK_CHECKOUT TOOLCHAIN EMPTY_OUTPUT_DIR WRITER");
         };
+        lean_host_mcp::shared_writer::configure_native_startup()?;
         let toolchain = toolchain.to_str().context("toolchain must be UTF-8")?;
         let version = match toolchain {
             "leanprover/lean4:v4.35.0" => "4.35.0",

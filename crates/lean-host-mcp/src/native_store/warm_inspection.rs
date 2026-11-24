@@ -151,7 +151,7 @@ impl Job {
             return Err(internal("warm inspection source changed before consume"));
         }
         let registry = RegistryIdentity {
-            directory: registry_directory().map_err(internal)?.as_os_str().as_bytes().to_vec(),
+            directory: ownership_registry().map_err(internal)?.as_os_str().as_bytes().to_vec(),
             device: expected.registry_device,
             inode: expected.registry_inode,
             generation: expected.generation.clone(),

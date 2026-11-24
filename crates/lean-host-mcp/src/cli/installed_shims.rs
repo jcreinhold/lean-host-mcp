@@ -13,6 +13,7 @@ pub(super) fn prepare(
     LeanWorkerPreparedHostArtifacts,
     lean_toolchain::shared_writer::SharedWriter,
 )> {
+    crate::shared_writer::ownership_registry()?;
     fs::create_dir(destination)?;
     for row in include_str!("shim-inputs-0.10.6.txt").lines() {
         let (hash, name) = row.split_once(' ').context("invalid packaged shim inventory")?;

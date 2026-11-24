@@ -145,6 +145,7 @@ impl Fixture {
             &self.record,
             input,
             &self.launcher,
+            &self.root.join("owners"),
             message["setup"]
                 .as_bool()
                 .unwrap_or(false)

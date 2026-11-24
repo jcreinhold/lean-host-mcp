@@ -79,6 +79,7 @@ fn wait_for(path: &Path) {
 }
 
 fn rejected_terminal(mode: &str) -> WriterFailure {
+    super::ownership_registry().expect("test host ownership registry");
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let executable = root.join("fake-sdk-helper");

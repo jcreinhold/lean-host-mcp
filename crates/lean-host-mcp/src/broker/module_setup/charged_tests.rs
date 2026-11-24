@@ -45,7 +45,16 @@ fn charged_setup_requires_positive_budget_and_bound_capability() -> io::Result<(
     ] {
         assert!(check_capability(descriptor(project, domain, capabilities).as_bytes(), root, lock).is_err());
     }
-    check_capability(descriptor("/project", "/lock", &caps).as_bytes(), root, lock)
+    assert_eq!(
+        check_capability(descriptor("/project", "/lock", &caps).as_bytes(), root, lock)?,
+        LEGACY_MODULE_SETUP_CAPTURE_ENV
+    );
+    let neutral = ["lake_module_setup_capture_v1", "lake_module_setup_capture_env_v2"];
+    assert_eq!(
+        check_capability(descriptor("/project", "/lock", &neutral).as_bytes(), root, lock)?,
+        MODULE_SETUP_CAPTURE_ENV
+    );
+    Ok(())
 }
 
 #[tokio::test]

@@ -184,6 +184,10 @@ const DEFAULT_HTTP_PATH: &str = "/mcp";
 fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
+    if let Err(error) = configure_native_startup(cli.command.as_ref()) {
+        eprintln!("lean-host-mcp native settings: {error}");
+        return ExitCode::FAILURE;
+    }
     match cli.command {
         #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
         Some(Command::LauncherTransition(args)) => match args.run() {
@@ -328,6 +332,25 @@ fn main() -> ExitCode {
     }
 }
 
+fn configure_native_startup(command: Option<&Command>) -> std::io::Result<()> {
+    match command {
+        Some(
+            Command::Config { .. }
+            | Command::Doctor {
+                command: DoctorCommand::Processes(_),
+            }
+            | Command::WriterLockPath(_)
+            | Command::WriterExec
+            | Command::NativeGuardian,
+        ) => return Ok(()),
+        Some(Command::InstallWorker(args)) if args.list || args.clean || args.prune => return Ok(()),
+        #[cfg(target_os = "linux")]
+        Some(Command::NativeReaderWait(_)) => return Ok(()),
+        _ => {}
+    }
+    lean_host_mcp::shared_writer::configure_native_startup()
+}
+
 #[cfg(unix)]
 fn prepare_generation(plan: &std::path::Path, writer: &std::path::Path) -> anyhow::Result<String> {
     use std::io::Read as _;
@@ -464,7 +487,7 @@ fn check_writer_rollback(root: &std::path::Path, device: u64, inode: u64, draine
             "disable source-bound admission and confirm supported launchers are drained before rollback",
         ));
     }
-    if lean_toolchain::native_guardian::registry_directory()? != root {
+    if lean_host_mcp::shared_writer::ownership_registry()? != root {
         return Err(std::io::Error::other(
             "rollback registry differs from the selected native registry",
         ));

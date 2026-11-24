@@ -14,6 +14,15 @@ the [tool catalog](tool-catalog.md) for request and response contracts.
 Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set,
 otherwise `$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700.
 The SDK removes each worker's socket on closure. Durable owner records continue to use their configured registry.
+The host passes `LEAN_RS_WORKER_OWNERS_DIRECTORY` to its SDK helpers. The default is
+`lean-host-mcp/native-generations` under the platform's local data directory. On macOS this is
+`$HOME/Library/Application Support/lean-host-mcp/native-generations`. Keep the same canonical directory when
+restarting the server, including across launcher mode and binary changes. `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR`
+sets the separate server PID directory used by `doctor processes`.
+
+The SDK writer executable setting is `LEAN_RS_WRITER_EXECUTABLE`. Launch environments may still use
+`LEAN_HOST_MCP_WRITER_EXECUTABLE` during the transition. A startup that supplies both must supply identical values.
+The server still selects its embedded writer for ordinary operations and honors explicit standalone-writer selections.
 
 ## Configuration file
 

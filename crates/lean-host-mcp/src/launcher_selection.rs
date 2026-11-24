@@ -211,6 +211,7 @@ impl Transition {
             return Err(invalid("custody pins exceed limit"));
         }
         let pins: Custody = serde_json::from_slice(&bytes)?;
+        crate::shared_writer::ownership_registry()?;
         let original_store = selected.managed_store.clone();
         let expected_store = uuid::Uuid::parse_str(&selected.managed_store_uuid).map_err(io::Error::other)?;
         with_drained_project(

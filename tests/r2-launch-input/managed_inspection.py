@@ -61,8 +61,10 @@ def run_check(args):
     ]
 
     @contextmanager
-    def server(*, stop_before_arm=False, stop_after_claim=False):
+    def server(*, stop_before_arm=False, stop_after_claim=False, neutral_writer=False):
         child_env = dict(env)
+        if neutral_writer:
+            child_env["LEAN_RS_WRITER_EXECUTABLE"] = child_env.pop("LEAN_HOST_MCP_WRITER_EXECUTABLE")
         if args.warm_reuse:
             child_env.update(
                 LEAN_HOST_MCP_IDLE_TIMEOUT_SECS="30",
@@ -859,6 +861,14 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             assert expected.startswith(trace) and time.monotonic() < end, (expected, trace)
             time.sleep(0.01)
 
+    def reacquire_locks(pins):
+        with ExitStack() as handles:
+            for path, expected in pins:
+                handle = handles.enter_context(open(path, "rb"))
+                physical = os.fstat(handle.fileno())
+                assert (physical.st_dev, physical.st_ino) == expected, path
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     with server() as (managed, result, tool, proc):
         discovery = result(managed("discover"))
         assert args.warm_reuse in discovery["operations"], "candidate does not advertise matched warm inspection"
@@ -908,7 +918,8 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             assert json.loads(payload)["declaration"]["name"] == args.declaration
             return done["result"]
 
-        assert pool()["occupied_slots"] == 0
+        original_pool = pool()
+        assert original_pool["occupied_slots"] == 0
         first, authorization = admit()
         try:
             if release is not None:
@@ -936,9 +947,15 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             assert (ordinal, ended) == (1, 1)
             worker = identity["worker"]["pid"]
             guardian = identity["guardian"]["pid"]
-            record = root / "owners" / f"worker-{identity['generation']}" / "owner.json"
+            registry = root / "owners"
+            record = registry / f"worker-{identity['generation']}" / "owner.json"
             owned = json.loads(record.read_bytes())
             assert owned["process"] == identity["worker"] and owned["guardian"] == identity["guardian"], owned
+            if entry_trace is None:
+                assert bytes(identity["directory"]) == os.fsencode(registry), identity
+                admission_lock = registry / ".admission.lock"
+                admission = admission_lock.stat(follow_symlinks=False)
+                admission_identity = (admission.st_dev, admission.st_ino)
             entry = f"{worker} {args.declaration}\n"
             wait_entries(entry)
             assert_artifact_locks_held(record)
@@ -1033,12 +1050,11 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
                     break
                 assert stopped["occupied_slots"] == 1 and time.monotonic() < end, stopped
                 time.sleep(0.04)
-            with ExitStack() as locks:
-                for domain in owned["protected_domains"]:
-                    handle = locks.enter_context(open(domain["lock_path"], "rb"))
-                    physical = os.fstat(handle.fileno())
-                    assert (physical.st_dev, physical.st_ino) == (domain["device"], domain["inode"])
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            artifact_locks = [
+                (domain["lock_path"], (domain["device"], domain["inode"]))
+                for domain in owned["protected_domains"]
+            ]
+            reacquire_locks(artifact_locks)
             for pid in (worker, guardian):
                 remaining = subprocess.run(
                     ["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, check=False,
@@ -1047,9 +1063,8 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             wait_entries(entry * 2)
             assert pool()["occupied_slots"] == 0
             if entry_trace is None:
-                recovered = result(managed("get", **second))
-                assert recovered["custody"] == "closed" and recovered["result"]["state"] == "retained", recovered
-                assert recovered["result"] == second_saved, recovered
+                closed = result(managed("get", **second))
+                assert closed["custody"] == "closed" and closed["result"] == second_saved, closed
                 print("Shipping warm lookups shared worker and guardian births; original GET survived retirement")
             else:
                 print("Two exact warm lookups shared worker and guardian births; stale A requests left B unchanged")
@@ -1059,6 +1074,26 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             if release is not None:
                 release.touch()
             saved_copy.unlink(missing_ok=True)
+
+    if entry_trace is None:
+        assert proc.returncode == 0, "original broker did not close normally"
+        with server(neutral_writer=True) as (managed, result, tool, replacement):
+            restarted = pool()
+            assert restarted["instance_id"] != original_pool["instance_id"], restarted
+            discovery = result(managed("discover"))
+            assert discovery["store"] == second["key"]["store"], discovery
+            assert discovery["acceptance_epoch"] == second["key"]["epoch"], discovery
+            assert result(managed("get", **second)) == closed
+            assert result(managed("start", **second)) == closed
+            assert bound(second) == (identity, 2, 1)
+            after = pool()
+            assert after["workers_stopped"] and after["outstanding_jobs"] == 0, after
+            assert registry.resolve(strict=True) == registry
+            physical = registry.stat()
+            assert (physical.st_dev, physical.st_ino) == (identity["device"], identity["inode"]), registry
+            reacquire_locks([(admission_lock, admission_identity), *artifact_locks])
+            print("Writer setting transition recovered the exact original result and reacquired the same locks")
+        assert replacement.returncode == 0, "replacement broker did not close normally"
 
 
 def observe_frozen_warm_expiry(proc, record, identity, owned, release, marker, baseline,

@@ -20,6 +20,8 @@ use tokio::process::{Child, ChildStderr, Command};
 
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
+const LEGACY_WRITER_ENV: &str = "LEAN_HOST_MCP_WRITER_EXECUTABLE";
 const EXPECTED_TOOLS: [&str; 8] = [
     "lean_compatibility",
     "lean_context",
@@ -365,6 +367,44 @@ async fn invalid_http_startup_config_exits() {
             stderr.contains("lean-host-mcp exited with error"),
             "stderr should include startup failure, got: {stderr}"
         );
+    }
+}
+
+#[tokio::test]
+async fn conflicting_writer_aliases_refuse_http_startup_before_opening_state() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    let owners = root.join("native-owners");
+    let processes = root.join("processes");
+    let journal = root.join("journal");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+    command
+        .kill_on_drop(true)
+        .current_dir(&root)
+        .arg("--bind")
+        .arg(reserve_loopback_addr().to_string())
+        .arg("--request-journal")
+        .arg(&journal)
+        .env_remove("LEAN_HOST_MCP_PROJECT")
+        .env_remove("LEAN_HOST_MCP_HTTP_PATH")
+        .env("LEAN_HOST_MCP_CONFIG_DIR", root.join("config"))
+        .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", &processes)
+        .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", &owners)
+        .env(WRITER_ENV, root.join("sdk-writer"))
+        .env(LEGACY_WRITER_ENV, root.join("former-writer"))
+        .stdin(Stdio::null());
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .expect("conflicting writer settings must exit before serving")
+        .expect("run lean-host-mcp with conflicting writer settings");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(WRITER_ENV) && stderr.contains(LEGACY_WRITER_ENV),
+        "{stderr}"
+    );
+    for path in [&owners, &processes, &journal] {
+        assert!(!path.exists(), "refused startup opened {}", path.display());
     }
 }
 
@@ -1804,6 +1844,8 @@ impl HttpMcpServer {
             .kill_on_drop(true)
             .arg("--bind")
             .arg(bind.to_string())
+            .env_remove(WRITER_ENV)
+            .env_remove(LEGACY_WRITER_ENV)
             .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
             .env("RUST_LOG", "warn")
             // These tests read `structuredContent` and full telemetry; opt into both.
@@ -2356,7 +2398,11 @@ async fn assert_drain_resumes(real_worker: bool) {
 async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
     use std::os::unix::fs::PermissionsExt;
 
-    for trap in [false, true] {
+    for (trap, writer_keys) in [
+        (false, &[LEGACY_WRITER_ENV][..]),
+        (true, &[WRITER_ENV][..]),
+        (true, &[LEGACY_WRITER_ENV, WRITER_ENV][..]),
+    ] {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().canonicalize().unwrap();
         std::fs::write(root.join("lakefile.toml"), "name = \"pure\"\n").unwrap();
@@ -2387,16 +2433,15 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
         .unwrap();
         std::fs::set_permissions(&helper_trap, std::fs::Permissions::from_mode(0o700)).unwrap();
         let namespace = root.join("native-owners");
+        let processes = root.join("processes");
         let root_s = root.to_str().unwrap();
-        let server = HttpMcpServer::start_with_env(
-            &[("--lake-root", root_s)],
-            &[
-                ("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap()),
-                ("LEAN_HOST_MCP_WRITER_EXECUTABLE", helper_trap.to_str().unwrap()),
-                ("LEAN_RS_WORKER_OWNERS_DIRECTORY", namespace.to_str().unwrap()),
-            ],
-        )
-        .await;
+        let mut settings = vec![
+            ("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap()),
+            ("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", processes.to_str().unwrap()),
+            ("LEAN_RS_WORKER_OWNERS_DIRECTORY", namespace.to_str().unwrap()),
+        ];
+        settings.extend(writer_keys.iter().map(|&key| (key, helper_trap.to_str().unwrap())));
+        let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s)], &settings).await;
         let mut owner = TaskHttpClient::new(&server.url);
         let acquired = owner.control(json!({"action":"acquire"})).await;
         assert_eq!(acquired["status"], "acquired");
@@ -2437,6 +2482,11 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
         .unwrap();
         assert_eq!(native["contract_sha256"], sha256_hex(&digest_input));
         assert_eq!(native["shared_writer"]["protocol"], 1);
+        let server_executable = Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")).canonicalize().unwrap();
+        assert_eq!(
+            native["shared_writer"]["executable"],
+            server_executable.to_str().unwrap()
+        );
         assert_eq!(
             native["shared_writer"]["ownership_registry"],
             namespace.to_str().unwrap()

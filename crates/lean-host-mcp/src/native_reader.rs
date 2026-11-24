@@ -14,9 +14,12 @@ use std::time::{Duration, Instant};
 use lean_rs_worker_parent::{
     LeanWorkerNativePendingCleanup, LeanWorkerNativeScope, LeanWorkerNativeScopeLease, LeanWorkerNativeSpawnError,
 };
-use lean_toolchain::native_guardian::{GuardianHandle, NativeCapacitySlot, NativeProcessIdentity, NativeReadDomain};
+use lean_toolchain::native_guardian::{
+    GuardianHandle, NativeCapacitySlot, NativeProcessIdentity, NativeReadDomain, OWNERS_DIRECTORY_ENV,
+};
 use lean_toolchain::process_group::{MeasuredChild, WaitedChildUsage};
 use lean_toolchain::shared_reader::SharedReader;
+use lean_toolchain::shared_writer::WRITER_HANDOFF_ENV;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use serde::{Deserialize, Serialize};
 
@@ -46,8 +49,6 @@ const PRIVATE_ENV: &[&str] = &[
     "LEAN_RS_NATIVE_GUARDIAN_WORKER_PID",
     "LEAN_RS_WORKER_SHARED_ARTIFACT_READS",
     "LEAN_RS_PREPARED_HOST_ARTIFACTS",
-    "LEAN_HOST_MCP_WRITER_LOCK_LOANS",
-    "LEAN_HOST_MCP_WRITER_WORKSPACES",
 ];
 
 /// Internal external-reader contract; all execution arguments follow `--`.
@@ -784,9 +785,10 @@ fn run_internal(
     if let Some(program) = program {
         command.envs(program.environment.iter().cloned());
     }
-    for name in PRIVATE_ENV {
+    for name in PRIVATE_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
         command.env_remove(name);
     }
+    command.env(OWNERS_DIRECTORY_ENV, &helper.ownership_registry);
     if let Some(program) = program {
         command
             .env(PROGRAM_CWD_ENV, &program.cwd)
@@ -1073,8 +1075,8 @@ fn verified_stdin(args: &NativeReaderArgs) -> io::Result<Option<(std::fs::File, 
             .ok_or_else(|| invalid("native stdin descriptor is not UTF-8"))?,
     )
     .map_err(io::Error::other)?;
-    let registry = std::env::var_os(lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV)
-        .ok_or_else(|| invalid("native stdin owner namespace missing"))?;
+    let registry =
+        std::env::var_os(OWNERS_DIRECTORY_ENV).ok_or_else(|| invalid("native stdin owner namespace missing"))?;
     let nonce = std::env::var("LEAN_RS_WORKER_PARENT_NONCE").map_err(io::Error::other)?;
     if nonce.len() != 48 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid("native stdin generation missing"));
@@ -1181,7 +1183,7 @@ pub fn run_exec(args: &NativeReaderArgs) -> io::Result<()> {
         waiter
     };
     command.current_dir(payload_cwd).stdin(stdin);
-    for name in PRIVATE_ENV {
+    for name in PRIVATE_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
         command.env_remove(name);
     }
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]

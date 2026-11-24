@@ -12,7 +12,7 @@ use lean_rs_worker_parent::{
     LeanWorkerCancellationToken, LeanWorkerDeclarationInspectionRequest, LeanWorkerDeclarationInspectionResult,
     LeanWorkerHostHandle, LeanWorkerOutputBudgets,
 };
-use lean_toolchain::native_guardian::{NativeGuardianDrainBinding, registry_directory};
+use lean_toolchain::native_guardian::NativeGuardianDrainBinding;
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use crate::native_store::store::{
     AdmissionDeadline, Binding, CallerKey, Capability, Consume, Gate, NativeKey, NativeStore, Problem, Reject,
     ResourceReport, SavedRequest, Scope, recovery::RegistryIdentity,
 };
+use crate::shared_writer::ownership_registry;
 use crate::{ProjectBroker, broker::ProjectHint, error::ServerError};
 
 pub(crate) const NAMED_INSPECTION: &str = "lean_declaration_inspection_v1";
@@ -386,7 +387,7 @@ impl Job {
             return Err(internal("inspection source changed before consuming launch"));
         }
         let registry = RegistryIdentity {
-            directory: registry_directory().map_err(internal)?.as_os_str().as_bytes().to_vec(),
+            directory: ownership_registry().map_err(internal)?.as_os_str().as_bytes().to_vec(),
             device: expected.registry_device,
             inode: expected.registry_inode,
             generation: expected.generation.clone(),
@@ -830,7 +831,7 @@ fn observe_recovered_closure(identity: &RegistryIdentity) -> std::io::Result<boo
     use std::{fs, io};
 
     let registry = std::path::Path::new(std::ffi::OsStr::from_bytes(&identity.directory));
-    if registry != registry_directory()? || !identity.matches_directory() {
+    if registry != ownership_registry()? || !identity.matches_directory() {
         return Ok(false);
     }
     match observe_original_guardian_closure(registry, &native_binding(identity), Duration::from_millis(100)) {
@@ -916,7 +917,7 @@ pub(crate) fn drain(
         .open_stage_recovery(&saved, Some(&generation))
         .map_err(|_| McpError::invalid_params("recovery_claim_changed", None))?;
     let registry = std::path::Path::new(std::ffi::OsStr::from_bytes(&identity.directory));
-    if registry_directory().ok().as_deref() != Some(registry) || !identity.matches_directory() {
+    if ownership_registry().ok().as_deref() != Some(registry) || !identity.matches_directory() {
         return Err(McpError::invalid_params("recovery_claim_changed", None));
     }
     let expected = native_binding(&identity);

@@ -314,7 +314,7 @@ impl Stage {
             return Err(invalid("external reader Ready belongs to another boot"));
         }
         let registry = RegistryIdentity {
-            directory: lean_toolchain::native_guardian::registry_directory()?
+            directory: crate::shared_writer::ownership_registry()?
                 .as_os_str()
                 .as_bytes()
                 .to_vec(),

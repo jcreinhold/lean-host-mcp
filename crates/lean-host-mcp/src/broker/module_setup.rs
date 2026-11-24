@@ -2,7 +2,7 @@
 //! import visibility, plugin entry points and compiler options.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
 use crate::cancellation::CallCancellation;
-use lean_toolchain::shared_writer::SharedWriter;
+use lean_toolchain::shared_writer::{LEGACY_MODULE_SETUP_CAPTURE_ENV, MODULE_SETUP_CAPTURE_ENV, SharedWriter};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -269,7 +269,7 @@ impl ChargedWriter {
         })
     }
 
-    async fn qualify(&self, root: &Path, timeout: Duration) -> io::Result<Identity> {
+    async fn qualify(&self, root: &Path, timeout: Duration) -> io::Result<(Identity, &'static str)> {
         use tokio::io::AsyncReadExt as _;
         const LIMIT: usize = 16 * 1024;
         if std::env::temp_dir().canonicalize()? != self.inherited_temp {
@@ -302,29 +302,34 @@ impl ChargedWriter {
             if bytes.len() > LIMIT || !child.wait().await?.success() {
                 return Err(invalid("writer did not provide its bounded capability descriptor"));
             }
-            check_capability(&bytes, root, &lock)?;
-            Ok(image)
+            let capture_env = check_capability(&bytes, root, &lock)?;
+            Ok((image, capture_env))
         })
         .await
         .map_err(io::Error::other)?
     }
 }
 
-fn check_capability(bytes: &[u8], root: &Path, lock: &Path) -> io::Result<()> {
+fn check_capability(bytes: &[u8], root: &Path, lock: &Path) -> io::Result<&'static str> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let capabilities = value.get("capabilities").and_then(serde_json::Value::as_array);
+    let supports = |name: &str| capabilities.is_some_and(|caps| caps.iter().any(|v| v == name));
     if value.get("protocol").and_then(serde_json::Value::as_u64) != Some(1)
         || value.get("project_root").and_then(serde_json::Value::as_str)
             != Some(root.to_str().ok_or_else(|| invalid("non-UTF-8 writer root"))?)
         || value.get("lock_path").and_then(serde_json::Value::as_str)
             != Some(lock.to_str().ok_or_else(|| invalid("non-UTF-8 writer lock"))?)
-        || !capabilities.is_some_and(|caps| caps.iter().any(|v| v == "lake_module_setup_capture_v1"))
+        || !supports("lake_module_setup_capture_v1")
     {
         return Err(invalid(
             "expected lake_module_setup_capture_v1 for the selected project lock",
         ));
     }
-    Ok(())
+    Ok(if supports("lake_module_setup_capture_env_v2") {
+        MODULE_SETUP_CAPTURE_ENV
+    } else {
+        LEGACY_MODULE_SETUP_CAPTURE_ENV
+    })
 }
 
 fn run_setup(
@@ -332,9 +337,9 @@ fn run_setup(
     root: &Path,
     file: &Path,
     source: &str,
-    timeout: Duration,
-    started: Instant,
+    remaining: &impl Fn() -> Duration,
     cancel: &CallCancellation,
+    capture_env: &str,
 ) -> Result<StagedSetup> {
     if !file.starts_with(root)
         || file.canonicalize()? != file
@@ -357,10 +362,8 @@ fn run_setup(
         .arg(file)
         .env("LAKE_CACHE_DIR", writer.asset_dir())
         .env("LAKE_ARTIFACT_CACHE", "false")
-        .env(crate::shared_writer::MODULE_SETUP_ENV, "1");
-    let result = writer.run_cancellable(&command, timeout.saturating_sub(started.elapsed()), &|| {
-        cancel.is_cancelled()
-    })?;
+        .env(capture_env, "1");
+    let result = writer.run_cancellable(&command, remaining(), &|| cancel.is_cancelled())?;
     if !result.status.success() {
         return Err(ServerError::BadProject(format!(
             "Lake setup-file failed ({}): {}",
@@ -436,12 +439,12 @@ impl ProjectBroker {
         let selected = match self.runtime_config.module_setup_writer.clone() {
             Some(selection) => {
                 let started = Instant::now();
-                let image = tokio::select! {
+                let (image, capture_env) = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "module setup cancelled before writer admission").into()),
                     result = selection.qualify(&root, timeout) => result?,
                 };
-                Some((selection, image, started))
+                Some((selection, image, capture_env, started))
             }
             None => None,
         };
@@ -449,10 +452,11 @@ impl ProjectBroker {
         let result = tokio::task::spawn_blocking(move || -> Result<StagedSetup> {
             let _activity = activity;
             let cancelled = || cancel.is_cancelled();
-            let (mut writer, started) = if let Some((selection, image, started)) = &selected {
+            let (mut writer, started, capture_env) = if let Some((selection, image, capture_env, started)) = &selected {
                 if Identity::read(&selection.executable)? != *image {
                     return Err(invalid("selected module setup writer changed before admission").into());
                 }
+                crate::shared_writer::ownership_registry()?;
                 let writer = SharedWriter::open_with_storage_request(
                     &selection.executable,
                     &root,
@@ -461,18 +465,20 @@ impl ProjectBroker {
                     timeout.saturating_sub(started.elapsed()),
                     &cancelled,
                 )?;
-                (writer, *started)
+                (writer, *started, *capture_env)
             } else {
                 let helper = crate::shared_writer::contract()?.executable;
                 let started = Instant::now();
                 (
                     SharedWriter::open_cancellable(&helper, &root, timeout, &cancelled)?,
                     started,
+                    MODULE_SETUP_CAPTURE_ENV,
                 )
             };
-            let outcome = run_setup(&mut writer, &root, &file, &source, timeout, started, &cancel);
+            let remaining = || timeout.saturating_sub(started.elapsed());
+            let outcome = run_setup(&mut writer, &root, &file, &source, &remaining, &cancel, capture_env);
             if selected.is_some()
-                && let Err(close) = writer.close(timeout.saturating_sub(started.elapsed()))
+                && let Err(close) = writer.close(remaining())
             {
                 return Err(match outcome {
                     Ok(_) => ServerError::Internal(format!("module setup writer settlement unconfirmed: {close}")),

@@ -308,16 +308,21 @@ struct RawHelper {
 
 impl RawHelper {
     fn start(fixture: &Fixture) -> Self {
-        let mut child = Command::new(HELPER)
+        Self::start_with(fixture, |_| {})
+    }
+
+    fn start_with(fixture: &Fixture, configure: impl FnOnce(&mut Command)) -> Self {
+        let mut command = Command::new(HELPER);
+        command
             .arg("writer")
             .arg(&fixture.root)
             .arg(&fixture.lock)
             .arg("3")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        configure(&mut command);
+        let mut child = command.spawn().unwrap();
         let input = child.stdin.take();
         let stdout = child.stdout.take().unwrap();
         let (sender, frames) = mpsc::channel();
@@ -367,6 +372,42 @@ impl Drop for RawHelper {
             thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+#[test]
+fn raw_writer_stage_keeps_the_selected_owner_directory() {
+    use lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV;
+
+    let fixture = Fixture::new();
+    let registry = fixture.root.join("owners");
+    for changed in [Value::Null, json!(fixture.root.join("other-owners"))] {
+        let mut helper = RawHelper::start_with(&fixture, |command| {
+            command.env(OWNERS_DIRECTORY_ENV, &registry);
+        });
+        assert_eq!(helper.frame()["state"], "locked");
+        helper.send(&json!({
+            "action":"run", "command":["/usr/bin/printenv", OWNERS_DIRECTORY_ENV],
+            "env":{(OWNERS_DIRECTORY_ENV):registry}, "timeout":1.0,
+        }));
+        assert_eq!(helper.frame()["state"], "started");
+        let stopped = helper.frame();
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["exit_code"], 0);
+        assert_eq!(stopped["stdout"], format!("{}\n", registry.display()));
+
+        let marker = fixture.root.join("must-not-run");
+        helper.send(&json!({
+            "action":"run", "command":["/usr/bin/touch", marker],
+            "env":{(OWNERS_DIRECTORY_ENV):changed}, "timeout":1.0,
+        }));
+        assert!(matches!(
+            helper.frames.recv_timeout(LIMIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(!helper.child.wait().unwrap().success());
+        assert!(!marker.exists());
+    }
+    assert!(!registry.exists());
 }
 
 #[test]
