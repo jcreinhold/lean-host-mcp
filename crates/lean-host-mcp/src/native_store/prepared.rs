@@ -237,6 +237,9 @@ fn validate_create_for_mode(bytes: &[u8], warm: bool) -> Result<(), Reject> {
         .as_ref()
         .and_then(|value| value.get("operation"))
         .and_then(serde_json::Value::as_str);
+    if operation == Some(trace_snapshot::OPERATION) {
+        trace_snapshot::validate_intent(bytes)?;
+    }
     let named = is_named(operation);
     let parsed = (named || (warm && operation.is_none()))
         .then(|| {
@@ -507,6 +510,7 @@ fn advertise_for_mode(mut reply: serde_json::Value, broker: &ProjectBroker, warm
                         readiness_writer::OPERATION,
                         crate::writer_preparation::OPERATION,
                         crate::writer_preparation::VERIFIER_OPERATION,
+                        crate::writer_preparation::GROUPED_VERIFIER_OPERATION,
                         readiness_writer::CONSUMER,
                         readiness_writer::SETUP_VERIFICATION,
                         readiness_writer::SETUP_DIAGNOSTICS,

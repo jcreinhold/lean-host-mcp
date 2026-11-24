@@ -307,6 +307,8 @@ impl NativeStore {
             Problem::Rejected(Reject::CapabilityDenied) => "capability_denied",
             Problem::Rejected(Reject::IntentChanged) => "intent_changed",
             Problem::Rejected(Reject::InvalidReadinessIntent) => "invalid_readiness_intent",
+            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+            Problem::Rejected(Reject::InvalidTraceIntent) => "invalid_trace_intent",
             Problem::Rejected(Reject::StoreFull) => "store_full",
             Problem::Rejected(Reject::DispatchDisabled) => "operation_disabled",
             Problem::Rejected(Reject::ConflictingResult) => "result_changed",

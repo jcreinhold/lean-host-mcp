@@ -1,5 +1,5 @@
 //! Fixed Lake provenance read with an original-key managed result.
-use std::{io, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, io, path::PathBuf, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
@@ -9,7 +9,7 @@ use crate::{
     ProjectBroker,
     artifact_reads::{ArtifactReadGuard, lake_trace_paths},
     broker::ProjectHint,
-    native_store::store::{AdmissionDeadline, Capability, NativeStore, ResourceReport, Snapshot},
+    native_store::store::{AdmissionDeadline, Capability, LIMIT, NativeStore, Reject, ResourceReport, Snapshot},
 };
 
 pub(super) const OPERATION: &str = "lake_artifact_traces_v1";
@@ -22,6 +22,32 @@ struct Intent {
     revision: u64,
     project: PathBuf,
     targets: Vec<String>,
+}
+
+fn checked_intent(bytes: &[u8]) -> Result<Intent, Reject> {
+    if bytes.len() > LIMIT {
+        return Err(Reject::InvalidTraceIntent);
+    }
+    let intent: Intent = serde_json::from_slice(bytes).map_err(|_| Reject::InvalidTraceIntent)?;
+    if intent.operation != OPERATION || intent.job.is_empty() || intent.revision == 0 {
+        return Err(Reject::InvalidTraceIntent);
+    }
+    let paths = lake_trace_paths(&intent.targets).ok_or(Reject::InvalidTraceIntent)?;
+    // Validated names yield unescaped UTF-8 JSON keys. Each distinct path
+    // adds two quoted strings, a colon, 64 digest bytes and a separator.
+    let paths: BTreeSet<_> = paths.iter().collect();
+    let result_bytes = br#"{"version":1,"traces":{}}"#
+        .len()
+        .saturating_sub(1)
+        .saturating_add(paths.iter().map(|path| path.len().saturating_add(70)).sum::<usize>());
+    if result_bytes > LIMIT {
+        return Err(Reject::InvalidTraceIntent);
+    }
+    Ok(intent)
+}
+
+pub(super) fn validate_intent(bytes: &[u8]) -> Result<(), Reject> {
+    checked_intent(bytes).map(|_| ())
 }
 
 pub(super) fn available(broker: &ProjectBroker) -> bool {
@@ -40,14 +66,7 @@ pub(super) async fn run(
     capability: Capability,
 ) -> Result<(), McpError> {
     let invalid = |reason| McpError::invalid_params(reason, None);
-    let intent: Intent = serde_json::from_slice(&original.intent).map_err(|_| invalid("invalid_trace_intent"))?;
-    if intent.operation != OPERATION
-        || intent.job.is_empty()
-        || intent.revision == 0
-        || lake_trace_paths(&intent.targets).is_none()
-    {
-        return Err(invalid("invalid_trace_intent"));
-    }
+    let intent = checked_intent(&original.intent).map_err(|_| invalid("invalid_trace_intent"))?;
     let root = broker
         .native_root(&ProjectHint::Default)
         .map_err(|_| invalid("trace_project_unavailable"))?;
@@ -127,18 +146,29 @@ mod tests {
 
     #[tokio::test]
     async fn managed_trace_shares_capacity_and_reopens_without_rereading_artifacts() {
+        for count in [152, 366] {
+            check_managed_trace(count).await;
+        }
+    }
+
+    async fn check_managed_trace(count: usize) {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().canonicalize().unwrap();
         let root = directory.join("project");
         let build = root.join(".lake/build/lib/lean");
         std::fs::create_dir_all(&build).unwrap();
-        let trace = build.join("Demo.trace");
+        let targets: Vec<_> = (0..count).map(|index| format!("Demo.Trace{index:03}")).collect();
         std::fs::write(root.join("lakefile.toml"), "name = 'demo'\n").unwrap();
-        std::fs::write(
-            &trace,
-            br#"{"synthetic":false,"inputs":{"files":1},"outputs":{"olean":2}}"#,
-        )
-        .unwrap();
+        std::fs::write(root.join("lake-manifest.json"), r#"{"version":"1.1.0","packages":[]}"#).unwrap();
+        for path in lake_trace_paths(&targets).unwrap() {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(
+                file,
+                br#"{"synthetic":false,"inputs":{"files":1},"outputs":{"olean":2}}"#,
+            )
+            .unwrap();
+        }
         let runtime = ProjectRuntimeConfig::default()
             .with_operator_primary(Some(&root))
             .unwrap();
@@ -168,13 +198,31 @@ mod tests {
             .admission(command(json!({"op":"discover"})).as_bytes())
             .unwrap();
         assert_eq!(advertise(discovery, &broker)["operations"], json!([OPERATION]));
-        let intent = json!({"operation":OPERATION,"job":[1],"revision":1,"project":root,"targets":["Demo"]})
-            .to_string()
-            .into_bytes();
+        let encode = |targets: &[String]| {
+            json!({"operation":OPERATION,"job":[1],"revision":1,"project":root,"targets":targets})
+                .to_string()
+                .into_bytes()
+        };
+        let too_large: Vec<_> = (0..366)
+            .map(|index| format!("Demo.{}.{index:03}", "A".repeat(140)))
+            .collect();
+        let oversized = encode(&too_large);
+        assert!(oversized.len() < LIMIT);
+        let refused = command(json!({"op":"create","key":key,"capability":capability.0,"intent":oversized}));
+        assert_eq!(
+            store
+                .lock()
+                .admission_with_validation(refused.as_bytes(), Some(Duration::from_secs(10)), validate_intent),
+            Err("invalid_trace_intent")
+        );
+        let missing = command(json!({"op":"get","key":key,"capability":capability.0}));
+        assert_eq!(store.lock().admission(missing.as_bytes()), Err("unknown_stage"));
+
+        let intent = encode(&targets);
         let create = command(json!({"op":"create","key":key,"capability":capability.0,"intent":intent}));
         store
             .lock()
-            .admission_with_budget(create.as_bytes(), Some(Duration::from_secs(10)))
+            .admission_with_validation(create.as_bytes(), Some(Duration::from_secs(10)), validate_intent)
             .unwrap();
         // Keep one warm actor permit and an independent readiness turn
         // charged while exercising the actual trace admission path.
@@ -207,11 +255,19 @@ mod tests {
         );
         assert_eq!(result["custody"], "closed");
         assert_eq!(result["result"]["state"], "retained");
+        let body: Vec<u8> = serde_json::from_value(result["result"]["body"].clone()).unwrap();
+        assert!(body.len() <= LIMIT);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["traces"].as_object().map(serde_json::Map::len),
+            Some(count),
+            "{body}"
+        );
         drop(store);
 
         // Even another authenticated START must return the original result.
         // A client that lost the reply uses GET, which also has no scan path.
-        std::fs::write(trace, b"not a trace anymore").unwrap();
+        std::fs::remove_dir_all(build).unwrap();
         let store = Arc::new(Mutex::new(NativeStore::open(&database).unwrap()));
         let get = command(json!({"op":"get","key":key,"capability":capability.0}));
         let reopened = store.lock().admission(get.as_bytes()).unwrap();

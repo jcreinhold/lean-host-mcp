@@ -23,7 +23,7 @@ pub(crate) mod readiness_writer;
 
 const CALLER_ROLE: i64 = 0x4c53_434a;
 const NATIVE_ROLE: i64 = 0x4c53_4e53;
-const LIMIT: usize = 65_536;
+pub(crate) const LIMIT: usize = 65_536;
 const MAX_STAGES: i64 = 1_024;
 type Id = [u8; 16];
 
@@ -84,6 +84,8 @@ pub(crate) enum Reject {
     NoConsumedGate,
     InvalidLaunchDeadline,
     InvalidReadinessIntent,
+    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
+    InvalidTraceIntent,
     ConflictingSpawn,
     ConflictingResult,
     ResultUnknown,

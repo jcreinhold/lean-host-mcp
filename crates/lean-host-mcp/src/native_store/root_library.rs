@@ -95,7 +95,7 @@ fn invalid_inventory() -> io::Error {
     )
 }
 
-fn query<T: DeserializeOwned>(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<T>, i32>> {
+pub(super) fn query<T: DeserializeOwned>(mut command: Command, targets: &[String]) -> io::Result<Result<Vec<T>, i32>> {
     let mut child = command
         .args(["--no-build", "query", "--json"])
         .args(targets)

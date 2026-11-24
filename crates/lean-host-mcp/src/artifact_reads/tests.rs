@@ -288,7 +288,14 @@ fn lake_trace_snapshot_selects_exact_files_and_rejects_incomplete_sets() {
 
     let guard = ArtifactReadGuard::for_project(&root).unwrap();
     let targets = ["Demo.Foo".to_string(), "runLinter".to_string()];
-    let traces = guard.lake_trace_snapshot(&root, &targets, || Ok(())).unwrap().unwrap();
+    let lock = std::fs::File::open(lean_toolchain::shared_writer::project_lock_path(&root).unwrap()).unwrap();
+    let traces = guard
+        .lake_trace_snapshot(&root, &targets, || {
+            assert!(matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
     assert_eq!(traces.len(), 2);
     assert_eq!(
         traces.get(".lake/build/lib/lean/Demo/Foo.trace").map(String::as_str),

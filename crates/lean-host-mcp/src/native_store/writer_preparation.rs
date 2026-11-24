@@ -1,5 +1,6 @@
 //! Fixed, writer-owned sequencer. The original helper owns all descendants.
 use std::{
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -14,6 +15,7 @@ use crate::{
 
 pub(crate) const OPERATION: &str = "lake_module_preparation_v1";
 pub(crate) const VERIFIER_OPERATION: &str = "lake_verifier_preparation_v1";
+pub(crate) const GROUPED_VERIFIER_OPERATION: &str = "lake_verifier_grouped_preparation_v1";
 const MAX_MODULES: usize = 64;
 const MAX_PLAN_BYTES: usize = 32 * 1024;
 
@@ -58,6 +60,9 @@ pub(crate) enum Target {
     },
     VerifierModules {
         names: Vec<String>,
+    },
+    VerifierGroups {
+        groups: Vec<Vec<String>>,
     },
     Ready {
         name: String,
@@ -110,6 +115,17 @@ impl Target {
                 !names.is_empty()
                     && names.len() <= MAX_MODULES
                     && names.iter().all(|target| module_name(target) && unique.insert(target))
+            }
+            Self::VerifierGroups { groups } => {
+                let mut unique = HashSet::new();
+                !groups.is_empty()
+                    && groups.len() <= MAX_MODULES
+                    && groups.iter().all(|group| {
+                        !group.is_empty()
+                            && group.len() <= root_library::BATCH
+                            && group.iter().all(|module| module_name(module) && unique.insert(module))
+                    })
+                    && unique.len() <= MAX_MODULES
             }
             Self::Regroup(request) => request.valid(),
             Self::ToolingSuites { .. } | Self::WholeLint { .. } | Self::FirstPartyClean { .. } => true,
@@ -284,6 +300,143 @@ fn verifier_preflight(root: &Path, watched: &impl Fn(&[&str]) -> io::Result<i32>
     Ok(report)
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GroupedVerifierReceipt {
+    version: u32,
+    stage: GroupedVerifierStage,
+    preflight: Preflight,
+    completed_groups: usize,
+    first_failure: Option<GroupFailure>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GroupedVerifierStage {
+    VerifierGroups,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GroupFailure {
+    group_index: Option<usize>,
+    phase: root_library::Phase,
+    exit_code: Option<i32>,
+}
+
+impl GroupedVerifierReceipt {
+    pub(super) fn parse(bytes: &[u8], expected_groups: usize) -> io::Result<Self> {
+        use root_library::Phase;
+
+        let receipt: Self = serde_json::from_slice(bytes)?;
+        let valid = if !receipt.preflight.ready() {
+            receipt.completed_groups == 0 && receipt.first_failure.is_none()
+        } else if let Some(first) = &receipt.first_failure {
+            match first.phase {
+                Phase::Imports => {
+                    receipt.completed_groups == 0
+                        && match first.group_index {
+                            None => first.exit_code.is_some_and(|code| code != 0),
+                            Some(index) => index < expected_groups && first.exit_code.is_none(),
+                        }
+                }
+                Phase::Dependencies | Phase::Setup | Phase::Build => {
+                    receipt.completed_groups < expected_groups
+                        && first.group_index == Some(receipt.completed_groups)
+                        && first.exit_code.is_some_and(|code| code != 0)
+                }
+                _ => false,
+            }
+        } else {
+            receipt.completed_groups == expected_groups
+        };
+        if receipt.version != 1 || !receipt.preflight.valid() || !valid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid grouped verifier receipt",
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+fn grouped_verifier(
+    groups: &[Vec<String>],
+    preflight: Preflight,
+    command: &impl Fn() -> Command,
+    authorize: &impl Fn() -> io::Result<std::time::Duration>,
+    after_deps: &impl Fn() -> io::Result<()>,
+) -> io::Result<GroupedVerifierReceipt> {
+    use root_library::Phase;
+
+    let mut receipt = GroupedVerifierReceipt {
+        version: 1,
+        stage: GroupedVerifierStage::VerifierGroups,
+        preflight,
+        completed_groups: 0,
+        first_failure: None,
+    };
+    if !receipt.preflight.ready() {
+        return Ok(receipt);
+    }
+
+    // Check the admitted grouping against Lake's actual root-package imports.
+    // This one query cannot build dependencies or load elaborated module code.
+    let by_name: HashMap<_, _> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, group)| group.iter().map(move |name| (name.as_str(), index)))
+        .collect();
+    let targets: Vec<_> = groups
+        .iter()
+        .flatten()
+        .map(|name| format!("@/+{name}:imports"))
+        .collect();
+    authorize()?;
+    let imports = match root_library::query::<Vec<String>>(command(), &targets)? {
+        Ok(imports) => imports,
+        Err(code) => {
+            receipt.first_failure = Some(GroupFailure {
+                group_index: None,
+                phase: Phase::Imports,
+                exit_code: Some(code),
+            });
+            return Ok(receipt);
+        }
+    };
+    let group_indices = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, group)| group.iter().map(move |_| index));
+    for (index, imports) in group_indices.zip(imports) {
+        if imports
+            .iter()
+            .any(|name| !module_name(name) || by_name.get(name.as_str()).is_some_and(|&dep| dep >= index))
+        {
+            receipt.first_failure = Some(GroupFailure {
+                group_index: Some(index),
+                phase: Phase::Imports,
+                exit_code: None,
+            });
+            return Ok(receipt);
+        }
+    }
+
+    for (index, group) in groups.iter().enumerate() {
+        let names: Vec<_> = group.iter().map(String::as_str).collect();
+        if let Some(failure) = root_library::run_ir_batch(&names, command, authorize, after_deps)? {
+            receipt.first_failure = Some(GroupFailure {
+                group_index: Some(index),
+                phase: failure.phase,
+                exit_code: failure.exit_code,
+            });
+            break;
+        }
+        receipt.completed_groups = index.saturating_add(1);
+    }
+    Ok(receipt)
+}
+
 fn run_module(
     name: String,
     watched: &impl Fn(&[&str]) -> io::Result<i32>,
@@ -404,8 +557,14 @@ pub fn run(encoded: &str) -> io::Result<()> {
         let receipt = request.run(&plan, &lake, command, &watched, &authorize, &after_deps)?;
         return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
     }
+    if let Target::VerifierGroups { groups } = &plan.target {
+        let preflight = verifier_preflight(&plan.root, &watched)?;
+        let receipt = grouped_verifier(groups, preflight, &command, &authorize, &after_deps)?;
+        return serde_json::to_writer(io::stdout().lock(), &receipt).map_err(io::Error::other);
+    }
     let receipt = match plan.target {
         Target::RootLibrary { .. }
+        | Target::VerifierGroups { .. }
         | Target::Regroup(_)
         | Target::ToolingSuites { .. }
         | Target::WholeLint { .. }
@@ -555,5 +714,178 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+    #[test]
+    fn verifier_groups_validate_size_uniqueness_and_receipt() {
+        for groups in [
+            vec![],
+            vec![vec![]],
+            vec![vec!["Demo.A".into()], vec!["Demo.A".into()]],
+            vec![vec!["other/Target".into()]],
+            vec![(0..17).map(|n| format!("Demo.M{n}")).collect()],
+            (0..65).map(|n| vec![format!("Demo.M{n}")]).collect(),
+        ] {
+            assert!(Target::VerifierGroups { groups }.validate().is_err());
+        }
+        let body = |receipt| serde_json::to_vec(&receipt).unwrap();
+        let base = serde_json::json!({
+            "version": 1, "stage": "verifier_groups",
+            "preflight": {"mathlib_exit_code": 0, "linter_exit_code": 0, "linter_executable_ready": true},
+            "completed_groups": 1, "first_failure": {"group_index": 1, "phase": "dependencies", "exit_code": 3},
+        });
+        assert!(GroupedVerifierReceipt::parse(&body(base.clone()), 2).is_ok());
+        let mut invented = base;
+        invented["first_failure"]["module"] = serde_json::json!("Demo.A");
+        assert!(GroupedVerifierReceipt::parse(&body(invented), 2).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires installed Elan selected by LEAN_SYSROOT"]
+    fn grouped_verifier_real_lean_preserves_no_build_boundary() -> Result<(), Box<dyn std::error::Error>> {
+        use std::cell::Cell;
+        use std::fs;
+        use std::time::Duration;
+
+        let sysroot = PathBuf::from(std::env::var_os("LEAN_SYSROOT").ok_or("LEAN_SYSROOT required")?);
+        let lake = sysroot.join("bin/lake");
+        let fixture = tempfile::tempdir()?;
+        let base = fixture.path().canonicalize()?;
+        let fixture_at = |name: &str| -> io::Result<PathBuf> {
+            let root = base.join(name);
+            let workspace = |path: &Path| {
+                let status = Command::new(&lake)
+                    .current_dir(path)
+                    .args(["--no-cache", "update"])
+                    .env("GIT_ALLOW_PROTOCOL", "")
+                    .status()?;
+                if !status.success() {
+                    return Err(io::Error::other("fixture Lake update failed"));
+                }
+                Ok(())
+            };
+            fs::create_dir_all(root.join("Demo"))?;
+            fs::write(
+                root.join("lakefile.lean"),
+                "import Lake\nopen Lake DSL\npackage demo\nrequire mathlib from \"mathlib\"\nrequire extra from \"extra\"\nlean_lib Demo where\n  globs := #[`Demo.*]\nlean_exe runLinter where\n  root := `LinterFixture\n",
+            )?;
+            fs::write(root.join("LinterFixture.lean"), "def main : IO Unit := pure ()\n")?;
+            for (package, module) in [("mathlib", "Mathlib"), ("extra", "Extra")] {
+                let dep = root.join(package);
+                fs::create_dir(&dep)?;
+                fs::write(
+                    dep.join("lakefile.toml"),
+                    format!("name = '{package}'\n[[lean_lib]]\nname = '{module}'\n"),
+                )?;
+                fs::write(
+                    dep.join(format!("{module}.lean")),
+                    "theorem cacheFixture : True := True.intro\n",
+                )?;
+                workspace(&dep)?;
+            }
+            for module in ["A", "B", "C", "Unreached"] {
+                fs::write(
+                    root.join(format!("Demo/{module}.lean")),
+                    format!("theorem {module}.ok : True := True.intro\n"),
+                )?;
+            }
+            fs::write(
+                root.join("Demo/D.lean"),
+                "import Demo.A\nimport Demo.B\nimport Demo.C\ntheorem D.ok : True := A.ok\n",
+            )?;
+            fs::write(
+                root.join("Demo/Cold.lean"),
+                "import Extra\ntheorem Cold.ok : True := cacheFixture\n",
+            )?;
+            workspace(&root)?;
+            let status = Command::new(&lake)
+                .current_dir(&root)
+                .args(["--no-cache", "build", "@/runLinter", "@mathlib/+Mathlib:olean"])
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("fixture readiness build failed"));
+            }
+            Ok(root)
+        };
+        let groups = vec![
+            ["Demo.A", "Demo.B", "Demo.C"].map(str::to_owned).to_vec(),
+            vec!["Demo.D".to_owned()],
+        ];
+        let run = |root: &Path, grouped: bool| -> io::Result<usize> {
+            let calls = Cell::new(0_usize);
+            let command = || {
+                calls.set(calls.get().saturating_add(1));
+                let mut c = Command::new(&lake);
+                c.current_dir(root).arg("--no-cache").stdout(Stdio::null());
+                c
+            };
+            let watched = |args: &[&str]| {
+                command()
+                    .args(args)
+                    .status()?
+                    .code()
+                    .ok_or_else(|| io::Error::other("fixture Lake interrupted"))
+            };
+            let authorize = || Ok(Duration::from_secs(20));
+            let preflight = verifier_preflight(root, &watched)?;
+            assert!(preflight.ready());
+            if grouped {
+                let receipt = grouped_verifier(&groups, preflight, &command, &authorize, &|| Ok(()))?;
+                let encoded = serde_json::to_vec(&receipt)?;
+                let receipt = GroupedVerifierReceipt::parse(&encoded, groups.len())?;
+                assert!(receipt.first_failure.is_none());
+                assert_eq!(receipt.completed_groups, 2);
+            } else {
+                let modules = run_modules(groups.iter().flatten().cloned().collect(), &watched, &|| Ok(()))?;
+                assert_eq!(modules.len(), 4);
+                assert!(modules.iter().all(ModuleReceipt::succeeded));
+            }
+            assert!(root.join(".lake/build/lib/lean/Demo/D.olean").is_file());
+            Ok(calls.get())
+        };
+        let old = fixture_at("old")?;
+        let grouped = fixture_at("grouped")?;
+        assert_eq!(run(&old, false)?, 14);
+        assert_eq!(run(&grouped, true)?, 9);
+
+        let launches = Cell::new(0_usize);
+        let command = || {
+            launches.set(launches.get().saturating_add(1));
+            let mut c = Command::new(&lake);
+            c.current_dir(&grouped).arg("--no-cache").stdout(Stdio::null());
+            c
+        };
+        let authorize = || Ok(Duration::from_secs(20));
+        let ready = || Preflight {
+            mathlib_exit_code: 0,
+            linter_exit_code: Some(0),
+            linter_executable_ready: true,
+        };
+        let deps = vec![vec!["Demo.Unreached".to_owned(), "Demo.Cold".to_owned()]];
+        let receipt = grouped_verifier(&deps, ready(), &command, &authorize, &|| {
+            Err(io::Error::other(
+                "managed IR attempted despite missing external dependency",
+            ))
+        })?;
+        assert_eq!(receipt.completed_groups, 0);
+        let failure = receipt.first_failure.ok_or("expected cold dependency failure")?;
+        assert!(matches!(
+            failure.phase,
+            root_library::Phase::Dependencies | root_library::Phase::Setup
+        ));
+        assert_eq!(failure.group_index, Some(0));
+        assert!(launches.get() <= 3);
+        assert!(!grouped.join("extra/.lake/build/lib/lean/Extra.olean").exists());
+        assert!(!grouped.join(".lake/build/lib/lean/Demo/Unreached.olean").exists());
+
+        launches.set(0);
+        let invalid = vec![vec!["Demo.A".to_owned(), "Demo.D".to_owned()]];
+        let receipt = grouped_verifier(&invalid, ready(), &command, &authorize, &|| {
+            Err(io::Error::other("managed IR attempted for dependent siblings"))
+        })?;
+        let failure = receipt.first_failure.ok_or("expected imports failure")?;
+        assert!(matches!(failure.phase, root_library::Phase::Imports));
+        assert_eq!(failure.group_index, Some(0));
+        assert_eq!(launches.get(), 1);
+        Ok(())
     }
 }

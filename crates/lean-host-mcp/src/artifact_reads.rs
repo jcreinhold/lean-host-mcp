@@ -310,7 +310,7 @@ fn open_trace_component(
     )
 ))]
 pub(crate) fn lake_trace_paths(targets: &[String]) -> Option<Vec<String>> {
-    if targets.is_empty() || targets.len() > 64 {
+    if targets.is_empty() {
         return None;
     }
     targets

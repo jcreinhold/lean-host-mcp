@@ -1,14 +1,15 @@
 //! One fixed Lake cache-readiness stage with native writer custody.
 use std::{
     io,
+    os::unix::process::ExitStatusExt as _,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     sync::Arc,
     time::Duration,
 };
 
 use lean_rs_worker_parent::LeanWorkerCancellationToken;
-use lean_toolchain::shared_writer::{SharedWriter, WriterStagePermit};
+use lean_toolchain::shared_writer::{SharedWriter, WriterDisposition, WriterFailure, WriterStagePermit};
 use parking_lot::Mutex;
 use rmcp::ErrorData as McpError;
 use serde::Deserialize;
@@ -57,6 +58,47 @@ enum Stage {
     SetupVerification(setup::Request, setup::Projection),
 }
 
+// A failure body is evidence about the writer exchange, not a stage verdict
+// or a substitute for the exact helper closure observation.
+fn writer_body(
+    result: io::Result<Output>,
+    receipt: impl FnOnce(Output) -> Option<serde_json::Value>,
+) -> serde_json::Value {
+    use serde_json::json;
+
+    match result {
+        Err(error) => {
+            let disposition = WriterFailure::from_io(&error).map(|failure| match failure.disposition {
+                WriterDisposition::NotStarted => "not_started",
+                WriterDisposition::Stopped => "stopped",
+                WriterDisposition::Unknown => "unknown",
+            });
+            json!({
+                "version": 1, "stage": "readiness-writer", "status": "unavailable",
+                "reason": "writer_error", "error_kind": format!("{:?}", error.kind()),
+                "writer_disposition": disposition,
+            })
+        }
+        Ok(output) => {
+            let status = output.status;
+            receipt(output).unwrap_or_else(|| {
+                if status.success() {
+                    json!({
+                        "version": 1, "stage": "readiness-writer", "status": "unavailable",
+                        "reason": "receipt_rejected",
+                    })
+                } else {
+                    json!({
+                        "version": 1, "stage": "readiness-writer", "status": "unavailable",
+                        "reason": "writer_command_failed", "command_exit_code": status.code(),
+                        "command_signal": status.signal(),
+                    })
+                }
+            })
+        }
+    }
+}
+
 pub(super) const OPERATION: &str = "lake_mathlib_cache_readiness_v1";
 
 #[derive(Deserialize)]
@@ -98,6 +140,7 @@ pub(super) fn is_operation(intent: &[u8]) -> bool {
                 OPERATION
                     | writer_preparation::OPERATION
                     | writer_preparation::VERIFIER_OPERATION
+                    | writer_preparation::GROUPED_VERIFIER_OPERATION
                     | CONSUMER
                     | FORMAT_FIX
                     | FORMAT_PREVIEW
@@ -156,6 +199,7 @@ fn parse_intent(intent: &[u8]) -> Option<(PathBuf, Stage)> {
             if !matches!(
                 target,
                 Target::VerifierModules { .. }
+                    | Target::VerifierGroups { .. }
                     | Target::Regroup(_)
                     | Target::ToolingSuites { .. }
                     | Target::WholeLint { .. }
@@ -169,6 +213,13 @@ fn parse_intent(intent: &[u8]) -> Option<(PathBuf, Stage)> {
         {
             Stage::Preparation(target)
         }
+        (
+            writer_preparation::GROUPED_VERIFIER_OPERATION,
+            Some(target @ Target::VerifierGroups { .. }),
+            None,
+            None,
+            None,
+        ) if target.validate().is_ok() => Stage::Preparation(target),
         (REGROUP, Some(target @ Target::Regroup(_)), None, None, None) if target.validate().is_ok() => {
             Stage::Preparation(target)
         }
@@ -311,6 +362,7 @@ pub(crate) fn validate_create(intent: &[u8]) -> Result<(), crate::native_store::
             value.get("operation").and_then(serde_json::Value::as_str),
             Some(
                 writer_preparation::OPERATION
+                    | writer_preparation::GROUPED_VERIFIER_OPERATION
                     | REGROUP
                     | SETUP_TRIAL
                     | SETUP_PROOF_POSITION
@@ -630,7 +682,12 @@ fn execute(
     let result = writer.run_permitted(&command, permit, &|| cancellation.is_cancelled() || expired());
     // Preserve the primary waited result independently of helper settlement.
     // The caller waits for closed custody before using it.
-    let body = result.ok().and_then(|output| match stage {
+    let body = writer_body(result, |output| match stage {
+        Stage::Preparation(Target::VerifierGroups { groups }) if output.status.success() => {
+            writer_preparation::GroupedVerifierReceipt::parse(&output.stdout, groups.len())
+                .ok()
+                .and_then(|receipt| serde_json::to_value(receipt).ok())
+        }
         Stage::Preparation(Target::FirstPartyClean { .. }) if output.status.success() => {
             writer_preparation::first_party_clean::Receipt::parse(&output.stdout)
                 .ok()
@@ -691,17 +748,15 @@ fn execute(
         Stage::Formatter(request) => Some(request.receipt(root, writer.asset_dir(), &output)),
         Stage::FormatterPreview(request) => Some(request.preview_receipt(writer.asset_dir(), &output)),
     });
-    let saved = body.map_or(Ok(()), |body| {
-        store
-            .lock()
-            .observe_result(
-                binding,
-                capability,
-                uuid::Uuid::new_v4().into_bytes(),
-                body.to_string().as_bytes(),
-            )
-            .map_err(|error| super::public_error(&error))
-    });
+    let saved = store
+        .lock()
+        .observe_result(
+            binding,
+            capability,
+            uuid::Uuid::new_v4().into_bytes(),
+            body.to_string().as_bytes(),
+        )
+        .map_err(|error| super::public_error(&error));
     if writer.close(Duration::from_secs(5)).is_ok() {
         store
             .lock()
@@ -709,4 +764,100 @@ fn execute(
             .map_err(|error| super::public_error(&error))?;
     }
     saved
+}
+
+#[cfg(test)]
+#[test]
+fn unavailable_writer_result_survives_get_without_changing_execution_or_custody()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::native_store::store::{Consume, NativeKey, Scope};
+    use serde_json::json;
+    use std::process::ExitStatus;
+
+    let root = tempfile::tempdir()?;
+    let path = root.path().canonicalize()?.join("stage.sqlite3");
+    let mut store = NativeStore::create_new(&path)?;
+    let capability = Capability([2; 32]);
+    let output = |status| Output {
+        status: ExitStatus::from_raw(status),
+        stdout: b"invalid receipt".to_vec(),
+        stderr: b"private diagnostic".to_vec(),
+    };
+    let error = io::Error::new(
+        io::ErrorKind::TimedOut,
+        WriterFailure {
+            disposition: WriterDisposition::Unknown,
+            detail: "private diagnostic".to_owned(),
+            stop_receipt: None,
+        },
+    );
+    let cases = [
+        (Err(error), "writer_error"),
+        (Ok(output(7 << 8)), "writer_command_failed"),
+        (Ok(output(0)), "receipt_rejected"),
+    ];
+    for ((outcome, reason), nonce) in cases.into_iter().zip(10..13) {
+        let key = NativeKey {
+            store: store.identity(),
+            epoch: 1,
+            nonce: [nonce; 16],
+            stage: 1,
+        };
+        let create = json!({"version": 1, "command": {
+            "op": "create", "key": key, "capability": capability.0, "intent": b"writer diagnostic",
+        }});
+        store.admission(create.to_string().as_bytes())?;
+        let binding = store.bind_scope(
+            key,
+            &capability,
+            Scope {
+                id: [nonce; 16],
+                generation: 1,
+                owner: [3; 16],
+            },
+        )?;
+        assert!(matches!(
+            store.consume_launch(binding, &capability)?,
+            Consume::Granted(_)
+        ));
+        store.observe_resource(binding, &capability, ResourceReport::Open)?;
+
+        let body = writer_body(outcome, |_| None);
+        assert_eq!(body["reason"], reason);
+        assert_eq!(body["status"], "unavailable");
+        assert!(!body.to_string().contains("private diagnostic"));
+        assert!(body.get("build_exit_code").is_none());
+        if reason == "writer_error" {
+            assert_eq!(body["writer_disposition"], "unknown");
+        } else if reason == "writer_command_failed" {
+            assert_eq!(body["command_exit_code"], 7);
+        }
+        store.observe_result(binding, &capability, [4; 16], body.to_string().as_bytes())?;
+        drop(store);
+        store = NativeStore::open(&path)?;
+
+        let get = json!({"version": 1, "command": {"op": "get", "key": key, "capability": capability.0}});
+        let reply = store.admission(get.to_string().as_bytes())?;
+        assert_eq!(reply["execution"], "unknown");
+        assert_eq!(reply["custody"], "open");
+        let retained: Vec<u8> = serde_json::from_value(reply["result"]["body"].clone())?;
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&retained)?, body);
+        assert!(matches!(
+            store.consume_launch(binding, &capability)?,
+            Consume::AlreadyConsumed
+        ));
+
+        store.observe_resource(binding, &capability, ResourceReport::Closed)?;
+        let closed = store.admission(get.to_string().as_bytes())?;
+        assert_eq!(closed["custody"], "closed");
+        assert_eq!(closed["execution"], "unknown");
+        assert_eq!(closed["result"], reply["result"]);
+    }
+
+    let valid_verdict = json!({"exit_code": 1});
+    assert_eq!(
+        writer_body(Ok(output(1 << 8)), |_| Some(valid_verdict.clone())),
+        valid_verdict
+    );
+    Ok(())
 }
