@@ -43,6 +43,20 @@ case tests a live, responsive old authority and one durable request under two co
 It assumes durable arbitration and a receiver that enforces the fence. Unavailable authority or evidence can
 leave execution uncertain. The model grants recovery no right to signal a PID or issue another GO.
 
+**Cold pre-dispatch deadline.** `ColdSpec` models one serving store owner. Freezing keeps the store lock;
+only owner exit lets a successor open the store. The planned domain fences conflicting writers without
+claiming a shared lock or a writer epoch. The acquired record binds the epoch sampled under the matching
+shared lock. The guardian enforces the original deadline before reads are retained. Expiry requests stop;
+observation of the exact native exit is a separate transition. GO and Lean entry are separate as well.
+
+The installed fixture needs distinct stops before GO. Freeze once after the plan is durable and before
+the shared lock is taken. Require no acquired epoch and refusal by the managed conflicting writer even
+if a raw lock probe succeeds. Freeze again after the matching shared lock and epoch are recorded. Require
+raw lock exclusion and the recorded epoch. In each cut, check that a replacement broker cannot open the
+same store while the first is frozen. Require original-deadline retirement, exact native exit, and a
+same-inode probe before accepting release. Recovery of the original key must preserve zero Lean target
+entries. These are fixture assertions for the matched SDK implementation, not installed test results.
+
 **Stopped broker recovery.** `StoppedRecoverySpec` projects the early O3 lookup (`aa8ec30`) onto one boot-qualified
 Running generation dedicated to one stage. The original broker commits the complete binding before GO and keeps
 it fixed for that generation. The case assumes authenticated capability, native ID and intent. A reader matches

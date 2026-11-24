@@ -46,6 +46,11 @@ HostInit == Init /\ h = [
     evidenceUnknown |-> FALSE, permitAtPause |-> "unused", startsAtPause |-> 0],
   deadline |-> [tick |-> 0, arm |-> "idle", armedKey |-> <<>>, finishedKey |-> <<>>,
     sentAt |-> <<>>, frozen |-> FALSE, paused |-> FALSE, expired |-> FALSE],
+  cold |-> [owner |-> "first", frozen |-> FALSE, refused |-> FALSE,
+    elapsed |-> FALSE, deadlineAtGuardian |-> FALSE, planned |-> FALSE,
+    readHeld |-> FALSE, epoch |-> "none", writerEntered |-> FALSE, frozenAt |-> "none",
+    permit |-> "unused", targetStarts |-> 0, stopped |-> FALSE, exited |-> FALSE, closed |-> FALSE,
+    afterFreeze |-> FALSE, recovered |-> FALSE, rivalClaim |-> FALSE],
   reuse |-> [active |-> 0, spent |-> {}, armed |-> {}, armAcks |-> {}, fenced |-> {}, saved |-> {}, accepted |-> {},
     acked |-> {}, ended |-> {}, aborted |-> "none", stale |-> {},
     finishFor |-> [i \in Commands |-> <<>>], ackFor |-> [i \in Commands |-> <<>>],
@@ -293,6 +298,8 @@ NoSdkReturnBeforeHost == ~(ConfirmedHostClosure /\ capacityReturns=1 /\ HostPerm
 NoHostReturnWithoutAck == ~(h.duplicateSeen /\ h.hostPermitReturns=1 /\ h.copied="success" /\ ~h.ack)
 NoHostReturnAfterNoStart == ~(h.hostPermitReturns=1 /\ h.fenced /\ ~runningDurable /\ capacityReturns=1)
 
+\* This SDK slot projection uses separately authorized non-serving senders.
+\* It does not grant a second serving broker access to the managed store.
 \* This boot-qualified Running scope fixes the entire binding for one stage.
 \* The original broker commits the association before the stage's GO.
 Stopped == h.stopped
@@ -403,6 +410,75 @@ NoStoppedRecoveryCompletion == ~(Stopped.startsAtPause=1 /\ Stopped.resumedAfter
 NoStoppedResponsiveRefusal == ~(Stopped.decision="refused-responsive" /\ Stopped.offer= <<>>)
 NoFreshStoppedDecision == ~(Stopped.responsiveRefusal /\ Stopped.pauses=2 /\ Stopped.request/= <<>>)
 NoStoppedStaleRefusal == Stopped.decision/="refused-stale"
+
+\* Cold managed inspection on the singleton store. The original budget starts
+\* at admission, independently of whether a grant or application command exists.
+\* Read custody begins only after the guardian has the admitted deadline.
+Cold == h.cold
+ColdProtect == HostOnly(Cold.owner="first" /\ ~Cold.frozen /\ ~Cold.elapsed
+  /\ ~Cold.deadlineAtGuardian /\ h'=[h EXCEPT !.cold.deadlineAtGuardian=TRUE])
+\* A plan names the domains and fences conflicting work but carries no epoch.
+\* The epoch is sampled only after taking the matching shared lock.
+ColdPlan == HostOnly(Cold.owner="first" /\ ~Cold.frozen /\ ~Cold.elapsed
+  /\ ~Cold.planned /\ ~Cold.writerEntered
+  /\ h'=[h EXCEPT !.cold.planned=TRUE,
+    !.cold.epoch=IF Mutation="cold-plan-has-epoch" THEN "exact" ELSE @])
+ColdFenced == Cold.planned /\ ~Cold.closed
+ColdWriterEnter == HostOnly(~Cold.writerEntered
+  /\ (~ColdFenced \/ (Mutation="cold-ignore-plan" /\ ~Cold.readHeld))
+  /\ h'=[h EXCEPT !.cold.writerEntered=TRUE])
+ColdRetain == HostOnly(Cold.owner="first" /\ ~Cold.frozen /\ ~Cold.elapsed /\ ~Cold.readHeld
+  /\ ColdFenced /\ ~Cold.writerEntered
+  /\ (Cold.deadlineAtGuardian \/ Mutation="cold-read-before-deadline")
+  /\ h'=[h EXCEPT !.cold.readHeld=TRUE])
+ColdPublishEpoch == HostOnly(Cold.owner="first" /\ ~Cold.frozen /\ ~Cold.elapsed
+  /\ Cold.readHeld /\ Cold.epoch="none"
+  /\ h'=[h EXCEPT !.cold.epoch=IF Mutation="cold-wrong-epoch" THEN "stale" ELSE "exact"])
+ColdAuthorize == HostOnly(Cold.owner="first" /\ ~Cold.frozen /\ ~Cold.elapsed
+  /\ Cold.readHeld /\ Cold.epoch="exact" /\ Cold.permit="unused"
+  /\ h'=[h EXCEPT !.cold.permit="go"])
+ColdEnter == HostOnly(Cold.owner="first" /\ ~Cold.frozen /\ Cold.permit="go" /\ ~Cold.elapsed
+  /\ h'=[h EXCEPT !.cold.permit="entered", !.cold.targetStarts=@+1])
+ColdFreeze == HostOnly(Cold.owner="first" /\ ~Cold.frozen /\ ColdFenced
+  /\ Cold.deadlineAtGuardian /\ Cold.permit="unused" /\ ~Cold.afterFreeze
+  /\ h'=[h EXCEPT !.cold.frozen=TRUE, !.cold.afterFreeze=TRUE,
+    !.cold.frozenAt=IF ~Cold.readHeld THEN "planned"
+                    ELSE IF Cold.epoch="none" THEN "locked" ELSE "recorded"])
+ColdContender == HostOnly(Cold.owner="first" /\ Cold.frozen /\ ~Cold.refused /\ ~Cold.rivalClaim
+  /\ h'=IF Mutation="cold-frozen-store-released"
+         THEN [h EXCEPT !.cold.rivalClaim=TRUE]
+         ELSE [h EXCEPT !.cold.refused=TRUE])
+ColdTick == HostOnly(~Cold.elapsed /\ h'=[h EXCEPT !.cold.elapsed=TRUE])
+ColdGuardianStop == HostOnly(Cold.elapsed /\ Cold.deadlineAtGuardian /\ ColdFenced /\ ~Cold.stopped
+  /\ h'=[h EXCEPT !.cold.stopped=TRUE])
+ColdExitNative == HostOnly(Cold.stopped /\ ~Cold.exited /\ h'=[h EXCEPT !.cold.exited=TRUE])
+\* Independently observed exact native exit. Deadline expiry alone cannot release custody.
+ColdConfirmExit == HostOnly((Cold.exited \/ (Mutation="cold-close-on-expiry" /\ Cold.stopped))
+  /\ ~Cold.closed /\ h'=[h EXCEPT !.cold.closed=TRUE, !.cold.readHeld=FALSE])
+ColdExitOwner == HostOnly(Cold.owner="first" /\ Cold.afterFreeze
+  /\ h'=[h EXCEPT !.cold.owner="none", !.cold.frozen=FALSE])
+ColdOpenSuccessor == HostOnly(Cold.owner="none" /\ h'=[h EXCEPT !.cold.owner="second"])
+ColdRecover == HostOnly(Cold.owner="second" /\ Cold.closed /\ ~Cold.recovered
+  /\ h'=[h EXCEPT !.cold.recovered=TRUE])
+ColdNext == ColdProtect \/ ColdPlan \/ ColdWriterEnter \/ ColdRetain \/ ColdPublishEpoch \/ ColdAuthorize \/ ColdEnter \/ ColdFreeze \/ ColdContender
+  \/ ColdTick \/ ColdGuardianStop \/ ColdExitNative \/ ColdConfirmExit \/ ColdExitOwner \/ ColdOpenSuccessor \/ ColdRecover
+ColdSpec == HostInit /\ [][ColdNext]_hv /\ WF_hv(ColdTick)
+  /\ WF_hv(ColdGuardianStop) /\ WF_hv(ColdExitNative) /\ WF_hv(ColdConfirmExit)
+ColdReadDeadline == Cold.readHeld => Cold.deadlineAtGuardian
+ColdPlanFence == ColdFenced => ~Cold.writerEntered
+ColdEpochExact == Cold.epoch/="none" => Cold.epoch="exact" /\ (Cold.readHeld \/ Cold.closed)
+ColdPlannedFreezeWitness == ~(Cold.frozenAt="planned" /\ Cold.frozen /\ Cold.refused
+  /\ Cold.closed /\ Cold.epoch="none")
+ColdAcquiredFreezeWitness == ~(Cold.frozenAt="recorded" /\ Cold.frozen /\ Cold.refused
+  /\ Cold.closed /\ Cold.epoch="exact")
+ColdSingleton == ~Cold.rivalClaim /\ (Cold.frozen => Cold.owner="first")
+ColdTargetSafe == Cold.targetStarts<=1
+  /\ (Cold.afterFreeze => Cold.permit="unused" /\ Cold.targetStarts=0)
+  /\ (Cold.recovered => Cold.closed /\ Cold.targetStarts=0)
+ColdClosureSafe == Cold.closed => Cold.exited /\ ~Cold.readHeld
+ColdFrozenExpires == (Cold.afterFreeze /\ ColdFenced) ~> Cold.closed
+ColdFrozenWitness == ~(Cold.frozen /\ Cold.refused /\ Cold.closed /\ Cold.targetStarts=0)
+ColdRecoveryWitness == ~Cold.recovered
 
 \* Opt-in projection: command 1 only warms the single generation. Command 2
 \* has one immutable deadline on a shared logical clock. No guardian loss,

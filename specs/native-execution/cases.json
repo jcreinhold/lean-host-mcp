@@ -1031,6 +1031,110 @@
       "invariants": ["WarmReuseClosure"]
     },
     {
+      "name": "cold-pre-arm-freeze",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "pass",
+      "invariants": ["ColdReadDeadline", "ColdPlanFence", "ColdEpochExact", "ColdSingleton", "ColdTargetSafe", "ColdClosureSafe"],
+      "properties": ["ColdFrozenExpires"]
+    },
+    {
+      "name": "cold-pre-arm-freeze-witness",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdFrozenWitness",
+      "invariants": ["ColdFrozenWitness"],
+      "properties": []
+    },
+    {
+      "name": "cold-pre-arm-recovery-witness",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdRecoveryWitness",
+      "invariants": ["ColdRecoveryWitness"],
+      "properties": []
+    },
+    {
+      "name": "cold-read-before-deadline",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdReadDeadline",
+      "constants": { "Mutation": "\"cold-read-before-deadline\"" },
+      "invariants": ["ColdReadDeadline"],
+      "properties": []
+    },
+    {
+      "name": "cold-frozen-store-released",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdSingleton",
+      "constants": { "Mutation": "\"cold-frozen-store-released\"" },
+      "invariants": ["ColdSingleton"],
+      "properties": []
+    },
+    {
+      "name": "cold-close-on-expiry",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdClosureSafe",
+      "constants": { "Mutation": "\"cold-close-on-expiry\"" },
+      "invariants": ["ColdClosureSafe"],
+      "properties": []
+    },
+    {
+      "name": "cold-planned-freeze-witness",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdPlannedFreezeWitness",
+      "invariants": ["ColdPlannedFreezeWitness"],
+      "properties": []
+    },
+    {
+      "name": "cold-acquired-freeze-witness",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdAcquiredFreezeWitness",
+      "invariants": ["ColdAcquiredFreezeWitness"],
+      "properties": []
+    },
+    {
+      "name": "cold-plan-has-epoch",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdEpochExact",
+      "constants": { "Mutation": "\"cold-plan-has-epoch\"" },
+      "invariants": ["ColdEpochExact"],
+      "properties": []
+    },
+    {
+      "name": "cold-wrong-epoch",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdEpochExact",
+      "constants": { "Mutation": "\"cold-wrong-epoch\"" },
+      "invariants": ["ColdEpochExact"],
+      "properties": []
+    },
+    {
+      "name": "cold-ignore-plan",
+      "model": "Stages",
+      "specification": "ColdSpec",
+      "expect": "invariant",
+      "invariant": "ColdPlanFence",
+      "constants": { "Mutation": "\"cold-ignore-plan\"" },
+      "invariants": ["ColdPlanFence"],
+      "properties": []
+    },
+    {
       "name": "host-deadline-warm",
       "model": "Stages",
       "specification": "DeadlineSpec",
