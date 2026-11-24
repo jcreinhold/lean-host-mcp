@@ -1,0 +1,231 @@
+"""Check enrolled launcher custody against the packaged warm HTTP server."""
+
+import contextlib
+import errno
+import fcntl
+import importlib.util
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+import uuid
+
+
+@contextlib.contextmanager
+def selector_reader(project):
+    directory = os.open(project, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(directory)
+
+
+def rpc(url):
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+
+    def call(method, params, number=None):
+        request = {"jsonrpc": "2.0", "method": method, "params": params}
+        if number is not None:
+            request["id"] = number
+        with urllib.request.urlopen(
+            urllib.request.Request(url, json.dumps(request).encode(), headers), timeout=10
+        ) as response:
+            if session := response.headers.get("Mcp-Session-Id"):
+                headers["Mcp-Session-Id"] = session
+            if number is None:
+                return
+            for line in response:
+                if line.startswith(b"data:"):
+                    data = line.removeprefix(b"data:").strip()
+                    if not data:
+                        continue
+                    reply = json.loads(data)
+                    if reply.get("id") == number:
+                        break
+                elif line.startswith(b"{"):
+                    reply = json.loads(line)
+                    break
+            else:
+                raise AssertionError(f"no response for {method} {number}")
+        assert reply.get("id") == number and "error" not in reply, reply
+        return reply["result"]
+
+    call("initialize", {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "managed-launcher-http-guard", "version": "1"},
+    }, 1)
+    call("notifications/initialized", {})
+    return call
+
+
+def check(host, project, workers, prepared, scratch):
+    state = scratch / "h"
+    state.mkdir(mode=0o700)
+    store = state / "store.sqlite3"
+    owners = state / "owners"
+    owners.mkdir(mode=0o700)
+    (owners / ".admission.lock").touch(mode=0o600)
+    env = {
+        **os.environ,
+        "LEAN_HOST_MCP_SOCKET_DIR": str(scratch),
+        "LEAN_RS_WORKER_OWNERS_DIRECTORY": str(owners),
+        "LEAN_HOST_MCP_PROCESS_REGISTRY_DIR": str(state / "processes"),
+        "LEAN_HOST_MCP_CONFIG_DIR": str(state / "config"),
+        "LEAN_HOST_MCP_WORKERS_DIR": str(workers),
+    }
+    opts = {"cwd": project, "env": env, "capture_output": True, "timeout": 10}
+    base = [host, "--lake-root", project]
+    managed_store = ["--managed-native-store", store]
+    bootstrap = subprocess.run([*base, *managed_store], input=b"", **opts)
+    assert bootstrap.returncode == 0, bootstrap.stderr
+    with contextlib.closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as db:
+        original, epoch = db.execute("SELECT store,epoch FROM meta WHERE singleton=1").fetchone()
+    selector = project / "lean-host-mcp.toml"
+    selector.write_text(
+        '[launcher]\nmode = "ordinary"\ngeneration = 1\n'
+        f'managed_store = {json.dumps(str(store))}\nmanaged_store_uuid = "{uuid.UUID(bytes=original)}"\n'
+    )
+    artifact_locks = []
+    for root in (project, project / "dep"):
+        probe = subprocess.run([host, "writer-lock-path", root], check=True, **opts)
+        lock = Path(json.loads(probe.stdout)["lock_path"])
+        stat = lock.stat()
+        artifact_locks.append([str(lock), stat.st_dev, stat.st_ino])
+    registry = owners.stat()
+    custody = state / "custody.json"
+    custody.write_text(json.dumps({
+        "registry": {"path": str(owners), "device": registry.st_dev, "inode": registry.st_ino},
+        "locks": artifact_locks,
+    }))
+
+    def transition(generation, mode, *, blocked=False):
+        result = subprocess.run([
+            host, "launcher-transition", "--project", project, "--from-generation", str(generation),
+            "--to", mode, "--custody", custody,
+        ], **opts)
+        if blocked:
+            assert result.returncode != 0 and (
+                os.strerror(errno.EAGAIN).encode() in result.stderr
+                or os.strerror(errno.EWOULDBLOCK).encode() in result.stderr
+            ), result
+        else:
+            assert result.returncode == 0, result.stderr
+
+    transition(1, "managed")
+    real = None
+    if guard_source := os.environ.get("LEAN_HOST_MCP_PROOFS_LAUNCHER_GUARD"):
+        spec = importlib.util.spec_from_file_location("proofs_launcher_selection", guard_source)
+        real = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = real
+        spec.loader.exec_module(real)
+    guard = real.guard if real else selector_reader
+    selection = real.capture(project) if real else None
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    managed = [*base, *managed_store, "--managed-only", "--launcher-mode", "managed",
+               "--launcher-generation", "2", "--prepared-generation", prepared.read_text().strip()]
+    warm = ["--managed-warm-inspections"]
+
+    def listening(broker):
+        deadline = time.monotonic() + 10
+        while True:
+            assert broker.poll() is None
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                    return
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+
+    def refused_broker(flags):
+        duplicate = subprocess.run([*managed, *flags], input=b"", **opts)
+        assert duplicate.returncode != 0 and b"managed store ownership unavailable" in duplicate.stderr, duplicate
+
+    def schema_version():
+        with contextlib.closing(sqlite3.connect(store.as_uri() + "?mode=ro", uri=True)) as db:
+            return db.execute("PRAGMA user_version").fetchone()[0]
+
+    bind = ["--bind", f"127.0.0.1:{port}"]
+    with subprocess.Popen([*managed, *bind], cwd=project, env=env) as cold:
+        try:
+            listening(cold)
+            refused_broker(warm)
+            assert schema_version() == 5, "warm startup changed the cold broker's schema"
+        finally:
+            if cold.poll() is None:
+                cold.terminate()
+                try:
+                    assert cold.wait(timeout=10) == 0
+                except subprocess.TimeoutExpired:
+                    cold.kill()
+                    cold.wait()
+                    raise
+    with subprocess.Popen([*managed, *warm, *bind], cwd=project, env=env) as broker:
+        try:
+            listening(broker)
+            assert schema_version() == 6
+            transition(2, "ordinary", blocked=True)
+            with guard(project):
+                call = rpc(f"http://127.0.0.1:{port}/mcp")
+
+                def admission(number, **command):
+                    envelope = call("tools/call", {
+                        "name": "lean_managed_admission",
+                        "arguments": {"request": json.dumps({"version": 1, "command": command})},
+                    }, number)
+                    assert not envelope.get("isError"), envelope
+                    return json.loads(envelope["content"][0]["text"])
+
+                discovery = admission(2, op="discover")
+                assert discovery["store"] == list(original) and discovery["acceptance_epoch"] == epoch
+                intent = json.dumps({"project": str(project), "job": [1], "revision": 1,
+                                     "operation": "lake_module_preparation_v1",
+                                     "target": {"kind": "module", "name": "Root"}}).encode()
+                if real:
+                    real.validate_service(discovery, intent)
+                key = {"store": list(original), "epoch": epoch, "stage": 1, "nonce": list(uuid.uuid4().bytes)}
+                auth = {"key": key, "capability": [37] * 32}
+                admitted = admission(3, op="create", intent=list(intent), **auth)
+                assert admitted["execution"] == "admitted", admitted
+                cancelled = admission(4, op="cancel", **auth)
+                assert cancelled["execution"] == "not_started" and cancelled["custody"] == "unobserved", cancelled
+                assert admission(5, op="get", **auth) == cancelled
+                for flags in ([], warm):
+                    refused_broker(flags)
+                broker.send_signal(signal.SIGTERM)
+                assert broker.wait(timeout=10) == 0
+                transition(2, "ordinary", blocked=True)
+            transition(2, "ordinary")
+            if real:
+                try:
+                    with real.guard(project, expected=selection):
+                        raise AssertionError("stale Python selection accepted")
+                except ValueError as error:
+                    assert "generation changed" in str(error), error
+            stale = subprocess.run([*managed, *warm], input=b"", **opts)
+            assert stale.returncode != 0 and b"selection or generation changed" in stale.stderr, stale
+            ordinary = subprocess.run(
+                [*base, "--launcher-mode", "ordinary", "--launcher-generation", "3"], input=b"", **opts
+            )
+            assert ordinary.returncode == 0, ordinary.stderr
+        finally:
+            if broker.poll() is None:
+                broker.terminate()
+                try:
+                    broker.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    broker.kill()
+                    broker.wait()
+    print(f"Managed HTTP admission, singleton, transition and stale selectors passed ({'Proofs guard' if real else 'Python shared lock'}).")
+
+
+if __name__ == "__main__":
+    check(*map(Path, sys.argv[1:]))

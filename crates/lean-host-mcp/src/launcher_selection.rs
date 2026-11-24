@@ -90,21 +90,8 @@ fn load(root: &Path) -> io::Result<(toml::Table, Selection, u32)> {
 ///
 /// # Errors
 /// Returns an error if a transition holds the lock or startup selected stale inputs.
-pub fn admit(
-    root: &Path,
-    mode: LauncherMode,
-    generation: u64,
-    store: Option<&Path>,
-    warm: bool,
-) -> io::Result<(File, [u8; 16])> {
-    // Warm promotion changes the original store schema. An exclusive
-    // selector guard fences any cold broker for the same generation.
-    let operation = if mode == LauncherMode::Managed && warm {
-        FlockOperation::NonBlockingLockExclusive
-    } else {
-        FlockOperation::NonBlockingLockShared
-    };
-    let held = lock_project(root, operation)?;
+pub fn admit(root: &Path, mode: LauncherMode, generation: u64, store: Option<&Path>) -> io::Result<(File, [u8; 16])> {
+    let held = lock_project(root, FlockOperation::NonBlockingLockShared)?;
     let (_, selected, _) = load(root)?;
     if selected.mode != mode
         || selected.generation != generation

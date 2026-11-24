@@ -16,7 +16,10 @@ def main():
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--warm-inspection", action="store_true")
     parser.add_argument("--workers", type=Path)
+    parser.add_argument("--launcher-http-only", action="store_true")
     args = parser.parse_args()
+    if args.launcher_http_only and not args.warm_inspection:
+        parser.error("--launcher-http-only requires --warm-inspection")
     if args.warm_inspection and args.workers is None:
         parser.error("--warm-inspection requires the packaged --workers installation")
     host, writer, sysroot = (p.resolve(strict=True) for p in (args.host, args.writer, args.sysroot))
@@ -91,11 +94,16 @@ def main():
         if args.warm_inspection:
             prepared = project / "prepared.json"
             prepared.write_text(result.stdout)
+            if not args.launcher_http_only:
+                subprocess.run([
+                    sys.executable, "-B", Path(__file__).with_name("managed_inspection.py"),
+                    "--parent", host, "--scratch", args.scratch, "--project", project,
+                    "--workers", args.workers, "--writer", writer, "--prepared", prepared,
+                    "--declaration", "first_ok", "--warm-reuse", "lean_declaration_inspection_warm_v1",
+                ], env=env, check=True)
             subprocess.run([
-                sys.executable, "-B", Path(__file__).with_name("managed_inspection.py"),
-                "--parent", host, "--scratch", args.scratch, "--project", project,
-                "--workers", args.workers, "--writer", writer, "--prepared", prepared,
-                "--declaration", "first_ok", "--warm-reuse", "lean_declaration_inspection_warm_v1",
+                sys.executable, "-B", Path(__file__).with_name("launcher_http_guard.py"),
+                host, project, args.workers, prepared, args.scratch,
             ], env=env, check=True)
             return
         refused = subprocess.run(command, cwd=project, env=env, capture_output=True, text=True)

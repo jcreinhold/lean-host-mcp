@@ -161,7 +161,8 @@ impl LeanHostService {
         expected: Option<[u8; 16]>,
     ) -> std::io::Result<Self> {
         use crate::native_store::store::NativeStore;
-        use std::os::unix::fs::MetadataExt as _;
+        use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+        use std::{fs::File, os::unix::fs::MetadataExt as _};
         let parent = path
             .parent()
             .ok_or_else(|| std::io::Error::other("managed store parent missing"))?;
@@ -176,7 +177,20 @@ impl LeanHostService {
                 "managed store requires a canonical private parent",
             ));
         }
-        let store = match std::fs::symlink_metadata(path) {
+        // Separate the lifetime broker lock from SQLite's own file locks.
+        // This directory already exists and is the store's private namespace.
+        let owner = File::from(open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let opened = owner.metadata()?;
+        if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
+            return Err(std::io::Error::other("managed store parent changed during startup"));
+        }
+        flock(&owner, FlockOperation::NonBlockingLockExclusive)
+            .map_err(|error| std::io::Error::other(format!("managed store ownership unavailable: {error}")))?;
+        let mut store = match std::fs::symlink_metadata(path) {
             Ok(file)
                 if file.is_file()
                     && file.nlink() == 1
@@ -192,6 +206,7 @@ impl LeanHostService {
             Err(error) => return Err(error),
         }
         .map_err(std::io::Error::other)?;
+        store.retain_serving_owner(owner);
         if expected.is_some_and(|uuid| store.identity() != uuid) {
             return Err(std::io::Error::other("original launcher store UUID changed"));
         }

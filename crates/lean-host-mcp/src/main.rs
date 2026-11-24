@@ -548,7 +548,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 mode,
                 args.launcher_generation.context("launcher generation required")?,
                 args.managed_native_store.as_deref(),
-                warm,
             )?;
             Some((root.to_owned(), guard, (mode == LauncherMode::Managed).then_some(store)))
         } else {

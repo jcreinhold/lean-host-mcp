@@ -580,6 +580,8 @@ pub(crate) struct NativeStore {
     store: Id,
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
     active_stops: std::collections::HashMap<NativeKey, ActiveStop>,
+    #[cfg(feature = "managed-native-store")]
+    serving_owner: Option<std::fs::File>,
 }
 impl NativeStore {
     #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
@@ -656,6 +658,8 @@ impl NativeStore {
             store,
             #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
             active_stops: std::collections::HashMap::new(),
+            #[cfg(feature = "managed-native-store")]
+            serving_owner: None,
         })
     }
     pub(crate) fn open(path: &Path) -> Answer<Self> {
@@ -755,8 +759,17 @@ impl NativeStore {
             store,
             #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
             active_stops: std::collections::HashMap::new(),
+            #[cfg(feature = "managed-native-store")]
+            serving_owner: None,
         })
     }
+    /// Keep ownership of the existing private store directory with the store,
+    /// including any service work that still shares this connection.
+    #[cfg(feature = "managed-native-store")]
+    pub(crate) fn retain_serving_owner(&mut self, owner: std::fs::File) {
+        self.serving_owner = Some(owner);
+    }
+
     pub(crate) fn identity(&self) -> Id {
         self.store
     }
