@@ -1324,8 +1324,51 @@ fn warm_recovery_binding_requires_saved_exact_finish_and_fences_stale_attempt() 
     let before_closure = get(&mut store, &second);
     assert_eq!(before_closure["result"]["state"], "retained");
     assert!(NativeStore::with_settled_launcher_store(&fixture.native(), identity, None, || Ok(())).is_err());
-    store.reconcile_closed_scope(a, &registry).unwrap();
+    let distinct = saved(&mut journal, &store, 3);
+    let deadline_c = admit(&mut store, &distinct);
+    let other_registry = RegistryIdentity {
+        generation: "b".repeat(48),
+        ..registry.clone()
+    };
+    let c = store
+        .bind_warm_contract(
+            &distinct,
+            Scope {
+                id: [6; 16],
+                ..scope(1)
+            },
+            &other_registry,
+            deadline_c.expires_ns,
+            1,
+        )
+        .unwrap();
+    store
+        .observe_resource(c, &distinct.capability, ResourceReport::Open)
+        .unwrap();
+    assert!(granted(store.consume_launch(c, &distinct.capability).unwrap()));
+    store
+        .observe_result(c, &distinct.capability, [22; 16], b"distinct result")
+        .unwrap();
+    store
+        .end_warm_contract(
+            &CheckedWarmFinish {
+                binding: c,
+                registry: other_registry.clone(),
+                ordinal: 1,
+                expires_ns: deadline_c.expires_ns,
+            },
+            &distinct.capability,
+        )
+        .unwrap();
+    let distinct_before = get(&mut store, &distinct);
     store.reconcile_closed_scope(b, &registry).unwrap();
+    let first_after = get(&mut store, &first);
+    assert_eq!(first_after["custody"], "closed");
+    assert_eq!(first_after["result"]["state"], "expired");
+    assert_eq!(first_after["result"]["id"], retained["result"]["id"]);
+    assert_eq!(first_after["result"]["sha256"], retained["result"]["sha256"]);
+    assert_eq!(get(&mut store, &distinct), distinct_before);
+    store.reconcile_closed_scope(c, &other_registry).unwrap();
     drop(store);
     assert!(NativeStore::with_settled_launcher_store(&fixture.native(), [0; 16], None, || Ok(())).is_err());
     NativeStore::with_settled_launcher_store(&fixture.native(), identity, None, || Ok(())).unwrap();

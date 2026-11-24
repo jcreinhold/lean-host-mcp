@@ -991,6 +991,7 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
                 before = result(managed("get", **second))
                 assert before["custody"] == "open" and before["result"]["state"] == "pending", before
                 assert "attempt_completion" not in before
+                assert result(managed("get", **first)) == acked
                 assert result(managed("ack", **ack_fields)) == acked
                 stale = result(managed("drain", **first, generation=identity["generation"], revision=1,
                                        submit=True, authorization=authorization, claimant=list(os.urandom(32))),
@@ -1018,6 +1019,10 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
                 release.touch()
             result(active)
             second_saved = completed(second, 2)
+            if entry_trace is None:
+                assert result(managed("get", **first)) == acked
+                second_ack = dict(second, result_id=second_saved["id"], result_digest=second_saved["sha256"])
+                assert result(managed("ack", **second_ack))["custody"] == "open"
             assert bound(second) == (identity, 2, 1)
             assert pool()["occupied_slots"] == 1
             if args.warm_expiry == "idle":
@@ -1064,7 +1069,17 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             assert pool()["occupied_slots"] == 0
             if entry_trace is None:
                 closed = result(managed("get", **second))
-                assert closed["custody"] == "closed" and closed["result"] == second_saved, closed
+                assert closed["custody"] == "closed", closed
+                with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as observer:
+                    k = first["key"]
+                    assert observer.execute(
+                        "SELECT resource_report FROM stages WHERE (epoch,nonce,stage)=(?,?,?)",
+                        (k["epoch"], bytes(k["nonce"]), k["stage"]),
+                    ).fetchone() == (3,)
+                first_closed = result(managed("get", **first))
+                for observed, original in ((first_closed, saved), (closed, second_saved)):
+                    assert observed["custody"] == "closed"
+                    assert observed["result"] == {k: v for k, v in original.items() if k in ("id", "sha256")} | {"state": "expired"}
                 print("Shipping warm lookups shared worker and guardian births; original GET survived retirement")
             else:
                 print("Two exact warm lookups shared worker and guardian births; stale A requests left B unchanged")
@@ -1083,6 +1098,8 @@ def run_warm_reuse(args, plan, prepared, db, entry_trace, root, server, wait_sto
             discovery = result(managed("discover"))
             assert discovery["store"] == second["key"]["store"], discovery
             assert discovery["acceptance_epoch"] == second["key"]["epoch"], discovery
+            assert result(managed("get", **first)) == first_closed
+            assert result(managed("start", **first)) == first_closed
             assert result(managed("get", **second)) == closed
             assert result(managed("start", **second)) == closed
             assert bound(second) == (identity, 2, 1)

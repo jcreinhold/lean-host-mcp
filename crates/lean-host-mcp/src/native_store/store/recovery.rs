@@ -599,6 +599,50 @@ impl NativeStore {
             return reject(Reject::WrongScope);
         }
         super::compact_closed_acknowledged(&tx, binding.key)?;
+        if warm_schema(&tx)? {
+            // Only the exact proved generation may settle already-ended attempts.
+            // Keep unrelated, ambiguous, unended and stale-scope bindings unchanged.
+            let mut siblings = tx.prepare(
+                "UPDATE stages AS s SET resource_report=3,
+                 result_body=CASE WHEN result_kind=2 THEN NULL ELSE result_body END,
+                 result_kind=CASE WHEN result_kind=2 THEN 3 ELSE result_kind END
+                 WHERE s.gate=1 AND s.resource_report IN (1,2) AND s.result_kind IN (1,2)
+                 AND EXISTS(SELECT 1 FROM scope_heads h
+                     WHERE h.scope=s.scope AND h.generation=s.generation AND h.owner=s.owner)
+                 AND EXISTS(SELECT 1 FROM recovery_bindings r
+                     WHERE (r.epoch,r.nonce,r.stage)=(s.epoch,s.nonce,s.stage)
+                       AND r.registry_generation=?1 AND r.identity=?2 AND r.ended=1
+                       AND r.ordinal IS NOT NULL AND r.expires_ns IS NOT NULL)
+                 AND EXISTS(SELECT 1 FROM recovery_bindings origin
+                     WHERE (origin.epoch,origin.nonce,origin.stage)=(?3,?4,?5)
+                       AND origin.registry_generation=?1 AND origin.identity=?2 AND origin.ordinal IS NOT NULL)
+                 AND NOT EXISTS(SELECT 1 FROM recovery_bindings other
+                     WHERE other.registry_generation=?1 AND other.identity<>?2)
+                 RETURNING epoch,nonce,stage",
+            )?;
+            let keys = siblings
+                .query_map(
+                    params![
+                        identity.generation,
+                        encoded,
+                        number(binding.key.epoch)?,
+                        binding.key.nonce,
+                        number(binding.key.stage)?
+                    ],
+                    |row| {
+                        Ok(NativeKey {
+                            store: binding.key.store,
+                            epoch: positive(row.get(0)?)?,
+                            nonce: fixed(row, 1)?,
+                            stage: positive(row.get(2)?)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for key in keys {
+                super::compact_closed_acknowledged(&tx, key)?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
