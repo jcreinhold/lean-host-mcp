@@ -733,7 +733,10 @@ with (root/'native-heartbeat').open('ab',buffering=0) as f:
         .unwrap()
         .expect("actual owned guardian scope");
     fs::write(fixture.root.join("end-guardian"), b"stop exact owned guardian").unwrap();
-    wait_until(|| fixture.root.join("guardian-reaped").exists() && fixture.root.join("native-heartbeat").exists());
+    wait_until(|| {
+        fixture.root.join("guardian-reaped").exists()
+            && fs::metadata(fixture.root.join("native-heartbeat")).is_ok_and(|metadata| metadata.len() > 0)
+    });
     let lock = File::open(&fixture.lock).unwrap();
     let metadata = lock.metadata().unwrap();
     let registry = registry_directory().unwrap();

@@ -322,11 +322,13 @@ impl NativeStage {
     pub(crate) fn finish_target(&self) {
         fs::write(self.root.join("finish-target"), b"fixture completion").unwrap();
     }
-    pub(crate) fn target_alive(&self) -> bool {
+    pub(crate) fn target_identity(&self) -> Option<NativeProcessIdentity> {
         read_json(&self.root.join("body-started.json"))
             .ok()
-            .and_then(|row| serde_json::from_value::<NativeProcessIdentity>(row["target"].clone()).ok())
-            .is_some_and(|target| target.is_live().unwrap())
+            .and_then(|row| serde_json::from_value(row["target"].clone()).ok())
+    }
+    pub(crate) fn target_alive(&self) -> bool {
+        self.target_identity().is_some_and(|target| target.is_live().unwrap())
     }
     fn observation(&self, kind: ObservedKind, result: Option<ResultId>) -> Observation {
         Observation {
@@ -417,7 +419,7 @@ for fd in range(3,4096):
  except OSError: pass
 row=json.dumps({'stage':cfg['stage'],'pid':os.getpid(),'root':str(root)})+'\n'
 fd=os.open(base/'leaf-starts.jsonl',os.O_CREAT|os.O_APPEND|os.O_WRONLY,0o600);os.write(fd,row.encode());os.close(fd)
-(root/'target-started').write_text(str(os.getpid()))
+(root/'target-started').touch()
 with (root/'heartbeat').open('ab',buffering=0) as out:
  while not (root/'finish-target').exists():
   out.write(b'x');time.sleep(.005)

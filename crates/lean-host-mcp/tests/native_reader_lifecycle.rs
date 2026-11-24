@@ -38,9 +38,10 @@ for fd in range(0,4096):
  except OSError: pass
 (root/'leaf.pending').write_text(str(os.getpid()))
 (root/'leaf.pending').replace(root/'leaf')
-while True:
- (root/'heartbeat').write_text(str(time.monotonic_ns()))
- time.sleep(.01)
+with (root/'heartbeat').open('ab', buffering=0) as output:
+ while True:
+  output.write(b'x')
+  time.sleep(.01)
 '''
     subprocess.Popen([sys.executable, '-c', leaf, str(root)], close_fds=True)
     while not (root/'leaf').exists(): time.sleep(.01)
@@ -203,7 +204,7 @@ fn descriptor_closing_descendant_is_stopped_before_read_custody_releases() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("descendant-mode"), "fork").unwrap();
     let child = OwnedChild::spawn(fixture.command(3000));
-    wait_for(|| fixture.root.join("heartbeat").exists());
+    wait_for(|| fs::metadata(fixture.root.join("heartbeat")).is_ok_and(|metadata| metadata.len() > 0));
     let leaf = fixture.marker_pid("leaf");
     assert!(Fixture::lock(&fixture.dependency).try_lock().is_err());
     fs::write(fixture.root.join("go"), "finish root").unwrap();
@@ -303,7 +304,7 @@ fn controller_death_does_not_drop_read_custody_while_payload_survives() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("descendant-mode"), "fork").unwrap();
     let mut child = OwnedChild::spawn(fixture.command(3000));
-    wait_for(|| fixture.root.join("heartbeat").exists());
+    wait_for(|| fs::metadata(fixture.root.join("heartbeat")).is_ok_and(|metadata| metadata.len() > 0));
     let payload = fixture.marker_pid("payload");
     let leaf = fixture.marker_pid("leaf");
     child.child().kill().unwrap();
@@ -655,7 +656,8 @@ env['LEAN_RS_WORKER_OWNERS_DIRECTORY']=str(root/'owners')
 separator=argv.index('--'); argv[separator:separator]=['--cancel-fd',str(read)]
 child=subprocess.Popen(argv,env=env,pass_fds=(read,),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 os.close(read)
-while not (root/'heartbeat').exists():
+heartbeat=root/'heartbeat'
+while not heartbeat.exists() or heartbeat.stat().st_size == 0:
  assert child.poll() is None
  time.sleep(.01)
 started=time.monotonic()

@@ -1,7 +1,6 @@
 use crate::fixtures::{self, Contender, Dispatch, Fixture, GoFault, NativeStage, Observation, ObservedKind};
 use crate::kernel::{AttemptId, LaunchGate, Resources, ResultId, Retention, ScopeBinding, StageKey};
 use crate::runtime::{PollFault, PrepareProblem, Runtime};
-use std::thread;
 use std::time::{Duration, Instant};
 
 fn key(stage: u64) -> StageKey {
@@ -178,17 +177,15 @@ fn genuine_old_callbacks_and_stop_packets_cannot_touch_replacement_work() {
     runtime.deliver_launch(&second, GoFault::None);
     started(&runtime);
     let contender = Contender::start(runtime.native());
+    let target = runtime.native().target_identity().unwrap();
     let old_delivery = runtime.deliver_stop(&old_stop, false);
-    // Check actual current work, not merely the return label or a stop counter.
-    thread::sleep(Duration::from_millis(35));
+    // Sample after dispatch: only subsequent writes prove the target progressed.
     let before_heartbeat = runtime.native().heartbeat();
-    thread::sleep(Duration::from_millis(35));
-    let after_heartbeat = runtime.native().heartbeat();
-    let alive = runtime.native().target_alive();
-    assert!(
-        alive && after_heartbeat > before_heartbeat,
-        "old stop affected later native work: alive={alive}, heartbeat={before_heartbeat}->{after_heartbeat}"
-    );
+    fixtures::wait(|| {
+        assert!(target.is_live().unwrap(), "old stop killed the replacement target");
+        runtime.native().heartbeat() > before_heartbeat
+    });
+    assert_eq!(runtime.native().target_identity(), Some(target));
     assert_eq!(old_delivery, Dispatch::Stale);
     assert_ne!(old_spawn.root_birth(), runtime.native().birth());
     runtime.native().finish_target();
