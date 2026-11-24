@@ -29,9 +29,8 @@ reviewing and running. The following are separate producer and consumer steps.
 1. Select the previously reviewed matched parent helper if available. For a
    fresh build, use the reviewed stock Lean release and the following steps.
    The helper source is host commit `bba2ec8cd886107840741b427595c17e9ccc8141`
-   (guarded startup and loader policy). The canonical local host repository retains it under
-   `refs/heads/fixtures/mac-plugin-guarded-helper-v1`. The source repository
-   supplied below must advertise that commit or a descendant. Keep the selected
+   (guarded startup and loader policy). The host repository keeps this commit in
+   the history of `main`. Use a full clone to access it. Keep the selected
    scratch manifest outside the checkout until its clean revision is verified.
 
    ```sh
