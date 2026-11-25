@@ -48,7 +48,7 @@ async fn stdio_shutdown_on_stdin_eof_exits_parent() {
     );
 }
 
-// Both cases share exclusive custody of the installed shim artifact roots.
+// Serialize with the other tests that take exclusive custody of the installed shim roots.
 #[tokio::test]
 #[serial_test::serial(installed_shim_custody)]
 async fn stdio_shutdown_after_tool_call_exits_worker_child() {
@@ -1335,6 +1335,7 @@ unsafe def main (args : List String) : IO UInt32 := do
     }
 
     #[tokio::test]
+    #[serial_test::serial(installed_shim_custody)]
     async fn managed_verification_preserves_verdict_and_axioms_when_info_is_clipped() {
         let (Some(writer), Some(workers)) = (
             std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER"),
@@ -1481,7 +1482,7 @@ theorem smokeProof : True := smokeAxiom
         assert!(!fixture.project.join(".lake/build").exists());
     }
 
-    // Both cases share exclusive custody of the installed shim artifact roots.
+    // Serialize with the other tests that take exclusive custody of the installed shim roots.
     #[tokio::test]
     #[serial_test::serial(installed_shim_custody)]
     async fn managed_file_command_trial_uses_original_setup_and_result() {
