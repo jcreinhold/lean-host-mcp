@@ -482,7 +482,7 @@ pub fn run(encoded: &str) -> io::Result<()> {
         Projection::ProofSearch => return Err(io::Error::other("missing admitted proof search")),
         Projection::Verify => concat!(
             include_str!("../lake/VerifyCommon.lean"),
-            "private abbrev verifySetup := verifyDeclarationBatchWithSetup\nprivate abbrev verifySetupReportRuntime := false\n",
+            "private abbrev verifySetup := verifyDeclarationBatchCompactWithSetup\nprivate abbrev verifySetupReportRuntime := false\n",
             include_str!("../lake/VerifySetup.lean")
         ),
     };

@@ -1335,6 +1335,98 @@ unsafe def main (args : List String) : IO UInt32 := do
     }
 
     #[tokio::test]
+    async fn managed_verification_preserves_verdict_and_axioms_when_info_is_clipped() {
+        let (Some(writer), Some(workers)) = (
+            std::env::var_os("LEAN_HOST_MCP_STDIO_PACKAGED_WRITER"),
+            std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR"),
+        ) else {
+            return;
+        };
+        let fixture = Fixture::new();
+        let source = r"import Lean.Elab.Command
+open Lean Elab Command in
+run_cmd logInfo (String.ofList (List.replicate 5000 'x'))
+axiom smokeAxiom : True
+theorem smokeProof : True := smokeAxiom
+";
+        fs::write(fixture.project.join("Probe.lean"), source).expect("Lean source");
+        let (store, _) = fixture.new_store("store").await;
+        let mut server = StdioServer::spawn(
+            fixture
+                .command()
+                .arg("--lake-root")
+                .arg(&fixture.project)
+                .arg("--managed-native-store")
+                .arg(store)
+                .arg("--managed-only")
+                .env("LEAN_HOST_MCP_MANAGED_READINESS_WRITER", writer)
+                .env("LEAN_HOST_MCP_WORKERS_DIR", workers),
+        );
+        server.initialize().await;
+        let info = managed(&mut server, json!({"op":"discover"})).await;
+        let key = json!({"store":info.get("store").expect("store"),"epoch":info.get("acceptance_epoch").expect("epoch"),
+            "nonce":uuid::Uuid::new_v4().into_bytes(),"stage":1});
+        let capability = [57_u8; 32];
+        use sha2::{Digest, Sha256};
+        let sha256: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        let intent = json!({"project":fixture.project,"job":[1],"revision":1,"operation":"lean_registered_module_verify_v1",
+            "setup_verification":{"file":"Probe.lean","sha256":sha256,"prepared_sha256":null,"declarations":["smokeProof"]}});
+        let created = managed(
+            &mut server,
+            json!({"op":"create","key":key,"capability":capability,
+            "intent":intent.to_string().as_bytes()}),
+        )
+        .await;
+        assert_eq!(
+            created.get("execution").and_then(Value::as_str),
+            Some("admitted"),
+            "{created}"
+        );
+        let (reply, _) = server
+            .request_with_budget(
+                "tools/call",
+                json!({"name":"lean_verify","arguments":{
+                    "targets":[{"kind":"explicit","file":"Probe.lean","declarations":["smokeProof"]}],
+                    "report_axioms":true,"managed_original":{"key":key,"capability":capability}
+                }}),
+                managed_execution_budget(),
+            )
+            .await;
+        let payload: Value = serde_json::from_str(
+            reply
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .expect("verify payload"),
+        )
+        .expect("verify JSON");
+        let row = payload.pointer("/data/results/0").expect("verified row");
+        assert_eq!(
+            row.get("verification_status").and_then(Value::as_str),
+            Some("verified"),
+            "{payload}"
+        );
+        assert_eq!(
+            row.pointer("/facts/axioms_available").and_then(Value::as_bool),
+            Some(true),
+            "{row}"
+        );
+        assert_eq!(row.pointer("/facts/axioms"), Some(&json!(["smokeAxiom"])), "{row}");
+        assert_eq!(
+            row.pointer("/facts/output_truncated").and_then(Value::as_bool),
+            Some(true),
+            "{row}"
+        );
+        let saved = managed(&mut server, json!({"op":"get","key":key,"capability":capability})).await;
+        assert_eq!(saved.get("custody").and_then(Value::as_str), Some("closed"), "{saved}");
+        assert_eq!(
+            saved.pointer("/result/state").and_then(Value::as_str),
+            Some("retained"),
+            "{saved}"
+        );
+        server.close_stdin_and_wait().await;
+    }
+
+    #[tokio::test]
     async fn managed_semantic_trial_requires_original_before_legacy_option_discovery() {
         let fixture = Fixture::new();
         fs::write(
