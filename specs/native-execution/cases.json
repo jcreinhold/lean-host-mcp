@@ -1035,7 +1035,14 @@
       "model": "Stages",
       "specification": "ColdSpec",
       "expect": "pass",
-      "invariants": ["ColdReadDeadline", "ColdPlanFence", "ColdEpochExact", "ColdSingleton", "ColdTargetSafe", "ColdClosureSafe"],
+      "invariants": [
+        "ColdReadDeadline",
+        "ColdPlanFence",
+        "ColdEpochExact",
+        "ColdSingleton",
+        "ColdTargetSafe",
+        "ColdClosureSafe"
+      ],
       "properties": ["ColdFrozenExpires"]
     },
     {

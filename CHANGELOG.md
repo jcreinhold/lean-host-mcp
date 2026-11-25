@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.22] - 2026-11-25
+
+### Fixed
+
+- Preserve managed proof verdicts and axiom results when informational diagnostics exceed the display budget.
+
 ## [0.16.21] - 2026-11-24
 
 ### Fixed
