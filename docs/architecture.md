@@ -44,7 +44,7 @@ crates/lean-host-mcp/src/
   config_file.rs         the tracked and local config files at the Lake root
 
 crates/lean-host-mcp-worker/src/
-  main.rs, authority.rs  worker child; serves only Init inspection in the installer's smoke project
+  main.rs, authority.rs  worker child; serves one Lake project from its own build through the roots named at launch
 ```
 
 `server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when needed,
@@ -106,6 +106,16 @@ exit observation restores capacity, including after cleanup-thread creation fail
 This registry is process-local and does not reconcile server crashes or Lake descendants. The cap counts actor runtimes,
 not memory bytes or each transient companion process. External Lean processes are outside it.
 
+The installed worker reads the project's own build in place. At launch the broker names the project's import roots in
+Lean's search order, from `lake_meta::manifest_artifact_roots`: the root package's `.lake/build/lib/lean`, then each
+manifest package's. For its whole life the worker holds shared the kernel lock of every artifact domain under those
+roots and of the installed shims. It admits an import only when the request's roots are exactly the launch roots, in
+order, then the installed shim roots, and while no root holds a package whose compiled code the worker runs, such as
+`Init` or `Init.olean`; any module names are allowed. A worker that cannot take custody of its project at launch, for
+example after the manifest dropped a package, starts anyway and refuses each import with the reason. A child that exits
+before it connects would cost the SDK's 30-second startup wait and leave an owner record that makes later writers wait.
+The host copies no files, hashes no build outputs, and writes no import plan.
+
 Same-project startup stays serialized after caller disconnects and rechecks the per-project limit. The broker can evict
 an idle LRU actor, but cannot evict a borrowed actor or one with queued work. Metadata-only degraded responses and pure
 `.ilean` reads use `project_identity_without_worker`; valid module-query cache hits bypass the actor mailbox. A full
@@ -143,10 +153,11 @@ the latest profile only if recently served (within one minute), and cycles at mo
 `import_residue_idle : import_residue` ratio measures how much restart cost lands between requests.
 
 A pooled environment is a snapshot from its import, so no writer may change the artifacts under a live worker. The
-worker holds the shared kernel lock for its whole life, and builds take the exclusive lock (see
-[turns and builds](#turns-and-builds)). As a backstop, each job carries the finished-build count of its read turn, and
-the actor keeps the count under which the live generation first loaded imports. A higher count cycles the worker before
-the job as `artifacts_rebuilt`, which is not execution taint, and drops every pooled profile.
+worker holds the shared kernel lock for its whole life, and a build stops the project's workers before it takes the
+exclusive lock (see [turns and builds](#turns-and-builds)). As a backstop for writers in other processes, each job
+carries the finished-build count of its read turn, and the actor keeps the count under which the live generation first
+loaded imports. A higher count cycles the worker before the job as `artifacts_rebuilt`, which is not execution taint,
+and drops every pooled profile.
 
 Worker death never authorizes replay: Lean elaboration and tactics may perform IO. The opt-in
 `retry_tainted_non_positive` policy allows one retry of a non-positive trial/verification verdict after a mid-call
@@ -420,11 +431,12 @@ whose domains the writer wants. A queued proxy turn always ends as a finished bu
 the grant.
 
 `lean_build` (`build.rs`, `tools/build.rs`) plans the run from the `[build]` and `[recipes]` config, takes the write
-turn, opens one writer helper, and runs the guard and each step in it, with all output in one capped log in the store.
-The turn ends only after the helper and every process of the build have exited. Lake decides what to build and in which
-order; the server checks only the words it hands to Lake. Do not add an import graph walk or a build scheduler: a test
-scans the build path for Lake's import-graph queries. `lean_imports` reads each file's transitive closure from
-`lake setup-file --no-build` under a read turn.
+turn, stops the project's workers and waits until each has exited (`ProjectBroker::stop_workers`), opens one writer
+helper, and runs the guard and each step in it, with all output in one capped log in the store. The next check starts a
+fresh worker. A build that changes nothing still stops the workers. The turn ends only after the helper and every
+process of the build have exited. Lake decides what to build and in which order; the server checks only the words it
+hands to Lake. Do not add an import graph walk or a build scheduler: a test scans the build path for Lake's import-graph
+queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build` under a read turn.
 
 A raw `lake build` takes no kernel lock, so neither the turns nor the finished-build count see it. Running one while the
 server reads the project is outside the contract.
@@ -437,7 +449,11 @@ that checks the code. "None yet" marks a gap.
 | Rule | Test |
 | --- | --- |
 | Within one server, turns go in arrival order. | `project_lock/tests.rs`: `builds_and_checks_take_turns_in_arrival_order` |
-| No check loads imports while a build runs. | `project_lock/tests.rs`: `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`; across processes, none yet |
+| No check loads imports while a build runs. | `project_lock/tests.rs`: `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build`; across processes, none yet |
+| A build stops the project's workers, and each has exited before Lake starts; the next check starts a fresh worker on the new build. | `tests/project_workers.rs`: `a_build_stops_the_project_workers_before_lake_starts` |
+| A worker serves trials, proof positions, lookups and checks of modules with no source file from the project's own build, path dependencies included. | `tests/project_workers.rs`: `a_trial_imports_a_dependency_module_and_prints_its_axioms`, `a_proof_position_and_a_lookup_answer_from_the_project_build`, `a_module_without_a_source_file_is_checked_in_a_worker` |
+| A worker admits an import only through its launch roots, in order, then the shim roots, while no root holds `Init`; a worker that cannot take custody of its project refuses at once. | `tests/project_workers.rs`: `an_import_through_other_roots_is_refused`, `an_import_root_that_holds_init_is_refused`, `a_worker_whose_launch_roots_leave_the_project_refuses_at_once` |
+| Workers stay within `max_workers` and `max_workers_per_project` while checks, trials and builds share a project. | `tests/many_clients.rs`: `many_clients_share_one_project` |
 | No build starts between a check's `setup-file` and its use of the imports. | `project_lock/tests.rs`: `a_nested_read_reuses_the_turn_while_a_writer_waits` |
 | One writer at a time, across processes and server restarts. | SDK `lean-toolchain/src/writer_lock/tests.rs`; `tests/requests.rs`: `a_killed_server_interrupts_its_build_and_runs_the_queued_one`; `tests/many_clients.rs`: `many_clients_share_one_project` |
 | No lock release while a process of the build may live. | SDK `writer_lock/tests.rs`: `inherited_same_description_loan_retains_exclusion_until_owned_child_exit` |

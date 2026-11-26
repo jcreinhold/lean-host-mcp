@@ -1,12 +1,15 @@
 //! Builds: Lake runs in a project under the project's write turn.
 //!
 //! A build first takes the root's write turn, so it waits for the checks that
-//! hold read turns and holds back the checks that come after it. Then it opens
-//! the writer helper, which takes the project's kernel lock exclusive, and runs
-//! the guard and every step in that one helper. Each step's output goes to one
-//! log file under the store, and the reply carries the log's tail. The turn
-//! ends only after the helper has exited, so no check starts while a process
-//! of the build still runs.
+//! hold read turns and holds back the checks that come after it. Then it stops
+//! the root's workers and waits until each has exited, so none still holds an
+//! old build's files; the next check starts a fresh worker. A build that
+//! changes nothing stops them too. Then it opens the writer helper, which
+//! takes the project's kernel lock exclusive, and runs the guard and every
+//! step in that one helper. Each step's output goes to one log file under the
+//! store, and the reply carries the log's tail. The turn ends only after the
+//! helper has exited, so no check starts while a process of the build still
+//! runs.
 //!
 //! Lake decides what to build and in which order. The server checks only the
 //! words it hands to Lake (see `lake_args`) and the config that names them
@@ -239,15 +242,15 @@ pub(crate) type OnRunning = Box<dyn FnOnce() -> std::result::Result<(), String> 
 
 /// Run `plan` in canonical Lake root `root` as build `id`, writing its output
 /// to `log` through helper executable `helper`. The plan's timeout bounds the
-/// wait for the turn and the run together. `on_running` runs after the writer
-/// opens and before the first step.
+/// wait for the turn, the workers' exit and the run together. `on_running`
+/// runs after the writer opens and before the first step.
 ///
 /// # Errors
-/// Fails when the build gets no turn, when its writer does not open, when
-/// `on_running` fails, or when its request is cancelled. A failing step is not
-/// an error.
+/// Fails when the build gets no turn, when a worker of `root` does not exit,
+/// when its writer does not open, when `on_running` fails, or when its request
+/// is cancelled. A failing step is not an error.
 pub(crate) async fn run_build(
-    lock: &Arc<ProjectLock>,
+    broker: &ProjectBroker,
     root: &Path,
     plan: BuildPlan,
     id: &str,
@@ -267,9 +270,10 @@ pub(crate) async fn run_build(
             .canonicalize()?;
         CappedLog::open(log, plan.log_limit)?
             .append(format!("[lean-host-mcp: build {id} in {}]\n", root.display()).as_bytes())?;
-        let turn = ensure_write(lock, id, deadline, &cancellation)
+        let turn = ensure_write(&broker.project_lock(root), id, deadline, &cancellation)
             .await
             .map_err(|refused| ProjectBroker::turn_refused(root, refused))?;
+        broker.stop_workers(root, deadline).await?;
         let job = Job {
             root: root.to_path_buf(),
             sysroot,

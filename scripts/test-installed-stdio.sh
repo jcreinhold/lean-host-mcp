@@ -54,7 +54,7 @@ if [[ $project != "$workers"/* ]]; then
 fi
 export LEAN_HOST_MCP_STDIO_TEST_PROJECT="$project"
 [[ -f "$slot/$generation/worker.json" ]]
-# The installed Init smoke root already has a locked, empty import directory.
+# The installed smoke project already has a locked, empty import directory.
 # Give this private project Lake discovery metadata without building an import.
 (
     set -o noclobber

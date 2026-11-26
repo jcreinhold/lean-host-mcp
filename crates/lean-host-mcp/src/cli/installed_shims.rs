@@ -513,7 +513,7 @@ mod tests {
         result?;
         let shadow = candidate.join("smoke-project/.lake/build/lib/lean/Init");
         fs::create_dir(&shadow)?;
-        let result = refuse("earlier import root shadows builtin Init");
+        let result = refuse("shadows compiled package Init");
         fs::remove_dir(shadow)?;
         result?;
         Ok(())

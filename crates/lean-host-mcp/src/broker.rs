@@ -92,6 +92,8 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
 const REAPER_TICK: Duration = Duration::from_mins(1);
 const ARTIFACT_HANDOFF_TICK: Duration = Duration::from_millis(100);
+/// How often a build checks whether the workers it stopped have exited.
+const WORKER_EXIT_POLL: Duration = Duration::from_millis(25);
 
 /// Bag of broker inputs. Built once at startup from the CLI / env /
 /// config; `cwd` is injectable so tests can drive the cwd-walk step
@@ -1416,6 +1418,50 @@ impl ProjectBroker {
         for v in evicted {
             v.shutdown();
         }
+    }
+
+    /// Stop every worker of canonical Lake root `root` and wait until each has
+    /// exited. The caller holds the root's write turn, so no check holds one of
+    /// these workers and none can start another. The next check on `root`
+    /// starts a fresh worker.
+    ///
+    /// # Errors
+    /// Fails when a worker has not exited by `deadline`.
+    pub(crate) async fn stop_workers(&self, root: &Path, deadline: tokio::time::Instant) -> Result<()> {
+        let stopped = self.remove_workers(root);
+        for project in &stopped {
+            project.shutdown();
+        }
+        while !stopped.iter().all(|project| project.has_exited()) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ServerError::Internal(format!(
+                    "a worker of {} did not exit before the build deadline",
+                    root.display()
+                )));
+            }
+            tokio::time::sleep(WORKER_EXIT_POLL).await;
+        }
+        // Release the stopped workers' slots now rather than on the next tick.
+        crate::worker_retirement::poll_retirements();
+        Ok(())
+    }
+
+    /// Take every worker of `root` out of the registry.
+    fn remove_workers(&self, root: &Path) -> Vec<Arc<LeanProject>> {
+        let mut inner = self.inner.lock();
+        let keys: Vec<WorkerKey> = inner
+            .registry
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut removed = Vec::with_capacity(keys.len());
+        for key in &keys {
+            inner.last_used.remove(key);
+            removed.extend(inner.registry.pop(key));
+        }
+        drop(inner);
+        removed
     }
 
     /// Stop all resident projects and clear broker-local project state.

@@ -1,12 +1,14 @@
 //! Twelve clients on one project through `lean_run` and `lean_get`: eight
-//! check files and four build, while the test edits a file during a build,
-//! kills a client, and kills the server during a build and starts it again.
+//! check files, half of them with a command trial in their second round, and
+//! four build, while the test edits a file during a build, kills a client, and
+//! kills the server during a build and starts it again.
 //!
 //! The test asserts that Lake writer steps never overlap, that a `ps` sampler
 //! every 50 ms sees at most one Lake writer, that each ended build row wrote
 //! one marker line, that every check reply's `source_sha256` matches the text
-//! it read and no check reports a missing import, that the worker count stays
-//! within its limit, and that every row ends.
+//! it read and no check reports a missing import, that every trial prints
+//! what its commands should, that the worker count stays within its limit,
+//! and that every row ends.
 //!
 //! It is ignored: it needs a Lean toolchain and an installed worker, whose
 //! shim deployment file checks run Lean from. Set `LEAN_HOST_MCP_TEST_FIXTURE`
@@ -71,6 +73,10 @@ struct Work {
     files: Vec<String>,
     /// Modules to build; none on the fixture, whose builds run `mark`.
     modules: Vec<String>,
+    /// The `lean_trial` arguments of a check client's trial.
+    trial: Value,
+    /// Text the trial's output must hold.
+    printed: String,
     /// Starts every request id, so that runs against one server differ.
     prefix: String,
 }
@@ -91,13 +97,22 @@ fn pick(items: &[String], index: usize) -> Option<&String> {
     items.get(index.checked_rem(items.len())?)
 }
 
+/// What a request asked for.
+#[derive(Debug)]
+enum Kind {
+    /// A file check: the file and the digests of its text before the call and
+    /// after the reply.
+    File(String, [String; 2]),
+    /// A command trial.
+    Trial,
+    Build,
+}
+
 /// One request, as its client saw it end.
 #[derive(Debug)]
 struct Outcome {
     id: String,
-    /// A check's file and the digests of its text before the call and after
-    /// the reply.
-    read: Option<(String, [String; 2])>,
+    kind: Kind,
     /// The final `lean_get` reply: `{request, result}`.
     reply: Value,
 }
@@ -127,6 +142,8 @@ async fn on_fixture() -> TestResult {
         root: chain.root.clone(),
         files: CHECKED.map(str::to_owned).to_vec(),
         modules: Vec::new(),
+        trial: json!({"kind": "command", "imports": ["Chain.C"], "commands": "#check b_eq\n#print axioms b_eq"}),
+        printed: "'b_eq' does not depend on any axioms".to_owned(),
         prefix: prefix(),
     });
     // Client 12 is a process the test kills during its build.
@@ -161,7 +178,7 @@ async fn on_fixture() -> TestResult {
     let after = Client::new(&work.url, "after")?;
     outcomes.push(Outcome {
         id: killed_id.clone(),
-        read: None,
+        kind: Kind::Build,
         reply: settle(&after, &killed_id).await?,
     });
     let sampled = sampler.stop()?;
@@ -196,7 +213,7 @@ async fn on_fixture() -> TestResult {
         "the sampler never saw a Lake writer: {sampled:?}"
     );
     assert!(sampled.most_workers > 0, "the sampler never saw a worker: {sampled:?}");
-    assert_common(&outcomes, &sampled, MAX_WORKERS)?;
+    assert_common(&outcomes, &sampled, MAX_WORKERS, &work.printed)?;
     let unended: Vec<_> = rows
         .iter()
         .filter(|row| !http::FINAL_STATES.contains(&row.state.as_str()))
@@ -222,11 +239,14 @@ async fn on_running_server(url: String) -> TestResult {
             .map(str::to_owned)
             .collect())
     };
+    let modules = list("LEAN_HOST_MCP_MANY_CLIENTS_MODULES")?;
     let work = Arc::new(Work {
         url,
         root: PathBuf::from(variable("LEAN_HOST_MCP_MANY_CLIENTS_ROOT")?).canonicalize()?,
         files: list("LEAN_HOST_MCP_MANY_CLIENTS_FILES")?,
-        modules: list("LEAN_HOST_MCP_MANY_CLIENTS_MODULES")?,
+        trial: json!({"kind": "command", "imports": modules, "commands": "#check Nat"}),
+        printed: "Nat : Type".to_owned(),
+        modules,
         prefix: prefix(),
     });
     if work.files.is_empty() || work.modules.is_empty() {
@@ -245,7 +265,7 @@ async fn on_running_server(url: String) -> TestResult {
     report(&outcomes, &sampled);
     eprintln!("the server's pool held at most {most} of {limit} workers");
     assert!(most <= limit, "the pool held {most} workers, over its limit {limit}");
-    assert_common(&outcomes, &sampled, usize::MAX)
+    assert_common(&outcomes, &sampled, usize::MAX, &work.printed)
 }
 
 /// A request id prefix of its own for this run.
@@ -294,17 +314,27 @@ async fn collect(clients: Vec<JoinHandle<Sent<Vec<Outcome>>>>) -> TestResult<Vec
 async fn check_client(client: Client, work: Arc<Work>, number: usize) -> TestResult<Vec<Outcome>> {
     let mut outcomes = Vec::new();
     for round in 0..ROUNDS {
+        let id = format!("{}-check-{number}-{round}", work.prefix);
+        if round == 1 && number.is_multiple_of(2) {
+            run(&client, &id, "lean_trial", &work.trial).await?;
+            let reply = settle(&client, &id).await?;
+            outcomes.push(Outcome {
+                id,
+                kind: Kind::Trial,
+                reply,
+            });
+            continue;
+        }
         let file = pick(&work.files, number.saturating_add(round)).ok_or("no file to check")?;
         let path = work.root.join(file);
         let before = http::sha256_hex(&std::fs::read(&path)?);
-        let id = format!("{}-check-{number}-{round}", work.prefix);
         let arguments = json!({"kind": "file_diagnostics", "file": file});
         run(&client, &id, "lean_status", &arguments).await?;
         let reply = settle(&client, &id).await?;
         let after = http::sha256_hex(&std::fs::read(&path)?);
         outcomes.push(Outcome {
             id,
-            read: Some((file.clone(), [before, after])),
+            kind: Kind::File(file.clone(), [before, after]),
             reply,
         });
     }
@@ -323,7 +353,11 @@ async fn build_client(client: Client, work: Arc<Work>, number: usize) -> TestRes
         )
         .await?;
         let reply = settle(&client, &id).await?;
-        outcomes.push(Outcome { id, read: None, reply });
+        outcomes.push(Outcome {
+            id,
+            kind: Kind::Build,
+            reply,
+        });
     }
     Ok(outcomes)
 }
@@ -511,14 +545,20 @@ impl Sampler {
 
 /// Say what the run did.
 fn report(outcomes: &[Outcome], sampled: &Sampled) {
-    let mut counts = std::collections::BTreeMap::<(bool, &str), usize>::new();
+    let mut counts = std::collections::BTreeMap::<(&str, &str), usize>::new();
     for outcome in outcomes {
-        let key = (outcome.read.is_some(), http::state(&outcome.reply).unwrap_or("?"));
-        let count = counts.entry(key).or_default();
+        let kind = match outcome.kind {
+            Kind::File(..) => "checks",
+            Kind::Trial => "trials",
+            Kind::Build => "builds",
+        };
+        let count = counts
+            .entry((kind, http::state(&outcome.reply).unwrap_or("?")))
+            .or_default();
         *count = count.saturating_add(1);
     }
-    for ((check, state), count) in counts {
-        eprintln!("{} {state}: {count}", if check { "checks" } else { "builds" });
+    for ((kind, state), count) in counts {
+        eprintln!("{kind} {state}: {count}");
     }
     for outcome in outcomes {
         let error = outcome
@@ -532,8 +572,9 @@ fn report(outcomes: &[Outcome], sampled: &Sampled) {
     eprintln!("ps sampler: {sampled:?}");
 }
 
-/// The assertions that hold on the fixture and on a running server.
-fn assert_common(outcomes: &[Outcome], sampled: &Sampled, max_workers: usize) -> TestResult {
+/// The assertions that hold on the fixture and on a running server. Each
+/// trial's output must hold `printed`.
+fn assert_common(outcomes: &[Outcome], sampled: &Sampled, max_workers: usize, printed: &str) -> TestResult {
     assert!(sampled.samples > 0, "the sampler saw nothing: {sampled:?}");
     assert!(
         sampled.most_writers <= 1,
@@ -546,9 +587,10 @@ fn assert_common(outcomes: &[Outcome], sampled: &Sampled, max_workers: usize) ->
     let mut steps = Vec::new();
     for outcome in outcomes {
         assert!(http::is_final(&outcome.reply), "{} did not end", outcome.id);
-        match &outcome.read {
-            Some(read) => check_read(outcome, read)?,
-            None => steps.extend(build_steps(outcome)?),
+        match &outcome.kind {
+            Kind::File(file, digests) => check_read(outcome, file, digests)?,
+            Kind::Trial => check_trial(outcome, printed)?,
+            Kind::Build => steps.extend(build_steps(outcome)?),
         }
     }
     steps.sort_unstable();
@@ -565,7 +607,7 @@ fn assert_common(outcomes: &[Outcome], sampled: &Sampled, max_workers: usize) ->
 
 /// Check what a check request saw: its digest names a text the file held,
 /// and it reports no missing import.
-fn check_read(outcome: &Outcome, (file, digests): &(String, [String; 2])) -> TestResult {
+fn check_read(outcome: &Outcome, file: &str, digests: &[String; 2]) -> TestResult {
     let id = &outcome.id;
     match http::state(&outcome.reply) {
         Some("interrupted") => Ok(()),
@@ -586,6 +628,38 @@ fn check_read(outcome: &Outcome, (file, digests): &(String, [String; 2])) -> Tes
             Ok(())
         }
         other => Err(format!("check {id} ended {other:?}").into()),
+    }
+}
+
+/// Check what a trial saw: Lean ran its commands without an error, and its
+/// output holds `printed`.
+fn check_trial(outcome: &Outcome, printed: &str) -> TestResult {
+    let id = &outcome.id;
+    match http::state(&outcome.reply) {
+        // The killed server ran it; it has no result.
+        Some("interrupted") => Ok(()),
+        Some("done") => {
+            let result = outcome.reply.get("result").ok_or("no result")?;
+            assert_ne!(result.get("isError"), Some(&json!(true)), "trial {id} failed: {result}");
+            let data = result
+                .pointer("/structuredContent/data")
+                .ok_or_else(|| format!("trial {id} has no data: {result}"))?;
+            assert_eq!(
+                data.pointer("/diagnostics/summary/errors"),
+                Some(&json!(0)),
+                "trial {id} reports errors: {result}"
+            );
+            let output = data
+                .pointer("/output/value")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                output.contains(printed),
+                "trial {id} did not print {printed:?}: {result}"
+            );
+            Ok(())
+        }
+        other => Err(format!("trial {id} ended {other:?}").into()),
     }
 }
 

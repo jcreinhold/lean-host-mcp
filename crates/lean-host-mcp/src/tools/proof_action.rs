@@ -1012,10 +1012,15 @@ fn prepare_verify_group(root: &Path, group: VerifyGroup) -> Result<PreparedVerif
                 targets: group.targets,
             })
         }
-        VerifySource::ModuleIndex { module, display_file } => Ok(PreparedVerifyGroup {
+        // The module has no source file, so the worker checks an empty buffer
+        // that imports its build. A label in angle brackets names that buffer:
+        // Lake option discovery then reads the workspace's options, as for an
+        // import-only `lean_trial`, rather than open a file that is not there.
+        // Rows still show the module's source path.
+        VerifySource::ModuleIndex { module, .. } => Ok(PreparedVerifyGroup {
             source: String::new(),
+            file_label: format!("<lean_verify module {module}>"),
             imports: vec![module],
-            file_label: display_file.to_string_lossy().into_owned(),
             source_fact: None,
             targets: group.targets,
         }),

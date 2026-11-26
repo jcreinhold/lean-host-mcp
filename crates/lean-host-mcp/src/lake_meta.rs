@@ -359,7 +359,10 @@ fn append_lean_path(roots: &mut Vec<PathBuf>, worker_cwd: &Path, lean_path: &str
     roots.extend(lean_path.split(separator).map(|path| worker_cwd.join(path)));
 }
 
-fn manifest_artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
+/// The project's own import roots in Lean's search order: its build output,
+/// then each manifest package's, as the SDK's session import computes them.
+/// A project worker gets these at launch and admits no other import.
+pub(crate) fn manifest_artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![lake_root.join(BUILD_LIB_REL)];
     let Ok(bytes) = std::fs::read(lake_root.join("lake-manifest.json")) else {
         return roots;

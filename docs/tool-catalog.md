@@ -251,11 +251,12 @@ independent work or wait for the existing owner; do not kill the active worker.
 ```
 
 The build waits for the project's write turn: checks already running finish first, and checks sent later wait until the
-build ends. One writer helper holds the project's exclusive lock while Lake runs every step. Lake decides what to build
-and in which order. When `[build] guard` names targets, the server adds the step `lake build --no-build <guard>` before
-the build (or where the recipe's `guard` puts it), so a build that would compile those targets stops instead. The first
-failing step ends the build. The config, recipes and the words the server refuses are in
-[operations](operations.md#builds).
+build ends. Then it stops the project's workers, so the next check starts a fresh worker on what the build wrote, even
+when the build changed nothing. One writer helper holds the project's exclusive lock while Lake runs every step. Lake
+decides what to build and in which order. When `[build] guard` names targets, the server adds the step
+`lake build --no-build <guard>` before the build (or where the recipe's `guard` puts it), so a build that would compile
+those targets stops instead. The first failing step ends the build. The config, recipes and the words the server refuses
+are in [operations](operations.md#builds).
 
 ```json
 {
@@ -655,7 +656,8 @@ advisory `post_closure_diagnostics`. That field appears only on closed candidate
 Runs bounded Lean command text as an in-memory trial. Use it for import-context snippets such as `#check` and
 `#print axioms`; it is not a replacement for project-wide shell workflows.
 
-Explicit imports:
+Explicit imports name modules from the build of the project or of its Lake dependencies, read in place as `lean` reads
+them; build them first with `lean_build`:
 
 ```json
 {
@@ -763,8 +765,12 @@ The `data` payload contains a summary and result rows. For one verified declarat
 `worker_recycled`, `header_parse_failed`, or `unsupported`. `summary.requested` counts expanded targets before host-side
 caps. `summary.truncated` is true when declaration inventory or target expansion was capped. `file_all` and
 source-backed `module_all` use the current source snapshot and report the same project-relative file paths in rows. If a
-module has no source file, `module_all` may use the `.ilean` declaration inventory, with typed artifact freshness facts
-in `trust`. Every source-backed trust fact includes `content_sha256`, the SHA-256 of the exact bytes used by the call.
+module of the project has no source file, `module_all` reads its declarations from the module's `.ilean` index in the
+project's build, with typed artifact freshness facts in `trust`, and a worker imports the module's build to check them.
+That check finds only declarations elaborated from source, so their rows read `not_found`; `lean_trial` with
+`kind: "command"`, the module in `imports` and `#print axioms` checks them instead. `module_all` reads no index from a
+Lake dependency's build. Every source-backed trust fact includes `content_sha256`, the SHA-256 of the exact bytes used
+by the call.
 
 `detail` defaults to `"compact"`, which keeps declaration names, files, statuses, bounded diagnostics and goal text,
 sorry/admit facts, axiom facts, and trustworthiness flags. It omits target and ambiguous-candidate span blocks. For

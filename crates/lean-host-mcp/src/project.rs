@@ -1126,6 +1126,10 @@ pub(crate) struct LeanProject {
     healthy: Arc<AtomicBool>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     module_queries: ModuleQueryCache,
+    /// Alive while the actor thread can still start a worker.
+    actor_scope: std::sync::Weak<()>,
+    /// Counts this actor's worker processes until each exit is confirmed.
+    process_tracker: LeanWorkerProcessTracker,
 }
 
 /// Reserve a bounded mailbox slot without losing FIFO position on a wakeup.
@@ -1172,6 +1176,10 @@ impl LeanProject {
     ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let mut protected_artifact_domains = BTreeSet::from([meta.canonical_root.clone()]);
+        // The worker holds every domain of the project shared, packages too.
+        if let Ok(domains) = lean_toolchain::shared_writer::project_artifact_roots(&meta.canonical_root) {
+            protected_artifact_domains.extend(domains);
+        }
         protected_artifact_domains.extend(prepared_host_artifacts.artifact_roots.iter().map(PathBuf::from));
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
             protected_artifact_domains,
@@ -1212,13 +1220,20 @@ impl LeanProject {
         // std::thread drops a failed spawn's closure before returning its error.
         let handoff = Arc::new(Mutex::new(Some(initialization)));
         let actor_handoff = Arc::clone(&handoff);
+        let process_tracker = config.process_tracker.clone();
+        let scope = Arc::new(());
+        let actor_scope = Arc::downgrade(&scope);
         if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
             let Some(initialization) = actor_handoff.lock().take() else {
                 return;
             };
             // The permit outlives shutdown, failed startup and unwinding.
-            let _slot = WorkerSlot::new(slot, config.process_tracker.clone());
+            let slot = WorkerSlot::new(slot, config.process_tracker.clone());
             actor_main(config, init_tx, initialization);
+            // The captured scope outlives the slot, even when unwinding. Once
+            // it is gone, no code of this actor can start another worker.
+            drop(slot);
+            drop(scope);
         }) {
             let initialization = handoff.lock().take();
             if let Some(initialization) = initialization {
@@ -1247,6 +1262,8 @@ impl LeanProject {
             healthy,
             runtime,
             module_queries: ModuleQueryCache::with_capacity(cache_cap),
+            actor_scope,
+            process_tracker,
         }))
     }
 
@@ -1259,9 +1276,12 @@ impl LeanProject {
         keepalive: Box<dyn Send>,
     ) -> Arc<Self> {
         let (tx, mut rx) = mpsc::channel::<ProjectMessage>(1);
+        let scope = Arc::new(());
+        let actor_scope = Arc::downgrade(&scope);
         thread::spawn(move || {
             let _keepalive = keepalive;
             while rx.blocking_recv().is_some() {}
+            drop(scope);
         });
         Arc::new(Self {
             canonical_root: root.to_path_buf(),
@@ -1288,6 +1308,8 @@ impl LeanProject {
                 import_residue_limit_bytes: None,
             })),
             module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
+            actor_scope,
+            process_tracker: LeanWorkerProcessTracker::new(),
         })
     }
 
@@ -1675,6 +1697,12 @@ impl LeanProject {
     pub(crate) fn shutdown(&self) {
         self.healthy.store(false, Ordering::Release);
         let _ = self.actor_tx.lock().take();
+    }
+
+    /// Whether the actor has ended and every worker process it started has a
+    /// confirmed exit, the same test that releases its worker slot.
+    pub(crate) fn has_exited(&self) -> bool {
+        self.actor_scope.strong_count() == 0 && self.process_tracker.active_processes() == 0
     }
 
     pub(crate) fn is_healthy(&self) -> bool {
@@ -3580,6 +3608,21 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
     if let Some(artifacts) = &config.prepared_host_artifacts {
         child = child.prepared_host_artifacts(artifacts.clone());
     }
+    if scope == "main" {
+        // The worker admits an import only through exactly these roots.
+        let roots = crate::lake_meta::manifest_artifact_roots(&config.lake_root)
+            .into_iter()
+            .map(|root| {
+                root.into_os_string()
+                    .into_string()
+                    .map_err(|_| ServerError::BadProject("project import root is not UTF-8".to_owned()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let input = serde_json::to_string(&roots).map_err(|error| ServerError::Internal(error.to_string()))?;
+        child = child
+            .application_launch_input(&input)
+            .map_err(|error| ServerError::BadProject(error.to_string()))?;
+    }
     Ok(child)
 }
 
@@ -4547,6 +4590,8 @@ mod tests {
                 import_residue_limit_bytes: None,
             })),
             module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
+            actor_scope: std::sync::Weak::new(),
+            process_tracker: LeanWorkerProcessTracker::new(),
         };
         (project, rx, test_admission_deadline(limit))
     }

@@ -111,15 +111,18 @@ check may overlap a build of the same project. The server keeps them apart with 
 
 - A check takes a read turn before it starts a worker job or a native reader, then the shared kernel lock on the
   project's artifacts, and keeps both until it ends. Read turns do not exclude each other.
-- `lean_build` takes the write turn, then the exclusive kernel lock through the writer helper. It waits for the checks
-  that hold read turns and holds back the checks that arrive after it, so a check sent during a build waits and then
-  sees what the build wrote. Turns follow arrival order; a waiting request keeps its place until its deadline.
+- `lean_build` takes the write turn, stops the project's workers and waits until each has exited, then takes the
+  exclusive kernel lock through the writer helper. It waits for the checks that hold read turns and holds back the
+  checks that arrive after it, so a check sent during a build waits and then sees what the build wrote. The next check
+  starts a fresh worker, even after a build that changed nothing. Turns follow arrival order; a waiting request keeps
+  its place until its deadline.
 - A worker holds the shared lock for its whole life. When a writer in another process asks for the exclusive lock, the
   server queues a write turn for it and retires the idle workers that hold the lock.
 
 Each read turn carries the number of builds that have finished on the root. A worker that loaded its imports before a
-later build finished is recycled before reuse, and `artifacts_rebuilt` records that. Since workers hold the shared lock
-for their whole life, this is a backstop. A cached query result answers only while the worker that computed it lives.
+later build finished is recycled before reuse, and `artifacts_rebuilt` records that. Since a build in this server stops
+the workers first and workers hold the shared lock for their whole life, this is a backstop for writers in other
+processes. A cached query result answers only while the worker that computed it lives.
 
 Build through `lean_build`, or through another process that holds the shared writer. A raw `lake build` takes no lock:
 it can rewrite `.olean` files while a check reads them, and the server does not notice. That is outside the contract.
@@ -210,11 +213,12 @@ steps = [["build"], ["exe", "lean-fmt", "format", "--check", "--no-build"]]
 append = "each"                     # the request's args go at the end of both steps
 ```
 
-A build takes the project's write turn (see [rebuilt artifacts](#rebuilt-artifacts)) and opens one writer helper, which
-holds the exclusive kernel lock while the guard and each step run in it. The first failing step ends the build. All
-output goes to one log under the store's `logs/`, capped at `build.log_limit_mib`; the reply gives each step's command
-and exit code, the log's path and its tail. At the deadline the server stops the running step. The turn ends only after
-the helper and every process of the build have exited, so no check starts while one still runs.
+A build takes the project's write turn (see [rebuilt artifacts](#rebuilt-artifacts)), stops the project's workers, and
+opens one writer helper, which holds the exclusive kernel lock while the guard and each step run in it. The first
+failing step ends the build. All output goes to one log under the store's `logs/`, capped at `build.log_limit_mib`; the
+reply gives each step's command and exit code, the log's path and its tail. At the deadline the server stops the running
+step. The turn ends only after the helper and every process of the build have exited, so no check starts while one still
+runs.
 
 Each step runs in the Lake root with the server's environment, except that the server sets `LEAN_SYSROOT` to the
 project's toolchain, sets `LAKE_ARTIFACT_CACHE=false` so that builds land in each package's `.lake/build`, and removes

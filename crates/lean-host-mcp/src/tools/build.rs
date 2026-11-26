@@ -80,8 +80,7 @@ pub(crate) async fn run_planned(
     on_running: Option<OnRunning>,
 ) -> Result<BuildOutcome, McpError> {
     let helper = crate::shared_writer::contract().map_err(ServerError::Io)?.executable;
-    let lock = ctx.broker.project_lock(&build.root);
-    Ok(run_build(&lock, &build.root, build.plan, id, log, &helper, on_running).await?)
+    Ok(run_build(&ctx.broker, &build.root, build.plan, id, log, &helper, on_running).await?)
 }
 
 /// `lean_imports` arguments.

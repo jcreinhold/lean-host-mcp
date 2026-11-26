@@ -253,6 +253,8 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
             import_residue_limit_bytes: None,
         })),
         module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
+        actor_scope: std::sync::Weak::new(),
+        process_tracker: LeanWorkerProcessTracker::new(),
     })
 }
 

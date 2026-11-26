@@ -123,6 +123,8 @@ fn mailbox_project() -> (Arc<LeanProject>, mpsc::Receiver<ProjectMessage>) {
             import_residue_limit_bytes: None,
         })),
         module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
+        actor_scope: std::sync::Weak::new(),
+        process_tracker: lean_rs_worker_parent::LeanWorkerProcessTracker::new(),
     };
     (Arc::new(project), rx)
 }

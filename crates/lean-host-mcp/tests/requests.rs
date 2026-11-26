@@ -389,8 +389,7 @@ fn span(reply: &Value) -> TestResult<(i64, i64)> {
 /// preparation slot in turn. Each check holds Lean for two seconds, so the
 /// rows must overlap by more than one; with one turn at a time they would
 /// overlap by a few milliseconds at most. File checks run Lean from an
-/// installed worker's shim deployment, and the worker refuses the project
-/// commands a worker check would need.
+/// installed worker's shim deployment.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
 async fn checks_on_one_project_run_at_once() -> TestResult {

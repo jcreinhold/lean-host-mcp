@@ -495,7 +495,11 @@ pub(crate) fn processes() -> TestResult<Vec<Process>> {
 
 /// The processes under `pid`, found by parent.
 pub(crate) fn descendants(pid: u32) -> TestResult<Vec<Process>> {
-    let all = processes()?;
+    Ok(descendants_in(&processes()?, pid))
+}
+
+/// The processes of `all` under `pid`, found by parent.
+pub(crate) fn descendants_in(all: &[Process], pid: u32) -> Vec<Process> {
     let mut parents = vec![pid];
     let mut found = Vec::new();
     while let Some(parent) = parents.pop() {
@@ -504,7 +508,22 @@ pub(crate) fn descendants(pid: u32) -> TestResult<Vec<Process>> {
             found.push(process.clone());
         }
     }
-    Ok(found)
+    found
+}
+
+/// The processes of `all` under server `server` that run the worker binary,
+/// at any depth.
+pub(crate) fn worker_processes(all: &[Process], server: u32) -> Vec<Process> {
+    descendants_in(all, server)
+        .into_iter()
+        .filter(|process| {
+            process
+                .command
+                .split_whitespace()
+                .next()
+                .is_some_and(|program| program.ends_with("lean-host-mcp-worker"))
+        })
+        .collect()
 }
 
 /// Watch `processes` every 50 ms, for up to `limit` after `since`, and say

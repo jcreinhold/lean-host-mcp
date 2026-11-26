@@ -8,7 +8,7 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             Some("--lean-rs-ready-host-artifacts" | "--lean-rs-prepare-host-artifacts")
         ) && std::env::args_os().len() == 2
         {
-            println!("{}", serde_json::to_string(deployment.prepared())?);
+            println!("{}", serde_json::to_string(deployment.ready()?)?);
             return Ok(std::process::ExitCode::SUCCESS);
         }
         return Err("unsupported installed worker preparation request".into());
