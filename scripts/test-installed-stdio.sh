@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Run the parent tests with a test-owned installed worker, including its verified shims.
+# Set LEAN_RS_CHECKOUT to build the writer, shims, worker and host from an SDK checkout.
 set -euo pipefail
 CDPATH='' cd -- "$(dirname -- "$0")/.."
+# shellcheck source=scripts/local-sdk.sh
+source scripts/local-sdk.sh
 toolchain=$(cat fixtures/lean/lean-toolchain)
 id=${toolchain##*:}
 target=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
@@ -12,22 +15,24 @@ fi
 export CARGO_TARGET_DIR="$target"
 LEAN_SYSROOT=$(scripts/fixture-lean-prefix.sh)
 export LEAN_SYSROOT
+mkdir -p "$target"
+scratch=$(mktemp -d "$target/stdio-install.XXXXXX")
+trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch"' EXIT
+local_sdk_enable "$scratch"
 if [[ -z ${LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR:-} ]]; then
-    mkdir -p "$target"
-    scratch=$(mktemp -d "$target/stdio-install.XXXXXX")
-    trap 'rm -rf -- "$scratch"' EXIT
     export LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$scratch/workers"
     export LEAN_RS_WORKER_OWNERS_DIRECTORY="$scratch/owners"
     sdk=$(python3 -c 'import tomllib; [version] = [p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"] == "lean-toolchain"]; print(version)')
-    cargo install --locked --debug --version "=$sdk" --root "$scratch/tools" lean-rs-writer
-    cargo build --locked -p lean-host-mcp --bin lean-host-mcp
+    local_sdk_install_writer "$scratch/tools" "$sdk"
+    local_sdk_cargo build -p lean-host-mcp --bin lean-host-mcp
+    local_sdk_check Cargo.toml
     # The source worker installer expects Cargo's native profile directories.
     parent="$target/debug/lean-host-mcp"
     if [[ ! -x $parent ]]; then
         printf 'Expected native parent binary at %s\n' "$parent" >&2
         exit 1
     fi
-    "$parent" install-worker --toolchain "$id" \
+    local_sdk_install_worker "$parent" --toolchain "$id" \
         --workers-dir "$scratch/workers" --source-dir "$PWD" \
         --standalone-writer "$scratch/tools/bin/lean-rs-writer"
 fi
@@ -58,4 +63,4 @@ export LEAN_HOST_MCP_STDIO_TEST_PROJECT="$project"
     [[ -f lean-toolchain ]] || printf '%s\n' "$toolchain" >lean-toolchain
     [[ -f lake-manifest.json ]] || "$LEAN_SYSROOT/bin/lake" --no-cache update
 )
-cargo test --locked -p lean-host-mcp "$@"
+local_sdk_cargo test -p lean-host-mcp "$@"

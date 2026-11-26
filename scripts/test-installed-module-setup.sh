@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Validate ordinary file-backed endpoints and optionally managed release against the packaged pair.
+# Set LEAN_RS_CHECKOUT to build the pair, writer and shims from an SDK checkout; release checks leave it unset.
 set -euo pipefail
 CDPATH='' cd -- "$(dirname -- "$0")/.."
+# shellcheck source=scripts/local-sdk.sh
+source scripts/local-sdk.sh
 managed_release=false
 if [[ ${1:-} == --managed-release ]]; then
     managed_release=true
@@ -25,13 +28,14 @@ version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb")
 sdk=$(python3 -c 'import tomllib; [v]=[p["version"] for p in tomllib.load(open("Cargo.lock","rb"))["package"] if p["name"]=="lean-toolchain"]; print(v)')
 mkdir -p "$CARGO_TARGET_DIR"
 scratch=$(mktemp -d "$CARGO_TARGET_DIR/module-setup.XXXXXX")
-trap 'rm -rf -- "$scratch"' EXIT
+trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch"' EXIT
 export R2_SETUP_ROOT="$scratch"
 export TMPDIR="$scratch/tmp" LEAN_RS_WORKER_OWNERS_DIRECTORY="$scratch/owners"
 export LEAN_HOST_MCP_SEMANTIC_CACHE_DIR="$scratch/semantic-cache"
 mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache" "$scratch/server-owners"
 # Verify the actual archives below with their published dependency locks.
 cargo package --locked --workspace --no-verify
+local_sdk_enable "$scratch"
 archives="$CARGO_TARGET_DIR/package"
 pair="$scratch/archives"
 mkdir "$pair"
@@ -50,13 +54,16 @@ lean-host-mcp-worker = { path = "lean-host-mcp-worker-$version" }
 EOF
 cp "$pair/lean-host-mcp-$version/Cargo.lock" "$pair/Cargo.lock"
 cargo update --offline --manifest-path "$pair/Cargo.toml" -p lean-host-mcp-worker
-python3 - "$pair" "$version" <<'PY_LOCK'
+python3 - "$pair" "$version" "$LOCAL_SDK_ROOT" <<'PY_LOCK'
 import pathlib
 import sys
 import tomllib
 
-pair, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+pair, version, local_sdk = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 host_names = {"lean-host-mcp", "lean-host-mcp-worker"}
+
+def is_sdk(name):
+    return bool(local_sdk) and name.startswith(("lean-rs", "lean-toolchain"))
 
 def read_lock(directory):
     with (directory / "Cargo.lock").open("rb") as stream:
@@ -65,7 +72,7 @@ def read_lock(directory):
 def registry_identities(entries):
     return {
         (p["name"], p["version"], p.get("source"), p.get("checksum"))
-        for p in entries if p["name"] not in host_names
+        for p in entries if p["name"] not in host_names and not is_sdk(p["name"])
     }
 
 published_locks = set().union(*(
@@ -91,7 +98,8 @@ if "$managed_release"; then
         warm_release=true
     fi
 fi
-cargo build --locked --manifest-path "$parent_manifest" --bin lean-host-mcp ${parent_features[@]+"${parent_features[@]}"}
+local_sdk_cargo build --manifest-path "$parent_manifest" --bin lean-host-mcp ${parent_features[@]+"${parent_features[@]}"}
+local_sdk_check "$pair/Cargo.toml"
 # The source worker installer expects Cargo's native profile directories.
 built_parent="$CARGO_TARGET_DIR/debug/lean-host-mcp"
 if [[ ! -x $built_parent ]]; then
@@ -100,25 +108,22 @@ if [[ ! -x $built_parent ]]; then
 fi
 export R2_SETUP_PARENT="$scratch/shipping-lean-host-mcp"
 cp "$built_parent" "$R2_SETUP_PARENT"
-cargo install --debug --locked --root "$R2_SETUP_ROOT/tools" --version "=$sdk" lean-rs-writer
-"$R2_SETUP_PARENT" install-worker --toolchain "$id" --workers-dir "$R2_SETUP_ROOT/workers" \
+local_sdk_install_writer "$R2_SETUP_ROOT/tools" "$sdk"
+local_sdk_install_worker "$R2_SETUP_PARENT" --toolchain "$id" --workers-dir "$R2_SETUP_ROOT/workers" \
     --source-dir "$worker_source" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
 # Build the bundled Lean capability under the same packaged writer before the
 # RPC smoke. Cold compilation has its own existing SDK budget.
-cargo run --locked --manifest-path "$parent_manifest" --example prepare_semantic_smoke \
+local_sdk_cargo run --manifest-path "$parent_manifest" --example prepare_semantic_smoke \
     ${parent_features[@]+"${parent_features[@]}"} -- \
     "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$R2_SETUP_PARENT"
 python3 tests/r2-launch-input/module_setup.py
 if "$managed_release"; then
     scripts/check-parent-link.sh "$R2_SETUP_PARENT"
+    if "$warm_release" && [[ -z ${LEAN_HOST_MCP_PREVIOUS_COLD_HOST:-} ]]; then
+        printf 'Skipping warm inspection: set LEAN_HOST_MCP_PREVIOUS_COLD_HOST to a previous host binary.\n' >&2
+        warm_release=false
+    fi
     if "$warm_release"; then
-        # Public hosted verification can install the prior registry image.
-        # Local paired runs may instead supply an existing exact executable.
-        if [[ ${GITHUB_ACTIONS:-} == true && -z ${LEAN_HOST_MCP_PREVIOUS_COLD_HOST:-} ]]; then
-            cargo install --debug --locked --root "$scratch/previous-cold" \
-                --version '=0.16.18' --features managed-native-store lean-host-mcp
-            export LEAN_HOST_MCP_PREVIOUS_COLD_HOST="$scratch/previous-cold/bin/lean-host-mcp"
-        fi
         warm_scratch=$(mktemp -d "${RUNNER_TEMP:-$CARGO_TARGET_DIR}/w.XXXXXX")
         python3 tests/r2-launch-input/prepare_generation.py --warm-inspection \
             --host "$R2_SETUP_PARENT" --writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer" \
@@ -132,7 +137,7 @@ if "$managed_release"; then
 
     # Only the injected rename fault uses this separately compiled executable.
     LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1 \
-        cargo build --locked --manifest-path "$parent_manifest" --bin lean-host-mcp "${parent_features[@]}"
+        local_sdk_cargo build --manifest-path "$parent_manifest" --bin lean-host-mcp "${parent_features[@]}"
     fault_parent="$scratch/fault-only-lean-host-mcp"
     cp "$built_parent" "$fault_parent"
     LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$fault_parent" \
