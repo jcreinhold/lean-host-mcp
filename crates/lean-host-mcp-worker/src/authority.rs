@@ -36,7 +36,8 @@ use std::{
 
 /// Where Lake writes a package's `.olean` files, relative to the package.
 const BUILD_LIB: &str = ".lake/build/lib/lean";
-/// Most launch roots: Lake's bound on the artifact domains of one project.
+/// Most launch roots: the SDK takes custody of at most 32 packages of one Lake
+/// workspace, and each package gives one root.
 const MAX_LAUNCH_ROOTS: usize = 32;
 
 #[derive(Deserialize)]

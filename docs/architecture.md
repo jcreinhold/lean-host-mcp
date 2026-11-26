@@ -113,8 +113,9 @@ roots and of the installed shims. It admits an import only when the request's ro
 order, then the installed shim roots, and while no root holds a package whose compiled code the worker runs, such as
 `Init` or `Init.olean`; any module names are allowed. A worker that cannot take custody of its project at launch, for
 example after the manifest dropped a package, starts anyway and refuses each import with the reason. A child that exits
-before it connects would cost the SDK's 30-second startup wait and leave an owner record that makes later writers wait.
-The host copies no files, hashes no build outputs, and writes no import plan.
+before it connects would make the server wait out the 30-second startup deadline it gives the SDK, and would leave an
+owner record that makes later writers wait. The host copies no files, hashes no build outputs, and writes no import
+plan.
 
 Same-project startup stays serialized after caller disconnects and rechecks the per-project limit. The broker can evict
 an idle LRU actor, but cannot evict a borrowed actor or one with queued work. Metadata-only degraded responses and pure
