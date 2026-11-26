@@ -503,22 +503,12 @@ async fn query(project: &LeanProject) -> Result<ProjectCall<LeanWorkerModuleQuer
         .await
 }
 
-/// A retained-request test can run this inside its own cancellation scope and
-/// observe genuine actor evidence without depending on an installed Lean worker.
-pub(crate) async fn retained_timeout_call(
-    remove_executable: bool,
-) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
-    let harness = ActorHarness::start(remove_executable);
-    let result = query(&harness.project).await;
-    assert_eq!(harness.requests("process_module_query").len(), 1);
-    harness.finish().await;
-    result
-}
-
-/// Compose the real actor/supervisor protocol with an outer retained request.
-/// This tests pre-body generation cycling, not physical artifact-lock custody
-/// or Lean elaboration; those have separate real-worker coverage.
-pub(crate) async fn retained_warm_prebody_cycle_call() -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
+/// One refused warm open replaces the worker before the target body, and the
+/// body runs once, on the replacement. This tests pre-body generation cycling,
+/// not physical artifact-lock custody or Lean elaboration; those have separate
+/// real-worker coverage.
+#[tokio::test]
+async fn one_warm_prebody_cycle_runs_the_target_body_once() {
     let harness = ActorHarness::start(false);
     harness
         .project
@@ -565,18 +555,21 @@ pub(crate) async fn retained_warm_prebody_cycle_call() -> Result<ProjectCall<Lea
     );
     assert!(harness.requests("attempt_proof").is_empty());
     harness.finish().await;
-    result
 }
 
-/// Cancel after any caller-owned preparation, but before this actor can receive
-/// a source operation. Preparation effects remain the caller's own evidence.
-pub(crate) async fn retained_cancelled_before_dispatch_call() -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
+/// A call cancelled before the actor receives it, as when its client goes
+/// away while it waits, never sends its target body.
+#[tokio::test]
+async fn a_call_cancelled_before_dispatch_never_reaches_the_worker() {
     let harness = ActorHarness::start(false);
-    CallCancellation::current().cancel();
-    let result = query(&harness.project).await;
+    let result = crate::cancellation::with_cancellation(&CancellationToken::new(), async {
+        CallCancellation::current().cancel();
+        query(&harness.project).await
+    })
+    .await;
+    assert!(result.is_err(), "a cancelled call returns no result");
     assert!(harness.requests("process_module_query").is_empty());
     harness.finish().await;
-    result
 }
 
 fn failure(error: ServerError) -> Box<WorkerUnavailable> {
@@ -1272,10 +1265,11 @@ async fn known_metadata_result_survives_read_release_failure_without_replay() {
     harness.finish().await;
 }
 
-/// Reproduce a missing-import terminal reply after an independently stopped
-/// older request changed the worker generation. No Lean or Lake is invoked.
-pub(crate) async fn retained_missing_import_after_replacement_call() -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>>
-{
+/// A missing import, after a stopped older request changed the worker
+/// generation, refuses before the target body and reuses no old stop receipt.
+/// No Lean or Lake runs.
+#[tokio::test]
+async fn missing_import_after_replacement_refuses_before_the_target_body() {
     let harness = ActorHarness::start(false);
     let prior_request = CancellationToken::new();
     let prior = crate::cancellation::with_cancellation(&prior_request, query(&harness.project)).await;
@@ -1324,7 +1318,6 @@ pub(crate) async fn retained_missing_import_after_replacement_call() -> Result<P
         "only the healthy replacement is resident"
     );
     harness.finish().await;
-    result
 }
 
 #[tokio::test]

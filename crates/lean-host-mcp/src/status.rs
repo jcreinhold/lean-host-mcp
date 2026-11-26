@@ -23,20 +23,6 @@ impl Default for BuildIdentity {
     }
 }
 
-/// Retention accounting, not proof that a client has consumed its final result.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct RequestRegistryStatus {
-    pub active: usize,
-    pub retained_terminal: usize,
-    pub capacity: usize,
-    pub terminal_retention_millis: u64,
-    /// Server admission incarnation; prepared tickets carry their own binding.
-    pub request_epoch: String,
-    pub durable: bool,
-    pub journal_healthy: bool,
-    pub max_record_bytes: usize,
-}
-
 /// Resolved execution controls, not raw environment or configuration files.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct EffectiveSettings {

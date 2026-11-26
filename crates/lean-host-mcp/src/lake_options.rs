@@ -124,31 +124,6 @@ async fn observe_preparation(
     }
 }
 
-/// Exercise preparation's real child/effect boundary without a Lean toolchain.
-#[cfg(test)]
-pub(crate) async fn successful_preparation_for_test(effect_path: &Path) -> Result<LeanWorkerElabOptions> {
-    observe_preparation("PreparationFixture.lean".to_owned(), async {
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg("printf prepared > \"$1\"")
-            .arg("lean-host-mcp-preparation-test")
-            .arg(effect_path)
-            .kill_on_drop(true);
-        let output = test_child_output(&mut command, Duration::from_secs(5))
-            .await
-            .map_err(PreparationFailure::unknown)?;
-        if !output.status.success() {
-            return Err(PreparationFailure::stopped(bad_project(format!(
-                "test preparation child exited: {}",
-                output.status
-            ))));
-        }
-        Ok(LeanWorkerElabOptions::new().file_label("PreparationFixture.lean"))
-    })
-    .await
-}
-
 fn preparation_failed(file_label: String, error: ServerError) -> ServerError {
     let target_check = TargetCheckNotStarted {
         file_label,

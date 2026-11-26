@@ -2,14 +2,14 @@
 
 Five semantic tools cover proof context, trials, lookup, verification, and status. `lean_context`, `lean_trial`,
 `lean_lookup`, and `lean_status` select a mode with `kind`; `lean_verify` takes target groups directly. Operational
-coordination uses `lean_compatibility`, `lean_request`, and `lean_runtime`. `lean_build` runs Lake, and `lean_imports`
-reads what Lake reports a file imports.
+coordination uses `lean_compatibility` and `lean_runtime`; `lean_run` and `lean_get` start and read named requests.
+`lean_build` runs Lake, and `lean_imports` reads what Lake reports a file imports.
 
 - Semantic tools: [context](#lean_context), [trial](#lean_trial), [verification](#lean_verify), [lookup](#lean_lookup),
   [status](#lean_status).
 - Shared contracts: [response shape](#response-shape), [output carrier](#output-carrier),
   [request synonyms](#request-synonyms), [proof workflow](#proof-workflow).
-- Coordination: [native compatibility](#native-compatibility), [retained requests](#prepared-retained-lifecycle-v3),
+- Coordination: [native compatibility](#native-compatibility), [named requests](#named-requests),
   [worker activity and admission leases](#worker-activity-and-admission-leases).
 - Lake: [builds](#lean_build), [import closures](#lean_imports).
 
@@ -47,11 +47,10 @@ including after internal replacement. Extra compatible loaded operations are all
 is refused before the caller submits its proof. Compatibility never certifies execution, a proof verdict, worker exit,
 absence of prior IO, or readiness of arbitrary first-party artifacts.
 
-Save the contract and instance with the prepared request. Semantic responses carry the actual call's receipt at
+Save the contract and instance with the request. Semantic responses carry the actual call's receipt at
 `trust.native_compatibility`, even with quiet telemetry. Validate it against the saved contract before accepting a
-result; a later broker instance does not rewrite the old request's identity. Retained recovery uses the original ticket
-rather than submitting again. `lean_runtime(action=status)` remains a non-mutating advisory snapshot and never opens a
-worker.
+result. To recover a lost reply, read the same `request_id` with `lean_get` rather than sending the call under a new id.
+`lean_runtime(action=status)` remains a non-mutating advisory snapshot and never opens a worker.
 
 `lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and helper
 configuration without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded handshake.
@@ -74,11 +73,8 @@ and a completion notification on `notifications/progress`. Clients such as Claud
 only while progress arrives, so a cold import or a large file's elaboration is not abandoned at the client while the
 worker keeps computing. Clients that omit the token keep the same single-response behavior.
 
-Clients declaring the `io.modelcontextprotocol/tasks` extension may receive a standard task handle from `tools/call`.
-Use `tasks/get` with its `taskId` to retrieve status and the eventual original tool result; use `tasks/cancel` to
-request cancellation. Cheap project status remains synchronous. Existing clients keep synchronous tool responses. The
-HTTP server shares task records across client sessions, so reconnecting clients can retrieve their existing handles. A
-task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
+The server offers no MCP Tasks. To keep a result past a dropped connection or a server restart, name the call with
+`request_id`; see [named requests](#named-requests).
 
 For one explicit named file group on the ordinary setup-aware `lean_verify` route, a complete verdict includes
 `trust.cli_file_verification` with schema `lean-host-cli-file-verification-v1`. It identifies the `server_instance_id`,
@@ -93,128 +89,86 @@ respectively. The `data` digest uses compact UTF-8 JSON with sorted object keys 
 check the exact requested names and compare the source digest against its saved input before accepting a verdict. The
 receipt establishes CLI provenance. Loaded-worker ABI evidence continues to use `trust.native_compatibility`.
 
-### Prepared retained lifecycle (v3)
+### Named requests
 
-Clients without the Tasks extension use `lean_request`. Servers advertise `retained_request_lifecycle_v3` in
-`lean_runtime`. Prepare new work first:
-
-```json
-{"name":"lean_request","arguments":{"action":"prepare","tool":"lean_verify","arguments":{"targets":[]}}}
-```
-
-`prepare` validates the tool and arguments, reserves one retained-record slot and returns a server-issued `taskId` and
-immutable `request` binding. It does not invoke the tool, open a worker, or evaluate Lake configuration. The ticket is
-valid for five minutes. Its `execution` remains `pending` with reason `prepared`, because it can still be submitted.
-Preparing does not reserve a worker lane. `prepare` rejects client-supplied IDs, epochs and digests.
-
-Save the returned ticket and binding before submitting the exact input:
+A call that carries `request_id` in its arguments is a named request. The server writes a row for it in the request
+table before anything runs, runs it at most once, and keeps its result. An id matches `^[A-Za-z0-9._:-]{8,128}$`; ids
+that start with `srv-` belong to the server. `tools/list` shows the optional `request_id` property on every tool except
+`lean_run`, `lean_get` and `lean_runtime`, which never run as requests.
 
 ```json
-{"name":"lean_request","arguments":{"action":"submit","request_id":"ticket-from-prepare","request_epoch":"epoch-from-ticket","tool":"lean_verify","arguments":{"targets":[]}}}
-{"name":"lean_request","arguments":{"action":"get","request_id":"ticket-from-prepare","request_epoch":"epoch-from-ticket"}}
-{"name":"lean_request","arguments":{"action":"cancel","request_id":"ticket-from-prepare","request_epoch":"epoch-from-ticket"}}
+{"name":"lean_verify","arguments":{"request_id":"verify-7c1d2e3f","targets":[{"kind":"file_all","file":"Chain/C.lean"}]}}
+{"name":"lean_run","arguments":{"request_id":"build-7c1d2e3f","tool":"lean_build","arguments":{"targets":["Chain.C"]}}}
+{"name":"lean_get","arguments":{"request_id":"build-7c1d2e3f","wait_seconds":60}}
 ```
 
-`submit` requires an existing prepared ticket. It never creates work for a missing ID. An exact retry of an accepted,
-running or retained terminal ticket returns its original record without executing again. Changed inputs are rejected.
-Malformed submit retries report `unknown` for the referenced ticket; a rejected retry cannot certify that previously
-accepted work never started. Pure invalid preparation or submission without a ticket can report typed `not_started`. Use
-the ticket's original epoch and origin instance on every recovery; status observations are advisory. Expiry,
-acknowledgment and unrelated requests do not rotate the live broker's epoch or invalidate another prepared ticket.
+- A tool called with `request_id` runs the request, waits for its end and returns the tool's result. If the connection
+  drops, the wait ends and the request goes on; the same call again returns the stored result.
+- `lean_run {request_id, tool, arguments}` records the request, starts it and replies at once with `{request: row}`. The
+  inner `arguments` must not hold `request_id`.
+- `lean_get {request_id, wait_seconds?}` returns `{request: row, result}`. `result` is null until the request ends, then
+  the stored tool result, which a direct call would have returned. A request that a server start ended has a null
+  result. `wait_seconds` (default 0) waits up to that long for the end; `[requests] wait_max_secs` caps it.
 
-The immutable `request` binding contains `server_instance_id`, `request_epoch`, `tool`, `submission_sha256`, and
-`project`. The digest is lowercase SHA-256 of the compact JSON array `[tool, arguments]`, with object keys sorted by the
-server's JSON serializer. `project` is the exact submitted string or null, not a source-revision claim. The origin
-instance and epoch remain unchanged after recovery by a restarted broker. The prepare receipt is authoritative even if
-an earlier status observation described a previous broker instance. Native Tasks records have no such binding.
+The row is `{request_id, tool, kind, state, created_at, deadline_at, started_at?, finished_at?, exit_code?, log?}`.
+`kind` is `build` for `lean_build` and `check` for every other tool. Times count milliseconds since the Unix epoch, and
+`log` names a build's log in the store. `state` is one of:
 
-Persist the logical request before preparing, the returned ticket before submitting, and submit intent before sending. A
-lost prepare response can be followed by another prepare because the unobserved ticket was never submitted. After
-submission might have occurred, recover only the same ticket and input. A missing or forgotten ticket is `unknown` and
-never authorizes a replacement submission. Earlier v2 records keep their immutable identities for retrieval,
-cancellation, acknowledgment and exact retained retries; fresh client-chosen IDs are no longer admitted.
+- `queued`: recorded, and waiting for its turn on the project;
+- `running`: it holds its turn and its work has started;
+- `done`: the tool returned. Its result may be a tool error or a negative verdict;
+- `timed_out`: the deadline passed. A check says so only once its worker request is seen to stop; when no one can see
+  the stop, the row says `done`;
+- `interrupted`: a server stopped before the request returned, and the next start ended it. It never runs again.
 
-`get` returns task metadata plus the original `CallToolResult` on completion or a JSON-RPC error on failure. A completed
-task can contain Lean errors or a negative verification verdict; it does not establish successful verification. The
-bridge remains synchronous for task-aware clients and never submits `lean_runtime` or another `lean_request`.
+The intent of a request is the SHA-256 of the JSON of `{tool, arguments}` without `request_id`, with no spaces and keys
+sorted at every level. The same id with the same intent returns the stored row, from any client and after a restart.
+Another intent fails with `request_id_conflict`, which names the stored tool and state. Ids are global, so a reused id
+returns the old result.
 
-The registry holds at most 128 prepared, active and finished records. Preparing can reclaim acknowledged records and
-expired records, but pressure never removes an unacknowledged terminal result. If all slots are protected, it returns
-`request_registry_full` with typed `execution.disposition: not_started`; no tool was submitted. Read or acknowledge
-existing results, then prepare new work. Unsubmitted tickets expire after five minutes and become irrevocably
-`not_started`; cancellation can close them earlier. Active dispatched requests never expire. Terminal bridge results
-have 24-hour retention; negotiated MCP Tasks keep their ten-minute process-local retention. Reads and admissions prune
-expired records. The record bound is 4 MiB, so an oversized result explicitly loses its verdict
-(`result_available: false`) while retaining execution evidence.
+Nothing cancels a named request: it ends when its tool returns, at its deadline, or at the next server start. The row
+fixes the deadline when it is written: `runtime.request_timeout_millis` for a check, `[build] timeout_secs` or the
+recipe's `timeout_secs` for a build. The wait for the project's turn counts. A build takes the write turn and the writer
+lock before its row says `running`; a check takes the read turn first. Checks on one project share the read turn, so
+their rows run at once, but the SDK starts their native readers one at a time (see
+[Operations](operations.md#rebuilt-artifacts)). A check sent during a build waits for it. Deadlines use wall-clock time,
+which counts a laptop's sleep.
 
-Every bridge record includes:
+When a server starts, it ends the rows an earlier server left. For a `running` row it first waits until no writer helper
+of that server holds the project, then marks the row `interrupted`. It starts `queued` rows in the order they came,
+unless the deadline has passed (`timed_out`) or the project is gone (`interrupted`).
 
-- `execution.disposition`: `pending`, `not_started`, `stopped`, or `unknown`.
-- `execution.reason`: a stable diagnostic code, separate from the Lean verdict.
-- `cancellation_requested`: intent, not evidence of exit.
-- `result_available` and `acknowledged`: whether the terminal payload is available or consumed.
+A call without `request_id` gets a server-made id `srv-<uuid>` and no row. When its connection drops, the server cancels
+it, as it does on MCP `notifications/cancelled`. A crash loses it.
 
-`not_started` means the entire retained invocation cannot dispatch. Failed preparation of one named target can instead
-carry scoped `execution.target_check` evidence while the overall execution remains `unknown`. Configuration evaluation
-and its subprocesses may already have started. A multi-operation tool may have completed earlier steps.
-
-Source-backed module queries, proof attempts and declaration verification also retain this scoped receipt with
-`stage: "project_admission"` when typed admission expiry or cancellation returns before the actor call. It identifies
-only the check named by `file_label`; option discovery, startup and earlier checks may already have run. The overall
-execution remains `unknown` without independent operation evidence, or `stopped` only when all started operations have
-independently confirmed termination or return. This is retained-request evidence; direct tool envelopes and historical
-stored results are unchanged. No receipt authorizes replay or supplies a proof verdict. Errors after admission do not
-gain this receipt.
-
-A confirmed worker timeout/cancellation can return `stopped` with an optional `execution.worker_stop_receipt` while the
-semantic response reports runtime unavailability and contains no proof verdict. The receipt binds the interrupted
-operation to its actor session and worker generation. It covers the direct worker only; it does not certify Lake
-descendants, roll back external effects or authorize replay. Unresolved operation evidence remains `unknown` through a
-successful fallback. Later queue refusal cannot turn earlier completed preparation or worker work into `not_started`.
-
-Cancellation records intent. A queued operation is skipped; a running operation retains cleanup ownership until it
-returns. If completion races cancellation, the original result is preserved. Failed/cancelled task status and the
-presence of a proof verdict do not independently release an execution lifetime.
-
-After durably saving the complete response and atomically updating its local source/build association, a client may
-acknowledge it:
+Every reply carries `request_id` at the top of its `structuredContent` and of its first text item when that is JSON, and
+every JSON-RPC error carries it in `error.data`. A refusal is a tool error (`isError: true`) with this body:
 
 ```json
-{"name":"lean_request","arguments":{"action":"acknowledge","request_id":"saved-ticket","request_epoch":"saved-epoch","submission_sha256":"digest-from-request-binding"}}
+{"error":{"code":"request_id_conflict","message":"request build-7c1d2e3f already holds another call: lean_build (running)"},"request_id":"build-7c1d2e3f","request":{"request_id":"build-7c1d2e3f","tool":"lean_build","kind":"build","state":"running","created_at":1764150000000,"deadline_at":1764164400000,"started_at":1764150000120}}
 ```
 
-Acknowledgment requires the exact binding and a terminal record. It releases the payload, preserving execution evidence
-while the record remains retained. Repeated acknowledgments are idempotent. Acknowledged records can be reclaimed for
-new tickets; subsequent access to a forgotten ID returns `unknown` and never relaunches work. A terminal `unknown` may
-be acknowledged only after its unresolved lifetime is preserved locally; acknowledgment does not certify exit.
+| Code | Meaning |
+| --- | --- |
+| `invalid_request_id` | The id breaks the rule above. |
+| `invalid_arguments` | The tool refuses the arguments, or the `lean_run` arguments hold `request_id`. |
+| `unknown_tool` | `lean_run` names a tool this server lacks, or `lean_run`, `lean_get` or `lean_runtime`. A direct call to a tool the server lacks fails with JSON-RPC invalid params. |
+| `request_id_conflict` | The id holds another call; `request` is its row. |
+| `request_not_found` | `lean_get` names an id with no row. |
+| `request_timed_out`, `request_interrupted` | A direct call with this id ended without a result; `request` is its row. |
+| `requests_unavailable` | The server has no store. Start it with `--lake-root`. |
+| `request_store_failed` | The table failed. `retryable` is true: ask again after `retry_after_millis`. |
 
-If a lost acknowledgment is retried after its record was reclaimed, the server returns `status: absent`,
-`acknowledged: true`, `result_available: false`, the echoed `request_id`/`request_epoch`/`submission_sha256`, and
-`identity_verified: false`. It includes no `execution`, request binding or proof result. This confirms only that no
-retained record remains; a client that already archived the bound result can clear its pending acknowledgment. It does
-not verify the echoed identity or establish an execution outcome. While a record remains retained, a wrong epoch or
-digest is still rejected.
+No refusal makes a row. The five semantic tools decode most of their arguments only when they run, so a bad argument to
+one of them makes a row whose result is the tool's error. A stored result of a tool that failed with a JSON-RPC error is
+a tool error of the same shape, whose code is the error's `reason`, `invalid_arguments` or `internal_error`.
 
-Durability is explicit: `request_registry.durable` requires a healthy `--request-journal DIR` or
-`LEAN_HOST_MCP_REQUEST_JOURNAL`. With no journal, retention is process-local. Storage failure disables new admission
-until current records can be synchronized again; reads and cancellation remain usable. The journal has one OS-locked
-broker owner and bounded atomic, synced request snapshots. It stores private response evidence, not a replay queue.
-
-Restart creates a new incarnation for new tickets. Recovered prepared and accepted-before-dispatch records become
-`not_started`; dispatch-intent records without a terminal outcome become `unknown`. Terminal results retain their
-original binding. No old work is replayed. A healthy new broker is not an old-worker exit witness. Journal recovery
-neither adopts nor kills old workers. Invalid or unreadable snapshots are preserved separately with a warning; failure
-to preserve them blocks startup. Missing evidence remains unknown. Quarantined files are retained for inspection and do
-not count toward registry capacity; repeated failures can grow that separate set of files.
-
-Busy project mailboxes and cold-project capacity admit waiting callers in FIFO order. Their admission wait and worker
-execution use separate bounded budgets. Closing an HTTP connection alone does not request cancellation. A synchronous
-client should send MCP `notifications/cancelled` with the original request ID when it intends to stop work. Reconnect
-and retrieve the same retained ticket after a lost response.
+[Operations](operations.md#request-table) describes the table and its settings. `lean_runtime` reports
+`requests: {queued, running}` and the capability `durable_requests_v1`.
 
 ## Worker Activity And Admission Leases
 
-`lean_runtime` is always synchronous, including for task-aware clients. It has five actions:
+`lean_runtime` always replies at once and never runs as a named request. It has five actions:
 
 Every response includes `build` with package `version`, full Git `revision`, and build-time `dirty` state. Missing Git
 metadata (for example, an exported source archive) is reported as null, never guessed from the runtime checkout. A Git
@@ -225,9 +179,9 @@ presentation and output overrides. Null output overrides mean each tool keeps it
 values the running process actually uses, not the current contents of a configuration file. No raw environment or
 credentials are exposed. Transport addresses are not part of the transport-agnostic tool service.
 
-`request_registry` reports active requests, retained terminal records, capacity, and terminal retention time. A zero
-active count does not prove clients have consumed retained results or authorize discarding them in a restart. Settings,
-build identity, registry counts, and capability discovery never open a Lean worker.
+On a server with a store, `requests: {queued, running}` counts the named requests that have not ended; a server without
+one leaves `requests` out and does not list `durable_requests_v1`. Settings, build identity, request counts, and
+capability discovery never open a Lean worker.
 
 | Action | Fields | Behavior |
 | --- | --- | --- |

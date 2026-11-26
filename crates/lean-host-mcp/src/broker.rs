@@ -897,7 +897,7 @@ impl ProjectBroker {
     /// All source-check preparation precedes the actor call. A typed admission
     /// expiry/cancellation here proves only that this named check was not sent.
     /// Preparation or earlier checks may already have run; their independent
-    /// operation evidence still determines the retained invocation's disposition.
+    /// operation evidence still determines the call's disposition.
     async fn prepare_check(
         &self,
         hint: ProjectHint,

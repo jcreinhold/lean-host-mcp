@@ -25,8 +25,10 @@ use lean_host_mcp::cli::config_init::{self, ConfigCommand};
 use lean_host_mcp::cli::install::{self, InstallArgs};
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
 use lean_host_mcp::cli::processes::{self, DoctorProcessesArgs};
+use lean_host_mcp::requests::{RequestRunner, RequestSettings};
 use lean_host_mcp::store::{self, StoreLock};
 use lean_host_mcp::toolchain;
+use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::{
     BrokerConfig, ConfigFile, LeanHostService, OutputBudgetOverrides, ProjectBroker, ProjectRuntimeConfig,
     ResponseCarrier, TelemetryVerbosity, ToolConfig,
@@ -109,11 +111,6 @@ struct ServeArgs {
     /// A per-call project can select this root. Discovery alone cannot approve a native project.
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
-
-    /// Directory for durable epoch-bound request results. One broker per directory;
-    /// old requests are recovered as evidence, never replayed.
-    #[arg(long, env = "LEAN_HOST_MCP_REQUEST_JOURNAL")]
-    request_journal: Option<PathBuf>,
 
     /// Loopback address for Streamable HTTP, e.g. 127.0.0.1:8765.
     /// If omitted, the server uses stdio.
@@ -377,10 +374,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?
         .with_operator_primary(lake_root.as_deref())?;
     let tool_config = resolve_tool_config(&file)?;
+    let request_settings = RequestSettings::from_file(&file.requests).map_err(anyhow::Error::msg)?;
     // One server per store. Take the lock after the config checks, so a bad
     // config leaves the store alone, and before the broker, the process record
-    // and the journal open. The store then keeps the native state, before any
-    // native work starts.
+    // and the request table open. The store then keeps the native state, before
+    // any native work starts.
     let store = lake_root
         .as_deref()
         .map(|root| -> anyhow::Result<_> {
@@ -427,14 +425,31 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         store.as_ref().map(|(_, dir)| dir.as_path()),
     )?;
     let mut service = LeanHostService::new(Arc::clone(&broker), tool_config);
-    if let Some(path) = args.request_journal {
-        service = service.with_request_journal(&path)?;
-    }
+    // The request table lives in the store. Recovery ends what the last server
+    // left and starts what it queued, before this server takes a call.
+    let runner = match &store {
+        Some((_, dir)) => {
+            let ctx = ToolContext {
+                broker: Arc::clone(&broker),
+                config: tool_config,
+            };
+            let runner = RequestRunner::open(ctx, dir, request_settings)
+                .with_context(|| format!("cannot open the request table in {}", dir.display()))?;
+            runner.recover().await?;
+            runner.start_pruning();
+            service = service.with_requests(Arc::clone(&runner));
+            Some(runner)
+        }
+        None => None,
+    };
     let result = if let Some(config) = http {
         transport_http::serve(service, config).await
     } else {
         serve_stdio(service).await
     };
+    if let Some(runner) = runner {
+        runner.shutdown().await;
+    }
     broker.shutdown_all();
     result
 }

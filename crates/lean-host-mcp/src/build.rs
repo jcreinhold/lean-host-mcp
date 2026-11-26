@@ -155,6 +155,7 @@ pub(crate) fn plan(config: &BuildConfig, request: &BuildRequest) -> std::result:
             .collect::<Vec<_>>()
     });
     let mut steps = Vec::new();
+    let mut timeout_secs = settings.timeout_secs;
     if let Some(name) = request.recipe.as_deref() {
         if !request.targets.is_empty() {
             return Err("`targets` and `recipe` exclude each other".to_owned());
@@ -166,6 +167,7 @@ pub(crate) fn plan(config: &BuildConfig, request: &BuildRequest) -> std::result:
                 if known.is_empty() { "none" } else { &known }
             ));
         };
+        timeout_secs = recipe.timeout_secs.unwrap_or(timeout_secs);
         if recipe.append == Append::None && !request.args.is_empty() {
             return Err(format!("recipe `{name}` takes no `args`"));
         }
@@ -203,7 +205,7 @@ pub(crate) fn plan(config: &BuildConfig, request: &BuildRequest) -> std::result:
     }
     Ok(BuildPlan {
         steps,
-        timeout: Duration::from_secs(settings.timeout_secs),
+        timeout: Duration::from_secs(timeout_secs),
         log_limit: settings.log_limit_mib.saturating_mul(1 << 20),
         tail_bytes: TAIL_BYTES,
     })
@@ -230,13 +232,20 @@ pub(crate) fn log_path(store: &Path, id: &str) -> io::Result<PathBuf> {
     Ok(logs.canonicalize()?.join(name))
 }
 
+/// Work a build does once it holds the write turn and the writer lock, before
+/// its first step: a request records its row as `running`. An error ends the
+/// build before any step starts.
+pub(crate) type OnRunning = Box<dyn FnOnce() -> std::result::Result<(), String> + Send>;
+
 /// Run `plan` in canonical Lake root `root` as build `id`, writing its output
 /// to `log` through helper executable `helper`. The plan's timeout bounds the
-/// wait for the turn and the run together.
+/// wait for the turn and the run together. `on_running` runs after the writer
+/// opens and before the first step.
 ///
 /// # Errors
-/// Fails when the build gets no turn, when its writer does not open, or when
-/// its request is cancelled. A failing step is not an error.
+/// Fails when the build gets no turn, when its writer does not open, when
+/// `on_running` fails, or when its request is cancelled. A failing step is not
+/// an error.
 pub(crate) async fn run_build(
     lock: &Arc<ProjectLock>,
     root: &Path,
@@ -244,6 +253,7 @@ pub(crate) async fn run_build(
     id: &str,
     log: &Path,
     helper: &Path,
+    on_running: Option<OnRunning>,
 ) -> Result<BuildOutcome> {
     let timeout = plan.timeout;
     with_deadline(timeout, async move {
@@ -268,12 +278,75 @@ pub(crate) async fn run_build(
             deadline: deadline.into_std(),
             cancellation,
             plan,
+            on_running,
         };
         // The job owns the turn, so a dropped request cannot end the turn
         // before the helper has exited; the drop cancels the job instead.
         tokio::task::spawn_blocking(move || job.run(turn))
             .await
             .map_err(|error| ServerError::Internal(format!("build task failed: {error}")))?
+    })
+    .await
+}
+
+/// Take the write turn on canonical Lake root `root`, then open and close the
+/// writer helper `helper` with no step. The helper gets the project's kernel
+/// lock exclusive only once every process that held it has exited, so a
+/// return shows that no process of an earlier server still works in `root`.
+/// `timeout` bounds the whole wait.
+///
+/// # Errors
+/// Fails when the turn or the lock does not come within `timeout`, or when the
+/// helper does not start.
+pub(crate) async fn confirm_no_writer(
+    lock: &Arc<ProjectLock>,
+    root: &Path,
+    helper: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    with_deadline(timeout, async move {
+        let cancellation = CallCancellation::current();
+        let deadline = cancellation
+            .deadline_or(timeout)
+            .ok_or_else(|| ServerError::Internal("recovery deadline is out of range".to_owned()))?;
+        let turn = ensure_write(lock, "recovery", deadline, &cancellation)
+            .await
+            .map_err(|refused| ProjectBroker::turn_refused(root, refused))?;
+        let root = root.to_path_buf();
+        let helper = helper.to_path_buf();
+        let deadline = deadline.into_std();
+        tokio::task::spawn_blocking(move || {
+            let stop = || Instant::now() >= deadline;
+            let mut observed = None;
+            let opened = SharedWriter::open_with_write_roots_observed(
+                &helper,
+                &root,
+                &[],
+                deadline.saturating_duration_since(Instant::now()),
+                &stop,
+                &mut observed,
+            );
+            let confirmed = match opened {
+                Ok(writer) => {
+                    if let Err(error) = writer.close(CLOSE_TIMEOUT) {
+                        tracing::info!(root = %root.display(), %error, "recovery helper did not confirm cleanup; waiting for it to exit");
+                        wait_for_exit(observed.as_ref(), &root);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    wait_for_exit(observed.as_ref(), &root);
+                    Err(ServerError::Internal(format!(
+                        "cannot take the writer lock of {}: {error}",
+                        root.display()
+                    )))
+                }
+            };
+            drop(turn);
+            confirmed
+        })
+        .await
+        .map_err(|error| ServerError::Internal(format!("recovery task failed: {error}")))?
     })
     .await
 }
@@ -296,6 +369,7 @@ struct Job {
     deadline: Instant,
     cancellation: CallCancellation,
     plan: BuildPlan,
+    on_running: Option<OnRunning>,
 }
 
 impl Job {
@@ -342,7 +416,8 @@ impl Job {
         command
     }
 
-    fn run(self, turn: WriteTurn) -> Result<BuildOutcome> {
+    fn run(mut self, turn: WriteTurn) -> Result<BuildOutcome> {
+        let on_running = self.on_running.take();
         let stop = || self.stop_requested();
         let mut observed = None;
         let opened = SharedWriter::open_with_write_roots_observed(
@@ -367,6 +442,16 @@ impl Job {
                 });
             }
         };
+        if let Some(Err(error)) = on_running.map(|record| record()) {
+            if let Err(close) = writer.close(CLOSE_TIMEOUT) {
+                tracing::info!(root = %self.root.display(), error = %close, "build helper did not confirm cleanup; waiting for it to exit");
+                wait_for_exit(observed.as_ref(), &self.root);
+            }
+            drop(turn);
+            return Err(ServerError::Internal(format!(
+                "build did not start: cannot record it as running: {error}"
+            )));
+        }
         let mut steps = Vec::new();
         let mut failed_step = None;
         let mut stopped = None;

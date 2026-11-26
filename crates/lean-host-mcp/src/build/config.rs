@@ -63,6 +63,9 @@ pub(crate) struct Recipe {
     pub(crate) append: Append,
     #[serde(default)]
     pub(crate) guard: GuardPlace,
+    /// The deadline of this recipe's builds, in place of `[build] timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 /// Which steps of a recipe get the client's `args`.
@@ -183,6 +186,9 @@ fn check_recipe(at: &str, recipe: &Recipe, errors: &mut Vec<String>) -> bool {
     let before = errors.len();
     if recipe.steps.is_empty() {
         errors.push(format!("{at}: `steps` is empty"));
+    }
+    if recipe.timeout_secs == Some(0) {
+        errors.push(format!("{at}: `timeout_secs` must be at least 1"));
     }
     for (index, step) in recipe.steps.iter().enumerate() {
         match check_step(step, step.len()) {

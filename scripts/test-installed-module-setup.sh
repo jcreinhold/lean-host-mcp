@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate ordinary file-backed endpoints against the packaged pair.
+# Package the parent and worker, build and install the pair from the archives, and prepare semantic search with it.
 # With --release, also check the packaged parent's link set and run the stdio suite against the packaged worker.
 # Set LEAN_RS_CHECKOUT to build the pair, writer and shims from an SDK checkout; release checks leave it unset.
 set -euo pipefail
@@ -30,7 +30,6 @@ sdk=$(python3 -c 'import tomllib; [v]=[p["version"] for p in tomllib.load(open("
 mkdir -p "$CARGO_TARGET_DIR"
 scratch=$(mktemp -d "$CARGO_TARGET_DIR/module-setup.XXXXXX")
 trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch"' EXIT
-export R2_SETUP_ROOT="$scratch"
 export TMPDIR="$scratch/tmp" LEAN_RS_WORKER_OWNERS_DIRECTORY="$scratch/owners"
 export LEAN_HOST_MCP_SEMANTIC_CACHE_DIR="$scratch/semantic-cache"
 mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache" "$scratch/server-owners"
@@ -96,17 +95,16 @@ if [[ ! -x $built_parent ]]; then
     printf 'Expected native parent binary at %s\n' "$built_parent" >&2
     exit 1
 fi
-export R2_SETUP_PARENT="$scratch/shipping-lean-host-mcp"
-cp "$built_parent" "$R2_SETUP_PARENT"
-local_sdk_install_writer "$R2_SETUP_ROOT/tools" "$sdk"
-local_sdk_install_worker "$R2_SETUP_PARENT" --toolchain "$id" --workers-dir "$R2_SETUP_ROOT/workers" \
-    --source-dir "$worker_source" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
-# Build the bundled Lean capability under the same packaged writer before the
-# RPC smoke. Cold compilation has its own existing SDK budget.
+parent="$scratch/shipping-lean-host-mcp"
+cp "$built_parent" "$parent"
+local_sdk_install_writer "$scratch/tools" "$sdk"
+local_sdk_install_worker "$parent" --toolchain "$id" --workers-dir "$scratch/workers" \
+    --source-dir "$worker_source" --standalone-writer "$scratch/tools/bin/lean-rs-writer"
+# Build the bundled Lean capability under the packaged writer. Cold
+# compilation has its own SDK budget.
 local_sdk_cargo run --manifest-path "$parent_manifest" --example prepare_semantic_smoke -- \
-    "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$R2_SETUP_PARENT"
-python3 tests/r2-launch-input/module_setup.py
+    "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$parent"
 if "$release"; then
-    scripts/check-parent-link.sh "$R2_SETUP_PARENT"
-    LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$R2_SETUP_ROOT/workers" scripts/test-installed-stdio.sh --all-targets
+    scripts/check-parent-link.sh "$parent"
+    LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$scratch/workers" scripts/test-installed-stdio.sh --all-targets
 fi

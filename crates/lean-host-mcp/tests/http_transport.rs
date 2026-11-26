@@ -9,6 +9,8 @@ use std::fmt::Write;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::header::HeaderMap;
@@ -21,13 +23,14 @@ const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
 const LEGACY_WRITER_ENV: &str = "LEAN_HOST_MCP_WRITER_EXECUTABLE";
-const EXPECTED_TOOLS: [&str; 10] = [
+const EXPECTED_TOOLS: [&str; 11] = [
     "lean_build",
     "lean_compatibility",
     "lean_context",
+    "lean_get",
     "lean_imports",
     "lean_lookup",
-    "lean_request",
+    "lean_run",
     "lean_runtime",
     "lean_status",
     "lean_trial",
@@ -92,6 +95,24 @@ async fn streamable_http_initialize_and_tools_list() {
             "tool {} must not advertise root-level oneOf; strict MCP clients may hide it: {tool:?}",
             tool.get("name").and_then(Value::as_str).unwrap_or("?")
         );
+        // Every tool but `lean_runtime` takes a request id: `lean_run` and
+        // `lean_get` need one, and the others take one to run as a request.
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or("?");
+        let request_id = tool.pointer("/inputSchema/properties/request_id");
+        match name {
+            "lean_runtime" => assert!(request_id.is_none(), "lean_runtime takes no request_id: {tool:?}"),
+            "lean_run" | "lean_get" => assert!(
+                tool.pointer("/inputSchema/required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| required.contains(&json!("request_id"))),
+                "tool {name} must require a request_id: {tool:?}"
+            ),
+            _ => assert_eq!(
+                request_id.and_then(|id| id.get("pattern")).and_then(Value::as_str),
+                Some("^[A-Za-z0-9._:-]{8,128}$"),
+                "tool {name} must take a request_id: {tool:?}"
+            ),
+        }
     }
     let verify_tool = listed
         .iter()
@@ -269,6 +290,13 @@ async fn modern_stateless_discovery_calls_and_protocol_guards() {
             .contains(&json!(VERSION))
     );
     assert!(discover.json.pointer("/result/capabilities/tools").is_some());
+    assert!(
+        discover
+            .json
+            .pointer("/result/capabilities/extensions/io.modelcontextprotocol~1tasks")
+            .is_none(),
+        "the server offers no MCP Tasks: {discover:?}"
+    );
 
     let listed = server
         .modern_request(
@@ -335,7 +363,8 @@ async fn modern_stateless_discovery_calls_and_protocol_guards() {
             json!({"jsonrpc":"2.0","id":6,"method":"tasks/get","params":{"taskId":"unknown-task","_meta":meta}}),
         )
         .await;
-    assert_eq!(task.json.pointer("/error/code").and_then(Value::as_i64), Some(-32021));
+    // Method not found: requests live in `lean_run` and `lean_get`.
+    assert_eq!(task.json.pointer("/error/code").and_then(Value::as_i64), Some(-32601));
     server.shutdown().await;
 }
 
@@ -374,16 +403,17 @@ async fn conflicting_writer_aliases_refuse_http_startup_before_opening_state() {
     let root = scratch.path().canonicalize().unwrap();
     let owners = root.join("native-owners");
     let processes = root.join("processes");
-    let journal = root.join("journal");
+    let store = root.join("store");
     let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
     command
         .kill_on_drop(true)
         .current_dir(&root)
         .arg("--bind")
         .arg(reserve_loopback_addr().to_string())
-        .arg("--request-journal")
-        .arg(&journal)
+        .arg("--lake-root")
+        .arg(&root)
         .env_remove("LEAN_HOST_MCP_PROJECT")
+        .env("LEAN_HOST_MCP_STORE_DIR", &store)
         .env_remove("LEAN_HOST_MCP_HTTP_PATH")
         .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", &processes)
         .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", &owners)
@@ -400,7 +430,7 @@ async fn conflicting_writer_aliases_refuse_http_startup_before_opening_state() {
         stderr.contains(WRITER_ENV) && stderr.contains(LEGACY_WRITER_ENV),
         "{stderr}"
     );
-    for path in [&owners, &processes, &journal] {
+    for path in [&owners, &processes, &store] {
         assert!(!path.exists(), "refused startup opened {}", path.display());
     }
 }
@@ -567,7 +597,8 @@ async fn streamable_http_fixture_tool_call() {
 
 /// Install, then serve, a copy of the fixture with `HOME` set to a new empty
 /// directory. A build, a check and a proof search must leave nothing under
-/// `HOME` and nothing in `git status`.
+/// `HOME` and nothing in `git status`. Each is a direct call with no
+/// `request_id`, so each reply names a server-made `srv-` id.
 ///
 /// `ELAN_HOME`, `CARGO_HOME` and `RUSTUP_HOME` keep their real values, and
 /// install builds the release worker offline. Set
@@ -664,8 +695,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         String::from_utf8_lossy(&install.stderr)
     );
 
-    // Serve as `make mcp-serve` does: the installed binary, the Lake root and
-    // a request journal in the local directory.
+    // Serve as `make mcp-serve` does: the installed binary and the Lake root.
     let local = project.join(".local/lean-host-mcp");
     let config: toml::Table = std::fs::read_to_string(local.join("config.toml"))
         .unwrap()
@@ -681,8 +711,6 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         .arg("127.0.0.1:0")
         .arg("--http-path")
         .arg("/mcp")
-        .arg("--request-journal")
-        .arg(local.join("requests"))
         .current_dir(&project)
         .env_clear()
         .envs(envs.iter().cloned())
@@ -725,6 +753,15 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
             "{name} failed: {}",
             response.json
         );
+        assert!(
+            response
+                .json
+                .pointer("/result/structuredContent/request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("srv-")),
+            "{name} names no server id: {}",
+            response.json
+        );
     }
     let status = std::process::Command::new("kill")
         .arg("-TERM")
@@ -739,10 +776,15 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         "",
         "git status after install, serve and a build"
     );
-    // The state that once went under `HOME` is in the store.
+    // The state that once went under `HOME` is in the store, with the
+    // request table.
     for dir in ["owners", "semantic-runtimes", "processes"] {
         assert!(local.join("store").join(dir).is_dir(), "the store has no {dir}/");
     }
+    assert!(
+        local.join("store/requests.sqlite3").is_file(),
+        "the store has no request table"
+    );
     let left = list_tree(&home);
     eprintln!("under the empty HOME: {left:?}");
     assert!(
@@ -948,514 +990,6 @@ async fn streamable_http_five_clients_serialize_source_consistent_results() {
 }
 
 #[tokio::test]
-async fn streamable_http_task_results_survive_new_client() {
-    let root = tempfile::tempdir().expect("metadata project");
-    std::fs::write(root.path().join("lakefile.lean"), "package lifecycle\n").unwrap();
-    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
-    let root_s = root.path().to_string_lossy();
-    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
-    let mut legacy = server.new_session().await;
-    let arguments = json!({"name": "lean_verify", "arguments": {"targets": []}});
-    let synchronous = legacy.request("tools/call", arguments.clone()).await.unwrap();
-    assert!(synchronous.json.pointer("/result/taskId").is_none());
-    assert!(synchronous.json.pointer("/result/structuredContent").is_some());
-
-    let mut original = TaskHttpClient::new(&server.url);
-    let accepted = original.request("tools/call", arguments).await;
-    let task_id = task_id(&accepted).to_owned();
-    assert_eq!(
-        accepted.pointer("/result/resultType").and_then(Value::as_str),
-        Some("task")
-    );
-    let immediate = original.request("tasks/get", json!({"taskId": task_id})).await;
-    assert_eq!(
-        immediate.pointer("/result/taskId").and_then(Value::as_str),
-        Some(task_id.as_str())
-    );
-    drop(original);
-    // A different HTTP client, with no session id or initialized connection,
-    // must retrieve the same server-owned task and its unchanged tool payload.
-    let mut reconnected = TaskHttpClient::new(&server.url);
-    let terminal = reconnected.terminal(&task_id, Duration::from_secs(5)).await;
-    assert_eq!(
-        terminal.pointer("/result/status").and_then(Value::as_str),
-        Some("completed")
-    );
-    let mut retained = terminal.pointer("/result/result").unwrap().clone();
-    let mut synchronous = synchronous.json.get("result").unwrap().clone();
-    // The current protocol adds its result discriminator; tool content and
-    // semantic metadata must otherwise be identical to the legacy response.
-    retained.as_object_mut().unwrap().remove("resultType");
-    synchronous.as_object_mut().unwrap().remove("resultType");
-    assert_eq!(retained, synchronous);
-    let status = reconnected
-        .request(
-            "tools/call",
-            json!({"name": "lean_status", "arguments": {"kind": "project"}}),
-        )
-        .await;
-    assert!(
-        status.pointer("/result/taskId").is_none(),
-        "cheap metadata remains synchronous: {status}"
-    );
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn streamable_http_plain_request_bridge_retains_results_and_deduplicates_retries() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("lakefile.lean"), "package retained\n").unwrap();
-    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
-    let root_s = root.path().to_string_lossy();
-    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
-    let mut original = server.new_session().await;
-    let prepared = prepare_retained(&mut original, "lean_verify", json!({"targets":[]})).await;
-    let request_id = prepared["taskId"].clone();
-    let epoch = prepared["request"]["request_epoch"].clone();
-    assert_eq!(prepared["execution"]["disposition"], "pending");
-    assert_eq!(prepared["execution"]["reason"], "prepared");
-    let submission = json!({"name": "lean_request", "arguments": {
-        "action": "submit", "request_id": request_id, "request_epoch": epoch,
-        "tool": "lean_verify", "arguments": {"targets": []}
-    }});
-    let accepted = original.request("tools/call", submission.clone()).await.unwrap();
-    assert_eq!(
-        accepted.json.pointer("/result/structuredContent/taskId"),
-        Some(&request_id)
-    );
-    for malformed in [
-        json!({"tool":"lean_runtime","arguments":{}}),
-        json!({"tool":"lean_trial","arguments":{"kind":42}}),
-        json!({"arguments":{"targets":[]}}),
-        json!({"tool":"lean_verify"}),
-        json!({"tool":"lean_verify","arguments":{"targets":[]},"submission_sha256":"unexpected"}),
-    ] {
-        let mut arguments = malformed;
-        arguments["action"] = json!("submit");
-        arguments["request_id"] = request_id.clone();
-        arguments["request_epoch"] = epoch.clone();
-        let rejected = original
-            .request("tools/call", json!({"name":"lean_request","arguments":arguments}))
-            .await
-            .unwrap();
-        assert_eq!(rejected.json["error"]["data"]["execution"]["disposition"], "unknown");
-    }
-    let binding = accepted
-        .json
-        .pointer("/result/structuredContent/request")
-        .unwrap()
-        .clone();
-    assert_eq!(binding["tool"], "lean_verify");
-    assert_eq!(binding["project"], Value::Null);
-    assert_eq!(
-        binding["submission_sha256"],
-        "27f1aae6bb5bec5f6b58dc30c3bdda13d76fefd07d5e1d1a72f5116c651f5b23"
-    );
-    let mut status_client = TaskHttpClient::new(&server.url);
-    let status = status_client.control(json!({"action":"status"})).await;
-    assert_eq!(binding["server_instance_id"], status["pool"]["instance_id"]);
-    assert_eq!(
-        status["capabilities"],
-        json!([
-            "retained_request_binding_v1",
-            "draining_lease_v1",
-            "retained_request_lifecycle_v3"
-        ])
-    );
-    // No Tasks negotiation, and the caller may disappear while work continues.
-    drop(original);
-    let mut reconnected = server.new_session().await;
-    let retry = reconnected.request("tools/call", submission).await.unwrap();
-    assert_eq!(
-        retry.json.pointer("/result/structuredContent/taskId"),
-        Some(&request_id)
-    );
-    let retained = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let response = reconnected
-                .request(
-                    "tools/call",
-                    json!({"name": "lean_request", "arguments": {
-                        "action": "get", "request_id": request_id, "request_epoch": epoch
-                    }}),
-                )
-                .await
-                .unwrap();
-            let task = response.json.pointer("/result/structuredContent").unwrap().clone();
-            if task["status"] != "working" {
-                break task;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(retained["status"], "completed", "{retained}");
-    assert_eq!(retained["request"], binding);
-    assert!(
-        retained.pointer("/result/structuredContent/errors").is_some(),
-        "original invalid-target result retained: {retained}"
-    );
-    let conflicting = reconnected
-        .request(
-            "tools/call",
-            json!({"name": "lean_request", "arguments": {
-                "action": "submit", "request_id": request_id, "request_epoch": epoch,
-                "tool": "lean_status", "arguments": {"kind": "project"}
-            }}),
-        )
-        .await
-        .unwrap();
-    assert!(
-        conflicting.json.get("error").is_some(),
-        "changed inputs must not rerun: {conflicting:?}"
-    );
-    let cancelled = reconnected
-        .request(
-            "tools/call",
-            json!({"name": "lean_request", "arguments": {
-                "action": "cancel", "request_id": request_id, "request_epoch": epoch
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        cancelled.json.pointer("/result/structuredContent"),
-        Some(&retained),
-        "cancellation cannot erase a finished result"
-    );
-    let mut task_client = TaskHttpClient::new(&server.url);
-    let get = task_client
-        .request(
-            "tools/call",
-            json!({"name": "lean_request", "arguments": {
-                "action": "get", "request_id": request_id, "request_epoch": epoch
-            }}),
-        )
-        .await;
-    assert_eq!(
-        get.pointer("/result/structuredContent"),
-        Some(&retained),
-        "bridge remains synchronous for task-aware clients"
-    );
-    let unknown = reconnected
-        .request(
-            "tools/call",
-            json!({"name": "lean_request", "arguments": {
-                "action": "get", "request_id": "missing"
-            }}),
-        )
-        .await
-        .unwrap();
-    assert!(unknown.json.get("error").is_some());
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn streamable_http_prepared_ticket_does_not_execute_and_cancel_prevents_submission() {
-    let root = tempfile::tempdir().unwrap();
-    let server = HttpMcpServer::start(&[("--lake-root", root.path().to_str().unwrap())]).await;
-    let mut client = server.new_session().await;
-    let arguments = json!({"kind":"command","commands":"#check Nat"});
-    let prepared = prepare_retained(&mut client, "lean_trial", arguments.clone()).await;
-    let id = prepared["taskId"].clone();
-    let epoch = prepared["request"]["request_epoch"].clone();
-    let get = json!({"name":"lean_request","arguments":{"action":"get","request_id":id,"request_epoch":epoch}});
-    let unchanged = client.request("tools/call", get).await.unwrap();
-    assert_eq!(unchanged.json["result"]["structuredContent"], prepared);
-    assert_eq!(prepared["execution"]["reason"], "prepared");
-    let mut status = TaskHttpClient::new(&server.url);
-    assert_eq!(
-        status.control(json!({"action":"status"})).await["pool"]["occupied_slots"],
-        0
-    );
-    let cancelled = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"cancel","request_id":id,"request_epoch":epoch
-            }}),
-        )
-        .await
-        .unwrap();
-    let cancelled = cancelled.json["result"]["structuredContent"].clone();
-    assert_eq!(cancelled["execution"]["disposition"], "not_started");
-    let late = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"submit","request_id":id,"request_epoch":epoch,"tool":"lean_trial","arguments":arguments
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(late.json["result"]["structuredContent"], cancelled);
-    for (field, value) in [
-        ("request_id", json!("chosen")),
-        ("request_epoch", epoch),
-        ("submission_sha256", json!("bad")),
-    ] {
-        let mut arguments = json!({"action":"prepare","tool":"lean_verify","arguments":{"targets":[]}});
-        arguments[field] = value;
-        let response = client
-            .request("tools/call", json!({"name":"lean_request","arguments":arguments}))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.json["error"]["data"]["execution"]["disposition"],
-            "not_started"
-        );
-    }
-    let missing = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"submit","tool":"lean_verify","arguments":{"targets":[]}
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(missing.json["error"]["data"]["execution"]["disposition"], "not_started");
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn streamable_http_retained_capacity_backpressures_without_forgetting_unacknowledged_results() {
-    let root = tempfile::tempdir().unwrap();
-    let server = HttpMcpServer::start(&[("--lake-root", root.path().to_str().unwrap())]).await;
-    let mut client = server.new_session().await;
-    let first = prepare_retained(&mut client, "lean_verify", json!({"targets":[]})).await;
-    let id = first["taskId"].clone();
-    let epoch = first["request"]["request_epoch"].clone();
-    let mut ids = BTreeSet::from([id.as_str().unwrap().to_owned()]);
-    for _ in 1..128 {
-        let ticket = prepare_retained(&mut client, "lean_verify", json!({"targets":[]})).await;
-        assert_eq!(ticket["request"]["request_epoch"], epoch);
-        assert!(ids.insert(ticket["taskId"].as_str().unwrap().to_owned()));
-    }
-    client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"submit","request_id":id,"request_epoch":epoch,"tool":"lean_verify","arguments":{"targets":[]}
-            }}),
-        )
-        .await
-        .unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let response = client
-                .request(
-                    "tools/call",
-                    json!({"name":"lean_request","arguments":{
-                        "action":"get","request_id":id,"request_epoch":epoch
-                    }}),
-                )
-                .await
-                .unwrap();
-            let record = response.json["result"]["structuredContent"].clone();
-            if record["execution"]["disposition"] != "pending" {
-                break record;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(completed["result_available"], true);
-    let busy = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"prepare","tool":"lean_verify","arguments":{"targets":[]}
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(busy.json["error"]["data"]["reason"], "request_registry_full");
-    assert_eq!(busy.json["error"]["data"]["execution"]["disposition"], "not_started");
-    let still_retained = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"get","request_id":id,"request_epoch":epoch
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(still_retained.json["result"]["structuredContent"], completed);
-    let wrong_digest = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"acknowledge","request_id":id,"request_epoch":epoch,
-                "submission_sha256":"wrong-digest"
-            }}),
-        )
-        .await
-        .unwrap();
-    assert!(
-        wrong_digest.json.get("error").is_some(),
-        "a retained binding must be verified"
-    );
-    // The result has been saved above. Ignore the acknowledgement receipt to
-    // model a lost response, then force its compact tombstone out under pressure.
-    client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"acknowledge","request_id":id,"request_epoch":epoch,
-                "submission_sha256":completed["request"]["submission_sha256"]
-            }}),
-        )
-        .await
-        .unwrap();
-    let fresh = prepare_retained(&mut client, "lean_verify", json!({"targets":[]})).await;
-    assert_eq!(fresh["request"]["request_epoch"], epoch);
-    assert!(!ids.contains(fresh["taskId"].as_str().unwrap()));
-    let repeated_ack = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"acknowledge","request_id":id,"request_epoch":epoch,
-                "submission_sha256":completed["request"]["submission_sha256"]
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        repeated_ack.json["result"]["structuredContent"],
-        json!({"status":"absent","acknowledged":true,"result_available":false,
-            "request_id":id,"request_epoch":epoch,"submission_sha256":completed["request"]["submission_sha256"],
-            "identity_verified":false}),
-        "absence must not fabricate an execution or proof result"
-    );
-    let replay = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"submit","request_id":id,"request_epoch":epoch,"tool":"lean_verify","arguments":{"targets":[]}
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(replay.json["error"]["data"]["execution"]["disposition"], "unknown");
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn durable_v3_result_survives_binary_restart_and_exact_acknowledgment() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("lakefile.lean"), "package retained\n").unwrap();
-    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
-    let journal = tempfile::tempdir().unwrap();
-    let args = [
-        ("--lake-root", root.path().to_str().unwrap()),
-        ("--request-journal", journal.path().to_str().unwrap()),
-    ];
-    let server = HttpMcpServer::start(&args).await;
-    let mut control = TaskHttpClient::new(&server.url);
-    let status = control.control(json!({"action":"status"})).await;
-    assert_eq!(status["request_registry"]["durable"], true);
-    assert_eq!(status["pool"]["occupied_slots"], 0);
-    let mut client = server.new_session().await;
-    let prepared = prepare_retained(&mut client, "lean_status", json!({"kind":"project"})).await;
-    let request_id = prepared["taskId"].clone();
-    let epoch = prepared["request"]["request_epoch"].clone();
-    let submission = json!({"name":"lean_request","arguments":{
-        "action":"submit","request_id":request_id,"request_epoch":epoch,
-        "tool":"lean_status","arguments":{"kind":"project"}
-    }});
-    client.request("tools/call", submission.clone()).await.unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let response = client
-                .request(
-                    "tools/call",
-                    json!({"name":"lean_request","arguments":{
-                        "action":"get","request_id":request_id,"request_epoch":epoch
-                    }}),
-                )
-                .await
-                .unwrap();
-            let record = response.json["result"]["structuredContent"].clone();
-            if record["status"] != "working" {
-                break record;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(completed["execution"]["disposition"], "stopped");
-    assert_eq!(completed["result_available"], true);
-    let unsubmitted = prepare_retained(&mut client, "lean_status", json!({"kind":"project"})).await;
-    // Kill only this test-owned, worker-free broker. The terminal snapshot must
-    // already be durable before the reply can be observed.
-    server.shutdown().await;
-    let restarted = HttpMcpServer::start(&args).await;
-    let mut control = TaskHttpClient::new(&restarted.url);
-    let new_status = control.control(json!({"action":"status"})).await;
-    assert_ne!(new_status["request_registry"]["request_epoch"], epoch);
-    assert_ne!(
-        new_status["pool"]["instance_id"],
-        completed["request"]["server_instance_id"]
-    );
-    assert_eq!(new_status["pool"]["occupied_slots"], 0);
-    let mut client = restarted.new_session().await;
-    let closed_preparation = client
-        .request("tools/call", json!({"name":"lean_request","arguments":{
-            "action":"submit","request_id":unsubmitted["taskId"],
-            "request_epoch":unsubmitted["request"]["request_epoch"],"tool":"lean_status","arguments":{"kind":"project"}
-        }}))
-        .await
-        .unwrap();
-    assert_eq!(
-        closed_preparation.json["result"]["structuredContent"]["execution"]["disposition"],
-        "not_started"
-    );
-    assert_eq!(
-        closed_preparation.json["result"]["structuredContent"]["result_available"],
-        false
-    );
-    let fresh = prepare_retained(&mut client, "lean_status", json!({"kind":"project"})).await;
-    assert_eq!(
-        fresh["request"]["server_instance_id"],
-        new_status["pool"]["instance_id"]
-    );
-    assert_ne!(fresh["request"]["server_instance_id"], status["pool"]["instance_id"]);
-    let retry = client.request("tools/call", submission).await.unwrap();
-    assert_eq!(retry.json["result"]["structuredContent"], completed);
-    let ack = json!({"name":"lean_request","arguments":{
-        "action":"acknowledge","request_id":request_id,"request_epoch":epoch,
-        "submission_sha256":completed["request"]["submission_sha256"]
-    }});
-    for _ in 0..2 {
-        let response = client.request("tools/call", ack.clone()).await.unwrap();
-        let record = &response.json["result"]["structuredContent"];
-        assert_eq!(record["acknowledged"], true);
-        assert_eq!(record["result_available"], false);
-        assert_eq!(record["execution"]["disposition"], "stopped");
-        assert!(record.get("result").is_none());
-    }
-    let stale = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"submit","request_id":"forgotten-old-id","request_epoch":epoch,
-                "tool":"lean_status","arguments":{"kind":"project"}
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(stale.json["error"]["data"]["execution"]["disposition"], "unknown");
-    restarted.shutdown().await;
-}
-
-#[tokio::test]
 async fn streamable_http_status_reports_resolved_settings_without_opening_worker() {
     let root = tempfile::tempdir().unwrap();
     let server = HttpMcpServer::start_with_env(
@@ -1472,7 +1006,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
         ],
     )
     .await;
-    let mut client = TaskHttpClient::new(&server.url);
+    let client = StatelessClient::new(&server.url);
     let status = client.control(json!({"action":"status"})).await;
     assert_eq!(status["status"], "ok");
     assert_eq!(status["build"]["version"], env!("CARGO_PKG_VERSION"));
@@ -1499,172 +1033,76 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     assert_eq!(runtime["worker_import_residue_soft_bytes"], 2_576_980_320_u64);
     assert_eq!(runtime["worker_session_pool_capacity"], 6);
     assert_eq!(status["effective_settings"]["server"]["response_carrier"], "both");
-    let registry = &status["request_registry"];
-    assert_eq!(registry["active"], 0);
-    assert_eq!(registry["retained_terminal"], 0);
-    assert_eq!(registry["capacity"], 128);
-    assert_eq!(registry["terminal_retention_millis"], 86_400_000);
-    assert_eq!(registry["durable"], false);
-    assert_eq!(registry["journal_healthy"], true);
-    assert_eq!(registry["max_record_bytes"], 4 * 1024 * 1024);
+    assert_eq!(status["requests"], json!({"queued": 0, "running": 0}));
+    assert_eq!(
+        status["capabilities"],
+        json!(["draining_lease_v1", "durable_requests_v1"])
+    );
     server.shutdown().await;
 }
 
 #[tokio::test]
 #[ignore = "requires built Lean fixture and worker binary"]
-async fn streamable_http_retained_requests_wait_past_full_mailbox_and_cancel() {
+async fn streamable_http_named_requests_survive_conflicts_and_dropped_calls() {
     let scratch = tempfile::tempdir().unwrap();
     let running = scratch.path().join("running");
     let finished = scratch.path().join("finished");
-    let cancelled = scratch.path().join("cancelled-must-not-run");
+    let dropped = scratch.path().join("dropped-call-must-not-run");
     let first = scratch.path().join("first");
     let last = scratch.path().join("last");
     let root = fixture_root();
     let root_s = root.to_string_lossy();
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_ref())],
-        &[
-            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
-            ("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY", "1"),
-        ],
+        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
     )
     .await;
-    let mut client = TaskHttpClient::new(&server.url);
-    let mut bridge = server.new_session().await;
-    let blocker_arguments = json!({"kind":"command","commands":sentinel_command(&running, Some((&finished, 4_000)))});
-    let prepared = prepare_retained(&mut bridge, "lean_trial", blocker_arguments.clone()).await;
-    let blocker = prepared["taskId"].as_str().unwrap().to_owned();
-    bridge
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"submit","request_id":blocker,"request_epoch":prepared["request"]["request_epoch"],
-                "tool":"lean_trial","arguments":blocker_arguments
-            }}),
-        )
-        .await
-        .unwrap();
-    wait_for_sentinel(&running, Duration::from_secs(30)).await;
-    let malformed = bridge
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"submit","request_id":blocker,"request_epoch":prepared["request"]["request_epoch"],
-                "tool":"lean_trial","arguments":{"kind":42}
-            }}),
-        )
+    let client = StatelessClient::new(&server.url);
+    client
+        .command("blocker-0001", &sentinel_command(&running, Some((&finished, 4_000))))
         .await;
-    assert_eq!(
-        malformed.unwrap().json["error"]["data"]["execution"]["disposition"],
-        "unknown"
-    );
-    let still_running = bridge
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{
-                "action":"get","request_id":blocker,"request_epoch":prepared["request"]["request_epoch"]
-            }}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        still_running.json["result"]["structuredContent"]["execution"]["disposition"],
-        "pending"
-    );
+    wait_for_sentinel(&running, Duration::from_secs(30)).await;
+    let conflict = client.run("blocker-0001", "lean_trial", trial("#eval (1 : Nat)")).await;
+    assert_eq!(conflict["error"]["code"], "request_id_conflict", "{conflict}");
+    assert_eq!(client.get("blocker-0001").await["request"]["state"], "running");
     assert!(
         !finished.exists(),
-        "malformed retry cannot stop or replace the running command"
+        "a retry with other arguments cannot stop or replace the running command"
     );
-    let first_id = client.command(&sentinel_command(&first, None)).await;
-    let cancel_id = client.command(&sentinel_command(&cancelled, None)).await;
-    let last_id = client.command(&sentinel_command(&last, None)).await;
+    client.command("first-0001", &sentinel_command(&first, None)).await;
+    // A direct call queues behind the blocker; then its client goes away.
+    let call = client.spawn_call("lean_trial", trial(&sentinel_command(&dropped, None)));
+    client.wait_for_jobs(3).await;
+    call.abort();
+    client.command("last-0001", &sentinel_command(&last, None)).await;
     assert!(!finished.exists());
-    client.request("tasks/cancel", json!({"taskId": cancel_id})).await;
-    let cancel_result = client.terminal(&cancel_id, Duration::from_secs(10)).await;
-    assert_eq!(cancel_result.pointer("/result/status"), Some(&json!("completed")));
-    drop(client);
-    let mut reconnected = TaskHttpClient::new(&server.url);
-    for id in [blocker, first_id, last_id] {
-        let result = reconnected.terminal(&id, Duration::from_secs(15)).await;
-        assert_eq!(result.pointer("/result/status"), Some(&json!("completed")), "{result}");
-        assert_eq!(
-            result.pointer("/result/result/isError"),
-            Some(&json!(false)),
-            "{result}"
-        );
+    let other = StatelessClient::new(&server.url);
+    for id in ["blocker-0001", "first-0001", "last-0001"] {
+        let reply = other.ended(id, Duration::from_secs(30)).await;
+        assert_eq!(reply["request"]["state"], "done", "{reply}");
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert!(
-            result.pointer("/result/result/structuredContent/data/output").is_some(),
-            "{result}"
+            reply.pointer("/result/structuredContent/data/output").is_some(),
+            "{reply}"
         );
     }
     assert!(finished.exists());
     assert!(first.exists());
     assert!(last.exists());
-    assert!(!cancelled.exists());
+    assert!(!dropped.exists(), "a dropped queued call must never enter Lean");
+    let healthy = scratch.path().join("healthy-follow-up");
+    let follow_up = other.call("lean_trial", trial(&sentinel_command(&healthy, None))).await;
+    assert_eq!(follow_up["result"]["isError"], false, "{follow_up}");
+    assert!(healthy.exists(), "the worker must stay usable: {follow_up}");
     server.shutdown().await;
 }
 
 #[tokio::test]
 #[ignore = "requires built Lean fixture and worker binary"]
-async fn streamable_http_queued_task_cancellation_skips_lean() {
-    let scratch = tempfile::tempdir().expect("test-owned sentinels");
-    let running = scratch.path().join("running");
-    let finished = scratch.path().join("finished");
-    let forbidden = scratch.path().join("cancelled-job-started");
-    let root = fixture_root();
-    let root_s = root.to_string_lossy();
-    let server = HttpMcpServer::start_with_env(
-        &[("--lake-root", root_s.as_ref())],
-        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
-    )
-    .await;
-    let mut client = TaskHttpClient::new(&server.url);
-    let blocker = client
-        .command(&sentinel_command(&running, Some((&finished, 4_000))))
-        .await;
-    wait_for_sentinel(&running, Duration::from_secs(30)).await;
-    let queued = client.command(&sentinel_command(&forbidden, None)).await;
-    assert!(!finished.exists(), "second request must be accepted while Lean is busy");
-    let ack = client.request("tasks/cancel", json!({"taskId": queued})).await;
-    assert_eq!(
-        ack.pointer("/result/resultType").and_then(Value::as_str),
-        Some("complete")
-    );
-    let cancelled = client.terminal(&queued, Duration::from_secs(10)).await;
-    assert_eq!(
-        cancelled.pointer("/result/status").and_then(Value::as_str),
-        Some("completed")
-    );
-    let blocker = client.terminal(&blocker, Duration::from_secs(10)).await;
-    assert_eq!(
-        blocker.pointer("/result/status").and_then(Value::as_str),
-        Some("completed")
-    );
-    assert!(
-        finished.exists(),
-        "blocking Lean command must finish normally: {blocker}"
-    );
-    assert!(!forbidden.exists(), "cancelled waiting command must never enter Lean");
-    let follow_up = scratch.path().join("healthy-follow-up");
-    let healthy = client.command(&sentinel_command(&follow_up, None)).await;
-    let result = client.terminal(&healthy, Duration::from_secs(10)).await;
-    assert_eq!(
-        result.pointer("/result/status").and_then(Value::as_str),
-        Some("completed")
-    );
-    assert!(
-        follow_up.exists(),
-        "same worker must remain usable after queued cancellation: {result}"
-    );
-    server.shutdown().await;
-}
-
-#[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
-async fn streamable_http_running_task_cancellation_stops_worker_and_drains() {
+async fn streamable_http_dropped_running_call_stops_lean_and_drains() {
     let scratch = tempfile::tempdir().expect("test-owned sentinels");
     let started = scratch.path().join("started");
-    let forbidden = scratch.path().join("ran-after-cancellation");
+    let forbidden = scratch.path().join("ran-after-the-client-left");
     let root = fixture_root();
     let root_s = root.to_string_lossy();
     let server = HttpMcpServer::start_with_env(
@@ -1672,39 +1110,35 @@ async fn streamable_http_running_task_cancellation_stops_worker_and_drains() {
         &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
     )
     .await;
-    let mut client = TaskHttpClient::new(&server.url);
-    let task = client
-        .command(&sentinel_command(&started, Some((&forbidden, 4_000))))
-        .await;
+    let client = StatelessClient::new(&server.url);
+    let call = client.spawn_call(
+        "lean_trial",
+        trial(&sentinel_command(&started, Some((&forbidden, 4_000)))),
+    );
     wait_for_sentinel(&started, Duration::from_secs(30)).await;
-    assert!(
-        !forbidden.exists(),
-        "cancellation must be requested before Lean finishes"
-    );
-    client.request("tasks/cancel", json!({"taskId": task})).await;
-    // The cancellation must settle before the uncancelled computation's sleep
-    // would end; merely forgetting its HTTP request cannot pass this check.
-    let cancelled = client.terminal(&task, Duration::from_secs(2)).await;
-    assert_eq!(
-        cancelled.pointer("/result/status").and_then(Value::as_str),
-        Some("completed")
-    );
+    assert!(!forbidden.exists(), "the client must leave before Lean finishes");
+    call.abort();
     let healthy = scratch.path().join("healthy-follow-up");
-    let follow_up = client.command(&sentinel_command(&healthy, None)).await;
-    let response = client.terminal(&follow_up, Duration::from_secs(10)).await;
-    assert_eq!(
-        response.pointer("/result/status").and_then(Value::as_str),
-        Some("completed")
-    );
+    let response = client
+        .call("lean_trial", trial(&sentinel_command(&healthy, None)))
+        .await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
     assert!(
         healthy.exists(),
-        "worker must accept work after cancellation drains: {response}"
+        "the worker must accept work after the dropped call drains: {response}"
     );
-    // Catch detached Lean execution that survives a prematurely terminal task.
+    assert!(
+        response
+            .pointer("/result/structuredContent/request_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("srv-")),
+        "{response}"
+    );
+    // Catch Lean work that survives its dropped call.
     tokio::time::sleep(Duration::from_millis(4_250)).await;
     assert!(
         !forbidden.exists(),
-        "cancelled worker computation continued in the background"
+        "the dropped call's Lean command went on in the background"
     );
     server.shutdown().await;
 }
@@ -1712,7 +1146,7 @@ async fn streamable_http_running_task_cancellation_stops_worker_and_drains() {
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires built Lean fixture and worker binary"]
-async fn streamable_http_cancelled_startup_preserves_coalesced_worker_at_capacity() {
+async fn streamable_http_dropped_startup_preserves_coalesced_worker_at_capacity() {
     use std::os::unix::fs::PermissionsExt;
 
     let scratch = tempfile::Builder::new()
@@ -1727,9 +1161,9 @@ async fn streamable_http_cancelled_startup_preserves_coalesced_worker_at_capacit
     let starts = scratch.path().join("worker-starts");
     let release = scratch.path().join("release-startup");
     let wrapper = scratch.path().join("lean-host-mcp-worker");
-    // Delay the actual worker handshake, not a Lean command. The first caller
-    // must therefore still own the same-project opening lock when cancelled.
-    // Bound the wrapper wait so an assertion failure cannot leave a child stuck.
+    // Delay the worker handshake, not a Lean command, so the first caller
+    // still holds the project's opening lock when its client leaves. Bound
+    // the wait so a failed assertion cannot leave a child stuck.
     let script = format!(
         "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nremaining=500\nwhile [ ! -f {} ]; do\n  remaining=$((remaining - 1))\n  [ \"$remaining\" -gt 0 ] || exit 75\n  sleep 0.01\ndone\nexec {} \"$@\"\n",
         shell_quote_path(&starts),
@@ -1749,46 +1183,30 @@ async fn streamable_http_cancelled_startup_preserves_coalesced_worker_at_capacit
         ],
     )
     .await;
-    let mut opener = TaskHttpClient::new(&server.url);
-    let forbidden = scratch.path().join("cancelled-opener-entered-lean");
-    let opening = opener.command(&sentinel_command(&forbidden, None)).await;
+    let opener = StatelessClient::new(&server.url);
+    let forbidden = scratch.path().join("dropped-opener-entered-lean");
+    let opening = opener.spawn_call("lean_trial", trial(&sentinel_command(&forbidden, None)));
     wait_for_sentinel(&starts, Duration::from_secs(30)).await;
-    let mut waiter = TaskHttpClient::new(&server.url);
+    let waiter = StatelessClient::new(&server.url);
     let healthy = scratch.path().join("surviving-waiter-entered-lean");
-    let waiting = waiter.command(&sentinel_command(&healthy, None)).await;
-    let status = waiter.request("tasks/get", json!({"taskId": waiting})).await;
-    assert_eq!(
-        status.pointer("/result/status").and_then(Value::as_str),
-        Some("working")
-    );
-    assert!(!healthy.exists(), "same-project request must wait for startup");
-    opener.request("tasks/cancel", json!({"taskId": opening})).await;
+    waiter.command("waiter-0001", &sentinel_command(&healthy, None)).await;
+    waiter.wait_for_state("waiter-0001", "running").await;
+    assert!(!healthy.exists(), "a same-project request must wait for startup");
+    opening.abort();
     assert_eq!(
         std::fs::read_to_string(&starts).unwrap().lines().count(),
         1,
         "only one worker may start while the capacity-one startup is held"
     );
     std::fs::write(&release, "continue").unwrap();
-    let cancelled = opener.terminal(&opening, Duration::from_secs(30)).await;
+    let completed = waiter.ended("waiter-0001", Duration::from_secs(30)).await;
     assert_eq!(
-        cancelled.pointer("/result/status").and_then(Value::as_str),
-        Some("completed"),
-        "opening caller must observe its own cancellation: {cancelled}"
+        completed["request"]["state"], "done",
+        "the surviving caller must reuse the new worker rather than report a busy pool: {completed}"
     );
-    let completed = waiter.terminal(&waiting, Duration::from_secs(30)).await;
-    assert_eq!(
-        completed.pointer("/result/status").and_then(Value::as_str),
-        Some("completed"),
-        "surviving caller must reuse the new worker rather than report a busy pool: {completed}"
-    );
-    assert!(
-        healthy.exists(),
-        "surviving caller must actually execute Lean: {completed}"
-    );
-    assert!(
-        !forbidden.exists(),
-        "cancelled opener must not execute its Lean command"
-    );
+    assert_eq!(completed["result"]["isError"], false, "{completed}");
+    assert!(healthy.exists(), "the surviving caller must run Lean: {completed}");
+    assert!(!forbidden.exists(), "the dropped opener must not run its Lean command");
     assert_eq!(
         std::fs::read_to_string(&starts).unwrap().lines().count(),
         1,
@@ -1812,13 +1230,13 @@ async fn streamable_http_runtime_lease_is_immediate_and_owned_across_connections
     std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
     let root_s = root.path().to_string_lossy();
     let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
-    let mut owner = TaskHttpClient::new(&server.url);
+    let owner = StatelessClient::new(&server.url);
     let acquired = owner.control(json!({"action": "acquire"})).await;
     assert_eq!(acquired["status"], "acquired");
     assert_eq!(acquired["pool"]["workers_stopped"], true);
     let token = acquired["lease_id"].as_str().unwrap().to_owned();
     drop(owner);
-    let mut reconnected = TaskHttpClient::new(&server.url);
+    let reconnected = StatelessClient::new(&server.url);
     let status = reconnected.control(json!({"action": "status"})).await;
     assert_eq!(status["pool"]["admission_paused"], true);
     assert!(status.get("lease_id").is_none());
@@ -1835,7 +1253,15 @@ async fn streamable_http_runtime_lease_is_immediate_and_owned_across_connections
         "{}",
         denied.json
     );
-    assert!(denied.json.pointer("/result/taskId").is_none());
+    assert!(
+        denied
+            .json
+            .pointer("/result/structuredContent/request_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("srv-")),
+        "{}",
+        denied.json
+    );
     let metadata = legacy
         .request(
             "tools/call",
@@ -1872,11 +1298,11 @@ async fn streamable_http_runtime_lease_preserves_warm_workers_and_retires_only_i
         &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
     )
     .await;
-    let mut client = TaskHttpClient::new(&server.url);
-    let warm = client.command("#eval (1 : Nat)").await;
+    let client = StatelessClient::new(&server.url);
+    client.command("warm-0001", "#eval (1 : Nat)").await;
     assert_eq!(
-        client.terminal(&warm, Duration::from_secs(30)).await["result"]["status"],
-        "completed"
+        client.ended("warm-0001", Duration::from_secs(30)).await["request"]["state"],
+        "done"
     );
     let acquired = client.acquire_idle(false).await;
     assert_eq!(acquired["pool"]["projects"].as_array().unwrap().len(), 1);
@@ -1885,16 +1311,16 @@ async fn streamable_http_runtime_lease_preserves_warm_workers_and_retires_only_i
     let generation = acquired["pool"]["projects"][0]["runtime"]["worker_generation"].clone();
     let token = acquired["lease_id"].as_str().unwrap().to_owned();
     client.control(json!({"action": "release", "lease_id": token})).await;
-    let repeat = client.command("#eval (2 : Nat)").await;
+    client.command("repeat-0001", "#eval (2 : Nat)").await;
     assert_eq!(
-        client.terminal(&repeat, Duration::from_secs(10)).await["result"]["status"],
-        "completed"
+        client.ended("repeat-0001", Duration::from_secs(10)).await["request"]["state"],
+        "done"
     );
     let scratch = tempfile::tempdir().unwrap();
     let started = scratch.path().join("started");
     let finished = scratch.path().join("finished");
-    let running = client
-        .command(&sentinel_command(&started, Some((&finished, 4_000))))
+    client
+        .command("running-0001", &sentinel_command(&started, Some((&finished, 4_000))))
         .await;
     wait_for_sentinel(&started, Duration::from_secs(10)).await;
     let busy = client.control(json!({"action": "acquire", "retire_idle": true})).await;
@@ -1904,8 +1330,8 @@ async fn streamable_http_runtime_lease_preserves_warm_workers_and_retires_only_i
     assert!(busy["pool"]["projects"][0]["outstanding_jobs"].as_u64().unwrap() >= 1);
     assert_eq!(busy["pool"]["projects"][0]["runtime"]["worker_generation"], generation);
     assert_eq!(
-        client.terminal(&running, Duration::from_secs(10)).await["result"]["status"],
-        "completed"
+        client.ended("running-0001", Duration::from_secs(10)).await["request"]["state"],
+        "done"
     );
     assert!(finished.exists(), "claiming must not cancel existing work");
     let retired = client.acquire_idle(true).await;
@@ -1924,47 +1350,103 @@ async fn streamable_http_runtime_lease_preserves_warm_workers_and_retires_only_i
     })
     .await
     .expect("retired child must confirm exit");
-    let blocked = client.command("#eval (3 : Nat)").await;
-    let blocked = client.terminal(&blocked, Duration::from_secs(10)).await;
+    client.command("blocked-0001", "#eval (3 : Nat)").await;
+    let blocked = client.ended("blocked-0001", Duration::from_secs(10)).await;
+    assert_eq!(blocked["request"]["state"], "done", "{blocked}");
     assert_eq!(
-        runtime_error_reason(&json!({"result": blocked["result"]["result"]})).as_deref(),
-        Some("worker_pool_leased")
+        runtime_error_reason(&json!({"result": blocked["result"]})).as_deref(),
+        Some("worker_pool_leased"),
+        "{blocked}"
     );
     let still_stopped = client.control(json!({"action": "status"})).await;
     assert_eq!(still_stopped["pool"]["workers_stopped"], true);
     client.control(json!({"action": "release", "lease_id": token})).await;
     let healthy = scratch.path().join("healthy");
-    let next = client.command(&sentinel_command(&healthy, None)).await;
+    client.command("healthy-0001", &sentinel_command(&healthy, None)).await;
     assert_eq!(
-        client.terminal(&next, Duration::from_secs(10)).await["result"]["status"],
-        "completed"
+        client.ended("healthy-0001", Duration::from_secs(10)).await["request"]["state"],
+        "done"
     );
     assert!(healthy.exists());
     server.shutdown().await;
 }
 
-struct TaskHttpClient {
+/// A client of the stateless protocol: one HTTP request per call, no session,
+/// no tasks.
+#[derive(Clone)]
+struct StatelessClient {
     client: reqwest::Client,
     url: String,
-    next_id: u64,
+    next_id: Arc<AtomicU64>,
 }
 
-impl TaskHttpClient {
-    async fn control(&mut self, arguments: Value) -> Value {
-        let response = self
-            .request("tools/call", json!({"name": "lean_runtime", "arguments": arguments}))
-            .await;
-        assert!(
-            response.pointer("/result/taskId").is_none(),
-            "control must remain synchronous: {response}"
+impl StatelessClient {
+    fn new(url: &str) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(35))
+                .build()
+                .unwrap(),
+            url: url.to_owned(),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Call `tool` and return the JSON-RPC response, which holds `result` or
+    /// `error`.
+    async fn send(&self, tool: &str, arguments: Value) -> Value {
+        use rmcp::model::{ClientCapabilities, Implementation, ProtocolVersion, RequestMetaObject};
+        let meta = RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2026_07_28,
+            Implementation::new("lean-host-lifecycle-test", "1"),
+            ClientCapabilities::default(),
         );
+        let params = json!({"name": tool, "arguments": arguments, "_meta": meta});
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let response = self
+            .client
+            .post(&self.url)
+            .header("Accept", ACCEPT_BOTH)
+            .header("Content-Type", "application/json")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", tool)
+            .body(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params}).to_string())
+            .send()
+            .await
+            .expect("HTTP request");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await.expect("HTTP body");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(status.is_success(), "HTTP request failed: {status}: {body}");
+        let response = parse_response_body(&headers, &bytes).expect("JSON-RPC response");
+        assert_eq!(response.get("id").and_then(Value::as_u64), Some(id));
+        response
+    }
+
+    /// Call `tool` and return the JSON-RPC response. Fails on a JSON-RPC
+    /// error.
+    async fn call(&self, tool: &str, arguments: Value) -> Value {
+        let response = self.send(tool, arguments).await;
+        assert!(response.get("error").is_none(), "JSON-RPC error: {response}");
+        response
+    }
+
+    /// The structured content of a call to `tool`.
+    async fn structured(&self, tool: &str, arguments: Value) -> Value {
+        let response = self.call(tool, arguments).await;
         response
             .pointer("/result/structuredContent")
-            .expect("structured control response")
+            .unwrap_or_else(|| panic!("{tool} returned no structured content: {response}"))
             .clone()
     }
 
-    async fn acquire_idle(&mut self, retire_idle: bool) -> Value {
+    async fn control(&self, arguments: Value) -> Value {
+        self.structured("lean_runtime", arguments).await
+    }
+
+    async fn acquire_idle(&self, retire_idle: bool) -> Value {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let result = self
@@ -1981,86 +1463,89 @@ impl TaskHttpClient {
         .expect("finished worker must become claimable")
     }
 
-    fn new(url: &str) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(35))
-                .build()
-                .unwrap(),
-            url: url.to_owned(),
-            next_id: 1,
-        }
+    /// `lean_run` request `id`: the structured reply.
+    async fn run(&self, id: &str, tool: &str, arguments: Value) -> Value {
+        self.structured(
+            "lean_run",
+            json!({"request_id": id, "tool": tool, "arguments": arguments}),
+        )
+        .await
     }
 
-    async fn request(&mut self, method: &str, mut params: Value) -> Value {
-        use rmcp::model::{ClientCapabilities, Implementation, ProtocolVersion, RequestMetaObject};
-        let meta = RequestMetaObject::with_client_context(
-            ProtocolVersion::V_2026_07_28,
-            Implementation::new("lean-host-lifecycle-test", "1"),
-            ClientCapabilities::builder().enable_tasks().build(),
-        );
-        params["_meta"] = serde_json::to_value(meta).unwrap();
-        let name = if method == "tools/call" {
-            params.get("name")
-        } else {
-            params.get("taskId")
-        }
-        .and_then(Value::as_str)
-        .expect("named tool or task request")
-        .to_owned();
-        let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).unwrap();
-        let response = self
-            .client
-            .post(&self.url)
-            .header("Accept", ACCEPT_BOTH)
-            .header("Content-Type", "application/json")
-            .header("MCP-Protocol-Version", "2026-07-28")
-            .header("Mcp-Method", method)
-            .header("Mcp-Name", name)
-            .body(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string())
-            .send()
+    /// Start request `id`, a `lean_trial` of `commands`.
+    async fn command(&self, id: &str, commands: &str) {
+        let reply = self.run(id, "lean_trial", trial(commands)).await;
+        assert!(reply.get("request").is_some(), "lean_run {id} made no row: {reply}");
+    }
+
+    /// `lean_get` of request `id`, waiting up to `wait_seconds`:
+    /// `{request, result}`.
+    async fn get_within(&self, id: &str, wait_seconds: u64) -> Value {
+        self.structured("lean_get", json!({"request_id": id, "wait_seconds": wait_seconds}))
             .await
-            .expect("task HTTP request");
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = response.bytes().await.expect("task HTTP body");
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(status.is_success(), "HTTP task request failed: {status}: {body}");
-        let response = parse_response_body(&headers, &bytes).expect("task HTTP JSON response");
-        assert!(response.get("error").is_none(), "task JSON-RPC error: {response}");
-        assert_eq!(response.get("id").and_then(Value::as_u64), Some(id));
-        response
     }
 
-    async fn command(&mut self, commands: &str) -> String {
-        let response = self.request("tools/call", json!({"name": "lean_trial", "arguments": {"kind": "command", "imports": ["Init"], "commands": commands}})).await;
-        task_id(&response).to_owned()
+    async fn get(&self, id: &str) -> Value {
+        self.get_within(id, 0).await
     }
 
-    async fn terminal(&mut self, task_id: &str, timeout: Duration) -> Value {
+    /// Wait up to `timeout` until request `id` ends; `lean_get`'s reply.
+    async fn ended(&self, id: &str, timeout: Duration) -> Value {
         tokio::time::timeout(timeout, async {
             loop {
-                let response = self.request("tasks/get", json!({"taskId": task_id})).await;
+                let reply = self.get_within(id, 1).await;
                 if matches!(
-                    response.pointer("/result/status").and_then(Value::as_str),
-                    Some("completed" | "failed" | "cancelled")
+                    reply.pointer("/request/state").and_then(Value::as_str),
+                    Some("done" | "timed_out" | "interrupted")
                 ) {
-                    return response;
+                    return reply;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("request {id} must end within {timeout:?}"))
+    }
+
+    /// Wait until request `id` reaches `state`.
+    async fn wait_for_state(&self, id: &str, state: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.get(id).await["request"]["state"] != state {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("request {id} never reached {state}"));
+    }
+
+    /// Wait until the pool counts at least `jobs` outstanding jobs.
+    async fn wait_for_jobs(&self, jobs: u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = self.control(json!({"action": "status"})).await;
+                if status["pool"]["outstanding_jobs"]
+                    .as_u64()
+                    .is_some_and(|count| count >= jobs)
+                {
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .expect("task must reach a terminal state within its test deadline")
+        .unwrap_or_else(|_| panic!("the pool never held {jobs} jobs"));
+    }
+
+    /// A direct call of `tool` in a task of its own. Aborting the task drops
+    /// the call's connection, as a client that goes away does.
+    fn spawn_call(&self, tool: &'static str, arguments: Value) -> tokio::task::JoinHandle<Value> {
+        let client = self.clone();
+        tokio::spawn(async move { client.send(tool, arguments).await })
     }
 }
 
-fn task_id(response: &Value) -> &str {
-    response
-        .pointer("/result/taskId")
-        .and_then(Value::as_str)
-        .expect("task handle over HTTP")
+/// `lean_trial` arguments that run `commands` after importing `Init`.
+fn trial(commands: &str) -> Value {
+    json!({"kind": "command", "imports": ["Init"], "commands": commands})
 }
 
 fn sentinel_command(started: &Path, completion: Option<(&Path, u32)>) -> String {
@@ -2237,18 +1722,6 @@ impl HttpMcpServer {
             eprintln!("HTTP test server stderr:\n{stderr}");
         }
     }
-}
-
-async fn prepare_retained(client: &mut HttpSession, tool: &str, arguments: Value) -> Value {
-    let response = client
-        .request(
-            "tools/call",
-            json!({"name":"lean_request","arguments":{"action":"prepare","tool":tool,"arguments":arguments}}),
-        )
-        .await
-        .unwrap();
-    assert!(response.json.get("error").is_none(), "prepare failed: {response:?}");
-    response.json["result"]["structuredContent"].clone()
 }
 
 #[derive(Debug)]
@@ -2604,7 +2077,7 @@ async fn assert_drain_resumes(real_worker: bool) {
             .unwrap();
         assert_eq!(envelope_status(&response.json), "ok", "{:?}", response.json);
     }
-    let mut owner = TaskHttpClient::new(&server.url);
+    let owner = StatelessClient::new(&server.url);
     let mut acquired = owner.control(json!({"action": "drain", "retire_idle": true})).await;
     let token = acquired["lease_id"].as_str().unwrap().to_owned();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -2724,7 +2197,7 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
         ];
         settings.extend(writer_keys.iter().map(|&key| (key, helper_trap.to_str().unwrap())));
         let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s)], &settings).await;
-        let mut owner = TaskHttpClient::new(&server.url);
+        let owner = StatelessClient::new(&server.url);
         let acquired = owner.control(json!({"action":"acquire"})).await;
         assert_eq!(acquired["status"], "acquired");
         let token = acquired["lease_id"].as_str().unwrap();
@@ -2828,7 +2301,7 @@ async fn streamable_http_pure_compatibility_rejects_unknown_mode_before_worker_a
         );
         assert!(response.json["result"].get("structuredContent").is_none());
     }
-    let mut control = TaskHttpClient::new(&server.url);
+    let control = StatelessClient::new(&server.url);
     let status = control.control(json!({"action":"status"})).await;
     assert_eq!(status["pool"]["occupied_slots"], 0);
     assert_eq!(status["pool"]["outstanding_jobs"], 0);

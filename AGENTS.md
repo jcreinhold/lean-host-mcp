@@ -108,16 +108,17 @@ Otherwise add one check at the one point where the requirement can fail, and del
 ## Tool and response contracts
 
 The public proof surface is `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup`, and `lean_status`.
-`lean_runtime`, `lean_compatibility`, and `lean_request` expose runtime control, compatibility, and retained work.
-`lean_build` runs Lake under the project's write turn, and `lean_imports` reads each file's import closure from Lake.
-`server.rs` owns registration; `tools/semantic.rs` adapts internal operations to public `{ data, errors, trust }`
-responses. The internal `Response<T>` in `envelope.rs` is not the public schema. Consult the catalog before changing
-either layer; keep field semantics and failure distinctions intact.
+`lean_runtime` and `lean_compatibility` expose runtime control and compatibility; `lean_run` and `lean_get` start and
+read named requests, whose rows live in the SQLite table of `requests/`. `lean_build` runs Lake under the project's
+write turn, and `lean_imports` reads each file's import closure from Lake. `server.rs` owns registration;
+`tools/semantic.rs` adapts internal operations to public `{ data, errors, trust }` responses. The internal `Response<T>`
+in `envelope.rs` is not the public schema. Consult the catalog before changing either layer; keep field semantics and
+failure distinctions intact.
 
 Lean parse, elaboration, kernel, and meta failures are domain data. Infrastructure failures use `ServerError` or
 structured runtime-unavailable results. Optional proof-position support must degrade cleanly when the loaded shim lacks
-it. Keep project identity, artifact freshness, execution disposition, and proof verdict separate. Retained requests, MCP
-Tasks, `lean_build` and `lean_imports` have their own shapes; do not force them into the semantic envelope.
+it. Keep project identity, artifact freshness, execution disposition, and proof verdict separate. Request rows,
+`lean_build` and `lean_imports` have their own shapes; do not force them into the semantic envelope.
 
 ## Maintenance
 

@@ -14,6 +14,8 @@ use std::process::Command;
 use lean_host_mcp::ToolchainId;
 
 pub(crate) mod chain;
+#[cfg(unix)]
+pub(crate) mod http;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 

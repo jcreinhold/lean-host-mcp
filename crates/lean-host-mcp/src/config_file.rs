@@ -109,6 +109,20 @@ pub struct ConfigFile {
     pub output: OutputFileConfig,
     #[serde(default)]
     pub install: InstallFileConfig,
+    #[serde(default)]
+    pub requests: RequestsFileConfig,
+}
+
+/// `[requests]` — how long the request table keeps ended requests, and how
+/// long one `lean_get` may wait.
+#[derive(Debug, Default, Deserialize)]
+pub struct RequestsFileConfig {
+    /// Hours an ended request stays in the table.
+    pub retention_hours: Option<u64>,
+    /// The most rows the table keeps; the oldest ended rows go first.
+    pub max_rows: Option<u64>,
+    /// The longest `wait_seconds` a `lean_get` may ask for.
+    pub wait_max_secs: Option<u64>,
 }
 
 /// `[runtime]` — worker policy knobs (mirrors `ProjectRuntimeConfig`).

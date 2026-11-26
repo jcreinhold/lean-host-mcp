@@ -147,7 +147,7 @@ jobs:
         run: cargo test --locked -p lean-host-mcp-worker --all-targets
 
       # Package once, install that worker once, and use the packaged host for
-      # the ordinary proof smoke, the link-set check and the stdio suite.
+      # semantic preparation, the link-set check and the stdio suite.
       - name: Verify packaged host and worker
         run: scripts/test-installed-module-setup.sh --release
 

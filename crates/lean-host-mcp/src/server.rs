@@ -7,12 +7,15 @@
 //! `Json` wrapper makes rmcp advertise a deep `outputSchema` that no Anthropic
 //! API client forwards to the model (it costs only wire bytes and breaks strict
 //! schema validators), so we drop it and place the serialized envelope per the
-//! configured [`ResponseCarrier`]. Clients negotiating the MCP Tasks extension
-//! receive process-local task handles. Clone a service across transport sessions
-//! to retain those handles and their results after a client reconnects.
+//! configured [`ResponseCarrier`].
+//!
+//! Every reply names its request. A call with a `request_id` argument runs as
+//! that request, recorded in the request table before it starts (see
+//! [`crate::requests`]); any other call gets a `srv-` id and no row. A reply
+//! carries the id at its top level, and a protocol error in its `data`.
 
-use std::fmt::Write as _;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,22 +23,28 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock, CreateTaskResult,
-    GetTaskParams, GetTaskResult, Implementation, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
-    ServerCapabilities, ServerConfig, Tool, UpdateTaskParams,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_router};
-use sha2::{Digest, Sha256};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 
-use crate::broker::{ProjectBroker, RuntimeControlRequest};
-use crate::cancellation::with_cancellation;
+use crate::broker::{ProjectBroker, ProjectHint, RuntimeControlRequest};
+use crate::cancellation::{with_cancellation, with_deadline};
 use crate::error::ServerError;
 use crate::request_log::RequestLog;
-use crate::tasks::{RequestBinding, RequestTasks};
+use crate::requests::{self, REQUEST_ID, RequestError, RequestRunner, RowView};
+use crate::runtime_compatibility::{CompatibilityMode, CompatibilityRequest};
 use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Tools that never run as a request: the two that manage requests, and the
+/// runtime lease, which must answer at once.
+const DIRECT_ONLY: [&str; 3] = ["lean_run", "lean_get", "lean_runtime"];
 
 /// Run one tool call while heartbeating `notifications/progress` to the client.
 ///
@@ -113,7 +122,8 @@ async fn progress_while_waiting<T>(
 pub struct LeanHostService {
     ctx: ToolContext,
     tool_router: ToolRouter<Self>,
-    tasks: RequestTasks,
+    /// The request table, when the server has a store.
+    requests: Option<Arc<RequestRunner>>,
 }
 
 impl LeanHostService {
@@ -122,175 +132,111 @@ impl LeanHostService {
         Self {
             ctx,
             tool_router: Self::tool_router(),
-            tasks: RequestTasks::default(),
+            requests: None,
         }
     }
 
-    /// Enable bounded durable evidence for epoch-bound retained requests.
-    /// This never restarts or replays old work. Unfinished dispatched requests
-    /// recovered from a previous broker remain explicitly unknown.
-    ///
-    /// # Errors
-    /// Returns an error if the journal is locked, malformed or inaccessible.
-    pub fn with_request_journal(mut self, path: &std::path::Path) -> std::io::Result<Self> {
-        self.tasks = RequestTasks::open(path)?;
-        Ok(self)
+    /// Run calls that carry a `request_id` through `runner`. Without it such
+    /// calls fail with `requests_unavailable`.
+    #[must_use]
+    pub fn with_requests(mut self, runner: Arc<RequestRunner>) -> Self {
+        self.requests = Some(runner);
+        self
     }
 }
 
-/// A plain-tool bridge for clients without the negotiated MCP Tasks extension.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// `lean_run` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct RetainedRequest {
-    action: RetainedAction,
-    /// Immutable epoch from the prepared ticket; retain it for every retry.
-    request_epoch: Option<String>,
-    /// Required with `request_epoch` when acknowledging a consumed result.
-    submission_sha256: Option<String>,
-    /// Server-issued prepared ticket ID, required for submit/get/cancel/acknowledge.
-    request_id: Option<String>,
-    /// One of `lean_context`, `lean_trial`, `lean_verify`, `lean_lookup` or `lean_status`.
-    tool: Option<String>,
-    /// The selected semantic tool's ordinary input object.
-    arguments: Option<serde_json::Map<String, serde_json::Value>>,
+pub struct LeanRunRequest {
+    /// Names the request: 8 to 128 characters from A-Z, a-z, 0-9, '.', '_', ':' and '-', not starting with `srv-`.
+    pub request_id: String,
+    /// The tool to run: any tool except `lean_run`, `lean_get` and `lean_runtime`.
+    pub tool: String,
+    /// The tool's arguments, without `request_id`.
+    #[serde(default)]
+    pub arguments: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum RetainedAction {
-    Prepare,
-    Submit,
-    Get,
-    Cancel,
-    Acknowledge,
+/// `lean_get` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LeanGetRequest {
+    /// The request to read.
+    pub request_id: String,
+    /// Wait up to this many seconds for the request to end. The server caps the wait at its `[requests]
+    /// wait_max_secs`. Default 0: reply at once.
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
 }
+
+/// The id `call_tool` gave a call that came without a `request_id`.
+#[derive(Clone, Debug)]
+struct CallId(String);
 
 #[tool_router]
 impl LeanHostService {
     #[tool(
-        description = "Prepare, submit, retrieve or cancel a retained Lean request without MCP Tasks negotiation. For new work call action=prepare with tool and arguments; it reserves a five-minute ticket without executing the tool. Save the returned taskId and immutable request binding, then submit the exact tool/arguments with that request_id and request_epoch. Retrying that ticket never runs twice; missing/expired IDs never create work. Capacity returns explicit no-start backpressure. Get/cancel use the same ticket; acknowledge a durably saved result with its epoch and submission_sha256. Execution disposition is separate from the proof verdict. Journal durability is reported by lean_runtime; old work is never replayed after restart."
+        description = "Start a tool call as request request_id and reply at once with the request's row; read its result with lean_get. The server records the request before it starts and runs it at most once: the same request_id with the same tool and arguments returns the same row, from any client and after a restart; other arguments fail with request_id_conflict. tool is any tool except lean_run, lean_get and lean_runtime."
     )]
-    async fn lean_request(&self, Parameters(request): Parameters<RetainedRequest>) -> Result<CallToolResult, McpError> {
-        let task = match request.action {
-            RetainedAction::Prepare | RetainedAction::Submit => {
-                let preparing = matches!(request.action, RetainedAction::Prepare);
-                if !preparing && request.request_id.is_none() {
-                    return Err(crate::tasks::no_start(
-                        "invalid_submission",
-                        "submit requires a prepared request_id",
-                    ));
-                }
-                // A malformed retry says nothing about work already accepted
-                // under this ticket. Only pure preparation has no old lifetime.
-                let invalid_submission = |message: &str| {
-                    if preparing {
-                        crate::tasks::no_start("invalid_submission", message)
-                    } else {
-                        McpError::invalid_params(
-                            message.to_owned(),
-                            Some(serde_json::json!({"reason":"invalid_ticket_submission",
-                                "execution":{"disposition":"unknown","reason":"invalid_ticket_submission"}})),
-                        )
-                    }
-                };
-                if preparing && (request.request_id.is_some() || request.request_epoch.is_some()) {
-                    return Err(crate::tasks::no_start(
-                        "invalid_submission",
-                        "prepare does not accept request_id or request_epoch",
-                    ));
-                }
-                if request.submission_sha256.is_some() {
-                    return Err(invalid_submission("prepare/submit do not accept submission_sha256"));
-                }
-                if !preparing && request.arguments.is_none() {
-                    return Err(invalid_submission("submit requires the prepared arguments object"));
-                }
-                let tool = request
-                    .tool
-                    .ok_or_else(|| invalid_submission("prepare/submit require tool"))?;
-                let call =
-                    CallToolRequestParams::new(tool.clone()).with_arguments(request.arguments.unwrap_or_default());
-                let parsed = TaskCall::parse(&call).map_err(|error| invalid_submission(&error.message))?;
-                let digest = Sha256::digest(
-                    serde_json::to_vec(&(&tool, &call.arguments))
-                        .map_err(|error| invalid_submission(&error.to_string()))?,
-                );
-                let mut submission_sha256 = String::with_capacity(64);
-                for byte in &digest {
-                    let _ = write!(submission_sha256, "{byte:02x}");
-                }
-                let submission = RequestBinding {
-                    server_instance_id: self.ctx.broker.instance_id(),
-                    request_epoch: request.request_epoch,
-                    tool: tool.clone(),
-                    submission_sha256,
-                    project: call
-                        .arguments
-                        .as_ref()
-                        .and_then(|args| args.get("project"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                };
-                if preparing {
-                    self.tasks.prepare(submission)?
-                } else {
-                    let request_id = request.request_id.ok_or_else(|| {
-                        crate::tasks::no_start("invalid_submission", "submit requires a prepared request_id")
-                    })?;
-                    let service = self.clone();
-                    let accepted = self.tasks.submit(&tool, request_id, submission, move || async move {
-                        service.run_task(parsed).await
-                    })?;
-                    self.tasks.get_retained(&accepted.task_id)?
-                }
-            }
-            RetainedAction::Get | RetainedAction::Cancel | RetainedAction::Acknowledge => {
-                if request.tool.is_some() || request.arguments.is_some() {
-                    return Err(McpError::invalid_params("get/cancel accepts only request_id", None));
-                }
-                let request_id = request
-                    .request_id
-                    .ok_or_else(|| McpError::invalid_params("get/cancel requires request_id", None))?;
-                if matches!(request.action, RetainedAction::Acknowledge) {
-                    let epoch = request
-                        .request_epoch
-                        .as_deref()
-                        .ok_or_else(|| McpError::invalid_params("acknowledge requires request_epoch", None))?;
-                    let digest = request
-                        .submission_sha256
-                        .as_deref()
-                        .ok_or_else(|| McpError::invalid_params("acknowledge requires submission_sha256", None))?;
-                    match self.tasks.acknowledge_if_retained(&request_id, epoch, digest)? {
-                        Some(task) => task,
-                        None => {
-                            return Ok(carry(
-                                &serde_json::json!({
-                                    "status":"absent", "acknowledged":true, "result_available":false,
-                                    "request_id":request_id, "request_epoch":epoch, "submission_sha256":digest,
-                                    "identity_verified":false,
-                                }),
-                                self.ctx.config.carrier,
-                            ));
-                        }
-                    }
-                } else {
-                    if request.submission_sha256.is_some() {
-                        return Err(McpError::invalid_params(
-                            "get/cancel does not accept submission_sha256",
-                            None,
-                        ));
-                    }
-                    if matches!(request.action, RetainedAction::Cancel) {
-                        self.tasks
-                            .cancel_scoped(&request_id, request.request_epoch.as_deref())?;
-                    }
-                    self.tasks
-                        .get_retained_scoped(&request_id, request.request_epoch.as_deref())?
-                }
-            }
+    async fn lean_run(
+        &self,
+        Parameters(request): Parameters<LeanRunRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let carrier = self.ctx.config.carrier;
+        let Some(runner) = &self.requests else {
+            return Ok(RequestError::unavailable().reply(&request.request_id, carrier));
         };
-        let value = serde_json::to_value(task).map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(carry(&value, self.ctx.config.carrier))
+        let client = client_name(&context);
+        Ok(
+            match runner
+                .run(&request.request_id, &request.tool, request.arguments, client)
+                .await
+            {
+                Ok(row) => carry(&json!({ "request": RowView::from(&row) }), carrier),
+                Err(error) => error.reply(&request.request_id, carrier),
+            },
+        )
+    }
+
+    #[tool(
+        description = "Read request request_id: its row, and once it has ended, the stored result of its tool call (null before). wait_seconds waits up to that many seconds for the end; the server caps the wait."
+    )]
+    async fn lean_get(
+        &self,
+        Parameters(request): Parameters<LeanGetRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let carrier = self.ctx.config.carrier;
+        let Some(runner) = &self.requests else {
+            return Ok(RequestError::unavailable().reply(&request.request_id, carrier));
+        };
+        if let Err(error) = requests::check_id(&request.request_id) {
+            return Ok(error.reply(&request.request_id, carrier));
+        }
+        let limit = runner.wait_limit(request.wait_seconds);
+        let wait = progress_while_waiting(&context, "lean_get", runner.wait(&request.request_id, Some(limit)));
+        let waited = tokio::select! {
+            biased;
+            () = context.ct.cancelled() => return Err(McpError::internal_error("the client stopped waiting", None)),
+            waited = wait => waited,
+        };
+        Ok(match waited {
+            Ok(row) => {
+                let result = row
+                    .state
+                    .is_final()
+                    .then(|| {
+                        row.result
+                            .as_deref()
+                            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    })
+                    .flatten();
+                carry(&json!({ "request": RowView::from(&row), "result": result }), carrier)
+            }
+            Err(error) => error.reply(&request.request_id, carrier),
+        })
     }
 
     #[tool(
@@ -298,27 +244,11 @@ impl LeanHostService {
     )]
     async fn lean_compatibility(
         &self,
-        Parameters(request): Parameters<crate::runtime_compatibility::CompatibilityRequest>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        if request.project.trim().is_empty() {
-            return Err(McpError::invalid_params("explicit project required", None));
-        }
-        let hint = crate::broker::ProjectHint::Explicit(std::path::PathBuf::from(request.project));
-        if matches!(request.mode, crate::runtime_compatibility::CompatibilityMode::PureV1) {
-            let result = self
-                .ctx
-                .broker
-                .describe_native_compatibility(&hint)
-                .map_err(McpError::from)?;
-            return Ok(carry(&result, self.ctx.config.carrier));
-        }
-        let result = self
-            .ctx
-            .broker
-            .native_compatibility(hint)
+        Parameters(request): Parameters<CompatibilityRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Compatibility(request), "lean_compatibility", &context)
             .await
-            .map_err(McpError::from)?;
-        Ok(carry(&result, self.ctx.config.carrier))
     }
 
     #[tool(
@@ -327,11 +257,16 @@ impl LeanHostService {
     async fn lean_runtime(
         &self,
         Parameters(request): Parameters<RuntimeControlRequest>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mut result = self.ctx.broker.runtime_control(&request);
         result.effective_settings.server = Some(self.ctx.config.into());
-        result.request_registry = Some(self.tasks.status());
-        result.capabilities.push("retained_request_lifecycle_v3".to_owned());
+        if let Some(runner) = &self.requests {
+            match runner.counts().await {
+                Ok(counts) => result.requests = Some(counts),
+                Err(error) => tracing::warn!(%error, "cannot count the requests"),
+            }
+            result.capabilities.push("durable_requests_v1".to_owned());
+        }
         Ok(carry(&result, self.ctx.config.carrier))
     }
 
@@ -342,13 +277,9 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::semantic::LeanContextToolRequest>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        Box::pin(with_progress(
-            &context,
-            "lean_context",
-            self.run_task(TaskCall::Context(req)),
-        ))
-        .await
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Semantic(SemanticCall::Context(req)), "lean_context", &context)
+            .await
     }
 
     #[tool(
@@ -358,13 +289,9 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::semantic::LeanTrialToolRequest>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        Box::pin(with_progress(
-            &context,
-            "lean_trial",
-            self.run_task(TaskCall::Trial(req)),
-        ))
-        .await
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Semantic(SemanticCall::Trial(req)), "lean_trial", &context)
+            .await
     }
 
     #[tool(description = "Verify Lean declarations from explicit, file_all, or module_all target groups.")]
@@ -372,13 +299,9 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::proof_action::LeanVerifyToolRequest>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        Box::pin(with_progress(
-            &context,
-            "lean_verify",
-            self.run_task(TaskCall::Verify(req)),
-        ))
-        .await
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Semantic(SemanticCall::Verify(req)), "lean_verify", &context)
+            .await
     }
 
     #[tool(description = "Semantic lookup. Kinds: declaration, declarations, proof_search, references.")]
@@ -386,13 +309,9 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::semantic::LeanLookupToolRequest>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        Box::pin(with_progress(
-            &context,
-            "lean_lookup",
-            self.run_task(TaskCall::Lookup(req)),
-        ))
-        .await
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Semantic(SemanticCall::Lookup(req)), "lean_lookup", &context)
+            .await
     }
 
     #[tool(
@@ -402,16 +321,8 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<crate::build::BuildRequest>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        let outcome = Box::pin(with_progress(
-            &context,
-            "lean_build",
-            tools::build::lean_build(&self.ctx, req),
-        ))
-        .await?;
-        let mut result = carry(&outcome, self.ctx.config.carrier);
-        result.is_error = Some(!outcome.ok);
-        Ok(result)
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Build(req), "lean_build", &context).await
     }
 
     #[tool(
@@ -421,23 +332,8 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::build::ImportsRequest>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        let timeout = Duration::from_millis(self.ctx.broker.request_timeout_millis());
-        let reply = Box::pin(with_progress(
-            &context,
-            "lean_imports",
-            crate::cancellation::with_deadline(timeout, tools::build::lean_imports(&self.ctx, req)),
-        ))
-        .await;
-        match reply {
-            Ok(reply) => Ok(carry(&reply, self.ctx.config.carrier)),
-            Err(tools::build::ImportsError::File(failure)) => {
-                let mut result = carry(&failure, self.ctx.config.carrier);
-                result.is_error = Some(true);
-                Ok(result)
-            }
-            Err(tools::build::ImportsError::Call(error)) => Err(error),
-        }
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Imports(req), "lean_imports", &context).await
     }
 
     #[tool(description = "Project/toolchain status and source diagnostics. Kinds: project, file_diagnostics.")]
@@ -445,48 +341,110 @@ impl LeanHostService {
         &self,
         Parameters(req): Parameters<tools::semantic::LeanStatusToolRequest>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        Box::pin(with_progress(
-            &context,
-            "lean_status",
-            self.run_task(TaskCall::Status(req)),
-        ))
-        .await
+    ) -> Result<CallToolResult, McpError> {
+        self.direct(ToolCall::Semantic(SemanticCall::Status(req)), "lean_status", &context)
+            .await
+    }
+}
+
+impl LeanHostService {
+    /// Run `call` for a call without a `request_id`, as the id `call_tool`
+    /// gave it. A dropped connection cancels the work.
+    async fn direct(
+        &self,
+        call: ToolCall,
+        tool: &str,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = context
+            .extensions
+            .get::<CallId>()
+            .map_or_else(requests::server_id, |id| id.0.clone());
+        Box::pin(with_progress(context, tool, call.execute(&self.ctx, &id))).await
+    }
+
+    async fn route(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    /// Run a call that names request `id` and wait for its end. A dropped
+    /// connection ends the wait, not the request.
+    async fn run_named(
+        &self,
+        id: &str,
+        tool: &str,
+        arguments: Map<String, Value>,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let carrier = self.ctx.config.carrier;
+        if self.tool_router.get(tool).is_none() {
+            let mut error = McpError::invalid_params("tool not found", None);
+            requests::stamp_error(&mut error, id);
+            return Err(error);
+        }
+        let Some(runner) = &self.requests else {
+            return Ok(RequestError::unavailable().reply(id, carrier).into());
+        };
+        if let Err(error) = runner.run(id, tool, arguments, client_name(context)).await {
+            return Ok(error.reply(id, carrier).into());
+        }
+        let waited = tokio::select! {
+            biased;
+            () = context.ct.cancelled() => {
+                let mut error = McpError::internal_error("the client stopped waiting; the request goes on", None);
+                requests::stamp_error(&mut error, id);
+                return Err(error);
+            }
+            waited = progress_while_waiting(context, tool, runner.wait(id, None)) => waited,
+        };
+        Ok(match waited {
+            Ok(row) => runner.stored_reply(&row),
+            Err(error) => error.reply(id, carrier),
+        }
+        .into())
     }
 }
 
 impl ServerHandler for LeanHostService {
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut request: CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        // Coordination is immediate and must return its lease token directly,
-        // even for clients that negotiate asynchronous Lean job handles.
-        if !matches!(
-            request.name.as_ref(),
-            "lean_runtime" | "lean_request" | "lean_compatibility"
-        ) && context.client_capabilities().is_some_and(|caps| caps.supports_tasks())
-        {
-            // Parse before acceptance. Task calls use no request-scoped peer or
-            // cancellation token, so disconnecting cannot abandon their result.
-            // Let the router handle parse failures so malformed arguments have
-            // the same tool-error shape with and without task negotiation.
-            if let Ok(call) = TaskCall::parse(&request)
-                && !call.is_cheap_metadata()
-            {
-                let service = self.clone();
-                if let Some(task) = self
-                    .tasks
-                    .spawn(&request.name, move || async move { service.run_task(call).await })
-                {
-                    return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
-                }
-            }
+        let tool = request.name.to_string();
+        if matches!(tool.as_str(), "lean_run" | "lean_get") {
+            // These tools name their request in their own arguments.
+            let id = request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get(REQUEST_ID))
+                .and_then(Value::as_str)
+                .filter(|id| requests::check_id(id).is_ok())
+                .map_or_else(requests::server_id, str::to_owned);
+            return stamped(self.route(request, context).await, &id);
         }
-        self.tool_router
-            .call(ToolCallContext::new(self, request, context))
-            .await
+        let Some(given) = request
+            .arguments
+            .as_mut()
+            .and_then(|arguments| arguments.remove(REQUEST_ID))
+        else {
+            let id = requests::server_id();
+            context.extensions.insert(CallId(id.clone()));
+            return stamped(self.route(request, context).await, &id);
+        };
+        match requests::id_from(&given) {
+            Ok(id) => {
+                let arguments = request.arguments.take().unwrap_or_default();
+                self.run_named(&id, &tool, arguments, &context).await
+            }
+            Err(error) => Ok(error.reply(&requests::server_id(), self.ctx.config.carrier).into()),
+        }
     }
 
     fn list_tools(
@@ -494,37 +452,12 @@ impl ServerHandler for LeanHostService {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(ListToolsResult::with_all_items(self.tool_router.list_all())))
+        let tools = self.tool_router.list_all().into_iter().map(with_request_id).collect();
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.tool_router.get(name).cloned()
-    }
-
-    fn get_task(
-        &self,
-        request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
-        std::future::ready(self.tasks.get(&request.task_id).map(GetTaskResult::new))
-    }
-
-    fn update_task(
-        &self,
-        request: UpdateTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
-        // These tools never ask for in-task input. Unknown/already answered
-        // input keys are ignored, as required by the Tasks extension.
-        std::future::ready(self.tasks.get(&request.task_id).map(|_| ()))
-    }
-
-    fn cancel_task(
-        &self,
-        request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
-        std::future::ready(self.tasks.cancel(&request.task_id))
+        self.tool_router.get(name).cloned().map(with_request_id)
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -532,62 +465,76 @@ impl ServerHandler for LeanHostService {
         // syntax (even with `..default`) is forbidden across crates. Build
         // via Default + field mutation.
         let mut info = ServerConfig::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().enable_tasks().build();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
         let common = "MCP server hosting Lean 4 in supervised worker children via lean-rs. \
              Tools expose five semantic Lean job families: context, trial, verification, lookup, and status. \
              Context, trial, lookup, and status select a mode with `kind`; verification takes explicit target groups. \
              lean_build runs Lake under the project's write turn, so checks wait for it; lean_imports reads what Lake built.";
-        let execution = " Clients advertising io.modelcontextprotocol/tasks may receive task handles; results remain available for ten minutes \
-             after completion while this server process lives. Use lean_request to submit, retrieve or cancel retained requests \
-             without task negotiation.";
-        info.instructions = Some(format!("{common}{execution}"));
+        let requests = " Add request_id to a call to make it a named request: the server records it before it starts, \
+             runs it at most once and keeps its result, so a retry with the same id returns that result. \
+             lean_run starts a named request and replies at once; lean_get reads its row and result.";
+        info.instructions = Some(format!("{common}{requests}"));
         info
     }
 }
 
-impl LeanHostService {
-    async fn run_task(&self, call: TaskCall) -> Result<CallToolResult, McpError> {
-        let mut log = call.request_log();
-        // One deadline covers the wait for a project turn and the work after it.
-        // The box keeps this future small; the work's own future is large.
-        let timeout = Duration::from_millis(self.ctx.broker.request_timeout_millis());
-        let result = crate::cancellation::with_deadline(
-            timeout,
-            Box::pin(async {
-                match call {
-                    TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
-                    TaskCall::Trial(req) => tools::semantic::lean_trial(&self.ctx, req.into_inner()).await,
-                    TaskCall::Verify(req) => tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await,
-                    TaskCall::Lookup(req) => tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await,
-                    TaskCall::Status(req) => tools::semantic::lean_status(&self.ctx, req.into_inner()).await,
-                }
-            }),
-        )
-        .await;
-        log.finish(&result);
-        self.respond_semantic(result)
-    }
+/// The client's name and version from `initialize`, if it sent them.
+fn client_name(context: &RequestContext<RoleServer>) -> Option<String> {
+    context
+        .client_info()
+        .map(|info| format!("{} {}", info.name, info.version))
+}
 
-    fn respond_semantic(
-        &self,
-        result: crate::error::Result<tools::semantic::SemanticResponse<serde_json::Value>>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        let response = match result {
-            Ok(response) => response,
-            Err(ServerError::WorkerUnavailable(info)) => tools::semantic::from_worker_unavailable(&info),
-            Err(ServerError::IncompatibleWorker {
-                message,
-                recovery_command,
-            }) => tools::semantic::from_incompatible_worker(&message, &recovery_command),
-            Err(err) => return Err(McpError::from(err)),
-        };
-        Ok(carry_semantic(&response, self.ctx.config.carrier))
+/// `response` with request `id` at the top of its result or in its error data.
+fn stamped(response: Result<CallToolResponse, McpError>, id: &str) -> Result<CallToolResponse, McpError> {
+    match response {
+        Ok(mut response) => {
+            if let CallToolResponse::Complete(result) = &mut response {
+                requests::stamp_result(result, id);
+            }
+            Ok(response)
+        }
+        Err(mut error) => {
+            requests::stamp_error(&mut error, id);
+            Err(error)
+        }
     }
 }
 
-enum TaskCall {
+/// `tool` with the optional `request_id` argument in its input schema, unless
+/// it never runs as a request.
+fn with_request_id(mut tool: Tool) -> Tool {
+    if DIRECT_ONLY.contains(&tool.name.as_ref()) {
+        return tool;
+    }
+    let schema = Arc::make_mut(&mut tool.input_schema);
+    let properties = schema.entry("properties").or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(properties) = properties {
+        properties.insert(
+            REQUEST_ID.to_owned(),
+            json!({
+                "type": "string",
+                "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+                "description": "Run the call as this named request. The server records it before it starts and runs it at most once: a retry with the same id and arguments returns the stored result. Ids that start with srv- belong to the server.",
+            }),
+        );
+    }
+    tool
+}
+
+/// A parsed call of a tool that can run as a request.
+pub(crate) enum ToolCall {
+    /// One of the five semantic tools.
+    Semantic(SemanticCall),
+    Build(crate::build::BuildRequest),
+    Imports(tools::build::ImportsRequest),
+    Compatibility(CompatibilityRequest),
+}
+
+/// A call of one of the semantic tools.
+pub(crate) enum SemanticCall {
     Context(tools::semantic::LeanContextToolRequest),
     Trial(tools::semantic::LeanTrialToolRequest),
     Verify(tools::proof_action::LeanVerifyToolRequest),
@@ -595,57 +542,195 @@ enum TaskCall {
     Status(tools::semantic::LeanStatusToolRequest),
 }
 
-impl TaskCall {
+/// Why a tool call cannot run as a request.
+#[derive(Debug)]
+pub(crate) enum ToolCallError {
+    /// No tool has the name, or the tool does not run as a request.
+    UnknownTool(String),
+    /// The tool refuses the arguments.
+    InvalidArguments(String),
+}
+
+impl ToolCall {
+    /// Decode and check the arguments of `tool`.
+    ///
+    /// # Errors
+    /// Names a tool that is unknown or does not run as a request, or the fault
+    /// in the arguments.
+    pub(crate) fn parse(tool: &str, arguments: &Map<String, Value>) -> Result<Self, ToolCallError> {
+        let args = Value::Object(arguments.clone());
+        let parsed = match tool {
+            "lean_context" => serde_json::from_value(args).map(|req| Self::Semantic(SemanticCall::Context(req))),
+            "lean_trial" => serde_json::from_value(args).map(|req| Self::Semantic(SemanticCall::Trial(req))),
+            "lean_verify" => serde_json::from_value(args).map(|req| Self::Semantic(SemanticCall::Verify(req))),
+            "lean_lookup" => serde_json::from_value(args).map(|req| Self::Semantic(SemanticCall::Lookup(req))),
+            "lean_status" => serde_json::from_value(args).map(|req| Self::Semantic(SemanticCall::Status(req))),
+            "lean_build" => serde_json::from_value(args).map(Self::Build),
+            "lean_imports" => serde_json::from_value(args).map(Self::Imports),
+            "lean_compatibility" => serde_json::from_value(args).map(Self::Compatibility),
+            _ if DIRECT_ONLY.contains(&tool) => {
+                return Err(ToolCallError::UnknownTool(format!(
+                    "{tool} does not run as a request; call it directly"
+                )));
+            }
+            _ => return Err(ToolCallError::UnknownTool(format!("no tool is named {tool}"))),
+        };
+        let call = parsed
+            .map_err(|error| ToolCallError::InvalidArguments(format!("failed to deserialize parameters: {error}")))?;
+        call.check().map_err(ToolCallError::InvalidArguments)?;
+        Ok(call)
+    }
+
+    /// Refuse arguments that decode but that the tool never accepts.
+    fn check(&self) -> Result<(), String> {
+        match self {
+            Self::Compatibility(request) if request.project.trim().is_empty() => {
+                Err("explicit project required".to_owned())
+            }
+            Self::Imports(request)
+                if request.files.is_empty() || request.files.len() > tools::build::MAX_IMPORT_FILES =>
+            {
+                Err(format!("`files` needs 1 to {} files", tools::build::MAX_IMPORT_FILES))
+            }
+            Self::Semantic(_) | Self::Build(_) | Self::Imports(_) | Self::Compatibility(_) => Ok(()),
+        }
+    }
+
+    /// The `project` argument, if any.
+    pub(crate) fn project(&self) -> Option<String> {
+        match self {
+            Self::Semantic(call) => call.project(),
+            Self::Build(request) => request.project.clone(),
+            Self::Imports(request) => request.project.clone(),
+            Self::Compatibility(request) => Some(request.project.clone()),
+        }
+    }
+
+    /// Whether the call is one of the semantic tools, whose failures are
+    /// semantic responses.
+    pub(crate) const fn is_semantic(&self) -> bool {
+        matches!(self, Self::Semantic(_))
+    }
+
+    /// Run the call as request or call `id`, which names a build and its log.
+    ///
+    /// # Errors
+    /// Returns the tool's protocol error.
+    pub(crate) async fn execute(self, ctx: &ToolContext, id: &str) -> Result<CallToolResult, McpError> {
+        self.check()
+            .map_err(|message| McpError::invalid_params(message, None))?;
+        let carrier = ctx.config.carrier;
+        // One deadline covers the wait for a project turn and the work after it.
+        let timeout = Duration::from_millis(ctx.broker.request_timeout_millis());
+        match self {
+            Self::Semantic(call) => {
+                let mut log = call.request_log();
+                // The box keeps this future small; the work's own future is large.
+                let result = with_deadline(timeout, Box::pin(call.run(ctx))).await;
+                log.finish(&result);
+                respond_semantic(result, carrier)
+            }
+            Self::Build(request) => {
+                let outcome = tools::build::lean_build_as(ctx, request, id).await?;
+                let mut result = carry(&outcome, carrier);
+                result.is_error = Some(!outcome.ok);
+                Ok(result)
+            }
+            Self::Imports(request) => match with_deadline(timeout, tools::build::lean_imports(ctx, request)).await {
+                Ok(reply) => Ok(carry(&reply, carrier)),
+                Err(tools::build::ImportsError::File(failure)) => {
+                    let mut result = carry(&failure, carrier);
+                    result.is_error = Some(true);
+                    Ok(result)
+                }
+                Err(tools::build::ImportsError::Call(error)) => Err(error),
+            },
+            Self::Compatibility(request) => {
+                let hint = ProjectHint::Explicit(PathBuf::from(request.project));
+                if matches!(request.mode, CompatibilityMode::PureV1) {
+                    let result = ctx
+                        .broker
+                        .describe_native_compatibility(&hint)
+                        .map_err(McpError::from)?;
+                    return Ok(carry(&result, carrier));
+                }
+                let result = ctx.broker.native_compatibility(hint).await.map_err(McpError::from)?;
+                Ok(carry(&result, carrier))
+            }
+        }
+    }
+}
+
+impl SemanticCall {
+    fn project(&self) -> Option<String> {
+        let value = match self {
+            Self::Context(req) => req.0.args.get("project"),
+            Self::Trial(req) => req.0.args.get("project"),
+            Self::Lookup(req) => req.0.args.get("project"),
+            Self::Status(req) => req.0.args.get("project"),
+            Self::Verify(req) => req.as_value().get("project"),
+        };
+        value.and_then(Value::as_str).map(str::to_owned)
+    }
+
     fn request_log(&self) -> RequestLog {
         match self {
-            Self::Context(req) => Self::semantic_log("lean_context", &req.0),
-            Self::Trial(req) => Self::semantic_log("lean_trial", &req.0),
-            Self::Lookup(req) => Self::semantic_log("lean_lookup", &req.0),
-            Self::Status(req) => Self::semantic_log("lean_status", &req.0),
+            Self::Context(req) => semantic_log("lean_context", &req.0),
+            Self::Trial(req) => semantic_log("lean_trial", &req.0),
+            Self::Lookup(req) => semantic_log("lean_lookup", &req.0),
+            Self::Status(req) => semantic_log("lean_status", &req.0),
             Self::Verify(req) => RequestLog::new(
                 "lean_verify",
                 None,
-                req.as_value().get("project").and_then(serde_json::Value::as_str),
+                req.as_value().get("project").and_then(Value::as_str),
             ),
         }
     }
 
-    fn semantic_log(tool: &'static str, req: &tools::semantic::SemanticToolRequest) -> RequestLog {
-        RequestLog::new(
-            tool,
-            req.kind.as_deref(),
-            req.args.get("project").and_then(serde_json::Value::as_str),
-        )
+    async fn run(self, ctx: &ToolContext) -> crate::error::Result<tools::semantic::SemanticResponse<Value>> {
+        match self {
+            Self::Context(req) => tools::semantic::lean_context(ctx, req.into_inner()).await,
+            Self::Trial(req) => tools::semantic::lean_trial(ctx, req.into_inner()).await,
+            Self::Verify(req) => tools::semantic::lean_verify_raw(ctx, req.into_inner()).await,
+            Self::Lookup(req) => tools::semantic::lean_lookup(ctx, req.into_inner()).await,
+            Self::Status(req) => tools::semantic::lean_status(ctx, req.into_inner()).await,
+        }
     }
+}
 
-    fn is_cheap_metadata(&self) -> bool {
-        matches!(self, Self::Status(req) if tools::request_aliases::canonical_kind(
-            "lean_status",
-            req.0.kind.as_deref().map(str::trim).filter(|kind| !kind.is_empty()).unwrap_or("project"),
-        ) == "project")
-    }
+fn semantic_log(tool: &'static str, req: &tools::semantic::SemanticToolRequest) -> RequestLog {
+    RequestLog::new(
+        tool,
+        req.kind.as_deref(),
+        req.args.get("project").and_then(Value::as_str),
+    )
+}
 
-    fn parse(request: &CallToolRequestParams) -> Result<Self, McpError> {
-        let args = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
-        let result = match request.name.as_ref() {
-            "lean_context" => serde_json::from_value(args).map(Self::Context),
-            "lean_trial" => serde_json::from_value(args).map(Self::Trial),
-            "lean_verify" => serde_json::from_value(args).map(Self::Verify),
-            "lean_lookup" => serde_json::from_value(args).map(Self::Lookup),
-            "lean_status" => serde_json::from_value(args).map(Self::Status),
-            _ => return Err(McpError::invalid_params("tool not found", None)),
-        };
-        result.map_err(|error| McpError::invalid_params(error.to_string(), None))
-    }
+/// A semantic tool's result, or its failure as a semantic response when the
+/// worker is unavailable or incompatible.
+///
+/// # Errors
+/// Returns the protocol error of any other failure.
+pub(crate) fn respond_semantic(
+    result: crate::error::Result<tools::semantic::SemanticResponse<Value>>,
+    carrier: ResponseCarrier,
+) -> Result<CallToolResult, McpError> {
+    let response = match result {
+        Ok(response) => response,
+        Err(ServerError::WorkerUnavailable(info)) => tools::semantic::from_worker_unavailable(&info),
+        Err(ServerError::IncompatibleWorker {
+            message,
+            recovery_command,
+        }) => tools::semantic::from_incompatible_worker(&message, &recovery_command),
+        Err(err) => return Err(McpError::from(err)),
+    };
+    Ok(carry_semantic(&response, carrier))
 }
 
 /// Invocation/runtime failures remain structured tool results, with the MCP
 /// error flag set. Negative Lean proof/check verdicts still carry domain data
 /// and are successful tool executions, not protocol or invocation failures.
-fn carry_semantic(
-    response: &tools::semantic::SemanticResponse<serde_json::Value>,
-    carrier: ResponseCarrier,
-) -> CallToolResult {
+fn carry_semantic(response: &tools::semantic::SemanticResponse<Value>, carrier: ResponseCarrier) -> CallToolResult {
     let mut result = carry(response, carrier);
     if response.data.is_none()
         && response
@@ -662,7 +747,7 @@ fn carry_semantic(
 /// `Text` emits one `content` text block (the model's read surface), `Both`
 /// also mirrors it into `structuredContent` for code-mode clients, and
 /// `Structured` emits only `structuredContent`.
-fn carry<T>(response: &T, carrier: ResponseCarrier) -> CallToolResult
+pub(crate) fn carry<T>(response: &T, carrier: ResponseCarrier) -> CallToolResult
 where
     T: serde::Serialize + schemars::JsonSchema,
 {
@@ -689,192 +774,6 @@ mod tests {
     use super::*;
     use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
     use crate::error::{ServerError, WorkerUnavailable};
-    use rmcp::ServiceExt;
-    use rmcp::model::{ClientCapabilities, NumberOrString, TaskPayload, TaskStatus};
-    use tokio::io::AsyncWriteExt;
-
-    #[tokio::test]
-    async fn retained_duplicate_submissions_and_polls_log_only_actual_execution() {
-        let (_guard, buffer) = crate::request_log::tests::capture();
-        let dir = tempfile::tempdir().unwrap();
-        let service = LeanHostService::new(
-            ProjectBroker::new(crate::broker::BrokerConfig {
-                env_default: Some(dir.path().to_path_buf()),
-                cwd: dir.path().to_path_buf(),
-                max_projects: crate::broker::BrokerConfig::default_max_projects(),
-                max_workers_per_project: std::num::NonZeroUsize::MIN,
-                idle_timeout: Duration::ZERO,
-            }),
-            ToolConfig::default(),
-        );
-        let prepare = RetainedRequest {
-            action: RetainedAction::Prepare,
-            request_epoch: None,
-            submission_sha256: None,
-            request_id: None,
-            tool: Some("lean_trial".to_owned()),
-            arguments: Some(
-                serde_json::from_value(serde_json::json!({"kind":"SECRET_KIND","commands":"SECRET_PROOF"})).unwrap(),
-            ),
-        };
-        let prepared = service.lean_request(Parameters(prepare)).await.unwrap();
-        let prepared: serde_json::Value =
-            serde_json::from_str(&prepared.content.first().unwrap().as_text().unwrap().text).unwrap();
-        let request_id = prepared
-            .get("taskId")
-            .and_then(serde_json::Value::as_str)
-            .unwrap()
-            .to_owned();
-        let epoch = prepared
-            .get("request")
-            .and_then(|binding| binding.get("request_epoch"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap()
-            .to_owned();
-        assert_eq!(buffer.text().matches("Lean request received").count(), 0);
-        let submit = || RetainedRequest {
-            action: RetainedAction::Submit,
-            request_epoch: Some(epoch.clone()),
-            submission_sha256: None,
-            request_id: Some(request_id.clone()),
-            tool: Some("lean_trial".to_owned()),
-            arguments: Some(
-                serde_json::from_value(serde_json::json!({"kind":"SECRET_KIND","commands":"SECRET_PROOF"})).unwrap(),
-            ),
-        };
-        service.lean_request(Parameters(submit())).await.unwrap();
-        service.lean_request(Parameters(submit())).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !service.tasks.get(&request_id).unwrap().status().is_terminal() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        for _ in 0..3 {
-            service
-                .lean_request(Parameters(RetainedRequest {
-                    action: RetainedAction::Get,
-                    request_epoch: Some(epoch.clone()),
-                    submission_sha256: None,
-                    request_id: Some(request_id.clone()),
-                    tool: None,
-                    arguments: None,
-                }))
-                .await
-                .unwrap();
-        }
-        service
-            .lean_runtime(Parameters(RuntimeControlRequest::default()))
-            .await
-            .unwrap();
-        let output = buffer.text();
-        assert_eq!(output.matches("Lean request received").count(), 1);
-        assert_eq!(output.matches("Lean response ready").count(), 1);
-        assert!(output.contains(r#"kind="invalid""#));
-        assert!(output.contains(r#"outcome="tool_error""#));
-        assert!(!output.contains("SECRET"));
-    }
-
-    #[tokio::test]
-    async fn task_negotiation_preserves_sync_payload_and_service_clone_results() {
-        let (_guard, buffer) = crate::request_log::tests::capture();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("lakefile.lean"), "package status\nlean_lib Status\n").unwrap();
-        std::fs::write(dir.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-        std::fs::write(dir.path().join("lake-manifest.json"), "{}\n").unwrap();
-        let broker = ProjectBroker::new(crate::broker::BrokerConfig {
-            env_default: Some(dir.path().to_path_buf()),
-            cwd: dir.path().to_path_buf(),
-            max_projects: crate::broker::BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
-            idle_timeout: Duration::ZERO,
-        });
-        let service = LeanHostService::new(broker, ToolConfig::default());
-        // Establish an in-memory legacy peer without enabling rmcp's client
-        // feature, opening a socket, or starting a Lean worker.
-        let (server_io, mut client_io) = tokio::io::duplex(65_536);
-        client_io.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.unwrap();
-        let running = service.clone().serve(server_io).await.unwrap();
-        let context = RequestContext::new(NumberOrString::Number(2), running.peer().clone());
-        let request = CallToolRequestParams::new("lean_verify")
-            .with_arguments(serde_json::from_value(serde_json::json!({"targets": []})).unwrap());
-        let synchronous = service.call_tool(request.clone(), context.clone()).await.unwrap();
-        let CallToolResponse::Complete(synchronous) = synchronous else {
-            unreachable!("legacy client must receive a synchronous result")
-        };
-        let mut task_context = context.clone();
-        task_context
-            .meta
-            .set_client_capabilities(ClientCapabilities::builder().enable_tasks().build());
-        let malformed = CallToolRequestParams::new("lean_context")
-            .with_arguments(serde_json::from_value(serde_json::json!({"kind": 7})).unwrap());
-        let sync_error = service.call_tool(malformed.clone(), context.clone()).await.unwrap();
-        let task_error = service.call_tool(malformed, task_context.clone()).await.unwrap();
-        let (CallToolResponse::Complete(sync_error), CallToolResponse::Complete(task_error)) = (sync_error, task_error)
-        else {
-            unreachable!("invalid arguments must be rejected before task acceptance")
-        };
-        assert_eq!(sync_error.is_error, Some(true));
-        assert_eq!(
-            serde_json::to_value(sync_error).unwrap(),
-            serde_json::to_value(task_error).unwrap()
-        );
-        let accepted = service.call_tool(request, task_context).await.unwrap();
-        let CallToolResponse::Task(accepted) = accepted else {
-            unreachable!("negotiated client should receive a task handle")
-        };
-        let clone = service.clone();
-        let task_id = accepted.task.task_id;
-        assert!(
-            clone
-                .get_task(GetTaskParams::new(&task_id), context.clone())
-                .await
-                .is_ok()
-        );
-        drop(service);
-        let final_task = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let task = clone
-                    .get_task(GetTaskParams::new(&task_id), context.clone())
-                    .await
-                    .unwrap()
-                    .task;
-                if task.status().is_terminal() {
-                    break task;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(final_task.status(), TaskStatus::Completed);
-        let TaskPayload::Completed { result } = final_task.payload else {
-            unreachable!("task result must be retained")
-        };
-        assert_eq!(
-            serde_json::Value::Object(result),
-            serde_json::to_value(synchronous).unwrap()
-        );
-        clone
-            .cancel_task(CancelTaskParams::new(&task_id), context.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            clone
-                .get_task(GetTaskParams::new(&task_id), context)
-                .await
-                .unwrap()
-                .task
-                .status(),
-            TaskStatus::Completed
-        );
-        let output = buffer.text();
-        assert_eq!(output.matches("Lean request received").count(), 2);
-        assert_eq!(output.matches("Lean response ready").count(), 2);
-        running.cancel().await.unwrap();
-        drop(client_io);
-    }
 
     #[test]
     fn worker_unavailable_is_a_structured_tool_response() {

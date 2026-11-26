@@ -39,6 +39,7 @@ crates/lean-host-mcp/src/
   lake_meta.rs           minimal Lake-project metadata
   cache.rs               bounded module-query cache, valid while the worker that computed an entry lives
   envelope.rs            internal operation envelope adapted to { data, errors, trust } at the public boundary
+  requests/              named requests: the SQLite request table, one launch per id, recovery at start
   store.rs               the server store: one-server lock, build logs
   config_file.rs         the tracked and local config files at the Lake root
 
@@ -57,10 +58,9 @@ HTTP sessions share the broker's worker caps, queues, and lifecycle state. Stdio
 HTTP.
 
 The SDK handles stateless discovery and per-request capability/version metadata for MCP 2026-07-28, with
-initialize/session support for legacy clients. Both paths use the same service and retained-request registry. HTTP
-rejects every present `Origin` with 403 and validates loopback Host headers. See
-[client setup](../README.md#connecting-an-mcp-client) for transport selection and [operations](operations.md) for
-runtime failure handling.
+initialize/session support for legacy clients. Both paths use the same service and request table. HTTP rejects every
+present `Origin` with 403 and validates loopback Host headers. See [client setup](../README.md#connecting-an-mcp-client)
+for transport selection and [operations](operations.md) for runtime failure handling.
 
 Runtime pressure remains in the semantic `errors` channel. Transport/protocol failures use HTTP or MCP errors. The
 semantic facade projects internal `Response<T>` envelopes into `{ data, errors, trust }`; operational tools have their
@@ -390,12 +390,19 @@ worker's cleanup reply. Dropping the caller future also signals cancellation; ac
 completion. Neither cancellation nor expiry counts as a successful proof check.
 
 Before source-backed actor calls, the broker keeps metadata/options preparation and project admission within one private
-boundary. Only typed `project_admission_timeout` or `request_cancelled` errors returned from that boundary record a
-named `execution.target_check` with stage `project_admission` on retained requests. The actor operation was not
-dispatched; preparation or earlier internal checks may still have effects or uncertain cleanup. Aggregate lifetime
-classification continues to use its existing operation evidence. A post-admission error cannot acquire this receipt, and
-no stored historical result is reclassified. Native-reader ACK precedes its read-admission/payload boundary, so a lost
-post-ACK result still cannot infer payload non-dispatch from a null start field or missing domains.
+boundary. A typed `project_admission_timeout` or `request_cancelled` error from that boundary means the actor operation
+was not dispatched; preparation or earlier internal checks may still have effects or uncertain cleanup. Native-reader
+ACK precedes its read-admission/payload boundary, so a lost post-ACK result still cannot infer payload non-dispatch from
+a null start field or missing domains.
+
+A named request (`requests/`) runs through the same tools. `RequestRunner::run` checks the id and arguments, plans the
+root, kind and deadline, then inserts the row in a `BEGIN IMMEDIATE` transaction that returns the stored row when the id
+exists, so of two parallel calls with one id only one inserts and starts. A check takes its read turn, then commits
+`mark_running`, then calls the tool. A build commits it in its `OnRunning` hook, which runs once the build holds the
+write turn and the writer lock and before its first step. Nothing starts before its row says `running`, and a row in a
+final state never changes: a trigger refuses the update. A check that fails at its deadline waits until the supervisor
+sees its worker request stop before its row says `timed_out`. A dropped connection ends only a client's wait; a call
+without an id keeps the old rule and is cancelled when its connection drops.
 
 ## Turns and builds
 
@@ -432,11 +439,11 @@ that checks the code. "None yet" marks a gap.
 | Within one server, turns go in arrival order. | `project_lock/tests.rs`: `builds_and_checks_take_turns_in_arrival_order` |
 | No check loads imports while a build runs. | `project_lock/tests.rs`: `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`; across processes, none yet |
 | No build starts between a check's `setup-file` and its use of the imports. | `project_lock/tests.rs`: `a_nested_read_reuses_the_turn_while_a_writer_waits` |
-| One writer at a time, across processes and server restarts. | SDK `lean-toolchain/src/writer_lock/tests.rs`; a server killed during a build and restarted, none yet |
+| One writer at a time, across processes and server restarts. | SDK `lean-toolchain/src/writer_lock/tests.rs`; `tests/requests.rs`: `a_killed_server_interrupts_its_build_and_runs_the_queued_one`; `tests/many_clients.rs`: `many_clients_share_one_project` |
 | No lock release while a process of the build may live. | SDK `writer_lock/tests.rs`: `inherited_same_description_loan_retains_exclusion_until_owned_child_exit` |
 | No worker slot returns while its worker may live. | None yet; SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` tests reaping and slot counts nearby |
 | A wait for a turn ends at its deadline. | `project_lock/tests.rs`: `a_read_wait_ends_at_its_deadline_or_on_cancel`, `a_write_wait_ends_at_its_deadline_or_on_cancel_and_leaves_the_line` |
-| One launch per request ID; a record before launch; the same ID with other arguments refused; a stored result never changes; a restart ends every recorded request. | None yet: these come with the request table |
+| One launch per request ID; a record before launch; the same ID with other arguments refused; a stored result never changes; a restart ends every recorded request; a call without an ID runs with a server ID and no record; checks on one project hold their read turns at once. | `requests/store_tests.rs`: `parallel_inserts_of_one_id_insert_once`, `one_id_holds_one_call`, `a_final_row_never_changes`; `tests/requests.rs`: `a_named_request_runs_once_and_keeps_its_result`, `the_same_build_sent_three_times_at_once_starts_one_lake`, `another_call_on_an_id_fails_and_makes_no_row`, `a_build_outlives_its_killed_client`, `a_killed_server_interrupts_its_build_and_runs_the_queued_one`, `an_ended_request_survives_a_server_kill`, `a_direct_verify_names_a_server_id`, `checks_on_one_project_run_at_once`; `tests/many_clients.rs`: `many_clients_share_one_project`; `tests/http_transport.rs`: `install_and_serve_keep_no_state_in_an_empty_home` |
 
 ## Native ownership and artifact custody
 
@@ -494,8 +501,9 @@ unions use the same canonical lock-path order.
 A timeout or cancelled caller returns no proof result. A confirmed request-bound child exit remains available through
 replacement failure and late reaping. Capacity is released only when the actor is sealed and its actual process scopes
 close. If wait authority is lost but group absence is confirmed, resource capacity and retained observation can recover
-without inventing an exit status or changing the unknown proof outcome. Retained request identities cannot silently
-redispatch after expiry, restart, lost replies, or full retention; safe storage exhaustion returns backpressure.
+without inventing an exit status or changing the unknown proof outcome. A named request never runs twice: a retry or a
+lost reply returns its stored row, and a restart ends a row that said `running` without starting it again. A store
+failure refuses new rows with a retryable error.
 
 Server death is observed by the guardian through the private channel and exact parent identity. If the guardian dies
 while the parent survives, the parent retains its actual unreaped child and uses the same owned-group termination

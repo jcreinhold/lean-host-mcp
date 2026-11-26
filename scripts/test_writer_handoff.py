@@ -29,10 +29,13 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 from pathlib import Path
 
 LIMIT = 20.0
 CAPACITY = 4
+# The request states after which a row never changes.
+ENDED = ("done", "timed_out", "interrupted")
 PROOF = "example (n : Nat) : n + 0 = n := Nat.add_zero n"
 HEADER_DIGEST = "eb951e1171d39b828e7ad60aed0b90759598b678bfe58cf85c65a1559c021bf9"
 # The warning ends with the server's own install command for the project:
@@ -560,8 +563,6 @@ class Harness:
                 str(self.a),
                 "--bind",
                 f"127.0.0.1:{self.port}",
-                "--request-journal",
-                str(self.root / "journal"),
             ],
             cwd=self.root,
             env=self.env,
@@ -632,6 +633,10 @@ class Harness:
 
     def status(self):
         return self.client.tool("lean_runtime", {"action": "status"})
+
+    def request(self, request_id):
+        """The row of request `request_id`, read without a wait."""
+        return self.client.tool("lean_get", {"request_id": request_id})["request"]
 
     def concurrent_readers(self):
         barrier = threading.Barrier(3)
@@ -773,39 +778,22 @@ class Harness:
             + json.dumps(str(matching_marker))
             + ' "started"',
         }
-        prepared = self.client.tool(
-            "lean_request",
-            {
-                "action": "prepare",
-                "tool": "lean_trial",
-                "arguments": matching_arguments,
-            },
-        )
-        require(
-            prepared["execution"] == {"disposition": "pending", "reason": "prepared"},
-            prepared,
-        )
-        request_id, binding = prepared["taskId"], prepared["request"]
-        identity = {"request_id": request_id, "request_epoch": binding["request_epoch"]}
+        request_id = "matching-" + uuid.uuid4().hex
         self.evidence.update(
-            matching_retained_request={
-                "id": request_id,
-                "binding": binding,
-                "single_submission_intent": True,
-            }
+            matching_request={"id": request_id, "single_submission_intent": True}
         )
-        self.client.tool(
-            "lean_request",
+        started = self.client.tool(
+            "lean_run",
             {
-                "action": "submit",
-                **identity,
+                "request_id": request_id,
                 "tool": "lean_trial",
                 "arguments": matching_arguments,
             },
         )
-        working = self.client.tool("lean_request", {"action": "get", **identity})
+        require(started["request"]["state"] not in ENDED, started)
         require(
-            working["status"] == "working" and working["request"] == binding, working
+            self.request(request_id)["state"] not in ENDED,
+            "the matching request ended before the writer",
         )
         require(
             not matching_marker.exists(),
@@ -819,9 +807,9 @@ class Harness:
             not active.done() and not finished_marker.exists(),
             "controlled active call did not wait for release",
         )
-        working = self.client.tool("lean_request", {"action": "get", **identity})
+        waiting = self.request(request_id)
         require(
-            working["status"] == "working" and not matching_marker.exists(), working
+            waiting["state"] not in ENDED and not matching_marker.exists(), waiting
         )
         active_release.write_text("release")
         writer.locked()
@@ -830,45 +818,36 @@ class Harness:
             active.result(timeout=LIMIT) == after_a,
             "active call did not retain its original generation",
         )
-        working = self.client.tool("lean_request", {"action": "get", **identity})
         require(
-            working["status"] == "working" and not matching_marker.exists(),
+            self.request(request_id)["state"] not in ENDED
+            and not matching_marker.exists(),
             "matching body ran beneath writer EX",
         )
         writer.marker(self.a / "active-writer.marker")
         writer.close()
         deadline = time.monotonic() + LIMIT
         while True:
-            result = self.client.tool("lean_request", {"action": "get", **identity})
-            require(
-                result["taskId"] == request_id and result["request"] == binding, result
+            result = self.client.tool(
+                "lean_get", {"request_id": request_id, "wait_seconds": 1}
             )
-            if result["status"] != "working":
+            require(result["request"]["request_id"] == request_id, result)
+            if result["request"]["state"] in ENDED:
                 break
             require(
                 time.monotonic() < deadline,
-                "retrieve original retained ticket; do not submit again",
+                "read the original request; do not start it again",
             )
-            time.sleep(0.05)
-        require(result["status"] == "completed" and result["result_available"], result)
-        require(result["execution"]["disposition"] != "unknown", result)
+        require(
+            result["request"]["state"] == "done" and result["result"] is not None,
+            result,
+        )
         payload = unwrap(result["result"])
         successor = trial_receipt(payload, self.a)
         require(
             matching_marker.exists() and successor and successor != after_a,
             "successor did not run after actual closure",
         )
-        # The complete terminal result is already saved before the sole own ACK.
-        acknowledged = self.client.tool(
-            "lean_request",
-            {
-                "action": "acknowledge",
-                **identity,
-                "submission_sha256": binding["submission_sha256"],
-            },
-        )
-        require(acknowledged["acknowledged"], acknowledged)
-        self.evidence.update_item("matching_retained_request", acknowledged=True)
+        self.evidence.update_item("matching_request", ended=True)
         self.evidence.case(
             "active call finishes; server-accepted matching request waits; unrelated proof continues; successor runs"
         )
@@ -901,7 +880,7 @@ class Harness:
 
         runtime = self.status()
         require(
-            runtime["request_registry"]["active"] == 0
+            runtime["requests"] == {"queued": 0, "running": 0}
             and runtime["pool"]["outstanding_jobs"] == 0,
             runtime,
         )
@@ -925,39 +904,29 @@ class Harness:
             ) as error:
                 errors.append(repr(error))
         _, pending = concurrent.futures.wait(self.futures, timeout=45)
-        retained_pending = False
-        retained = self.evidence.item("matching_retained_request")
+        request_pending = False
+        named = self.evidence.item("matching_request")
         if (
             not pending
-            and retained
-            and not retained.get("acknowledged")
+            and named
+            and not named.get("ended")
             and self.server
             and self.server.poll() is None
         ):
-            # Retrieving an already issued ticket is safe after a lost response.
-            # No resubmit, result acceptance or unverified acknowledgement here.
-            identity = {
-                "request_id": retained["id"],
-                "request_epoch": retained["binding"]["request_epoch"],
-            }
+            # Reading a started request is safe after a lost reply. Never
+            # start it again here.
             deadline = time.monotonic() + 35
             try:
                 while True:
-                    terminal = self.client.tool(
-                        "lean_request", {"action": "get", **identity}
+                    observed = self.client.tool(
+                        "lean_get", {"request_id": named["id"], "wait_seconds": 1}
                     )
-                    self.evidence.update(cleanup_retained_observation=terminal)
-                    if terminal["status"] != "working":
-                        if (
-                            terminal.get("execution", {}).get("disposition")
-                            == "unknown"
-                        ):
-                            retained_pending = True
+                    self.evidence.update(cleanup_request_observation=observed)
+                    if observed["request"]["state"] in ENDED:
                         break
                     if time.monotonic() >= deadline:
-                        retained_pending = True
+                        request_pending = True
                         break
-                    time.sleep(0.1)
             except (
                 AssertionError,
                 AttributeError,
@@ -968,15 +937,15 @@ class Harness:
                 TypeError,
                 ValueError,
             ) as error:
-                retained_pending = True
-                errors.append("retained cleanup observation: " + repr(error))
-        if pending or retained_pending:
+                request_pending = True
+                errors.append("request cleanup observation: " + repr(error))
+        if pending or request_pending:
             errors.append(
                 "private calls remain unresolved; server kept alive, no resubmission or forced signal"
             )
         if (
             not pending
-            and not retained_pending
+            and not request_pending
             and self.server is not None
             and self.server.poll() is None
         ):

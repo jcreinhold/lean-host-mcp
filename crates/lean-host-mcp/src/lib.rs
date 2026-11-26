@@ -20,6 +20,7 @@
 //!   project that the private project runtime consumes.
 //! - [`error`]: `ServerError`, the one error type tool handlers return.
 //! - [`tools`]: tool implementations, grouped by proof workflow stage.
+//! - [`requests`]: the request table, which runs each named request once.
 //! - [`server`]: rmcp glue.
 
 mod artifact_reads;
@@ -42,8 +43,8 @@ mod native_socket;
 mod project;
 mod project_lock;
 pub mod projections;
-mod request_journal;
 mod request_log;
+pub mod requests;
 pub mod runtime_compatibility;
 mod semantic_search;
 pub mod server;
@@ -51,7 +52,6 @@ pub mod shared_writer;
 mod smoke;
 pub mod status;
 pub mod store;
-mod tasks;
 pub mod toolchain;
 pub mod tools;
 pub mod trust;

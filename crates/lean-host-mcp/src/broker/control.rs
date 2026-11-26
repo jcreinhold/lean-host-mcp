@@ -90,9 +90,10 @@ pub struct RuntimeControlResult {
     pub effective_settings: crate::status::EffectiveSettings,
     /// Negotiated extensions; absence on older servers means unsupported.
     pub capabilities: Vec<String>,
-    /// Filled by the service that owns the retained-request registry.
+    /// Queued and running rows of the request table. Filled by a service that
+    /// has the table.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_registry: Option<crate::status::RequestRegistryStatus>,
+    pub requests: Option<crate::requests::RequestCounts>,
     /// Result of the requested coordination action.
     pub status: RuntimeControlStatus,
     /// Explanation for a refused or invalid operation.
@@ -335,7 +336,7 @@ impl ProjectBroker {
         }
     }
 
-    /// Identity shared by status and immutable retained-request bindings.
+    /// This server's identity, as status, compatibility and file receipts name it.
     #[must_use]
     pub fn instance_id(&self) -> String {
         self.inner.lock().control.instance_id.clone()
@@ -464,8 +465,8 @@ impl ProjectBroker {
                 runtime: crate::status::RuntimeSettings::from(&self.runtime_config),
                 server: None,
             },
-            capabilities: vec!["retained_request_binding_v1".to_owned(), "draining_lease_v1".to_owned()],
-            request_registry: None,
+            capabilities: vec!["draining_lease_v1".to_owned()],
+            requests: None,
             status: result,
             detail,
             lease_id: token,

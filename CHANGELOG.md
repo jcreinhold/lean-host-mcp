@@ -27,6 +27,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the server and `install-worker --lake-root` find the Lean toolchain there. Lake, Cargo and helper children get
   `ELAN_HOME` set.
 - `doctor processes --lake-root PROJECT` lists that project's servers from the records in its store.
+- Named requests. A tool called with `request_id` gets a row in `store/requests.sqlite3` before it starts, runs at most
+  once and keeps its result: the same id and arguments return that result, from any client and after a restart, and
+  other arguments fail with `request_id_conflict`. A dropped connection ends only the client's wait. `lean_run` starts a
+  named request and replies at once; `lean_get` returns its row and, once it has ended, its result. A build's row says
+  `running` only once it holds the write turn and the writer lock, and a check's once it holds its read turn. At start
+  the server ends the rows an earlier server left: `running` rows become `interrupted` and never run again, and `queued`
+  rows run. A call without an id gets a `srv-` id in its reply. `rusqlite`, with SQLite built in, is a dependency again.
+- Config table `[requests]` (`retention_hours`, `max_rows`, `wait_max_secs`) and the key `recipes.<name>.timeout_secs`.
+  `lean_runtime` reports `requests: {queued, running}` and the capability `durable_requests_v1`.
 
 ### Changed
 
@@ -67,6 +76,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove the owner directory's fallback to the platform's local data directory and the semantic cache's fallback to the
   user cache directory. Without a store, native work and `doctor writer-rollback` need
   `LEAN_RS_WORKER_OWNERS_DIRECTORY`, and semantic tools need `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`.
+- Remove MCP Tasks; the `lean_request` tool with its tickets, cancel and acknowledge; the request journal with
+  `--request-journal` and `LEAN_HOST_MCP_REQUEST_JOURNAL`; `request_registry` in `lean_runtime`; and the capabilities
+  `retained_request_lifecycle_v3` and `retained_request_binding_v1`. Named requests replace them and have no cancel.
 
 ### Fixed
 

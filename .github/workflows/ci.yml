@@ -65,7 +65,7 @@ jobs:
         run: cargo build --locked -p lean-host-mcp --all-targets
       - name: test (worker)
         run: cargo test --locked -p lean-host-mcp-worker --all-targets
-      - name: Installed package proof and semantic search
+      - name: Installed package and semantic search
         run: scripts/test-installed-module-setup.sh
       - name: test (parent)
         run: scripts/test-installed-stdio.sh --all-targets

@@ -209,7 +209,7 @@ impl ExpectedContract {
             schema: SCHEMA.into(),
             native_api: "shared-native-checks-v1".into(),
             capabilities: vec![
-                "retained_request_lifecycle_v3".into(),
+                "durable_requests_v1".into(),
                 "generation_bound_worker_stop_v1".into(),
                 "capacity_until_reaped_v1".into(),
                 "worker_owned_shared_artifact_reads_v1".into(),
@@ -541,7 +541,7 @@ mod tests {
     fn digest_matches_the_python_client_fixed_tuple_encoding() -> Result<(), String> {
         assert_eq!(
             contract()?.digest().map_err(|error| error.to_string())?,
-            "ba1ea759ffda92968c02756ff178e1445a9dd814a9b33f21ba6f6b6193ea3b0c"
+            "37c16087fce0de8a2f9795b89e2af9b289f7e224110b6cf30c33200731cf17f6"
         );
         Ok(())
     }

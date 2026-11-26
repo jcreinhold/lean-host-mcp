@@ -11,7 +11,7 @@ use super::ToolContext;
 use super::source_input::{read_query_file, source_path_for_module};
 use crate::broker::ProjectHint;
 use crate::build::config::BuildConfig;
-use crate::build::{BuildOutcome, BuildRequest, log_path, new_id, plan, run_build};
+use crate::build::{BuildOutcome, BuildPlan, BuildRequest, OnRunning, log_path, new_id, plan, run_build};
 use crate::error::ServerError;
 
 /// The most files one `lean_imports` call reads.
@@ -25,19 +25,63 @@ pub const MAX_IMPORT_FILES: usize = 16;
 /// config, and the broker's error when the build gets no turn, its writer
 /// does not open, or the request is cancelled.
 pub async fn lean_build(ctx: &ToolContext, request: BuildRequest) -> Result<BuildOutcome, McpError> {
+    lean_build_as(ctx, request, &new_id()).await
+}
+
+/// [`lean_build`] as build `id`, which names the build in its log and the
+/// log's file.
+///
+/// # Errors
+/// As [`lean_build`].
+pub(crate) async fn lean_build_as(
+    ctx: &ToolContext,
+    request: BuildRequest,
+    id: &str,
+) -> Result<BuildOutcome, McpError> {
+    let build = plan_build(ctx, &request)?;
+    let store = crate::store::store_dir(&build.root, None);
+    crate::store::create_store_dir(&store, &build.root).map_err(ServerError::Io)?;
+    let log = log_path(&store, id).map_err(ServerError::Io)?;
+    run_planned(ctx, build, id, &log, None).await
+}
+
+/// A build checked against its project's config.
+pub(crate) struct PlannedBuild {
+    /// The canonical Lake root.
+    pub(crate) root: PathBuf,
+    pub(crate) plan: BuildPlan,
+}
+
+/// Check the build `request` asks for against its project and config.
+///
+/// # Errors
+/// Returns invalid params when the request does not fit the project's config,
+/// and the broker's error when the project is not this server's.
+pub(crate) fn plan_build(ctx: &ToolContext, request: &BuildRequest) -> Result<PlannedBuild, McpError> {
     let root = ctx
         .broker
         .native_root(&ProjectHint::from_request(request.project.clone()))?;
     let config = BuildConfig::load(&root).map_err(|errors| ServerError::BadProject(errors.join("; ")))?;
-    let mut planned = plan(&config, &request).map_err(|problem| McpError::invalid_params(problem, None))?;
+    let mut planned = plan(&config, request).map_err(|problem| McpError::invalid_params(problem, None))?;
     planned.cap_tail(ctx.config.output.max_field_bytes);
-    let id = new_id();
-    let store = crate::store::store_dir(&root, None);
-    crate::store::create_store_dir(&store, &root).map_err(ServerError::Io)?;
-    let log = log_path(&store, &id).map_err(ServerError::Io)?;
+    Ok(PlannedBuild { root, plan: planned })
+}
+
+/// Run `build` as build `id`, writing its output to `log`. `on_running` runs
+/// once the build holds the write turn and the writer lock.
+///
+/// # Errors
+/// As [`lean_build`], and when `on_running` fails.
+pub(crate) async fn run_planned(
+    ctx: &ToolContext,
+    build: PlannedBuild,
+    id: &str,
+    log: &Path,
+    on_running: Option<OnRunning>,
+) -> Result<BuildOutcome, McpError> {
     let helper = crate::shared_writer::contract().map_err(ServerError::Io)?.executable;
-    let lock = ctx.broker.project_lock(&root);
-    Ok(run_build(&lock, &root, planned, &id, &log, &helper).await?)
+    let lock = ctx.broker.project_lock(&build.root);
+    Ok(run_build(&lock, &build.root, build.plan, id, log, &helper, on_running).await?)
 }
 
 /// `lean_imports` arguments.

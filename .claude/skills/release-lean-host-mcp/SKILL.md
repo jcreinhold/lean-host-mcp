@@ -34,7 +34,7 @@ another worker's staged files.
 Run `scripts/prerelease.sh` in full with cargo-deny installed. `--quick` is for iteration. The runner resolves the
 fixture's Lean pin through Elan.
 
-Test the packaged proof and search paths:
+Test the packaged pair and the search path:
 
 ```sh
 scripts/test-installed-module-setup.sh

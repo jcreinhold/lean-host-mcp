@@ -40,7 +40,7 @@ struct FieldDoc {
 
 /// Every knob, in the order it appears in the generated file and docs table:
 /// `[runtime]`, `[broker]`, `[server]`, `[telemetry]`, `[output]`, `[install]`,
-/// `[build]`, `[recipes.<name>]`.
+/// `[requests]`, `[build]`, `[recipes.<name>]`.
 const SCHEMA_FIELDS: &[FieldDoc] = &[
     // ---- [runtime] — worker memory + lifecycle --------------------------
     FieldDoc {
@@ -224,6 +224,31 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         overrides: "ELAN_HOME",
         description: "Elan's home when install ran: ELAN_HOME, else $HOME/.elan. When ELAN_HOME is unset, the server and install-worker --lake-root look for the Lean toolchain here, not under $HOME, and pass it on as ELAN_HOME.",
     },
+    // ---- [requests] — the request table ----------------------------------
+    FieldDoc {
+        key: "requests.retention_hours",
+        ty: "integer (h)",
+        value: "168",
+        commented: false,
+        overrides: "",
+        description: "Hours an ended request keeps its row, its stored result and its build log. The server prunes at start and every hour; it never prunes a request that has not ended. Default 7 days.",
+    },
+    FieldDoc {
+        key: "requests.max_rows",
+        ty: "integer",
+        value: "10000",
+        commented: false,
+        overrides: "",
+        description: "Most rows the request table keeps. Past this, pruning deletes the ended rows that finished first. Default 10000.",
+    },
+    FieldDoc {
+        key: "requests.wait_max_secs",
+        ty: "integer (s)",
+        value: "300",
+        commented: false,
+        overrides: "",
+        description: "Longest wait_seconds one lean_get may ask for. Default 300 s.",
+    },
     // ---- [build] — lean_build -------------------------------------------
     FieldDoc {
         key: "build.guard",
@@ -273,6 +298,14 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         commented: false,
         overrides: "",
         description: "Where the build.guard step runs: before the steps, after them, or not at all. A failing guard before the steps ends the recipe. Default before.",
+    },
+    FieldDoc {
+        key: "recipes.<name>.timeout_secs",
+        ty: "integer (s)",
+        value: "3600",
+        commented: true,
+        overrides: "",
+        description: "Deadline for one build of this recipe, in place of build.timeout_secs. Unset uses build.timeout_secs.",
     },
 ];
 
@@ -494,6 +527,15 @@ mod tests {
         assert_eq!(
             config.output.slow_call_warning_millis,
             Some(crate::tools::DEFAULT_SLOW_CALL_WARNING_MILLIS)
+        );
+        assert_eq!(
+            config.requests.retention_hours,
+            Some(crate::requests::DEFAULT_RETENTION_HOURS)
+        );
+        assert_eq!(config.requests.max_rows, Some(crate::requests::DEFAULT_MAX_ROWS));
+        assert_eq!(
+            config.requests.wait_max_secs,
+            Some(crate::requests::DEFAULT_WAIT_MAX_SECS)
         );
     }
 

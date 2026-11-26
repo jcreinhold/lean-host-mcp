@@ -86,12 +86,16 @@ Units are shown in the table; GiB figures in descriptions are explanatory, not l
 | `install.workers_dir` | path | unset | `LEAN_HOST_MCP_WORKERS_DIR` | Directory of per-toolchain worker installs, shared by install, install-worker and the server. Unset uses .local/lean-host-mcp/workers under the Lake root. A relative path is relative to the Lake root. |
 | `install.store_dir` | path | unset | `LEAN_HOST_MCP_STORE_DIR` | Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. It also holds the native owner records (owners/), the semantic runtime cache (semantic-runtimes/) and the server process records (processes/). Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root. |
 | `install.elan_home` | path | unset | `ELAN_HOME` | Elan's home when install ran: ELAN_HOME, else $HOME/.elan. When ELAN_HOME is unset, the server and install-worker --lake-root look for the Lean toolchain here, not under $HOME, and pass it on as ELAN_HOME. |
+| `requests.retention_hours` | integer (h) | `168` | none | Hours an ended request keeps its row, its stored result and its build log. The server prunes at start and every hour; it never prunes a request that has not ended. Default 7 days. |
+| `requests.max_rows` | integer | `10000` | none | Most rows the request table keeps. Past this, pruning deletes the ended rows that finished first. Default 10000. |
+| `requests.wait_max_secs` | integer (s) | `300` | none | Longest wait_seconds one lean_get may ask for. Default 300 s. |
 | `build.guard` | array of Lake targets | `[]` | none | Targets that must already be built. A guard step runs lake build --no-build on them, which fails without building anything when one is out of date. It runs before a build of targets; a recipe's guard key places it. Proofs uses ["@mathlib/+Mathlib:olean"]. Empty runs no guard. |
 | `build.timeout_secs` | integer (s) | `14400` | none | Deadline for one build, counted from its request: the wait for the project's write turn and every step count. Default 4 hours. |
 | `build.log_limit_mib` | integer (MiB) | `16` | none | Cap on one build's log, which lives in the store's logs directory. Output past the cap is dropped, and the reply says so. Default 16 MiB. |
 | `recipes.<name>.steps` | array of arrays of strings | unset | none | The Lake runs of one recipe, in order. Each is the words after lake and names a Lake command. Lake's -d, --dir, -f and --file options are refused, and a word that starts with - fits only after exe and its program, or after --. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name. |
 | `recipes.<name>.append` | string (none, last, each) | `"none"` | none | Which steps get the request's args at their end: none refuses args, last gives them to the last step, each to every step. Default none. |
 | `recipes.<name>.guard` | string (before, after, none) | `"before"` | none | Where the build.guard step runs: before the steps, after them, or not at all. A failing guard before the steps ends the recipe. Default before. |
+| `recipes.<name>.timeout_secs` | integer (s) | unset | none | Deadline for one build of this recipe, in place of build.timeout_secs. Unset uses build.timeout_secs. |
 <!-- END GENERATED -->
 
 `output.max_field_bytes` and `output.max_total_bytes` bound model-facing payloads before they leave the worker. Tight
@@ -243,9 +247,10 @@ worker exit is confirmed.
 Worker-capacity admission, mailbox admission, and time waiting in the actor queue share one
 `runtime.request_timeout_millis` deadline. Expiry returns `project_admission_timeout`, `mailbox_admission_timeout`, or
 `queue_wait_timeout` without dispatching that queued operation. Once dispatch begins, the worker execution timeout
-applies separately. This is not a whole-tool deadline: a tool that submits several worker operations can take longer.
-Explicit retained requests share a 128-record limit; synchronous requests retain their normal transport behavior.
-Parallel server processes remain independent; lower `broker.max_workers` when the machine cannot hold that many workers.
+applies separately. This is not a whole-tool deadline: a tool that submits several worker operations can take longer. A
+named check is the exception: its row fixes one deadline of the same length for the whole call, counted from the moment
+the server records it. Parallel server processes remain independent; lower `broker.max_workers` when the machine cannot
+hold that many workers.
 
 Cheap metadata paths never open a worker at all: degraded `needs_build` responses, invalid-request responses, and
 project-scope `.ilean` reference reads answer from the Lake files directly. A repeat module query on an unmodified file
@@ -256,12 +261,23 @@ Semantic proof ranking briefly opens a companion child in addition to the elabor
 memory planning. The server shuts it down after the call; it does not keep a separate resident ranking pool.
 Measurements in `project.rs::open_semantic_capability` found no significant improvement from keeping it resident.
 
-### Retained request storage
+### Request table
 
-Enable durable request evidence with `--request-journal DIR` or `LEAN_HOST_MCP_REQUEST_JOURNAL`. Use one directory per
-broker. Without it, retention is process-local. Recovered requests preserve evidence and are never replayed
-automatically. See the [retained lifecycle contract](tool-catalog.md#prepared-retained-lifecycle-v3) for ticket binding,
-result retrieval, acknowledgment, capacity, and recovery semantics.
+A server started with `--lake-root` keeps one row per [named request](tool-catalog.md#named-requests) in
+`requests.sqlite3` in its store, and a build's log in the store's `logs/`. The table uses SQLite's write-ahead log with
+`synchronous=FULL` (and `fullfsync` on macOS), so a row the server has written survives a crash of the server or the
+machine. The file has mode 0600. A server without a store has no table and refuses request ids with
+`requests_unavailable`.
+
+The server prunes the table when it starts and every hour after. It deletes ended rows older than
+`requests.retention_hours`, then the oldest ended rows past `requests.max_rows`, and then their logs. It never prunes a
+row that has not ended. At start it also deletes every log that no row names.
+
+Before it listens, a starting server ends the rows an earlier server left. For each project with a `running` row it
+takes the write turn and waits, for up to 15 minutes, until the writer lock is free, which shows that no helper of the
+earlier server still runs; the rows then become `interrupted`. If the lock stays held, the server does not start. It
+then starts the `queued` rows in the order they came, or ends them as `timed_out` past their deadline and as
+`interrupted` when their project is gone. No row that said `running` runs again.
 
 ## Request activity in the terminal
 
@@ -277,10 +293,10 @@ INFO Lean request received (preparing or waiting for worker) request=42 tool="le
 INFO Lean response ready request=42 tool="lean_verify" kind="verification" project=proofs elapsed_ms=1532 outcome="completed" tool_errors=0 tool_warnings=0 verified=3 failed=1 needs_build=0
 ```
 
-Synchronous calls, negotiated MCP tasks and retained `lean_request` submissions share this boundary. Retrying the same
-retained ID or polling its result does not log a second execution. Routine `lean_runtime` status and result polling
-remain quiet. If a future disappears before it returns, a warning explicitly says worker completion is not confirmed;
-that log is not a receipt proving that an executing worker stopped.
+Direct calls and named requests share this boundary. A retry with the same `request_id` or a `lean_get` does not log a
+second execution. Routine `lean_runtime` status and `lean_get` polling remain quiet. If a future disappears before it
+returns, a warning explicitly says worker completion is not confirmed; that log is not a receipt proving that an
+executing worker stopped.
 
 These summaries do not print command/tactic text, theorem names, imports, diagnostics, response bodies, caller-supplied
 request IDs or full project paths. Project labels are bounded and terminal-safe; kind/outcome labels are allowlisted.
@@ -351,6 +367,10 @@ its structured child shutdown: terminate, bounded graceful wait, kill escalation
 may finish normally or run until the configured request timeout before the worker layer reports a terminal runtime
 outcome. Abrupt parent death can still skip Rust `Drop`; child-side parent-loss handling is best effort. Stronger
 containment is the job of the process manager that starts the server.
+
+On shutdown the server stops its named requests and leaves their rows as they are. At the next start a `running` row
+becomes `interrupted` and a `queued` row runs (see [request table](#request-table)). A build's writer helper ends when
+the server dies, however it dies, so a killed server's build does not finish.
 
 Every running server writes a PID record in its store's `processes/` and removes it on normal shutdown. A server without
 `--lake-root` writes it under the per-user cache directory at `lean-host-mcp/processes/` instead, and
@@ -553,7 +573,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings # safe; clippy do
 cargo test --locked -p lean-host-mcp --lib                      # parent unit tests
 cargo test --locked -p lean-host-mcp-worker --all-targets       # worker tests
 scripts/test-installed-stdio.sh --all-targets                  # includes installed-worker EOF and exit
-scripts/test-installed-module-setup.sh                         # packaged proof and semantic search
+scripts/test-installed-module-setup.sh                         # packaged pair and semantic search
 scripts/check-parent-link.sh                                  # build and inspect the release parent
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
     cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation -- --ignored

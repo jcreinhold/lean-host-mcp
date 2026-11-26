@@ -24,8 +24,9 @@ Five semantic tool families cover the proof workflow:
 | `lean_status` | `project`, `file_diagnostics`: project status or current-source diagnostics |
 
 `lean_compatibility` describes compiled expectations with `mode: "pure_v1"`, or checks an actual worker in the default
-`loaded` mode. `lean_runtime` observes worker activity and leases an idle worker pool. `lean_request` prepares and
-submits retained requests, retrieves results, and requests cancellation without requiring MCP Tasks negotiation.
+`loaded` mode. `lean_runtime` observes worker activity and leases an idle worker pool. Any other tool takes an optional
+`request_id`: the server records the call before it starts, runs it at most once and keeps its result, so a retry
+returns that result. `lean_run` starts such a request and replies at once; `lean_get` reads its state and result.
 
 `lean_build` runs Lake in the project: Lake targets, or a recipe of Lake steps from the project's config. Checks wait
 while it runs and then see what it built. `lean_imports` lists each file's whole transitive import closure from
@@ -33,8 +34,8 @@ while it runs and then see what it built. `lean_imports` lists each file's whole
 
 Semantic responses contain `data`, structured `errors`, and project/session `trust`. Lean-domain failures remain in
 `data`; recoverable runtime failures appear in `errors`. See the [tool catalog](docs/tool-catalog.md) for request and
-response schemas, proof-position selectors, artifact freshness, and the
-[retained request lifecycle](docs/tool-catalog.md#prepared-retained-lifecycle-v3).
+response schemas, proof-position selectors, artifact freshness, and
+[named requests](docs/tool-catalog.md#named-requests).
 
 ## Quick start
 
@@ -128,7 +129,7 @@ Lean itself runs only for the `--lake-root` project. The server reads two config
 reads no config file from its working directory or your home directory. Run
 `lean-host-mcp config init --lake-root PROJECT` to create a documented tracked file. The
 [operations guide](docs/operations.md#configuration-file) covers precedence, pool sizing, deadlines, memory budgets,
-response presentation, durable request journals, and the `[build]` and `[recipes]` tables that `lean_build` reads (see
+response presentation, the request table, and the `[build]` and `[recipes]` tables that `lean_build` reads (see
 [builds](docs/operations.md#builds)). By default a project uses one worker; configuring `broker.max_workers_per_project`
 allows concurrent calls in the same project within the global `broker.max_workers` cap.
 

@@ -1,4 +1,4 @@
-//! Preserve semantic preparation evidence through errors and retained requests.
+//! Preserve semantic preparation evidence through errors and call evidence.
 
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
@@ -7,11 +7,11 @@ use std::io;
 use lean_toolchain::shared_writer::{WriterDisposition, WriterFailure};
 use lean_toolchain::{LinkDiagnostics, SourcePackageError};
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, TaskStatus};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::tasks::{RequestBinding, RequestTasks};
+use crate::cancellation::with_cancellation_evidence;
 
 fn writer_failure(disposition: WriterDisposition) -> WriterFailure {
     WriterFailure {
@@ -127,30 +127,9 @@ fn mailbox_project() -> (Arc<LeanProject>, mpsc::Receiver<ProjectMessage>) {
     (Arc::new(project), rx)
 }
 
-async fn await_terminal(tasks: &RequestTasks, id: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !tasks.get(id).expect("retained request").status().is_terminal() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("bounded request completion");
-}
-
-async fn retained_preparation_error(disposition: WriterDisposition, prior_unknown: bool) {
-    let tasks = RequestTasks::default();
-    let prepared = tasks
-        .prepare(RequestBinding {
-            server_instance_id: "semantic-preparation-test".to_owned(),
-            tool: "test".to_owned(),
-            submission_sha256: "ab".repeat(32),
-            project: Some("/unused-semantic-project".to_owned()),
-            request_epoch: None,
-        })
-        .expect("reserve request");
-    let prepared = serde_json::to_value(prepared).expect("serialize ticket");
-    let id = prepared["taskId"].as_str().expect("ticket ID").to_owned();
-    let binding: RequestBinding = serde_json::from_value(prepared["request"].clone()).expect("immutable binding");
+/// A failed semantic preparation reaches the call as an error without a proof
+/// result, and its call evidence says whether its worker scope closed.
+async fn preparation_error(disposition: WriterDisposition, prior_unknown: bool) {
     let (project, mut mailbox) = mailbox_project();
     let actor_project = Arc::clone(&project);
     let actor = tokio::spawn(async move {
@@ -171,63 +150,42 @@ async fn retained_preparation_error(disposition: WriterDisposition, prior_unknow
             .send(Err(ServerError::worker_unavailable(failure)))
             .expect("deliver failed preparation");
     });
-    tasks
-        .submit("test", id.clone(), binding.clone(), move || async move {
-            project
-                .native_compatibility(
-                    Instant::now()
-                        .checked_add(Duration::from_secs(5))
-                        .expect("finite test admission"),
-                )
-                .await
-                .map(|_| CallToolResult::success(vec![]))
-                .map_err(McpError::from)
-        })
-        .expect("submit reserved request once");
-    await_terminal(&tasks, &id).await;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .expect("finite test admission");
+    let (result, evidence) = with_cancellation_evidence(&CancellationToken::new(), async {
+        project.native_compatibility(deadline).await
+    })
+    .await;
     actor.await.expect("actor completed");
-    assert_eq!(tasks.get(&id).expect("failed request").status(), TaskStatus::Failed);
-    let retained = serde_json::to_value(tasks.get_retained(&id).expect("retained failure")).expect("serialize failure");
-    let expected = if prior_unknown || disposition == WriterDisposition::Unknown {
-        "unknown"
-    } else {
-        "stopped"
-    };
-    assert_eq!(retained["execution"]["disposition"], expected);
-    assert!(retained["execution"].get("worker_stop_receipt").is_none());
+    let error =
+        serde_json::to_string(&McpError::from(result.expect_err("preparation failed"))).expect("serialize error");
+    assert!(error.contains("preparation has no proof result"), "{error}");
     assert!(
-        retained.get("result").is_none(),
-        "preparation failure cannot invent a proof result"
-    );
-    assert!(retained.get("error").is_some());
-    assert!(
-        retained["error"]
-            .to_string()
-            .contains("preparation has no proof result")
-    );
-    assert!(
-        !retained["error"].to_string().contains("preparation_closed"),
+        !error.contains("preparation_closed"),
         "internal classification stays private"
     );
-    tasks
-        .submit("test", id.clone(), binding, || async {
-            panic!("failed preparation must never replay")
-        })
-        .expect("same ticket returns retained outcome");
+    let unknown = prior_unknown || disposition == WriterDisposition::Unknown;
     assert_eq!(
-        serde_json::to_value(tasks.get_retained(&id).expect("same retained outcome")).expect("serialize outcome"),
-        retained
+        evidence.uncertain, unknown,
+        "{disposition:?}, prior unknown {prior_unknown}"
     );
+    assert_eq!(evidence.pending, 0);
+    assert!(evidence.deferred.is_empty());
+    assert!(evidence.worker_stop_receipt.is_none());
+    if disposition != WriterDisposition::Unknown {
+        assert_eq!(evidence.returned, 1, "a closed preparation returned");
+    }
 }
 
 #[tokio::test]
-async fn semantic_preparation_dispositions_reach_retention_without_proof_results_or_replay() {
+async fn semantic_preparation_dispositions_reach_call_evidence_without_proof_results() {
     for disposition in [
         WriterDisposition::NotStarted,
         WriterDisposition::Stopped,
         WriterDisposition::Unknown,
     ] {
-        retained_preparation_error(disposition, false).await;
+        preparation_error(disposition, false).await;
     }
-    retained_preparation_error(WriterDisposition::Stopped, true).await;
+    preparation_error(WriterDisposition::Stopped, true).await;
 }
