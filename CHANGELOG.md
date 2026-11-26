@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `[install]`. `--dir` moves `bin/`, `workers/` and `store/`. It never writes a tracked file.
 - One server per store: a server with `--lake-root` locks `store/server.lock`, and a second one exits and names the pid
   and Lake root of the first. `LEAN_HOST_MCP_STORE_DIR` and `[install] store_dir` move the store.
+- `lean_build` runs Lake targets, or a recipe of Lake steps from the config, under the project's write turn. Checks wait
+  for it. The reply gives each step's command and exit code, the path of the log in `store/logs/`, and the log's tail.
+- `lean_imports` lists each file's whole import closure from `lake --no-build setup-file`. A missing or stale import
+  fails the call with `setup_file_failed` and Lake's own message.
+- Config tables `[build]` (`guard`, `timeout_secs`, `log_limit_mib`) and `[recipes.<name>]` (`steps`, `append`,
+  `guard`). `config check --lake-root PROJECT` checks both config files and prints these tables without running Lake.
 
 ### Changed
 
@@ -28,6 +34,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A missing or unusable worker gives one line naming the toolchain, the worker directory and the fix, `SERVER install
   --lake-root PROJECT`. A protocol mismatch carries the same recovery command.
 - `config init` writes `lean-host-mcp.toml` in the working directory or at `--lake-root`.
+- Checks and builds share one fair lock per project. A check waits in arrival order behind a queued build instead of
+  failing busy, and a build waits for running checks. A build outside the server that holds the project's writer lock
+  makes new checks wait the same way. A raw `lake build`, which takes no lock, is outside this contract.
+- Setup-file runs as a native reader with `--no-build`, under the check's shared lock, and never as a writer.
+- A worker reloads its imports after a build only as a backstop: the finished-build count replaces the import stamps. A
+  cached query result lives only as long as the worker that computed it.
 
 ### Removed
 
@@ -37,6 +49,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove config lookup in the home directory, the working directory and its parents, with `LEAN_HOST_MCP_CONFIG_DIR`,
   `config init --home` and the `primary_project` key. Neither config lookup nor the worker directory depends on `HOME`.
   The server ignores an old `[launcher]` table.
+- Remove the serve flags `--module-setup-writer`, `--module-setup-storage-request`, `--prepared-generation` and
+  `--verification-approval`, with prepared worker generations and the writer's setup-file path.
 
 ## [0.16.22] - 2026-11-25
 
@@ -48,7 +62,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Group independent verifier modules under one admitted writer and retain bounded readiness failures and artifact trace results.
+- Group independent verifier modules under one admitted writer and retain bounded readiness failures and artifact trace
+  results.
 - Bind SDK helpers to the existing ownership registry and enforce the original deadline before cold inspection dispatch.
 - Settle acknowledged warm attempts after exact generation retirement so a normal drain permits rollback without replay.
 
@@ -56,40 +71,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Use one broker capacity limit for managed readiness, trace snapshots, utility readers, and warm workers. Keep slots charged until the exact execution scope closes.
-- Transfer managed readiness locks to the verified writer helper. If the helper fails before dispatch, return capacity only after exact exit and reacquisition of every original lock.
-- Allow launcher rollback after confirmed custody closure when the original result is unknown. Preserve the original key and refuse replay.
+- Use one broker capacity limit for managed readiness, trace snapshots, utility readers, and warm workers. Keep slots
+  charged until the exact execution scope closes.
+- Transfer managed readiness locks to the verified writer helper. If the helper fails before dispatch, return capacity
+  only after exact exit and reacquisition of every original lock.
+- Allow launcher rollback after confirmed custody closure when the original result is unknown. Preserve the original key
+  and refuse replay.
 
 ## [0.16.19] - 2026-11-24
 
 ### Fixed
 
 - Let managed HTTP callers share the project selector lock while one broker owns the private store directory.
-- Promote enrolled warm stores only during an exclusive launcher transition, so a running cold broker cannot share a store during promotion.
+- Promote enrolled warm stores only during an exclusive launcher transition, so a running cold broker cannot share a
+  store during promotion.
 
 ## [0.16.18] - 2026-11-23
 
 ### Added
 
-- Opt-in warm managed declaration lookup reuses a verified worker for the same prepared imports. Guarded writes retire the worker, and original results remain recoverable by key.
-- Managed preparation derives the selected import closure, checks pinned cache inputs, and builds first-party modules in dependency order.
-- Managed file-backed proof context, command and tactic trials, proof search, and declaration lookup use admitted inputs. Managed root-library builds, blueprint declaration checks, and read-only regrouping retain bounded results.
+- Opt-in warm managed declaration lookup reuses a verified worker for the same prepared imports. Guarded writes retire
+  the worker, and original results remain recoverable by key.
+- Managed preparation derives the selected import closure, checks pinned cache inputs, and builds first-party modules in
+  dependency order.
+- Managed file-backed proof context, command and tactic trials, proof search, and declaration lookup use admitted
+  inputs. Managed root-library builds, blueprint declaration checks, and read-only regrouping retain bounded results.
 
 ### Fixed
 
-- Initialize Lake project discovery patterns before serving requests to avoid a stack overflow during ordinary proof search.
-- Verify installed packages with the matched lean-rs 0.10.15 worker and writer. Run launcher fault injection on a separate executable.
+- Initialize Lake project discovery patterns before serving requests to avoid a stack overflow during ordinary proof
+  search.
+- Verify installed packages with the matched lean-rs 0.10.15 worker and writer. Run launcher fault injection on a
+  separate executable.
 
 ## [0.16.17] - 2026-11-23
 
 ### Added
 
 - Opt-in managed project selection with guarded rollback, original-key result recovery, and verified custody closure.
-- Managed root architecture lint and fixed prebuilt Lean tooling suites, with bounded diagnostics and retained preflight refusals.
+- Managed root architecture lint and fixed prebuilt Lean tooling suites, with bounded diagnostics and retained preflight
+  refusals.
 
 ### Fixed
 
-- Setup-aware file verification records the executing CLI toolchain and exact inputs separately from worker compatibility.
+- Setup-aware file verification records the executing CLI toolchain and exact inputs separately from worker
+  compatibility.
 - Managed first-party clean checks the effective Lake output layout before deleting build files.
 
 ## [0.16.16] - 2026-11-22
@@ -108,8 +134,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Native readers can select `native_reader_stdout_frame_v1` to retain a complete result when stderr clips.
-  Oversized required stdout reports a stopped operation after confirmed closure.
+- Native readers can select `native_reader_stdout_frame_v1` to retain a complete result when stderr clips. Oversized
+  required stdout reports a stopped operation after confirmed closure.
 
 ## [0.16.13] - 2026-11-21
 
@@ -122,41 +148,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Installer smoke, worker sessions, and file-backed verification and search use a private socket directory.
-  Set `LEAN_HOST_MCP_SOCKET_DIR` to select it explicitly. Durable worker records stay in their existing registry.
-- The embedded writer checks its complete lock set for outstanding storage charges before starting work.
-  An overlapping charge refuses admission while a disjoint project can proceed.
+- Installer smoke, worker sessions, and file-backed verification and search use a private socket directory. Set
+  `LEAN_HOST_MCP_SOCKET_DIR` to select it explicitly. Durable worker records stay in their existing registry.
+- The embedded writer checks its complete lock set for outstanding storage charges before starting work. An overlapping
+  charge refuses admission while a disjoint project can proceed.
 
 ## [0.16.11] - 2026-11-21
 
 ### Fixed
 
-- Compact file verification uses the lean-rs 0.10.3 compact verdict and reports whether axiom data is available or truncated.
+- Compact file verification uses the lean-rs 0.10.3 compact verdict and reports whether axiom data is available or
+  truncated.
 - Registry worker installation stages Cargo output separately from the selected worker generation.
 
 ## [0.16.10] - 2026-11-21
 
 ### Fixed
 
-- Ship the bounded Lake module setup transfer described below. Version 0.16.9 did not publish because the
-  release workflow selected an incomplete Lean prefix. Release verification now checks the header and
-  shared library under the prefix reported by the selected Lean executable.
+- Ship the bounded Lake module setup transfer described below. Version 0.16.9 did not publish because the release
+  workflow selected an incomplete Lean prefix. Release verification now checks the header and shared library under the
+  prefix reported by the selected Lean executable.
 
 ## [0.16.9] - 2026-11-21
 
 ### Fixed
 
-- File-backed verification and search now accept Lake module setup data up to 16 MiB from the selected
-  no-build setup command. Large import maps no longer exhaust the generic writer output limit.
+- File-backed verification and search now accept Lake module setup data up to 16 MiB from the selected no-build setup
+  command. Large import maps no longer exhaust the generic writer output limit.
 
 ## [0.16.8] - 2026-11-21
 
 ### Changed
 
 - Adopt published lean-rs 0.10.2 and use Lean 4.36.0 for the release fixture.
-- Verify current project files in a supervised Lean process using the selected Lake module setup. Check
-  project inputs again when transferring them from writer to reader custody. A missing or changed input
-  prevents verification.
+- Verify current project files in a supervised Lean process using the selected Lake module setup. Check project inputs
+  again when transferring them from writer to reader custody. A missing or changed input prevents verification.
 - Use semantic runtime 0.7.9 to elaborate file-backed search goals with the selected Lake module setup.
 - Bind native workers, build helpers and external readers to one supervised process scope and canonical artifact-lock
   union. Preserve confirmed stop evidence through timeout and replacement failures; recover capacity after actual
@@ -167,7 +193,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `lean_compatibility` discovery with explicit `pure_v1` mode.
 - Reevaluate Lake options under shared custody with generation-owned private caches, preserving warm workers and saved
   root options. Require matched SDK 0.10.2 and worker protocol 13.
-
 
 ## [0.16.7] - 2026-11-14
 

@@ -13,7 +13,8 @@ privileges; the worker is not an OS sandbox.
 - [Proof API](#declaration-centric-proof-api), [tool routing](#tool-semantics), and
   [cache validity](#budgets-and-caching)
 - [Reference indices](#reference-indices)
-- [Lake options](#lake-compilation-options) and [deadlines](#queue-and-execution-deadlines)
+- [Lake options](#lake-compilation-options), [deadlines](#queue-and-execution-deadlines) and
+  [turns and builds](#turns-and-builds)
 - [Artifact custody](#native-ownership-and-artifact-custody) and
   [external inputs](#pure-compatibility-and-external-input)
 
@@ -21,20 +22,28 @@ privileges; the worker is not an OS sandbox.
 
 ```
 crates/lean-host-mcp/src/
-  main.rs           clap CLI, shared broker setup, rmcp stdio entry
-  transport_http.rs private axum/rmcp Streamable HTTP entry
-  server.rs         LeanHostService tool registration
-  broker.rs         ProjectBroker: LRU pool, idle eviction, per-call routing
-  broker/control.rs process-local worker activity snapshots and expiring admission leases
-  project.rs        LeanProject actor: one serialized controller and worker
-  tools/            semantic.rs facade; declaration/proof_search/proof_action/position internals
-  projections.rs    stable MCP projections from lean-rs worker types
-  lake_meta.rs      minimal Lake-project metadata
-  cache.rs          bounded module-query cache with source/options/artifact/generation keys
-  envelope.rs       internal operation envelope adapted to { data, errors, trust } at the public boundary
+  main.rs                clap CLI, shared broker setup, rmcp stdio entry
+  transport_http.rs      private axum/rmcp Streamable HTTP entry
+  server.rs              LeanHostService tool registration
+  broker.rs              ProjectBroker: LRU pool, idle eviction, per-call routing, the reaper
+  broker/control.rs      process-local worker activity snapshots and expiring admission leases
+  broker/module_setup.rs lake setup-file as a native reader; the import closure for lean_imports
+  broker/verify_file.rs  file checks through one-shot Lean programs
+  project.rs             LeanProject actor: one serialized controller and worker
+  project_lock.rs        fair read and write turns per Lake root, the shared kernel guard, proxy turns
+  build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, the run in one helper
+  shared_writer.rs       the SDK writer helper, including its build log mode
+  native_reader.rs       one-shot Lean programs in the SDK's native reader scope
+  tools/                 semantic.rs facade; declaration/proof_search/proof_action/position internals; build.rs
+  projections.rs         stable MCP projections from lean-rs worker types
+  lake_meta.rs           minimal Lake-project metadata
+  cache.rs               bounded module-query cache, valid while the worker that computed an entry lives
+  envelope.rs            internal operation envelope adapted to { data, errors, trust } at the public boundary
+  store.rs               the server store: one-server lock, build logs
+  config_file.rs         the tracked and local config files at the Lake root
 
 crates/lean-host-mcp-worker/src/
-  main.rs           worker child: lean_rs_worker_child::run_worker_child_stdio()
+  main.rs, authority.rs  worker child; serves only Init inspection in the installer's smoke project
 ```
 
 `server.rs` is glue only. Tool implementations resolve a project through `ProjectBroker`, read source files when needed,
@@ -133,11 +142,11 @@ Above 60% of the residue budget, a quiet actor can cycle as `import_residue_idle
 the latest profile only if recently served (within one minute), and cycles at most once per quiet period. The
 `import_residue_idle : import_residue` ratio measures how much restart cost lands between requests.
 
-A pooled environment is a snapshot from its import. Before reuse, the controller compares exact metadata for each named
-`.olean` in that profile: resolved path, size, mtime, and Unix file identity/change time. Removal, backdating,
-replacement, or unreadable metadata invalidate a previously held profile. A pre-job `artifacts_rebuilt` recycle is not
-execution taint. Actual artifact read epochs independently invalidate a generation after a cooperating writer changes
-transitive inputs; named-import stamps alone cannot detect every failed partial build.
+A pooled environment is a snapshot from its import, so no writer may change the artifacts under a live worker. The
+worker holds the shared kernel lock for its whole life, and builds take the exclusive lock (see
+[turns and builds](#turns-and-builds)). As a backstop, each job carries the finished-build count of its read turn, and
+the actor keeps the count under which the live generation first loaded imports. A higher count cycles the worker before
+the job as `artifacts_rebuilt`, which is not execution taint, and drops every pooled profile.
 
 Worker death never authorizes replay: Lean elaboration and tactics may perform IO. The opt-in
 `retry_tainted_non_positive` policy allows one retry of a non-positive trial/verification verdict after a mid-call
@@ -235,12 +244,13 @@ Operational status, compatibility, and lifecycle tools have separate contracts; 
 Worker APIs cap rendered fields and total output before IPC. The host adds candidate and reference-fanout caps. Public
 queries do not request whole info trees or unbounded project scans, so query shape controls frame size.
 
-`ModuleQueryCache` stores bounded file-keyed outcomes for single and batched queries. A key includes source bytes,
-query/selector shape and output budgets, session/freshness imports, elaboration options, exact named-import artifact
-metadata, and worker generation. There is no TTL. Import stamps are sampled under complete cooperating read custody
-before lookup and after execution; changed artifacts or final execution taint prevent insertion. Unknown query variants
-bypass caching. This depends on Lake propagating dependency changes to named imports rather than scanning their whole
-transitive closure on every lookup.
+`ModuleQueryCache` stores bounded file-keyed outcomes for single and batched queries. A key includes the file path,
+source bytes, query/selector shape and output budgets, session/freshness imports, elaboration options, and the
+finished-build count of the request's read turn. There is no TTL. Each entry names the worker generation that computed
+it and answers only while that generation lives: the worker holds the shared kernel lock for its whole life, so no
+writer has changed what it read. A probe made while another generation lives, or none, drops the entry. The count alone
+is not enough, since a short build in another process can end between two reaper ticks and never move it. Execution
+taint prevents insertion, and unknown query variants bypass caching.
 
 A valid hit bypasses the actor mailbox, but source option discovery still runs. Name-only inspection/search, proof
 attempts, and verification are not cached: their meaning depends on an imported environment and execution policy that
@@ -387,6 +397,31 @@ classification continues to use its existing operation evidence. A post-admissio
 no stored historical result is reclassified. Native-reader ACK precedes its read-admission/payload boundary, so a lost
 post-ACK result still cannot infer payload non-dispatch from a null start field or missing domains.
 
+## Turns and builds
+
+`project_lock.rs` gives each canonical Lake root one fair `tokio::sync::RwLock`. A request takes at most one turn and
+keeps it in a task-local slot, so a nested check in the same request reuses its read turn instead of queueing behind a
+waiting writer. A check takes its read turn before it pins an actor or starts a native reader, then the shared kernel
+guard on the project's artifacts, and holds both until the request ends. A build takes the write turn, then the
+exclusive kernel lock through the SDK writer helper; a request that holds a read turn cannot take the write turn. Tokio
+grants turns in arrival order, so a queued build holds back later checks, and each waiter keeps its place until its
+deadline. Each finished write turn adds one to the root's finished-build count.
+
+Workers hold the shared kernel lock for their whole generation. When a writer in another process announces demand, the
+reaper queues a proxy write turn on that root, so new checks wait behind it, and retires the idle, unborrowed actors
+whose domains the writer wants. A queued proxy turn always ends as a finished build, even when the demand ended before
+the grant.
+
+`lean_build` (`build.rs`, `tools/build.rs`) plans the run from the `[build]` and `[recipes]` config, takes the write
+turn, opens one writer helper, and runs the guard and each step in it, with all output in one capped log in the store.
+The turn ends only after the helper and every process of the build have exited. Lake decides what to build and in which
+order; the server checks only the words it hands to Lake. Do not add an import graph walk or a build scheduler: a test
+scans the build path for Lake's import-graph queries. `lean_imports` reads each file's transitive closure from
+`lake setup-file --no-build` under a read turn.
+
+A raw `lake build` takes no kernel lock, so neither the turns nor the finished-build count see it. Running one while the
+server reads the project is outside the contract.
+
 ## Native ownership and artifact custody
 
 Each project actor owns its actual worker child and its reaper. Ordinary and semantic generations share one durable
@@ -452,12 +487,13 @@ primitive as other supervised commands. Failed kill, or loss of both parent and 
 fences until actual group absence; recovery never signals a PID recovered from disk. The supported boundary requires
 descendants to remain in the inherited process group. On Linux a short-lived payload waiter adopts orphaned descendants.
 After reaping the payload it checks for children across all groups and sessions. A survivor at verdict time prevents
-success. The bootstrap retains the guardian and its acknowledged read loans until the exact waiter exits and its
-bounded report is collected. A lost waiter or report supplies no verdict. The outer owner separately checks closure of
-the original scope. That closure does not establish that an escaped process stopped writing, including after a waiter
-crash. This check cannot detect a descendant that detached and exited before the verdict. The actor quota bounds admitted generations, not every paused pre-admission OS process;
-one bounded preparation utility may coexist without evicting a warm actor. Independent uncoordinated writers and
-arbitrary user IO outside declared cooperating domains are outside this lock protocol.
+success. The bootstrap retains the guardian and its acknowledged read loans until the exact waiter exits and its bounded
+report is collected. A lost waiter or report supplies no verdict. The outer owner separately checks closure of the
+original scope. That closure does not establish that an escaped process stopped writing, including after a waiter crash.
+This check cannot detect a descendant that detached and exited before the verdict. The actor quota bounds admitted
+generations, not every paused pre-admission OS process; one bounded preparation utility may coexist without evicting a
+warm actor. Independent uncoordinated writers and arbitrary user IO outside declared cooperating domains are outside
+this lock protocol.
 
 ## Pure compatibility and external input
 

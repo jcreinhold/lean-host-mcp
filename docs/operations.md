@@ -5,25 +5,24 @@ the [tool catalog](tool-catalog.md) for request and response contracts.
 
 - [Configuration](#configuration-file) and [reference table](#configuration-reference)
 - [Artifact freshness](#rebuilt-artifacts) and [memory sizing](#memory-and-import-cycling)
-- [Concurrency and admission](#concurrency-and-admission)
+- [Builds](#builds) and [concurrency and admission](#concurrency-and-admission)
 - [Logging](#request-activity-in-the-terminal) and [worker recycles](#observing-worker-recycles)
 - [Process lifetime](#process-lifetime) and [runtime failures](#runtime-error-contract)
 - [Server installation](#installing-the-server), [worker installation](#installing-workers) and
   [test harnesses](#build-test-lint)
 
 
-Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set,
-otherwise `$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700.
-The SDK removes each worker's socket on closure. Durable owner records continue to use their configured registry.
-The host passes `LEAN_RS_WORKER_OWNERS_DIRECTORY` to its SDK helpers. The default is
-`lean-host-mcp/native-generations` under the platform's local data directory. On macOS this is
-`$HOME/Library/Application Support/lean-host-mcp/native-generations`. Keep the same canonical directory when
-restarting the server, including across binary changes. `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR`
-sets the separate server PID directory used by `doctor processes`.
+Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set, otherwise
+`$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700. The SDK removes
+each worker's socket on closure. Durable owner records continue to use their configured registry. The host passes
+`LEAN_RS_WORKER_OWNERS_DIRECTORY` to its SDK helpers. The default is `lean-host-mcp/native-generations` under the
+platform's local data directory. On macOS this is `$HOME/Library/Application Support/lean-host-mcp/native-generations`.
+Keep the same canonical directory when restarting the server, including across binary changes.
+`LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` sets the separate server PID directory used by `doctor processes`.
 
 The SDK writer executable setting is `LEAN_RS_WRITER_EXECUTABLE`. Launch environments may still use
-`LEAN_HOST_MCP_WRITER_EXECUTABLE` during the transition. A startup that supplies both must supply identical values.
-The server still selects its embedded writer for ordinary operations and honors explicit standalone-writer selections.
+`LEAN_HOST_MCP_WRITER_EXECUTABLE` during the transition. A startup that supplies both must supply identical values. The
+server still selects its embedded writer for ordinary operations and honors explicit standalone-writer selections.
 
 ## Configuration file
 
@@ -93,19 +92,28 @@ summary shows nonzero `budget_exceeded`, `not_attempted`, or `output_truncated` 
 
 ### Rebuilt artifacts
 
-A worker session's Lean environment is a snapshot taken at import. Reusing that session does not read newer `.olean`
-files, so the server must detect build changes before reusing it.
+A worker session's Lean environment is a snapshot taken at import, and a check reads `.olean` files while it runs, so no
+check may overlap a build of the same project. The server keeps them apart with one fair turn per Lake root:
 
-The server records individual imported `.olean` metadata, including resolved path, size, modification time, and Unix
-file identity/change time. It follows manifest package order, custom `packagesDir`, path dependencies, Git `subDir`, and
-inherited `LEAN_PATH`. Rebuilt, removed, replaced, or newly available artifacts invalidate affected cached queries and
-pooled sessions. The worker is recycled before reuse; `artifacts_rebuilt` records that transition. Unrelated artifacts
-do not invalidate a warm query.
+- A check takes a read turn before it starts a worker job or a native reader, then the shared kernel lock on the
+  project's artifacts, and keeps both until it ends. Read turns do not exclude each other.
+- `lean_build` takes the write turn, then the exclusive kernel lock through the writer helper. It waits for the checks
+  that hold read turns and holds back the checks that arrive after it, so a check sent during a build waits and then
+  sees what the build wrote. Turns follow arrival order; a waiting request keeps its place until its deadline.
+- A worker holds the shared lock for its whole life. When a writer in another process asks for the exclusive lock, the
+  server queues a write turn for it and retires the idle workers that hold the lock.
 
-Only named imports are watched rather than their full transitive closure: normal Lake dependency propagation must update
-the corresponding imported artifacts. Bundled shims and installed toolchain contents remain trusted fixed runtime
-inputs. Concurrent builds are not an atomic execution snapshot; changed artifacts prevent result-cache insertion.
-Callers requiring an exact source/build revision must coordinate those inputs.
+Each read turn carries the number of builds that have finished on the root. A worker that loaded its imports before a
+later build finished is recycled before reuse, and `artifacts_rebuilt` records that. Since workers hold the shared lock
+for their whole life, this is a backstop. A cached query result answers only while the worker that computed it lives.
+
+Build through `lean_build`, or through another process that holds the shared writer. A raw `lake build` takes no lock:
+it can rewrite `.olean` files while a check reads them, and the server does not notice. That is outside the contract.
+Bundled shims and installed toolchain contents remain trusted fixed runtime inputs.
+
+File checks and `lake setup-file` runs are native readers. The SDK starts one at a time per owner registry, across all
+projects and servers that share it. A reader that cannot start within 30 seconds, or by its request's deadline if that
+comes first, fails.
 
 ### Memory and import cycling
 
@@ -162,6 +170,48 @@ completed verdict.
 Earlier resident-memory measurements (+1 GiB per import and an 11.2 GiB `SIGKILL`) used a fixture whose import profiles
 shared about 99% of their closure. They should not replace the physical-footprint measurements above: under pressure,
 RSS can fall while unreclaimable import bytes keep growing.
+
+## Builds
+
+`lean_build` runs Lake in the Lake root and replies when Lake is done. A request names Lake `targets` (none: Lake's
+default targets) or a `recipe` from the tracked config, plus `args` where the recipe's `append` lets them in. For
+example:
+
+```toml
+[build]
+guard = ["@mathlib/+Mathlib:olean"] # must already be built; checked with lake build --no-build
+timeout_secs = 14400                # from the request: the wait for the turn and every step count
+log_limit_mib = 16
+
+[recipes.clean]
+steps = [["clean", "Proofs"]]
+guard = "none"
+
+[recipes.format]
+steps = [["build"], ["exe", "lean-fmt", "format", "--check", "--no-build"]]
+append = "each"                     # the request's args go at the end of both steps
+```
+
+A build takes the project's write turn (see [rebuilt artifacts](#rebuilt-artifacts)) and opens one writer helper, which
+holds the exclusive kernel lock while the guard and each step run in it. The first failing step ends the build. All
+output goes to one log under the store's `logs/`, capped at `build.log_limit_mib`; the reply gives each step's command
+and exit code, the log's path and its tail. At the deadline the server stops the running step. The turn ends only after
+the helper and every process of the build have exited, so no check starts while one still runs.
+
+Each step runs in the Lake root with the server's environment, except that the server sets `LEAN_SYSROOT` to the
+project's toolchain, sets `LAKE_ARTIFACT_CACHE=false` so that builds land in each package's `.lake/build`, and removes
+`LEAN_PATH`. Set a variable such as `LEAN_NUM_THREADS` where the server starts. The server checks only the words it
+hands to Lake: it refuses `-d`, `--dir`, `-f` and `--file`, and a client word that starts with `-` fits only after
+`exe <name>` or `--`. Lake decides what to build and in which order.
+
+`lean-host-mcp config check --lake-root PROJECT` reads both config files, names every unknown key and bad value, and
+prints `[build]` and each recipe with their defaults. It runs no Lake and writes nothing, so it is safe beside a running
+server.
+
+`lean_imports` lists, for each file, its whole transitive import closure as `lake setup-file --no-build` reports it
+(`importArts`), not only its direct imports: each module, its `.olean`, and its source when Lake built it under the
+project's `.lake/build`. It builds nothing: a missing or stale import fails the call with `setup_file_failed`, naming
+the file and quoting Lake.
 
 ## Concurrency and admission
 
@@ -243,10 +293,10 @@ Log lines carry structured fields — `cause`, `reason`, `worker_generation`, `r
 
 - `warn` — abnormal/crash causes: `rss_hard_limit_exceeded`, `child_abort`, `child_exit`, `session_missing`,
   `worker_internal`, `timeout`, `cancelled` (and `restart limit exceeded; marking project unhealthy`).
-- `info` — `artifacts_rebuilt` (a `.olean` among the imports of a session the child may still hold was rewritten, so the
-  child was recycled), `import_residue` (the reactive half of the residue budget — the cycle a call had to wait for, and
-  the frequency an operator tunes against), memory-pressure cycles (`rss_post_job`), plus `opened project` / `idle
-  reaper evicted projects` lifecycle lines.
+- `info` — `artifacts_rebuilt` (a build finished after the child loaded its imports, so it was recycled; a backstop, see
+  [rebuilt artifacts](#rebuilt-artifacts)), `import_residue` (the reactive half of the residue budget — the cycle a call
+  had to wait for, and the frequency an operator tunes against), memory-pressure cycles (`rss_post_job`), plus
+  `opened project` / `idle reaper evicted projects` lifecycle lines.
 - `debug` — pure hygiene (`import_residue_idle`, `max_imports`, `max_requests`, `idle`, `explicit`), detailed project
   resolution, and the `job` span.
 
@@ -436,12 +486,12 @@ The provenance sidecar records the worker wire-protocol version independently of
   current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current workers
   too (e.g. to re-run the smoke test or replace a corrupted binary).
 - `install-worker --toolchain <id>` builds a fresh generation in its final directory. The installer verifies the
-  published SDK shim sources, builds them with the standalone SDK writer, and records their identities in
-  `worker.json`. Use `--shim-source DIR` or `--standalone-writer PATH` for explicit inputs. After the builtin
-  `Nat.add_zero` inspection and successful shutdown it atomically updates `current-generation`. Existing workers
-  retain their original paths. Installs without a selector continue to use the legacy directory.
-  The installed shims and their compiled Lean imports run without the source checkout or Cargo source cache.
-  To use a different worker root, reinstall there. The SDK manifest records absolute paths for its generation.
+  published SDK shim sources, builds them with the standalone SDK writer, and records their identities in `worker.json`.
+  Use `--shim-source DIR` or `--standalone-writer PATH` for explicit inputs. After the builtin `Nat.add_zero` inspection
+  and successful shutdown it atomically updates `current-generation`. Existing workers retain their original paths.
+  Installs without a selector continue to use the legacy directory. The installed shims and their compiled Lean imports
+  run without the source checkout or Cargo source cache. To use a different worker root, reinstall there. The SDK
+  manifest records absolute paths for its generation.
 - `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
   `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
 - `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are
@@ -461,8 +511,8 @@ no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/wor
 
 ### Source-bound writer cutover
 
-Source-bound staging is opt-in. Stop the running servers, then install the matched digest-aware host and standalone
-SDK writer. Use that writer's `writer-storage approve-handoff` with the existing registry path, device, and inode. Set
+Source-bound staging is opt-in. Stop the running servers, then install the matched digest-aware host and standalone SDK
+writer. Use that writer's `writer-storage approve-handoff` with the existing registry path, device, and inode. Set
 `LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` on the server to the approved JSON fields `ownership_registry`,
 `registry_device`, `registry_inode`, `executable`, `sha256`, and the returned `approval_generation`. The server reports
 that approval in its compatibility receipt. The SDK enforces the generation at admission. Startup does not issue
@@ -471,8 +521,8 @@ approval.
 To roll back, disable source-bound admission and stop the servers. Use the same pinned SDK writer's
 `writer-storage revoke-handoff` on the original registry. If revocation is busy or its result is unknown, keep the
 servers stopped and retry after custody closes. Once revocation succeeds, restart the matched digest-aware host with
-`LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` unset. Keep the same registry and lock inodes. This procedure has been
-qualified with source-built images. Published package identities require a repeat with the installed artifacts.
+`LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` unset. Keep the same registry and lock inodes. This procedure has been qualified
+with source-built images. Published package identities require a repeat with the installed artifacts.
 
 ## Build, test, lint
 
@@ -486,8 +536,14 @@ scripts/test-installed-stdio.sh --all-targets                  # includes instal
 scripts/test-installed-module-setup.sh                         # packaged proof and semantic search
 scripts/check-parent-link.sh                                  # build and inspect the release parent
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
-    cargo test --locked -p lean-host-mcp --test e2e -- --ignored
+    cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation -- --ignored
 ```
+
+On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs, and the installed worker refuses any
+`DYLD_*` variable, so opt-in tests that check files or start a worker fail under `cargo test`. Build them with
+`cargo test --no-run`, then run each printed binary with `--ignored` under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
+`LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_RS_WORKER_OWNERS_DIRECTORY`,
+`LEAN_HOST_MCP_STORE_DIR` and `TMPDIR` under the target directory.
 
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
@@ -500,8 +556,8 @@ toolchain under `~/.elan/toolchains` for worker installation and discovery. `LEA
 for the build. Run `actionlint` and `shellcheck scripts/*.sh` to lint the workflow and shell files.
 
 Dispatch the Release workflow from `main` to rehearse verification and packaging. A push of a matching `v<version>` tag
-triggers publication after the changelog and packages pass verification. To recover after partial publication, rerun
-the original tagged workflow. It skips crate versions already present on crates.io and continues to GitHub Release creation.
+triggers publication after the changelog and packages pass verification. To recover after partial publication, rerun the
+original tagged workflow. It skips crate versions already present on crates.io and continues to GitHub Release creation.
 
 ## Smoke and performance baseline
 
@@ -552,22 +608,25 @@ Filesystem discovery can select a project for metadata. A native request using d
 resolve to the approved canonical directory before the broker prepares Lake options or opens a worker. Worker-side
 source and capability checks still apply.
 
-To verify a file in an already-built project, start the stdio server with `lean-host-mcp --lake-root /absolute/path/to/project`. Call `lean_verify` with a project-relative file and a declaration, for example:
+To verify a file in an already-built project, start the stdio server with
+`lean-host-mcp --lake-root /absolute/path/to/project`. Call `lean_verify` with a project-relative file and a
+declaration, for example:
 
 ```json
 {"targets":[{"kind":"explicit","file":"Demo.lean","declarations":["Demo.exampleTheorem"]}]}
 ```
 
-The server runs the selected toolchain's `lake --no-build --no-cache setup-file <file>` under the project writer and checks the current source using that file's options, imports, plugins and dynamic libraries. Keep the project's existing compiled artifacts available. Missing setup inputs produce an error. This route requires the setup-aware verification shim and takes no `--prepared-generation` argument.
+Under the request's read turn, the server runs the selected toolchain's `lake --no-build --no-cache setup-file <file>`
+as a native reader and checks the current source using that file's options, imports, plugins and dynamic libraries. Lake
+builds nothing here, so keep the project built: a missing or stale import is an error that quotes Lake. This route
+requires the setup-aware verification shim. File-backed `lean_lookup` with `kind="proof_search"` uses the same setup for
+goal elaboration.
 
-To charge ordinary file setup, supply both `--module-setup-writer PATH` and `--module-setup-storage-request JSON`
-at server startup for the operator-approved primary project. Use the matched standalone writer and its v1 full-turn
-storage request, including a positive byte budget, free-space floor, and directory identities for the project,
-registry, scratch parent, inherited temporary directory and any additional participating roots. Lake uses writer
-scratch for its artifact cache. A refused charge or changed writer fails the call. Omitting both options keeps ordinary setup.
+Lake writes its own config cache under `.lake/config/` when the lakefile changed, under Lake's own lock, so a file check
+right after a lakefile edit can write there.
 
-Use `--prepared-generation` only for the separately prepared worker-import path. Ordinary file-backed `lean_lookup` with `kind="proof_search"` uses the selected file’s Lake setup for goal elaboration.
-
-The optional CLI-only `--verification-approval verify-batch-v1:<sha256>` records one verification policy digest for the operator-selected canonical project at startup. The digest binds independently reviewed source and batch options, the installed generation and its ordered import domains. There is no project-local or per-request setter. The startup binding alone grants no native source operation.
-
-**Elan maintenance.** Keep the selected canonical Elan toolchain installed and unchanged while its workers run. Drain and stop those workers before uninstalling or replacing that toolchain. The host checks release identity at admission; it does not acquire an Elan maintenance lock. Generation-based installs retain shared artifact locks. Clean and prune require exclusive access to those same domains, including older generations in the slot. Flat legacy installations predate these locks and require their workers to be stopped before maintenance.
+**Elan maintenance.** Keep the selected canonical Elan toolchain installed and unchanged while its workers run. Drain
+and stop those workers before uninstalling or replacing that toolchain. The host checks release identity at admission;
+it does not acquire an Elan maintenance lock. Generation-based installs retain shared artifact locks. Clean and prune
+require exclusive access to those same domains, including older generations in the slot. Flat legacy installations
+predate these locks and require their workers to be stopped before maintenance.

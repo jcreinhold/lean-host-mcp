@@ -2,7 +2,8 @@
 
 Five semantic tools cover proof context, trials, lookup, verification, and status. `lean_context`, `lean_trial`,
 `lean_lookup`, and `lean_status` select a mode with `kind`; `lean_verify` takes target groups directly. Operational
-coordination uses `lean_compatibility`, `lean_request`, and `lean_runtime`.
+coordination uses `lean_compatibility`, `lean_request`, and `lean_runtime`. `lean_build` runs Lake, and `lean_imports`
+reads what Lake reports a file imports.
 
 - Semantic tools: [context](#lean_context), [trial](#lean_trial), [verification](#lean_verify), [lookup](#lean_lookup),
   [status](#lean_status).
@@ -10,6 +11,7 @@ coordination uses `lean_compatibility`, `lean_request`, and `lean_runtime`.
   [request synonyms](#request-synonyms), [proof workflow](#proof-workflow).
 - Coordination: [native compatibility](#native-compatibility), [retained requests](#prepared-retained-lifecycle-v3),
   [worker activity and admission leases](#worker-activity-and-admission-leases).
+- Lake: [builds](#lean_build), [import closures](#lean_imports).
 
 ```text
 lean_context -> lean_lookup -> lean_trial -> lean_verify
@@ -79,17 +81,17 @@ HTTP server shares task records across client sessions, so reconnecting clients 
 task continues while its client is disconnected; reconnect with the existing handle rather than submitting it again.
 
 For one explicit named file group on the ordinary setup-aware `lean_verify` route, a complete verdict includes
-`trust.cli_file_verification` with schema `lean-host-cli-file-verification-v1`. It identifies the
-`server_instance_id`, canonical `project_root` and `source_file`, selected `lean_toolchain`,
-`lean_executable`, and `runtime_lean_version` reported by the executing Lean CLI. The runtime version must
-match the selection before that process opens the staged setup.
+`trust.cli_file_verification` with schema `lean-host-cli-file-verification-v1`. It identifies the `server_instance_id`,
+canonical `project_root` and `source_file`, selected `lean_toolchain`, `lean_executable`, and `runtime_lean_version`
+reported by the executing Lean CLI. The runtime version must match the selection before that process opens the staged
+setup.
 
 The receipt includes lowercase SHA-256 strings `source_sha256`, `module_setup_sha256`, `artifact_identity_sha256`,
 `request_sha256`, and `data_sha256`. These bind the exact source bytes, staged ModuleSetup bytes, checked input
 identities and installed shim digests under read custody, the staged driver request bytes, and the returned `data`
-respectively. The `data` digest uses compact UTF-8 JSON with sorted object keys and unchanged array order. A caller
-must check the exact requested names and compare the source digest against its saved input before accepting a verdict.
-The receipt establishes CLI provenance. Loaded-worker ABI evidence continues to use `trust.native_compatibility`.
+respectively. The `data` digest uses compact UTF-8 JSON with sorted object keys and unchanged array order. A caller must
+check the exact requested names and compare the source digest against its saved input before accepting a verdict. The
+receipt establishes CLI provenance. Loaded-worker ABI evidence continues to use `trust.native_compatibility`.
 
 ### Prepared retained lifecycle (v3)
 
@@ -283,6 +285,88 @@ claim and whether retirement is worth losing warm caches.
 For example, obtain a memory handoff with `{"action":"acquire","retire_idle":true,"lease_seconds":30}`, retain its
 token, observe confirmed exit, renew during the external operation, and release in cleanup. If acquire is busy, continue
 independent work or wait for the existing owner; do not kill the active worker.
+
+## `lean_build`
+
+`lean_build` runs Lake in the project root. Send Lake `targets`, or a `recipe` from the project's config with optional
+`args`. The two exclude each other; with neither, Lake builds its default targets.
+
+```json
+{"name":"lean_build","arguments":{"targets":["Chain.C"]}}
+{"name":"lean_build","arguments":{"recipe":"format","args":["Proofs/Foo.lean"]}}
+```
+
+The build waits for the project's write turn: checks already running finish first, and checks sent later wait until the
+build ends. One writer helper holds the project's exclusive lock while Lake runs every step. Lake decides what to build
+and in which order. When `[build] guard` names targets, the server adds the step `lake build --no-build <guard>` before
+the build (or where the recipe's `guard` puts it), so a build that would compile those targets stops instead. The first
+failing step ends the build. The config, recipes and the words the server refuses are in
+[operations](operations.md#builds).
+
+```json
+{
+  "state": "done",
+  "ok": false,
+  "exit_code": 1,
+  "failed_step": 1,
+  "steps": [
+    {"argv": ["lake", "build", "--no-build", "@dep/+Dep:olean"], "exit_code": 0,
+     "started_at_ms": 1764150000000, "finished_at_ms": 1764150000420},
+    {"argv": ["lake", "build", "Chain.C"], "exit_code": 1,
+     "started_at_ms": 1764150000421, "finished_at_ms": 1764150003870}
+  ],
+  "log": {"path": "/abs/project/.local/lean-host-mcp/store/logs/3f0c….log", "bytes": 5120, "truncated": false},
+  "tail": "error: ./././Chain/C.lean:3:2: type mismatch …"
+}
+```
+
+- `state` is `done` when every step that should run ran, and `timed_out` when `[build] timeout_secs` stopped the build.
+  The wait for the turn counts toward that deadline.
+- `ok` is true when every step ran and passed. The reply sets MCP `isError` when `ok` is false.
+- `exit_code` is the first failing step's code, `0` when all passed, and null when the build was stopped. `failed_step`
+  is that step's index in `steps`.
+- Each step's `exit_code` is Lake's code, or 128 plus the signal that ended it.
+- `log` names the whole log of every step, in the server's store. Output past `[build] log_limit_mib` is dropped and
+  `truncated` is true. `tail` holds the log's last 8 KiB, or less when `[output] max_field_bytes` is smaller.
+
+A request the config does not allow, such as an unknown recipe or a word Lake must not see, fails with MCP invalid
+params before anything runs.
+
+## `lean_imports`
+
+`lean_imports` lists each file's whole transitive import closure, not only the file's direct imports. It reads the
+closure from `lake --no-build --no-cache setup-file <file>` (the `importArts` Lake reports) under the project's read
+turn, so it waits for a running build. It builds nothing.
+
+```json
+{"name":"lean_imports","arguments":{"files":["Chain/C.lean"]}}
+```
+
+```json
+{
+  "files": [
+    {
+      "file": "Chain/C.lean",
+      "module": "Chain.C",
+      "imports": [
+        {"module": "Chain.B", "olean": "/abs/project/.lake/build/lib/lean/Chain/B.olean",
+         "source": "/abs/project/Chain/B.lean"},
+        {"module": "Chain.A", "olean": "/abs/project/.lake/build/lib/lean/Chain/A.olean",
+         "source": "/abs/project/Chain/A.lean"},
+        {"module": "Dep", "olean": "/abs/project/dep/.lake/build/lib/lean/Dep.olean", "source": null}
+      ]
+    }
+  ]
+}
+```
+
+- `files` takes 1 to 16 Lean files, absolute or relative to the Lake root. Each reply entry keeps `file` as the request
+  named it.
+- `olean` is the absolute path Lake loads. `source` is the absolute source path when the `.olean` lies under the root's
+  own `.lake/build` and the file exists where the module name puts it; otherwise it is null.
+- When an import of a file is missing or stale, the call fails as a whole: the result sets MCP `isError` and holds
+  `{"error":{"code":"setup_file_failed","message":…}}`, whose message names the file and quotes Lake. A file the server
+  cannot read fails the same way with code `invalid_request`. The reply never holds a partial list.
 
 ## Response Shape
 
@@ -639,8 +723,8 @@ declaration in a module. The server reads Lean source and calls Lean's elaborato
 run `lake build`.
 
 For an explicitly selected prepared project, file-backed verification stages the current source and checks it in a
-supervised one-shot Lean process against the prepared imports. A compiled declaration lookup can still succeed after
-an edit breaks the proof. Use file-backed verification to check that edit.
+supervised one-shot Lean process against the prepared imports. A compiled declaration lookup can still succeed after an
+edit breaks the proof. Use file-backed verification to check that edit.
 
 By-name targets support multi-clause equation definitions and theorems, `where`-structure definitions,
 `structure`/`class` commands, and anonymous instances under generated `inst…` names. Discover generated names with
@@ -720,10 +804,10 @@ module has no source file, `module_all` may use the `.ilean` declaration invento
 in `trust`. Every source-backed trust fact includes `content_sha256`, the SHA-256 of the exact bytes used by the call.
 
 `detail` defaults to `"compact"`, which keeps declaration names, files, statuses, bounded diagnostics and goal text,
-sorry/admit facts, axiom facts, and trustworthiness flags. It omits target and ambiguous-candidate span blocks.
-For ordinary file-backed verification, diagnostics that exceed the compact row budget may be skipped while later
-diagnostics are retained. `facts.output_truncated` identifies partial display evidence. Use `"detail": "full"` when you
-need source spans in each row.
+sorry/admit facts, axiom facts, and trustworthiness flags. It omits target and ambiguous-candidate span blocks. For
+ordinary file-backed verification, diagnostics that exceed the compact row budget may be skipped while later diagnostics
+are retained. `facts.output_truncated` identifies partial display evidence. Use `"detail": "full"` when you need source
+spans in each row.
 
 `retry_tainted_non_positive` (default `false`) opts into one server-side retry per target-group batch: when the worker
 was recycled mid-call and the batch comes back non-positive (any row that would be relabeled `worker_recycled`), the
@@ -736,8 +820,8 @@ A `not_found` row for an explicit target may carry declarations with matching sh
 job; the server returns no diff-coverage object.
 
 Check `facts_trustworthy` before interpreting absence of sorry or unresolved goals. An empty `axioms` list establishes
-that no dependencies were found only when `axioms_available` is true and `axioms_truncated` is false.
-`axioms_available` is false when reporting was not requested or the axiom set could not be computed.
+that no dependencies were found only when `axioms_available` is true and `axioms_truncated` is false. `axioms_available`
+is false when reporting was not requested or the axiom set could not be computed.
 
 ## `lean_lookup`
 
