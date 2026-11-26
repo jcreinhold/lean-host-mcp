@@ -38,6 +38,8 @@ use rustix::process::{Pid, getpgrp, getsid, setsid};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub(crate) mod log;
+
 /// Version of the shared-writer CLI and ownership record.
 pub const PROTOCOL: u32 = 1;
 const FRAME_BYTES: u64 = 1024 * 1024;
@@ -976,7 +978,8 @@ fn barrier_closed(barrier: &rustix::fd::OwnedFd) -> io::Result<bool> {
 }
 
 // Two streams at this limit still fit the 1 MiB control frame even when
-// every byte needs JSON's longest six-byte escape. No log tempfile can grow.
+// every byte needs JSON's longest six-byte escape. A run with a log sends its
+// output to the log instead.
 const CAPTURE_BYTES: usize = 64 * 1024;
 
 pub(crate) fn module_setup_digest(bytes: &[u8]) -> String {
@@ -996,12 +999,18 @@ struct Capture {
     limit: usize,
 }
 
+/// A pipe whose ends close on exec, with a nonblocking read end.
+fn output_pipe() -> io::Result<(rustix::fd::OwnedFd, rustix::fd::OwnedFd)> {
+    let (read, write) = pipe()?;
+    fcntl_setfd(&read, FdFlags::CLOEXEC)?;
+    fcntl_setfd(&write, FdFlags::CLOEXEC)?;
+    fcntl_setfl(&read, fcntl_getfl(&read)? | OFlags::NONBLOCK)?;
+    Ok((read, write))
+}
+
 impl Capture {
     fn pipe() -> io::Result<(Self, Stdio)> {
-        let (read, write) = pipe()?;
-        fcntl_setfd(&read, FdFlags::CLOEXEC)?;
-        fcntl_setfd(&write, FdFlags::CLOEXEC)?;
-        fcntl_setfl(&read, fcntl_getfl(&read)? | OFlags::NONBLOCK)?;
+        let (read, write) = output_pipe()?;
         Ok((
             Self {
                 descriptor: read,
@@ -1058,6 +1067,53 @@ fn poll_output(stdout: &mut Capture, stderr: &mut Capture, reason: &mut Option<S
                 reason.get_or_insert_with(|| format!("writer output read failed: {error}"));
             }
             Ok(_) => {}
+        }
+    }
+}
+
+/// Where a stage's stdout and stderr go: two captures that the stopped frame
+/// carries, or one pipe into the server's log.
+enum StageOutput {
+    Captured(Capture, Capture),
+    Logged(log::LogSink),
+}
+
+impl StageOutput {
+    /// The helper's side and the stage's stdout and stderr.
+    fn open(log: Option<&log::LogTarget>) -> io::Result<(Self, Stdio, Stdio)> {
+        let Some(target) = log else {
+            let (stdout, child_stdout) = Capture::pipe()?;
+            let (stderr, child_stderr) = Capture::pipe()?;
+            return Ok((Self::Captured(stdout, stderr), child_stdout, child_stderr));
+        };
+        let (read, write) = output_pipe()?;
+        let stderr = write.try_clone()?;
+        Ok((
+            Self::Logged(log::LogSink::new(read, target)?),
+            Stdio::from(write),
+            Stdio::from(stderr),
+        ))
+    }
+
+    /// Read what the stage has written. A capture over its limit stops the
+    /// stage; a log never does.
+    fn poll(&mut self, reason: &mut Option<String>) {
+        match self {
+            Self::Captured(stdout, stderr) => poll_output(stdout, stderr, reason),
+            Self::Logged(sink) => {
+                if let Err(error) = sink.read_available() {
+                    reason.get_or_insert_with(|| format!("writer log failed: {error}"));
+                }
+            }
+        }
+    }
+
+    /// The stdout and stderr a stopped frame carries. A logged stage's output
+    /// is in its log.
+    fn texts(&self) -> (String, String) {
+        match self {
+            Self::Captured(stdout, stderr) => (stdout.text(), stderr.text()),
+            Self::Logged(_) => (String::new(), String::new()),
         }
     }
 }
@@ -1119,10 +1175,8 @@ fn write_launch(
 
 const DESCENDANT_EXIT_GRACE: Duration = Duration::from_millis(100);
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "private lifecycle seam keeps actual process and lock custody testable"
-)]
+/// Run one stage. A private seam so tests can drive real process and lock
+/// custody with a fixture launcher.
 fn execute_with_launcher(
     message: &Value,
     root: &Path,
@@ -1133,6 +1187,7 @@ fn execute_with_launcher(
     input: &Receiver<io::Result<Value>>,
     launcher: &Path,
     registry: &Path,
+    log: Option<&log::LogTarget>,
     mut emit: impl FnMut(&Value) -> io::Result<()>,
 ) -> io::Result<bool> {
     canonical(root)?;
@@ -1145,8 +1200,7 @@ fn execute_with_launcher(
     let deadline = started
         .checked_add(timeout)
         .ok_or_else(|| invalid("writer timeout is too large"))?;
-    let (mut stdout, child_stdout) = Capture::pipe()?;
-    let (mut stderr, child_stderr) = Capture::pipe()?;
+    let (mut output, child_stdout, child_stderr) = StageOutput::open(log)?;
     let (barrier, inherited) = pipe()?;
     fcntl_setfd(&barrier, FdFlags::CLOEXEC)?;
     fcntl_setfl(&barrier, fcntl_getfl(&barrier)? | OFlags::NONBLOCK)?;
@@ -1222,7 +1276,7 @@ fn execute_with_launcher(
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        poll_output(&mut stdout, &mut stderr, &mut reason);
+        output.poll(&mut reason);
         let status = match group.try_wait() {
             Ok(status) => status,
             Err(error) => {
@@ -1274,9 +1328,8 @@ fn execute_with_launcher(
                 if let Err(error) = &cleared {
                     reason.get_or_insert_with(|| format!("writer closed but ownership record cleanup failed: {error}"));
                 }
-                poll_output(&mut stdout, &mut stderr, &mut reason);
-                let captured_stdout = stdout.text();
-                let captured_stderr = stderr.text();
+                output.poll(&mut reason);
+                let (captured_stdout, captured_stderr) = output.texts();
                 let unavailable = reason.is_some() || group.intervened();
                 // Physical closure is a distinct terminal fact even when the
                 // command's result is unusable. Never lose it behind the earlier
@@ -1400,6 +1453,7 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                     {
                         return Err(invalid(format!("writer stage cannot change {OWNERS_DIRECTORY_ENV}")));
                     }
+                    let log = log::take_log(&mut message)?;
                     // Re-derive the declared graph immediately before this stage.
                     // Unknown or expanded graphs never release a command body.
                     for required in workspace_domains(&workspaces)? {
@@ -1434,6 +1488,7 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                         &input,
                         &std::env::current_exe()?,
                         &registry,
+                        log.as_ref(),
                         send,
                     )? {
                         break;

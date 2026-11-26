@@ -53,8 +53,8 @@ pub struct InstallArgs {
     #[arg(long, value_name = "DIR")]
     pub lake_root: PathBuf,
 
-    /// Install directory for `bin/`, `workers/` and `store/`
-    /// [default: <root>/.local/lean-host-mcp].
+    /// Install directory for `bin/`, `workers/` and `store/`; defaults to
+    /// `<root>/.local/lean-host-mcp`.
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
 
