@@ -134,6 +134,12 @@ impl ProjectLock {
         Arc::clone(&self.rw).try_read_owned().ok()
     }
 
+    /// Write turns that ended with `finish`. Stable while any read turn on
+    /// this root is held.
+    pub(crate) fn builds_finished(&self) -> u64 {
+        self.builds_finished.load(Ordering::Acquire)
+    }
+
     /// The writer at the front of the line, which every new reader waits for.
     fn blocked_by(&self) -> Option<String> {
         self.writers.lock().line.front().map(|(_, name)| name.clone())
@@ -209,7 +215,7 @@ pub(crate) async fn ensure_read(
     cancellation: &CallCancellation,
 ) -> Result<u64, TurnRefused> {
     let Ok(slot) = TURN.try_with(Arc::clone) else {
-        return Ok(lock.builds_finished.load(Ordering::Acquire));
+        return Ok(lock.builds_finished());
     };
     let mut held = slot.lock().await;
     if let Some(read) = held.as_ref() {
@@ -225,7 +231,7 @@ pub(crate) async fn ensure_read(
         turn = tokio::time::timeout_at(deadline, Arc::clone(&lock.rw).read_owned()) => turn
             .map_err(|_| TurnRefused::Expired { blocked_by: lock.blocked_by() })?,
     };
-    let granted_at = lock.builds_finished.load(Ordering::Acquire);
+    let granted_at = lock.builds_finished();
     let guard_root = root.to_path_buf();
     let remaining = deadline.saturating_duration_since(Instant::now());
     let guard = tokio::select! {
@@ -251,6 +257,20 @@ pub(crate) async fn ensure_read(
         granted_at,
     });
     Ok(granted_at)
+}
+
+/// The finished-build count at the current request's read turn on `root`.
+/// `None` outside a request scope, before the request holds a turn there, or
+/// while another part of the request waits for one.
+pub(crate) fn granted_at(root: &Path) -> Option<u64> {
+    TURN.try_with(|slot| {
+        let held = slot.try_lock().ok()?;
+        held.as_ref()
+            .filter(|read| read.root == root)
+            .map(|read| read.granted_at)
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

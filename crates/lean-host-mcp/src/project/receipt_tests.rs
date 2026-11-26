@@ -311,6 +311,7 @@ fn ordinary_state(root: &Path, tracker: &LeanWorkerProcessTracker) -> (Arc<LeanP
         worker_generation_base: 1,
         last_restart: None,
         imports_seen: Vec::new(),
+        loaded_at: None,
         profile_switch_count: 0,
         last_rss_kib: None,
         abnormal_restart_times: VecDeque::new(),
@@ -1181,6 +1182,66 @@ async fn lifecycle_ticks_preserve_residue_quiescence_and_one_cycle_per_quiet_per
         2,
         "prewarming cannot spend the same quiet period twice"
     );
+    harness.finish().await;
+}
+
+/// Run one call the way a request does: under a read turn on the project.
+async fn call_under_turn(harness: &ActorHarness, lock: &crate::project_lock::ProjectLock) -> (u64, ProjectCall<()>) {
+    crate::project_lock::scope(async {
+        let granted = crate::project_lock::ensure_read(
+            lock,
+            &harness.project.canonical_root,
+            admission_deadline().into(),
+            &CallCancellation::default(),
+        )
+        .await
+        .expect("read turn on the fixture");
+        let call = Box::pin(harness.project.native_compatibility(admission_deadline()))
+            .await
+            .expect("the fake worker serves the call");
+        (granted, call)
+    })
+    .await
+}
+
+/// The fake worker holds no kernel lock, so a write turn can finish while it
+/// lives, which a real worker prevents. The count then makes the actor
+/// replace it once, before the next job.
+#[tokio::test]
+async fn a_build_finished_since_load_replaces_the_worker_once() {
+    use crate::project_lock::{Demand, ProjectLock};
+
+    let harness = ActorHarness::start_with_runtime(false, None, None, Some(TEST_DEADLINE));
+    let lock = Arc::new(ProjectLock::default());
+    let (granted, first) = call_under_turn(&harness, &lock).await;
+    assert_eq!(granted, 0);
+    assert!(first.runtime.call_restart.is_none(), "{:?}", first.runtime.call_restart);
+    let handle = tokio::runtime::Handle::current();
+    lock.observe_demand(Demand::Present, &handle);
+    lock.observe_demand(Demand::Absent, &handle);
+    tokio::time::timeout(TEST_DEADLINE, async {
+        while lock.builds_finished() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the outside writer's turn finishes");
+    let (granted, second) = call_under_turn(&harness, &lock).await;
+    assert_eq!(granted, 1);
+    let restart = second
+        .runtime
+        .call_restart
+        .as_ref()
+        .expect("a new worker serves the call");
+    assert_eq!(restart.cause, "artifacts_rebuilt");
+    assert_eq!(second.runtime.worker_generation, 2);
+    let (_, third) = call_under_turn(&harness, &lock).await;
+    assert!(
+        third.runtime.call_restart.is_none(),
+        "the new worker loaded after the build: {:?}",
+        third.runtime.call_restart
+    );
+    assert_eq!(harness.requests("spawn").len(), 2, "one replacement");
     harness.finish().await;
 }
 

@@ -760,6 +760,9 @@ struct JobMeta {
     retry_policy: RetryPolicy,
     _active_job: ActiveJobGuard,
     cancellation: CallCancellation,
+    /// The finished-build count of the request's read turn, or `None` when the
+    /// job was sent without one.
+    granted_at: Option<u64>,
 }
 
 enum ProjectMessage {
@@ -1519,6 +1522,7 @@ impl LeanProject {
                 pool_active_jobs: Arc::clone(&self.pool_active_jobs),
             },
             cancellation: CallCancellation::current(),
+            granted_at: crate::project_lock::granted_at(&self.canonical_root),
         }
     }
 
@@ -1675,6 +1679,13 @@ impl LeanProject {
 
     pub(crate) fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire) && self.actor_tx.lock().as_ref().is_some_and(|tx| !tx.is_closed())
+    }
+
+    /// The generation of this project's worker while the actor is healthy.
+    /// A cached answer is good only while the generation that computed it
+    /// lives. The actor notices a dead child within one liveness poll.
+    pub(crate) fn live_generation(&self) -> Option<u64> {
+        self.is_healthy().then(|| self.runtime.lock().worker_generation)
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -1904,21 +1915,34 @@ impl ActorConfig {
     }
 }
 
-/// One import profile the child may be holding, and the build state it was
-/// holding it at.
-struct ImportProfileStamp {
+/// One import profile the child may be holding.
+struct ImportProfile {
     fingerprint: String,
     /// The profile's imports, kept so a pre-warm after an idle cycle can reopen
     /// it. The fingerprint is `imports.join("\n")` and could be split back, but
     /// that makes the pre-warm depend on the fingerprint's spelling; this list is
     /// what the child was actually asked for.
     imports: Vec<String>,
-    /// Exact per-import artifact metadata when last served. `None` means an
-    /// artifact could not be inspected, so a pooled session cannot be trusted.
-    artifact_stamp: Option<crate::cache::ImportArtifactStamp>,
     /// When this profile was last served, so an idle cycle only pre-warms a
     /// profile a returning caller is plausibly still working in.
     last_served: Instant,
+}
+
+/// The finished-build count under which a worker generation first loaded
+/// imports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoadedAt {
+    generation: u64,
+    builds_finished: u64,
+}
+
+impl LoadedAt {
+    /// Whether a job whose read turn saw `granted_at` must not reuse
+    /// `generation`: a build finished after that generation loaded. A record
+    /// for another generation says nothing about this one.
+    const fn stale_for(self, generation: u64, granted_at: u64) -> bool {
+        self.generation == generation && granted_at > self.builds_finished
+    }
 }
 
 struct ProjectActorState {
@@ -1932,9 +1956,11 @@ struct ProjectActorState {
     ///
     /// A *list* because the child pools sessions: it holds several imported
     /// environments at once, so "the profile the live session was opened with"
-    /// is no longer a single value, and a stamp recorded for one profile stays
-    /// relevant while another is served.
-    imports_seen: Vec<ImportProfileStamp>,
+    /// is no longer a single value.
+    imports_seen: Vec<ImportProfile>,
+    /// The finished-build count under which the live generation first loaded
+    /// imports. A record for an older generation is ignored.
+    loaded_at: Option<LoadedAt>,
     profile_switch_count: u64,
     last_rss_kib: Option<u64>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
@@ -2148,7 +2174,8 @@ impl ProjectActorState {
         self.note_import_profile_switch(&meta);
         let job_started = Instant::now();
         let cpu_baseline = self.cpu_baseline();
-        let mut call_restart: Option<RuntimeRestartEvent> = self.cycle_if_imports_rebuilt(&meta)?;
+        self.note_import_profile(&meta.import_fingerprint, &meta.imports);
+        let mut call_restart: Option<RuntimeRestartEvent> = self.cycle_if_build_finished(&meta)?;
         let established = crate::broker::MaintenanceAccess::native_contract(&self.config.toolchain_label)
             .map_err(ServerError::BadProject)?;
         let expectation =
@@ -2409,6 +2436,11 @@ impl ProjectActorState {
             }
         };
 
+        // A retry or restart may have loaded imports on a new generation,
+        // still under this job's read turn.
+        if let Some(granted_at) = meta.granted_at {
+            self.note_loaded_at(granted_at);
+        }
         // The one finalization point: elapsed/CPU are sampled after the loop,
         // and the facts are built and published exactly once per call.
         let call_elapsed_millis = millis_u64(job_started.elapsed());
@@ -2713,46 +2745,40 @@ impl ProjectActorState {
             })
     }
 
-    /// Drop the live session when a `.olean` it imported has been rebuilt.
+    /// Replace the worker when a build finished after it loaded imports.
     ///
-    /// A worker session's environment is a snapshot taken at import: the child
-    /// reuses a session whose imports match, so `.olean` files written after
-    /// that import are invisible to it. Before the child learned to reuse,
-    /// every call re-imported, and that accident is what kept a mid-session
-    /// `lake build` from being served stale answers. This restores the property
-    /// deliberately, at k `stat` calls per job rather than a full import.
+    /// A worker session's environment is a snapshot taken at import, and the
+    /// child pools sessions, so `.olean` files written later are invisible to
+    /// every profile it holds. Each job carries the finished-build count of its
+    /// read turn; the actor keeps the count under which the live generation
+    /// first loaded. A higher count means a write turn ended in between, so the
+    /// job runs on a fresh worker instead, which is why `artifacts_rebuilt` is
+    /// not an execution taint.
     ///
-    /// Checked against the stamp recorded for *this* import profile, whichever
-    /// profile ran in between. Until the child pooled sessions, a differing
-    /// profile always re-imported, so only the immediately preceding profile
-    /// could be stale and one remembered stamp sufficed. A pooled child parks
-    /// the old environment instead, so a profile served three calls ago can be
-    /// restored without importing — and would be served from `.olean` files
-    /// rebuilt since. Recycling before the job means the job then runs on a
-    /// fresh worker, which is why `artifacts_rebuilt` is not an execution taint.
-    ///
-    /// Named-import stamps are a per-profile hint, including removal and
-    /// backdated replacement. They are insufficient when a failed build changed
-    /// a transitive dependency without rebuilding the named import. Actual
-    /// worker read epochs independently invalidate the whole child before
-    /// imported state or a body is reused after such a writer.
-    fn cycle_if_imports_rebuilt(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
-        let stamp = crate::cache::ImportArtifactStamp::capture_for_project(&self.config.lake_root, &meta.imports);
-        // Recorded unconditionally: this is the stamp of the artifacts the
-        // session about to serve the job will have imported, whether that
-        // session is a pooled one, the live one, or the replacement opened
-        // below.
-        if !self.note_import_profile(&meta.import_fingerprint, &meta.imports, stamp) {
+    /// A worker holds the shared kernel lock for its whole life, so no writer
+    /// can finish under a live generation and this check is a backstop. A job
+    /// sent without a read turn is not checked.
+    fn cycle_if_build_finished(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
+        let Some(granted_at) = meta.granted_at else {
+            return Ok(None);
+        };
+        let generation = self.observed_generation();
+        if !self
+            .loaded_at
+            .is_some_and(|loaded| loaded.stale_for(generation, granted_at))
+        {
+            self.note_loaded_at(granted_at);
             return Ok(None);
         }
         let reason = format!(
-            "artifacts_rebuilt imports={} named_olean_metadata_changed",
+            "artifacts_rebuilt imports={} build_finished_since_load",
             meta.imports.len()
         );
         self.record_restart_or_stop(RestartCause::ArtifactsRebuilt, &reason)
             .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
         self.handle.cycle().map_err(map_worker_err)?;
         self.forget_pooled_import_profiles();
+        self.note_loaded_at(granted_at);
         let event = restart_event(
             RestartCause::ArtifactsRebuilt,
             reason,
@@ -2764,6 +2790,18 @@ impl ProjectActorState {
         Ok(Some(event))
     }
 
+    /// Record that the live generation loads imports under `builds_finished`,
+    /// unless it already has a record. The first load is the one that counts.
+    fn note_loaded_at(&mut self, builds_finished: u64) {
+        let generation = self.observed_generation();
+        if self.loaded_at.is_none_or(|loaded| loaded.generation != generation) {
+            self.loaded_at = Some(LoadedAt {
+                generation,
+                builds_finished,
+            });
+        }
+    }
+
     /// The profile the most recent job ran with, or `None` before the first job.
     ///
     /// Reported as the `import_profile` runtime fact and used to count switches.
@@ -2772,41 +2810,28 @@ impl ProjectActorState {
         self.imports_seen.last().map(|held| held.fingerprint.as_str())
     }
 
-    /// Record that `fingerprint` is now the most recently served profile,
-    /// carrying `stamp`, and report whether an existing session must be cycled.
-    ///
-    /// A new profile has no session to invalidate. A failed artifact inspection
-    /// always invalidates a previously held session.
-    fn note_import_profile(
-        &mut self,
-        fingerprint: &str,
-        imports: &[String],
-        stamp: Option<crate::cache::ImportArtifactStamp>,
-    ) -> bool {
+    /// Record that `fingerprint` is now the most recently served profile.
+    fn note_import_profile(&mut self, fingerprint: &str, imports: &[String]) {
         if let Some(index) = self
             .imports_seen
             .iter()
             .position(|held| held.fingerprint == fingerprint)
         {
             let mut held = self.imports_seen.remove(index);
-            let changed = stamp.is_none() || held.artifact_stamp != stamp;
-            held.artifact_stamp = stamp;
             held.last_served = Instant::now();
             self.imports_seen.push(held);
-            return changed;
+            return;
         }
         // Bounded by the child's own session-pool capacity, so the parent's
         // picture of what the child holds cannot outgrow what it can hold.
         while self.imports_seen.len() >= self.config.session_pool_capacity {
             self.imports_seen.remove(0);
         }
-        self.imports_seen.push(ImportProfileStamp {
+        self.imports_seen.push(ImportProfile {
             fingerprint: fingerprint.to_owned(),
             imports: imports.to_vec(),
-            artifact_stamp: stamp,
             last_served: Instant::now(),
         });
-        false
     }
 
     /// Cycle the child now, between requests, if imports have retained more than
@@ -2876,7 +2901,7 @@ impl ProjectActorState {
         };
         // Idle recycling and prewarming can start a child and elaborate Lean.
         // They participate in the same atomic admission/retirement boundary.
-        let Some(_activity) = self
+        let Some(activity) = self
             .config
             .maintenance
             .try_begin(&self.config.lake_root, &self.config.session_id)
@@ -2949,13 +2974,13 @@ impl ProjectActorState {
         let Some((fingerprint, imports)) = prewarm else {
             return;
         };
-        let stamp = crate::cache::ImportArtifactStamp::capture_for_project(&self.config.lake_root, &imports);
         match self.handle.open_session_with_imports(imports.clone(), None, None) {
             Ok(_session) => {
                 // Record it the same way a served job would, so the *next* call
-                // on this profile compares artifact stamps against the import
-                // that actually happened rather than treating it as unseen.
-                let _changed = self.note_import_profile(&fingerprint, &imports, stamp);
+                // compares its read turn's count against the one this import
+                // happened under.
+                self.note_import_profile(&fingerprint, &imports);
+                self.note_loaded_at(activity.builds_finished());
             }
             Err(err) => {
                 self.seal_artifact_refusal(&err);
@@ -2970,11 +2995,11 @@ impl ProjectActorState {
     /// Forget every pooled profile except the one the current job is serving.
     ///
     /// Called after the child is replaced: the new child holds nothing its
-    /// predecessor held, so every remembered stamp but one describes an
+    /// predecessor held, so every remembered profile but one describes an
     /// environment that no longer exists. The exception is the current job's
     /// profile, which the caller records before the replacement and the job
-    /// then re-imports into the fresh child — dropping it too would blind the
-    /// *next* call to a rebuild that lands right after this one.
+    /// then re-imports into the fresh child, so it stays the profile a later
+    /// idle cycle pre-warms.
     fn forget_pooled_import_profiles(&mut self) {
         if let Some(current) = self.imports_seen.pop() {
             self.imports_seen.clear();
@@ -3375,6 +3400,7 @@ fn actor_main(
         worker_generation_base: 1,
         last_restart: None,
         imports_seen: Vec::new(),
+        loaded_at: None,
         profile_switch_count: 0,
         last_rss_kib: None,
         runtime: Arc::clone(&config.runtime),
@@ -4734,6 +4760,7 @@ mod tests {
                     pool_active_jobs: Arc::clone(&pool_active),
                 },
                 cancellation: cancellation.clone(),
+                granted_at: None,
             },
             source: String::new(),
             query: LeanWorkerModuleQuery::Diagnostics,

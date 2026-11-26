@@ -257,7 +257,8 @@ impl MaintenanceAccess {
         }
         // Idle work never waits for a turn. It runs only when no writer holds
         // or waits for the project.
-        let turn = registry.locks.get(root).try_read()?;
+        let lock = registry.locks.get(root);
+        let turn = lock.try_read()?;
         // An evicted/replaced controller cannot start another idle recycle.
         let job = registry
             .registry
@@ -268,6 +269,7 @@ impl MaintenanceAccess {
         Some(MaintenanceGuard {
             _job: job?,
             _turn: turn,
+            builds_finished: lock.builds_finished(),
         })
     }
 }
@@ -277,6 +279,14 @@ impl MaintenanceAccess {
 pub(crate) struct MaintenanceGuard {
     _job: crate::project::ActiveJobGuard,
     _turn: tokio::sync::OwnedRwLockReadGuard<()>,
+    builds_finished: u64,
+}
+
+impl MaintenanceGuard {
+    /// The finished-build count under this read turn.
+    pub(crate) const fn builds_finished(&self) -> u64 {
+        self.builds_finished
+    }
 }
 
 impl ProjectBroker {

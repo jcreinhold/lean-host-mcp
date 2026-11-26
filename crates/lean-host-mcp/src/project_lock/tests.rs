@@ -23,7 +23,7 @@ async fn wait_for(mut condition: impl FnMut() -> bool) -> TestResult {
 }
 
 fn finished(lock: &ProjectLock) -> u64 {
-    lock.builds_finished.load(Ordering::Acquire)
+    lock.builds_finished()
 }
 
 #[tokio::test]
@@ -81,12 +81,12 @@ async fn a_nested_read_reuses_the_turn_while_a_writer_waits() -> TestResult {
     let handle = tokio::runtime::Handle::current();
     let cancellation = CallCancellation::default();
     let until = deadline(WAIT)?;
-    let (first, nested, elsewhere) = scope(async {
+    let (first, nested, elsewhere, seen) = scope(async {
         let first = ensure_read(&lock, &root, until, &cancellation).await;
         lock.observe_demand(Demand::Present, &handle);
         let nested = ensure_read(&lock, &root, until, &cancellation).await;
         let elsewhere = ensure_read(&lock, &other, until, &cancellation).await;
-        (first, nested, elsewhere)
+        (first, nested, elsewhere, (granted_at(&root), granted_at(&other)))
     })
     .await;
     assert!(matches!(first, Ok(0)), "{first:?}");
@@ -95,6 +95,8 @@ async fn a_nested_read_reuses_the_turn_while_a_writer_waits() -> TestResult {
         "a nested read must not queue behind the writer: {nested:?}"
     );
     assert!(matches!(&elsewhere, Err(TurnRefused::OtherRoot(held)) if *held == root));
+    assert_eq!(seen, (Some(0), None), "a request reads the count of its own turn");
+    assert_eq!(granted_at(&root), None, "no turn outside a request");
     // The request ended, so the writer gets its turn.
     lock.observe_demand(Demand::Absent, &handle);
     wait_for(|| finished(&lock) == 1).await

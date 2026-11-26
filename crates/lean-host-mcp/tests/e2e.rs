@@ -18,13 +18,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 // Four tests below share one mutable file: the fixture's `Handles.olean`,
-// whose mtime the rebuild tests bump to stand in for `lake build`, while the
-// residue-budget tests assert across multi-second sleeps that the worker
-// serving that same import never recycles. Under the default parallel test
-// runner one test's bump lands inside another's stability window and the
-// assertions fail with `artifacts_rebuilt`; the named serial key confines
-// the exclusion to exactly these four, leaving the rest of the suite
-// parallel.
+// whose mtime the rebuild tests bump under an outside writer's turn to stand
+// in for `lake build`, while the residue-budget tests assert across
+// multi-second sleeps that the worker serving that same import never
+// recycles. A writer turn retires every idle worker on the fixture, so under
+// the default parallel test runner one test's bump would land inside
+// another's stability window; the named serial key confines the exclusion to
+// exactly these four, leaving the rest of the suite parallel.
 use serial_test::serial;
 
 use lean_host_mcp::tools::declaration::{InspectDeclarationFields, InspectDeclarationRequest, inspect_declaration};
@@ -1703,10 +1703,40 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
     );
 }
 
+/// Stand in for `lake build` of the fixture's `Handles` module the way another
+/// process does it: take the write turn through the shared writer, move the
+/// `.olean` mtime forward, and release. Forward, so the artifact stays newer
+/// than its source and Lake still considers the fixture built.
+///
+/// An idle worker holds the shared lock for its whole life, so the writer gets
+/// in only after the host retires that worker. The writer blocks, so it runs
+/// off this test's runtime, where the host's handoff reaper must keep running.
+async fn rebuild_handles_as_an_outside_writer(root: &Path) {
+    const LIMIT: std::time::Duration = std::time::Duration::from_mins(1);
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let helper = Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+        let writer = lean_toolchain::shared_writer::SharedWriter::open(helper, &root, LIMIT)
+            .expect("the host hands the fixture to an outside writer");
+        let olean = root.join(".lake/build/lib/lean/LeanRsFixture/Handles.olean");
+        let bumped = fs::metadata(&olean).expect("fixture must be built").modified().unwrap()
+            + std::time::Duration::from_mins(1);
+        fs::File::options()
+            .write(true)
+            .open(&olean)
+            .expect("open the imported olean")
+            .set_modified(bumped)
+            .expect("bump the olean mtime");
+        writer.close(LIMIT).expect("the outside writer settles");
+    })
+    .await
+    .expect("the outside writer thread");
+}
+
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 #[serial(handles_olean)]
-async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call() {
+async fn an_outside_rebuild_hands_the_next_call_a_fresh_worker() {
     let Some(root) = fixture_root() else {
         return;
     };
@@ -1721,7 +1751,6 @@ async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call()
         fields: InspectDeclarationFields::default(),
     };
 
-    // First call opens the session and stamps the import's artifact.
     let first = inspect_declaration(&ctx, request()).await.expect("first inspect");
     let first_generation = first
         .runtime()
@@ -1729,8 +1758,8 @@ async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call()
         .worker_generation;
 
     // A second identical call must reuse everything: same session, no recycle.
-    // Asserted first so the recycle below is attributable to the mtime bump
-    // and not to something this workload does on every repeat.
+    // Asserted first so the fresh worker below is due to the writer and not to
+    // something this workload does on every repeat.
     let steady = inspect_declaration(&ctx, request()).await.expect("second inspect");
     let steady_runtime = steady.runtime().expect("full verbosity keeps runtime facts");
     assert!(
@@ -1739,38 +1768,24 @@ async fn rebuilding_an_imported_olean_recycles_the_worker_before_the_next_call()
         steady_runtime.call_restart
     );
     assert_eq!(steady_runtime.worker_generation, first_generation);
+    assert_eq!(steady.freshness.session_id, first.freshness.session_id);
 
-    // Now stand in for `lake build`: move the imported module's `.olean`
-    // mtime forward. Forward, not backward, so the artifact stays newer than
-    // its source and Lake still considers the fixture built.
-    let olean = root.join(".lake/build/lib/lean/LeanRsFixture/Handles.olean");
-    let bumped = std::fs::metadata(&olean)
-        .expect("fixture must be built")
-        .modified()
-        .unwrap()
-        + std::time::Duration::from_mins(1);
-    std::fs::File::options()
-        .write(true)
-        .open(&olean)
-        .expect("open the imported olean")
-        .set_modified(bumped)
-        .expect("bump the olean mtime");
+    rebuild_handles_as_an_outside_writer(&root).await;
 
+    // The worker that loaded the old artifact is gone, so the next call
+    // imports afresh in a new session and has nothing to recycle.
     let after = inspect_declaration(&ctx, request()).await.expect("third inspect");
-    let after_runtime = after.runtime().expect("full verbosity keeps runtime facts");
-    assert_eq!(
-        after_runtime.call_restart.as_ref().map(|event| event.cause.as_str()),
-        Some("artifacts_rebuilt"),
-        "a rebuilt import must recycle the worker so the next session re-imports; runtime={after_runtime:?}"
-    );
-    assert!(
-        after_runtime.worker_generation > first_generation,
-        "the recycle must actually advance the worker generation: {} -> {}",
-        first_generation,
-        after_runtime.worker_generation
-    );
-    // The recycle is pre-job, so the answer is still a real one.
     assert!(matches!(after.status, lean_host_mcp::ResponseStatus::Ok));
+    assert_ne!(
+        after.freshness.session_id, first.freshness.session_id,
+        "a writer turn must retire the worker that loaded the old artifact"
+    );
+    let after_runtime = after.runtime().expect("full verbosity keeps runtime facts");
+    assert!(
+        after_runtime.call_restart.is_none(),
+        "a fresh worker has nothing to recycle: {:?}",
+        after_runtime.call_restart
+    );
 }
 
 /// The proactive half of the residue policy: when a project falls quiet above
@@ -1864,17 +1879,16 @@ async fn a_project_under_its_soft_budget_never_cycles_for_residue() {
     }
 }
 
-/// A rebuild must be caught even when another import profile ran in between.
+/// A rebuild must reach a profile even when another import profile ran in
+/// between.
 ///
 /// The child pools sessions, so the profile served two calls ago is still alive
 /// and would be restored without re-importing — from `.olean` files that have
-/// since changed. Before the pool a differing profile always re-imported, so
-/// remembering only the immediately preceding profile was enough; this pins the
-/// property that survived that change.
+/// since changed. A writer turn retires the whole worker, pool and all.
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 #[serial(handles_olean)]
-async fn a_rebuild_recycles_even_when_another_profile_ran_in_between() {
+async fn an_outside_rebuild_reaches_a_pooled_profile() {
     let Some(root) = fixture_root() else {
         return;
     };
@@ -1887,14 +1901,10 @@ async fn a_rebuild_recycles_even_when_another_profile_ran_in_between() {
         raw_statement: false,
         fields: InspectDeclarationFields::default(),
     };
-    // Profile A stamps its artifact, then profile B takes over as the live one.
+    // Profile A loads its import, then profile B takes over as the live one.
     let first = inspect_declaration(&ctx, request("LeanRsFixture.Handles"))
         .await
         .expect("inspect under profile A");
-    let first_generation = first
-        .runtime()
-        .expect("full verbosity keeps runtime facts")
-        .worker_generation;
     let other = inspect_declaration(&ctx, request("LeanRsFixture.Strings"))
         .await
         .expect("inspect under profile B");
@@ -1904,50 +1914,31 @@ async fn a_rebuild_recycles_even_when_another_profile_ran_in_between() {
         "switching profiles must not recycle on its own: {:?}",
         other_runtime.call_restart
     );
+    assert_eq!(other.freshness.session_id, first.freshness.session_id);
 
-    // Stand in for `lake build` on A's import only. Forward, so the artifact
-    // stays newer than its source and Lake still considers the fixture built.
-    let olean = root.join(".lake/build/lib/lean/LeanRsFixture/Handles.olean");
-    let bumped = std::fs::metadata(&olean)
-        .expect("fixture must be built")
-        .modified()
-        .unwrap()
-        + std::time::Duration::from_mins(1);
-    std::fs::File::options()
-        .write(true)
-        .open(&olean)
-        .expect("open the imported olean")
-        .set_modified(bumped)
-        .expect("bump the olean mtime");
+    rebuild_handles_as_an_outside_writer(&root).await;
 
     let back = inspect_declaration(&ctx, request("LeanRsFixture.Handles"))
         .await
         .expect("inspect back under profile A");
-    let back_runtime = back.runtime().expect("full verbosity keeps runtime facts");
-    assert_eq!(
-        back_runtime.call_restart.as_ref().map(|event| event.cause.as_str()),
-        Some("artifacts_rebuilt"),
-        "returning to a rebuilt profile must recycle rather than reuse the pooled session; runtime={back_runtime:?}"
-    );
-    assert!(
-        back_runtime.worker_generation > first_generation,
-        "the recycle must actually advance the worker generation: {} -> {}",
-        first_generation,
-        back_runtime.worker_generation
-    );
     assert!(matches!(back.status, lean_host_mcp::ResponseStatus::Ok));
+    assert_ne!(
+        back.freshness.session_id, first.freshness.session_id,
+        "returning to a rebuilt profile must not reuse the pooled session"
+    );
 
-    // And it must not recycle again: the fresh child imported A at the new
-    // stamp, so the very next call has nothing left to invalidate.
+    // The fresh child imported A after the build, so the very next call has
+    // nothing left to replace.
     let settled = inspect_declaration(&ctx, request("LeanRsFixture.Handles"))
         .await
-        .expect("inspect after the recycle");
+        .expect("inspect after the rebuild");
     let settled_runtime = settled.runtime().expect("full verbosity keeps runtime facts");
     assert!(
         settled_runtime.call_restart.is_none(),
-        "one rebuild must cost exactly one recycle: {:?}",
+        "one rebuild must cost exactly one new worker: {:?}",
         settled_runtime.call_restart
     );
+    assert_eq!(settled.freshness.session_id, back.freshness.session_id);
 }
 
 #[tokio::test]

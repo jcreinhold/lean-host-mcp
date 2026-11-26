@@ -5,14 +5,14 @@
 //! host-side cache because the MCP host opens short-lived worker sessions for
 //! each request, while the Lean-side snapshot cache is scoped to one session.
 //!
-//! There is no TTL: source bytes, elaboration options, import artifacts and
-//! worker generation must match instead. Import metadata is checked before a
-//! lookup and again before insertion, so a rebuild during processing cannot
-//! poison subsequent hits. Each sampling pass holds the complete cooperating
-//! workspace read union; no partial lock set is retained across worker dispatch.
-//! As with the worker's session invalidation, this
-//! relies on Lake propagating dependency changes to the named imports; it does
-//! not scan their entire transitive closure on each query.
+//! There is no TTL. A key holds the source bytes, the elaboration inputs, and
+//! the finished-build count of the request's read turn. Each entry also names
+//! the worker generation that computed it and answers only while that
+//! generation lives: the worker holds the shared kernel lock for its whole
+//! life, so no writer has changed the artifacts it read. A probe made while
+//! another generation lives, or none, drops the entry. The count alone is not
+//! enough, since a short build in another process can end between two reaper
+//! ticks and never move it.
 //!
 //! **Only file-keyed module queries are cached**, and the reason is the same
 //! one stated positively. `inspect_declaration`, `search_declarations`,
@@ -25,6 +25,7 @@
 //! a question about a different elaboration budget than the one asked. Each
 //! bypass site carries a one-line pointer back here.
 
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -35,135 +36,38 @@ use lean_rs_worker_parent::{
 use lru::LruCache;
 use parking_lot::Mutex;
 
-/// Exact metadata of the resolved named imports. Unlike a maximum mtime, this
-/// notices deletion, backdating, and replacement of any individual artifact.
-/// It intentionally does not hash library contents on a cache lookup.
-#[derive(Eq, PartialEq, Hash, Clone, Debug)]
-pub(crate) struct ImportArtifactStamp(Vec<(String, Option<ArtifactFileStamp>)>);
-
-#[derive(Eq, PartialEq, Hash, Clone, Debug)]
-struct ArtifactFileStamp {
-    path: PathBuf,
-    length: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    identity: (u64, u64, i64, i64),
-}
-
-impl ImportArtifactStamp {
-    /// An unreadable artifact is uncacheable; a missing artifact is recorded
-    /// explicitly so creating it changes the stamp. Roots are searched in the
-    /// same order as the actor's artifact freshness check.
-    pub(crate) fn capture_for_project(root: &Path, imports: &[String]) -> Option<Self> {
-        let guard = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).ok()?;
-        let roots = crate::lake_meta::artifact_roots(root);
-        if roots.iter().any(|root| !guard.covers_artifact_root(root)) {
-            return None;
-        }
-        Self::capture_checked(&roots, imports, Some(&guard))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capture(roots: &[PathBuf], imports: &[String]) -> Option<Self> {
-        Self::capture_checked(roots, imports, None)
-    }
-
-    fn capture_checked(
-        roots: &[PathBuf],
-        imports: &[String],
-        guard: Option<&crate::artifact_reads::ArtifactReadGuard>,
-    ) -> Option<Self> {
-        let mut stamps = Vec::with_capacity(imports.len());
-        for import in imports {
-            let relative = import.split('.').collect::<PathBuf>().with_extension("olean");
-            let mut resolved = None;
-            for root in roots {
-                let path = root.join(&relative);
-                if guard.is_some_and(|guard| !guard.covers_artifact_root(&path)) {
-                    return None;
-                }
-                let metadata = match std::fs::metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => return None,
-                };
-                if !metadata.is_file() {
-                    return None;
-                }
-                #[cfg(unix)]
-                let identity = {
-                    use std::os::unix::fs::MetadataExt as _;
-                    (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
-                };
-                resolved = Some(ArtifactFileStamp {
-                    path,
-                    length: metadata.len(),
-                    modified: metadata.modified().ok()?,
-                    #[cfg(unix)]
-                    identity,
-                });
-                break;
-            }
-            stamps.push((import.clone(), resolved));
-        }
-        Some(Self(stamps))
-    }
-}
-
-/// All non-source inputs to a module query. Runtime configuration is immutable
-/// for a project handle; generation additionally separates recycled workers.
+/// All non-source inputs to a module query: the imports and options it asks
+/// with, and the finished-build count of the request's read turn.
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 pub(crate) struct ModuleQueryContext {
     request_hash: [u8; 32],
-    imports: Vec<String>,
-    artifacts: ImportArtifactStamp,
-    worker_generation: u64,
+    builds_finished: u64,
 }
 
 impl ModuleQueryContext {
     pub(crate) fn capture(
-        root: &Path,
         session_imports: &[String],
         freshness_imports: &[String],
         options: &lean_rs_worker_parent::LeanWorkerElabOptions,
-        worker_generation: u64,
+        builds_finished: u64,
     ) -> Option<Self> {
         let request_hash = hash_bytes(&serde_json::to_vec(&(session_imports, freshness_imports, options)).ok()?);
-        let mut imports = session_imports.to_vec();
-        imports.extend_from_slice(freshness_imports);
-        imports.sort();
-        imports.dedup();
-        let artifacts = ImportArtifactStamp::capture_for_project(root, &imports)?;
         Some(Self {
             request_hash,
-            imports,
-            artifacts,
-            worker_generation,
+            builds_finished,
         })
     }
+}
 
-    /// Admit a result only if the worker completed the call reliably. A crash
-    /// can return an empty outcome alongside restart facts; caching that value
-    /// would strip the failure on the next hit, which uses fresh runtime facts.
-    pub(crate) fn after_call(&self, root: &Path, runtime: &crate::envelope::RuntimeFacts) -> Option<Self> {
-        if crate::diagnosis::execution_taint(runtime).is_some() {
-            return None;
-        }
-        self.after_processing(root, runtime.worker_generation)
-    }
-
-    /// Resample only mutable inputs after processing. A changed generation is
-    /// safe to store under the resulting generation if artifacts stayed equal.
-    pub(crate) fn after_processing(&self, root: &Path, worker_generation: u64) -> Option<Self> {
-        let artifacts = ImportArtifactStamp::capture_for_project(root, &self.imports)?;
-        if artifacts != self.artifacts {
-            return None;
-        }
-        Some(Self {
-            worker_generation,
-            ..self.clone()
-        })
-    }
+/// The worker generation to file a call's result under: the one the call
+/// ended on. `None` when the worker did not complete the call reliably. A
+/// crash can return an empty outcome alongside restart facts; caching that
+/// value would strip the failure on the next hit, which uses fresh runtime
+/// facts.
+pub(crate) fn completed_generation(runtime: &crate::envelope::RuntimeFacts) -> Option<u64> {
+    crate::diagnosis::execution_taint(runtime)
+        .is_none()
+        .then_some(runtime.worker_generation)
 }
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
@@ -247,10 +151,33 @@ impl ModuleQueryBatchKey {
     }
 }
 
+/// A cached answer and the worker generation that computed it.
+#[derive(Debug)]
+struct Entry<T> {
+    value: T,
+    worker_generation: u64,
+}
+
+/// The cached answer for `key` when the generation that computed it is
+/// `live_generation`. Drops any other entry: its generation has retired.
+fn probe<K: Hash + Eq, T: Clone>(
+    cache: &Mutex<LruCache<K, Entry<T>>>,
+    key: &K,
+    live_generation: Option<u64>,
+) -> Option<T> {
+    let mut cache = cache.lock();
+    let entry = cache.get(key)?;
+    if Some(entry.worker_generation) == live_generation {
+        return Some(entry.value.clone());
+    }
+    cache.pop(key);
+    None
+}
+
 #[derive(Debug)]
 pub(crate) struct ModuleQueryCache {
-    single: Mutex<LruCache<CacheKey, LeanWorkerModuleQueryOutcome>>,
-    batch: Mutex<LruCache<BatchCacheKey, LeanWorkerModuleQueryBatchOutcome>>,
+    single: Mutex<LruCache<CacheKey, Entry<LeanWorkerModuleQueryOutcome>>>,
+    batch: Mutex<LruCache<BatchCacheKey, Entry<LeanWorkerModuleQueryBatchOutcome>>>,
 }
 
 impl ModuleQueryCache {
@@ -261,12 +188,15 @@ impl ModuleQueryCache {
         }
     }
 
+    /// `live_generation` is the generation of the project's live worker, or
+    /// `None` when no worker lives.
     pub(crate) fn get(
         &self,
         path: &Path,
         content_hash: [u8; 32],
         context: &ModuleQueryContext,
         query: &ModuleQueryKey,
+        live_generation: Option<u64>,
     ) -> Option<LeanWorkerModuleQueryOutcome> {
         let key = CacheKey {
             file_path: path.to_path_buf(),
@@ -274,7 +204,7 @@ impl ModuleQueryCache {
             context: context.clone(),
             query: query.clone(),
         };
-        self.single.lock().get(&key).cloned()
+        probe(&self.single, &key, live_generation)
     }
 
     pub(crate) fn insert(
@@ -283,6 +213,7 @@ impl ModuleQueryCache {
         content_hash: [u8; 32],
         context: ModuleQueryContext,
         query: ModuleQueryKey,
+        worker_generation: u64,
         value: LeanWorkerModuleQueryOutcome,
     ) {
         let key = CacheKey {
@@ -291,15 +222,23 @@ impl ModuleQueryCache {
             context,
             query,
         };
-        self.single.lock().put(key, value);
+        self.single.lock().put(
+            key,
+            Entry {
+                value,
+                worker_generation,
+            },
+        );
     }
 
+    /// As [`Self::get`], for a batch.
     pub(crate) fn get_batch(
         &self,
         path: &Path,
         content_hash: [u8; 32],
         context: &ModuleQueryContext,
         query: &ModuleQueryBatchKey,
+        live_generation: Option<u64>,
     ) -> Option<LeanWorkerModuleQueryBatchOutcome> {
         let key = BatchCacheKey {
             file_path: path.to_path_buf(),
@@ -307,7 +246,7 @@ impl ModuleQueryCache {
             context: context.clone(),
             query: query.clone(),
         };
-        self.batch.lock().get(&key).cloned().map(mark_batch_cache_hit)
+        probe(&self.batch, &key, live_generation).map(mark_batch_cache_hit)
     }
 
     pub(crate) fn insert_batch(
@@ -316,6 +255,7 @@ impl ModuleQueryCache {
         content_hash: [u8; 32],
         context: ModuleQueryContext,
         query: ModuleQueryBatchKey,
+        worker_generation: u64,
         value: LeanWorkerModuleQueryBatchOutcome,
     ) {
         let key = BatchCacheKey {
@@ -324,7 +264,13 @@ impl ModuleQueryCache {
             context,
             query,
         };
-        self.batch.lock().put(key, value);
+        self.batch.lock().put(
+            key,
+            Entry {
+                value,
+                worker_generation,
+            },
+        );
     }
 }
 
@@ -356,138 +302,150 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     reason = "a key these tests construct from a variant they name is always Some; a panic is the honest failure"
 )]
 mod tests {
-    use super::{ImportArtifactStamp, ModuleQueryBatchKey, ModuleQueryContext, ModuleQueryKey};
+    use std::path::Path;
+
+    use super::{ModuleQueryBatchKey, ModuleQueryCache, ModuleQueryContext, ModuleQueryKey, completed_generation};
     use lean_rs_worker_parent::{
-        LeanWorkerModuleQuery, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets, LeanWorkerProofPositionSelector,
+        LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryOutcome,
+        LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets, LeanWorkerProofPositionSelector,
     };
 
-    fn context(root: &std::path::Path) -> ModuleQueryContext {
+    fn context(builds_finished: u64) -> ModuleQueryContext {
         ModuleQueryContext::capture(
-            root,
             &["Demo.A".into()],
             &[],
             &lean_rs_worker_parent::LeanWorkerElabOptions::default(),
-            1,
+            builds_finished,
         )
         .unwrap()
     }
 
+    fn cache() -> ModuleQueryCache {
+        ModuleQueryCache::with_capacity(std::num::NonZeroUsize::new(4).unwrap())
+    }
+
+    fn batch_key() -> ModuleQueryBatchKey {
+        ModuleQueryBatchKey::from_batch(&[], &LeanWorkerOutputBudgets::default()).unwrap()
+    }
+
+    /// A write turn that finished after the entry was stored changes the key,
+    /// so even the live generation's answer misses.
     #[test]
-    fn imported_artifact_changes_invalidate_unchanged_source() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifact = temp.path().join(".lake/build/lib/lean/Demo/A.olean");
-        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        std::fs::write(&artifact, b"original").unwrap();
-        let cache = super::ModuleQueryCache::with_capacity(std::num::NonZeroUsize::new(4).unwrap());
-        let path = temp.path().join("Query.lean");
+    fn a_finished_build_misses_unchanged_source() {
+        let cache = cache();
+        let path = Path::new("/demo/Query.lean");
         let source = super::hash_bytes(b"import Demo.A");
-        let before = context(temp.path());
+        let before = context(0);
         cache.insert(
-            path.clone(),
+            path.to_path_buf(),
             source,
             before.clone(),
             ModuleQueryKey::Diagnostics,
-            lean_rs_worker_parent::LeanWorkerModuleQueryOutcome::Unsupported,
+            1,
+            LeanWorkerModuleQueryOutcome::Unsupported,
+        );
+        cache.insert_batch(
+            path.to_path_buf(),
+            source,
+            before.clone(),
+            batch_key(),
+            1,
+            LeanWorkerModuleQueryBatchOutcome::Unsupported,
         );
         assert!(
             cache
-                .get(&path, source, &before, &ModuleQueryKey::Diagnostics)
+                .get(path, source, &before, &ModuleQueryKey::Diagnostics, Some(1))
                 .is_some()
         );
-
-        // Deliberately backdate it: a newer-maximum-mtime check misses this.
-        std::fs::write(&artifact, b"changed artifact").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&artifact)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
-            .unwrap();
-        let after = context(temp.path());
-        assert_ne!(before, after);
-        assert!(cache.get(&path, source, &after, &ModuleQueryKey::Diagnostics).is_none());
+        assert!(cache.get_batch(path, source, &before, &batch_key(), Some(1)).is_some());
+        let after = context(1);
         assert!(
-            before.after_processing(temp.path(), 1).is_none(),
-            "rebuild during execution must not be cached"
+            cache
+                .get(path, source, &after, &ModuleQueryKey::Diagnostics, Some(1))
+                .is_none()
         );
-        std::fs::remove_file(&artifact).unwrap();
-        let missing = context(temp.path());
-        assert_ne!(after, missing);
-        std::fs::write(&artifact, b"rebuilt").unwrap();
-        assert_ne!(
-            missing,
-            context(temp.path()),
-            "creating a formerly missing import invalidates"
-        );
+        assert!(cache.get_batch(path, source, &after, &batch_key(), Some(1)).is_none());
+    }
+
+    /// An entry answers only while the generation that computed it lives:
+    /// that worker's shared lock has kept every writer out since it loaded.
+    /// After it retires, a build in another process may have ended between
+    /// two reaper ticks without moving the count, so the entry goes.
+    #[test]
+    fn a_retired_generations_cache_entries_miss() {
+        let cache = cache();
+        let path = Path::new("/demo/Query.lean");
+        let source = super::hash_bytes(b"import Demo.A");
+        let context = context(0);
+        let key = ModuleQueryKey::Diagnostics;
+        for live in [None, Some(2)] {
+            cache.insert(
+                path.to_path_buf(),
+                source,
+                context.clone(),
+                key.clone(),
+                1,
+                LeanWorkerModuleQueryOutcome::Unsupported,
+            );
+            cache.insert_batch(
+                path.to_path_buf(),
+                source,
+                context.clone(),
+                batch_key(),
+                1,
+                LeanWorkerModuleQueryBatchOutcome::Unsupported,
+            );
+            assert!(cache.get(path, source, &context, &key, Some(1)).is_some());
+            assert!(cache.get_batch(path, source, &context, &batch_key(), Some(1)).is_some());
+            assert!(cache.get(path, source, &context, &key, live).is_none(), "{live:?}");
+            assert!(
+                cache.get_batch(path, source, &context, &batch_key(), live).is_none(),
+                "{live:?}"
+            );
+            // The miss dropped both entries, so they do not come back.
+            assert!(cache.get(path, source, &context, &key, Some(1)).is_none(), "{live:?}");
+            assert!(
+                cache.get_batch(path, source, &context, &batch_key(), Some(1)).is_none(),
+                "{live:?}"
+            );
+        }
     }
 
     #[test]
-    fn artifact_stamps_track_each_import_and_preserve_warm_unrelated_queries() {
-        let temp = tempfile::tempdir().unwrap();
-        let roots = [temp.path().to_path_buf()];
-        let imports = ["A".into(), "B".into()];
-        let a = temp.path().join("A.olean");
-        let b = temp.path().join("B.olean");
-        std::fs::write(&a, b"a").unwrap();
-        std::fs::write(&b, b"b").unwrap();
-        let before = ImportArtifactStamp::capture(&roots, &imports).unwrap();
-        std::fs::write(temp.path().join("Unrelated.olean"), b"unrelated").unwrap();
-        assert_eq!(Some(before.clone()), ImportArtifactStamp::capture(&roots, &imports));
-        std::fs::remove_file(a).unwrap();
-        assert_ne!(Some(before), ImportArtifactStamp::capture(&roots, &imports));
-    }
-
-    #[test]
-    fn query_context_includes_options_imports_and_worker_generation() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let before = context(root);
+    fn query_context_includes_options_imports_and_build_count() {
+        let before = context(0);
         let project_options = lean_rs_worker_parent::LeanWorkerElabOptions::default().lean_options(
             std::collections::BTreeMap::from([("autoImplicit".into(), lean_toolchain::LeanOptionValue::Bool(false))]),
         );
         assert_ne!(
             Some(before.clone()),
-            ModuleQueryContext::capture(root, &["Demo.A".into()], &[], &project_options, 1)
+            ModuleQueryContext::capture(&["Demo.A".into()], &[], &project_options, 0)
         );
-
         let options = lean_rs_worker_parent::LeanWorkerElabOptions::default().heartbeat_limit(1);
         assert_ne!(
             Some(before.clone()),
-            ModuleQueryContext::capture(root, &["Demo.A".into()], &[], &options, 1)
+            ModuleQueryContext::capture(&["Demo.A".into()], &[], &options, 0)
         );
         assert_ne!(
             Some(before.clone()),
             ModuleQueryContext::capture(
-                root,
                 &["Demo.B".into()],
                 &[],
                 &lean_rs_worker_parent::LeanWorkerElabOptions::default(),
-                1
+                0
             )
         );
-        assert_ne!(
-            Some(before.clone()),
-            ModuleQueryContext::capture(
-                root,
-                &["Demo.A".into()],
-                &[],
-                &lean_rs_worker_parent::LeanWorkerElabOptions::default(),
-                2
-            )
-        );
-        assert_eq!(before.after_processing(root, 1), Some(before.clone()));
-        assert_eq!(before.after_processing(root, 2).unwrap().worker_generation, 2);
+        assert_ne!(before, context(1));
+        assert_eq!(before, context(0));
     }
 
     #[test]
     fn interrupted_call_cannot_cache_empty_outcome_for_retry() {
         use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
-        let temp = tempfile::tempdir().unwrap();
-        let before = context(temp.path());
-        let cache = super::ModuleQueryCache::with_capacity(std::num::NonZeroUsize::new(4).unwrap());
-        let path = temp.path().join("Query.lean");
+        let cache = cache();
+        let context = context(0);
+        let path = Path::new("/demo/Query.lean");
         let hash = super::hash_bytes(b"source containing an error");
-        let key = ModuleQueryBatchKey::from_batch(&[], &LeanWorkerOutputBudgets::default()).unwrap();
         for cause in [
             "child_abort",
             "child_exit",
@@ -504,25 +462,26 @@ mod tests {
                 }),
                 ..RuntimeFacts::default()
             };
-            if let Some(context) = before.after_call(temp.path(), &runtime) {
+            if let Some(generation) = completed_generation(&runtime) {
                 cache.insert_batch(
-                    path.clone(),
+                    path.to_path_buf(),
                     hash,
-                    context,
-                    key.clone(),
-                    lean_rs_worker_parent::LeanWorkerModuleQueryBatchOutcome::Unsupported,
+                    context.clone(),
+                    batch_key(),
+                    generation,
+                    LeanWorkerModuleQueryBatchOutcome::Unsupported,
                 );
             }
-            let retry = before.after_processing(temp.path(), 2).unwrap();
-            assert!(cache.get_batch(&path, hash, &retry, &key).is_none(), "{cause}");
+            assert!(
+                cache.get_batch(path, hash, &context, &batch_key(), Some(2)).is_none(),
+                "{cause}"
+            );
         }
     }
 
     #[test]
     fn retry_cache_requires_explicit_completed_final_attempt() {
         use crate::envelope::{FinalAttemptStatus, RuntimeFacts, RuntimeRestartEvent};
-        let temp = tempfile::tempdir().unwrap();
-        let before = context(temp.path());
         for status in [
             FinalAttemptStatus::Unknown,
             FinalAttemptStatus::Interrupted,
@@ -539,19 +498,17 @@ mod tests {
                 ..RuntimeFacts::default()
             };
             assert_eq!(
-                before.after_call(temp.path(), &runtime).is_some(),
-                status == FinalAttemptStatus::Completed
+                completed_generation(&runtime),
+                (status == FinalAttemptStatus::Completed).then_some(2)
             );
             runtime.call_restart = runtime.previous_attempt_failure.clone();
-            assert!(before.after_call(temp.path(), &runtime).is_none());
+            assert_eq!(completed_generation(&runtime), None);
         }
     }
 
     #[test]
     fn completed_calls_cache_after_planned_recycle_or_historical_crash() {
         use crate::envelope::{RuntimeFacts, RuntimeRestartEvent};
-        let temp = tempfile::tempdir().unwrap();
-        let before = context(temp.path());
         for cause in ["import_residue", "import_residue_idle", "artifacts_rebuilt"] {
             let runtime = RuntimeFacts {
                 worker_generation: 2,
@@ -562,7 +519,7 @@ mod tests {
                 }),
                 ..RuntimeFacts::default()
             };
-            assert!(before.after_call(temp.path(), &runtime).is_some(), "{cause}");
+            assert_eq!(completed_generation(&runtime), Some(2), "{cause}");
         }
         let runtime = RuntimeFacts {
             worker_generation: 2,
@@ -572,27 +529,7 @@ mod tests {
             }),
             ..RuntimeFacts::default()
         };
-        assert!(before.after_call(temp.path(), &runtime).is_some());
-    }
-
-    #[test]
-    fn batch_cache_also_separates_dependency_context() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache = super::ModuleQueryCache::with_capacity(std::num::NonZeroUsize::new(4).unwrap());
-        let before = context(temp.path());
-        let path = temp.path().join("Query.lean");
-        let hash = super::hash_bytes(b"source");
-        let query = ModuleQueryBatchKey::from_batch(&[], &LeanWorkerOutputBudgets::default()).unwrap();
-        cache.insert_batch(
-            path.clone(),
-            hash,
-            before.clone(),
-            query.clone(),
-            lean_rs_worker_parent::LeanWorkerModuleQueryBatchOutcome::Unsupported,
-        );
-        assert!(cache.get_batch(&path, hash, &before, &query).is_some());
-        let after = before.after_processing(temp.path(), 2).unwrap();
-        assert!(cache.get_batch(&path, hash, &after, &query).is_none());
+        assert_eq!(completed_generation(&runtime), Some(2));
     }
 
     #[test]
@@ -634,11 +571,10 @@ mod tests {
     /// question is never served as its answer to a different one.
     #[test]
     fn one_files_answer_is_never_served_for_a_different_question() {
-        let cache = super::ModuleQueryCache::with_capacity(std::num::NonZeroUsize::new(4).unwrap());
-        let path = std::path::Path::new("/demo/Basic.lean");
+        let cache = cache();
+        let path = Path::new("/demo/Basic.lean");
         let hash = super::hash_bytes(b"theorem t : True := trivial");
-        let temp = tempfile::tempdir().unwrap();
-        let context = context(temp.path());
+        let context = context(0);
         let stored = ModuleQueryKey::from_query(&LeanWorkerModuleQuery::TypeAt { line: 1, column: 2 }).unwrap();
 
         cache.insert(
@@ -646,11 +582,12 @@ mod tests {
             hash,
             context.clone(),
             stored.clone(),
-            lean_rs_worker_parent::LeanWorkerModuleQueryOutcome::Unsupported,
+            1,
+            LeanWorkerModuleQueryOutcome::Unsupported,
         );
 
         assert!(
-            cache.get(path, hash, &context, &stored).is_some(),
+            cache.get(path, hash, &context, &stored, Some(1)).is_some(),
             "same question, same answer"
         );
         for other in [
@@ -661,7 +598,7 @@ mod tests {
         ] {
             let key = ModuleQueryKey::from_query(&other).unwrap();
             assert!(
-                cache.get(path, hash, &context, &key).is_none(),
+                cache.get(path, hash, &context, &key, Some(1)).is_none(),
                 "{other:?} read a foreign entry"
             );
         }
@@ -669,7 +606,7 @@ mod tests {
         // this must miss without any TTL involved.
         assert!(
             cache
-                .get(path, super::hash_bytes(b"edited"), &context, &stored)
+                .get(path, super::hash_bytes(b"edited"), &context, &stored, Some(1))
                 .is_none()
         );
     }

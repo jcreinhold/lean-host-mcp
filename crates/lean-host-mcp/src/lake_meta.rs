@@ -336,7 +336,7 @@ pub(crate) const BUILD_LIB_REL: &str = ".lake/build/lib/lean";
 /// `manifest_package_root` without linking the Lean runtime into this parent.
 /// Keep this contract aligned when updating that dependency: project first,
 /// then manifest order, with `packagesDir`, path `dir`, and Git `subDir`
-/// respected. Unbuilt paths remain in the list so later builds are observed.
+/// respected. Unbuilt paths stay in the list so a reader finds later builds.
 /// Missing or malformed manifests still retain inherited `LEAN_PATH` entries.
 /// Process-owned shim and toolchain roots are treated as immutable runtime
 /// inputs; these roots describe the mutable project/package/environment paths.
@@ -439,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_lean_path_is_watched_without_a_manifest_and_keeps_entry_order() {
+    fn inherited_lean_path_keeps_entry_order_without_a_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let mut roots = manifest_artifact_roots(root);
@@ -459,20 +459,10 @@ mod tests {
                 root.to_path_buf()
             ]
         );
-        let imports = ["EnvModule".to_owned()];
-        let artifact = root.join("relative/EnvModule.olean");
-        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        fs::write(&artifact, b"first").unwrap();
-        let before = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
-        fs::write(artifact, b"rebuilt artifact").unwrap();
-        assert_ne!(
-            Some(before),
-            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
-        );
     }
 
     #[test]
-    fn project_and_manifest_packages_take_precedence_over_lean_path_shadows() {
+    fn project_and_manifest_packages_come_before_lean_path_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::write(
@@ -482,31 +472,15 @@ mod tests {
         ]}"#,
         )
         .unwrap();
-        let project = root.join(BUILD_LIB_REL).join("Shared.olean");
-        let package = root.join("dep").join(BUILD_LIB_REL).join("Shared.olean");
-        let env = root.join("env/Shared.olean");
-        for artifact in [&project, &package, &env] {
-            fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-            fs::write(artifact, b"initial").unwrap();
-        }
         let mut roots = manifest_artifact_roots(root);
         append_lean_path(&mut roots, root, "env");
-        assert_eq!(roots.last(), Some(&root.join("env")));
-        let imports = ["Shared".to_owned()];
-        let project_stamp = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
-        fs::write(&env, b"environment rebuilt").unwrap();
-        fs::write(&package, b"package rebuilt").unwrap();
         assert_eq!(
-            Some(project_stamp.clone()),
-            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
-        );
-        fs::remove_file(project).unwrap();
-        let package_stamp = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
-        assert_ne!(project_stamp, package_stamp);
-        fs::write(env, b"environment rebuilt again").unwrap();
-        assert_eq!(
-            Some(package_stamp),
-            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
+            roots,
+            vec![
+                root.join(BUILD_LIB_REL),
+                root.join("dep").join(BUILD_LIB_REL),
+                root.join("env")
+            ]
         );
     }
 
@@ -623,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn new_package_build_changes_import_stamp_without_changing_manifest() {
+    fn building_a_package_keeps_the_roots_and_their_order() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::write(
@@ -634,8 +608,6 @@ mod tests {
         )
         .unwrap();
         let roots = artifact_roots(root);
-        let imports = ["Demo.A".to_owned()];
-        let before = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
         let artifact = root.join("local-dep").join(BUILD_LIB_REL).join("Demo/A.olean");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(artifact, b"built").unwrap();
@@ -643,43 +615,6 @@ mod tests {
             artifact_roots(root),
             roots,
             "building must not change search precedence"
-        );
-        assert_ne!(
-            Some(before),
-            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
-        );
-    }
-
-    #[test]
-    fn import_stamps_only_watch_first_resolved_package_in_manifest_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"packages":[
-            {"name":"first","type":"path","dir":"first"},
-            {"name":"second","type":"path","dir":"second"}
-        ]}"#,
-        )
-        .unwrap();
-        let first = root.join("first").join(BUILD_LIB_REL).join("Shared.olean");
-        let second = root.join("second").join(BUILD_LIB_REL).join("Shared.olean");
-        for artifact in [&first, &second] {
-            fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-            fs::write(artifact, b"initial").unwrap();
-        }
-        let roots = artifact_roots(root);
-        let imports = ["Shared".to_owned()];
-        let before = crate::cache::ImportArtifactStamp::capture(&roots, &imports).unwrap();
-        fs::write(&second, b"shadowed change").unwrap();
-        assert_eq!(
-            Some(before.clone()),
-            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
-        );
-        fs::remove_file(first).unwrap();
-        assert_ne!(
-            Some(before),
-            crate::cache::ImportArtifactStamp::capture(&roots, &imports)
         );
     }
 

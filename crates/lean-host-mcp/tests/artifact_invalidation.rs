@@ -8,10 +8,13 @@ use std::time::Duration;
 
 use lean_host_mcp::tools::semantic::{SemanticResponse, SemanticToolRequest, lean_status};
 use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
-use lean_host_mcp::{BrokerConfig, ProjectBroker, RuntimeFacts, ToolchainId};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, ToolchainId};
+use lean_toolchain::shared_writer::SharedWriter;
 use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const WRITER_LIMIT: Duration = Duration::from_mins(1);
 
 fn compiler_and_pin() -> TestResult<(PathBuf, String)> {
     let fixture_pin = std::env::var_os("LEAN_HOST_MCP_TEST_FIXTURE")
@@ -43,19 +46,31 @@ fn compiler_and_pin() -> TestResult<(PathBuf, String)> {
     Ok((compiler, pin))
 }
 
-fn rebuild_import(compiler: &Path, dependency: &Path, value: u32) -> TestResult {
+/// Rebuild the dependency's one module the way another process does: under
+/// the shared writer's turn on the dependency. The writer blocks, so it runs
+/// off the test's runtime, where the host's reaper must keep running.
+async fn rebuild_import(compiler: &Path, dependency: &Path, value: u32) -> TestResult {
     fs::write(
         dependency.join("Imported.lean"),
         format!("def importedValue : Nat := {value}\n"),
     )?;
     let output = dependency.join(".lake/build/lib/lean/Imported.olean");
     fs::create_dir_all(output.parent().ok_or("artifact has no parent")?)?;
-    let result = Command::new(compiler)
+    let mut command = Command::new(compiler);
+    command
         .current_dir(dependency)
         .arg("-o")
         .arg(&output)
-        .arg("Imported.lean")
-        .output()?;
+        .arg("Imported.lean");
+    let dependency = dependency.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let helper = Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+        let mut writer = SharedWriter::open(helper, &dependency, WRITER_LIMIT)?;
+        let result = writer.run(&command, WRITER_LIMIT)?;
+        writer.close(WRITER_LIMIT)?;
+        std::io::Result::Ok(result)
+    })
+    .await??;
     assert!(result.status.success(), "real import rebuild failed: {result:?}");
     Ok(())
 }
@@ -69,14 +84,6 @@ async fn diagnostics(ctx: &ToolContext) -> TestResult<SemanticResponse<Value>> {
         },
     )
     .await?)
-}
-
-fn runtime(response: &SemanticResponse<Value>) -> TestResult<&RuntimeFacts> {
-    response
-        .telemetry
-        .as_ref()
-        .and_then(|telemetry| telemetry.runtime.as_ref())
-        .ok_or_else(|| "full telemetry must include worker runtime facts".into())
 }
 
 fn assert_evaluated(response: &SemanticResponse<Value>, expected: &str) {
@@ -117,7 +124,7 @@ fn assert_evaluated(response: &SemanticResponse<Value>, expected: &str) {
 
 #[tokio::test]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT and a matching installed worker"]
-async fn unchanged_query_observes_rebuilt_path_dependency_and_recycles_worker() -> TestResult {
+async fn unchanged_query_sees_a_dependency_rebuilt_by_another_writer() -> TestResult {
     let (compiler, pin) = compiler_and_pin()?;
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("project");
@@ -136,9 +143,15 @@ async fn unchanged_query_observes_rebuilt_path_dependency_and_recycles_worker() 
             ]
         }))?,
     )?;
+    // Readers and writers lock every workspace named in each manifest, so the
+    // dependency needs one too, with no packages of its own.
+    fs::write(
+        dependency.join("lake-manifest.json"),
+        serde_json::to_vec(&json!({"version": "1.2.0", "packages": []}))?,
+    )?;
     let source = "import Imported\n#eval importedValue\n";
     fs::write(root.join("Query.lean"), source)?;
-    rebuild_import(&compiler, &dependency, 1)?;
+    rebuild_import(&compiler, &dependency, 1).await?;
     let ctx = ToolContext {
         broker: ProjectBroker::new(BrokerConfig {
             env_default: Some(root.clone()),
@@ -154,25 +167,13 @@ async fn unchanged_query_observes_rebuilt_path_dependency_and_recycles_worker() 
     };
     let first = diagnostics(&ctx).await?;
     assert_evaluated(&first, "1");
-    let first_generation = runtime(&first)?.worker_generation;
     let warm = diagnostics(&ctx).await?;
     assert_evaluated(&warm, "1");
-    assert_eq!(runtime(&warm)?.worker_generation, first_generation);
-    // Host cache hits use the zero-cost runtime snapshot rather than the
-    // worker call's measured facts. No sleep or timing threshold is required.
-    assert_eq!(runtime(&warm)?.call_elapsed_millis, 0);
-    assert!(runtime(&warm)?.call_restart.is_none());
 
-    rebuild_import(&compiler, &dependency, 2)?;
+    rebuild_import(&compiler, &dependency, 2).await?;
     assert_eq!(fs::read_to_string(root.join("Query.lean"))?, source);
     let rebuilt = diagnostics(&ctx).await?;
     assert_evaluated(&rebuilt, "2");
-    let refreshed = runtime(&rebuilt)?;
-    assert!(refreshed.worker_generation > first_generation);
-    assert_eq!(
-        refreshed.call_restart.as_ref().map(|event| event.cause.as_str()),
-        Some("artifacts_rebuilt")
-    );
     ctx.broker.shutdown_all();
     Ok(())
 }

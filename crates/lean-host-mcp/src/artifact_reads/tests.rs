@@ -105,7 +105,6 @@ fn regression_exclusive_child_prevents_artifact_reads() {
             .kind(),
         std::io::ErrorKind::TimedOut
     );
-    assert!(crate::cache::ImportArtifactStamp::capture_for_project(&root, &["Demo".into()]).is_none());
     let declarations = crate::ilean::declarations_in_module(&root, "Demo");
     assert_eq!(
         declarations.status,
@@ -116,7 +115,6 @@ fn regression_exclusive_child_prevents_artifact_reads() {
     assert_eq!(references.status, crate::ilean::IndexStatus::Unavailable);
     assert_eq!(references.modules_scanned, 0);
     child.release();
-    assert!(crate::cache::ImportArtifactStamp::capture_for_project(&root, &["Demo".into()]).is_some());
     assert_eq!(
         crate::ilean::declarations_in_module(&root, "Demo").status,
         crate::ilean::ModuleDeclarationIndexStatus::Present
@@ -173,7 +171,6 @@ fn unsupported_dependency_closure_refuses_parent_reads() {
     let error = ArtifactReadGuard::try_acquire(root.path()).err().unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("no dependency manifest"));
-    assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
     assert_eq!(
         crate::ilean::references_to(root.path(), "Demo.foo", None).status,
         crate::ilean::IndexStatus::Unavailable
@@ -194,7 +191,6 @@ fn artifact_symlink_escape_refuses_parent_reads() {
     .unwrap();
     let guard = ArtifactReadGuard::try_acquire(root.path()).unwrap();
     assert!(!guard.covers_artifact_root(&root.path().join(crate::lake_meta::BUILD_LIB_REL)));
-    assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
     assert_eq!(
         crate::ilean::declarations_in_module(root.path(), "Demo").status,
         crate::ilean::ModuleDeclarationIndexStatus::Unavailable
@@ -246,26 +242,8 @@ fn undeclared_nested_workspace_symlink_refuses_parent_reads() {
     .unwrap();
     let guard = ArtifactReadGuard::try_acquire(root.path()).unwrap();
     assert!(!guard.covers_artifact_root(&root.path().join(crate::lake_meta::BUILD_LIB_REL)));
-    assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
     assert_eq!(
         crate::ilean::references_to(root.path(), "Demo.foo", None).status,
         crate::ilean::IndexStatus::Unavailable
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn individual_artifact_symlink_escape_is_uncacheable() {
-    let root = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    stage_index(root.path());
-    stage_index(outside.path());
-    let artifact = root.path().join(crate::lake_meta::BUILD_LIB_REL).join("Demo.olean");
-    std::fs::remove_file(&artifact).unwrap();
-    std::os::unix::fs::symlink(
-        outside.path().join(crate::lake_meta::BUILD_LIB_REL).join("Demo.olean"),
-        artifact,
-    )
-    .unwrap();
-    assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
 }

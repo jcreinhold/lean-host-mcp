@@ -553,29 +553,18 @@ impl ProjectBroker {
         // A query this build cannot key is run uncached rather than filed under
         // a shared key; see `ModuleQueryKey`.
         let key = ModuleQueryKey::from_query(&query);
-        let context = crate::cache::ModuleQueryContext::capture(
-            project.canonical_root(),
-            &session_imports,
-            &freshness_imports,
-            &options,
-            project.runtime_facts().worker_generation,
-        );
+        // The request already holds its read turn; this reads its count.
+        let builds_finished = self.ensure_read(project.canonical_root()).await?;
+        let context =
+            crate::cache::ModuleQueryContext::capture(&session_imports, &freshness_imports, &options, builds_finished);
         // The lookup is a plain in-process map probe on the project handle: a
         // hit answers without ever entering the actor's mailbox, so a warm
         // repeat of an unmodified file never queues behind in-flight Lean work.
-        if let Some(value) = key
-            .as_ref()
-            .zip(context.as_ref())
-            .and_then(|(key, context)| project.module_query_cache().get(&path, content_hash, context, key))
-            .filter(|_| {
-                context.as_ref().is_some_and(|context| {
-                    context
-                        .after_processing(project.canonical_root(), project.runtime_facts().worker_generation)
-                        .as_ref()
-                        == Some(context)
-                })
-            })
-        {
+        if let Some(value) = key.as_ref().zip(context.as_ref()).and_then(|(key, context)| {
+            project
+                .module_query_cache()
+                .get(&path, content_hash, context, key, project.live_generation())
+        }) {
             return Ok(CachedBrokerCall {
                 value,
                 runtime: project.runtime_facts(),
@@ -590,12 +579,10 @@ impl ProjectBroker {
             .process_module_query(session_imports, source, query, options, admission_deadline)
             .await?;
         let (value, runtime) = call.into_parts();
-        if let Some((key, context)) =
-            key.zip(context.and_then(|context| context.after_call(project.canonical_root(), &runtime)))
-        {
+        if let Some(((key, context), generation)) = key.zip(context).zip(crate::cache::completed_generation(&runtime)) {
             project
                 .module_query_cache()
-                .insert(path, content_hash, context, key, value.clone());
+                .insert(path, content_hash, context, key, generation, value.clone());
         }
         Ok(CachedBrokerCall {
             value,
@@ -650,32 +637,16 @@ impl ProjectBroker {
         let (project, options, admission_deadline) = self.prepare_check(hint, options).await?;
         let option_facts = crate::envelope::ElaborationOptions::from_worker(&options);
         let key = ModuleQueryBatchKey::from_batch(&selectors, &budgets);
-        let context = crate::cache::ModuleQueryContext::capture(
-            project.canonical_root(),
-            &session_imports,
-            &freshness_imports,
-            &options,
-            project.runtime_facts().worker_generation,
-        );
+        let builds_finished = self.ensure_read(project.canonical_root()).await?;
+        let context =
+            crate::cache::ModuleQueryContext::capture(&session_imports, &freshness_imports, &options, builds_finished);
         // As in `process_cached_module_query`: a hit bypasses the mailbox, and
         // an unkeyable batch runs uncached.
-        if let Some(value) = key
-            .as_ref()
-            .zip(context.as_ref())
-            .and_then(|(key, context)| {
-                project
-                    .module_query_cache()
-                    .get_batch(&path, content_hash, context, key)
-            })
-            .filter(|_| {
-                context.as_ref().is_some_and(|context| {
-                    context
-                        .after_processing(project.canonical_root(), project.runtime_facts().worker_generation)
-                        .as_ref()
-                        == Some(context)
-                })
-            })
-        {
+        if let Some(value) = key.as_ref().zip(context.as_ref()).and_then(|(key, context)| {
+            project
+                .module_query_cache()
+                .get_batch(&path, content_hash, context, key, project.live_generation())
+        }) {
             return Ok(CachedBrokerCall {
                 value,
                 runtime: project.runtime_facts(),
@@ -690,12 +661,10 @@ impl ProjectBroker {
             .process_module_query_batch(session_imports, source, selectors, budgets, options, admission_deadline)
             .await?;
         let (value, runtime) = call.into_parts();
-        if let Some((key, context)) =
-            key.zip(context.and_then(|context| context.after_call(project.canonical_root(), &runtime)))
-        {
+        if let Some(((key, context), generation)) = key.zip(context).zip(crate::cache::completed_generation(&runtime)) {
             project
                 .module_query_cache()
-                .insert_batch(path, content_hash, context, key, value.clone());
+                .insert_batch(path, content_hash, context, key, generation, value.clone());
         }
         Ok(CachedBrokerCall {
             value,
