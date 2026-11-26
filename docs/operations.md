@@ -92,8 +92,8 @@ Units are shown in the table; GiB figures in descriptions are explanatory, not l
 | `build.guard` | array of Lake targets | `[]` | none | Targets that must already be built. A guard step runs lake build --no-build on them, which fails without building anything when one is out of date. It runs before a build of targets; a recipe's guard key places it. Proofs uses ["@mathlib/+Mathlib:olean"]. Empty runs no guard. |
 | `build.timeout_secs` | integer (s) | `14400` | none | Deadline for one build, counted from its request: the wait for the project's write turn and every step count. Default 4 hours. |
 | `build.log_limit_mib` | integer (MiB) | `16` | none | Cap on one build's log, which lives in the store's logs directory. Output past the cap is dropped, and the reply says so. Default 16 MiB. |
-| `recipes.<name>.steps` | array of arrays of strings | unset | none | The Lake runs of one recipe, in order. Each is the words after lake and names a Lake command. Lake's -d, --dir, -f and --file options are refused, and a word that starts with - fits only after exe and its program, or after --. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name. |
-| `recipes.<name>.append` | string (none, last, each) | `"none"` | none | Which steps get the request's args at their end: none refuses args, last gives them to the last step, each to every step. Default none. |
+| `recipes.<name>.steps` | array of arrays of strings | unset | none | The Lake runs of one recipe, in order. Each is the words after lake and may not be empty; Lake reports its own errors in them. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name. |
+| `recipes.<name>.append` | string (none, last, each) | `"none"` | none | Which steps get the request's args at their end: none refuses args, last gives them to the last step, each to every step. An arg may not be empty or start with -. Default none. |
 | `recipes.<name>.guard` | string (before, after, none) | `"before"` | none | Where the build.guard step runs: before the steps, after them, or not at all. A failing guard before the steps ends the recipe. Default before. |
 | `recipes.<name>.timeout_secs` | integer (s) | unset | none | Deadline for one build of this recipe, in place of build.timeout_secs. Unset uses build.timeout_secs. |
 <!-- END GENERATED -->
@@ -222,9 +222,10 @@ runs.
 
 Each step runs in the Lake root with the server's environment, except that the server sets `LEAN_SYSROOT` to the
 project's toolchain, sets `LAKE_ARTIFACT_CACHE=false` so that builds land in each package's `.lake/build`, and removes
-`LEAN_PATH`. Set a variable such as `LEAN_NUM_THREADS` where the server starts. The server checks only the words it
-hands to Lake: it refuses `-d`, `--dir`, `-f` and `--file`, and a client word that starts with `-` fits only after
-`exe <name>` or `--`. Lake decides what to build and in which order.
+`LEAN_PATH`. Set a variable such as `LEAN_NUM_THREADS` where the server starts. The server checks only the words a
+client adds: a target or recipe argument may not be empty or start with `-`, so a client cannot pass Lake an option such
+as `-d`. Recipe words come from the tracked config, and Lake reports its own errors in them. Lake decides what to build
+and in which order.
 
 `lean-host-mcp config check --lake-root PROJECT` reads both config files, names every unknown key and bad value, and
 prints `[build]` and each recipe with their defaults. It runs no Lake and writes nothing, so it is safe beside a running

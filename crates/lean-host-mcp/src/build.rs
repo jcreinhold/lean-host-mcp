@@ -12,7 +12,7 @@
 //! runs.
 //!
 //! Lake decides what to build and in which order. The server checks only the
-//! words it hands to Lake (see `lake_args`) and the config that names them
+//! words a client adds (see `lake_args`) and the config that names the rest
 //! (see `config`).
 
 pub(crate) mod config;
@@ -63,8 +63,7 @@ pub struct BuildRequest {
     /// A recipe from the project's `[recipes]` config.
     #[serde(default)]
     pub recipe: Option<String>,
-    /// Words the recipe appends to its steps, where its `append` allows. Words that start with `-` fit only after
-    /// `exe <name>` or `--`.
+    /// Words the recipe appends to its steps, where its `append` allows. A word may not start with `-`.
     #[serde(default)]
     pub args: Vec<String>,
 }
@@ -174,6 +173,7 @@ pub(crate) fn plan(config: &BuildConfig, request: &BuildRequest) -> std::result:
         if recipe.append == Append::None && !request.args.is_empty() {
             return Err(format!("recipe `{name}` takes no `args`"));
         }
+        lake_args::check_client_words(&request.args).map_err(|problem| format!("recipe `{name}`: {problem}"))?;
         let (before, after) = match recipe.guard {
             GuardPlace::Before => (guard, None),
             GuardPlace::After => (None, guard),
@@ -191,8 +191,6 @@ pub(crate) fn plan(config: &BuildConfig, request: &BuildRequest) -> std::result:
             if appends {
                 args.extend(request.args.iter().cloned());
             }
-            lake_args::check_step(&args, words.len())
-                .map_err(|problem| format!("recipe `{name}` step {index}: {problem}"))?;
             steps.push(args);
         }
         steps.extend(after);
@@ -200,9 +198,9 @@ pub(crate) fn plan(config: &BuildConfig, request: &BuildRequest) -> std::result:
         if !request.args.is_empty() {
             return Err("`args` needs a `recipe`; name Lake targets in `targets`".to_owned());
         }
+        lake_args::check_client_words(&request.targets)?;
         let mut args = vec!["build".to_owned()];
         args.extend(request.targets.iter().cloned());
-        lake_args::check_step(&args, 1)?;
         steps.extend(guard);
         steps.push(args);
     }

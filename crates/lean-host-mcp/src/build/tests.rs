@@ -114,7 +114,7 @@ env = { LEAN_NUM_THREADS = "2" }
 step = [["build"]]
 
 [recipes.bad]
-steps = [["build", "-d", "/elsewhere"], ["--no-build"], []]
+steps = [["build"], []]
 
 [recipes.cut]
 steps = [["build"]]
@@ -124,9 +124,7 @@ mode = "all"
     for expected in [
         "[build]: unknown field `env`",
         "[recipes.typo]: unknown field `step`",
-        "[recipes.bad]: step 0: `-d` would move Lake",
-        "[recipes.bad]: step 1 names no Lake command",
-        "[recipes.bad]: step 2 names no Lake command",
+        "[recipes.bad]: step 1 is empty",
         "[recipes.cut]: unknown field `mode`",
     ] {
         assert!(
@@ -227,8 +225,8 @@ fn requests_that_do_not_fit_are_refused() -> Result<(), String> {
         "no recipe `nope`; this project has cache, format, lint, proof-audit, strict-lint"
     );
     assert!(refused(&recipe("lint", "x")).contains("takes no `args`"));
-    // `format` appends to `build` too, where Lake would read the option.
-    assert!(refused(&recipe("format", "--wfail")).contains("step 0"));
+    // A recipe's client words follow the same rule.
+    assert!(refused(&recipe("format", "--wfail")).contains("recipe `format`: argument `--wfail` starts with `-`"));
     Ok(())
 }
 
@@ -247,13 +245,11 @@ fn recipes_place_the_guard_and_the_args() -> Result<(), String> {
             words("exe lean-fmt format --check --no-build --inherit-process-group --workers 2 Proofs/A.lean"),
         ]
     );
-    // Words that start with `-` fit after `exe runLinter`.
-    let strict = plan(&config, &recipe("strict-lint", "--json-out Proofs.A"))?;
+    // A recipe's own words may start with `-`; the client's follow them.
+    let strict = plan(&config, &recipe("strict-lint", "Proofs.A"))?;
     assert_eq!(
         strict.steps.last().map(|step| step.join(" ")),
-        Some(
-            "--no-build exe runLinter --no-build --module-only --format=json --deny=all --json-out Proofs.A".to_owned()
-        )
+        Some("--no-build exe runLinter --no-build --module-only --format=json --deny=all Proofs.A".to_owned())
     );
     let unguarded = self::config("[recipes.clean]\nsteps = [[\"clean\", \"Proofs\"]]\nguard = \"none\"")?;
     assert_eq!(plan(&unguarded, &recipe("clean", ""))?.steps, [words("clean Proofs")]);

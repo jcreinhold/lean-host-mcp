@@ -14,8 +14,6 @@ use std::collections::BTreeMap;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::lake_args::{check_step, has_command};
-
 /// Default `[build] timeout_secs`: four hours.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 14_400;
 /// Default `[build] log_limit_mib`.
@@ -191,10 +189,8 @@ fn check_recipe(at: &str, recipe: &Recipe, errors: &mut Vec<String>) -> bool {
         errors.push(format!("{at}: `timeout_secs` must be at least 1"));
     }
     for (index, step) in recipe.steps.iter().enumerate() {
-        match check_step(step, step.len()) {
-            Err(problem) => errors.push(format!("{at}: step {index}: {problem}")),
-            Ok(_) if !has_command(step) => errors.push(format!("{at}: step {index} names no Lake command")),
-            Ok(_) => {}
+        if step.is_empty() {
+            errors.push(format!("{at}: step {index} is empty"));
         }
     }
     errors.len() == before

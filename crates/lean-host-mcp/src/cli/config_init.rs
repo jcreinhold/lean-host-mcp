@@ -205,7 +205,7 @@ mod tests {
         let (_dir, root) = root_with(
             "[launcher]\nmode = 'x'\n[broker]\nmax_worker = 2\nmax_projects = 3\n\
              [runtime]\nlean_max_memory_kib = 'big'\n[build]\ntimeout_secs = 0\n\
-             [recipes.lint]\nsteps = [['-d', 'x']]\n",
+             [recipes.lint]\nsteps = [[]]\n",
         );
         let before = names(&root);
         let problems = check(&root).expect_err("problems");
@@ -215,7 +215,7 @@ mod tests {
         assert!(!named("max_projects"), "{problems:?}");
         assert!(named("lean_max_memory_kib"), "{problems:?}");
         assert!(named("[build]: `timeout_secs`"), "{problems:?}");
-        assert!(named("[recipes.lint]: step 0"), "{problems:?}");
+        assert!(named("[recipes.lint]: step 0 is empty"), "{problems:?}");
         assert_eq!(names(&root), before);
     }
 

@@ -281,7 +281,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "[[\"build\", \"Proofs\"], [\"lint\"]]",
         commented: true,
         overrides: "",
-        description: "The Lake runs of one recipe, in order. Each is the words after lake and names a Lake command. Lake's -d, --dir, -f and --file options are refused, and a word that starts with - fits only after exe and its program, or after --. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name.",
+        description: "The Lake runs of one recipe, in order. Each is the words after lake and may not be empty; Lake reports its own errors in them. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name.",
     },
     FieldDoc {
         key: "recipes.<name>.append",
@@ -289,7 +289,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "\"none\"",
         commented: false,
         overrides: "",
-        description: "Which steps get the request's args at their end: none refuses args, last gives them to the last step, each to every step. Default none.",
+        description: "Which steps get the request's args at their end: none refuses args, last gives them to the last step, each to every step. An arg may not be empty or start with -. Default none.",
     },
     FieldDoc {
         key: "recipes.<name>.guard",
