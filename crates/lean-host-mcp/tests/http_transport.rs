@@ -21,9 +21,11 @@ const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
 const LEGACY_WRITER_ENV: &str = "LEAN_HOST_MCP_WRITER_EXECUTABLE";
-const EXPECTED_TOOLS: [&str; 8] = [
+const EXPECTED_TOOLS: [&str; 10] = [
+    "lean_build",
     "lean_compatibility",
     "lean_context",
+    "lean_imports",
     "lean_lookup",
     "lean_request",
     "lean_runtime",

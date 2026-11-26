@@ -202,6 +202,36 @@ impl ProjectBroker {
         Ok((setup, reader, activity))
     }
 
+    /// The module Lake names for `file`, and the `.olean` of every module it
+    /// imports, directly or not, as `lake setup-file` reports them under this
+    /// request's read turn.
+    pub(crate) async fn module_imports(
+        &self,
+        root: &Path,
+        file: &Path,
+        source: &str,
+    ) -> Result<(String, Vec<(String, PathBuf)>)> {
+        self.ensure_read(root).await?;
+        let setup = parse_setup(&self.setup_file(root, file, source).await?.bytes)?;
+        let imports = setup
+            .import_arts
+            .into_iter()
+            .map(|(module, parts)| {
+                let olean = parts
+                    .first()
+                    .and_then(|oleans| {
+                        oleans
+                            .iter()
+                            .find(|path| path.extension().is_some_and(|ext| ext == "olean"))
+                    })
+                    .cloned()
+                    .ok_or_else(|| ServerError::BadProject(format!("Lake reported no .olean for import {module}")))?;
+                Ok((module, olean))
+            })
+            .collect::<Result<_>>()?;
+        Ok((setup.name, imports))
+    }
+
     /// Run `lake setup-file` as a native reader. The guardian holds the project
     /// lock shared while Lake reads the build products and prints the setup.
     /// No step takes the lock exclusively.

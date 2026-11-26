@@ -68,7 +68,7 @@ struct Writers {
     line: VecDeque<(u64, String)>,
 }
 
-/// Why a request got no read turn.
+/// Why a request got no turn.
 #[derive(Debug)]
 pub(crate) enum TurnRefused {
     /// The deadline passed while the request waited. Names the writer ahead
@@ -81,6 +81,8 @@ pub(crate) enum TurnRefused {
     Guard(io::Error),
     /// The request already holds a turn on this other root.
     OtherRoot(PathBuf),
+    /// The request holds a read turn, so its write turn would wait for itself.
+    HoldsRead,
 }
 
 /// What the reaper saw of writer demand on a root.
@@ -113,8 +115,9 @@ impl Drop for WriterTicket {
     }
 }
 
-/// A granted write turn.
-struct WriteTurn {
+/// A granted write turn. Dropping it without `finish` releases the turn
+/// without counting a build.
+pub(crate) struct WriteTurn {
     ticket: WriterTicket,
     _guard: OwnedRwLockWriteGuard<()>,
 }
@@ -122,7 +125,7 @@ struct WriteTurn {
 impl WriteTurn {
     /// Count the turn as a finished build, then release it, so the next
     /// reader sees the new count.
-    fn finish(self) {
+    pub(crate) fn finish(self) {
         self.ticket.lock.builds_finished.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -143,6 +146,17 @@ impl ProjectLock {
     /// The writer at the front of the line, which every new reader waits for.
     fn blocked_by(&self) -> Option<String> {
         self.writers.lock().line.front().map(|(_, name)| name.clone())
+    }
+
+    /// The first writer in line ahead of writer `id`.
+    fn writer_ahead_of(&self, id: u64) -> Option<String> {
+        let writers = self.writers.lock();
+        writers
+            .line
+            .iter()
+            .take_while(|(other, _)| *other != id)
+            .map(|(_, name)| name.clone())
+            .next()
     }
 
     fn enter_writer(self: &Arc<Self>, name: &str) -> WriterTicket {
@@ -257,6 +271,30 @@ pub(crate) async fn ensure_read(
         granted_at,
     });
     Ok(granted_at)
+}
+
+/// Give the current request the write turn on `lock`'s root, naming it `name`
+/// to the requests that wait behind it. The writer takes its place in line
+/// before it waits, so readers that come later name it as `blocked_by`.
+pub(crate) async fn ensure_write(
+    lock: &Arc<ProjectLock>,
+    name: &str,
+    deadline: Instant,
+    cancellation: &CallCancellation,
+) -> Result<WriteTurn, TurnRefused> {
+    if let Ok(slot) = TURN.try_with(Arc::clone)
+        && slot.lock().await.is_some()
+    {
+        return Err(TurnRefused::HoldsRead);
+    }
+    let ticket = lock.enter_writer(name);
+    let guard = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(TurnRefused::Cancelled),
+        guard = tokio::time::timeout_at(deadline, Arc::clone(&lock.rw).write_owned()) => guard
+            .map_err(|_| TurnRefused::Expired { blocked_by: lock.writer_ahead_of(ticket.id) })?,
+    };
+    Ok(WriteTurn { ticket, _guard: guard })
 }
 
 /// The finished-build count at the current request's read turn on `root`.

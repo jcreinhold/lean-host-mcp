@@ -222,6 +222,36 @@ impl ConfigFile {
     }
 }
 
+/// The config files of Lake root `root`, merged as [`ConfigFile::load`]
+/// merges them, but failing on a file that cannot be read or parsed. Builds
+/// read their tables through this: a typo in a recipe must stop the build,
+/// not drop the recipe. A missing file contributes nothing.
+///
+/// # Errors
+///
+/// Names the file and the read or parse error.
+pub(crate) fn load_strict(root: &Path) -> Result<toml::Table, String> {
+    let mut merged = toml::Value::Table(toml::Table::new());
+    for path in [root.join(TRACKED_FILE_NAME), local_file(root)] {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let value = toml::from_str::<toml::Value>(&contents).map_err(|error| format!("{}: {error}", path.display()))?;
+        merge_toml(&mut merged, value);
+    }
+    match merged {
+        toml::Value::Table(table) => Ok(table),
+        toml::Value::String(_)
+        | toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Boolean(_)
+        | toml::Value::Datetime(_)
+        | toml::Value::Array(_) => Err("merged config is not a table".to_owned()),
+    }
+}
+
 /// Read and parse one TOML file. Missing file → `None` (silent); parse error
 /// → `None` with a warning, so a typo in one file can't take down startup.
 fn read_toml(path: &Path) -> Option<toml::Value> {

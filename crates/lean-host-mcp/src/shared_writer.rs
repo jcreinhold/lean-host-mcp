@@ -81,14 +81,40 @@ pub fn ownership_registry() -> io::Result<PathBuf> {
     Ok(directory)
 }
 
-/// Report the current executable, without a path-specific compatibility pin.
+/// The helper executable set by [`use_helper_executable`].
+static HELPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Run the helper subcommands from `path` instead of this process's own
+/// executable.
+///
+/// A process whose executable lacks `writer`, `writer-exec`,
+/// `native-reader-exec` and the rest, such as a test harness, calls this once
+/// before native work.
+///
+/// # Errors
+/// Returns an error when `path` cannot be resolved, or when an earlier call
+/// named another file.
+pub fn use_helper_executable(path: &Path) -> io::Result<()> {
+    let path = path.canonicalize()?;
+    if *HELPER.get_or_init(|| path.clone()) == path {
+        Ok(())
+    } else {
+        Err(invalid("the helper executable is already set to another file"))
+    }
+}
+
+/// Report the helper executable, without a path-specific compatibility pin.
 ///
 /// # Errors
 /// Returns the operating-system error when the executable cannot be identified.
 pub fn contract() -> io::Result<WriterContract> {
+    let executable = match HELPER.get() {
+        Some(path) => path.clone(),
+        None => std::env::current_exe()?.canonicalize()?,
+    };
     Ok(WriterContract {
         protocol: PROTOCOL,
-        executable: std::env::current_exe()?.canonicalize()?,
+        executable,
         ownership_registry: ownership_registry()?,
     })
 }

@@ -395,6 +395,51 @@ impl LeanHostService {
         .await
     }
 
+    #[tool(
+        description = "Run Lake in the project: build `targets` (none: Lake's default targets) or run a configured `recipe` with `args`. Checks wait while it runs. Replies with each step's exit code, the log path and the log's tail; isError when a step failed or the build timed out."
+    )]
+    async fn lean_build(
+        &self,
+        Parameters(req): Parameters<crate::build::BuildRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let outcome = Box::pin(with_progress(
+            &context,
+            "lean_build",
+            tools::build::lean_build(&self.ctx, req),
+        ))
+        .await?;
+        let mut result = carry(&outcome, self.ctx.config.carrier);
+        result.is_error = Some(!outcome.ok);
+        Ok(result)
+    }
+
+    #[tool(
+        description = "List each file's whole transitive import closure from Lake setup-file (importArts), not only its direct imports: module, absolute .olean path, and the absolute source path for modules built under this project's .lake/build (else null). Builds nothing: a missing or stale import fails the call with error code setup_file_failed, naming the file and quoting Lake. At most 16 files."
+    )]
+    async fn lean_imports(
+        &self,
+        Parameters(req): Parameters<tools::build::ImportsRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let timeout = Duration::from_millis(self.ctx.broker.request_timeout_millis());
+        let reply = Box::pin(with_progress(
+            &context,
+            "lean_imports",
+            crate::cancellation::with_deadline(timeout, tools::build::lean_imports(&self.ctx, req)),
+        ))
+        .await;
+        match reply {
+            Ok(reply) => Ok(carry(&reply, self.ctx.config.carrier)),
+            Err(tools::build::ImportsError::File(failure)) => {
+                let mut result = carry(&failure, self.ctx.config.carrier);
+                result.is_error = Some(true);
+                Ok(result)
+            }
+            Err(tools::build::ImportsError::Call(error)) => Err(error),
+        }
+    }
+
     #[tool(description = "Project/toolchain status and source diagnostics. Kinds: project, file_diagnostics.")]
     async fn lean_status(
         &self,
@@ -492,7 +537,8 @@ impl ServerHandler for LeanHostService {
             .with_website_url("https://github.com/jcreinhold/lean-host-mcp");
         let common = "MCP server hosting Lean 4 in supervised worker children via lean-rs. \
              Tools expose five semantic Lean job families: context, trial, verification, lookup, and status. \
-             Context, trial, lookup, and status select a mode with `kind`; verification takes explicit target groups.";
+             Context, trial, lookup, and status select a mode with `kind`; verification takes explicit target groups. \
+             lean_build runs Lake under the project's write turn, so checks wait for it; lean_imports reads what Lake built.";
         let execution = " Clients advertising io.modelcontextprotocol/tasks may receive task handles; results remain available for ten minutes \
              after completion while this server process lives. Use lean_request to submit, retrieve or cancel retained requests \
              without task negotiation.";

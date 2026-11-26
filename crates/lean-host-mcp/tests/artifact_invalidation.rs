@@ -1,68 +1,36 @@
-//! Opt-in regression using real rebuilt artifacts, entirely inside a tempdir.
+//! Opt-in regression on real rebuilt artifacts: a check of an unchanged file
+//! sees a dependency that another process rebuilt under the shared writer.
 //! Set `LEAN_HOST_MCP_TEST_FIXTURE` or `LEAN_SYSROOT` and install its matching worker.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+mod support;
+
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 use lean_host_mcp::tools::semantic::{SemanticResponse, SemanticToolRequest, lean_status};
-use lean_host_mcp::tools::{TelemetryVerbosity, ToolConfig, ToolContext};
-use lean_host_mcp::{BrokerConfig, ProjectBroker, ToolchainId};
+use lean_host_mcp::tools::{ToolConfig, ToolContext, as_call};
+use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectRuntimeConfig};
 use lean_toolchain::shared_writer::SharedWriter;
 use serde_json::{Value, json};
-
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+use support::TestResult;
+use support::chain::{Chain, chain_project};
 
 const WRITER_LIMIT: Duration = Duration::from_mins(1);
 
-fn compiler_and_pin() -> TestResult<(PathBuf, String)> {
-    let fixture_pin = std::env::var_os("LEAN_HOST_MCP_TEST_FIXTURE")
-        .map(|root| fs::read_to_string(PathBuf::from(root).join("lean-toolchain")))
-        .transpose()?;
-    let sysroot = match std::env::var_os("LEAN_SYSROOT") {
-        Some(root) => PathBuf::from(root),
-        None => ToolchainId::parse(
-            fixture_pin
-                .as_deref()
-                .ok_or("set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT for this ignored test")?,
-        )?
-        .elan_dir()?,
-    };
-    let compiler = sysroot.join("bin/lean");
-    let pin = if let Some(pin) = fixture_pin {
-        pin.trim().to_owned()
-    } else {
-        let version = Command::new(&compiler).arg("--version").output()?;
-        assert!(version.status.success(), "lean --version failed: {version:?}");
-        let output = String::from_utf8(version.stdout)?;
-        let version = output
-            .split_once("version ")
-            .and_then(|(_, rest)| rest.split_once(','))
-            .map(|(version, _)| version)
-            .ok_or("could not identify compiler version")?;
-        format!("leanprover/lean4:v{version}")
-    };
-    Ok((compiler, pin))
-}
-
-/// Rebuild the dependency's one module the way another process does: under
-/// the shared writer's turn on the dependency. The writer blocks, so it runs
-/// off the test's runtime, where the host's reaper must keep running.
-async fn rebuild_import(compiler: &Path, dependency: &Path, value: u32) -> TestResult {
-    fs::write(
-        dependency.join("Imported.lean"),
-        format!("def importedValue : Nat := {value}\n"),
-    )?;
-    let output = dependency.join(".lake/build/lib/lean/Imported.olean");
-    fs::create_dir_all(output.parent().ok_or("artifact has no parent")?)?;
-    let mut command = Command::new(compiler);
+/// Rebuild the dependency the way another process does: Lake runs in `dep/`
+/// under the shared writer's turn there. The writer blocks, so it runs off
+/// the test's runtime, where the host's reaper must keep running.
+async fn rebuild_dep(chain: &Chain, value: u32) -> TestResult {
+    chain.write("dep/Dep.lean", &format!("def dep : Nat := {value}\n"))?;
+    let dependency = chain.root.join("dep");
+    let mut command = Command::new(chain.sysroot.join("bin/lake"));
     command
-        .current_dir(dependency)
-        .arg("-o")
-        .arg(&output)
-        .arg("Imported.lean");
-    let dependency = dependency.to_path_buf();
+        .arg("build")
+        .current_dir(&dependency)
+        .env("LEAN_SYSROOT", &chain.sysroot)
+        .env("LAKE_ARTIFACT_CACHE", "false")
+        .env_remove("LEAN_PATH");
     let result = tokio::task::spawn_blocking(move || {
         let helper = Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         let mut writer = SharedWriter::open(helper, &dependency, WRITER_LIMIT)?;
@@ -71,109 +39,73 @@ async fn rebuild_import(compiler: &Path, dependency: &Path, value: u32) -> TestR
         std::io::Result::Ok(result)
     })
     .await??;
-    assert!(result.status.success(), "real import rebuild failed: {result:?}");
-    Ok(())
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(format!("the rebuild failed: {result:?}").into())
+    }
 }
 
 async fn diagnostics(ctx: &ToolContext) -> TestResult<SemanticResponse<Value>> {
-    Ok(lean_status(
-        ctx,
-        SemanticToolRequest {
-            kind: Some("file_diagnostics".to_owned()),
-            args: std::iter::once(("file".to_owned(), json!("Query.lean"))).collect(),
-        },
-    )
-    .await?)
+    let request = SemanticToolRequest {
+        kind: Some("file_diagnostics".to_owned()),
+        args: std::iter::once(("file".to_owned(), json!("Chain/Query.lean"))).collect(),
+    };
+    Ok(as_call(lean_status(ctx, request)).await?)
 }
 
-fn assert_evaluated(response: &SemanticResponse<Value>, expected: &str) {
-    assert!(
-        response
-            .errors
-            .iter()
-            .all(|issue| issue.severity.as_deref() != Some("error")),
-        "tool returned errors: {:?}",
-        response.errors
-    );
-    assert_eq!(
-        response
-            .data
-            .as_ref()
-            .and_then(|data| data.pointer("/diagnostics/summary/errors"))
-            .and_then(Value::as_u64),
-        Some(0),
-        "Lean must elaborate successfully: {:?}",
-        response.data
-    );
-    assert!(
-        response
-            .data
-            .as_ref()
-            .and_then(|data| data.pointer("/diagnostics/diagnostics"))
-            .and_then(Value::as_array)
-            .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+/// Fail unless Lean checked the file without an error and `#eval` printed
+/// `expected`.
+fn assert_evaluated(response: &SemanticResponse<Value>, expected: &str) -> TestResult {
+    let data = response.data.as_ref();
+    let errors = data
+        .and_then(|data| data.pointer("/diagnostics/summary/errors"))
+        .and_then(Value::as_u64);
+    let printed = data
+        .and_then(|data| data.pointer("/diagnostics/diagnostics"))
+        .and_then(Value::as_array)
+        .is_some_and(|diagnostics| {
+            diagnostics.iter().any(|diagnostic| {
                 diagnostic
                     .get("message")
                     .and_then(Value::as_str)
                     .is_some_and(|message| message.trim() == expected)
-            })),
-        "expected #eval output {expected}: {:?}",
-        response.data
-    );
+            })
+        });
+    let tool_errors = response
+        .errors
+        .iter()
+        .any(|issue| issue.severity.as_deref() == Some("error"));
+    if errors == Some(0) && printed && !tool_errors {
+        Ok(())
+    } else {
+        let (issues, data) = (&response.errors, &response.data);
+        Err(format!("expected #eval output {expected}: {issues:?} {data:?}").into())
+    }
 }
 
 #[tokio::test]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT and a matching installed worker"]
 async fn unchanged_query_sees_a_dependency_rebuilt_by_another_writer() -> TestResult {
-    let (compiler, pin) = compiler_and_pin()?;
-    let temp = tempfile::tempdir()?;
-    let root = temp.path().join("project");
-    let dependency = temp.path().join("dep");
-    fs::create_dir_all(&root)?;
-    fs::create_dir_all(&dependency)?;
-    fs::write(root.join("lakefile.toml"), "name = \"artifact_query\"\n")?;
-    fs::write(dependency.join("lakefile.toml"), "name = \"artifact_dep\"\n")?;
-    fs::write(root.join("lean-toolchain"), &pin)?;
-    fs::write(dependency.join("lean-toolchain"), &pin)?;
-    fs::write(
-        root.join("lake-manifest.json"),
-        serde_json::to_vec(&json!({
-            "version": "1.2.0", "packagesDir": "unused-vendor", "packages": [
-                {"name": "artifact_dep", "type": "path", "dir": "../dep"}
-            ]
-        }))?,
-    )?;
-    // Readers and writers lock every workspace named in each manifest, so the
-    // dependency needs one too, with no packages of its own.
-    fs::write(
-        dependency.join("lake-manifest.json"),
-        serde_json::to_vec(&json!({"version": "1.2.0", "packages": []}))?,
-    )?;
-    let source = "import Imported\n#eval importedValue\n";
-    fs::write(root.join("Query.lean"), source)?;
-    rebuild_import(&compiler, &dependency, 1).await?;
+    let chain = chain_project()?;
+    chain.write("Chain/Query.lean", "import Dep\n#eval dep\n")?;
+    lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
     let ctx = ToolContext {
-        broker: ProjectBroker::new(BrokerConfig {
-            env_default: Some(root.clone()),
-            cwd: root.clone(),
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
-            idle_timeout: Duration::ZERO,
-        }),
-        config: ToolConfig {
-            verbosity: TelemetryVerbosity::Full,
-            ..ToolConfig::default()
-        },
+        broker: ProjectBroker::new_with_runtime_config(
+            BrokerConfig {
+                env_default: Some(chain.root.clone()),
+                cwd: chain.root.clone(),
+                max_projects: BrokerConfig::default_max_projects(),
+                max_workers_per_project: std::num::NonZeroUsize::MIN,
+                idle_timeout: BrokerConfig::default_idle_timeout(),
+            },
+            ProjectRuntimeConfig::default().with_operator_primary(Some(&chain.root))?,
+        ),
+        config: ToolConfig::default(),
     };
-    let first = diagnostics(&ctx).await?;
-    assert_evaluated(&first, "1");
-    let warm = diagnostics(&ctx).await?;
-    assert_evaluated(&warm, "1");
-
-    rebuild_import(&compiler, &dependency, 2).await?;
-    assert_eq!(fs::read_to_string(root.join("Query.lean"))?, source);
-    let rebuilt = diagnostics(&ctx).await?;
-    assert_evaluated(&rebuilt, "2");
+    assert_evaluated(&diagnostics(&ctx).await?, "1")?;
+    rebuild_dep(&chain, 2).await?;
+    assert_evaluated(&diagnostics(&ctx).await?, "2")?;
     ctx.broker.shutdown_all();
     Ok(())
 }

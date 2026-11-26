@@ -7,7 +7,49 @@
 // used by *that* suite reads as dead there. Expected by construction.
 #![allow(dead_code)]
 
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use lean_host_mcp::ToolchainId;
+
+pub(crate) mod chain;
+
+pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// The Lean sysroot and `lean-toolchain` pin the ignored toolchain tests use:
+/// the fixture's pin from `LEAN_HOST_MCP_TEST_FIXTURE`, or the version of the
+/// Lean at `LEAN_SYSROOT`.
+pub(crate) fn sysroot_and_pin() -> TestResult<(PathBuf, String)> {
+    let fixture_pin = std::env::var_os("LEAN_HOST_MCP_TEST_FIXTURE")
+        .map(|root| fs::read_to_string(PathBuf::from(root).join("lean-toolchain")))
+        .transpose()?;
+    let sysroot = match std::env::var_os("LEAN_SYSROOT") {
+        Some(root) => PathBuf::from(root),
+        None => ToolchainId::parse(
+            fixture_pin
+                .as_deref()
+                .ok_or("set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT for this ignored test")?,
+        )?
+        .elan_dir()?,
+    };
+    let pin = if let Some(pin) = fixture_pin {
+        pin.trim().to_owned()
+    } else {
+        let version = Command::new(sysroot.join("bin/lean")).arg("--version").output()?;
+        if !version.status.success() {
+            return Err(format!("lean --version failed: {version:?}").into());
+        }
+        let output = String::from_utf8(version.stdout)?;
+        let version = output
+            .split_once("version ")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .map(|(version, _)| version)
+            .ok_or("could not identify compiler version")?;
+        format!("leanprover/lean4:v{version}")
+    };
+    Ok((sysroot, pin))
+}
 
 /// The worker directory a spawned test server must be pinned to.
 ///

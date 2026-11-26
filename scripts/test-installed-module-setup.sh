@@ -49,12 +49,11 @@ cat >"$pair/Cargo.toml" <<EOF
 [workspace]
 members = ["lean-host-mcp-$version", "lean-host-mcp-worker-$version"]
 resolver = "3"
-
-[patch.crates-io]
-lean-host-mcp-worker = { path = "lean-host-mcp-worker-$version" }
 EOF
 cp "$pair/lean-host-mcp-$version/Cargo.lock" "$pair/Cargo.lock"
-cargo update --offline --manifest-path "$pair/Cargo.toml" -p lean-host-mcp-worker
+# The parent does not depend on the worker, so its lock lacks the worker's
+# entries. Add them and leave every locked package as it is.
+cargo update --offline --manifest-path "$pair/Cargo.toml" --workspace
 python3 - "$pair" "$version" "$LOCAL_SDK_ROOT" <<'PY_LOCK'
 import pathlib
 import sys

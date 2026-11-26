@@ -4,6 +4,8 @@
 //! remaining modules are internal operation building blocks, split by what
 //! plumbing they share rather than one file per public tool:
 //!
+//! - [`build`]: `lean_build` and `lean_imports`, which run Lake under the
+//!   project's write turn and read what it built.
 //! - [`declaration`]: `inspect_declaration`, the bounded single-declaration
 //!   proof-work inspection tool.
 //! - [`declaration_inventory`]: source-fresh and `.ilean`-backed declaration
@@ -17,6 +19,7 @@
 
 use std::sync::Arc;
 
+pub mod build;
 pub mod declaration;
 pub mod declaration_inventory;
 pub mod position;
@@ -139,6 +142,13 @@ impl Default for ToolConfig {
 pub struct ToolContext {
     pub broker: Arc<ProjectBroker>,
     pub config: ToolConfig,
+}
+
+/// Run `operation` as one tool call, as the server runs each call: the turns
+/// it takes on a project end when it returns. For callers that run tool
+/// functions in process, such as tests.
+pub async fn as_call<T>(operation: impl Future<Output = T>) -> T {
+    crate::cancellation::with_cancellation(&tokio_util::sync::CancellationToken::new(), operation).await
 }
 
 /// Imports passed to worker sessions: `Init` is the internal base

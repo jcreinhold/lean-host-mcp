@@ -24,6 +24,7 @@
 
 mod artifact_reads;
 pub mod broker;
+pub mod build;
 mod cache;
 mod cancellation;
 pub mod cli;

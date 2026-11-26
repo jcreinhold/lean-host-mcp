@@ -5,7 +5,6 @@ Cargo.lock.bak
 .idea/
 .vscode/
 .lake/
-build/
 *.olean
 __pycache__/
 *.py[cod]

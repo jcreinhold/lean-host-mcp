@@ -64,6 +64,27 @@ fn open_ctx(root: &Path) -> ToolContext {
 /// test can reach the residue paths without a Mathlib-scale import. Everything
 /// else is the shipped default.
 fn open_ctx_with_residue_budget(root: &Path, budget_bytes: u64) -> ToolContext {
+    open_broker(
+        root,
+        ProjectRuntimeConfig::default().with_import_residue_budget_bytes(budget_bytes),
+        ToolConfig {
+            verbosity: TelemetryVerbosity::Full,
+            ..ToolConfig::default()
+        },
+    )
+}
+
+fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
+    open_broker(root, ProjectRuntimeConfig::default(), config)
+}
+
+/// A context set up as the server sets itself up for `--lake-root root`: the
+/// operator approves `root` for native work, and the helper subcommands run
+/// from the server binary, since the test harness lacks them.
+fn open_broker(root: &Path, runtime: ProjectRuntimeConfig, config: ToolConfig) -> ToolContext {
+    lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))
+        .expect("helper executable");
+    let runtime = runtime.with_operator_primary(Some(root)).expect("operator root");
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {
             env_default: Some(root.to_path_buf()),
@@ -72,25 +93,8 @@ fn open_ctx_with_residue_budget(root: &Path, budget_bytes: u64) -> ToolContext {
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: BrokerConfig::default_idle_timeout(),
         },
-        ProjectRuntimeConfig::default().with_import_residue_budget_bytes(budget_bytes),
+        runtime,
     );
-    ToolContext {
-        broker,
-        config: ToolConfig {
-            verbosity: TelemetryVerbosity::Full,
-            ..ToolConfig::default()
-        },
-    }
-}
-
-fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
-    let broker = ProjectBroker::new(BrokerConfig {
-        env_default: Some(root.to_path_buf()),
-        cwd: root.to_path_buf(),
-        max_projects: BrokerConfig::default_max_projects(),
-        max_workers_per_project: std::num::NonZeroUsize::MIN,
-        idle_timeout: BrokerConfig::default_idle_timeout(),
-    });
     ToolContext { broker, config }
 }
 

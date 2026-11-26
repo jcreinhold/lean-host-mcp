@@ -966,23 +966,34 @@ impl ProjectBroker {
     /// before it pins a worker or starts a reader. Both last until the request
     /// ends. Returns the finished-build count at the grant.
     pub(crate) async fn ensure_read(&self, root: &Path) -> Result<u64> {
-        use crate::project_lock::TurnRefused;
-        let lock = self.inner.lock().locks.get(root);
+        let lock = self.project_lock(root);
         let deadline = self.request_deadline()?;
         crate::project_lock::ensure_read(&lock, root, deadline, &CallCancellation::current())
             .await
-            .map_err(|refused| match refused {
-                TurnRefused::Expired { blocked_by } => {
-                    Self::pool_unavailable_behind(root, "project_admission_timeout", true, blocked_by)
-                }
-                TurnRefused::Cancelled => Self::pool_unavailable(root, "request_cancelled", false),
-                TurnRefused::Guard(error) => {
-                    ServerError::BadProject(format!("artifact read lock unavailable: {error}"))
-                }
-                TurnRefused::OtherRoot(held) => {
-                    ServerError::Internal(format!("request already holds a project turn on {}", held.display()))
-                }
-            })
+            .map_err(|refused| Self::turn_refused(root, refused))
+    }
+
+    /// The turn lock of canonical project root `root`.
+    pub(crate) fn project_lock(&self, root: &Path) -> Arc<crate::project_lock::ProjectLock> {
+        self.inner.lock().locks.get(root)
+    }
+
+    /// The error a request on `root` gets when it gets no turn.
+    pub(crate) fn turn_refused(root: &Path, refused: crate::project_lock::TurnRefused) -> ServerError {
+        use crate::project_lock::TurnRefused;
+        match refused {
+            TurnRefused::Expired { blocked_by } => {
+                Self::pool_unavailable_behind(root, "project_admission_timeout", true, blocked_by)
+            }
+            TurnRefused::Cancelled => Self::pool_unavailable(root, "request_cancelled", false),
+            TurnRefused::Guard(error) => ServerError::BadProject(format!("artifact read lock unavailable: {error}")),
+            TurnRefused::OtherRoot(held) => {
+                ServerError::Internal(format!("request already holds a project turn on {}", held.display()))
+            }
+            TurnRefused::HoldsRead => {
+                ServerError::Internal("a request that holds a read turn asked to write".to_owned())
+            }
+        }
     }
 
     /// Look up or open the project for `root`. Mutex is released around

@@ -39,7 +39,8 @@ struct FieldDoc {
 }
 
 /// Every knob, in the order it appears in the generated file and docs table:
-/// `[runtime]`, `[broker]`, `[server]`, `[telemetry]`, `[output]`, `[install]`.
+/// `[runtime]`, `[broker]`, `[server]`, `[telemetry]`, `[output]`, `[install]`,
+/// `[build]`, `[recipes.<name>]`.
 const SCHEMA_FIELDS: &[FieldDoc] = &[
     // ---- [runtime] — worker memory + lifecycle --------------------------
     FieldDoc {
@@ -215,7 +216,60 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         overrides: "LEAN_HOST_MCP_STORE_DIR",
         description: "Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root.",
     },
+    // ---- [build] — lean_build -------------------------------------------
+    FieldDoc {
+        key: "build.guard",
+        ty: "array of Lake targets",
+        value: "[]",
+        commented: false,
+        overrides: "",
+        description: "Targets that must already be built. A guard step runs lake build --no-build on them, which fails without building anything when one is out of date. It runs before a build of targets; a recipe's guard key places it. Proofs uses [\"@mathlib/+Mathlib:olean\"]. Empty runs no guard.",
+    },
+    FieldDoc {
+        key: "build.timeout_secs",
+        ty: "integer (s)",
+        value: "14400",
+        commented: false,
+        overrides: "",
+        description: "Deadline for one build, counted from its request: the wait for the project's write turn and every step count. Default 4 hours.",
+    },
+    FieldDoc {
+        key: "build.log_limit_mib",
+        ty: "integer (MiB)",
+        value: "16",
+        commented: false,
+        overrides: "",
+        description: "Cap on one build's log, which lives in the store's logs directory. Output past the cap is dropped, and the reply says so. Default 16 MiB.",
+    },
+    // ---- [recipes.<name>] — Lake commands a client runs by name ----------
+    FieldDoc {
+        key: "recipes.<name>.steps",
+        ty: "array of arrays of strings",
+        value: "[[\"build\", \"Proofs\"], [\"lint\"]]",
+        commented: true,
+        overrides: "",
+        description: "The Lake runs of one recipe, in order. Each is the words after lake and names a Lake command. Lake's -d, --dir, -f and --file options are refused, and a word that starts with - fits only after exe and its program, or after --. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name.",
+    },
+    FieldDoc {
+        key: "recipes.<name>.append",
+        ty: "string (none, last, each)",
+        value: "\"none\"",
+        commented: false,
+        overrides: "",
+        description: "Which steps get the request's args at their end: none refuses args, last gives them to the last step, each to every step. Default none.",
+    },
+    FieldDoc {
+        key: "recipes.<name>.guard",
+        ty: "string (before, after, none)",
+        value: "\"before\"",
+        commented: false,
+        overrides: "",
+        description: "Where the build.guard step runs: before the steps, after them, or not at all. A failing guard before the steps ends the recipe. Default before.",
+    },
 ];
+
+/// Keys the server reads that no row documents: old names it still accepts.
+const ALIASES: &[&str] = &["broker.max_projects"];
 
 /// Split a dotted key into `(table, leaf)`. A top-level key (no `.`) returns an
 /// empty table.
@@ -223,12 +277,31 @@ fn split_key(key: &str) -> (&str, &str) {
     key.rsplit_once('.').unwrap_or(("", key))
 }
 
+/// Whether `table` is a real table name rather than a pattern such as
+/// `recipes.<name>`, which the generated file must comment out.
+fn is_bare_path(table: &str) -> bool {
+    table
+        .split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+}
+
+/// Whether some row documents a key of table `name`.
+pub(crate) fn is_section(name: &str) -> bool {
+    SCHEMA_FIELDS.iter().any(|field| split_key(field.key).0 == name)
+}
+
+/// Whether the server reads the dotted key `key`.
+pub(crate) fn is_documented(key: &str) -> bool {
+    SCHEMA_FIELDS.iter().any(|field| field.key == key) || ALIASES.contains(&key)
+}
+
 /// Render the documented starter config `config init` writes.
 ///
 /// Every knob with a built-in default is emitted active at that default;
 /// optional knobs with no literal default (`server.bind`, `server.http_path`,
 /// the `[install]` paths) are emitted commented out, so a freshly-generated
-/// file reproduces the current defaults and changes nothing until edited.
+/// file reproduces the current defaults and changes nothing until edited. A
+/// pattern table such as `[recipes.<name>]` is commented out whole.
 #[must_use]
 pub fn render_default_toml() -> String {
     let mut out = String::with_capacity(4096);
@@ -243,7 +316,9 @@ pub fn render_default_toml() -> String {
          # what you set here.\n\
          #\n\
          # Active lines below are set to the current built-in defaults. Commented\n\
-         # lines are optional knobs with no default; uncomment to opt in.\n",
+         # lines are optional knobs with no default; uncomment to opt in. The\n\
+         # [recipes.<name>] lines show one recipe: copy them under a header\n\
+         # such as [recipes.lint] for each recipe.\n",
     );
 
     // A sentinel that no real table name equals, so the first field always
@@ -251,12 +326,16 @@ pub fn render_default_toml() -> String {
     let mut current = "\0";
     for field in SCHEMA_FIELDS {
         let (table, leaf) = split_key(field.key);
+        let pattern = !is_bare_path(table);
         if table == current {
             out.push('\n');
         } else {
             current = table;
             out.push('\n');
             if !table.is_empty() {
+                if pattern {
+                    out.push_str("# ");
+                }
                 out.push('[');
                 out.push_str(table);
                 out.push_str("]\n");
@@ -271,7 +350,7 @@ pub fn render_default_toml() -> String {
             out.push_str(field.overrides);
         }
         out.push_str(".\n");
-        if field.commented {
+        if field.commented || pattern {
             out.push_str("# ");
         }
         out.push_str(leaf);
@@ -406,6 +485,21 @@ mod tests {
         assert_eq!(
             config.output.slow_call_warning_millis,
             Some(crate::tools::DEFAULT_SLOW_CALL_WARNING_MILLIS)
+        );
+    }
+
+    /// The generated `[build]` lines hold the built-in build defaults, and the
+    /// commented recipe pattern adds no recipe.
+    #[test]
+    fn generated_build_tables_are_the_defaults() {
+        use crate::build::config::BuildConfig;
+        let text = render_default_toml();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert!(text.contains("\n# [recipes.<name>]\n"));
+        assert!(!table.contains_key("recipes"));
+        assert_eq!(
+            BuildConfig::from_table(&table).unwrap(),
+            BuildConfig::from_table(&toml::Table::new()).unwrap()
         );
     }
 
