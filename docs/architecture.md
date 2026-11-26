@@ -434,7 +434,7 @@ that checks the code. "None yet" marks a gap.
 | No build starts between a check's `setup-file` and its use of the imports. | `project_lock/tests.rs`: `a_nested_read_reuses_the_turn_while_a_writer_waits` |
 | One writer at a time, across processes and server restarts. | SDK `lean-toolchain/src/writer_lock/tests.rs`; a server killed during a build and restarted, none yet |
 | No lock release while a process of the build may live. | SDK `writer_lock/tests.rs`: `inherited_same_description_loan_retains_exclusion_until_owned_child_exit` |
-| No worker slot returns while its worker may live. | SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` |
+| No worker slot returns while its worker may live. | None yet; SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` tests reaping and slot counts nearby |
 | A wait for a turn ends at its deadline. | `project_lock/tests.rs`: `a_read_wait_ends_at_its_deadline_or_on_cancel`, `a_write_wait_ends_at_its_deadline_or_on_cancel_and_leaves_the_line` |
 | One launch per request ID; a record before launch; the same ID with other arguments refused; a stored result never changes; a restart ends every recorded request. | None yet: these come with the request table |
 
