@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   fails the call with `setup_file_failed` and Lake's own message.
 - Config tables `[build]` (`guard`, `timeout_secs`, `log_limit_mib`) and `[recipes.<name>]` (`steps`, `append`,
   `guard`). `config check --lake-root PROJECT` checks both config files and prints these tables without running Lake.
+- `[install] elan_home`: install records the elan home, `ELAN_HOME` or else `$HOME/.elan`. When `ELAN_HOME` is unset,
+  the server and `install-worker --lake-root` find the Lean toolchain there. Lake, Cargo and helper children get
+  `ELAN_HOME` set.
+- `doctor processes --lake-root PROJECT` lists that project's servers from the records in its store.
 
 ### Changed
 
@@ -44,6 +48,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `trust.source_sha256`.
 - A worker reloads its imports after a build only as a backstop: the finished-build count replaces the import stamps. A
   cached query result lives only as long as the worker that computed it.
+- The store keeps the state that went under `HOME`: the SDK's native owner records in `owners/`, the semantic runtime
+  cache in `semantic-runtimes/` and the server process records in `processes/`. Serve and install bind the owner
+  directory before any native work. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
+  `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` still move each one. Install, then serve, write nothing under `HOME` but the
+  socket directory.
 
 ### Removed
 
@@ -55,6 +64,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The server ignores an old `[launcher]` table.
 - Remove the serve flags `--module-setup-writer`, `--module-setup-storage-request`, `--prepared-generation` and
   `--verification-approval`, with prepared worker generations and the writer's setup-file path.
+- Remove the owner directory's fallback to the platform's local data directory and the semantic cache's fallback to the
+  user cache directory. Without a store, native work and `doctor writer-rollback` need
+  `LEAN_RS_WORKER_OWNERS_DIRECTORY`, and semantic tools need `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`.
 
 ## [0.16.22] - 2026-11-25
 

@@ -13,12 +13,21 @@ the [tool catalog](tool-catalog.md) for request and response contracts.
 
 
 Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set, otherwise
-`$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700. The SDK removes
-each worker's socket on closure. Durable owner records continue to use their configured registry. The host passes
-`LEAN_RS_WORKER_OWNERS_DIRECTORY` to its SDK helpers. The default is `lean-host-mcp/native-generations` under the
-platform's local data directory. On macOS this is `$HOME/Library/Application Support/lean-host-mcp/native-generations`.
-Keep the same canonical directory when restarting the server, including across binary changes.
-`LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` sets the separate server PID directory used by `doctor processes`.
+`$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700. On macOS a
+socket path holds at most 103 bytes, so the directory's path may hold at most 54. The SDK removes each worker's socket
+on closure.
+
+The server keeps its other state in its [store](#one-server-per-store), not under `HOME`: the SDK's durable owner
+records in `owners/`, the semantic runtime cache in `semantic-runtimes/`, and in `processes/` the PID records that
+`doctor processes` reads. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
+`LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` move each one. The server binds the owner directory before any native work, the SDK
+creates it, and the server passes it to its SDK helpers as `LEAN_RS_WORKER_OWNERS_DIRECTORY`. Keep the same canonical
+owner directory when restarting the server, including across binary changes. A server without `--lake-root` has no
+store: its native work then needs `LEAN_RS_WORKER_OWNERS_DIRECTORY`, its semantic tools need
+`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, and its PID records go under the per-user cache directory.
+
+The server finds the Lean toolchain under `ELAN_HOME`, else under the elan home that install recorded as
+`[install] elan_home`, else under `$HOME/.elan`. It passes that home to Lake, Cargo and its helpers as `ELAN_HOME`.
 
 The SDK writer executable setting is `LEAN_RS_WRITER_EXECUTABLE`. Launch environments may still use
 `LEAN_HOST_MCP_WRITER_EXECUTABLE` during the transition. A startup that supplies both must supply identical values. The
@@ -75,7 +84,8 @@ Units are shown in the table; GiB figures in descriptions are explanatory, not l
 | `output.slow_call_warning_millis` | integer (ms) | `10000` | `LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS` | Worker-call CPU time above which every tool response carries a warning naming the elapsed milliseconds and recommending refactoring (splitting the declaration, explicit type annotations, extracted lemmas). Keys on call_cpu_millis, not wallclock, so machine contention never triggers it. Default 10 s. |
 | `install.binary` | path | unset | none | The server executable that install copied, for MCP client configs and scripts that run the server by absolute path. The server itself ignores it. |
 | `install.workers_dir` | path | unset | `LEAN_HOST_MCP_WORKERS_DIR` | Directory of per-toolchain worker installs, shared by install, install-worker and the server. Unset uses .local/lean-host-mcp/workers under the Lake root. A relative path is relative to the Lake root. |
-| `install.store_dir` | path | unset | `LEAN_HOST_MCP_STORE_DIR` | Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root. |
+| `install.store_dir` | path | unset | `LEAN_HOST_MCP_STORE_DIR` | Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. It also holds the native owner records (owners/), the semantic runtime cache (semantic-runtimes/) and the server process records (processes/). Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root. |
+| `install.elan_home` | path | unset | `ELAN_HOME` | Elan's home when install ran: ELAN_HOME, else $HOME/.elan. When ELAN_HOME is unset, the server and install-worker --lake-root look for the Lean toolchain here, not under $HOME, and pass it on as ELAN_HOME. |
 | `build.guard` | array of Lake targets | `[]` | none | Targets that must already be built. A guard step runs lake build --no-build on them, which fails without building anything when one is out of date. It runs before a build of targets; a recipe's guard key places it. Proofs uses ["@mathlib/+Mathlib:olean"]. Empty runs no guard. |
 | `build.timeout_secs` | integer (s) | `14400` | none | Deadline for one build, counted from its request: the wait for the project's write turn and every step count. Default 4 hours. |
 | `build.log_limit_mib` | integer (MiB) | `16` | none | Cap on one build's log, which lives in the store's logs directory. Output past the cap is dropped, and the reply says so. Default 16 MiB. |
@@ -338,11 +348,14 @@ may finish normally or run until the configured request timeout before the worke
 outcome. Abrupt parent death can still skip Rust `Drop`; child-side parent-loss handling is best effort. Stronger
 containment is the job of the process manager that starts the server.
 
-Every running server writes a PID record under the per-user cache directory at `lean-host-mcp/processes/` and removes it
-on normal shutdown. The record contains the exact server PID, executable path, working directory, transport, bind/path,
-startup parent PID, and process group. Inspect records with:
+Every running server writes a PID record in its store's `processes/` and removes it on normal shutdown. A server without
+`--lake-root` writes it under the per-user cache directory at `lean-host-mcp/processes/` instead, and
+`LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` overrides both. The record contains the exact server PID, executable path, working
+directory, transport, bind/path, startup parent PID, and process group. Inspect the records of a project's servers with
+the first command, and those of servers without a Lake root with the second:
 
 ```sh
+lean-host-mcp doctor processes --lake-root PROJECT
 lean-host-mcp doctor processes
 ```
 
@@ -434,8 +447,8 @@ bootstrap failure.
 | `bin/lean-host-mcp` | a copy of the running executable |
 | `bin/lean-rs-writer` | the SDK writer that builds and checks the worker's shims |
 | `workers/` | the worker for the project's toolchain, built as `install-worker` builds it |
-| `store/` | the server's private state, mode 0700 |
-| `config.toml` | the local config file, with `[install]` set to the absolute `binary`, `workers_dir` and `store_dir` |
+| `store/` | the server's private state, mode 0700, including the native owner records that install binds |
+| `config.toml` | the local config file, with `[install]` set to the absolute `binary`, `workers_dir`, `store_dir` and `elan_home` |
 
 Serve with the installed copy:
 
@@ -453,7 +466,10 @@ PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
 - `--shim-source DIR` and `--source-dir DIR` pass to the worker build, as for `install-worker`.
 
 Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
-file that is not valid TOML before it builds anything.
+file that is not valid TOML before it builds anything. It records `elan_home` as `ELAN_HOME`, else `$HOME/.elan`, so a
+server started without `ELAN_HOME` finds the toolchain without reading `HOME`. Install, then serve, write nothing under
+`HOME` but the socket directory; `install_and_serve_keep_no_state_in_an_empty_home` in `tests/http_transport.rs` checks
+this.
 
 ## Installing workers
 
@@ -481,10 +497,10 @@ elan; the freshly built worker is smoke-tested before it is recorded as usable.
 
 The provenance sidecar records the worker wire-protocol version independently of the package version:
 
-- `install-worker --auto` (the default) scans `~/.elan/toolchains` and (re)builds any worker that is **missing or
-  stale** — protocol mismatch, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that are
-  current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current workers
-  too (e.g. to re-run the smoke test or replace a corrupted binary).
+- `install-worker --auto` (the default) scans `toolchains/` in the elan home and (re)builds any worker that is **missing
+  or stale** — protocol mismatch, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that
+  are current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current
+  workers too (e.g. to re-run the smoke test or replace a corrupted binary).
 - `install-worker --toolchain <id>` builds a fresh generation in its final directory. The installer verifies the
   published SDK shim sources, builds them with the standalone SDK writer, and records their identities in `worker.json`.
   Use `--shim-source DIR` or `--standalone-writer PATH` for explicit inputs. After the builtin `Nat.add_zero` inspection
@@ -537,13 +553,18 @@ scripts/test-installed-module-setup.sh                         # packaged proof 
 scripts/check-parent-link.sh                                  # build and inspect the release parent
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
     cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation -- --ignored
+LEAN_HOST_MCP_MATCHED_SDK_WRITER=/path/to/lean-rs-writer CARGO_NET_OFFLINE=true \
+    cargo test --locked -p lean-host-mcp --test http_transport install_and_serve_keep_no_state_in_an_empty_home \
+    -- --ignored                                               # install and serve with an empty HOME
 ```
 
 On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs, and the installed worker refuses any
 `DYLD_*` variable, so opt-in tests that check files or start a worker fail under `cargo test`. Build them with
 `cargo test --no-run`, then run each printed binary with `--ignored` under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
 `LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_RS_WORKER_OWNERS_DIRECTORY`,
-`LEAN_HOST_MCP_STORE_DIR` and `TMPDIR` under the target directory.
+`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, `LEAN_HOST_MCP_STORE_DIR` and `TMPDIR` under the target directory. The empty-HOME
+test clears its children's environment, so it runs under `cargo test`. Build its writer from the lean-rs checkout at the
+version `Cargo.lock` pins, with `--target-dir` under this repository's target directory.
 
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
@@ -552,8 +573,8 @@ directory's `package/` subdirectory.
 
 The installed smoke scripts require Python 3.11 or later and a native build. They resolve the pin in
 `fixtures/lean/lean-toolchain` through Elan and use Cargo's configured target directory for artifacts. Keep the matching
-toolchain under `~/.elan/toolchains` for worker installation and discovery. `LEAN_SYSROOT` can select a matching prefix
-for the build. Run `actionlint` and `shellcheck scripts/*.sh` to lint the workflow and shell files.
+toolchain in the elan home's `toolchains/` for worker installation and discovery. `LEAN_SYSROOT` can select a matching
+prefix for the build. Run `actionlint` and `shellcheck scripts/*.sh` to lint the workflow and shell files.
 
 Dispatch the Release workflow from `main` to rehearse verification and packaging. A push of a matching `v<version>` tag
 triggers publication after the changelog and packages pass verification. To recover after partial publication, rerun the

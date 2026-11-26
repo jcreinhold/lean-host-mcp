@@ -26,6 +26,7 @@ use lean_host_mcp::cli::install::{self, InstallArgs};
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
 use lean_host_mcp::cli::processes::{self, DoctorProcessesArgs};
 use lean_host_mcp::store::{self, StoreLock};
+use lean_host_mcp::toolchain;
 use lean_host_mcp::{
     BrokerConfig, ConfigFile, LeanHostService, OutputBudgetOverrides, ProjectBroker, ProjectRuntimeConfig,
     ResponseCarrier, TelemetryVerbosity, ToolConfig,
@@ -350,6 +351,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // The config files of the Lake root, local over tracked. They are the
     // layer beneath env/CLI: each knob is CLI > env > local > tracked > default.
     let file = ConfigFile::load(lake_root.as_deref());
+    // Find the toolchain where install found it, whatever `HOME` is now.
+    if let Some(home) = lake_root.as_deref().and_then(|root| file.install.elan_home(root)) {
+        toolchain::use_recorded_elan_home(&home)?;
+    }
     // Transport: clap already folds CLI-or-env into `args.*`, so `.or(file)`
     // yields CLI > env > file. The file's `bind` is a raw string, parsed here so
     // the library config schema stays transport-type-free.
@@ -374,10 +379,17 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let tool_config = resolve_tool_config(&file)?;
     // One server per store. Take the lock after the config checks, so a bad
     // config leaves the store alone, and before the broker, the process record
-    // and the journal open.
-    let _store = lake_root
+    // and the journal open. The store then keeps the native state, before any
+    // native work starts.
+    let store = lake_root
         .as_deref()
-        .map(|root| StoreLock::acquire(&store::store_dir(root, None), root))
+        .map(|root| -> anyhow::Result<_> {
+            let dir = store::store_dir(root, None);
+            let lock = StoreLock::acquire(&dir, root)?;
+            let dir = store::use_for_native_state(&dir)
+                .with_context(|| format!("cannot keep native state in the store {}", dir.display()))?;
+            Ok((lock, dir))
+        })
         .transpose()?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -408,7 +420,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         },
         runtime_config,
     );
-    let _process_record = processes::ServerProcessRecord::register(transport, bind_display.clone(), http_path_log)?;
+    let _process_record = processes::ServerProcessRecord::register(
+        transport,
+        bind_display.clone(),
+        http_path_log,
+        store.as_ref().map(|(_, dir)| dir.as_path()),
+    )?;
     let mut service = LeanHostService::new(Arc::clone(&broker), tool_config);
     if let Some(path) = args.request_journal {
         service = service.with_request_journal(&path)?;

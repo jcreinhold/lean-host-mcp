@@ -8,9 +8,15 @@
 //! Actions:
 //!
 //! - `--toolchain <id>`: build for one toolchain (always overwrites).
-//! - no flag / `--auto`: scan `~/.elan/toolchains/leanprover--lean4---*`
+//! - no flag / `--auto`: scan `<elan home>/toolchains/leanprover--lean4---*`
 //!   and build for any that are missing or stale (protocol mismatch, header
-//!   drift, failed/absent smoke); `--force` rebuilds current ones too.
+//!   drift, failed/absent smoke); `--force` rebuilds current ones too. The
+//!   elan home is [`toolchain::elan_home`], which with `--lake-root` includes
+//!   the root's recorded `[install] elan_home`.
+//!
+//! A build runs the worker's smoke test, which is native work. With
+//! `--lake-root` its state goes in that root's store; without, set
+//! `LEAN_RS_WORKER_OWNERS_DIRECTORY`.
 //! - `--list`: print a table of currently-installed workers, including a
 //!   `protocol` column that reports wire compatibility.
 //! - `--clean [--toolchain <id>]`: remove all installed workers, or just one.
@@ -37,7 +43,8 @@ use std::time::SystemTime;
 use clap::Args;
 use sha2::{Digest, Sha256};
 
-use crate::config_file;
+use crate::config_file::{self, ConfigFile};
+use crate::store;
 use crate::toolchain::{
     self, ToolchainId, WORKER_FILE_NAME, WORKERS_DIR_ENV, WindowVerdict, WorkerBinary, WorkerSidecar, hash_lean_header,
 };
@@ -66,7 +73,7 @@ pub struct InstallWorkerArgs {
     #[arg(long, value_name = "ID")]
     pub toolchain: Option<String>,
 
-    /// Scan `~/.elan/toolchains` and install a worker for every supported
+    /// Scan the elan home's `toolchains` and install a worker for every supported
     /// Lean toolchain that is missing or stale (host-version skew, header
     /// drift, or a failed/absent smoke record). This is the default when no
     /// action flag is supplied. Use `--force` to rebuild current ones too.
@@ -127,7 +134,21 @@ pub struct InstallWorkerArgs {
 /// a non-zero exit-code-equivalent error when any auto install fails.
 pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     check_arg_combination(args)?;
-    let root = workers_root(args)?;
+    let lake_root = args
+        .lake_root
+        .as_deref()
+        .map(|root| {
+            root.canonicalize()
+                .map_err(|e| anyhow::anyhow!("--lake-root {}: {e}", root.display()))
+        })
+        .transpose()?;
+    // Find the toolchains where install found them, whatever `HOME` is now.
+    if let Some(root) = lake_root.as_deref()
+        && let Some(home) = ConfigFile::load(Some(root)).install.elan_home(root)
+    {
+        toolchain::use_recorded_elan_home(&home)?;
+    }
+    let root = workers_root(args, lake_root.as_deref())?;
     if args.list {
         return run_list(&root);
     }
@@ -139,7 +160,9 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
         let target = args.toolchain.as_deref().map(ToolchainId::parse).transpose()?;
         return clean_in(&root, target.as_ref());
     }
-    // Default action (no flag) and `--auto` both scan and install.
+    // Default action (no flag) and `--auto` both scan and install. Check where
+    // the smoke test keeps its native state before a long build.
+    use_native_state(lake_root.as_deref())?;
     let source = resolve_worker_source(args.source_dir.as_deref())?;
     if let Some(raw) = args.toolchain.as_deref() {
         // `check_arg_combination` ruled out `--toolchain --auto`, so this is a
@@ -151,15 +174,30 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     run_auto(&root, &source, args)
 }
 
-/// The worker directory this run acts on. With `--lake-root` it is the one
-/// the server uses for that root; without, `--workers-dir` or
+/// Keep the native state of a worker's smoke test in the store of the
+/// canonical Lake root `lake_root`, creating the store. Without a root,
+/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` must name the owner directory.
+fn use_native_state(lake_root: Option<&Path>) -> anyhow::Result<()> {
+    match lake_root {
+        Some(root) => {
+            let dir = store::store_dir(root, None);
+            store::create_store_dir(&dir, root)
+                .and_then(|()| store::use_for_native_state(&dir))
+                .map_err(|e| anyhow::anyhow!("cannot keep native state in the store {}: {e}", dir.display()))?;
+        }
+        None => {
+            crate::shared_writer::ownership_registry()?;
+        }
+    }
+    Ok(())
+}
+
+/// The worker directory this run acts on. With the canonical `lake_root` it
+/// is the one the server uses for that root; without, `--workers-dir` or
 /// `LEAN_HOST_MCP_WORKERS_DIR` must name it.
-fn workers_root(args: &InstallWorkerArgs) -> anyhow::Result<PathBuf> {
-    if let Some(root) = args.lake_root.as_deref() {
-        let root = root
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("--lake-root {}: {e}", root.display()))?;
-        return Ok(toolchain::workers_dir(&root, args.workers_dir.as_deref()));
+fn workers_root(args: &InstallWorkerArgs, lake_root: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(root) = lake_root {
+        return Ok(toolchain::workers_dir(root, args.workers_dir.as_deref()));
     }
     args.workers_dir
         .clone()
@@ -314,7 +352,8 @@ fn run_auto(root: &Path, source: &WorkerSource, args: &InstallWorkerArgs) -> any
     let force = args.force;
     let toolchains = discover_elan_toolchains()?;
     if toolchains.is_empty() {
-        println!("(no Lean toolchains found under ~/.elan/toolchains)");
+        let home = toolchain::elan_home().map_or_else(|| "$ELAN_HOME".to_owned(), |home| home.display().to_string());
+        println!("(no Lean toolchains found under {home}/toolchains)");
         return Ok(());
     }
     let mut failed = false;
@@ -692,10 +731,10 @@ fn select_generation(slot: &Path, generation: &Path) -> anyhow::Result<()> {
 }
 
 fn discover_elan_toolchains() -> anyhow::Result<Vec<ToolchainId>> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = toolchain::elan_home() else {
         return Ok(Vec::new());
     };
-    let dir = home.join(".elan").join("toolchains");
+    let dir = home.join("toolchains");
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -785,6 +824,7 @@ fn worker_cargo(id: &ToolchainId, sysroot: &Path) -> Command {
     cargo
         .env("LEAN_HOST_MCP_TARGET_TOOLCHAIN", id.as_str())
         .env("LEAN_SYSROOT", sysroot);
+    toolchain::pass_elan_home(&mut cargo);
     cargo
 }
 
@@ -1145,6 +1185,14 @@ mod tests {
         assert_eq!(
             env.get(OsStr::new("LEAN_HOST_MCP_TARGET_TOOLCHAIN")),
             Some(&Some(OsStr::new("v4.36.0")))
+        );
+        assert_eq!(
+            env.get(OsStr::new("ELAN_HOME"))
+                .copied()
+                .flatten()
+                .map(std::path::PathBuf::from),
+            crate::toolchain::elan_home(),
+            "the build finds the same elan whatever its HOME"
         );
     }
 

@@ -565,6 +565,227 @@ async fn streamable_http_fixture_tool_call() {
     server.shutdown().await;
 }
 
+/// Install, then serve, a copy of the fixture with `HOME` set to a new empty
+/// directory. A build, a check and a proof search must leave nothing under
+/// `HOME` and nothing in `git status`.
+///
+/// `ELAN_HOME`, `CARGO_HOME` and `RUSTUP_HOME` keep their real values, and
+/// install builds the release worker offline. Set
+/// `LEAN_HOST_MCP_MATCHED_SDK_WRITER` to a `lean-rs-writer` built locally at
+/// the version `Cargo.lock` pins, so install downloads nothing. The sockets go
+/// to a short directory in the target directory: `$HOME/.lean-host-mcp-ipc`
+/// with `HOME` there makes socket paths too long for macOS.
+#[tokio::test]
+#[ignore = "builds the release worker; needs LEAN_HOST_MCP_MATCHED_SDK_WRITER"]
+async fn install_and_serve_keep_no_state_in_an_empty_home() {
+    let writer = std::env::var_os("LEAN_HOST_MCP_MATCHED_SDK_WRITER")
+        .map(PathBuf::from)
+        .expect("set LEAN_HOST_MCP_MATCHED_SDK_WRITER to a local lean-rs-writer");
+    let real_home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let real = |name: &str, default: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| real_home.join(default), PathBuf::from)
+    };
+    let target_tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let scratch = tempfile::Builder::new()
+        .prefix("empty-home-")
+        .tempdir_in(target_tmp)
+        .unwrap();
+    let sockets = tempfile::Builder::new()
+        .prefix("s")
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(target_tmp.parent().expect("target directory"))
+        .unwrap();
+    let scratch_dir = scratch.path().canonicalize().unwrap();
+    let home = scratch_dir.join("home");
+    let tmp = scratch_dir.join("tmp");
+    let project = scratch_dir.join("project");
+    for dir in [&home, &tmp, &project] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    copy_fixture(&fixture_root(), &project);
+    std::fs::write(project.join(".gitignore"), "/.lake/\n").unwrap();
+
+    let envs: Vec<(&str, std::ffi::OsString)> = vec![
+        ("PATH", std::env::var_os("PATH").expect("PATH")),
+        ("HOME", home.clone().into()),
+        ("ELAN_HOME", real("ELAN_HOME", ".elan").into()),
+        ("CARGO_HOME", real("CARGO_HOME", ".cargo").into()),
+        ("RUSTUP_HOME", real("RUSTUP_HOME", ".rustup").into()),
+        ("TMPDIR", tmp.into()),
+        ("CARGO_NET_OFFLINE", "true".into()),
+        (
+            "LEAN_HOST_MCP_SOCKET_DIR",
+            sockets.path().canonicalize().unwrap().into(),
+        ),
+        ("NO_COLOR", "1".into()),
+    ];
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=lean-host-mcp", "-c", "user.email=test@example.invalid"])
+            .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .current_dir(&project)
+            .env_clear()
+            .envs(envs.iter().cloned())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "fixture"]);
+
+    let install = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
+        .arg("install")
+        .arg("--lake-root")
+        .arg(&project)
+        .arg("--standalone-writer")
+        .arg(&writer)
+        .env_clear()
+        .envs(envs.iter().cloned())
+        .stdin(Stdio::null())
+        .output();
+    let install = tokio::time::timeout(Duration::from_mins(30), install)
+        .await
+        .expect("install must finish")
+        .expect("run install");
+    assert!(
+        install.status.success(),
+        "install failed:\n{}{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    // Serve as `make mcp-serve` does: the installed binary, the Lake root and
+    // a request journal in the local directory.
+    let local = project.join(".local/lean-host-mcp");
+    let config: toml::Table = std::fs::read_to_string(local.join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let binary = config["install"]["binary"].as_str().expect("installed binary");
+    let mut command = Command::new(binary);
+    command
+        .kill_on_drop(true)
+        .arg("--lake-root")
+        .arg(&project)
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--http-path")
+        .arg("/mcp")
+        .arg("--request-journal")
+        .arg(local.join("requests"))
+        .current_dir(&project)
+        .env_clear()
+        .envs(envs.iter().cloned())
+        .env("RUST_LOG", "warn,lean_host_mcp::transport_http=info")
+        .env("LEAN_HOST_MCP_RESPONSE_CARRIER", "both")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let server = HttpMcpServer::spawn(command, None).await;
+    let mut session = server.new_session().await;
+    // The installed worker serves no project request, so the semantic call is
+    // a proof search, which a native reader runs.
+    for (name, arguments) in [
+        ("lean_build", json!({})),
+        (
+            "lean_verify",
+            json!({"targets": [{
+                "kind": "explicit",
+                "file": "LeanRsFixture/ProofActions.lean",
+                "declarations": ["LeanRsFixture.ProofActions.stepTheorem"]
+            }]}),
+        ),
+        (
+            "lean_lookup",
+            json!({
+                "kind": "proof_search",
+                "file": "LeanRsFixture/ProofAgent.lean",
+                "declaration": "LeanRsFixture.ProofAgent.miniRatDenominatorStep",
+                "limit": 5
+            }),
+        ),
+    ] {
+        let response = session
+            .request("tools/call", json!({"name": name, "arguments": arguments}))
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_ne!(
+            response.json.pointer("/result/isError"),
+            Some(&Value::Bool(true)),
+            "{name} failed: {}",
+            response.json
+        );
+    }
+    let status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(server.pid().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success(), "kill -TERM: {status}");
+    server.wait_for_exit().await;
+
+    assert_eq!(
+        git(&["status", "--porcelain", "--untracked-files=all"]),
+        "",
+        "git status after install, serve and a build"
+    );
+    // The state that once went under `HOME` is in the store.
+    for dir in ["owners", "semantic-runtimes", "processes"] {
+        assert!(local.join("store").join(dir).is_dir(), "the store has no {dir}/");
+    }
+    let left = list_tree(&home);
+    eprintln!("under the empty HOME: {left:?}");
+    assert!(
+        left.iter().all(|path| path.starts_with(".lean-host-mcp-ipc")),
+        "install and serve wrote under HOME: {left:?}"
+    );
+}
+
+/// Copy the fixture's sources from `from` into the existing directory `to`,
+/// leaving out Lake's build directory.
+fn copy_fixture(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == ".lake" {
+            continue;
+        }
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir(&target).unwrap();
+            copy_fixture(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Every path under `root`, relative to it, in order.
+fn list_tree(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            }
+            paths.push(entry.path().strip_prefix(root).unwrap().to_path_buf());
+        }
+    }
+    paths.sort();
+    paths
+}
+
 #[tokio::test]
 #[ignore = "requires built Lean fixture and worker binary"]
 async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
@@ -1873,8 +2094,9 @@ struct HttpMcpServer {
     client: reqwest::Client,
     url: String,
     /// The server's own store, so tests on one Lake root do not share its
-    /// lock. A test that passes `LEAN_HOST_MCP_STORE_DIR` replaces it.
-    _store: tempfile::TempDir,
+    /// lock. A test that passes `LEAN_HOST_MCP_STORE_DIR` replaces it; an
+    /// installed server keeps its store under its Lake root.
+    _store: Option<tempfile::TempDir>,
 }
 
 impl HttpMcpServer {
@@ -1911,7 +2133,13 @@ impl HttpMcpServer {
         for (key, value) in envs {
             command.env(key, value);
         }
+        Self::spawn(command, Some(store)).await
+    }
 
+    /// Spawn `command`, a server that binds `127.0.0.1:0` with stderr piped
+    /// and logs `lean_host_mcp::transport_http` at info, and wait for the
+    /// address it listens on.
+    async fn spawn(mut command: Command, store: Option<tempfile::TempDir>) -> Self {
         let mut child = command.spawn().expect("spawn lean-host-mcp HTTP server");
         let stderr = child.stderr.take().expect("server stderr");
         let mut stderr = BufReader::new(stderr);

@@ -18,10 +18,67 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::config_file::{self, ConfigFile};
 use crate::smoke::SmokeOutcome;
+
+/// Env var that names elan's home, as elan itself reads it.
+pub const ELAN_HOME_ENV: &str = "ELAN_HOME";
+
+/// The `[install] elan_home` of the Lake root this process serves, set by
+/// [`use_recorded_elan_home`].
+static RECORDED_ELAN_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Look for elan in `path` when `ELAN_HOME` is unset.
+///
+/// `path` is the `[install] elan_home` that `install` recorded for the Lake
+/// root this process serves. Call it once, before any toolchain lookup.
+///
+/// # Errors
+///
+/// Fails when an earlier call recorded another path.
+pub fn use_recorded_elan_home(path: &Path) -> io::Result<()> {
+    if RECORDED_ELAN_HOME.get_or_init(|| path.to_path_buf()) == path {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "the recorded elan home is already set to another path",
+        ))
+    }
+}
+
+/// Elan's home, where the Lean toolchains are.
+///
+/// It is `ELAN_HOME`, then the recorded `[install] elan_home`, then
+/// `$HOME/.elan`. `install`, `install-worker` and the server all resolve it
+/// here, and set it as `ELAN_HOME` on the Lean and Lake processes they start.
+#[must_use]
+pub fn elan_home() -> Option<PathBuf> {
+    elan_home_from(
+        std::env::var_os(ELAN_HOME_ENV),
+        RECORDED_ELAN_HOME.get().map(PathBuf::as_path),
+        dirs::home_dir(),
+    )
+}
+
+/// Set `ELAN_HOME` on `command` to [`elan_home`], so the Lean, Lake or Cargo
+/// process it starts finds the same elan whatever its `HOME`.
+pub(crate) fn pass_elan_home(command: &mut std::process::Command) {
+    if let Some(home) = elan_home() {
+        command.env(ELAN_HOME_ENV, home);
+    }
+}
+
+/// [`elan_home`] with its inputs passed in. An empty `ELAN_HOME` counts as unset.
+pub(crate) fn elan_home_from(env: Option<OsString>, recorded: Option<&Path>, home: Option<PathBuf>) -> Option<PathBuf> {
+    env.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| recorded.map(Path::to_path_buf))
+        .or_else(|| home.map(|home| home.join(".elan")))
+}
 
 /// Canonical short form of a Lean toolchain pin (e.g. `v4.30.0`,
 /// `nightly-2026-05-20`).
@@ -121,7 +178,8 @@ impl ToolchainId {
     }
 
     /// Resolved path to the elan toolchain root
-    /// (`~/.elan/toolchains/leanprover--lean4---<id>`).
+    /// (`<elan home>/toolchains/leanprover--lean4---<id>`, with the elan home
+    /// from [`elan_home`]).
     ///
     /// # Errors
     ///
@@ -129,14 +187,14 @@ impl ToolchainId {
     /// absent. Returns the path even when present so callers can build
     /// further on top of it.
     pub fn elan_dir(&self) -> Result<PathBuf, ToolchainError> {
-        let home = dirs::home_dir().ok_or_else(|| ToolchainError::ElanToolchainNotInstalled {
-            toolchain: self.clone(),
-            elan_dir: PathBuf::from(format!("~/.elan/toolchains/leanprover--lean4---{}", self.0)),
-        })?;
-        let dir = home
-            .join(".elan")
-            .join("toolchains")
-            .join(format!("leanprover--lean4---{}", self.0));
+        let name = format!("leanprover--lean4---{}", self.0);
+        let Some(home) = elan_home() else {
+            return Err(ToolchainError::ElanToolchainNotInstalled {
+                toolchain: self.clone(),
+                elan_dir: Path::new("$ELAN_HOME/toolchains").join(name),
+            });
+        };
+        let dir = home.join("toolchains").join(name);
         if dir.is_dir() {
             Ok(dir)
         } else {
@@ -498,7 +556,7 @@ pub enum Readiness {
     Unusable { toolchain: ToolchainId, detail: String },
     /// No worker binary installed for this pin.
     NotInstalled { toolchain: ToolchainId },
-    /// The pinned elan toolchain itself is not installed under `~/.elan`.
+    /// The pinned elan toolchain itself is not installed under the elan home.
     ToolchainNotInstalled { toolchain: ToolchainId, elan_dir: PathBuf },
     /// Pin is installed and header-fresh but unrecognized (`nightly-*`):
     /// proceed, but flag it to the caller. Carries `lean_sysroot` so the caller
@@ -882,6 +940,31 @@ mod tests {
 
     /// The fix command the readiness tests pass; notes must repeat it.
     const FIX: &str = "lean-host-mcp install --lake-root /project";
+
+    #[test]
+    fn elan_home_prefers_the_env_then_the_recorded_path_then_home() {
+        let env = || Some(OsString::from("/env/elan"));
+        let recorded = Some(Path::new("/recorded/elan"));
+        let home = || Some(PathBuf::from("/home/user"));
+        assert_eq!(
+            elan_home_from(env(), recorded, home()),
+            Some(PathBuf::from("/env/elan"))
+        );
+        assert_eq!(
+            elan_home_from(None, recorded, home()),
+            Some(PathBuf::from("/recorded/elan"))
+        );
+        assert_eq!(
+            elan_home_from(Some(OsString::new()), recorded, home()),
+            Some(PathBuf::from("/recorded/elan")),
+            "an empty ELAN_HOME counts as unset"
+        );
+        assert_eq!(
+            elan_home_from(None, None, home()),
+            Some(PathBuf::from("/home/user/.elan"))
+        );
+        assert_eq!(elan_home_from(None, None, None), None);
+    }
 
     #[test]
     fn parse_accepts_elan_prefix_and_bare_short_form() {

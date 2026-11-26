@@ -162,6 +162,7 @@ fn configure(command: &mut Command, sysroot: &Path, writer: &Path, registry: &Pa
     for name in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
         command.env_remove(name);
     }
+    crate::toolchain::pass_elan_home(command);
     configure_writer_executable(command, Some(writer))
 }
 

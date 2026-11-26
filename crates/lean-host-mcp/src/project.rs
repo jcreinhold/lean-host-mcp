@@ -3741,6 +3741,8 @@ pub(crate) fn semantic_runtime(
     Ok(runtime)
 }
 
+/// The semantic runtime cache: `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, an existing
+/// canonical directory, else `semantic-runtimes` in the server's store.
 fn semantic_runtime_cache_root() -> Result<PathBuf> {
     // This changes only the destination of the released runtime builder. It
     // still checks the package inputs and uses the same supervised writer.
@@ -3753,9 +3755,13 @@ fn semantic_runtime_cache_root() -> Result<PathBuf> {
         }
         return Ok(dir);
     }
-    let cache_dir =
-        dirs::cache_dir().ok_or_else(|| ServerError::Internal("could not resolve user cache directory".to_owned()))?;
-    Ok(cache_dir.join("lean-host-mcp").join("semantic-runtimes"))
+    crate::store::native_store()
+        .map(|store| store.join(crate::store::SEMANTIC_CACHE_DIR_NAME))
+        .ok_or_else(|| {
+            ServerError::BadProject(
+                "no semantic runtime cache: serve with --lake-root, or set LEAN_HOST_MCP_SEMANTIC_CACHE_DIR".into(),
+            )
+        })
 }
 
 #[cfg(test)]

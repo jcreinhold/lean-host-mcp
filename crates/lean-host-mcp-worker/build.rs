@@ -6,7 +6,8 @@
 //! 1. `LEAN_SYSROOT`: the explicit Lean prefix used for both headers and
 //!    runtime linking. The installer sets it to the selected elan toolchain.
 //! 2. `LEAN_HOST_MCP_TARGET_TOOLCHAIN`: short toolchain ID resolved under
-//!    `~/.elan/toolchains` for builds without an explicit prefix.
+//!    `$ELAN_HOME/toolchains`, else `$HOME/.elan/toolchains`, for builds
+//!    without an explicit prefix.
 //! 3. `lean --print-prefix`: fall back to whatever `lean` resolves to on
 //!    `PATH` (the developer's default toolchain).
 //!
@@ -25,6 +26,7 @@ fn main() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=LEAN_HOST_MCP_TARGET_TOOLCHAIN");
     println!("cargo:rerun-if-env-changed=LEAN_SYSROOT");
     println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=ELAN_HOME");
     println!("cargo:rerun-if-env-changed=HOME");
 
     if env::var_os("CARGO_FEATURE_NATIVE_WORKER").is_none() || env::var_os("DOCS_RS").is_some() {
@@ -75,11 +77,12 @@ fn explicit_prefix(prefix: PathBuf, target_os: &str) -> Result<PathBuf, String> 
 fn discover_prefix() -> Option<PathBuf> {
     if let Some(id) = env::var_os("LEAN_HOST_MCP_TARGET_TOOLCHAIN") {
         let id = id.to_string_lossy().into_owned();
-        if let Some(home) = env::var_os("HOME") {
-            let path = PathBuf::from(home)
-                .join(".elan")
-                .join("toolchains")
-                .join(format!("leanprover--lean4---{id}"));
+        let elan = env::var_os("ELAN_HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".elan")));
+        if let Some(elan) = elan {
+            let path = elan.join("toolchains").join(format!("leanprover--lean4---{id}"));
             if path.is_dir() {
                 return Some(path);
             }

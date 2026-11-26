@@ -338,6 +338,7 @@ impl Job {
             .env_remove("LEAN_PATH")
             .env(LOG_ENV, &self.log)
             .env(LOG_LIMIT_ENV, self.plan.log_limit.to_string());
+        crate::toolchain::pass_elan_home(&mut command);
         command
     }
 

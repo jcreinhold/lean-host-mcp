@@ -54,28 +54,39 @@ pub struct WriterContract {
     pub ownership_registry: PathBuf,
 }
 
-/// Check the writer settings and bind the host registry before native startup.
+/// Check the writer settings before native startup.
+///
+/// It also binds the owner directory when `LEAN_RS_WORKER_OWNERS_DIRECTORY`
+/// names one. Otherwise the server and install bind their store's directory
+/// once they know the store, through [`crate::store::use_for_native_state`].
 ///
 /// # Errors
-/// Refuses conflicting writer aliases or an unavailable ownership registry.
+/// Refuses conflicting writer aliases or an invalid owner directory.
 pub fn configure_native_startup() -> io::Result<()> {
     lean_toolchain::shared_writer::writer_executable_from_env()?;
-    ownership_registry()?;
+    if std::env::var_os(OWNERS_DIRECTORY_ENV).is_some() {
+        ownership_registry()?;
+    }
     Ok(())
 }
 
-/// Bind the SDK to the host's existing worker and writer ownership directory.
+/// Bind the SDK to the owner directory of this process's workers and writers.
+///
+/// That is `LEAN_RS_WORKER_OWNERS_DIRECTORY`, else `owners` in the store set
+/// by [`crate::store::use_for_native_state`]. It never creates the directory:
+/// the SDK does, with the mode it checks.
 ///
 /// # Errors
-/// Returns an error if the directory cannot be resolved or bound to the SDK.
+/// Returns an error if neither names a directory, or if the SDK refuses it.
 pub fn ownership_registry() -> io::Result<PathBuf> {
     let directory = if let Some(path) = std::env::var_os(OWNERS_DIRECTORY_ENV) {
         PathBuf::from(path)
+    } else if let Some(store) = crate::store::native_store() {
+        store.join(crate::store::OWNERS_DIR_NAME)
     } else {
-        dirs::data_local_dir()
-            .ok_or_else(|| io::Error::other("local data directory unavailable"))?
-            .join("lean-host-mcp")
-            .join("native-generations")
+        return Err(io::Error::other(format!(
+            "no native owner directory: serve or install with --lake-root, or set {OWNERS_DIRECTORY_ENV}"
+        )));
     };
     bind_registry_directory(&directory)?;
     Ok(directory)

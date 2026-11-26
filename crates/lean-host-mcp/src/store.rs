@@ -6,12 +6,18 @@
 //! exits, so a crashed server never leaves the store locked. The holder writes
 //! its pid and Lake root into the same file; a second server that cannot take
 //! the lock reads them to name the server that holds it.
+//!
+//! The store also keeps the state that would otherwise go under `HOME`: the
+//! SDK owner directory `owners/`, the semantic runtime cache
+//! `semantic-runtimes/` and the server process records `processes/`. A server
+//! or install selects it for this with [`use_for_native_state`].
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::config_file::{self, ConfigFile};
 
@@ -21,6 +27,51 @@ pub const STORE_DIR_ENV: &str = "LEAN_HOST_MCP_STORE_DIR";
 
 /// The lock file inside the store.
 const LOCK_FILE_NAME: &str = "server.lock";
+
+/// The SDK owner directory inside the store, unless
+/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` names another.
+pub const OWNERS_DIR_NAME: &str = "owners";
+
+/// The semantic runtime cache inside the store, unless
+/// `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` names another.
+pub const SEMANTIC_CACHE_DIR_NAME: &str = "semantic-runtimes";
+
+/// The server process records inside the store, unless
+/// `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` names another directory.
+pub const PROCESSES_DIR_NAME: &str = "processes";
+
+/// The canonical store this process keeps its native state in, set by
+/// [`use_for_native_state`].
+static NATIVE_STORE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep this process's native state in the existing store `store`.
+///
+/// It binds the SDK owner directory `<store>/owners`, unless
+/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` names another, and makes
+/// `<store>/semantic-runtimes` the semantic runtime cache. Call it once,
+/// before any native work. It creates neither directory; the SDK creates the
+/// owner directory with the mode it checks. Returns the canonical store.
+///
+/// # Errors
+///
+/// Fails when `store` cannot be resolved, when an earlier call chose another
+/// store, or when the SDK refuses the owner directory.
+pub fn use_for_native_state(store: &Path) -> io::Result<PathBuf> {
+    let store = store.canonicalize()?;
+    if *NATIVE_STORE.get_or_init(|| store.clone()) != store {
+        return Err(io::Error::other(
+            "this process already keeps its native state in another store",
+        ));
+    }
+    crate::shared_writer::ownership_registry()?;
+    Ok(store)
+}
+
+/// The canonical store set by [`use_for_native_state`], if any.
+#[must_use]
+pub fn native_store() -> Option<&'static Path> {
+    NATIVE_STORE.get().map(PathBuf::as_path)
+}
 
 /// The store directory for Lake root `root`: `flag` (a CLI flag), then
 /// `LEAN_HOST_MCP_STORE_DIR`, then `[install] store_dir` from the root's config

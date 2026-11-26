@@ -814,6 +814,7 @@ fn run_internal(
         command.env_remove(name);
     }
     command.env(OWNERS_DIRECTORY_ENV, &helper.ownership_registry);
+    crate::toolchain::pass_elan_home(&mut command);
     if let Some(program) = program {
         command
             .env(PROGRAM_CWD_ENV, &program.cwd)

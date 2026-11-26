@@ -180,6 +180,9 @@ pub struct InstallFileConfig {
     /// Private directory for server state, including the lock that admits
     /// one server.
     pub store_dir: Option<PathBuf>,
+    /// Elan's home when install ran. The server finds the Lean toolchain
+    /// there when `ELAN_HOME` is unset, so it does not depend on `HOME`.
+    pub elan_home: Option<PathBuf>,
 }
 
 impl InstallFileConfig {
@@ -187,6 +190,12 @@ impl InstallFileConfig {
     #[must_use]
     pub fn workers_dir(&self, root: &Path) -> Option<PathBuf> {
         self.workers_dir.as_deref().map(|path| root.join(path))
+    }
+
+    /// The recorded elan home, resolved against `root`.
+    #[must_use]
+    pub fn elan_home(&self, root: &Path) -> Option<PathBuf> {
+        self.elan_home.as_deref().map(|path| root.join(path))
     }
 
     /// The configured store directory, resolved against `root`.

@@ -38,9 +38,9 @@ On macOS this command cannot reach a worker: Cargo sets `DYLD_FALLBACK_LIBRARY_P
 refuses any `DYLD_*` variable. Run the binaries that `cargo test --no-run` prints under
 `env -u DYLD_FALLBACK_LIBRARY_PATH` instead; see `docs/operations.md`.
 
-For a non-default toolchain, export `LEAN_SYSROOT=$HOME/.elan/toolchains/leanprover--lean4---<id>` for the whole
-build-and-test invocation. Set `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` for the worker build too. The latter chooses its
-rpath; it does not select the header fingerprint baked into dependencies and parent tests. A mismatched header fails
+For a non-default toolchain, export `LEAN_SYSROOT=${ELAN_HOME:-$HOME/.elan}/toolchains/leanprover--lean4---<id>` for the
+whole build-and-test invocation. Set `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` for the worker build too. The latter chooses
+its rpath; it does not select the header fingerprint baked into dependencies and parent tests. A mismatched header fails
 bootstrap with `lean_rs.loader.unsupported_toolchain_fingerprint`. See CI's environment setup.
 
 Use `scripts/check-parent-link.sh` to build and inspect the parent separately in release mode.

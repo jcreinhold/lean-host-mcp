@@ -6,13 +6,15 @@
 //!
 //! - installs the SDK writer at `bin/lean-rs-writer`;
 //! - copies this executable to `bin/lean-host-mcp`;
+//! - creates the private server store `store/` (mode 0700);
 //! - installs the worker for the toolchain in `workers/`, by the
-//!   `install-worker` code path;
-//! - creates the private server store `store/` (mode 0700).
+//!   `install-worker` code path, keeping the worker's native state in the
+//!   store.
 //!
 //! Without `--dir`, `LEAN_HOST_MCP_WORKERS_DIR` and `LEAN_HOST_MCP_STORE_DIR`
 //! and an earlier install's paths still apply, as they do for the server. The
-//! command then records the absolute paths in the `[install]` table of
+//! command then records the absolute paths, and elan's home (`ELAN_HOME`, else
+//! `$HOME/.elan`), in the `[install]` table of
 //! `<root>/.local/lean-host-mcp/config.toml`, the ignored local config file. It
 //! never writes a tracked file.
 
@@ -84,12 +86,19 @@ struct Plan {
     bin: PathBuf,
     workers_dir: PathBuf,
     store_dir: PathBuf,
+    /// Elan's home, recorded so the server finds the toolchain without `HOME`.
+    elan_home: Option<PathBuf>,
 }
 
 impl Plan {
     /// Resolve the plan for `args`, with the worker and store env vars'
-    /// values passed in.
-    fn resolve(args: &InstallArgs, workers_env: Option<OsString>, store_env: Option<OsString>) -> anyhow::Result<Self> {
+    /// values and elan's home passed in.
+    fn resolve(
+        args: &InstallArgs,
+        workers_env: Option<OsString>,
+        store_env: Option<OsString>,
+        elan_home: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let root = args
             .lake_root
             .canonicalize()
@@ -107,6 +116,7 @@ impl Plan {
             bin: dir.join("bin"),
             workers_dir: std::path::absolute(workers_dir)?,
             store_dir: std::path::absolute(store_dir)?,
+            elan_home: elan_home.map(std::path::absolute).transpose()?,
             root,
             toolchain,
         })
@@ -129,12 +139,18 @@ impl Plan {
 /// the writer or worker install fails, or when a file cannot be written.
 pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("cannot find this executable")?;
+    // Nothing recorded the elan home in this process, so this is `ELAN_HOME`,
+    // else `$HOME/.elan`: the elan of the shell that runs install.
     let plan = Plan::resolve(
         args,
         std::env::var_os(toolchain::WORKERS_DIR_ENV),
         std::env::var_os(store::STORE_DIR_ENV),
+        toolchain::elan_home(),
     )?;
     let config = install(&plan, args, &exe, |workers, id, writer| {
+        // The worker's smoke test is native work; keep its state in the store.
+        store::use_for_native_state(&plan.store_dir)
+            .with_context(|| format!("cannot keep native state in the store {}", plan.store_dir.display()))?;
         let source = install_worker::resolve_worker_source(args.source_dir.as_deref())?;
         let inputs = WriterInputs {
             shim_source: args.shim_source.clone(),
@@ -174,6 +190,9 @@ fn install(
     let local = read_local_config(&plan.root)?;
     config_file::ensure_local_dir(&plan.root)?;
     fs::create_dir_all(&plan.bin).with_context(|| format!("creating {}", plan.bin.display()))?;
+    // The worker build keeps its native state in the store, so make it first.
+    store::create_store_dir(&plan.store_dir, &plan.root)
+        .with_context(|| format!("creating store {}", plan.store_dir.display()))?;
 
     let writer = plan.writer();
     install_writer(&writer, exe, args.standalone_writer.as_deref(), args.force)?;
@@ -189,17 +208,15 @@ fn install(
         }
     }
 
-    store::create_store_dir(&plan.store_dir, &plan.root)
-        .with_context(|| format!("creating store {}", plan.store_dir.display()))?;
-    write_local_config(
-        &plan.root,
-        local,
-        &[
-            ("binary", &plan.binary()),
-            ("workers_dir", &plan.workers_dir),
-            ("store_dir", &plan.store_dir),
-        ],
-    )
+    let mut paths = vec![
+        ("binary", plan.binary()),
+        ("workers_dir", plan.workers_dir.clone()),
+        ("store_dir", plan.store_dir.clone()),
+    ];
+    if let Some(home) = &plan.elan_home {
+        paths.push(("elan_home", home.clone()));
+    }
+    write_local_config(&plan.root, local, &paths)
 }
 
 /// Put the SDK writer at `dest`: `--standalone-writer` when given, else a
@@ -289,7 +306,7 @@ fn read_local_config(root: &Path) -> anyhow::Result<toml::Table> {
 
 /// Write `table`, the local config file of `root`, with its `[install]` table
 /// set to `paths`.
-fn write_local_config(root: &Path, mut table: toml::Table, paths: &[(&str, &Path)]) -> anyhow::Result<PathBuf> {
+fn write_local_config(root: &Path, mut table: toml::Table, paths: &[(&str, PathBuf)]) -> anyhow::Result<PathBuf> {
     let path = config_file::local_file(root);
     let mut install = toml::Table::new();
     for (key, value) in paths {
@@ -352,11 +369,18 @@ mod tests {
         }
     }
 
+    /// The elan home the tests install with.
+    const ELAN_HOME: &str = "/opt/elan";
+
     /// Install with a fake worker build that records its inputs.
     fn run_install(args: &InstallArgs, exe: &Path) -> anyhow::Result<(Plan, Vec<(PathBuf, String, PathBuf)>)> {
-        let plan = Plan::resolve(args, None, None)?;
+        let plan = Plan::resolve(args, None, None, Some(PathBuf::from(ELAN_HOME)))?;
         let mut builds = Vec::new();
         install(&plan, args, exe, |workers, id, writer| {
+            anyhow::ensure!(
+                plan.store_dir.is_dir(),
+                "the worker build keeps native state in the store, so it must exist first"
+            );
             builds.push((workers.to_path_buf(), id.to_string(), writer.to_path_buf()));
             let slot = workers.join(id.as_str());
             fs::create_dir_all(&slot)?;
@@ -400,6 +424,11 @@ mod tests {
         assert_eq!(install.workers_dir(root), Some(local.join("workers")));
         assert_eq!(install.store_dir(root), Some(local.join("store")));
         assert_eq!(
+            install.elan_home(root),
+            Some(PathBuf::from(ELAN_HOME)),
+            "the server finds the toolchain without HOME"
+        );
+        assert_eq!(
             config.runtime.worker_restart_limit,
             Some(5),
             "install keeps other local keys"
@@ -439,7 +468,7 @@ mod tests {
 
         // Without `--dir`, a reinstall uses the recorded worker and store paths,
         // as the server does.
-        let again = Plan::resolve(&args(&fixture, None), None, None)?;
+        let again = Plan::resolve(&args(&fixture, None), None, None, None)?;
         assert_eq!(again.workers_dir, dir.join("workers"));
         assert_eq!(again.store_dir, dir.join("store"));
         assert_eq!(again.bin, config_file::local_dir(&fixture.root).join("bin"));

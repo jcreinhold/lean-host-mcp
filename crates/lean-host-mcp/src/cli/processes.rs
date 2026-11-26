@@ -21,6 +21,11 @@ pub struct DoctorProcessesArgs {
     /// Remove registry records whose PID is confirmed absent.
     #[arg(long)]
     pub cleanup_stale_records: bool,
+
+    /// List the servers of this Lake root, whose records are in its store.
+    /// Without it, list the servers started without a Lake root.
+    #[arg(long, value_name = "DIR")]
+    pub lake_root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -29,7 +34,8 @@ pub struct ServerProcessRecord {
 }
 
 impl ServerProcessRecord {
-    /// Register this running server in the per-user process registry.
+    /// Register this running server in the process registry: `processes` in
+    /// its store `store`, or the per-user registry for a server without one.
     ///
     /// The record is removed on normal process shutdown. If a launcher kills
     /// the process before `Drop` runs, `doctor processes --cleanup-stale-records`
@@ -39,8 +45,13 @@ impl ServerProcessRecord {
     ///
     /// Returns an error if the registry directory, current executable, current
     /// directory, record serialization, or record write cannot be resolved.
-    pub fn register(transport: &str, bind: Option<String>, http_path: Option<&str>) -> Result<Self> {
-        let dir = registry_dir()?;
+    pub fn register(
+        transport: &str,
+        bind: Option<String>,
+        http_path: Option<&str>,
+        store: Option<&Path>,
+    ) -> Result<Self> {
+        let dir = registry_dir(store)?;
         fs::create_dir_all(&dir).with_context(|| format!("create process registry {}", dir.display()))?;
         let pid = std::process::id();
         let path = dir.join(format!("{pid}.json"));
@@ -105,7 +116,23 @@ struct ListedRecord {
 /// Returns an error if the registry cannot be read, a record cannot be parsed,
 /// or a requested stale-record cleanup cannot remove its file.
 pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
-    let records = list_records()?;
+    let store = args
+        .lake_root
+        .as_deref()
+        .map(|root| {
+            root.canonicalize()
+                .map(|root| crate::store::store_dir(&root, None))
+                .with_context(|| format!("--lake-root {}", root.display()))
+        })
+        .transpose()?;
+    let records = list_records(&registry_dir(store.as_deref())?)?;
+    let cleanup = match args.lake_root.as_deref() {
+        Some(root) => format!(
+            "lean-host-mcp doctor processes --lake-root {} --cleanup-stale-records",
+            crate::toolchain::shell_word(&root.to_string_lossy())
+        ),
+        None => "lean-host-mcp doctor processes --cleanup-stale-records".to_owned(),
+    };
     for listed in &records {
         println!(
             "pid={} alive={} liveness_error={} executable_match={} transport={} bind={} http_path={} cwd={} started_unix_millis={} parent_pid_at_start={} current_parent_pid={} parent_alive_at_start={} process_group_id={} current_process_group_id={} stale_client={} record={}",
@@ -133,7 +160,7 @@ pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
             None => println!("  child_pids=unknown"),
         }
         if listed.liveness == ProcessLiveness::Dead {
-            println!("  stale_record_cleanup=lean-host-mcp doctor processes --cleanup-stale-records");
+            println!("  stale_record_cleanup={cleanup}");
         } else if stale_stdio_client(listed) {
             println!("  exact_terminate=kill -TERM {}", listed.record.pid);
         }
@@ -144,13 +171,12 @@ pub fn run(args: &DoctorProcessesArgs) -> Result<()> {
     Ok(())
 }
 
-fn list_records() -> Result<Vec<ListedRecord>> {
-    let dir = registry_dir()?;
+fn list_records(dir: &Path) -> Result<Vec<ListedRecord>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in fs::read_dir(&dir).with_context(|| format!("read process registry {}", dir.display()))? {
+    for entry in fs::read_dir(dir).with_context(|| format!("read process registry {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if path.extension() != Some(OsStr::new("json")) {
@@ -183,9 +209,15 @@ fn list_records() -> Result<Vec<ListedRecord>> {
     Ok(out)
 }
 
-fn registry_dir() -> Result<PathBuf> {
+/// The process registry: `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR`, else
+/// `processes` in the server store `store`, else `lean-host-mcp/processes`
+/// under the user cache directory.
+fn registry_dir(store: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os(REGISTRY_ENV) {
         return Ok(PathBuf::from(path));
+    }
+    if let Some(store) = store {
+        return Ok(store.join(crate::store::PROCESSES_DIR_NAME));
     }
     let cache = dirs::cache_dir().context("could not resolve user cache directory")?;
     Ok(cache.join("lean-host-mcp").join("processes"))

@@ -214,7 +214,15 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "\"/abs/path/to/project/.local/lean-host-mcp/store\"",
         commented: true,
         overrides: "LEAN_HOST_MCP_STORE_DIR",
-        description: "Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root.",
+        description: "Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. It also holds the native owner records (owners/), the semantic runtime cache (semantic-runtimes/) and the server process records (processes/). Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root.",
+    },
+    FieldDoc {
+        key: "install.elan_home",
+        ty: "path",
+        value: "\"/abs/path/to/home/.elan\"",
+        commented: true,
+        overrides: "ELAN_HOME",
+        description: "Elan's home when install ran: ELAN_HOME, else $HOME/.elan. When ELAN_HOME is unset, the server and install-worker --lake-root look for the Lean toolchain here, not under $HOME, and pass it on as ELAN_HOME.",
     },
     // ---- [build] — lean_build -------------------------------------------
     FieldDoc {
@@ -432,6 +440,7 @@ mod tests {
         assert!(config.install.binary.is_none());
         assert!(config.install.workers_dir.is_none());
         assert!(config.install.store_dir.is_none());
+        assert!(config.install.elan_home.is_none());
     }
 
     /// Each active default in the catalogue must equal the built-in constant it
