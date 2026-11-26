@@ -299,12 +299,16 @@ impl Default for ProjectRuntimeConfig {
 
 impl ProjectRuntimeConfig {
     pub(crate) fn require_operator_primary(&self, root: &Path) -> Result<()> {
-        if self.operator_primary.as_deref() == Some(root) {
-            Ok(())
-        } else {
-            Err(ServerError::BadProject(
-                "native execution requires an operator-approved project".into(),
-            ))
+        match self.operator_primary.as_deref() {
+            Some(primary) if primary == root => Ok(()),
+            Some(primary) => Err(ServerError::BadProject(format!(
+                "this server serves {}, not {}; start a server with `--lake-root` set to that project",
+                primary.display(),
+                root.display()
+            ))),
+            None => Err(ServerError::BadProject(
+                "native execution requires an operator-approved project; start the server with `--lake-root`".into(),
+            )),
         }
     }
 

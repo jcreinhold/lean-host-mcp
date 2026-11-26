@@ -435,6 +435,34 @@ async fn conflicting_writer_aliases_refuse_http_startup_before_opening_state() {
     }
 }
 
+/// Workers refuse an inherited `LEAN_PATH`, so a server started with one
+/// would fail every check. It refuses to start instead, before opening state.
+#[tokio::test]
+async fn an_inherited_lean_path_refuses_startup() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    let store = root.join("store");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+    command
+        .kill_on_drop(true)
+        .current_dir(&root)
+        .arg("--bind")
+        .arg(reserve_loopback_addr().to_string())
+        .arg("--lake-root")
+        .arg(&root)
+        .env("LEAN_PATH", "/nowhere")
+        .env("LEAN_HOST_MCP_STORE_DIR", &store)
+        .stdin(Stdio::null());
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .expect("a server with LEAN_PATH set must exit before serving")
+        .expect("run lean-host-mcp with LEAN_PATH set");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("LEAN_PATH is set"), "{stderr}");
+    assert!(!store.exists(), "refused startup opened {}", store.display());
+}
+
 #[tokio::test]
 async fn second_server_on_one_store_names_the_first() {
     let scratch = tempfile::tempdir().unwrap();

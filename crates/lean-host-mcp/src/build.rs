@@ -411,7 +411,6 @@ impl Job {
             // Keep build products under each package's `.lake/build`, where
             // setup-file and the workers read them.
             .env("LAKE_ARTIFACT_CACHE", "false")
-            .env_remove("LEAN_PATH")
             .env(LOG_ENV, &self.log)
             .env(LOG_LIMIT_ENV, self.plan.log_limit.to_string());
         crate::toolchain::pass_elan_home(&mut command);

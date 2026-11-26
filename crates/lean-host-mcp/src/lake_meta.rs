@@ -330,38 +330,17 @@ fn fingerprint_lake_project(lake_root: &Path) -> Result<String> {
 /// [`artifact_roots`] and the `.ilean` reader must agree on where Lake writes.
 pub(crate) const BUILD_LIB_REL: &str = ".lake/build/lib/lean";
 
-/// Project and dependency artifact roots in the worker's search precedence.
-///
-/// Mirrors `lean-rs-host` 0.9.4's `LakeProject::olean_search_paths` and
-/// `manifest_package_root` without linking the Lean runtime into this parent.
-/// Keep this contract aligned when updating that dependency: project first,
-/// then manifest order, with `packagesDir`, path `dir`, and Git `subDir`
-/// respected. Unbuilt paths stay in the list so a reader finds later builds.
-/// Missing or malformed manifests still retain inherited `LEAN_PATH` entries.
-/// Process-owned shim and toolchain roots are treated as immutable runtime
-/// inputs; these roots describe the mutable project/package/environment paths.
-pub(crate) fn artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
-    let mut roots = manifest_artifact_roots(lake_root);
-    if let Ok(lean_path) = std::env::var("LEAN_PATH") {
-        // lean-rs-worker-parent does not override the child cwd. Its relative
-        // LEAN_PATH entries therefore resolve against our inherited cwd too.
-        let worker_cwd = std::env::current_dir().unwrap_or_default();
-        append_lean_path(&mut roots, &worker_cwd, &lean_path);
-    }
-    roots
-}
-
-/// Lean's `System.SearchPath.parse` splits on the platform separator without
-/// shell quoting or filtering empty entries. `worker_cwd` is injected so tests
-/// can resolve relative paths without changing the process environment or cwd.
-fn append_lean_path(roots: &mut Vec<PathBuf>, worker_cwd: &Path, lean_path: &str) {
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    roots.extend(lean_path.split(separator).map(|path| worker_cwd.join(path)));
-}
-
 /// The project's own import roots in Lean's search order: its build output,
 /// then each manifest package's, as the SDK's session import computes them.
-/// A project worker gets these at launch and admits no other import.
+/// A project worker gets these at launch and admits no other import, and a
+/// native reader searches them. The server refuses to start with `LEAN_PATH`
+/// set, so nothing else joins them.
+///
+/// Mirrors `lean-rs-host`'s `LakeProject::olean_search_paths` and
+/// `manifest_package_root` without linking the Lean runtime into this parent:
+/// project first, then manifest order, with `packagesDir`, path `dir`, and Git
+/// `subDir` respected. Unbuilt paths stay in the list so a reader finds later
+/// builds.
 pub(crate) fn manifest_artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![lake_root.join(BUILD_LIB_REL)];
     let Ok(bytes) = std::fs::read(lake_root.join("lake-manifest.json")) else {
@@ -436,57 +415,6 @@ mod tests {
 
     use super::*;
 
-    // Manifest tests are independent of the test process's inherited LEAN_PATH.
-    fn artifact_roots(root: &Path) -> Vec<PathBuf> {
-        manifest_artifact_roots(root)
-    }
-
-    #[test]
-    fn inherited_lean_path_keeps_entry_order_without_a_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let mut roots = manifest_artifact_roots(root);
-        let absolute = root.join("absolute");
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        append_lean_path(
-            &mut roots,
-            root,
-            &format!("relative{separator}{}{separator}", absolute.display()),
-        );
-        assert_eq!(
-            roots,
-            vec![
-                root.join(BUILD_LIB_REL),
-                root.join("relative"),
-                absolute,
-                root.to_path_buf()
-            ]
-        );
-    }
-
-    #[test]
-    fn project_and_manifest_packages_come_before_lean_path_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(
-            root.join("lake-manifest.json"),
-            r#"{"packages":[
-            {"name":"dep","type":"path","dir":"dep"}
-        ]}"#,
-        )
-        .unwrap();
-        let mut roots = manifest_artifact_roots(root);
-        append_lean_path(&mut roots, root, "env");
-        assert_eq!(
-            roots,
-            vec![
-                root.join(BUILD_LIB_REL),
-                root.join("dep").join(BUILD_LIB_REL),
-                root.join("env")
-            ]
-        );
-    }
-
     #[test]
     fn artifact_roots_follow_manifest_order_without_scanning_or_filtering_packages() {
         let tmp = tempfile::tempdir().unwrap();
@@ -501,7 +429,7 @@ mod tests {
         // A checkout absent from the manifest must not affect resolution.
         fs::create_dir_all(root.join(".lake/packages/unlisted").join(BUILD_LIB_REL)).unwrap();
         assert_eq!(
-            artifact_roots(root),
+            manifest_artifact_roots(root),
             vec![
                 root.join(BUILD_LIB_REL),
                 root.join(".lake/packages/z-first").join(BUILD_LIB_REL),
@@ -522,7 +450,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            artifact_roots(root),
+            manifest_artifact_roots(root),
             vec![
                 root.join(BUILD_LIB_REL),
                 root.join("vendor/doc-gen4").join(BUILD_LIB_REL),
@@ -548,7 +476,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            artifact_roots(root),
+            manifest_artifact_roots(root),
             vec![
                 root.join(BUILD_LIB_REL),
                 root.join("../sibling").join(BUILD_LIB_REL),
@@ -569,7 +497,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            artifact_roots(root),
+            manifest_artifact_roots(root),
             vec![
                 root.join(BUILD_LIB_REL),
                 root.join("vendor/multi-package/crates/lean").join(BUILD_LIB_REL)
@@ -582,7 +510,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::write(root.join("lake-manifest.json"), b"{malformed").unwrap();
-        assert_eq!(artifact_roots(root), vec![root.join(BUILD_LIB_REL)]);
+        assert_eq!(manifest_artifact_roots(root), vec![root.join(BUILD_LIB_REL)]);
         fs::write(
             root.join("lake-manifest.json"),
             r#"{"packages":[
@@ -591,7 +519,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            artifact_roots(root),
+            manifest_artifact_roots(root),
             vec![
                 root.join(BUILD_LIB_REL),
                 root.join(".lake/packages/fallback").join(BUILD_LIB_REL)
@@ -610,12 +538,12 @@ mod tests {
         ]}"#,
         )
         .unwrap();
-        let roots = artifact_roots(root);
+        let roots = manifest_artifact_roots(root);
         let artifact = root.join("local-dep").join(BUILD_LIB_REL).join("Demo/A.olean");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(artifact, b"built").unwrap();
         assert_eq!(
-            artifact_roots(root),
+            manifest_artifact_roots(root),
             roots,
             "building must not change search precedence"
         );
@@ -625,7 +553,7 @@ mod tests {
     fn artifact_roots_survive_a_project_with_no_lake_directory_at_all() {
         let tmp = tempfile::tempdir().unwrap();
         // An unbuilt project still yields its own nonexistent build directory.
-        let roots = artifact_roots(tmp.path());
+        let roots = manifest_artifact_roots(tmp.path());
         assert_eq!(roots, vec![tmp.path().join(BUILD_LIB_REL)]);
     }
 

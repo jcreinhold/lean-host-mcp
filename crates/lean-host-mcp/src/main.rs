@@ -336,6 +336,12 @@ fn logging_filter(directives: Option<&str>) -> EnvFilter {
     reason = "the store lock, broker and service must live until the transport returns"
 )]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    // Each check takes its search path from the Lake manifest. Workers refuse
+    // an inherited `LEAN_PATH`, so every check would fail.
+    anyhow::ensure!(
+        std::env::var_os("LEAN_PATH").is_none(),
+        "LEAN_PATH is set; unset it and start the server again"
+    );
     let cwd = std::env::current_dir()?;
     let lake_root = args
         .lake_root

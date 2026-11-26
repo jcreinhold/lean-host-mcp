@@ -221,11 +221,12 @@ step. The turn ends only after the helper and every process of the build have ex
 runs.
 
 Each step runs in the Lake root with the server's environment, except that the server sets `LEAN_SYSROOT` to the
-project's toolchain, sets `LAKE_ARTIFACT_CACHE=false` so that builds land in each package's `.lake/build`, and removes
-`LEAN_PATH`. Set a variable such as `LEAN_NUM_THREADS` where the server starts. The server checks only the words a
-client adds: a target or recipe argument may not be empty or start with `-`, so a client cannot pass Lake an option such
-as `-d`. Recipe words come from the tracked config, and Lake reports its own errors in them. Lake decides what to build
-and in which order.
+project's toolchain and sets `LAKE_ARTIFACT_CACHE=false` so that builds land in each package's `.lake/build`. Set a
+variable such as `LEAN_NUM_THREADS` where the server starts. The server refuses to start with `LEAN_PATH` set: each
+check takes its search path from the Lake manifest, and workers refuse an inherited one. The server checks only the
+words a client adds: a target or recipe argument may not be empty or start with `-`, so a client cannot pass Lake an
+option such as `-d`. Recipe words come from the tracked config, and Lake reports its own errors in them. Lake decides
+what to build and in which order.
 
 `lean-host-mcp config check --lake-root PROJECT` reads both config files, names every unknown key and bad value, and
 prints `[build]` and each recipe with their defaults. It runs no Lake and writes nothing, so it is safe beside a running

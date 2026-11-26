@@ -1565,6 +1565,7 @@ pub struct BrokerConfigSnapshot {
     pub lean_max_memory_kib: u64,
 }
 
+/// Freshness of a reply that elaborated nothing.
 fn freshness_from_meta(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
     Freshness {
         elaboration_options: None,
@@ -1574,6 +1575,15 @@ fn freshness_from_meta(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshnes
         session_id: "metadata-only".to_owned(),
         lean_toolchain: meta.toolchain.clone(),
         toolchain_advisories: Vec::new(),
+    }
+}
+
+/// Freshness of a reply that a native reader elaborated. Each reader is one
+/// `lean` process, so each run has its own session id.
+fn reader_freshness(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
+    Freshness {
+        session_id: format!("native-reader-{}", uuid::Uuid::new_v4()),
+        ..freshness_from_meta(meta, imports)
     }
 }
 
@@ -1624,13 +1634,17 @@ mod tests {
             .with_operator_primary(Some(&approved))
             .unwrap();
         let broker = ProjectBroker::new_with_runtime_config(cfg(other.clone(), None), runtime);
+        let approved = approved.canonicalize().unwrap();
         for hint in [ProjectHint::Default, ProjectHint::Explicit(other.clone())] {
             let err = broker
                 .prepare_check(hint, LeanWorkerElabOptions::new())
                 .await
                 .err()
                 .unwrap();
-            assert!(matches!(err, ServerError::BadProject(reason) if reason.contains("operator-approved")));
+            assert!(
+                matches!(&err, ServerError::BadProject(reason) if reason.contains(&format!("this server serves {}", approved.display()))),
+                "{err:?}"
+            );
             assert!(broker.resident_paths().is_empty());
         }
         let canonical = broker.resolve(&ProjectHint::Explicit(approved.join("."))).unwrap();

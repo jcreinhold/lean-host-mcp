@@ -111,6 +111,9 @@ async fn diagnostics(ctx: &ToolContext, file: &str) -> TestResult<SemanticRespon
 
 /// Fail unless Lean checked the file of `response` without an error.
 fn assert_clean(response: &SemanticResponse<Value>) -> TestResult {
+    if response.trust.session_id == "metadata-only" {
+        return Err("the reply to a file check says Lean elaborated nothing".into());
+    }
     let errors = response
         .data
         .as_ref()

@@ -143,6 +143,15 @@ impl Server {
         for name in WRITER_ENVS {
             command.env_remove(name);
         }
+        // `cargo test` adds its library path (`DYLD_FALLBACK_LIBRARY_PATH` on
+        // macOS, `LD_LIBRARY_PATH` on Linux). A server started by hand has
+        // none, and workers refuse to start with one.
+        for (name, _) in std::env::vars_os() {
+            let key = name.as_encoded_bytes();
+            if key.starts_with(b"DYLD_") || key.starts_with(b"LD_") || key.starts_with(b"__XPC_DYLD_") {
+                command.env_remove(&name);
+            }
+        }
         // A worker directory the caller names, such as a test install's:
         // file checks need an installed worker. Else the worker built with
         // this test, not the developer's installed one.

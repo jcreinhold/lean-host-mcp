@@ -4,7 +4,7 @@
 use super::verify_file::PreparedReader;
 use super::{
     BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, SemanticProofSearchRequest,
-    SemanticProofSearchResult, ServerError, freshness_from_meta,
+    SemanticProofSearchResult, ServerError, reader_freshness,
 };
 use crate::cancellation::CallCancellation;
 use lean_semantic_search_runtime::SemanticSearchRuntimeProvenance;
@@ -37,7 +37,7 @@ impl ProjectBroker {
         let (setup, mut reader, activity) = self
             .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
             .await?;
-        reader.roots = crate::lake_meta::artifact_roots(&root);
+        reader.roots = crate::lake_meta::manifest_artifact_roots(&root);
         if reader.roots.iter().any(|p| !reader.custody.covers_artifact_root(p)) {
             return Err(invalid("semantic declaration root outside held project domains"));
         }
@@ -133,7 +133,7 @@ impl ProjectBroker {
         Ok(BrokerCall {
             value: request.reader_result(&bytes)?,
             runtime: RuntimeFacts::default(),
-            freshness: freshness_from_meta(&meta, freshness),
+            freshness: reader_freshness(&meta, freshness),
         })
     }
 }

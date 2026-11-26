@@ -98,15 +98,17 @@ fn trial(imports: &[&str], commands: &str) -> Value {
     json!({"kind": "command", "imports": imports, "commands": commands})
 }
 
-/// Lean commands that write `started`, sleep for `millis` ms, then write
-/// `finished`.
-fn sleeper(started: &Path, finished: &Path, millis: u32) -> TestResult<String> {
+/// Lean commands that write `started`, wait until `release` exists (at most
+/// five minutes), then write `finished`.
+fn holder(started: &Path, release: &Path, finished: &Path) -> TestResult<String> {
     let quote = |path: &Path| -> TestResult<String> {
         Ok(serde_json::to_string(path.to_str().ok_or("a path that is not UTF-8")?)?)
     };
     Ok(format!(
-        "#eval do\n  IO.FS.writeFile {} \"started\"\n  IO.sleep {millis}\n  IO.FS.writeFile {} \"finished\"\n",
+        "#eval do\n  IO.FS.writeFile {} \"started\"\n  for _ in [0:15000] do\n    if (← System.FilePath.pathExists \
+         {}) then break\n    IO.sleep 20\n  IO.FS.writeFile {} \"finished\"\n",
         quote(started)?,
+        quote(release)?,
         quote(finished)?
     ))
 }
@@ -136,25 +138,53 @@ async fn wait_for(path: &Path) -> TestResult {
     Ok(())
 }
 
-/// Send trial `second` while a sleeping trial holds the chain's one worker, and
-/// write `changed` to the chain's manifest while `second` waits in that
+/// Wait until one worker holds `jobs` jobs, the running one included. A job
+/// counts once its request has chosen that worker.
+async fn wait_for_jobs(client: &Client, jobs: u64) -> TestResult {
+    let until = Instant::now().checked_add(PATIENCE).ok_or("patience is too long")?;
+    loop {
+        let status = client.control(&json!({"action": "status"})).await?;
+        let held = status
+            .pointer("/pool/projects")
+            .and_then(Value::as_array)
+            .and_then(|projects| {
+                projects
+                    .iter()
+                    .filter_map(|project| project.get("outstanding_jobs")?.as_u64())
+                    .max()
+            });
+        if held >= Some(jobs) {
+            return Ok(());
+        }
+        if Instant::now() >= until {
+            return Err(format!("no worker held {jobs} jobs within {PATIENCE:?}: {status}").into());
+        }
+        tokio::time::sleep(SAMPLE_EVERY).await;
+    }
+}
+
+/// Send trial `second` while another trial holds the chain's one worker, and
+/// write `changed` to the chain's manifest once `second` has joined that
 /// worker's queue. The worker reads the manifest at `second`'s import. Returns
 /// the response to `second` once the manifest is back as it was.
 async fn behind_a_manifest_change(chain: &Chain, client: &Client, changed: &Value, second: Value) -> TestResult<Value> {
     let manifest = chain.root.join("lake-manifest.json");
     let original = std::fs::read_to_string(&manifest)?;
     let started = chain.root.join("started.txt");
+    let release = chain.root.join("release.txt");
     let finished = chain.root.join("finished.txt");
     let first = spawn_send(
         client,
         "lean_trial",
-        trial(&["Chain.A"], &sleeper(&started, &finished, 6000)?),
+        trial(&["Chain.A"], &holder(&started, &release, &finished)?),
     );
     wait_for(&started).await?;
     let second = spawn_send(client, "lean_trial", second);
-    // Give the second trial time to join the busy worker's queue.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Each check runs Lake to read the project's options before it chooses a
+    // worker, which can take seconds.
+    wait_for_jobs(client, 2).await?;
     std::fs::write(&manifest, changed.to_string())?;
+    std::fs::write(&release, "release")?;
     let first = first.await??;
     let second = second.await??;
     std::fs::write(&manifest, &original)?;

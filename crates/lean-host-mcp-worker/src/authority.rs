@@ -312,22 +312,31 @@ impl Installed {
             }
             Err(error) => (Vec::new(), Some(error)),
         };
-        let sysroot = std::env::var("LEAN_SYSROOT").unwrap_or_default();
-        if record.sysroot
-            != Path::new(
-                option_env!("LEAN_HOST_COMPILED_SYSROOT")
-                    .ok_or_else(|| invalid("worker build lacks stable Lean prefix"))?,
-            )
-            || std::env::vars_os().any(|(k, _)| {
-                let k = k.to_string_lossy();
+        let compiled = option_env!("LEAN_HOST_COMPILED_SYSROOT")
+            .ok_or_else(|| invalid("worker build lacks stable Lean prefix"))?;
+        if record.sysroot != Path::new(compiled) {
+            return Err(invalid(
+                "the installed Lean prefix differs from the one this worker was built with",
+            ));
+        }
+        if let Some(name) = std::env::vars_os()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .find(|k| {
                 k.starts_with("DYLD_")
                     || k.starts_with("__XPC_DYLD_")
-                    || matches!(&*k, "LD_PRELOAD" | "LD_LIBRARY_PATH" | "LD_AUDIT")
+                    || matches!(k.as_str(), "LD_PRELOAD" | "LD_LIBRARY_PATH" | "LD_AUDIT")
             })
-            || std::env::var_os("LEAN_PATH").is_some()
-            || Path::new(&sysroot) != record.sysroot
         {
-            return Err(invalid("unapproved Lean runtime environment"));
+            return Err(invalid(&format!("unapproved Lean runtime environment: {name} is set")));
+        }
+        if std::env::var_os("LEAN_PATH").is_some() {
+            return Err(invalid("unapproved Lean runtime environment: LEAN_PATH is set"));
+        }
+        let sysroot = std::env::var("LEAN_SYSROOT").unwrap_or_default();
+        if Path::new(&sysroot) != record.sysroot {
+            return Err(invalid(
+                "unapproved Lean runtime environment: LEAN_SYSROOT is not the installed Lean prefix",
+            ));
         }
         for (path, expected) in &record.files {
             if digest(path)? != *expected {

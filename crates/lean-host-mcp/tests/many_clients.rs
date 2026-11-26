@@ -618,6 +618,11 @@ fn check_read(outcome: &Outcome, file: &str, digests: &[String; 2]) -> TestResul
                 !http::names_missing_import(&text),
                 "check {id} of {file} reports a missing import: {text}"
             );
+            assert_ne!(
+                result.pointer("/structuredContent/trust/session_id"),
+                Some(&json!("metadata-only")),
+                "check {id} of {file} says Lean elaborated nothing: {text}"
+            );
             let digest = result
                 .pointer("/structuredContent/trust/source_sha256")
                 .and_then(Value::as_str);
