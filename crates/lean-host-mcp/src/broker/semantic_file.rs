@@ -75,17 +75,7 @@ impl ProjectBroker {
             .to_owned();
         // Dropping the build writer closes its input. Its observer can still be
         // reaping the helper when the completed build returns.
-        let started = std::time::Instant::now();
-        let budget = CallCancellation::current().remaining_or(Duration::from_millis(self.request_timeout_millis()));
-        let runtime_guard = loop {
-            match lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(std::slice::from_ref(&package)) {
-                Ok(guard) => break guard,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < budget => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
+        let runtime_guard = self.read_when_admitted(std::slice::from_ref(&package)).await?;
         let image = runtime.built.dylib_path().map_err(invalid)?.canonicalize()?;
         let bootstrap = select_semantic_runtime(
             || Ok(runtime_guard.validate()?),

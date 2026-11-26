@@ -194,7 +194,7 @@ impl ProjectBroker {
         self.ensure_read(&root).await?;
         let setup = self.setup_file(&root, Path::new(file), source).await?;
         let activity = self.preparation_activity(&root).await?;
-        let reader = Self::installed_reader(&root, meta)?;
+        let reader = self.installed_reader(&root, meta).await?;
         setup.check(&root, &reader.sysroot, &reader.custody)?;
         if fs::read(file)? != source.as_bytes() {
             return Err(ServerError::BadProject("source changed during setup transfer".into()));

@@ -123,7 +123,11 @@ Bundled shims and installed toolchain contents remain trusted fixed runtime inpu
 
 File checks and `lake setup-file` runs are native readers. The SDK starts one at a time per owner registry, across all
 projects and servers that share it. A reader that cannot start within 30 seconds, or by its request's deadline if that
-comes first, fails.
+comes first, fails. Each start first removes the files of readers that have ended, while an ended reader may still be
+removing its own inputs. When a start finds such a file gone, it logs `native reader admission found a file gone` and
+tries again, up to three times. Every file check also takes shared custody of the installed shims. When checks start
+together, one may find the SDK's admission gate on the shims held for a moment; it tries again every 20 ms until its
+request's time runs out.
 
 ### Memory and import cycling
 

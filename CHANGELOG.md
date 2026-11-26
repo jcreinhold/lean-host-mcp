@@ -68,6 +68,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   user cache directory. Without a store, native work and `doctor writer-rollback` need
   `LEAN_RS_WORKER_OWNERS_DIRECTORY`, and semantic tools need `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`.
 
+### Fixed
+
+- File checks that start together no longer fail with `another transient reader admission gate is active`: a check that
+  finds the SDK's gate on the installed shims held tries again every 20 ms until its request's time runs out.
+- A native reader whose start finds an ended reader's input file gone tries again, up to three times, instead of failing
+  with `native utility refused before bootstrap spawn: No such file or directory`.
+
 ## [0.16.22] - 2026-11-25
 
 ### Fixed

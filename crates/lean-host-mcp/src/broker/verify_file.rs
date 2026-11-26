@@ -56,10 +56,14 @@ pub(super) struct PreparedReader {
 }
 
 impl ProjectBroker {
-    pub(super) fn installed_reader(root: &Path, meta: &crate::lake_meta::LakeProjectMeta) -> Result<PreparedReader> {
+    pub(super) async fn installed_reader(
+        &self,
+        root: &Path,
+        meta: &crate::lake_meta::LakeProjectMeta,
+    ) -> Result<PreparedReader> {
         let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).map_err(invalid)?;
         let shims = VerifierShims::select(meta)?;
-        let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&shims.domains)?;
+        let shim_guards = self.read_when_admitted(&shims.domains).await?;
         shims.validate()?;
         let shim_identity_sha256 = crate::shared_writer::module_setup_digest(
             &serde_json::to_vec(&(&shims.sysroot, &shims.paths, &shims.domains, &shims.files)).map_err(invalid)?,
@@ -73,6 +77,31 @@ impl ProjectBroker {
             shim_guards,
             roots: Vec::new(),
         })
+    }
+
+    /// Take shared custody of the artifacts under `roots` for this request.
+    /// The SDK refuses with `WouldBlock` while another reader holds its
+    /// admission gate, while a writer has announced or holds these artifacts,
+    /// or while an ended writer's helper still runs. Every file check reads
+    /// the same installed shims, so checks that start together meet the first
+    /// case. After each refusal this waits 20 ms and tries again, until the
+    /// request's time runs out.
+    pub(super) async fn read_when_admitted(
+        &self,
+        roots: &[PathBuf],
+    ) -> io::Result<lean_toolchain::shared_writer::LocalArtifactRead> {
+        let started = std::time::Instant::now();
+        let budget = crate::cancellation::CallCancellation::current()
+            .remaining_or(Duration::from_millis(self.request_timeout_millis()));
+        loop {
+            match lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(roots) {
+                Ok(guard) => return Ok(guard),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < budget => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 

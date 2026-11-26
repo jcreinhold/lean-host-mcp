@@ -30,6 +30,13 @@ mod input;
 pub const PROTOCOL: u32 = 1;
 const POLL: Duration = Duration::from_millis(10);
 const CLEANUP: Duration = Duration::from_secs(2);
+/// How many times admission tries again after it finds a file gone. Each
+/// admission collects the closed generations under the SDK's admission lock,
+/// while the reader that saw its own scope close removes that scope's inputs
+/// without the lock (`cleanup_inputs`). When both remove the same inputs at
+/// once, the collection fails with `NotFound` and keeps the record for the
+/// next one.
+const VANISHED_RETRIES: u32 = 3;
 /// Default payload stdout limit, and the stderr limit for every payload.
 pub(crate) const OUTPUT_LIMIT: usize = 1024 * 1024;
 /// The most stdout a program may ask for. Lake's setup-file for a large import
@@ -677,6 +684,7 @@ fn reserve_scope(
         deadline
     };
     let socket_root = crate::native_socket::directory()?;
+    let mut vanished = 0_u32;
     loop {
         if cancelled() {
             return Err(io::Error::new(
@@ -692,6 +700,11 @@ fn reserve_scope(
         ) {
             Ok(scope) => return Ok(scope),
             Err(error) if utility && error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL.min(remaining(admission_deadline)?));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && vanished < VANISHED_RETRIES => {
+                vanished = vanished.saturating_add(1);
+                tracing::warn!(%error, attempt = vanished, "native reader admission found a file gone; trying again");
                 thread::sleep(POLL.min(remaining(admission_deadline)?));
             }
             Err(error) => return Err(error),
