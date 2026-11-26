@@ -37,7 +37,7 @@ CASES = {
     "LateResult": "ResultImmutable",
     "IgnoreIntent": "IntentConflictRefused",
     "UnfairLock": "FifoGrant",
-    "StaleReuse": "FreshImports",
+    "NoGuard": "FreshImports",
     "DropQueuedOnRestart": "EveryRequestEnds",
 }
 
