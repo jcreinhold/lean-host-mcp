@@ -52,8 +52,9 @@ the one property it breaks.
   group may live, and a worker's capacity returns only after it has exited (`WriterExclusion`, `NoEarlyCapacityReturn`
   there). This model takes those results as given.
 - A worker holds the lock file shared for its whole life, as SDK 0.10.17 does. Warm reuse is safe because of that lock,
-  so the model has no build counter; the server keeps one only to report rebuilt imports and as a backstop. An SDK that
-  released the lock once imports load would need a model change first.
+  so the model has no build counter; the server keeps one only as a backstop. A cached query result lives only as long
+  as the worker generation that computed it, for the same reason. An SDK that released the lock once imports load would
+  need a model change first.
 - No process leaves its group, and a kill reaches every member. On Linux the SDK cannot yet confirm this for a late
   descendant.
 - Every writer uses the lock file. A `lake build` run without it is out of scope.
