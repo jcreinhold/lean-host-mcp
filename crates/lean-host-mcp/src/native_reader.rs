@@ -5,7 +5,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, Read};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -20,6 +20,7 @@ use lean_toolchain::native_guardian::{
 use lean_toolchain::process_group::{MeasuredChild, WaitedChildUsage};
 use lean_toolchain::shared_reader::SharedReader;
 use lean_toolchain::shared_writer::WRITER_HANDOFF_ENV;
+use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use serde::{Deserialize, Serialize};
 
@@ -29,8 +30,15 @@ mod input;
 pub const PROTOCOL: u32 = 1;
 const POLL: Duration = Duration::from_millis(10);
 const CLEANUP: Duration = Duration::from_secs(2);
-const FRAME_LIMIT: usize = 16 * 1024 * 1024;
-const OUTPUT_LIMIT: usize = 1024 * 1024;
+/// Default payload stdout limit, and the stderr limit for every payload.
+pub(crate) const OUTPUT_LIMIT: usize = 1024 * 1024;
+/// The most stdout a program may ask for. Lake's setup-file for a large import
+/// closure can print more than the default.
+pub(crate) const PROGRAM_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+// A frame holds the largest stdout after JSON escaping doubles it, and stderr
+// when every byte takes the six-byte escape. Output that escapes worse fails
+// with "native-reader reply exceeds limit".
+const FRAME_LIMIT: usize = 2 * PROGRAM_OUTPUT_LIMIT + 6 * OUTPUT_LIMIT + 1024 * 1024;
 const STDIN_ENV: &str = "LEAN_HOST_MCP_NATIVE_READER_STDIN";
 const PROGRAM_CWD_ENV: &str = "LEAN_HOST_MCP_NATIVE_READER_CWD";
 const PROGRAM_ROLE_ENV: &str = "LEAN_HOST_MCP_NATIVE_READER_ROLE";
@@ -72,6 +80,7 @@ pub struct NativeReaderArgs {
     /// The payload exit status is the result; stdout and stderr are previews.
     #[arg(long, hide = true, requires = "stdout_result_frame")]
     diagnostic_preview: bool,
+    /// Payload stdout limit. Payload stderr keeps at most the default limit.
     #[arg(long, default_value_t = OUTPUT_LIMIT)]
     max_output_bytes: usize,
     #[arg(last = true, required = true)]
@@ -85,6 +94,8 @@ pub(crate) struct NativeReaderProgram {
     pub(crate) cwd: PathBuf,
     /// Frozen physical domains; only `project_root` is expanded as a workspace.
     pub(crate) artifact_roots: Vec<PathBuf>,
+    /// At most [`PROGRAM_OUTPUT_LIMIT`]; more stdout fails the program.
+    pub(crate) max_stdout_bytes: usize,
 }
 
 /// Run one private-input utility through the same native-reader scope.
@@ -159,7 +170,7 @@ pub(crate) fn run_program_with_contract(
             cancel_fd: None,
             stdout_result_frame: false,
             diagnostic_preview: false,
-            max_output_bytes: OUTPUT_LIMIT,
+            max_output_bytes: program.max_stdout_bytes,
             command: program.command.clone(),
         };
         Ok::<_, io::Error>(((scope, deadline), program, args))
@@ -340,7 +351,7 @@ impl NativeReaderArgs {
             .first()
             .ok_or_else(|| invalid("payload executable required after --"))?;
         canonical(Path::new(executable))?;
-        if !Path::new(executable).is_file() || !(1..=OUTPUT_LIMIT).contains(&self.max_output_bytes) {
+        if !Path::new(executable).is_file() || !(1..=PROGRAM_OUTPUT_LIMIT).contains(&self.max_output_bytes) {
             return Err(invalid("native-reader executable or output limit invalid"));
         }
         until(Duration::from_millis(self.timeout_millis))?;
@@ -527,6 +538,7 @@ struct Capture<R> {
     bytes: Vec<u8>,
     limit: usize,
     truncated: bool,
+    closed: bool,
 }
 impl<R: Read + AsFd> Capture<R> {
     fn new(reader: R, limit: usize) -> io::Result<Self> {
@@ -537,6 +549,7 @@ impl<R: Read + AsFd> Capture<R> {
             bytes: Vec::new(),
             limit,
             truncated: false,
+            closed: false,
         })
     }
     fn poll(&mut self) -> io::Result<bool> {
@@ -544,7 +557,10 @@ impl<R: Read + AsFd> Capture<R> {
         // Bound each turn even when a payload writes continuously.
         for _ in 0..128 {
             match self.reader.read(&mut buffer) {
-                Ok(0) => return Ok(true),
+                Ok(0) => {
+                    self.closed = true;
+                    return Ok(true);
+                }
                 Ok(count) => {
                     let accepted = count.min(self.limit.saturating_sub(self.bytes.len()));
                     self.bytes
@@ -560,6 +576,33 @@ impl<R: Read + AsFd> Capture<R> {
     }
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+    /// The stream to wake on: still open and under its limit. Output past the
+    /// limit drains at the fixed pace, so a flood cannot spin the loop.
+    fn awaited(&self) -> Option<BorrowedFd<'_>> {
+        (!self.closed && !self.truncated).then(|| self.reader.as_fd())
+    }
+}
+
+/// Sleep up to `timeout`, waking early when one of `streams` has bytes or
+/// closes. A pipe then moves at its writer's pace instead of one pipe buffer per
+/// fixed sleep.
+fn wait_readable(streams: &[Option<BorrowedFd<'_>>], timeout: Duration) {
+    let mut set: Vec<PollFd<'_>> = streams
+        .iter()
+        .flatten()
+        .map(|stream| PollFd::from_borrowed_fd(*stream, PollFlags::IN))
+        .collect();
+    wait_ready(&mut set, timeout);
+}
+
+// Readiness only paces the loops; reads and writes report their own errors.
+// Without a usable wait, fall back to the fixed sleep.
+fn wait_ready(set: &mut [PollFd<'_>], timeout: Duration) {
+    let waited = !set.is_empty()
+        && Timespec::try_from(timeout).is_ok_and(|limit| rustix::event::poll(set, Some(&limit)).is_ok());
+    if !waited {
+        thread::sleep(timeout);
     }
 }
 
@@ -940,7 +983,7 @@ fn run_internal(
                 interrupted.or_else(|| Some("native scope closure remains unconfirmed".into())),
             ));
         }
-        thread::sleep(POLL);
+        wait_readable(&[output.awaited(), diagnostics.awaited()], POLL);
     }
 }
 
@@ -1190,7 +1233,7 @@ fn wait_for_payload_report(mut command: Command, deadline: Instant) -> io::Resul
             }
         }
         remaining(deadline)?;
-        thread::sleep(POLL);
+        wait_readable(&[report.awaited()], POLL);
     }
     if report.truncated || report.bytes.last() != Some(&b'\n') {
         return Err(invalid("incomplete or oversized native payload waiter report"));
@@ -1247,7 +1290,7 @@ fn measure_payload(
                     .get()?
                     .take_stderr()
                     .ok_or_else(|| invalid("payload stderr missing"))?,
-                args.max_output_bytes,
+                args.max_output_bytes.min(OUTPUT_LIMIT),
             )?;
             loop {
                 output.poll()?;
@@ -1276,7 +1319,7 @@ fn measure_payload(
                     break;
                 }
                 remaining(deadline)?;
-                thread::sleep(POLL);
+                wait_readable(&[output.awaited(), diagnostics.awaited()], POLL);
             }
             payload.stdout = output.text();
             payload.stderr = diagnostics.text();
@@ -1326,7 +1369,7 @@ fn emit(value: &impl Serialize) -> io::Result<()> {
                     .ok_or_else(|| invalid("native-reader reply count invalid"))?;
             }
             Err(error) if error == rustix::io::Errno::AGAIN || error == rustix::io::Errno::INTR => {
-                thread::sleep(POLL.min(budget));
+                wait_ready(&mut [PollFd::new(&output, PollFlags::OUT)], POLL.min(budget));
             }
             Err(error) => return Err(error.into()),
         }

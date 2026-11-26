@@ -1,17 +1,15 @@
 //! File setup from the selected Lake. Keep Lake's original frame, including
 //! import visibility, plugin entry points and compiler options.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
-use crate::cancellation::CallCancellation;
-use lean_toolchain::shared_writer::{LEGACY_MODULE_SETUP_CAPTURE_ENV, MODULE_SETUP_CAPTURE_ENV, SharedWriter};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs, io,
-    io::Read as _,
     path::{Path, PathBuf},
-    process::Command,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+const SETUP_FILE: &str = "Lake setup-file";
 
 fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
@@ -99,7 +97,7 @@ impl StagedSetup {
 }
 
 fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
-    if bytes.len() > crate::shared_writer::MODULE_SETUP_LIMIT {
+    if bytes.len() > crate::native_reader::PROGRAM_OUTPUT_LIMIT {
         return Err(invalid("Lake module setup exceeds capture limit"));
     }
     let setup: ModuleSetup =
@@ -176,216 +174,6 @@ pub(crate) fn stage(
     })
 }
 
-/// Supplied at startup by the operator for the approved project. The standalone
-/// writer validates the full request and reserves under its existing admission lock.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ChargedWriter {
-    executable: PathBuf,
-    image: Identity,
-    inherited_temp: PathBuf,
-    request: String,
-}
-
-impl ChargedWriter {
-    pub(crate) fn new(root: &Path, executable: PathBuf, request: String) -> io::Result<Self> {
-        if request.len() > 16 * 1024 {
-            return Err(invalid("oversized module setup storage request"));
-        }
-        let value: serde_json::Value = serde_json::from_str(&request)?;
-        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-            || value
-                .get("budget_bytes")
-                .and_then(serde_json::Value::as_u64)
-                .is_none_or(|v| v == 0)
-        {
-            return Err(invalid("module setup requires an explicit v1 full-turn storage budget"));
-        }
-        // The standalone writer owns full root validation and reservation under its admission lock.
-        // Bind this startup approval to the project before the helper can see the request.
-        let roots = value
-            .get("roots")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| invalid("module setup storage request lacks roots"))?;
-        if roots.len() > 48
-            || roots.iter().any(|r| {
-                r["role"].as_str().is_none()
-                    || !r["path"].as_str().is_some_and(|s| Path::new(s).is_absolute())
-                    || r["device"].as_u64().is_none()
-                    || r["inode"].as_u64().is_none()
-            })
-        {
-            return Err(invalid(
-                "module setup requires bounded storage roots with directory identities",
-            ));
-        }
-        if value.get("floor_bytes").and_then(serde_json::Value::as_u64).is_none()
-            || !roots
-                .iter()
-                .any(|r| r["role"] == "project" && r["path"].as_str().map(Path::new) == Some(root))
-            || !["registry", "scratch_parent"]
-                .iter()
-                .all(|role| roots.iter().any(|r| r["role"].as_str() == Some(role)))
-        {
-            return Err(invalid(
-                "module setup requires the approved project, registry, scratch parent and floor",
-            ));
-        }
-        // The setup command inherits the helper's temporary directory. Its v1 command
-        // envelope permits the writer-owned cache selector, but no TMPDIR override.
-        let temp = std::env::temp_dir().canonicalize()?;
-        if !roots
-            .iter()
-            .any(|r| r["path"].as_str().map(Path::new) == Some(temp.as_path()))
-        {
-            return Err(invalid(
-                "module setup storage request must include the inherited temporary directory",
-            ));
-        }
-        // This host sends no source handoff; its caller owns the read and explicit close.
-        if value.get("command_only").is_some_and(|v| v.as_bool() != Some(false))
-            || value.get("handoff_sha256").is_some()
-            || value.get("approval_generation").is_some()
-        {
-            return Err(invalid("unsupported module setup storage handoff"));
-        }
-        let image = Identity::read(&executable)?;
-        Ok(Self {
-            executable,
-            image,
-            inherited_temp: temp,
-            request,
-        })
-    }
-
-    async fn qualify(&self, root: &Path, timeout: Duration) -> io::Result<(Identity, &'static str)> {
-        use tokio::io::AsyncReadExt as _;
-        const LIMIT: usize = 16 * 1024;
-        if std::env::temp_dir().canonicalize()? != self.inherited_temp {
-            return Err(invalid("module setup temporary directory changed"));
-        }
-        let image = Identity::read(&self.executable)?;
-        if image != self.image {
-            return Err(invalid("configured module setup writer changed"));
-        }
-        let lock = lean_toolchain::shared_writer::project_lock_path(root)?;
-        tokio::time::timeout(timeout, async {
-            use std::process::Stdio;
-            let mut child = tokio::process::Command::new(&self.executable)
-                .arg("writer-lock-path")
-                .arg(root)
-                .arg("--capabilities")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()?;
-            let mut bytes = Vec::new();
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| invalid("writer descriptor unavailable"))?
-                .take((LIMIT + 1) as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-            if bytes.len() > LIMIT || !child.wait().await?.success() {
-                return Err(invalid("writer did not provide its bounded capability descriptor"));
-            }
-            let capture_env = check_capability(&bytes, root, &lock)?;
-            Ok((image, capture_env))
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
-}
-
-fn check_capability(bytes: &[u8], root: &Path, lock: &Path) -> io::Result<&'static str> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)?;
-    let capabilities = value.get("capabilities").and_then(serde_json::Value::as_array);
-    let supports = |name: &str| capabilities.is_some_and(|caps| caps.iter().any(|v| v == name));
-    if value.get("protocol").and_then(serde_json::Value::as_u64) != Some(1)
-        || value.get("project_root").and_then(serde_json::Value::as_str)
-            != Some(root.to_str().ok_or_else(|| invalid("non-UTF-8 writer root"))?)
-        || value.get("lock_path").and_then(serde_json::Value::as_str)
-            != Some(lock.to_str().ok_or_else(|| invalid("non-UTF-8 writer lock"))?)
-        || !supports("lake_module_setup_capture_v1")
-    {
-        return Err(invalid(
-            "expected lake_module_setup_capture_v1 for the selected project lock",
-        ));
-    }
-    Ok(if supports("lake_module_setup_capture_env_v2") {
-        MODULE_SETUP_CAPTURE_ENV
-    } else {
-        LEGACY_MODULE_SETUP_CAPTURE_ENV
-    })
-}
-
-fn run_setup(
-    writer: &mut SharedWriter,
-    root: &Path,
-    file: &Path,
-    source: &str,
-    remaining: &impl Fn() -> Duration,
-    cancel: &CallCancellation,
-    capture_env: &str,
-) -> Result<StagedSetup> {
-    if !file.starts_with(root)
-        || file.canonicalize()? != file
-        || file.extension().is_none_or(|s| s != "lean")
-        || fs::read(file)? != source.as_bytes()
-    {
-        return Err(ServerError::BadProject(
-            "current source differs from selected verification file".into(),
-        ));
-    }
-    let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(|e| ServerError::BadProject(e.to_string()))?;
-    let sysroot = id
-        .elan_dir()
-        .map_err(|e| ServerError::BadProject(e.to_string()))?
-        .canonicalize()?;
-    let mut command = Command::new(sysroot.join("bin/lake"));
-    command
-        .current_dir(root)
-        .args(["--no-build", "--no-cache", "setup-file"])
-        .arg(file)
-        .env("LAKE_CACHE_DIR", writer.asset_dir())
-        .env("LAKE_ARTIFACT_CACHE", "false")
-        .env(capture_env, "1");
-    let result = writer.run_cancellable(&command, remaining(), &|| cancel.is_cancelled())?;
-    if !result.status.success() {
-        return Err(ServerError::BadProject(format!(
-            "Lake setup-file failed ({}): {}",
-            result.status,
-            String::from_utf8_lossy(&result.stderr)
-        )));
-    }
-    let path = writer.asset_dir().join(crate::shared_writer::MODULE_SETUP_FILE);
-    let staged = fs::File::from(
-        rustix::fs::open(
-            &path,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::NONBLOCK,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(io::Error::from)?,
-    );
-    let meta = staged.metadata()?;
-    let limit = crate::shared_writer::MODULE_SETUP_LIMIT as u64;
-    if !meta.is_file() || meta.len() > limit {
-        return Err(invalid("invalid Lake module setup staging file").into());
-    }
-    let mut bytes = Vec::new();
-    staged.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
-    if bytes.len() > crate::shared_writer::MODULE_SETUP_LIMIT
-        || crate::shared_writer::module_setup_digest(&bytes).as_bytes() != result.stdout
-    {
-        return Err(invalid("Lake module setup exceeds limit or differs from writer receipt").into());
-    }
-    Ok(stage(bytes, writer.write_roots(), &sysroot, root, file)?)
-}
-
 impl ProjectBroker {
     pub(super) async fn file_reader_with_setup(
         &self,
@@ -402,7 +190,7 @@ impl ProjectBroker {
         if root != meta.canonical_root {
             return Err(ServerError::BadProject("project selection changed".into()));
         }
-        let setup = self.prepare_file_setup(hint, file, source).await?;
+        let setup = self.setup_file(&root, Path::new(file), source).await?;
         let activity = self.preparation_activity(&root).await?;
         let reader = Self::installed_reader(&root, meta)?;
         setup.check(&root, &reader.sysroot, &reader.custody)?;
@@ -412,69 +200,68 @@ impl ProjectBroker {
         Ok((setup, reader, activity))
     }
 
-    async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
-        let root = self.native_root(hint)?;
-        let activity = self.preparation_activity(&root).await?;
-        let timeout = Duration::from_millis(self.request_timeout_millis());
-        let file = PathBuf::from(file);
-        let source = source.to_owned();
-        let cancel = CallCancellation::current();
-        let selected = match self.runtime_config.module_setup_writer.clone() {
-            Some(selection) => {
-                let started = Instant::now();
-                let (image, capture_env) = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "module setup cancelled before writer admission").into()),
-                    result = selection.qualify(&root, timeout) => result?,
-                };
-                Some((selection, image, capture_env, started))
-            }
-            None => None,
-        };
-        let mut on_drop = cancel.cancel_on_drop();
-        let result = tokio::task::spawn_blocking(move || -> Result<StagedSetup> {
-            let _activity = activity;
-            let cancelled = || cancel.is_cancelled();
-            let (mut writer, started, capture_env) = if let Some((selection, image, capture_env, started)) = &selected {
-                if Identity::read(&selection.executable)? != *image {
-                    return Err(invalid("selected module setup writer changed before admission").into());
-                }
-                crate::shared_writer::ownership_registry()?;
-                let writer = SharedWriter::open_with_storage_request(
-                    &selection.executable,
-                    &root,
-                    &[],
-                    &selection.request,
-                    timeout.saturating_sub(started.elapsed()),
-                    &cancelled,
-                )?;
-                (writer, *started, *capture_env)
-            } else {
-                let helper = crate::shared_writer::contract()?.executable;
-                let started = Instant::now();
-                (
-                    SharedWriter::open_cancellable(&helper, &root, timeout, &cancelled)?,
-                    started,
-                    MODULE_SETUP_CAPTURE_ENV,
-                )
-            };
-            let remaining = || timeout.saturating_sub(started.elapsed());
-            let outcome = run_setup(&mut writer, &root, &file, &source, &remaining, &cancel, capture_env);
-            if selected.is_some()
-                && let Err(close) = writer.close(remaining())
-            {
-                return Err(match outcome {
-                    Ok(_) => ServerError::Internal(format!("module setup writer settlement unconfirmed: {close}")),
-                    Err(primary) => {
-                        ServerError::BadProject(format!("{primary}; writer settlement unconfirmed: {close}"))
-                    }
-                });
-            }
-            outcome
-        })
-        .await;
-        on_drop.disarm();
-        result.map_err(|e| ServerError::Internal(e.to_string()))?
+    /// Run `lake setup-file` as a native reader. The guardian holds the project
+    /// lock shared while Lake reads the build products and prints the setup.
+    /// No step takes the lock exclusively.
+    async fn setup_file(&self, root: &Path, file: &Path, source: &str) -> Result<StagedSetup> {
+        if !file.starts_with(root)
+            || file.canonicalize()? != file
+            || file.extension().is_none_or(|s| s != "lean")
+            || fs::read(file)? != source.as_bytes()
+        {
+            return Err(ServerError::BadProject(
+                "current source differs from selected verification file".into(),
+            ));
+        }
+        let id =
+            crate::toolchain::ToolchainId::from_lake_root(root).map_err(|e| ServerError::BadProject(e.to_string()))?;
+        if id.window_verdict() != crate::toolchain::WindowVerdict::Supported {
+            return Err(ServerError::BadProject(format!(
+                "{SETUP_FILE} needs a supported toolchain, not {id}"
+            )));
+        }
+        let sysroot = id
+            .elan_dir()
+            .map_err(|e| ServerError::BadProject(e.to_string()))?
+            .canonicalize()?;
+        let domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
+        let activity = self.preparation_activity(root).await?;
+        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root)?;
+        let lake = sysroot.join("bin/lake");
+        let (cwd, source_file) = (root.to_owned(), file.to_owned());
+        let bytes = crate::lake_options::reader_output(
+            SETUP_FILE,
+            root.to_owned(),
+            Duration::from_millis(self.request_timeout_millis()),
+            self.config.max_projects.get(),
+            custody,
+            None,
+            Some(Box::new(activity)),
+            move |assets| {
+                // Point any Lake cache at the reader's private inputs.
+                let cache = assets.join("lake-cache");
+                fs::create_dir(&cache)?;
+                Ok(crate::native_reader::NativeReaderProgram {
+                    command: vec![
+                        lake.into_os_string(),
+                        "--no-build".into(),
+                        "--no-cache".into(),
+                        "setup-file".into(),
+                        source_file.into_os_string(),
+                    ],
+                    environment: vec![
+                        ("LAKE_CACHE_DIR".into(), cache.into_os_string()),
+                        ("LAKE_ARTIFACT_CACHE".into(), "false".into()),
+                    ],
+                    cwd,
+                    artifact_roots: Vec::new(),
+                    max_stdout_bytes: crate::native_reader::PROGRAM_OUTPUT_LIMIT,
+                })
+            },
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+        Ok(stage(bytes, &domains, &sysroot, root, file)?)
     }
 }
 
@@ -517,6 +304,3 @@ mod tests {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod charged_tests;

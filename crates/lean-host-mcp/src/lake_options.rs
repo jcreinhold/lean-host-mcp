@@ -237,6 +237,7 @@ async fn resolve_inner(
                 environment: vec![("LEAN_SYSROOT".into(), sysroot.into_os_string())],
                 cwd: command_package,
                 artifact_roots: Vec::new(),
+                max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
             })
         },
     )

@@ -29,7 +29,6 @@ use std::time::{Duration, Instant};
 
 use lean_toolchain::native_guardian::{OWNERS_DIRECTORY_ENV, bind_registry_directory};
 use lean_toolchain::process_group::OwnedCommandGroup;
-use lean_toolchain::shared_writer::{LEGACY_MODULE_SETUP_CAPTURE_ENV, MODULE_SETUP_CAPTURE_ENV};
 use lean_toolchain::writer_demand::{ReadAdmission, WriterDemand};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{FdFlags, fcntl_setfd};
@@ -980,68 +979,6 @@ fn barrier_closed(barrier: &rustix::fd::OwnedFd) -> io::Result<bool> {
 // every byte needs JSON's longest six-byte escape. No log tempfile can grow.
 const CAPTURE_BYTES: usize = 64 * 1024;
 
-// The required setup is temporary input for the broker. Only its digest crosses the control frame.
-pub(crate) const MODULE_SETUP_LIMIT: usize = 16 * 1024 * 1024;
-pub(crate) const MODULE_SETUP_FILE: &str = "module-setup.json";
-
-fn module_setup_path(message: &Value, root: &Path, assets: &Path) -> io::Result<Option<PathBuf>> {
-    let env = field(message, "env");
-    let current = env.get(MODULE_SETUP_CAPTURE_ENV);
-    let former = env.get(LEGACY_MODULE_SETUP_CAPTURE_ENV);
-    if current.is_none() && former.is_none() {
-        return Ok(None);
-    }
-    if let (Some(current), Some(former)) = (current, former)
-        && current != former
-    {
-        return Err(invalid(format!(
-            "conflicting {MODULE_SETUP_CAPTURE_ENV} and {LEGACY_MODULE_SETUP_CAPTURE_ENV}"
-        )));
-    }
-    let refused = || invalid("marked writer stage requires selected Lake no-build setup-file for this project");
-    let mut expected = serde_json::Map::from_iter([
-        ("LAKE_CACHE_DIR".to_owned(), json!(assets)),
-        ("LAKE_ARTIFACT_CACHE".to_owned(), json!("false")),
-    ]);
-    if current.is_some() {
-        expected.insert(MODULE_SETUP_CAPTURE_ENV.to_owned(), json!("1"));
-    }
-    if former.is_some() {
-        expected.insert(LEGACY_MODULE_SETUP_CAPTURE_ENV.to_owned(), json!("1"));
-    }
-    if env.as_object() != Some(&expected) || field(message, "cwd").as_str() != root.to_str() {
-        return Err(refused());
-    }
-    let args = field(message, "command").as_array().ok_or_else(refused)?;
-    let [program, no_build, no_cache, setup_file, source] = args.as_slice() else {
-        return Err(refused());
-    };
-    if no_build != "--no-build" || no_cache != "--no-cache" || setup_file != "setup-file" {
-        return Err(refused());
-    }
-    let id = crate::toolchain::ToolchainId::from_lake_root(root).map_err(io::Error::other)?;
-    if id.window_verdict() != crate::toolchain::WindowVerdict::Supported {
-        return Err(refused());
-    }
-    let lake = id
-        .elan_dir()
-        .map_err(io::Error::other)?
-        .canonicalize()?
-        .join("bin/lake");
-    let file = Path::new(source.as_str().ok_or_else(refused)?);
-    if program.as_str() != lake.to_str()
-        || !lake.is_file()
-        || lake.canonicalize()?.as_os_str() != lake.as_os_str()
-        || !file.starts_with(root)
-        || file.extension().is_none_or(|s| s != "lean")
-        || !file.is_file()
-        || file.canonicalize()?.as_os_str() != file.as_os_str()
-    {
-        return Err(refused());
-    }
-    Ok(Some(assets.join(MODULE_SETUP_FILE)))
-}
-
 pub(crate) fn module_setup_digest(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
@@ -1057,7 +994,6 @@ struct Capture {
     bytes: Vec<u8>,
     overflowed: bool,
     limit: usize,
-    eof: bool,
 }
 
 impl Capture {
@@ -1072,7 +1008,6 @@ impl Capture {
                 bytes: Vec::new(),
                 overflowed: false,
                 limit: CAPTURE_BYTES,
-                eof: false,
             },
             Stdio::from(write),
         ))
@@ -1085,10 +1020,7 @@ impl Capture {
         // existing owner requests stop and observes closure.
         for _ in 0..32 {
             match rustix::io::read(&self.descriptor, &mut buffer) {
-                Ok(0) => {
-                    self.eof = true;
-                    return Ok(self.overflowed);
-                }
+                Ok(0) => return Ok(self.overflowed),
                 Ok(count) => {
                     let keep = count.min(self.limit.saturating_sub(self.bytes.len()));
                     self.bytes.extend_from_slice(
@@ -1116,18 +1048,11 @@ impl Capture {
     }
 }
 
-fn poll_output(stdout: &mut Capture, stderr: &mut Capture, module_setup: bool, reason: &mut Option<String>) {
-    for (capture, required) in [(stdout, true), (stderr, !module_setup)] {
+fn poll_output(stdout: &mut Capture, stderr: &mut Capture, reason: &mut Option<String>) {
+    for capture in [stdout, stderr] {
         match capture.read_available() {
-            Ok(true) if required => {
-                reason.get_or_insert_with(|| {
-                    if module_setup {
-                        "Lake module setup exceeds 16 MiB"
-                    } else {
-                        "writer captured output limit exceeded"
-                    }
-                    .to_owned()
-                });
+            Ok(true) => {
+                reason.get_or_insert_with(|| "writer captured output limit exceeded".to_owned());
             }
             Err(error) => {
                 reason.get_or_insert_with(|| format!("writer output read failed: {error}"));
@@ -1208,7 +1133,6 @@ fn execute_with_launcher(
     input: &Receiver<io::Result<Value>>,
     launcher: &Path,
     registry: &Path,
-    setup_path: Option<&Path>,
     mut emit: impl FnMut(&Value) -> io::Result<()>,
 ) -> io::Result<bool> {
     canonical(root)?;
@@ -1223,9 +1147,6 @@ fn execute_with_launcher(
         .ok_or_else(|| invalid("writer timeout is too large"))?;
     let (mut stdout, child_stdout) = Capture::pipe()?;
     let (mut stderr, child_stderr) = Capture::pipe()?;
-    if setup_path.is_some() {
-        stdout.limit = MODULE_SETUP_LIMIT;
-    }
     let (barrier, inherited) = pipe()?;
     fcntl_setfd(&barrier, FdFlags::CLOEXEC)?;
     fcntl_setfl(&barrier, fcntl_getfl(&barrier)? | OFlags::NONBLOCK)?;
@@ -1301,7 +1222,7 @@ fn execute_with_launcher(
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        poll_output(&mut stdout, &mut stderr, setup_path.is_some(), &mut reason);
+        poll_output(&mut stdout, &mut stderr, &mut reason);
         let status = match group.try_wait() {
             Ok(status) => status,
             Err(error) => {
@@ -1353,34 +1274,8 @@ fn execute_with_launcher(
                 if let Err(error) = &cleared {
                     reason.get_or_insert_with(|| format!("writer closed but ownership record cleanup failed: {error}"));
                 }
-                poll_output(&mut stdout, &mut stderr, setup_path.is_some(), &mut reason);
-                // With the group closed, drain buffered required bytes to EOF. An
-                // open empty pipe or an excess byte refuses publication.
-                while setup_path.is_some() && reason.is_none() && !stdout.eof {
-                    let before = stdout.bytes.len();
-                    poll_output(&mut stdout, &mut stderr, true, &mut reason);
-                    if stdout.bytes.len() == before {
-                        break;
-                    }
-                }
-                let captured_stdout = if let Some(path) = setup_path {
-                    if !stdout.eof {
-                        reason.get_or_insert_with(|| "incomplete Lake module setup stdout".into());
-                    }
-                    if status.success() && reason.is_none() && !group.intervened() {
-                        match File::create_new(path).and_then(|mut output| output.write_all(&stdout.bytes)) {
-                            Ok(()) => module_setup_digest(&stdout.bytes),
-                            Err(error) => {
-                                reason.get_or_insert_with(|| format!("could not stage Lake module setup: {error}"));
-                                String::new()
-                            }
-                        }
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    stdout.text()
-                };
+                poll_output(&mut stdout, &mut stderr, &mut reason);
+                let captured_stdout = stdout.text();
                 let captured_stderr = stderr.text();
                 let unavailable = reason.is_some() || group.intervened();
                 // Physical closure is a distinct terminal fact even when the
@@ -1529,7 +1424,6 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                             return Err(invalid("native artifact readers remain unresolved before GO"));
                         }
                     }
-                    let setup_path = module_setup_path(&message, &args.root, &asset_dir)?;
                     if !execute_with_launcher(
                         &message,
                         &args.root,
@@ -1540,7 +1434,6 @@ pub fn run_cli(args: &WriterArgs) -> io::Result<()> {
                         &input,
                         &std::env::current_exe()?,
                         &registry,
-                        setup_path.as_deref(),
                         send,
                     )? {
                         break;
@@ -1576,7 +1469,6 @@ mod tests {
             bytes: Vec::new(),
             overflowed: false,
             limit: CAPTURE_BYTES,
-            eof: false,
         };
         let chunk = [b'x'; 1024];
         // Every poll must consume the next chunk even after overflow. A reader
@@ -1614,7 +1506,6 @@ mod tests {
             bytes: Vec::new(),
             overflowed: false,
             limit: CAPTURE_BYTES,
-            eof: false,
         };
         let chunk = [b'a'; 1024];
         for _ in 0..64 {

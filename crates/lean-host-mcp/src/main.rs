@@ -119,22 +119,9 @@ struct ServeArgs {
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
 
-    /// Operator-reviewed verify-batch-v1 digest for this primary project.
-    /// Records startup policy only; the released worker keeps native source grants closed.
-    #[arg(long)]
-    verification_approval: Option<String>,
-
     /// Optional generation JSON for prepared worker imports. Ordinary file verification uses Lake setup-file.
     #[arg(long)]
     prepared_generation: Option<String>,
-
-    /// Operator-selected standalone writer for this primary project's Lake file setup.
-    #[arg(long, requires = "module_setup_storage_request")]
-    module_setup_writer: Option<PathBuf>,
-
-    /// Complete v1 storage request JSON for the selected module setup writer.
-    #[arg(long, requires = "module_setup_writer")]
-    module_setup_storage_request: Option<String>,
 
     /// Directory for durable epoch-bound request results. One broker per directory;
     /// old requests are recovered as evidence, never replayed.
@@ -536,9 +523,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let max_projects = max_workers; // Legacy internal name; the limit counts worker processes.
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?
         .with_operator_primary(lake_root.as_deref())?
-        .with_verification_input(args.verification_approval)?
-        .with_prepared_generation(args.prepared_generation)?
-        .with_module_setup_writer(args.module_setup_writer, args.module_setup_storage_request)?;
+        .with_prepared_generation(args.prepared_generation)?;
     let tool_config = resolve_tool_config(&file)?;
     // One server per store. Take the lock after the config checks, so a bad
     // config leaves the store alone, and before the broker, the process record
@@ -823,61 +808,6 @@ mod tests {
             assert!(output.contains("transport error"));
             assert!(output.contains("request summary"));
         }
-    }
-
-    #[test]
-    fn verification_approval_is_bound_to_explicit_startup_and_primary() {
-        let tree = tempfile::tempdir().expect("test project");
-        let project = tree.path().canonicalize().expect("canonical project");
-        let digest = format!("verify-batch-v1:{}", "ab".repeat(32));
-        std::fs::write(
-            project.join("lean-host-mcp.toml"),
-            format!("verification_approval = '{digest}'"),
-        )
-        .expect("local settings");
-        let cli = Cli::parse_from(["lean-host-mcp"]);
-        assert!(cli.serve.verification_approval.is_none());
-        let config = ConfigFile::load(Some(&project));
-        let runtime = ProjectRuntimeConfig::from_env_with_file(&config.runtime, 1)
-            .expect("runtime")
-            .with_operator_primary(Some(&project))
-            .expect("select project");
-        assert!(runtime.verification_input_for(&project).is_none());
-        let explicit = Cli::parse_from(["lean-host-mcp", "--verification-approval", &digest]);
-        let selected = runtime
-            .with_verification_input(explicit.serve.verification_approval)
-            .expect("startup input");
-        assert_eq!(selected.verification_input_for(&project), Some(digest.as_str()));
-        assert!(selected.verification_input_for(&project.join("other")).is_none());
-        assert!(
-            selected
-                .with_operator_primary(None)
-                .expect("clear selection")
-                .verification_input_for(&project)
-                .is_none()
-        );
-        assert!(
-            ProjectRuntimeConfig::default()
-                .with_verification_input(Some(digest))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn module_setup_writer_requires_an_explicit_startup_pair() {
-        let ordinary = Cli::parse_from(["lean-host-mcp"]);
-        assert!(ordinary.serve.module_setup_writer.is_none() && ordinary.serve.module_setup_storage_request.is_none());
-        assert!(Cli::try_parse_from(["lean-host-mcp", "--module-setup-storage-request", "{}"]).is_err());
-        assert!(Cli::try_parse_from(["lean-host-mcp", "--module-setup-writer", "/writer"]).is_err());
-        let selected = Cli::parse_from([
-            "lean-host-mcp",
-            "--module-setup-writer",
-            "/writer",
-            "--module-setup-storage-request",
-            "{}",
-        ]);
-        assert_eq!(selected.serve.module_setup_writer, Some(PathBuf::from("/writer")));
-        assert_eq!(selected.serve.module_setup_storage_request.as_deref(), Some("{}"));
     }
 
     #[test]

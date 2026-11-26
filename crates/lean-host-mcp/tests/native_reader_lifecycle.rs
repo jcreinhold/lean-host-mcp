@@ -91,6 +91,9 @@ impl Fixture {
         self.reader_command(timeout_millis, false)
     }
     fn reader_command(&self, timeout_millis: u64, stdout_frame: bool) -> Command {
+        self.limited_command(timeout_millis, stdout_frame, 64)
+    }
+    fn limited_command(&self, timeout_millis: u64, stdout_frame: bool, max_output_bytes: usize) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command.arg("native-reader");
         if stdout_frame {
@@ -104,7 +107,7 @@ impl Fixture {
             .arg("--timeout-millis")
             .arg(timeout_millis.to_string())
             .arg("--max-output-bytes")
-            .arg("64")
+            .arg(max_output_bytes.to_string())
             .arg("--")
             .arg(&self.executable)
             .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", self.root.join("owners"))
@@ -138,12 +141,17 @@ impl OwnedChild {
     }
     fn finish(mut self) -> (std::process::ExitStatus, Value) {
         wait_for(|| self.child().try_wait().unwrap().is_some());
+        self.read_to_exit()
+    }
+    /// Drain stdout while the child runs, for a frame larger than the pipe buffer.
+    fn read_to_exit(mut self) -> (std::process::ExitStatus, Value) {
         let output = self.0.take().unwrap().wait_with_output().unwrap();
         let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            let head = |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
             panic!(
                 "invalid native-reader result {error}: stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                head(&output.stdout),
+                head(&output.stderr)
             )
         });
         (output.status, value)
@@ -287,7 +295,9 @@ print('not a completion report')
 #[test]
 fn deadline_stops_scope_without_returning_semantic_success_or_replaying() {
     let fixture = Fixture::new();
-    let child = OwnedChild::spawn(fixture.command(500));
+    // The payload must start before the deadline. In the parallel suite,
+    // admission and spawn alone can take over a second.
+    let child = OwnedChild::spawn(fixture.command(3000));
     wait_for(|| fixture.root.join("payload").exists());
     let payload = fixture.marker_pid("payload");
     let (status, result) = child.finish();
@@ -421,6 +431,37 @@ fn frame_requires_complete_stdout_but_accepts_clipped_diagnostics() {
             assert_eq!(result["detail"], "required payload stdout exceeds capture limit");
         }
     }
+}
+
+#[test]
+fn full_program_stdout_fits_one_frame_while_stderr_keeps_the_default() {
+    const DEFAULT: usize = 1024 * 1024;
+    const PROGRAM: usize = 16 * 1024 * 1024;
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.executable,
+        format!(
+            "#!/bin/sh\nhead -c {} /dev/zero | tr '\\0' e >&2\nhead -c {PROGRAM} /dev/zero | tr '\\0' o\n",
+            DEFAULT + 1
+        ),
+    )
+    .unwrap();
+    // Each pipe must carry the whole frame within the reply's 2 s write deadline.
+    let (status, result) = OwnedChild::spawn(fixture.limited_command(20_000, true, PROGRAM)).read_to_exit();
+    assert!(status.success(), "{} {}", result["state"], result["detail"]);
+    assert_eq!(result["state"], "completed");
+    assert_eq!(result["output_truncated"], false);
+    assert_eq!(result["stdout"].as_str().unwrap().len(), PROGRAM);
+    assert_eq!(result["stderr"].as_str().unwrap().len(), DEFAULT);
+    assert_eq!(result["detail"], "payload stderr diagnostic clipped");
+
+    let (status, result) = OwnedChild::spawn(fixture.limited_command(10_000, true, PROGRAM + 1)).read_to_exit();
+    assert!(!status.success());
+    assert_eq!(result["state"], "not_started");
+    assert!(
+        result["detail"].as_str().unwrap().contains("output limit invalid"),
+        "{result}"
+    );
 }
 
 #[test]

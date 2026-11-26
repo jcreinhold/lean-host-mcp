@@ -74,6 +74,7 @@ impl Fixture {
             },
             cwd: self.project.clone(),
             artifact_roots: vec![],
+            max_stdout_bytes: OUTPUT_LIMIT,
         })
     }
     fn assert_exclusive_available(&self) {

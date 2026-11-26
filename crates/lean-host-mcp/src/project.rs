@@ -282,8 +282,6 @@ const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectRuntimeConfig {
     operator_primary: Option<PathBuf>,
-    pub(crate) module_setup_writer: Option<Arc<crate::broker::ChargedWriter>>,
-    verification_input: Option<String>,
     prepared_generation: Option<String>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
@@ -318,58 +316,7 @@ impl ProjectRuntimeConfig {
     /// Returns an error if the selected directory cannot be resolved.
     pub fn with_operator_primary(mut self, root: Option<&Path>) -> std::io::Result<Self> {
         self.operator_primary = root.map(Path::canonicalize).transpose()?;
-        self.verification_input = None;
         self.prepared_generation = None;
-        self.module_setup_writer = None;
-        Ok(self)
-    }
-
-    /// Bind a standalone module setup writer and its v1 storage request to the approved primary project.
-    ///
-    /// # Errors
-    ///
-    /// Incomplete selections, noncanonical executables and requests for another project are refused.
-    pub fn with_module_setup_writer(
-        mut self,
-        executable: Option<PathBuf>,
-        request: Option<String>,
-    ) -> std::io::Result<Self> {
-        self.module_setup_writer = match (executable, request) {
-            (None, None) => None,
-            (Some(path), Some(request)) => {
-                let root = self.operator_primary.as_deref().ok_or_else(|| {
-                    std::io::Error::other("module setup writer requires an operator-approved primary project")
-                })?;
-                Some(Arc::new(crate::broker::ChargedWriter::new(root, path, request)?))
-            }
-            _ => {
-                return Err(std::io::Error::other(
-                    "module setup writer and storage request must be supplied together",
-                ));
-            }
-        };
-        Ok(self)
-    }
-
-    /// Attach operator-selected startup data to this exact primary root. This alone enables no operation.
-    ///
-    /// # Errors
-    ///
-    /// An approval requires a selected project and a versioned lowercase SHA-256 digest.
-    pub fn with_verification_input(mut self, value: Option<String>) -> std::io::Result<Self> {
-        if let Some(value) = &value {
-            let digest = value.strip_prefix("verify-batch-v1:").unwrap_or("");
-            if self.operator_primary.is_none()
-                || digest.len() != 64
-                || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "verification approval requires an operator-selected root and verify-batch-v1 SHA-256",
-                ));
-            }
-        }
-        self.verification_input = value;
         Ok(self)
     }
 
@@ -396,16 +343,6 @@ impl ProjectRuntimeConfig {
         self.prepared_generation.as_deref()
     }
 
-    /// Immutable launch data for the selected canonical project. Worker grants are independent.
-    #[must_use]
-    pub fn verification_input_for(&self, canonical_root: &Path) -> Option<&str> {
-        if self.operator_primary.as_deref() == Some(canonical_root) {
-            self.verification_input.as_deref()
-        } else {
-            None
-        }
-    }
-
     /// Defaults for a broker that keeps up to `max_projects` worker children
     /// resident.
     ///
@@ -419,8 +356,6 @@ impl ProjectRuntimeConfig {
         let import_residue_budget_bytes = default_import_residue_budget_bytes(max_projects);
         Self {
             operator_primary: None,
-            module_setup_writer: None,
-            verification_input: None,
             prepared_generation: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
@@ -682,8 +617,6 @@ fn parse_runtime_config(
     .saturating_mul(1024 * 1024);
     let config = ProjectRuntimeConfig {
         operator_primary: None,
-        module_setup_writer: None,
-        verification_input: None,
         prepared_generation: None,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
