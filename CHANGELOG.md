@@ -38,6 +38,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   failing busy, and a build waits for running checks. A build outside the server that holds the project's writer lock
   makes new checks wait the same way. A raw `lake build`, which takes no lock, is outside this contract.
 - Setup-file runs as a native reader with `--no-build`, under the check's shared lock, and never as a writer.
+- Every reply whose result came from a file's text names that file with the SHA-256 of the bytes it checked, in a
+  `source` trust row's `content_sha256`. `needs_build` replies from `lean_context`, `lean_lookup` `declarations` and
+  `references`, and `proof_search` from a file, now carry it too. A reply that checked one file also has it as
+  `trust.source_sha256`.
 - A worker reloads its imports after a build only as a backstop: the finished-build count replaces the import stamps. A
   cached query result lives only as long as the worker that computed it.
 

@@ -436,7 +436,9 @@ pub async fn proof_state(ctx: &ToolContext, req: ProofStateRequest) -> Result<Re
         crate::diagnosis::CallOutcome::NeedsBuild(err) => {
             // Forward the file's real header imports so the degraded envelope's
             // `freshness.imports` matches the success path.
-            let response = proof_state_needs_build_response(ctx, hint, source.imports.clone(), err)?;
+            let source_fact =
+                ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &source.resolved, source.hash);
+            let response = proof_state_needs_build_response(ctx, hint, source.imports.clone(), source_fact, err)?;
             return Ok(response);
         }
     };
@@ -618,11 +620,14 @@ fn proof_state_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
     imports: Vec<String>,
+    source_fact: ArtifactTrust,
     err: ServerError,
 ) -> Result<Response<ProofStateResult>> {
     let base = ctx.broker.project_identity_without_worker(&hint, imports)?;
     let message = err.to_string().lines().next().unwrap_or_default().trim().to_owned();
-    let response = Response::ok(needs_build_context(message), base.freshness).with_runtime(base.runtime);
+    let response = Response::ok(needs_build_context(message), base.freshness)
+        .with_runtime(base.runtime)
+        .with_trust_artifact(source_fact);
     Ok(crate::diagnosis::warn_needs_build(
         response,
         &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
@@ -1124,8 +1129,16 @@ async fn find_references_in_file(
     // A read failure lands in the same `Err` arms below that it reached through
     // `run_module_query` before the file became a parameter — an unreadable file
     // is a skipped file, not a failed call.
+    let mut read_fact = None;
     let run = match read_query_file(root, &path) {
-        Ok(source) => run_module_query(ctx, hint, root, &source, query).await,
+        Ok(source) => {
+            read_fact = Some(ArtifactTrust::source_file_edit_fresh(
+                root,
+                &source.resolved,
+                source.hash,
+            ));
+            run_module_query(ctx, hint, root, &source, query).await
+        }
         Err(err) => Err(err),
     };
     match run {
@@ -1215,6 +1228,9 @@ async fn find_references_in_file(
         }
         Err(err) if crate::diagnosis::missing_olean_failure(&err) => {
             files_skipped = files_skipped.saturating_add(1);
+            // The file's header decided the verdict, so the reply names the
+            // text it read.
+            source_fact = read_fact;
             needs_build = Some(err);
         }
         Err(err) => return Err(err),

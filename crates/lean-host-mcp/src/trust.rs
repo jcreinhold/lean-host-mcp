@@ -241,6 +241,24 @@ pub(crate) fn dedupe_artifacts(artifacts: impl IntoIterator<Item = ArtifactTrust
     deduper.into_vec()
 }
 
+/// The digest of the one source text a reply's result came from.
+///
+/// A check that read one file reports that file's `content_sha256`, so the
+/// caller can compare it with the text it meant to check. `None` when the
+/// reply read no file, or read two files or two versions of one file; each
+/// `source` row still carries its own digest then. Pass deduplicated rows, or
+/// two reads of the same unchanged file count as two texts.
+pub(crate) fn checked_source_sha256(artifacts: &[ArtifactTrust]) -> Option<String> {
+    let mut sources = artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact == ArtifactKind::Source && artifact.scope == TrustScope::File);
+    let only = sources.next()?;
+    if sources.next().is_some() {
+        return None;
+    }
+    only.content_sha256.clone()
+}
+
 pub fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
 }
@@ -292,6 +310,22 @@ mod tests {
         let ilean = ArtifactTrust::ilean_project_build_fresh();
         let deduped = dedupe_artifacts([source.clone(), ilean.clone(), source.clone()]);
         assert_eq!(deduped, vec![source, ilean]);
+    }
+
+    #[test]
+    fn a_reply_names_a_source_digest_only_for_one_text() {
+        let root = Path::new("/tmp/project");
+        let first = ArtifactTrust::source_file_edit_fresh(root, Path::new("/tmp/project/A.lean"), [0xab; 32]);
+        let ilean = ArtifactTrust::ilean_project_build_fresh();
+        assert_eq!(
+            checked_source_sha256(&[ilean.clone(), first.clone()]),
+            Some("ab".repeat(32))
+        );
+        assert_eq!(checked_source_sha256(std::slice::from_ref(&ilean)), None);
+        let other_file = ArtifactTrust::source_file_edit_fresh(root, Path::new("/tmp/project/B.lean"), [0xab; 32]);
+        assert_eq!(checked_source_sha256(&[first.clone(), other_file]), None);
+        let edited = ArtifactTrust::source_file_edit_fresh(root, Path::new("/tmp/project/A.lean"), [0xcd; 32]);
+        assert_eq!(checked_source_sha256(&[first, edited]), None);
     }
 
     #[test]

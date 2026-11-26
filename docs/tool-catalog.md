@@ -406,6 +406,15 @@ missing/stale build state; `needs_build` degradations report missing `.olean` ar
 collapsed while preserving first occurrence order. Runtime counters, cache timings, and import lists remain telemetry,
 not trust.
 
+Every reply whose result came from a source file's text, including a `needs_build` reply, has a `source` / `file` /
+`edit_fresh` row for that file. Its `content_sha256` is the lowercase SHA-256 of the exact bytes the call read and
+checked. When the call checked one file, `trust.source_sha256` repeats that digest: compare it with the text you meant
+to check before you trust the result. A `lean_verify` call that names several files, or that read one file twice and saw
+an edit between the reads, has one row per text and no `trust.source_sha256`. This holds for `lean_context`,
+`lean_trial`, `lean_verify`, `lean_status` with `file_diagnostics`, and `lean_lookup` with `declarations`, `references`
+or `proof_search` when they read a file. `lean_lookup` with `declaration` reads only a file's header to choose imports,
+so its result comes from built artifacts and carries no source row.
+
 Lean-domain outcomes remain data. A failed tactic, a rejected declaration, an ambiguous name, or a `needs_build` verdict
 is not an MCP transport error. Infrastructure failures appear in `errors` with structured details and a `retryable`
 flag; follow that flag, since restart-loop exhaustion and compatibility refusals require recovery. Warnings and next

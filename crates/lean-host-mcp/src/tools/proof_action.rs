@@ -1696,13 +1696,16 @@ mod tests {
     use crate::tools::{ToolConfig, ToolContext};
     use crate::trust::{ArtifactKind, TrustScope, TrustStatus};
 
+    /// The text of `Demo.lean` in [`make_lake_dir`].
+    const DEMO_SOURCE: &str = "import Init\nexample : True := by trivial\n";
+
     fn make_lake_dir(root: &std::path::Path) -> std::path::PathBuf {
         let dir = root.join("proof_action");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("lakefile.lean"), "package proof_action\nlean_lib Demo\n").unwrap();
         std::fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
         std::fs::write(dir.join("lake-manifest.json"), "{}\n").unwrap();
-        std::fs::write(dir.join("Demo.lean"), "import Init\nexample : True := by trivial\n").unwrap();
+        std::fs::write(dir.join("Demo.lean"), DEMO_SOURCE).unwrap();
         dir.canonicalize().unwrap()
     }
 
@@ -1723,12 +1726,16 @@ mod tests {
         )
     }
 
+    /// The reply names `Demo.lean` as read for this call, with the digest of
+    /// the exact text it checked.
     fn assert_source_edit_fresh(response: &Response<impl serde::Serialize + JsonSchema>) {
+        let digest = crate::shared_writer::module_setup_digest(DEMO_SOURCE.as_bytes());
         assert!(response.trust_artifacts.iter().any(|artifact| {
             artifact.artifact == ArtifactKind::Source
                 && artifact.scope == TrustScope::File
                 && artifact.status == TrustStatus::EditFresh
                 && artifact.path.as_deref() == Some("Demo.lean")
+                && artifact.content_sha256.as_deref() == Some(digest.as_str())
         }));
     }
 

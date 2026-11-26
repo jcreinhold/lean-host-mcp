@@ -184,7 +184,7 @@ async fn worker_declarations(
     };
     let call = match classify_missing_olean(outcome)? {
         CallOutcome::Ready(call) => call,
-        CallOutcome::NeedsBuild(err) => return worker_needs_build_response(ctx, hint, err),
+        CallOutcome::NeedsBuild(err) => return worker_needs_build_response(ctx, hint, source_fact, err),
     };
     let mut result = project_worker_outline(call.value, limit);
     let index_fact = if let Some(module) = module.as_deref() {
@@ -281,10 +281,13 @@ fn index_declarations(
 fn worker_needs_build_response(
     ctx: &ToolContext,
     hint: ProjectHint,
+    source_fact: ArtifactTrust,
     err: ServerError,
 ) -> Result<Response<DeclarationInventoryResult>> {
     let base = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
-    let response = Response::ok(missing_build_result(err.to_string()), base.freshness).with_runtime(base.runtime);
+    let response = Response::ok(missing_build_result(err.to_string()), base.freshness)
+        .with_runtime(base.runtime)
+        .with_trust_artifact(source_fact);
     Ok(warn_needs_build(
         response,
         &IncompleteCause::MissingOlean(err.to_string()),

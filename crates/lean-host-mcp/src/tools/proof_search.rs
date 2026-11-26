@@ -32,6 +32,7 @@ use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResu
 use crate::tools::position::ProofPositionSelector;
 use crate::tools::source_input::module_name_for_file;
 use crate::tools::{ToolContext, session_imports};
+use crate::trust::ArtifactTrust;
 
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 20;
@@ -150,6 +151,9 @@ struct TargetProfile {
     cache_status: Option<String>,
     warnings: Vec<String>,
     semantic: Option<SemanticProofSearchRequest>,
+    /// The source file the profile read, with the digest of its bytes, for
+    /// the reply's trust facts. `None` for a search from explicit text.
+    source_fact: Option<ArtifactTrust>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -187,6 +191,7 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let project = req.project.clone();
     let mut profile = target_profile(ctx, req, limit)?;
     let mut warnings = std::mem::take(&mut profile.warnings);
+    let source_fact = profile.source_fact.take();
     let searches = plan_searches(&profile, mode);
     let semantic = run_semantic_search(ctx, project.clone(), &profile).await?;
 
@@ -202,7 +207,9 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
         };
         let hint = ProjectHint::from_request(project);
         let identity = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
-        return Ok(Response::ok(result, identity.freshness).with_runtime(identity.runtime));
+        return Ok(Response::ok(result, identity.freshness)
+            .with_runtime(identity.runtime)
+            .with_trust_artifacts(source_fact));
     }
 
     // One call for the whole group: the searches share an import set, so they
@@ -224,7 +231,9 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
             let identity = ctx
                 .broker
                 .project_identity_without_worker(&hint, profile.imports.clone())?;
-            let response = Response::ok(result, identity.freshness).with_runtime(identity.runtime);
+            let response = Response::ok(result, identity.freshness)
+                .with_runtime(identity.runtime)
+                .with_trust_artifacts(source_fact);
             let response = crate::diagnosis::warn_needs_build(
                 response,
                 &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
@@ -256,7 +265,9 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let freshness_imports = profile.imports.clone();
     let hint = ProjectHint::from_request(project);
     let identity = ctx.broker.project_identity_without_worker(&hint, freshness_imports)?;
-    Ok(Response::ok(result, identity.freshness).with_runtime(runtime))
+    Ok(Response::ok(result, identity.freshness)
+        .with_runtime(runtime)
+        .with_trust_artifacts(source_fact))
 }
 
 fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -> Result<TargetProfile> {
@@ -323,6 +334,7 @@ fn source_profile(
         Some(semantic),
     );
     profile.source_declaration = Some(declaration.to_owned());
+    profile.source_fact = Some(ArtifactTrust::source_file_edit_fresh(root, &input.resolved, input.hash));
     Ok(profile)
 }
 
@@ -351,6 +363,7 @@ fn profile_from_text(
         cache_status,
         warnings,
         semantic,
+        source_fact: None,
     }
 }
 
@@ -1999,5 +2012,34 @@ mod tests {
 
         assert!(solver_score > array_score, "{solver_score} should beat {array_score}");
         assert!(cooper_score > order_score, "{cooper_score} should beat {order_score}");
+    }
+
+    #[test]
+    fn a_search_from_a_file_reports_the_digest_of_the_text_it_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let text = "import Init\ntheorem demo : 1 + 1 = 2 := by\n  rfl\n";
+        std::fs::write(root.join("Demo.lean"), text).unwrap();
+        let input = crate::tools::source_input::read_query_file(&root, std::path::Path::new("Demo.lean")).unwrap();
+
+        let profile = source_profile(
+            &root,
+            &input,
+            "demo",
+            &ProofPositionSelector::Default,
+            &[],
+            String::new(),
+            DEFAULT_LIMIT,
+        )
+        .unwrap();
+
+        let fact = profile.source_fact.expect("a search from a file names the file");
+        assert_eq!(fact.path.as_deref(), Some("Demo.lean"));
+        assert_eq!(
+            fact.content_sha256,
+            Some(crate::shared_writer::module_setup_digest(text.as_bytes()))
+        );
+        let from_text = profile_from_text(String::new(), None, Vec::new(), String::new(), None, Vec::new(), None);
+        assert!(from_text.source_fact.is_none());
     }
 }

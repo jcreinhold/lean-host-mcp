@@ -17,7 +17,7 @@ use crate::broker::{BrokerConfigSnapshot, ProjectHint};
 use crate::envelope::{FreshnessIdentity, Response, RuntimeFailure, Telemetry};
 use crate::error::{Result, ServerError, WorkerUnavailable};
 use crate::tools::{ResponseCarrier, TelemetryVerbosity, ToolConfig, ToolContext};
-use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus, dedupe_artifacts};
+use crate::trust::{ArtifactKind, ArtifactTrust, TrustStatus, checked_source_sha256, dedupe_artifacts};
 
 use super::declaration::{self, InspectDeclarationRequest};
 use super::declaration_inventory::{self, DeclarationInventoryRequest};
@@ -461,6 +461,11 @@ pub struct SemanticTrust {
     pub native_compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_file_verification: Option<Box<crate::envelope::CliFileVerification>>,
+    /// Lowercase SHA-256 of the exact bytes the check read and ran on, when
+    /// its result came from one source file's text. It equals that file's
+    /// `source` row `content_sha256`; compare it with the text you meant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
     pub project_root: String,
     pub session_id: String,
     pub lean_toolchain: String,
@@ -473,6 +478,7 @@ impl SemanticTrust {
         Self {
             native_compatibility: None,
             cli_file_verification: None,
+            source_sha256: None,
             project_root: String::new(),
             session_id: "request-invalid".to_owned(),
             lean_toolchain: String::new(),
@@ -481,13 +487,15 @@ impl SemanticTrust {
     }
 
     fn from_parts(freshness: FreshnessIdentity, artifacts: Vec<ArtifactTrust>) -> Self {
+        let artifacts = dedupe_artifacts(artifacts);
         Self {
             native_compatibility: None,
             cli_file_verification: None,
+            source_sha256: checked_source_sha256(&artifacts),
             project_root: freshness.project_root,
             session_id: freshness.session_id,
             lean_toolchain: freshness.lean_toolchain,
-            artifacts: dedupe_artifacts(artifacts),
+            artifacts,
         }
     }
 }
@@ -1366,6 +1374,39 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("missing_build")
         );
+    }
+
+    #[test]
+    fn a_check_reply_names_the_digest_of_the_text_it_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let text = "import Init\nexample : True := by trivial\n";
+        let source = ArtifactTrust::source_file_edit_fresh(
+            root,
+            &root.join("Demo.lean"),
+            crate::cache::hash_bytes(text.as_bytes()),
+        );
+        let response = Response::ok(serde_json::json!({"status": "ok"}), freshness(root))
+            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build())
+            .with_trust_artifact(source);
+
+        let json = serde_json::to_value(from_tool_response(response, ToolConfig::default()).unwrap()).unwrap();
+
+        let expected = crate::shared_writer::module_setup_digest(text.as_bytes());
+        assert_eq!(
+            json.pointer("/trust/source_sha256").and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            json.pointer("/trust/artifacts/1/content_sha256")
+                .and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
+
+        let no_file = Response::ok(serde_json::json!({"status": "ok"}), freshness(root))
+            .with_trust_artifact(ArtifactTrust::ilean_project_missing_build());
+        let json = serde_json::to_value(from_tool_response(no_file, ToolConfig::default()).unwrap()).unwrap();
+        assert!(json.pointer("/trust/source_sha256").is_none());
     }
 
     #[tokio::test]
