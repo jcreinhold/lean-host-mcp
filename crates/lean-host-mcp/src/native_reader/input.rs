@@ -195,17 +195,8 @@ pub(super) fn capture<F: AsFd>(
     still_alive: &(impl Fn() -> io::Result<bool> + ?Sized),
 ) -> io::Result<StagedInput> {
     let bytes = capture_bytes(input, deadline, still_alive)?;
-    stage_bytes(directory, &bytes, deadline, still_alive)
-}
-
-pub(super) fn stage_bytes(
-    directory: &Path,
-    bytes: &[u8],
-    deadline: Instant,
-    still_alive: &(impl Fn() -> io::Result<bool> + ?Sized),
-) -> io::Result<StagedInput> {
     ready(deadline, still_alive)?;
-    let stored = store(directory, bytes)?;
+    let stored = store(directory, &bytes)?;
     ready(deadline, still_alive)?;
     Ok(StagedInput {
         path: directory.join("stdin"),

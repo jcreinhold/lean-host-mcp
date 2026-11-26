@@ -175,31 +175,9 @@ pub async fn inspect_declaration(
     ctx: &ToolContext,
     req: InspectDeclarationRequest,
 ) -> Result<Response<DeclarationInspectionResult>> {
-    inspect_declaration_inner(
-        ctx,
-        req,
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn inspect_declaration_inner(
-    ctx: &ToolContext,
-    req: InspectDeclarationRequest,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
-) -> Result<Response<DeclarationInspectionResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
     let budgets = budgets_for(&ctx.config.output);
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    let budgets = if managed.is_some() {
-        LeanWorkerOutputBudgets::default()
-    } else {
-        budgets
-    };
     let mut fields: LeanWorkerDeclarationInspectionFields = req.fields.into();
     if req.raw_statement {
         fields.rendering = LeanWorkerRendering::Raw;
@@ -214,21 +192,8 @@ pub(crate) async fn inspect_declaration_inner(
         );
     }
     let mut imports = req.imports.clone();
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    let mut admitted_source = None;
     if let Some(file) = req.file.as_ref() {
         let input = read_query_file(&meta.canonical_root, file)?;
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        if managed.is_some() {
-            let relative = input
-                .resolved
-                .strip_prefix(&meta.canonical_root)
-                .map_err(|_| ServerError::BadProject("managed declaration file is outside its project".into()))?;
-            admitted_source = Some(crate::managed_prepared::InspectionSource {
-                file: relative.to_owned(),
-                sha256: input.hash,
-            });
-        }
         extend_unique(&mut imports, input.imports);
         if let Some(module) = module_name_for_file(&meta.canonical_root, &input.resolved) {
             extend_unique(&mut imports, vec![module]);
@@ -239,20 +204,6 @@ pub(crate) async fn inspect_declaration_inner(
         fields,
         budgets,
     };
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    if let Some(call) = managed {
-        let outcome = crate::managed_prepared::named_lookup(
-            call,
-            &ctx.broker,
-            &meta.canonical_root,
-            &session_imports(imports.clone()),
-            &request,
-            admitted_source.as_ref(),
-        )
-        .await?;
-        let identity = ctx.broker.project_identity_without_worker(&hint, imports)?;
-        return Ok(inspection_response(req, outcome, identity.freshness, identity.runtime));
-    }
     // Uncached on purpose: this names a declaration rather than supplying
     // source, so there is no content hash to invalidate the answer. See the
     // module doc of `crate::cache`.

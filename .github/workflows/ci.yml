@@ -47,9 +47,7 @@ jobs:
         run: cargo fmt --all -- --check
       # clippy --workspace is link-safe (no final link happens) per AGENTS.md.
       - name: clippy
-        run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo clippy --locked -p lean-host-mcp --features managed-warm-inspections --test stdio_lifecycle -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # rustdoc per member: a broken or private intra-doc link ships to docs.rs
       # as dead text, so fail on it here.
       - name: rustdoc

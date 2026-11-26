@@ -49,7 +49,7 @@ const POLL: Duration = Duration::from_millis(25);
 pub struct WriterContract {
     pub protocol: u32,
     pub executable: PathBuf,
-    /// Shared native scope namespace that every managed writer must inspect.
+    /// Shared native scope namespace that every host-run writer must inspect.
     pub ownership_registry: PathBuf,
 }
 

@@ -309,8 +309,6 @@ pub struct ProjectBroker {
     runtime_config: ProjectRuntimeConfig,
     worker_slots: Arc<Semaphore>,
     capacity_admission: AsyncMutex<()>,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    launcher_guards: Mutex<HashMap<PathBuf, std::fs::File>>,
 }
 
 impl std::fmt::Debug for ProjectBroker {
@@ -354,8 +352,6 @@ impl ProjectBroker {
             runtime_config,
             worker_slots: Arc::new(Semaphore::new(config.max_projects.get())),
             capacity_admission: AsyncMutex::new(()),
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            launcher_guards: Mutex::new(HashMap::new()),
             config,
         });
         broker.spawn_reaper();
@@ -441,29 +437,6 @@ impl ProjectBroker {
     /// Returns [`ServerError::BadProject`] when the explicit / env /
     /// config path is unusable or no lakefile is reachable from `cwd`.
     pub fn resolve(&self, hint: &ProjectHint) -> Result<PathBuf> {
-        let root = self.resolve_candidate(hint)?;
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        {
-            let mut guards = self.launcher_guards.lock();
-            if !guards.contains_key(&root) {
-                if guards.len() >= 256 {
-                    return Err(ServerError::BadProject("launcher project guard limit reached".into()));
-                }
-                let guard = crate::launcher_selection::admit_unenrolled(&root)
-                    .map_err(|error| ServerError::BadProject(format!("launcher admission refused: {error}")))?;
-                guards.insert(root.clone(), guard);
-            }
-        }
-        Ok(root)
-    }
-
-    /// Retain the checked startup selector for its exact canonical project.
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    pub fn retain_launcher_guard(&self, root: PathBuf, guard: std::fs::File) {
-        self.launcher_guards.lock().insert(root, guard);
-    }
-
-    fn resolve_candidate(&self, hint: &ProjectHint) -> Result<PathBuf> {
         if let ProjectHint::Explicit(p) = hint {
             return canonicalise(p);
         }
@@ -786,14 +759,7 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
-        if self.runtime_config.managed_only {
-            return Err(ServerError::BadProject(
-                "semantic proof search requires an admitted runtime selection".to_owned(),
-            ));
-        }
-        if !self.runtime_config.managed_semantic_companion
-            && (request.goal.file_label.is_some() || self.prepared_generation().is_some())
-        {
+        if request.goal.file_label.is_some() || self.prepared_generation().is_some() {
             return self
                 .semantic_file(
                     hint,
@@ -861,17 +827,6 @@ impl ProjectBroker {
         Ok(out)
     }
 
-    pub(crate) fn managed_only(&self) -> bool {
-        self.runtime_config.managed_only
-    }
-
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    pub(crate) fn managed_warm(&self) -> bool {
-        #[cfg(lean_host_mcp_development_warm)]
-        return self.runtime_config.managed_warm_idle_seconds.is_some();
-        #[cfg(not(lean_host_mcp_development_warm))]
-        false
-    }
     pub(crate) fn prepared_generation(&self) -> Option<&str> {
         self.runtime_config.prepared_generation()
     }
@@ -1012,11 +967,6 @@ impl ProjectBroker {
         meta: &LakeProjectMeta,
         options: LeanWorkerElabOptions,
     ) -> Result<LeanWorkerElabOptions> {
-        if self.runtime_config.managed_only {
-            return Err(ServerError::BadProject(
-                "Lake option discovery requires a managed preparation stage".to_owned(),
-            ));
-        }
         let activity = self.preparation_activity(&meta.canonical_root).await?;
         // Resolve availability before evaluating arbitrary project configuration.
         // This is metadata-only and preserves ordinary missing-worker precedence.
@@ -1053,18 +1003,9 @@ impl ProjectBroker {
     }
 
     async fn acquire_until(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
-        self.acquire_until_with_preparation(root, deadline, None).await
-    }
-
-    async fn acquire_until_with_preparation(
-        &self,
-        root: PathBuf,
-        deadline: tokio::time::Instant,
-        managed_prepared: Option<&str>,
-    ) -> Result<Arc<LeanProject>> {
         let cancellation = CallCancellation::current();
         loop {
-            let result = self.acquire_attempt(root.clone(), deadline, managed_prepared).await;
+            let result = self.acquire_attempt(root.clone(), deadline).await;
             if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if matches!(info.reason.as_str(), "worker_pool_draining" | "artifact_admission_busy"))
             {
                 return result;
@@ -1080,17 +1021,12 @@ impl ProjectBroker {
         }
     }
 
-    async fn acquire_attempt(
-        &self,
-        root: PathBuf,
-        deadline: tokio::time::Instant,
-        managed_prepared: Option<&str>,
-    ) -> Result<Arc<LeanProject>> {
+    async fn acquire_attempt(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
         if CallCancellation::current().is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
         let epoch = self.inner.lock().shutdown_epoch;
-        if let Some(project) = self.select_worker_for_preparation(&root, managed_prepared)? {
+        if let Some(project) = self.select_worker(&root)? {
             return Ok(project);
         }
 
@@ -1102,22 +1038,15 @@ impl ProjectBroker {
             .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
         let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
         let cancellation = CallCancellation::current();
-        let prepared = if let Some(selection) = managed_prepared {
-            let installed = Self::installed_host_artifacts(&worker, &sysroot)?;
-            // Validate the operator's exact project and product selection before
-            // opening a receiver. The admitted job later retains its own loan.
-            Self::prepared_reader_for_actor(&root, &meta, selection)?;
-            installed
-        } else {
-            let writer = crate::shared_writer::contract()?.executable;
-            self.prepare_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
-                .await?
-        };
+        let writer = crate::shared_writer::contract()?.executable;
+        let prepared = self
+            .prepare_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
+            .await?;
         let open_guard = self.acquire_opening_guard(&root, deadline, &cancellation).await?;
 
         // Root-local startup serialization closes the race between callers that
         // both saw spare capacity. Selection pins the returned actor with an Arc.
-        if let Some(project) = self.select_worker_for_preparation(&root, managed_prepared)? {
+        if let Some(project) = self.select_worker(&root)? {
             return Ok(project);
         }
         let (lane, growing) = {
@@ -1141,14 +1070,14 @@ impl ProjectBroker {
         let slot = if growing {
             let Ok(_turn) = self.capacity_admission.try_lock() else {
                 return self
-                    .select_existing_worker(&root, managed_prepared)?
+                    .select_existing_worker(&root)?
                     .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
             };
             match Arc::clone(&self.worker_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
                     return self
-                        .select_existing_worker(&root, managed_prepared)?
+                        .select_existing_worker(&root)?
                         .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
                 }
             }
@@ -1160,13 +1089,7 @@ impl ProjectBroker {
         if cancellation.is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
-        let runtime_config = if let Some(selection) = managed_prepared {
-            self.runtime_config
-                .clone()
-                .with_prepared_generation(Some(selection.to_owned()))?
-        } else {
-            self.runtime_config.clone()
-        };
+        let runtime_config = self.runtime_config.clone();
         let inner = Arc::clone(&self.inner);
         let maintenance = MaintenanceAccess::new(&self.inner);
         let native_capacity_limit = self.config.max_projects.get();
@@ -1232,12 +1155,7 @@ impl ProjectBroker {
 
     /// Prefer a free actor; grow only while the global pool has spare capacity.
     /// A busy actor remains a valid queue, not a reason to refuse a request.
-    #[cfg(test)]
     fn select_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
-        self.select_worker_for_preparation(root, None)
-    }
-
-    fn select_worker_for_preparation(&self, root: &Path, prepared: Option<&str>) -> Result<Option<Arc<LeanProject>>> {
         {
             let mut inner = self.inner.lock();
             Self::check_runtime_admission(&mut inner, root)?;
@@ -1265,7 +1183,7 @@ impl ProjectBroker {
         let candidates: Vec<_> = inner
             .registry
             .iter()
-            .filter(|(key, actor)| key.root == root && actor.accepts_prepared_generation(prepared))
+            .filter(|(key, _)| key.root == root)
             .map(|(key, actor)| {
                 (
                     key.clone(),
@@ -1289,58 +1207,14 @@ impl ProjectBroker {
         Ok(inner.registry.get(&key).cloned())
     }
 
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    pub(crate) async fn managed_actor(&self, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
-        let selection = self.prepared_generation().ok_or_else(|| {
-            ServerError::BadProject("managed inspection requires an installed prepared generation".to_owned())
-        })?;
-        self.managed_actor_for_record(selection, deadline).await
-    }
-
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    pub(crate) async fn managed_actor_for_record(
-        &self,
-        selection: &str,
-        deadline: tokio::time::Instant,
-    ) -> Result<Arc<LeanProject>> {
-        let root = self.native_root(&ProjectHint::Default)?;
-        if let Some(actor) = self.select_existing_worker(&root, Some(selection))? {
-            return Ok(actor);
-        }
-        // The installed-only bootstrap opens a guarded receiver with an empty
-        // import set. The durable job binds the exact receiver and artifact loan.
-        tokio::time::timeout_at(
-            deadline,
-            self.acquire_until_with_preparation(root.clone(), deadline, Some(selection)),
-        )
-        .await
-        .map_err(|_| Self::pool_unavailable(&root, "project_admission_timeout", true))?
-    }
-
-    #[cfg(lean_host_mcp_development_warm)]
-    pub(crate) fn existing_managed_actor_for_digest(&self, digest: &[u8; 32]) -> Result<Arc<LeanProject>> {
-        let root = self.native_root(&ProjectHint::Default)?;
-        let mut inner = self.inner.lock();
-        Self::check_runtime_admission(&mut inner, &root)?;
-        let _artifact_admission = Self::check_artifact_admission(&inner, &root)?;
-        inner
-            .registry
-            .iter()
-            .find(|(key, actor)| key.root == root && actor.is_healthy() && actor.has_prepared_digest(digest))
-            .map(|(_, actor)| Arc::clone(actor))
-            .ok_or_else(|| ServerError::BadProject("warm prepared generation is unavailable".to_owned()))
-    }
-
-    fn select_existing_worker(&self, root: &Path, prepared: Option<&str>) -> Result<Option<Arc<LeanProject>>> {
+    fn select_existing_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;
         let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         let key = inner
             .registry
             .iter()
-            .filter(|(key, actor)| {
-                key.root == root && actor.is_healthy() && actor.accepts_prepared_generation(prepared)
-            })
+            .filter(|(key, actor)| key.root == root && actor.is_healthy())
             .min_by_key(|(_, actor)| {
                 actor
                     .outstanding_jobs()
@@ -1382,21 +1256,6 @@ impl ProjectBroker {
             return Err(error);
         }
         Ok(())
-    }
-
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    pub(crate) fn try_managed_stage_slot(&self, root: &Path) -> Result<OwnedSemaphorePermit> {
-        crate::worker_retirement::poll_retirements();
-        let mut inner = self.inner.lock();
-        Self::check_runtime_admission(&mut inner, root)?;
-        // Do not jump a cold worker already waiting for a released slot.
-        let _turn = self
-            .capacity_admission
-            .try_lock()
-            .map_err(|_| Self::pool_unavailable(root, "worker_pool_busy", true))?;
-        Arc::clone(&self.worker_slots)
-            .try_acquire_owned()
-            .map_err(|_| Self::pool_unavailable(root, "worker_pool_busy", true))
     }
 
     async fn reserve_worker_slot(&self, root: &Path, deadline: tokio::time::Instant) -> Result<OwnedSemaphorePermit> {
@@ -1699,28 +1558,6 @@ mod tests {
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         }
-    }
-
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    #[tokio::test]
-    async fn cold_managed_actor_requires_installed_preparation() {
-        let tree = tempfile::tempdir().unwrap();
-        let root = make_lake_dir(tree.path(), "managed");
-        let runtime = ProjectRuntimeConfig::default()
-            .with_operator_primary(Some(&root))
-            .unwrap();
-        let broker = ProjectBroker::new_with_runtime_config(cfg(root.clone(), Some(root.clone()), None), runtime);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        let error = broker.managed_actor(deadline).await.err().unwrap();
-        assert!(error.to_string().contains("requires an installed prepared generation"));
-        assert!(broker.resident_paths().is_empty());
-
-        let uninstalled = root.join("worker");
-        fs::write(&uninstalled, b"fixture without installed runtime").unwrap();
-        let error = ProjectBroker::installed_host_artifacts(&uninstalled, &root)
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("missing matching installed shim deployment"));
     }
 
     #[tokio::test]

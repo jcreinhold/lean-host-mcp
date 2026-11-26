@@ -259,32 +259,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_preparation_does_not_select_an_ordinary_actor() {
-        let fixture = Fixture::new();
-        let broker = fixture.broker();
-        let ordinary = Fixture::actor(&fixture.project, vec![fixture.project.clone()]);
-        broker.test_register_actor(Arc::clone(&ordinary));
-
-        assert!(
-            broker
-                .select_worker_for_preparation(&fixture.project, Some("selected-record"))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            broker
-                .select_existing_worker(&fixture.project, Some("selected-record"))
-                .unwrap()
-                .is_none()
-        );
-        let selected = broker.select_worker(&fixture.project).unwrap().unwrap();
-        assert!(Arc::ptr_eq(&ordinary, &selected));
-        drop(selected);
-        drop(ordinary);
-        broker.shutdown_all();
-    }
-
-    #[tokio::test]
     async fn warm_frozen_dependency_hands_off_without_idle_expiry_or_manual_drain() {
         let f = Fixture::new();
         let broker = f.broker();

@@ -152,9 +152,9 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
             .with_module_setup_writer(Some(writer.clone()), Some(incomplete.to_string()))
             .is_err()
     );
-    let managed = approved.with_module_setup_writer(Some(writer.clone()), Some(proposal))?;
+    let with_writer = approved.with_module_setup_writer(Some(writer.clone()), Some(proposal))?;
     assert!(
-        managed
+        with_writer
             .clone()
             .with_operator_primary(Some(&peer))?
             .module_setup_writer
@@ -169,7 +169,7 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         },
-        managed,
+        with_writer,
     );
     let hint = ProjectHint::Explicit(project.clone());
     let meta = crate::lake_meta::LakeProjectMeta::from_explicit(&project)?;

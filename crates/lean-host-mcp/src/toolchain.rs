@@ -672,21 +672,10 @@ pub(crate) struct WorkerSidecar {
     smoke: Option<SmokeOutcome>,
 }
 
-#[cfg(lean_host_mcp_development_warm)]
-pub(crate) const WARM_WORKER_VERSION: &str = "0.10.17";
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct WarmInstallation {
-    sdk_worker_version: String,
-    guardian_sha256: String,
-}
-
 /// Candidate executable binding. This alone grants no native operation.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WorkerDeployment {
     worker_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    warm: Option<WarmInstallation>,
     #[serde(flatten)]
     runtime: Option<InstalledRuntime>,
 }
@@ -764,7 +753,6 @@ impl WorkerSidecar {
         Self {
             deployment: worker_sha256.map(|worker_sha256| WorkerDeployment {
                 worker_sha256,
-                warm: None,
                 runtime: None,
             }),
             toolchain: id.as_str().to_owned(),
@@ -775,47 +763,6 @@ impl WorkerSidecar {
             header_digest,
             smoke: None,
         }
-    }
-
-    #[cfg(lean_host_mcp_development_warm)]
-    pub(crate) fn qualify_warm(&mut self) -> anyhow::Result<()> {
-        let deployment = self
-            .deployment
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("missing worker identity"))?;
-        deployment.warm = Some(WarmInstallation {
-            sdk_worker_version: WARM_WORKER_VERSION.into(),
-            guardian_sha256: crate::cli::install_worker::sha256_prefix(&std::env::current_exe()?, 64)?,
-        });
-        Ok(())
-    }
-
-    #[cfg(lean_host_mcp_development_warm)]
-    pub(crate) fn require_warm_worker(worker: &Path, pin: &ToolchainId) -> anyhow::Result<()> {
-        use crate::cli::install_worker::sha256_prefix;
-        let directory = worker
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("missing worker install directory"))?;
-        let record = Self::load(directory).ok_or_else(|| anyhow::anyhow!("missing installed worker contract"))?;
-        let deployment = record
-            .deployment
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("missing worker identity"))?;
-        let warm = deployment
-            .warm
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("worker installation has no warm qualification"))?;
-        anyhow::ensure!(
-            record.toolchain == pin.as_str()
-                && matches!(record.smoke(), Some(SmokeOutcome::Passed))
-                && deployment.runtime.is_some()
-                && warm.sdk_worker_version == WARM_WORKER_VERSION
-                && std::fs::symlink_metadata(worker)?.is_file()
-                && deployment.worker_sha256 == sha256_prefix(worker, 64)?
-                && warm.guardian_sha256 == sha256_prefix(&std::env::current_exe()?, 64)?,
-            "installed worker or lookup guardian differs from the warm qualification"
-        );
-        Ok(())
     }
 
     pub(crate) fn bind_runtime(&mut self, runtime: InstalledRuntime) -> std::io::Result<()> {

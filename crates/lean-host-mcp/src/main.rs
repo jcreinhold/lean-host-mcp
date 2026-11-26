@@ -44,8 +44,6 @@ struct Cli {
 enum Command {
     /// Run the stdio MCP server (default when no subcommand is given).
     Serve(ServeArgs),
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    LauncherTransition(lean_host_mcp::launcher_selection::Transition),
 
     /// Internal process-bound shared-writer supervisor.
     Writer(lean_host_mcp::shared_writer::WriterArgs),
@@ -58,12 +56,6 @@ enum Command {
     ReadProxy(lean_host_mcp::shared_writer::ReadProxyArgs),
     #[command(hide = true)]
     WriterExec,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    #[command(hide = true)]
-    WriterPrepare { plan: String },
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    #[command(hide = true)]
-    WriterVerifySetup { plan: String },
     /// Internal independent owner for a native worker generation.
     #[command(hide = true)]
     NativeGuardian,
@@ -123,15 +115,6 @@ struct ServeArgs {
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
 
-    /// Expected project launcher mode. The server holds the selection guard until shutdown.
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    #[arg(long, requires_all = ["launcher_generation", "lake_root"])]
-    launcher_mode: Option<lean_host_mcp::launcher_selection::LauncherMode>,
-
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    #[arg(long, requires = "launcher_mode")]
-    launcher_generation: Option<u64>,
-
     /// Operator-reviewed verify-batch-v1 digest for this primary project.
     /// Records startup policy only; the released worker keeps native source grants closed.
     #[arg(long)]
@@ -154,21 +137,6 @@ struct ServeArgs {
     #[arg(long, env = "LEAN_HOST_MCP_REQUEST_JOURNAL")]
     request_journal: Option<PathBuf>,
 
-    /// Enable bounded managed admission on this server using an explicit SQLite path.
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    #[arg(long)]
-    managed_native_store: Option<PathBuf>,
-
-    /// Require managed admission for file setup. Omit for ordinary file setup.
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    #[arg(long, requires = "managed_native_store", conflicts_with = "module_setup_writer")]
-    managed_only: bool,
-
-    /// Explicitly retain a matched managed named-inspection generation between lookups.
-    #[cfg(lean_host_mcp_development_warm)]
-    #[arg(long, requires = "managed_only")]
-    managed_warm_inspections: bool,
-
     /// Loopback address for Streamable HTTP, e.g. 127.0.0.1:8765.
     /// If omitted, the server uses stdio.
     #[arg(long, env = "LEAN_HOST_MCP_BIND")]
@@ -189,14 +157,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     match cli.command {
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        Some(Command::LauncherTransition(args)) => match args.run() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp launcher-transition: {error}");
-                ExitCode::FAILURE
-            }
-        },
         Some(Command::InstallWorker(args)) => match install_worker::run(&args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -284,22 +244,6 @@ fn main() -> ExitCode {
             Err(error) => {
                 eprintln!("lean-host-mcp reader: {error}");
                 ExitCode::from(lean_host_mcp::shared_writer::reader_failure_exit_code(&error))
-            }
-        },
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        Some(Command::WriterPrepare { plan }) => match lean_host_mcp::writer_preparation::run(&plan) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp writer-prepare: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        Some(Command::WriterVerifySetup { plan }) => match lean_host_mcp::writer_setup_verification::run(&plan) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp writer-verify-setup: {error}");
-                ExitCode::FAILURE
             }
         },
         Some(Command::WriterExec) => match lean_host_mcp::shared_writer::run_exec() {
@@ -545,49 +489,11 @@ fn logging_filter(directives: Option<&str>) -> EnvFilter {
 
 #[allow(clippy::significant_drop_tightening)]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    #[cfg(lean_host_mcp_development_warm)]
-    let warm = args.managed_warm_inspections;
-    #[cfg(all(
-        feature = "managed-native-store",
-        any(target_os = "macos", target_os = "linux"),
-        not(lean_host_mcp_development_warm)
-    ))]
-    let warm = false;
     let cwd = std::env::current_dir()?;
     // Merged config file (project-local `lean-host-mcp.toml` over the home
     // file). It is the layer beneath env/CLI: each knob is CLI > env > file >
     // default.
     let (file, home_primary) = ConfigFile::load_for_server(&cwd);
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    let launcher = {
-        use lean_host_mcp::launcher_selection::{self, LauncherMode};
-        if let Some(mode) = args.launcher_mode {
-            if args.managed_only != (mode == LauncherMode::Managed) {
-                anyhow::bail!("launcher mode differs from managed-only startup policy");
-            }
-            let root = args.lake_root.as_deref().context("launcher project required")?;
-            let (guard, store) = launcher_selection::admit(
-                root,
-                mode,
-                args.launcher_generation.context("launcher generation required")?,
-                args.managed_native_store.as_deref(),
-            )?;
-            Some((root.to_owned(), guard, (mode == LauncherMode::Managed).then_some(store)))
-        } else {
-            let root = args
-                .lake_root
-                .as_deref()
-                .or_else(|| launcher_selection::enclosing_config_root(&cwd))
-                .or(file.primary_project.as_deref());
-            root.map(|root| -> std::io::Result<_> {
-                let root = root.canonicalize()?;
-                let guard = launcher_selection::admit_unenrolled(&root)?;
-                Ok((root, guard, None))
-            })
-            .transpose()?
-        }
-    };
-
     // Transport: clap already folds CLI-or-env into `args.*`, so `.or(file)`
     // yields CLI > env > file. The file's `bind` is a raw string, parsed here so
     // the library config schema stays transport-type-free.
@@ -615,16 +521,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_verification_input(args.verification_approval)?
         .with_prepared_generation(args.prepared_generation)?
         .with_module_setup_writer(args.module_setup_writer, args.module_setup_storage_request)?;
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    let runtime_config = if args.managed_native_store.is_some() {
-        runtime_config
-            .with_managed_semantic_companion()
-            .with_managed_only(args.managed_only)
-    } else {
-        runtime_config
-    };
-    #[cfg(lean_host_mcp_development_warm)]
-    let runtime_config = runtime_config.with_managed_warm_idle(warm, idle_timeout.as_secs());
     let tool_config = resolve_tool_config(&file)?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -657,25 +553,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         },
         runtime_config,
     );
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    let expected_launcher_store = launcher.and_then(|(root, guard, store)| {
-        broker.retain_launcher_guard(root, guard);
-        store
-    });
-    #[cfg(all(
-        unix,
-        feature = "managed-native-store",
-        not(any(target_os = "macos", target_os = "linux"))
-    ))]
-    let expected_launcher_store = None;
     let _process_record = processes::ServerProcessRecord::register(transport, bind_display.clone(), http_path_log)?;
     let mut service = LeanHostService::new(Arc::clone(&broker), tool_config);
     if let Some(path) = args.request_journal {
         service = service.with_request_journal(&path)?;
-    }
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    if let Some(path) = args.managed_native_store {
-        service = service.with_managed_native_store_identity(&path, expected_launcher_store)?;
     }
     let result = if let Some(config) = http {
         transport_http::serve(service, config).await
@@ -974,47 +855,6 @@ mod tests {
         ]);
         assert_eq!(selected.serve.module_setup_writer, Some(PathBuf::from("/writer")));
         assert_eq!(selected.serve.module_setup_storage_request.as_deref(), Some("{}"));
-    }
-
-    #[cfg(lean_host_mcp_development_warm)]
-    #[test]
-    fn managed_warm_requires_explicit_managed_only_selection() {
-        assert!(!Cli::parse_from(["lean-host-mcp"]).serve.managed_warm_inspections);
-        assert!(Cli::try_parse_from(["lean-host-mcp", "--managed-warm-inspections"]).is_err());
-        assert!(
-            Cli::parse_from([
-                "lean-host-mcp",
-                "--managed-native-store",
-                "store.sqlite3",
-                "--managed-only",
-                "--managed-warm-inspections",
-            ])
-            .serve
-            .managed_warm_inspections
-        );
-    }
-
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    #[test]
-    fn managed_only_requires_store_and_refuses_explicit_ordinary_setup_writer() {
-        assert!(!Cli::parse_from(["lean-host-mcp"]).serve.managed_only);
-        assert!(Cli::try_parse_from(["lean-host-mcp", "--managed-only"]).is_err());
-        let selected = ["lean-host-mcp", "--managed-only", "--managed-native-store", "/stages"];
-        assert!(Cli::parse_from(selected).serve.managed_only);
-        assert!(
-            Cli::try_parse_from(selected.into_iter().chain([
-                "--module-setup-writer",
-                "/writer",
-                "--module-setup-storage-request",
-                "{}",
-            ]))
-            .is_err()
-        );
-        assert!(
-            !Cli::parse_from(["lean-host-mcp", "--managed-native-store", "/stages"])
-                .serve
-                .managed_only
-        );
     }
 
     #[test]

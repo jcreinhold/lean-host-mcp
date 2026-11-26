@@ -83,11 +83,6 @@ pub struct SearchForProofRequest {
     pub project: Option<String>,
 }
 
-#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-pub(crate) use self::managed::{AdmittedSearch, RuntimeSelection};
-#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-mod managed;
-
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ProofSearchCandidate {
     pub name: String,
@@ -262,46 +257,6 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
     let hint = ProjectHint::from_request(project);
     let identity = ctx.broker.project_identity_without_worker(&hint, freshness_imports)?;
     Ok(Response::ok(result, identity.freshness).with_runtime(runtime))
-}
-
-#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-pub(crate) async fn managed_search(
-    ctx: &ToolContext,
-    req: SearchForProofRequest,
-    call: crate::writer_setup_verification::ManagedCall<'_>,
-) -> Result<Response<serde_json::Value>> {
-    let runtime = RuntimeSelection::configured()?;
-    let admitted = AdmittedSearch::from_public(&req, runtime.sha256)?;
-    let hint = ProjectHint::from_request(req.project);
-    let root = ctx.broker.native_root(&hint)?;
-    let file = req
-        .file
-        .ok_or_else(|| ServerError::BadProject("managed proof search requires a file".into()))?;
-    let input = crate::tools::source_input::read_query_file(&root, &file)?;
-    let reply = call
-        .file_query::<serde_json::Value>(
-            &ctx.broker,
-            &hint,
-            &root,
-            &input.resolved,
-            &input.source,
-            input.imports.clone(),
-            crate::writer_setup_verification::FileQuery::Search(&admitted),
-        )
-        .await?;
-    let mut value = reply.value;
-    if !ctx.config.verbosity.is_full()
-        && let Some(diag) = value.get_mut("diagnostics").and_then(serde_json::Value::as_object_mut)
-    {
-        diag.remove("funnel");
-    }
-    Ok(Response::ok(value, reply.freshness)
-        .with_runtime(reply.runtime)
-        .with_trust_artifact(crate::trust::ArtifactTrust::source_file_edit_fresh(
-            &root,
-            &input.resolved,
-            input.hash,
-        )))
 }
 
 fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -> Result<TargetProfile> {

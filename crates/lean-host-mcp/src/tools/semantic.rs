@@ -202,7 +202,6 @@ fn lean_context_schema() -> Schema {
                 "file": { "type": "string", "description": "Path to a .lean file, relative to the project root unless absolute." },
                 "declaration": { "type": "string", "description": "Fully-qualified or file-local declaration name." },
                 "proof_position": proof_position_selector_schema(),
-                "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                 "include_boundaries": { "type": "boolean", "default": false, "description": "Opt in to the proof-boundary list (proof_boundaries). Default false: boundaries are navigation metadata; request them once per declaration to pick a position selector, then drive steps with self-contained lean_trial calls." },
                 "include_expected_type": { "type": "boolean", "default": false, "description": "Opt in to the goal's expected type (expected_type). Default false." },
                 "project": { "type": ["string", "null"], "description": "Optional project-root override." }
@@ -227,7 +226,6 @@ fn lean_trial_schema() -> Schema {
                     "file": { "type": "string" },
                     "declaration": { "type": "string" },
                     "proof_position": proof_position_selector_schema(),
-                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "snippet": { "type": ["string", "null"] },
                     "snippets": { "type": "array", "items": { "type": "string" } },
                     "retry_tainted_non_positive": {
@@ -247,7 +245,6 @@ fn lean_trial_schema() -> Schema {
                 "properties": {
                     "kind": { "const": "command" },
                     "commands": { "type": "string" },
-                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "file": { "type": ["string", "null"], "description": "Optional source file whose contents precede the command." },
                     "imports": { "type": "array", "items": { "type": "string" } },
                     "project": { "type": ["string", "null"] }
@@ -270,7 +267,6 @@ fn lean_lookup_schema() -> Schema {
                 "required": ["kind", "name"],
                 "properties": {
                     "kind": { "const": "declaration" },
-                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "name": { "type": "string" },
                     "file": { "type": ["string", "null"] },
                     "imports": { "type": "array", "items": { "type": "string" } },
@@ -317,7 +313,6 @@ fn lean_lookup_schema() -> Schema {
                 "required": ["kind"],
                 "properties": {
                     "kind": { "const": "proof_search" },
-                    "managed_original": { "type": "object", "description": "Original managed admission key and capability" },
                     "file": { "type": ["string", "null"] },
                     "declaration": { "type": ["string", "null"] },
                     "proof_position": proof_position_selector_schema(),
@@ -378,7 +373,6 @@ fn lean_status_schema() -> Schema {
                 "properties": {
                     "kind": { "const": "file_diagnostics" },
                     "file": { "type": "string" },
-                    "managed_original": { "type": "object", "description": "Original managed key and capability for file diagnostics in managed-only mode." },
                     "project": { "type": ["string", "null"] }
                 },
                 "additionalProperties": false,
@@ -600,22 +594,6 @@ impl StatusInclude {
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_context(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    lean_context_inner(
-        ctx,
-        req,
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn lean_context_inner(
-    ctx: &ToolContext,
-    req: SemanticToolRequest,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
-) -> Result<SemanticResponse<Value>> {
     let kind = req.kind().map(|kind| canonical_kind("lean_context", kind).to_owned());
     match kind.as_deref() {
         Some("proof_position") => {
@@ -623,13 +601,6 @@ pub(crate) async fn lean_context_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            let response = if managed.is_some() {
-                position::proof_state_inner(ctx, request, managed).await?
-            } else {
-                position::proof_state(ctx, request).await?
-            };
-            #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
             let response = position::proof_state(ctx, request).await?;
             from_tool_response(response, ctx.config)
         }
@@ -645,22 +616,6 @@ pub(crate) async fn lean_context_inner(
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_trial(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    lean_trial_inner(
-        ctx,
-        req,
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn lean_trial_inner(
-    ctx: &ToolContext,
-    req: SemanticToolRequest,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
-) -> Result<SemanticResponse<Value>> {
     let kind = req.kind().map(|kind| canonical_kind("lean_trial", kind).to_owned());
     match kind.as_deref() {
         Some("proof_step") => {
@@ -668,13 +623,6 @@ pub(crate) async fn lean_trial_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            let response = if managed.is_some() {
-                proof_action::try_proof_step_inner(ctx, request, managed).await?
-            } else {
-                proof_action::try_proof_step(ctx, request).await?
-            };
-            #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
             let response = proof_action::try_proof_step(ctx, request).await?;
             from_tool_response(response, ctx.config)
         }
@@ -683,16 +631,7 @@ pub(crate) async fn lean_trial_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            from_tool_response(
-                position::command_trial_inner(
-                    ctx,
-                    request,
-                    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-                    managed,
-                )
-                .await?,
-                ctx.config,
-            )
+            from_tool_response(position::command_trial(ctx, request).await?, ctx.config)
         }
         Some(kind) => Ok(invalid_kind("lean_trial", kind, &["proof_step", "command"])),
         None => Ok(missing_kind("lean_trial", &["proof_step", "command"])),
@@ -723,23 +662,7 @@ pub async fn lean_verify(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
 ///
 /// Returns infrastructure failures only; malformed requests are structured
 /// semantic data.
-pub async fn lean_verify_raw(ctx: &ToolContext, value: Value) -> Result<SemanticResponse<Value>> {
-    lean_verify_raw_inner(
-        ctx,
-        value,
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn lean_verify_raw_inner(
-    ctx: &ToolContext,
-    mut value: Value,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
-) -> Result<SemanticResponse<Value>> {
+pub async fn lean_verify_raw(ctx: &ToolContext, mut value: Value) -> Result<SemanticResponse<Value>> {
     normalize_verify_request(&mut value);
     if let Some(kind) = value
         .get("kind")
@@ -753,13 +676,6 @@ pub(crate) async fn lean_verify_raw_inner(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    if managed.is_some() {
-        return from_tool_response(
-            proof_action::verify_targets_inner(ctx, request, managed).await?,
-            ctx.config,
-        );
-    }
     lean_verify_targets(ctx, request).await
 }
 
@@ -786,22 +702,6 @@ pub async fn lean_verify_targets(ctx: &ToolContext, request: LeanVerifyRequest) 
 /// Returns infrastructure failures only; invalid semantic modes are returned as
 /// structured semantic errors.
 pub async fn lean_lookup(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    lean_lookup_inner(
-        ctx,
-        req,
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn lean_lookup_inner(
-    ctx: &ToolContext,
-    req: SemanticToolRequest,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
-) -> Result<SemanticResponse<Value>> {
     let kind = req.kind().map(|kind| canonical_kind("lean_lookup", kind).to_owned());
     match kind.as_deref() {
         Some("declaration") => {
@@ -809,13 +709,6 @@ pub(crate) async fn lean_lookup_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            if managed.is_some() {
-                return from_tool_response(
-                    declaration::inspect_declaration_inner(ctx, request, managed).await?,
-                    ctx.config,
-                );
-            }
             from_tool_response(declaration::inspect_declaration(ctx, request).await?, ctx.config)
         }
         Some("declarations") => {
@@ -823,13 +716,6 @@ pub(crate) async fn lean_lookup_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            if managed.is_some() {
-                return from_tool_response(
-                    declaration_inventory::inventory(ctx, request, false, managed).await?,
-                    ctx.config,
-                );
-            }
             from_tool_response(
                 declaration_inventory::declaration_inventory(ctx, request).await?,
                 ctx.config,
@@ -840,10 +726,6 @@ pub(crate) async fn lean_lookup_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            if let Some(call) = managed {
-                return from_tool_response(proof_search::managed_search(ctx, request, call).await?, ctx.config);
-            }
             from_tool_response(proof_search::search_for_proof(ctx, request).await?, ctx.config)
         }
         Some("references") => {
@@ -872,22 +754,6 @@ pub(crate) async fn lean_lookup_inner(
 /// Returns Lake-project resolution failures. Invalid semantic modes are
 /// returned as structured semantic errors.
 pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<SemanticResponse<Value>> {
-    lean_status_inner(
-        ctx,
-        req,
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn lean_status_inner(
-    ctx: &ToolContext,
-    req: SemanticToolRequest,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
-) -> Result<SemanticResponse<Value>> {
     let kind = canonical_kind("lean_status", req.kind().unwrap_or("project")).to_owned();
     match kind.as_str() {
         "project" => {
@@ -946,13 +812,6 @@ pub(crate) async fn lean_status_inner(
                 Ok(request) => request,
                 Err(response) => return Ok(*response),
             };
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            if managed.is_some() {
-                return from_tool_response(
-                    position::file_diagnostics_inner(ctx, request, managed).await?,
-                    ctx.config,
-                );
-            }
             from_tool_response(position::file_diagnostics(ctx, request).await?, ctx.config)
         }
         other => Ok(invalid_kind("lean_status", other, &["project", "file_diagnostics"])),

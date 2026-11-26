@@ -93,37 +93,20 @@ pub async fn declaration_inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
 ) -> Result<Response<DeclarationInventoryResult>> {
-    inventory(
-        ctx,
-        req,
-        false,
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
+    inventory(ctx, req, false).await
 }
 
 pub(super) async fn verification_inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
 ) -> Result<Response<DeclarationInventoryResult>> {
-    inventory(
-        ctx,
-        req,
-        ctx.broker.prepared_generation().is_none(),
-        #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-        None,
-    )
-    .await
+    inventory(ctx, req, ctx.broker.prepared_generation().is_none()).await
 }
 
-pub(crate) async fn inventory(
+async fn inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
     supervised: bool,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
 ) -> Result<Response<DeclarationInventoryResult>> {
     let hint = ProjectHint::from_request(req.project.clone());
     let meta = ctx.broker.resolve_meta(&hint)?;
@@ -132,10 +115,6 @@ pub(crate) async fn inventory(
         DeclarationInventoryTarget::File { path } => {
             let resolved = resolve_path(&meta.canonical_root, &path);
             if !resolved.is_file() {
-                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-                if managed.is_some() {
-                    return Err(ServerError::BadProject("managed outline source unavailable".into()));
-                }
                 return metadata_response(
                     ctx,
                     hint,
@@ -145,41 +124,13 @@ pub(crate) async fn inventory(
                     )),
                 );
             }
-            worker_declarations(
-                ctx,
-                hint,
-                &meta.canonical_root,
-                &path,
-                None,
-                limit,
-                supervised,
-                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-                managed,
-            )
-            .await
+            worker_declarations(ctx, hint, &meta.canonical_root, &path, None, limit, supervised).await
         }
         DeclarationInventoryTarget::Module { module } => {
             let path = source_path_for_module(&meta.canonical_root, &module);
             if path.is_file() {
-                worker_declarations(
-                    ctx,
-                    hint,
-                    &meta.canonical_root,
-                    &path,
-                    Some(module),
-                    limit,
-                    supervised,
-                    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-                    managed,
-                )
-                .await
+                worker_declarations(ctx, hint, &meta.canonical_root, &path, Some(module), limit, supervised).await
             } else {
-                #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-                if managed.is_some() {
-                    return Err(ServerError::BadProject(
-                        "managed outline requires source for the selected module".into(),
-                    ));
-                }
                 index_declarations(ctx, hint, &meta.canonical_root, &module, limit)
             }
         }
@@ -194,9 +145,6 @@ async fn worker_declarations(
     module_hint: Option<String>,
     limit: usize,
     supervised: bool,
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))] managed: Option<
-        crate::writer_setup_verification::ManagedCall<'_>,
-    >,
 ) -> Result<Response<DeclarationInventoryResult>> {
     let input = read_query_file(root, path)?;
     let source_for_index = input.source.clone();
@@ -206,29 +154,7 @@ async fn worker_declarations(
     let selectors = vec![LeanWorkerModuleQuerySelector::DeclarationOutline {
         id: DECLARATION_OUTLINE_ID.to_owned(),
     }];
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    let admitted = if let Some(call) = &managed {
-        Some(
-            call.project_file(
-                &ctx.broker,
-                &hint,
-                root,
-                &input.resolved,
-                &input.source,
-                input.imports.clone(),
-                crate::writer_setup_verification::Projection::Outline,
-            )
-            .await,
-        )
-    } else {
-        None
-    };
-    #[cfg(not(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux"))))]
-    let admitted = None;
-    let used_admission = admitted.is_some();
-    let outcome = if let Some(outcome) = admitted {
-        outcome
-    } else if supervised {
+    let outcome = if supervised {
         ctx.broker
             .file_projection(
                 &hint,
@@ -259,7 +185,7 @@ async fn worker_declarations(
         CallOutcome::NeedsBuild(err) => return worker_needs_build_response(ctx, hint, err),
     };
     let mut result = project_worker_outline(call.value, limit);
-    let index_fact = if !used_admission && let Some(module) = module.as_deref() {
+    let index_fact = if let Some(module) = module.as_deref() {
         supplement_with_fresh_index(root, module, &source_for_index, &mut result, limit)
     } else {
         None

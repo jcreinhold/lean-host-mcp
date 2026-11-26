@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Validate ordinary file-backed endpoints and optionally managed release against the packaged pair.
+# Validate ordinary file-backed endpoints against the packaged pair.
+# With --release, also check the packaged parent's link set and run the stdio suite against the packaged worker.
 # Set LEAN_RS_CHECKOUT to build the pair, writer and shims from an SDK checkout; release checks leave it unset.
 set -euo pipefail
 CDPATH='' cd -- "$(dirname -- "$0")/.."
 # shellcheck source=scripts/local-sdk.sh
 source scripts/local-sdk.sh
-managed_release=false
-if [[ ${1:-} == --managed-release ]]; then
-    managed_release=true
+release=false
+if [[ ${1:-} == --release ]]; then
+    release=true
     shift
 fi
 if [[ $# != 0 ]]; then
-    printf 'Usage: %s [--managed-release]\n' "$0" >&2
+    printf 'Usage: %s [--release]\n' "$0" >&2
     exit 2
 fi
 toolchain=$(cat fixtures/lean/lean-toolchain)
@@ -88,17 +89,7 @@ if (not identities <= published_locks
                for _, _, source, checksum in identities)):
     raise SystemExit("candidate pairing changed external registry identities")
 PY_LOCK
-unset LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT
-parent_features=()
-warm_release=false
-if "$managed_release"; then
-    parent_features=(--features managed-native-store)
-    if python3 -c 'import sys,tomllib; sys.exit("managed-warm-inspections" not in tomllib.load(open(sys.argv[1],"rb"))["features"])' "$parent_manifest"; then
-        parent_features=(--features managed-warm-inspections)
-        warm_release=true
-    fi
-fi
-local_sdk_cargo build --manifest-path "$parent_manifest" --bin lean-host-mcp ${parent_features[@]+"${parent_features[@]}"}
+local_sdk_cargo build --manifest-path "$parent_manifest" --bin lean-host-mcp
 local_sdk_check "$pair/Cargo.toml"
 # The source worker installer expects Cargo's native profile directories.
 built_parent="$CARGO_TARGET_DIR/debug/lean-host-mcp"
@@ -113,34 +104,10 @@ local_sdk_install_worker "$R2_SETUP_PARENT" --toolchain "$id" --workers-dir "$R2
     --source-dir "$worker_source" --standalone-writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
 # Build the bundled Lean capability under the same packaged writer before the
 # RPC smoke. Cold compilation has its own existing SDK budget.
-local_sdk_cargo run --manifest-path "$parent_manifest" --example prepare_semantic_smoke \
-    ${parent_features[@]+"${parent_features[@]}"} -- \
+local_sdk_cargo run --manifest-path "$parent_manifest" --example prepare_semantic_smoke -- \
     "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$R2_SETUP_PARENT"
 python3 tests/r2-launch-input/module_setup.py
-if "$managed_release"; then
+if "$release"; then
     scripts/check-parent-link.sh "$R2_SETUP_PARENT"
-    if "$warm_release" && [[ -z ${LEAN_HOST_MCP_PREVIOUS_COLD_HOST:-} ]]; then
-        printf 'Skipping warm inspection: set LEAN_HOST_MCP_PREVIOUS_COLD_HOST to a previous host binary.\n' >&2
-        warm_release=false
-    fi
-    if "$warm_release"; then
-        warm_scratch=$(mktemp -d "${RUNNER_TEMP:-$CARGO_TARGET_DIR}/w.XXXXXX")
-        python3 tests/r2-launch-input/prepare_generation.py --warm-inspection \
-            --host "$R2_SETUP_PARENT" --writer "$R2_SETUP_ROOT/tools/bin/lean-rs-writer" \
-            --sysroot "$LEAN_SYSROOT" --scratch "$warm_scratch" --workers "$R2_SETUP_ROOT/workers"
-        rm -rf -- "$warm_scratch"
-    fi
-    export LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$R2_SETUP_ROOT/workers"
-    export LEAN_HOST_MCP_STDIO_PACKAGED_WRITER="$R2_SETUP_ROOT/tools/bin/lean-rs-writer"
-    LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$R2_SETUP_PARENT" \
-        scripts/test-installed-stdio.sh --all-targets "${parent_features[@]}"
-
-    # Only the injected rename fault uses this separately compiled executable.
-    LEAN_HOST_MCP_COMPILE_DISPOSABLE_CUT=1 \
-        local_sdk_cargo build --manifest-path "$parent_manifest" --bin lean-host-mcp "${parent_features[@]}"
-    fault_parent="$scratch/fault-only-lean-host-mcp"
-    cp "$built_parent" "$fault_parent"
-    LEAN_HOST_MCP_STDIO_PACKAGED_LAUNCHER="$fault_parent" \
-        scripts/test-installed-stdio.sh "${parent_features[@]}" --test stdio_lifecycle -- \
-        --ignored --exact launcher_regressions::launcher_uncertain_publication_reconciles_without_another_generation
+    LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$R2_SETUP_ROOT/workers" scripts/test-installed-stdio.sh --all-targets
 fi

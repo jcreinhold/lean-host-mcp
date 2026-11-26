@@ -96,18 +96,6 @@ impl StagedSetup {
         }
         Ok(())
     }
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    pub(crate) fn check_exclusive(&self, domains: &[PathBuf]) -> io::Result<()> {
-        if self.domains != domains {
-            return Err(invalid("setup domains changed under writer custody"));
-        }
-        for (path, identity) in &self.inputs {
-            if Identity::read(path)? != *identity {
-                return Err(invalid("setup input changed before driver dispatch"));
-            }
-        }
-        Ok(())
-    }
 }
 
 fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
@@ -188,7 +176,7 @@ pub(crate) fn stage(
     })
 }
 
-/// Supplied only by the managed caller for its approved project. The standalone
+/// Supplied at startup by the operator for the approved project. The standalone
 /// writer validates the full request and reserves under its existing admission lock.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ChargedWriter {
@@ -425,11 +413,6 @@ impl ProjectBroker {
     }
 
     async fn prepare_file_setup(&self, hint: &ProjectHint, file: &str, source: &str) -> Result<StagedSetup> {
-        if self.runtime_config.managed_only {
-            return Err(ServerError::BadProject(
-                "ordinary file setup is unavailable in managed-only mode".into(),
-            ));
-        }
         let root = self.native_root(hint)?;
         let activity = self.preparation_activity(&root).await?;
         let timeout = Duration::from_millis(self.request_timeout_millis());

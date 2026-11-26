@@ -36,17 +36,8 @@ mod host_preparation;
 mod ilean;
 pub mod lake_meta;
 mod lake_options;
-#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-#[path = "native_store/prepared.rs"]
-mod managed_prepared;
 pub mod native_reader;
 mod native_socket;
-#[cfg(all(unix, feature = "managed-native-store"))]
-#[expect(
-    dead_code,
-    reason = "managed broker wiring is intentionally separate from store qualification"
-)]
-mod native_store;
 mod project;
 pub mod projections;
 mod request_journal;
@@ -62,14 +53,6 @@ pub mod toolchain;
 pub mod tools;
 pub mod trust;
 mod worker_retirement;
-#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-#[doc(hidden)]
-#[path = "native_store/writer_preparation.rs"]
-pub mod writer_preparation;
-#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-#[doc(hidden)]
-#[path = "native_store/setup_verification.rs"]
-pub mod writer_setup_verification;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
 pub use config_file::ConfigFile;
@@ -89,7 +72,3 @@ pub use server::LeanHostService;
 pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};
 pub use tools::{OutputBudgetOverrides, ResponseCarrier, TelemetryVerbosity, ToolConfig};
 pub use trust::{ArtifactKind, ArtifactTrust, TrustScope, TrustStatus};
-
-#[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-#[doc(hidden)]
-pub mod launcher_selection;

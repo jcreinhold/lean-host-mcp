@@ -66,17 +66,6 @@ impl HelperMode {
 }
 
 impl ProjectBroker {
-    /// Load only the selected worker generation's installed runtime.
-    pub(super) fn installed_host_artifacts(worker: &Path, sysroot: &Path) -> Result<LeanWorkerPreparedHostArtifacts> {
-        worker
-            .parent()
-            .and_then(crate::toolchain::WorkerSidecar::load)
-            .and_then(crate::toolchain::WorkerSidecar::into_runtime)
-            .filter(|installed| installed.sysroot == sysroot)
-            .map(|installed| installed.prepared)
-            .ok_or_else(|| ServerError::BadProject("missing matching installed shim deployment".to_owned()))
-    }
-
     /// No project Arc, opening Arc, capacity turn or worker slot may be held here.
     pub(super) async fn prepare_host_artifacts(
         &self,

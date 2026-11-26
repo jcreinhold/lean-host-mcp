@@ -440,10 +440,6 @@ optional proof-position selector:
 }
 ```
 
-The managed implementation binds the file digest, declaration, and exact proof selector to the original
-admission. Its `lean_file_proof_position_v1` capability stays unadvertised on normal installations pending the
-matching SDK release and verification of the updated installer shim inventory.
-
 The response omits echoed declaration and namespace names. Two fields are opt-in, both defaulting to `false`:
 
 - `include_boundaries: true` returns the `proof_boundaries` navigation list (and `proof_boundaries_truncated`). Request
@@ -766,10 +762,6 @@ explicit import context.
 Optional `fields` can select `source`, `statement`, `docstring`, `attributes`, and `flags`; `raw_statement` asks for the
 raw elaborated term.
 
-Managed named lookup requires an installed prepared generation. The admission binds the normalized
-inspection fields and default output budgets, the ordered resolved imports, and the file digest when a file
-is supplied. Retrieve a lost result using its original key after custody closes.
-
 ### `kind: "declarations"`
 
 Lists declarations in one source file or module. File targets use the current source snapshot and the worker's
@@ -826,18 +818,6 @@ or from explicit goal/type text:
 ```
 
 Modes are `next_step`, `exact`, `apply`, `rewrite`, and `simp`. `limit` is clamped to the tool cap.
-
-Managed proof search requires a file, declaration and a prebuilt semantic runtime approved by the server operator.
-Set `LEAN_HOST_MCP_PREBUILT_SEMANTIC_RUNTIME` to a JSON object with the canonical `manifest` and `image` paths
-and the approved `sha256` as 32 bytes. The digest binds the manifest, image, runtime provenance and loadable module
-files. Compute it over sorted package-relative UTF-8 paths, each followed by NUL and the file's 32 raw SHA-256
-bytes. Discovery returns that digest as `semantic_runtime_sha256`.
-
-For `lean_file_proof_search_v1`, send the admitted file and source SHA-256 under `setup_verification`, with
-`prepared_sha256` from discovery if a prepared project is selected. Its `proof_search` object binds the
-`declaration`, public `proof_position` selector, `goal`, `type_text`, ordered `imports`, normalized `mode` and
-`limit`, and the discovery digest as `runtime_sha256`. The public call carries `managed_original`. Both retrieval
-paths run under one writer and its original deadline. Original-key GET returns the ranked result after closure.
 
 ### `kind: "references"`
 
@@ -921,13 +901,3 @@ fact for the file snapshot.
 A worker crash or timeout returns `data: null` and an `errors` issue with `code: "runtime_unavailable"`, with MCP
 `isError: true`. Interrupted results are not cached. Planned recycling before a successful check does not invalidate its
 result.
-
-### Opt-in managed module lint
-
-`lean_module_lint_v1` accepts an ordered list of qualified module names for the approved primary
-project. It runs the project's canonical prebuilt `.lake/build/bin/runLinter` with
-`--no-build --module-only --deny=all` and returns its bounded output, exit code, and verdict.
-This version uses the same standard Lake layout as the managed artifact trace reader. It
-does not resolve custom Lake build or binary directories. If the canonical executable is
-missing or resolves through an alias, START refuses with `prebuilt_module_linter_unavailable`
-before launching it. The operation does not invoke Lake to discover or build the executable.

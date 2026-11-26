@@ -130,9 +130,7 @@ jobs:
 
       # clippy --workspace is link-safe (no final link happens) per AGENTS.md.
       - name: Clippy
-        run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo clippy --locked -p lean-host-mcp --features managed-warm-inspections --test stdio_lifecycle -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # rustdoc per member: a broken or private intra-doc link ships to docs.rs
       # as dead text, so fail on it here.
@@ -149,9 +147,9 @@ jobs:
         run: cargo test --locked -p lean-host-mcp-worker --all-targets
 
       # Package once, install that worker once, and use the packaged host for
-      # both the ordinary proof smoke and the managed transition regressions.
-      - name: Verify packaged host, worker, and launcher transition
-        run: scripts/test-installed-module-setup.sh --managed-release
+      # the ordinary proof smoke, the link-set check and the stdio suite.
+      - name: Verify packaged host and worker
+        run: scripts/test-installed-module-setup.sh --release
 
       - name: Check packaged installer inputs
         env:

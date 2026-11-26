@@ -17,7 +17,7 @@ The SDK removes each worker's socket on closure. Durable owner records continue 
 The host passes `LEAN_RS_WORKER_OWNERS_DIRECTORY` to its SDK helpers. The default is
 `lean-host-mcp/native-generations` under the platform's local data directory. On macOS this is
 `$HOME/Library/Application Support/lean-host-mcp/native-generations`. Keep the same canonical directory when
-restarting the server, including across launcher mode and binary changes. `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR`
+restarting the server, including across binary changes. `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR`
 sets the separate server PID directory used by `doctor processes`.
 
 The SDK writer executable setting is `LEAN_RS_WRITER_EXECUTABLE`. Launch environments may still use
@@ -269,8 +269,8 @@ Project shutdown is bounded by the worker layer. The host stops accepting new pr
 `runtime_unavailable` with reason `project_shutting_down`, and the controller then lets `lean-rs-worker-parent` perform
 its structured child shutdown: terminate, bounded graceful wait, kill escalation if needed, and reap. An active request
 may finish normally or run until the configured request timeout before the worker layer reports a terminal runtime
-outcome. Abrupt parent death can still skip Rust `Drop`; child-side parent-loss handling is best effort, and stronger
-containment remains a launcher or process-manager responsibility.
+outcome. Abrupt parent death can still skip Rust `Drop`; child-side parent-loss handling is best effort. Stronger
+containment is the job of the process manager that starts the server.
 
 Every running server writes a PID record under the per-user cache directory at `lean-host-mcp/processes/` and removes it
 on normal shutdown. The record contains the exact server PID, executable path, working directory, transport, bind/path,
@@ -389,43 +389,20 @@ At runtime, package-version skew is silent when the protocol matches. A recorded
 `runtime_unavailable` response with `lean-host-mcp install-worker --auto` as the exact recovery command. Header drift or
 smoke failure is also a hard refusal with an actionable reinstall command.
 
-### Managed source-bound writer cutover
+### Source-bound writer cutover
 
-Source-bound staging is opt-in. After draining the supported launchers, install the matched digest-aware host and
-standalone SDK writer. Use that writer's `writer-storage approve-handoff` with the existing registry path, device,
-and inode. Set `LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` on the managed broker to the approved JSON fields
-`ownership_registry`, `registry_device`, `registry_inode`, `executable`, `sha256`, and the returned
-`approval_generation`. The broker reports that approval in its compatibility receipt. The SDK enforces the
-generation at admission. Startup does not issue approval.
+Source-bound staging is opt-in. Stop the running servers, then install the matched digest-aware host and standalone
+SDK writer. Use that writer's `writer-storage approve-handoff` with the existing registry path, device, and inode. Set
+`LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` on the server to the approved JSON fields `ownership_registry`,
+`registry_device`, `registry_inode`, `executable`, `sha256`, and the returned `approval_generation`. The server reports
+that approval in its compatibility receipt. The SDK enforces the generation at admission. Startup does not issue
+approval.
 
-For managed rollback, disable source-bound admission and pause the supported launchers. Use the same pinned
-SDK writer's `writer-storage revoke-handoff` on the original registry. If revocation is busy or its result is
-unknown, keep the launchers paused and retry after custody closes. Once revocation succeeds, restart the matched
-digest-aware host with `LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` unset. Keep the same registry and lock inodes.
-Use `make mcp-rollback` for the supported Proofs launcher. This procedure has been qualified with source-built
-images. Published package identities require a repeat with the installed artifacts.
-
-### Enrolled warm launcher transition
-
-After draining the selected project, use the installed host built with `managed-warm-inspections` and the original
-custody descriptor to switch an enrolled ordinary project to warm managed serving.
-
-```sh
-lean-host-mcp launcher-transition --project "$PROJECT" --from-generation "$GENERATION" \
-  --to managed --promote-warm-store --custody "$CUSTODY"
-```
-
-The transition durably promotes the original store before publishing the managed selector. If interrupted, retry the
-same command and retain the original store and custody descriptor. An already promoted store keeps its UUID and
-results. Start the matching managed host with `--managed-warm-inspections` after the selector transition succeeds.
-Cold transitions omit `--promote-warm-store`. For ordinary rollback, drain both broker and callers, verify the store
-has settled, and switch with `--to ordinary` on the same matching host. The store schema remains at its promoted version.
-
-A warm attempt can report `confirmed_ended` while its generation still holds custody for reuse. On normal drain,
-the actor verifies exact retirement and settles the generation's eligible ended attempts before returning its slot.
-If the broker was lost or settlement failed, use one authenticated original-key GET per affected retired
-generation to verify closure and settle its eligible ended attempts. This preserves saved result identities and
-applies normal acknowledged-result compaction. The pool's stopped status alone is not a durable closure receipt.
+To roll back, disable source-bound admission and stop the servers. Use the same pinned SDK writer's
+`writer-storage revoke-handoff` on the original registry. If revocation is busy or its result is unknown, keep the
+servers stopped and retry after custody closes. Once revocation succeeds, restart the matched digest-aware host with
+`LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` unset. Keep the same registry and lock inodes. This procedure has been
+qualified with source-built images. Published package identities require a repeat with the installed artifacts.
 
 ## Build, test, lint
 

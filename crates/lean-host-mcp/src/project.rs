@@ -285,10 +285,6 @@ pub struct ProjectRuntimeConfig {
     pub(crate) module_setup_writer: Option<Arc<crate::broker::ChargedWriter>>,
     verification_input: Option<String>,
     prepared_generation: Option<String>,
-    pub(crate) managed_semantic_companion: bool,
-    pub(crate) managed_only: bool,
-    #[cfg(lean_host_mcp_development_warm)]
-    pub(crate) managed_warm_idle_seconds: Option<u64>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -324,7 +320,6 @@ impl ProjectRuntimeConfig {
         self.operator_primary = root.map(Path::canonicalize).transpose()?;
         self.verification_input = None;
         self.prepared_generation = None;
-        self.managed_semantic_companion = false;
         self.module_setup_writer = None;
         Ok(self)
     }
@@ -397,30 +392,6 @@ impl ProjectRuntimeConfig {
         Ok(self)
     }
 
-    /// Select the installed companion on the explicitly managed prepared project.
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    #[must_use]
-    pub fn with_managed_semantic_companion(mut self) -> Self {
-        self.managed_semantic_companion = self.prepared_generation.is_some();
-        self
-    }
-
-    /// Refuse ordinary file setup on a server selected for managed admission only.
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    #[must_use]
-    pub fn with_managed_only(mut self, enabled: bool) -> Self {
-        self.managed_only = enabled;
-        self
-    }
-
-    #[cfg(lean_host_mcp_development_warm)]
-    /// Carry the resolved broker idle limit into a selected warm managed generation.
-    #[must_use]
-    pub fn with_managed_warm_idle(mut self, enabled: bool, seconds: u64) -> Self {
-        self.managed_warm_idle_seconds = (enabled && self.managed_only).then_some(seconds);
-        self
-    }
-
     pub(crate) fn prepared_generation(&self) -> Option<&str> {
         self.prepared_generation.as_deref()
     }
@@ -451,10 +422,6 @@ impl ProjectRuntimeConfig {
             module_setup_writer: None,
             verification_input: None,
             prepared_generation: None,
-            managed_semantic_companion: false,
-            managed_only: false,
-            #[cfg(lean_host_mcp_development_warm)]
-            managed_warm_idle_seconds: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -718,10 +685,6 @@ fn parse_runtime_config(
         module_setup_writer: None,
         verification_input: None,
         prepared_generation: None,
-        managed_semantic_companion: false,
-        managed_only: false,
-        #[cfg(lean_host_mcp_development_warm)]
-        managed_warm_idle_seconds: None,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),
@@ -894,13 +857,6 @@ struct JobMeta {
 }
 
 enum ProjectMessage {
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    ManagedInspection {
-        meta: JobMeta,
-        job: Box<crate::managed_prepared::Job>,
-        reply: oneshot::Sender<Result<ProjectCall<()>>>,
-    },
-
     NativeCompatibility {
         meta: JobMeta,
         reply: oneshot::Sender<Result<ProjectCall<()>>>,
@@ -960,8 +916,6 @@ enum ProjectMessage {
 impl ProjectMessage {
     fn meta(&self) -> &JobMeta {
         match self {
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            Self::ManagedInspection { meta, .. } => meta,
             Self::NativeCompatibility { meta, .. }
             | Self::ModuleQuery { meta, .. }
             | Self::ModuleQueryBatch { meta, .. }
@@ -980,10 +934,6 @@ impl ProjectMessage {
 
     fn reject(self, state: &ProjectActorState, reason: &'static str) {
         match self {
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            Self::ManagedInspection { meta, reply, .. } => {
-                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
-            }
             Self::NativeCompatibility { meta, reply } => {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
@@ -1252,7 +1202,6 @@ fn retain_artifact_domains(
 /// Cheap to clone via `Arc`.
 pub(crate) struct LeanProject {
     canonical_root: PathBuf,
-    prepared_generation: Option<String>,
     toolchain: String,
     package: Option<String>,
     library: Option<String>,
@@ -1347,7 +1296,6 @@ impl LeanProject {
         config.prepared_host_artifacts = Some(prepared_host_artifacts);
         config.native_capacity_limit = native_capacity_limit;
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
-        let prepared_generation = config.prepared_generation.clone();
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
 
@@ -1378,7 +1326,6 @@ impl LeanProject {
         let cache_cap = NonZeroUsize::new(MODULE_QUERY_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         Ok(Arc::new(Self {
             canonical_root: meta.canonical_root,
-            prepared_generation,
             toolchain: runtime_toolchain,
             package: meta.package,
             library: meta.library,
@@ -1392,18 +1339,6 @@ impl LeanProject {
             runtime,
             module_queries: ModuleQueryCache::with_capacity(cache_cap),
         }))
-    }
-
-    pub(crate) fn accepts_prepared_generation(&self, required: Option<&str>) -> bool {
-        required.is_none_or(|record| self.prepared_generation.as_deref() == Some(record))
-    }
-
-    #[cfg(lean_host_mcp_development_warm)]
-    pub(crate) fn has_prepared_digest(&self, digest: &[u8; 32]) -> bool {
-        use sha2::{Digest as _, Sha256};
-        self.prepared_generation
-            .as_deref()
-            .is_some_and(|record| Sha256::digest(record.as_bytes()).as_slice() == digest)
     }
 
     /// A test controller whose real shared-lock owner exits with its mailbox.
@@ -1421,7 +1356,6 @@ impl LeanProject {
         });
         Arc::new(Self {
             canonical_root: root.to_path_buf(),
-            prepared_generation: None,
             toolchain: "test".into(),
             package: None,
             library: None,
@@ -1498,17 +1432,6 @@ impl LeanProject {
             reply,
         };
         self.enqueue(message, rx).await
-    }
-
-    #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-    pub(crate) async fn inspect_managed(&self, job: crate::managed_prepared::Job, deadline: Instant) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let message = ProjectMessage::ManagedInspection {
-            meta: self.job_meta(job.imports().to_vec(), RetryPolicy::Never, deadline),
-            job: Box::new(job),
-            reply,
-        };
-        self.enqueue(message, rx).await.map(|_| ())
     }
 
     /// Inspect one declaration through this project's serialized worker actor.
@@ -1913,8 +1836,6 @@ impl Drop for LeanProject {
 #[derive(Clone)]
 struct ActorConfig {
     prepared_generation: Option<String>,
-    #[cfg(lean_host_mcp_development_warm)]
-    managed_warm_idle_seconds: Option<u64>,
     maintenance: crate::broker::MaintenanceAccess,
     lake_root: PathBuf,
     manifest_hash: String,
@@ -2052,8 +1973,6 @@ impl ActorConfig {
                 .prepared_generation
                 .clone()
                 .filter(|_| runtime_config.operator_primary.as_ref() == Some(&meta.canonical_root)),
-            #[cfg(lean_host_mcp_development_warm)]
-            managed_warm_idle_seconds: runtime_config.managed_warm_idle_seconds,
             manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
             worker_path,
@@ -2098,8 +2017,6 @@ struct ImportProfileStamp {
 }
 
 struct ProjectActorState {
-    #[cfg(lean_host_mcp_development_warm)]
-    warm_inspection: Option<crate::managed_prepared::WarmGeneration>,
     config: ActorConfig,
     handle: LeanWorkerHostHandle,
     worker_generation_base: u64,
@@ -2135,29 +2052,6 @@ impl ProjectActorState {
         // A call was served, so the next quiet period earns a fresh idle cycle.
         self.cycled_while_idle = false;
         match message {
-            #[cfg(all(feature = "managed-native-store", any(target_os = "macos", target_os = "linux")))]
-            ProjectMessage::ManagedInspection { meta, job, reply } => {
-                let result = if meta.cancellation.is_cancelled() {
-                    Err(self.shutdown_unavailable(&meta, "request_cancelled"))
-                } else {
-                    tracing::debug!(
-                        session_id = %self.config.session_id,
-                        correlation_id = %meta.correlation_id,
-                        imports = meta.imports.len(),
-                        queue_wait_millis = millis_u64(meta.queued_at.elapsed()),
-                        "managed inspection actor dispatch"
-                    );
-                    job.run(
-                        &mut self.handle,
-                        self.config.prepared_generation.as_deref(),
-                        &self.config.healthy,
-                        #[cfg(lean_host_mcp_development_warm)]
-                        &mut self.warm_inspection,
-                    )
-                    .map(|()| ProjectCall::new((), RuntimeFacts::default()))
-                };
-                let _ = reply.send(result);
-            }
             ProjectMessage::NativeCompatibility { meta, reply } => {
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     let _session = handle.open_session_with_imports(imports, Some(cancellation), None)?;
@@ -3597,8 +3491,6 @@ fn actor_main(
         }
     };
     let mut state = ProjectActorState {
-        #[cfg(lean_host_mcp_development_warm)]
-        warm_inspection: None,
         config: config.clone(),
         handle,
         worker_generation_base: 1,
@@ -3678,11 +3570,6 @@ fn actor_main(
 
     match state.handle.shutdown() {
         Ok(report) => {
-            // The actor still owns its broker permit while settling exact custody.
-            #[cfg(lean_host_mcp_development_warm)]
-            if let Some(warm) = state.warm_inspection.take() {
-                warm.reconcile_retirement();
-            }
             tracing::debug!(
                 outcome = ?report.outcome,
                 elapsed_millis = millis_u64(report.elapsed),
@@ -3778,13 +3665,6 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
             "native actor requires prepared host artifacts".to_owned(),
         ));
     }
-    #[cfg(lean_host_mcp_development_warm)]
-    if scope == "main" && config.managed_warm_idle_seconds.is_some() {
-        let pin =
-            ToolchainId::parse(&config.toolchain_label).map_err(|error| ServerError::BadProject(error.to_string()))?;
-        crate::toolchain::WorkerSidecar::require_warm_worker(&config.worker_path, &pin)
-            .map_err(|error| ServerError::BadProject(error.to_string()))?;
-    }
     let mut child = LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
         .shared_writer_executable(writer.executable.clone())
         .native_guardian(writer.executable)
@@ -3798,11 +3678,6 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
     if scope == "main"
         && let Some(input) = &config.prepared_generation
     {
-        #[cfg(lean_host_mcp_development_warm)]
-        if let Some(seconds) = config.managed_warm_idle_seconds {
-            child = child.managed_warm_idle_seconds(seconds);
-        }
-
         child = child
             .application_launch_input(input)
             .map_err(|e| ServerError::BadProject(e.to_string()))?;
@@ -4643,8 +4518,6 @@ mod tests {
         }));
         let mut config = ActorConfig {
             prepared_generation: None,
-            #[cfg(lean_host_mcp_development_warm)]
-            managed_warm_idle_seconds: None,
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: tmp.path().join("consumer"),
             manifest_hash: "sha256-test".to_owned(),
@@ -4865,7 +4738,6 @@ mod tests {
         let (tx, rx) = mpsc::channel(2);
         let project = LeanProject {
             canonical_root: PathBuf::from("/test"),
-            prepared_generation: None,
             toolchain: "test".into(),
             package: None,
             library: None,

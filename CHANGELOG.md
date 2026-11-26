@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Removed
+
+- Remove the managed mode: the `lean_managed_admission` tool, the `managed_original` tool argument, the launcher and writer
+  setup subcommands, the managed serve flags, and the `managed-native-store` and `managed-warm-inspections` features. The
+  server always runs its ordinary mode, and `rusqlite` is no longer a dependency.
+
 ## [0.16.22] - 2026-11-25
 
 ### Fixed

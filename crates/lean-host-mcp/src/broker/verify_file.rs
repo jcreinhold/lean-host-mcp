@@ -61,24 +61,6 @@ impl ProjectBroker {
         input: &str,
         imports: &[String],
     ) -> Result<PreparedReader> {
-        Self::prepared_reader_with_identity(root, meta, input, imports, true)
-    }
-
-    pub(super) fn prepared_reader_for_actor(
-        root: &Path,
-        meta: &crate::lake_meta::LakeProjectMeta,
-        input: &str,
-    ) -> Result<PreparedReader> {
-        Self::prepared_reader_with_identity(root, meta, input, &[], false)
-    }
-
-    fn prepared_reader_with_identity(
-        root: &Path,
-        meta: &crate::lake_meta::LakeProjectMeta,
-        input: &str,
-        imports: &[String],
-        check_derived: bool,
-    ) -> Result<PreparedReader> {
         let selection = PreparedGeneration::decode(input).map_err(invalid)?;
         if selection.project() != root {
             return Err(invalid("unexpected prepared project"));
@@ -89,9 +71,7 @@ impl ProjectBroker {
             return Err(invalid("incomplete prepared selection"));
         }
         let project_domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
-        if check_derived || !selection.is_derived() {
-            PreparedGeneration::check_identity(input, &project_domains).map_err(invalid)?;
-        }
+        PreparedGeneration::check_identity(input, &project_domains).map_err(invalid)?;
         let mut expected: Vec<_> = project_domains.iter().map(|p| p.join(".lake/build/lib/lean")).collect();
         expected.extend(shims.clone());
         expected.push(selection.release().to_owned());
@@ -135,8 +115,6 @@ impl ProjectBroker {
 }
 
 pub(crate) struct VerifierShims {
-    #[cfg(all(unix, feature = "managed-native-store"))]
-    pub(crate) worker: PathBuf,
     pub(crate) sysroot: PathBuf,
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) domains: Vec<PathBuf>,
@@ -154,8 +132,6 @@ impl VerifierShims {
             return Err(invalid("incomplete prepared import selection"));
         }
         Ok(Self {
-            #[cfg(all(unix, feature = "managed-native-store"))]
-            worker,
             sysroot,
             domains: installed.prepared.artifact_roots.iter().map(PathBuf::from).collect(),
             paths: installed.prepared.shim_search_paths.iter().map(PathBuf::from).collect(),
