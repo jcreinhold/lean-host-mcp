@@ -742,35 +742,17 @@ pub async fn file_diagnostics(
     let source_fact = ArtifactTrust::source_file_edit_fresh(&meta.canonical_root, &input.resolved, input.hash);
     let file_label = input.resolved.to_string_lossy().into_owned();
     let imports = input.imports.clone();
-    let selectors = vec![LeanWorkerModuleQuerySelector::Diagnostics {
-        id: PROOF_STATE_DIAGNOSTICS_ID.to_owned(),
-    }];
-    let outcome = if ctx.broker.prepared_generation().is_none() {
-        ctx.broker
-            .file_projection(
-                &hint,
-                &file_label,
-                &input.source,
-                imports.clone(),
-                crate::broker::FileProjection::Diagnostics,
-                proof_agent_budgets(),
-            )
-            .await
-    } else {
-        ctx.broker
-            .process_cached_module_query_batch(
-                hint.clone(),
-                input.resolved,
-                input.hash,
-                session_imports(imports.clone()),
-                imports.clone(),
-                input.source,
-                selectors,
-                proof_agent_budgets(),
-                LeanWorkerElabOptions::new().file_label(&file_label),
-            )
-            .await
-    };
+    let outcome = ctx
+        .broker
+        .file_projection(
+            &hint,
+            &file_label,
+            &input.source,
+            imports.clone(),
+            crate::broker::FileProjection::Diagnostics,
+            proof_agent_budgets(),
+        )
+        .await;
     let call = match crate::diagnosis::classify_missing_olean(outcome)? {
         crate::diagnosis::CallOutcome::Ready(call) => call,
         crate::diagnosis::CallOutcome::NeedsBuild(err) => {

@@ -282,7 +282,6 @@ const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectRuntimeConfig {
     operator_primary: Option<PathBuf>,
-    prepared_generation: Option<String>,
     lean_max_memory_kib: u64,
     request_timeout_millis: u64,
     mailbox_capacity: usize,
@@ -316,31 +315,7 @@ impl ProjectRuntimeConfig {
     /// Returns an error if the selected directory cannot be resolved.
     pub fn with_operator_primary(mut self, root: Option<&Path>) -> std::io::Result<Self> {
         self.operator_primary = root.map(Path::canonicalize).transpose()?;
-        self.prepared_generation = None;
         Ok(self)
-    }
-
-    /// Bind a producer's bounded record to the operator-selected primary at server startup.
-    ///
-    /// # Errors
-    /// Refuses a record selected for any other project.
-    pub fn with_prepared_generation(mut self, input: Option<String>) -> std::io::Result<Self> {
-        if let Some(text) = &input {
-            let invalid = || std::io::Error::other("invalid prepared generation for primary project");
-            if text.len() > 4096 {
-                return Err(invalid());
-            }
-            let selection = lean_host_mcp_worker::prepared_project::PreparedGeneration::decode(text)?;
-            if self.operator_primary.as_deref() != Some(selection.project()) {
-                return Err(invalid());
-            }
-        }
-        self.prepared_generation = input;
-        Ok(self)
-    }
-
-    pub(crate) fn prepared_generation(&self) -> Option<&str> {
-        self.prepared_generation.as_deref()
     }
 
     /// Defaults for a broker that keeps up to `max_projects` worker children
@@ -356,7 +331,6 @@ impl ProjectRuntimeConfig {
         let import_residue_budget_bytes = default_import_residue_budget_bytes(max_projects);
         Self {
             operator_primary: None,
-            prepared_generation: None,
             lean_max_memory_kib: lean_max_memory_kib_for(import_residue_budget_bytes),
             request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
             mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
@@ -617,7 +591,6 @@ fn parse_runtime_config(
     .saturating_mul(1024 * 1024);
     let config = ProjectRuntimeConfig {
         operator_primary: None,
-        prepared_generation: None,
         lean_max_memory_kib: parse_nonzero_u64(
             "LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB",
             env.lean_max_memory_kib.as_deref(),
@@ -1769,7 +1742,6 @@ impl Drop for LeanProject {
 
 #[derive(Clone)]
 struct ActorConfig {
-    prepared_generation: Option<String>,
     maintenance: crate::broker::MaintenanceAccess,
     lake_root: PathBuf,
     manifest_hash: String,
@@ -1906,10 +1878,6 @@ impl ActorConfig {
         let config = Self {
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: meta.canonical_root.clone(),
-            prepared_generation: runtime_config
-                .prepared_generation
-                .clone()
-                .filter(|_| runtime_config.operator_primary.as_ref() == Some(&meta.canonical_root)),
             manifest_hash: meta.manifest_hash.clone(),
             toolchain_label: meta.toolchain.clone(),
             worker_path,
@@ -2460,24 +2428,6 @@ impl ProjectActorState {
             let actual = self.handle.host_runtime_metadata().ok_or_else(|| {
                 ServerError::BadProject("actual host runtime metadata missing after completed native call".into())
             })?;
-            if let Some(input) = &self.config.prepared_generation {
-                #[derive(serde::Deserialize)]
-                struct Generation {
-                    plan: RootPlan,
-                }
-                #[derive(serde::Deserialize)]
-                struct RootPlan {
-                    roots: Vec<String>,
-                }
-                let generation: Generation =
-                    serde_json::from_str(input).map_err(|err| ServerError::BadProject(err.to_string()))?;
-                if actual.effective_import_roots.as_ref() != Some(&generation.plan.roots) {
-                    self.config.healthy.store(false, Ordering::Release);
-                    return Err(ServerError::BadProject(
-                        "opened worker import order differs from prepared generation".into(),
-                    ));
-                }
-            }
             let proposed =
                 crate::runtime_compatibility::contract_from_loaded(actual).map_err(ServerError::BadProject)?;
             let (instance, contract) = self
@@ -2554,7 +2504,7 @@ impl ProjectActorState {
         let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
         let generation_before = self.observed_generation();
         let job_started = Instant::now();
-        let mut capability = self.open_semantic_capability(&meta, request)?;
+        let mut capability = self.open_semantic_capability(&meta)?;
         // The semantic search runs in this separate capability child, so the
         // CPU delta samples it rather than the main worker handle.
         let cpu_baseline = capability.cumulative_cpu_millis();
@@ -2720,11 +2670,7 @@ impl ProjectActorState {
     ///
     /// Revisit only with a workload where the semantic child's spawn is a
     /// measured majority of the call — and revert again unless the bench moves.
-    fn open_semantic_capability(
-        &self,
-        meta: &JobMeta,
-        request: &SemanticProofSearchRequest,
-    ) -> Result<lean_rs_worker_parent::LeanWorkerCapability> {
+    fn open_semantic_capability(&self, meta: &JobMeta) -> Result<lean_rs_worker_parent::LeanWorkerCapability> {
         let runtime = semantic_runtime(
             &self.config.toolchain_label,
             &self.config.lean_sysroot,
@@ -2745,13 +2691,7 @@ impl ProjectActorState {
             }
             error
         })?;
-        let startup = self
-            .config
-            .prepared_generation
-            .as_deref()
-            .map(|prepared| semantic_launch_input(&self.config, &runtime.built, request, prepared))
-            .transpose()?;
-        semantic_capability_builder(&self.config, &runtime.built, startup.as_deref())?
+        semantic_capability_builder(&self.config, &runtime.built)?
             .open()
             .map_err(|err| {
                 self.seal_artifact_refusal(&err);
@@ -3614,13 +3554,6 @@ fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerCh
     if let Some(artifacts) = &config.prepared_host_artifacts {
         child = child.prepared_host_artifacts(artifacts.clone());
     }
-    if scope == "main"
-        && let Some(input) = &config.prepared_generation
-    {
-        child = child
-            .application_launch_input(input)
-            .map_err(|e| ServerError::BadProject(e.to_string()))?;
-    }
     Ok(child)
 }
 
@@ -3645,122 +3578,9 @@ fn worker_builder(config: &ActorConfig) -> Result<LeanWorkerHostHandleBuilder> {
     )
 }
 
-fn semantic_launch_input(
-    config: &ActorConfig,
-    built: &lean_toolchain::LeanBuiltCapability,
-    request: &SemanticProofSearchRequest,
-    prepared: &str,
-) -> Result<String> {
-    use crate::runtime_compatibility::digest_hex;
-    use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
-
-    fn hash_file(path: &Path) -> std::io::Result<String> {
-        if path.canonicalize()? != path || !path.is_file() {
-            return Err(std::io::Error::other("semantic input must be a canonical regular file"));
-        }
-        let mut input = std::fs::File::open(path)?;
-        let mut digest = Sha256::new();
-        let mut block = [0; 8192];
-        loop {
-            let count = input.read(&mut block)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(
-                block
-                    .get(..count)
-                    .ok_or_else(|| std::io::Error::other("invalid read length"))?,
-            );
-        }
-        Ok(digest_hex(digest.finalize()))
-    }
-
-    let bad = |message: &str| ServerError::BadProject(message.to_owned());
-    let prepared_input = prepared;
-    let prepared: serde_json::Value = serde_json::from_str(prepared_input).map_err(|error| bad(&error.to_string()))?;
-    let selection = lean_host_mcp_worker::prepared_project::PreparedGeneration::decode(prepared_input)?;
-    let approved = selection
-        .modules()
-        .iter()
-        .any(|(module, domain)| module == &request.goal.module && domain == &config.lake_root);
-    let source = crate::tools::source_input::source_path_for_module(&config.lake_root, &request.goal.module);
-    if !approved
-        || request.goal.file_label.as_deref().map(Path::new) != Some(source.as_path())
-        || source.canonicalize()? != source
-    {
-        return Err(bad("semantic source is outside the approved prepared generation"));
-    }
-    let domains = lean_toolchain::shared_writer::project_artifact_roots(&config.lake_root)?;
-    let project_custody = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&domains)?;
-    let mut source_bytes = Vec::new();
-    std::fs::File::open(source)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut source_bytes)?;
-    if source_bytes.len() > 1024 * 1024 || source_bytes != request.goal.source_text.as_bytes() {
-        return Err(bad("semantic source bytes differ from the prepared file"));
-    }
-    lean_host_mcp_worker::prepared_project::PreparedGeneration::check_identity(prepared_input, &domains)?;
-    project_custody.validate()?;
-    let selected = config.worker_path.canonicalize()?;
-    let generation = selected
-        .parent()
-        .ok_or_else(|| bad("installed worker generation is missing"))?;
-    let sysroot = config.lean_sysroot.canonicalize()?;
-    let manifest = built
-        .resolved_manifest_path()
-        .map_err(|error| bad(&error.to_string()))?;
-    let image = built.dylib_path().map_err(|error| bad(&error.to_string()))?;
-    let root = manifest
-        .ancestors()
-        .filter(|path| path.file_name().is_some_and(|name| name == ".lake"))
-        .filter_map(Path::parent)
-        .find(|root| {
-            manifest.starts_with(root.join(".lake/lean-rs-build-cache"))
-                && image.starts_with(root.join(".lake/build/lib"))
-        })
-        .ok_or_else(|| bad("semantic artifacts do not share their expected cache root"))?;
-    if !built.dependency_descriptors().is_empty() {
-        return Err(bad("prepared semantic companion requires a dependency-free capability"));
-    }
-    let custody = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&[root.to_path_buf()])?;
-    let mut snapshot = Vec::new();
-    std::fs::File::open(&manifest)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut snapshot)?;
-    if snapshot.len() > 1024 * 1024 || manifest.canonicalize()? != manifest {
-        return Err(bad("semantic manifest exceeds the bounded canonical input"));
-    }
-    let verified = lean_toolchain::CapabilityManifest::from_bytes(&manifest, &snapshot)
-        .map_err(|_| bad("semantic capability manifest is invalid"))?;
-    if verified.primary_dylib != image || !verified.dependencies.is_empty() {
-        return Err(bad("semantic manifest differs from the selected dependency-free image"));
-    }
-    let [goal, declarations] = request.command_payload_digests()?;
-    let input = serde_json::json!({
-        "semantic_v1": {
-            "prepared": prepared,
-            "generation": generation,
-            "sidecar_sha256": hash_file(&generation.join("worker.json"))?,
-            "sysroot": sysroot,
-            "artifact_root": root,
-            "manifest": { "path": manifest, "sha256": digest_hex(Sha256::digest(&snapshot)) },
-            "image": { "path": image, "sha256": hash_file(&image)? },
-            "dependencies": [],
-            "commands": [
-                { "operation": "json_command", "export": lean_semantic_search_capability::PROOF_GOAL_FEATURES_EXPORT, "payload_sha256": goal },
-                { "operation": "json_command", "export": lean_semantic_search_capability::DECLARATION_FEATURES_EXPORT, "payload_sha256": declarations }
-            ]
-        }
-    });
-    custody.validate()?;
-    Ok(input.to_string())
-}
-
 fn semantic_capability_builder(
     config: &ActorConfig,
     built: &lean_toolchain::LeanBuiltCapability,
-    startup: Option<&str>,
 ) -> Result<LeanWorkerCapabilityBuilder> {
     // See `residue_restart_policy`: bounded by retained bytes, one Lean heap
     // ceiling.
@@ -3769,10 +3589,7 @@ fn semantic_capability_builder(
         crate::broker::MaintenanceAccess::native_contract(&config.toolchain_label).map_err(ServerError::BadProject)?;
     let expectation = crate::runtime_compatibility::session_expectation(&config.toolchain_label, contract.as_ref())
         .map_err(ServerError::BadProject)?;
-    let mut child = native_worker_child(config, "semantic")?;
-    if let Some(input) = startup {
-        child = child.application_launch_input(input).map_err(map_worker_err)?;
-    }
+    let child = native_worker_child(config, "semantic")?;
     let builder = LeanWorkerCapabilityBuilder::from_built_capability(built, std::iter::empty::<String>())
         .map_err(map_worker_err)?
         .require_host_runtime(expectation)
@@ -4455,7 +4272,6 @@ mod tests {
             import_residue_limit_bytes: None,
         }));
         let mut config = ActorConfig {
-            prepared_generation: None,
             maintenance: crate::broker::MaintenanceAccess::default(),
             lake_root: tmp.path().join("consumer"),
             manifest_hash: "sha256-test".to_owned(),
@@ -4481,7 +4297,7 @@ mod tests {
             toolchain_advisories: Vec::new(),
         };
 
-        let builder = semantic_capability_builder(&config, &built, None).unwrap();
+        let builder = semantic_capability_builder(&config, &built).unwrap();
         let debug = format!("{builder:?}");
 
         assert!(debug.contains("imports: []"), "builder debug: {debug}");
@@ -4495,7 +4311,7 @@ mod tests {
         );
         config.toolchain_label = "leanprover/lean4:test".to_owned();
         assert!(
-            semantic_capability_builder(&config, &built, None).is_err(),
+            semantic_capability_builder(&config, &built).is_err(),
             "unsupported toolchain cannot bypass the first-session expectation"
         );
     }

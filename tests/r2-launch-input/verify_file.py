@@ -1,4 +1,4 @@
-"""Check the prepared disposable R2 fixture via the ordinary stdio endpoint."""
+"""Check a disposable R2 fixture through the ordinary stdio endpoint."""
 
 import argparse
 import hashlib
@@ -11,7 +11,6 @@ import subprocess
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ordinary-imports", action="store_true")
     parser.add_argument("--fixture", type=Path)
     args = parser.parse_args()
     checkout = Path(__file__).resolve().parents[2]
@@ -23,8 +22,7 @@ def main():
     assert source.resolve() == source and original.count(proof) == 1
     artifact = project / ".lake/build/lib/lean/Root.olean"
     initial_hash = hashlib.sha256(artifact.read_bytes()).digest()
-    generation = None if args.ordinary_imports else (fixture / "installed-input").read_text()
-    release = Path(os.environ["LEAN_SYSROOT"]) if generation is None else Path(json.loads(generation)["plan"]["release"]).parents[1]
+    release = Path(os.environ["LEAN_SYSROOT"])
     environment = {
         **os.environ,
         "LEAN_SYSROOT": str(release),
@@ -37,7 +35,6 @@ def main():
     command = [
         checkout / "target/debug/lean-host-mcp",
         "--lake-root", project,
-        *([] if args.ordinary_imports else ["--prepared-generation", generation]),
         "--request-journal", fixture / "journal",
     ]
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -83,47 +80,44 @@ def main():
             good = verify(2, report_axioms=True)
             assert good["verification_status"] == "verified" and good["facts"]["axioms_available"]
 
-            if args.ordinary_imports:
-                for call_id, target in enumerate((
-                    {"kind": "file_all", "file": "Root.lean"},
-                    {"kind": "module_all", "module": "Root"},
-                ), start=10):
-                    send({"id": call_id, "method": "tools/call", "params": {
-                        "name": "lean_verify", "arguments": {"targets": [target]}}})
-                    reply = json.loads(receive(call_id)["content"][0]["text"])
-                    rows = reply["data"]["results"]
-                    assert any(row["id"] == good["id"] and row["verification_status"] == "verified"
-                               for row in rows), reply
-                clean = diagnostics(12)
-                assert clean["summary"]["errors"] == 0 and not clean.get("truncated"), clean
-                # Several bounded messages exercise the aggregate cap even when Lean
-                # retains the last complete message that crossed its byte budget.
-                source.write_bytes(original + (b'\n#check "' + b"x" * 512 + b'"\n') * 20)
-                clipped = diagnostics(13)
-                assert clipped.get("truncated"), clipped
+            for call_id, target in enumerate((
+                {"kind": "file_all", "file": "Root.lean"},
+                {"kind": "module_all", "module": "Root"},
+            ), start=10):
+                send({"id": call_id, "method": "tools/call", "params": {
+                    "name": "lean_verify", "arguments": {"targets": [target]}}})
+                reply = json.loads(receive(call_id)["content"][0]["text"])
+                rows = reply["data"]["results"]
+                assert any(row["id"] == good["id"] and row["verification_status"] == "verified"
+                           for row in rows), reply
+            clean = diagnostics(12)
+            assert clean["summary"]["errors"] == 0 and not clean.get("truncated"), clean
+            # Several bounded messages exercise the aggregate cap even when Lean
+            # retains the last complete message that crossed its byte budget.
+            source.write_bytes(original + (b'\n#check "' + b"x" * 512 + b'"\n') * 20)
+            clipped = diagnostics(13)
+            assert clipped.get("truncated"), clipped
             source.write_bytes(original.replace(proof, b"theorem first_ok : True := False.intro"))
-            if args.ordinary_imports:
-                errors = diagnostics(14)
-                line = original[:original.index(proof)].count(b"\n") + 1
-                column = len(b"theorem first_ok : True := ")
-                assert errors["summary"]["errors"] > 0 and any(
-                    row["severity"] == "error"
-                    and "False.intro" in row["message"]
-                    and (span := row.get("original_range"))
-                    and Path(span["file"]) == source
-                    and span["start_line"] == span["end_line"] == line
-                    and span["start_column"] <= column < span["end_column"]
-                    for row in errors["diagnostics"]
-                ), errors
+            errors = diagnostics(14)
+            line = original[:original.index(proof)].count(b"\n") + 1
+            column = len(b"theorem first_ok : True := ")
+            assert errors["summary"]["errors"] > 0 and any(
+                row["severity"] == "error"
+                and "False.intro" in row["message"]
+                and (span := row.get("original_range"))
+                and Path(span["file"]) == source
+                and span["start_line"] == span["end_line"] == line
+                and span["start_column"] <= column < span["end_column"]
+                for row in errors["diagnostics"]
+            ), errors
             broken = verify(3)
             assert broken["verification_status"] != "verified" and broken["facts"]["diagnostics"]["diagnostics"]
 
             source.write_bytes(original.replace(proof, b"theorem first_ok : True := sorry"))
-            if args.ordinary_imports:
-                warnings = diagnostics(15)
-                assert warnings["summary"]["warnings"] > 0 and any(
-                    row["severity"] == "warning" and "sorry" in row["message"]
-                    for row in warnings["diagnostics"]), warnings
+            warnings = diagnostics(15)
+            assert warnings["summary"]["warnings"] > 0 and any(
+                row["severity"] == "warning" and "sorry" in row["message"]
+                for row in warnings["diagnostics"]), warnings
             denied = verify(4)
             assert denied["verification_status"] == "has_sorry" and denied["facts"]["contains_sorry"]
             allowed = verify(5, allow_sorry=True)

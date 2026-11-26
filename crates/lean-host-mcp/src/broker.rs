@@ -764,16 +764,8 @@ impl ProjectBroker {
         freshness_imports: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
-        if request.goal.file_label.is_some() || self.prepared_generation().is_some() {
-            return self
-                .semantic_file(
-                    hint,
-                    session_imports,
-                    freshness_imports,
-                    request,
-                    self.prepared_generation(),
-                )
-                .await;
+        if request.goal.file_label.is_some() {
+            return self.semantic_file(hint, freshness_imports, request).await;
         }
         let (project, admission_deadline) = self.project_for(hint).await?;
         let call = project
@@ -830,10 +822,6 @@ impl ProjectBroker {
         out.freshness.elaboration_options = Some(option_facts);
         drop(project);
         Ok(out)
-    }
-
-    pub(crate) fn prepared_generation(&self) -> Option<&str> {
-        self.runtime_config.prepared_generation()
     }
 
     /// Verify several declarations in one source snapshot through the project runtime.

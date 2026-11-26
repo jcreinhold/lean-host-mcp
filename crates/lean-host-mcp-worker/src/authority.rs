@@ -1,6 +1,6 @@
-//! The installed worker's first supported operation is inspection of builtin Init
-//! in the installer's empty smoke project. Other project operations require a
-//! separate, project-specific admission.
+//! The installed worker supports one operation: inspection of builtin Init in
+//! the installer's empty smoke project. It refuses every other import, source
+//! request and worker command.
 use lean_rs::host_bridge::{
     HostCachedModuleBatch, HostModuleBatch, HostModuleQuery, HostSourceOptions, TrustedHostKernelRequest,
     TrustedHostTerm, TrustedModuleSource,
@@ -68,9 +68,6 @@ impl Deployment {
 }
 pub(super) struct Installed {
     record: Deployment,
-    launch_input: Option<String>,
-    semantic: Option<crate::semantic_selection::Semantic>,
-    held_project: std::sync::OnceLock<lean_host_mcp_worker::prepared_project::PreparedProject>,
     project: PathBuf,
     guards: Vec<fs::File>,
 }
@@ -163,6 +160,7 @@ impl Installed {
                     || matches!(&*k, "LD_PRELOAD" | "LD_LIBRARY_PATH" | "LD_AUDIT")
             })
             || std::env::var_os("LEAN_PATH").is_some()
+            || std::env::var_os("LEAN_RS_WORKER_APPLICATION_INPUT").is_some()
             || std::env::var_os("LEAN_SYSROOT").map(PathBuf::from).as_ref() != Some(&record.sysroot)
         {
             return Err(invalid("unapproved Lean runtime environment"));
@@ -229,31 +227,7 @@ impl Installed {
                 }
             }
         }
-        let launch_input = std::env::var_os("LEAN_RS_WORKER_APPLICATION_INPUT")
-            .map(|s| {
-                s.into_string()
-                    .map_err(|_| invalid("invalid prepared generation encoding"))
-            })
-            .transpose()?;
-        if launch_input.as_ref().is_some_and(|s| s.len() > 4096) {
-            return Err(invalid("oversized prepared generation"));
-        }
-        let mut semantic = None;
-        let mut launch_input = launch_input;
-        if let Some(input) = launch_input.as_deref() {
-            let value: serde_json::Value = serde_json::from_str(input)?;
-            if value.get("semantic_v1").is_some() {
-                let selected: crate::semantic_selection::Selection = serde_json::from_value(value)?;
-                let (prepared, admitted) =
-                    crate::semantic_selection::Semantic::open(selected.semantic_v1, dir, &record.sysroot, &bytes)?;
-                launch_input = Some(prepared);
-                semantic = Some(admitted);
-            }
-        }
         Ok(Self {
-            semantic,
-            launch_input,
-            held_project: std::sync::OnceLock::new(),
             record,
             project,
             guards,
@@ -313,7 +287,7 @@ impl WorkerAuthority for Installed {
     }
     #[allow(
         unsafe_code,
-        reason = "the installed application retains the approved import generation and checks the exact import profile"
+        reason = "the installed application checks the exact smoke-project import profile"
     )]
     fn imports<'c>(
         &self,
@@ -322,48 +296,6 @@ impl WorkerAuthority for Installed {
         names: Vec<String>,
         options: HostImportOptions,
     ) -> LeanResult<TrustedHostImports<'static, 'c>> {
-        if let Some(input) = &self.launch_input {
-            use lean_host_mcp_worker::prepared_project::PreparedGeneration;
-            let generation: PreparedGeneration = serde_json::from_str(input).map_err(|_| deny())?;
-            let ordered = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
-            if options != HostImportOptions::default() {
-                return Err(deny());
-            }
-            let release = self.record.sysroot.join("lib/lean");
-            let deny_changed =
-                |error| lean_rs::error::host_internal(format!("prepared generation refused before import: {error}"));
-            if generation.is_derived()
-                && let Some(held) = self.held_project.get()
-            {
-                generation
-                    .check_import_selection(generation.project(), &release, &ordered, &names)
-                    .map_err(deny_changed)?;
-                let roots = generation
-                    .roots()
-                    .iter()
-                    .map(|path| path.to_str().map(str::to_owned).ok_or_else(deny))
-                    .collect::<LeanResult<Vec<_>>>()?;
-                held.check_observed(Some(&roots)).map_err(deny_changed)?;
-            } else {
-                let held = PreparedGeneration::verify_before_import(
-                    input,
-                    generation.project(),
-                    &release,
-                    &expected_roots(&self.record).collect::<Vec<_>>(),
-                    &ordered,
-                    &names,
-                )
-                .map_err(deny_changed)?;
-                self.held_project.get_or_init(|| held);
-            }
-            // SAFETY: the operator selects a trusted fresh-build record at server startup.
-            // The matched launcher replaces inherited input. The verified digest covers the
-            // approved plugin-free modules and their resolved dependencies, and this authority
-            // retains project and shim read custody. Registered-release records also
-            // bind the selected installed Elan release and refuse prior-root shadowing.
-            // The installed release must stay intact. Only default import options reach here.
-            return Ok(unsafe { cap.import_scope_with_options(paths, names, options) });
-        }
         let expected = std::iter::once(self.project.join(".lake/build/lib/lean"))
             .chain(self.record.prepared.shim_search_paths.iter().map(PathBuf::from))
             .collect::<Vec<_>>();
@@ -385,14 +317,7 @@ impl WorkerAuthority for Installed {
         // resolves to the trusted official runtime, with no project or shim Init namespace.
         Ok(unsafe { cap.import_scope_with_options(paths, names, options) })
     }
-    fn validate_source_context(&self, _: &WorkerSourceContext<'_, '_>, observed: Option<&[String]>) -> LeanResult<()> {
-        if self.launch_input.is_some() {
-            self.held_project
-                .get()
-                .ok_or_else(deny)?
-                .check_observed(observed)
-                .map_err(|e| lean_rs::error::host_internal(e.to_string()))?;
-        }
+    fn validate_source_context(&self, _: &WorkerSourceContext<'_, '_>, _: Option<&[String]>) -> LeanResult<()> {
         Ok(())
     }
     fn project(
@@ -406,16 +331,11 @@ impl WorkerAuthority for Installed {
     fn manifest_read(&self, _: &Path) -> LeanResult<WorkerManifestRead> {
         Err(deny())
     }
-    fn worker(
-        &self,
-        runtime: &'static LeanRuntime,
-        path: &Path,
-        bytes: &[u8],
-    ) -> LeanResult<AuthorizedWorkerSnapshot<'static>> {
-        self.semantic.as_ref().ok_or_else(deny)?.snapshot(runtime, path, bytes)
+    fn worker(&self, _: &'static LeanRuntime, _: &Path, _: &[u8]) -> LeanResult<AuthorizedWorkerSnapshot<'static>> {
+        Err(deny())
     }
-    fn authorize_worker_string_call(&self, call: lean_rs_worker_child::WorkerStringCall<'_>) -> LeanResult<()> {
-        self.semantic.as_ref().ok_or_else(deny)?.command(&call)
+    fn authorize_worker_string_call(&self, _: lean_rs_worker_child::WorkerStringCall<'_>) -> LeanResult<()> {
+        Err(deny())
     }
     fn term<'c>(
         &self,

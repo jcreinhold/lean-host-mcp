@@ -1,5 +1,4 @@
 mod authority;
-mod semantic_selection;
 
 fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let deployment = authority::Installed::open()?;
@@ -16,6 +15,3 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     }
     Ok(lean_rs_worker_child::run_worker_child_with_authority(deployment)?)
 }
-
-#[cfg(test)]
-mod verification_preflight;

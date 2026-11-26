@@ -72,20 +72,6 @@ impl SemanticProofSearchRequest {
         }
     }
 
-    pub(crate) fn command_payload_digests(&self) -> Result<[String; 2]> {
-        use sha2::{Digest as _, Sha256};
-
-        // Match LeanWorkerSession::run_json_command's wire serialization.
-        fn digest(payload: &impl Serialize) -> Result<String> {
-            let encoded = serde_json::to_string(payload).map_err(|error| ServerError::BadProject(error.to_string()))?;
-            Ok(crate::runtime_compatibility::digest_hex(Sha256::digest(
-                encoded.as_bytes(),
-            )))
-        }
-
-        Ok([digest(&self.goal)?, digest(&self.declarations())?])
-    }
-
     pub(crate) fn reader_input(&self, roots: &[std::path::PathBuf]) -> Result<Vec<u8>> {
         #[derive(Serialize)]
         struct Input<'a> {

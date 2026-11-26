@@ -1,10 +1,11 @@
-//! One-shot checks of current source against the operator-selected build products.
+//! One-shot checks of current source against the project's build products.
+//! Each check runs as a native reader with the module setup that `lake
+//! setup-file` prints for the file.
 use super::{
     BrokerCall, Duration, LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
     LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError,
     freshness_from_meta,
 };
-use lean_host_mcp_worker::prepared_project::PreparedGeneration;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{fs, io};
@@ -55,45 +56,6 @@ pub(super) struct PreparedReader {
 }
 
 impl ProjectBroker {
-    pub(super) fn prepared_reader(
-        root: &Path,
-        meta: &crate::lake_meta::LakeProjectMeta,
-        input: &str,
-        imports: &[String],
-    ) -> Result<PreparedReader> {
-        let selection = PreparedGeneration::decode(input).map_err(invalid)?;
-        if selection.project() != root {
-            return Err(invalid("unexpected prepared project"));
-        }
-        let reader = Self::installed_reader(root, meta)?;
-        let PreparedReader { sysroot, shims, .. } = &reader;
-        if selection.release() != sysroot.join("lib/lean") {
-            return Err(invalid("incomplete prepared selection"));
-        }
-        let project_domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
-        PreparedGeneration::check_identity(input, &project_domains).map_err(invalid)?;
-        let mut expected: Vec<_> = project_domains.iter().map(|p| p.join(".lake/build/lib/lean")).collect();
-        expected.extend(shims.clone());
-        expected.push(selection.release().to_owned());
-        let mut ordered = selection.roots().to_vec();
-        ordered.sort();
-        expected.sort();
-        if ordered != expected {
-            return Err(invalid("prepared roots differ from installed domains"));
-        }
-        if imports
-            .iter()
-            .any(|n| n != "Init" && !selection.modules().iter().any(|(name, _)| name == n))
-        {
-            return Err(invalid("unsupported import outside prepared project"));
-        }
-        selection.check_products().map_err(invalid)?;
-        Ok(PreparedReader {
-            roots: selection.roots().to_vec(),
-            ..reader
-        })
-    }
-
     pub(super) fn installed_reader(root: &Path, meta: &crate::lake_meta::LakeProjectMeta) -> Result<PreparedReader> {
         let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).map_err(invalid)?;
         let shims = VerifierShims::select(meta)?;
@@ -200,22 +162,10 @@ impl ProjectBroker {
             return Err(invalid("unapproved verification path"));
         }
         self.ensure_read(&root).await?;
-        let (options, reader, setup, activity) = if let Some(selection) = self.prepared_generation() {
-            let options = self.resolve_options(&meta, options).await?;
-            let activity = self.preparation_activity(&root).await?;
-            let reader = Self::prepared_reader(&root, &meta, selection, &imports)?;
-            (options, reader, None, activity)
-        } else {
-            let (setup, reader, activity) = self
-                .file_reader_with_setup(&hint, &meta, &options.file_label, &request.source)
-                .await?;
-            (
-                options.lean_options(setup.options.clone()),
-                reader,
-                Some(setup),
-                activity,
-            )
-        };
+        let (setup, reader, activity) = self
+            .file_reader_with_setup(&hint, &meta, &options.file_label, &request.source)
+            .await?;
+        let options = options.lean_options(setup.options.clone());
         let roots = &reader.roots;
         let targets = request
             .targets
@@ -238,10 +188,10 @@ impl ProjectBroker {
             "optionsJson": lean_toolchain::lean_options_json(&options.lean_options),
             "heartbeats": options.heartbeat_limit,
             "diagnosticBytes": options.diagnostic_byte_limit,
-            "expectedRuntimeVersion": setup.as_ref().map(|_| selected_lean_version(&meta.toolchain)),
+            "expectedRuntimeVersion": selected_lean_version(&meta.toolchain),
         }))
         .map_err(invalid)?;
-        let entry = if setup.is_some() {
+        let entry = {
             use crate::tools::proof_action::LeanVerifyDetail;
             let selection = match detail {
                 LeanVerifyDetail::Compact => "private abbrev verifySetup := verifyDeclarationBatchCompactWithSetup\n",
@@ -254,22 +204,9 @@ impl ProjectBroker {
                 include_str!("../lake/VerifySetup.lean"),
             ]
             .concat()
-        } else {
-            [
-                include_str!("../lake/VerifyCommon.lean"),
-                include_str!("../lake/VerifyBatch.lean"),
-            ]
-            .concat()
         };
-        let setup_binding = setup
-            .as_ref()
-            .map(|staged| {
-                Ok::<_, io::Error>((
-                    crate::shared_writer::module_setup_digest(&staged.bytes),
-                    staged.artifact_identity_sha256(&reader.shim_identity_sha256)?,
-                ))
-            })
-            .transpose()?;
+        let module_setup_sha256 = crate::shared_writer::module_setup_digest(&setup.bytes);
+        let artifact_identity_sha256 = setup.artifact_identity_sha256(&reader.shim_identity_sha256)?;
         let lean_executable = reader.sysroot.join("bin/lean");
         let request_sha256 = crate::shared_writer::module_setup_digest(&body);
         let source_sha256 = crate::shared_writer::module_setup_digest(request.source.as_bytes());
@@ -278,28 +215,24 @@ impl ProjectBroker {
             .await?;
         let mut runtime = RuntimeFacts::default();
         let mut freshness = freshness_from_meta(&meta, freshness);
-        let value = if let Some((module_setup_sha256, artifact_identity_sha256)) = setup_binding {
-            let frame = decode_setup_verdict(&bytes, &freshness.lean_toolchain)?;
-            if matches!(frame.outcome, LeanWorkerDeclarationVerificationBatchResult::Ok { .. }) {
-                runtime.cli_file_verification = Some(Box::new(crate::envelope::CliFileVerification {
-                    schema: "lean-host-cli-file-verification-v1",
-                    server_instance_id: self.instance_id(),
-                    project_root: root,
-                    source_file: file,
-                    lean_toolchain: freshness.lean_toolchain.clone(),
-                    runtime_lean_version: frame.runtime_lean_version,
-                    lean_executable,
-                    source_sha256,
-                    module_setup_sha256,
-                    artifact_identity_sha256,
-                    request_sha256,
-                    data_sha256: String::new(),
-                }));
-            }
-            frame.outcome
-        } else {
-            serde_json::from_slice(&bytes).map_err(invalid)?
-        };
+        let frame = decode_setup_verdict(&bytes, &freshness.lean_toolchain)?;
+        if matches!(frame.outcome, LeanWorkerDeclarationVerificationBatchResult::Ok { .. }) {
+            runtime.cli_file_verification = Some(Box::new(crate::envelope::CliFileVerification {
+                schema: "lean-host-cli-file-verification-v1",
+                server_instance_id: self.instance_id(),
+                project_root: root,
+                source_file: file,
+                lean_toolchain: freshness.lean_toolchain.clone(),
+                runtime_lean_version: frame.runtime_lean_version,
+                lean_executable,
+                source_sha256,
+                module_setup_sha256,
+                artifact_identity_sha256,
+                request_sha256,
+                data_sha256: String::new(),
+            }));
+        }
+        let value = frame.outcome;
         if let LeanWorkerDeclarationVerificationBatchResult::Ok { results, .. }
         | LeanWorkerDeclarationVerificationBatchResult::MissingImports { results, .. } = &value
             && (results.len() != request.targets.len()
@@ -323,7 +256,7 @@ impl ProjectBroker {
         root: PathBuf,
         reader: PreparedReader,
         activity: super::control::PreparationActivityGuard,
-        setup: Option<super::module_setup::StagedSetup>,
+        setup: super::module_setup::StagedSetup,
         entry: String,
         body: Vec<u8>,
     ) -> Result<Vec<u8>> {
@@ -346,9 +279,7 @@ impl ProjectBroker {
             Some(Box::new((activity, shim_guards))),
             move |assets| {
                 let driver = assets.join("FileDriver.lean");
-                if let Some(setup) = setup {
-                    fs::write(assets.join("module.setup.json"), setup.bytes)?;
-                }
+                fs::write(assets.join("module.setup.json"), setup.bytes)?;
                 fs::write(&driver, entry)?;
                 let data = assets.join("request.json");
                 fs::write(&data, body)?;
@@ -408,9 +339,7 @@ impl ProjectBroker {
             include_str!("../lake/OutlineSetup.lean"),
         ]
         .concat();
-        let bytes = self
-            .run_file_driver(root, reader, activity, Some(setup), entry, body)
-            .await?;
+        let bytes = self.run_file_driver(root, reader, activity, setup, entry, body).await?;
         let mut result: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
         let object = result
             .as_object_mut()

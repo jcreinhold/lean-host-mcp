@@ -1,4 +1,6 @@
-//! Supervised semantic adapter for an explicitly selected prepared project.
+//! Semantic proof search for a goal in one source file. A native reader runs
+//! the semantic feature driver with the module setup that `lake setup-file`
+//! prints for that file.
 use super::verify_file::PreparedReader;
 use super::{
     BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, SemanticProofSearchRequest,
@@ -21,35 +23,25 @@ impl ProjectBroker {
     pub(super) async fn semantic_file(
         &self,
         hint: ProjectHint,
-        imports: Vec<String>,
         freshness: Vec<String>,
         request: SemanticProofSearchRequest,
-        input: Option<&str>,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
         let root = self.native_root(&hint)?;
         let meta = self.meta(&root)?;
         self.ensure_read(&root).await?;
-        let (reader, setup, activity) = if let Some(input) = input {
-            let activity = self.preparation_activity(&root).await?;
-            let mut selected = imports;
-            selected.extend(request.candidate_modules.iter().cloned());
-            (Self::prepared_reader(&root, &meta, input, &selected)?, None, activity)
-        } else {
-            let file = request
-                .goal
-                .file_label
-                .as_deref()
-                .ok_or_else(|| invalid("missing semantic source file"))?;
-            let (setup, mut reader, activity) = self
-                .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
-                .await?;
-            reader.roots = crate::lake_meta::artifact_roots(&root);
-            if reader.roots.iter().any(|p| !reader.custody.covers_artifact_root(p)) {
-                return Err(invalid("semantic declaration root outside held project domains"));
-            }
-            reader.roots.push(reader.sysroot.join("lib/lean"));
-            (reader, Some(setup), activity)
-        };
+        let file = request
+            .goal
+            .file_label
+            .as_deref()
+            .ok_or_else(|| invalid("missing semantic source file"))?;
+        let (setup, mut reader, activity) = self
+            .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
+            .await?;
+        reader.roots = crate::lake_meta::artifact_roots(&root);
+        if reader.roots.iter().any(|p| !reader.custody.covers_artifact_root(p)) {
+            return Err(invalid("semantic declaration root outside held project domains"));
+        }
+        reader.roots.push(reader.sysroot.join("lib/lean"));
         let PreparedReader {
             custody,
             sysroot,
@@ -115,13 +107,15 @@ impl ProjectBroker {
             Some(Box::new((activity, shim_guards, runtime_guard))),
             move |assets| {
                 let driver = assets.join("SemanticFeatures.lean");
-                let entry = if let Some(setup) = setup {
-                    fs::write(assets.join("module.setup.json"), setup.bytes)?;
-                    include_str!("../lake/SemanticSetup.lean")
-                } else {
-                    include_str!("../lake/SemanticPrepared.lean")
-                };
-                fs::write(&driver, [include_str!("../lake/SemanticFeatures.lean"), entry].concat())?;
+                fs::write(assets.join("module.setup.json"), setup.bytes)?;
+                fs::write(
+                    &driver,
+                    [
+                        include_str!("../lake/SemanticFeatures.lean"),
+                        include_str!("../lake/SemanticSetup.lean"),
+                    ]
+                    .concat(),
+                )?;
                 let data = assets.join("semantic.json");
                 fs::write(&data, body)?;
                 Ok(crate::native_reader::NativeReaderProgram {

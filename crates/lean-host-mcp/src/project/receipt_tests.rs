@@ -271,7 +271,6 @@ fn fixture_config(
         worker_path: executable,
         lean_sysroot: root.join("unused-sysroot"),
         prepared_host_artifacts: None,
-        prepared_generation: None,
         native_capacity_limit: crate::broker::DEFAULT_MAX_PROJECTS,
         session_id: project.session_id.clone(),
         runtime: Arc::clone(&project.runtime),

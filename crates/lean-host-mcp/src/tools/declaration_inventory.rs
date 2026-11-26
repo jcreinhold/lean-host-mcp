@@ -100,7 +100,7 @@ pub(super) async fn verification_inventory(
     ctx: &ToolContext,
     req: DeclarationInventoryRequest,
 ) -> Result<Response<DeclarationInventoryResult>> {
-    inventory(ctx, req, ctx.broker.prepared_generation().is_none()).await
+    inventory(ctx, req, true).await
 }
 
 async fn inventory(
