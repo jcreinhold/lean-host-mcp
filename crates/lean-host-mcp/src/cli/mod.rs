@@ -2,11 +2,14 @@
 //!
 //! The default subcommand is `serve`, which boots the rmcp stdio
 //! transport against a [`ProjectBroker`](crate::broker::ProjectBroker).
-//! [`install_worker`] (sub)builds and installs a per-toolchain worker
-//! binary into [`WorkerBinary::install_root`](crate::toolchain::WorkerBinary::install_root).
-//! [`config_init`] writes a documented starter config file.
+//! [`install`] makes one Lake root ready to serve: worker, writer, server
+//! binary, store and local config. [`install_worker`] builds and installs a
+//! per-toolchain worker binary into a worker directory
+//! ([`workers_dir`](crate::toolchain::workers_dir)). [`config_init`] writes a
+//! documented starter config file.
 
 pub mod config_init;
+pub mod install;
 pub mod install_worker;
 mod installed_shims;
 pub mod processes;

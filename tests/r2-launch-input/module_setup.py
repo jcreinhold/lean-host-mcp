@@ -37,6 +37,8 @@ env = dict(
     LEAN_SYSROOT=str(release),
     TMPDIR=str(b / "tmp"),
     LEAN_HOST_MCP_PROCESS_REGISTRY_DIR=str(b / "server-owners"),
+    # Keep the server store out of the projects whose files the probes compare.
+    LEAN_HOST_MCP_STORE_DIR=str(b / "store"),
     LEAN_RS_WORKER_OWNERS_DIRECTORY=str(b / "owners"),
     LEAN_HOST_MCP_WORKERS_DIR=str(b / "workers"),
     LAKE_CACHE_DIR=str(b / "cache"),

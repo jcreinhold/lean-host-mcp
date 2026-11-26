@@ -105,7 +105,6 @@ impl Fixture {
 
 fn broker() -> Arc<ProjectBroker> {
     ProjectBroker::new(super::super::BrokerConfig {
-        config_default: None,
         env_default: None,
         cwd: PathBuf::from("/unused"),
         max_projects: std::num::NonZeroUsize::MIN,

@@ -379,7 +379,6 @@ impl ActorHarness {
         let root = tempfile::tempdir().expect("private actor fixture");
         let executable = fake_worker(root.path(), remove_executable);
         let broker_config = crate::broker::BrokerConfig {
-            config_default: None,
             env_default: None,
             cwd: root.path().to_path_buf(),
             max_projects: NonZeroUsize::MIN,

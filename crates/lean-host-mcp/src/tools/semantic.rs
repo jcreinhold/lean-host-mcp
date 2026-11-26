@@ -1300,7 +1300,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            config_default: None,
             env_default: Some(root.clone()),
             cwd: root,
             max_projects: BrokerConfig::default_max_projects(),
@@ -1374,7 +1373,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            config_default: None,
             env_default: Some(root),
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
@@ -1409,7 +1407,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            config_default: None,
             env_default: Some(root),
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
@@ -1457,7 +1454,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            config_default: None,
             env_default: Some(root),
             cwd: tmp.path().to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),

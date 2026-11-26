@@ -9,11 +9,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `lean-host-mcp install --lake-root PROJECT` installs everything one project needs under
+  `PROJECT/.local/lean-host-mcp/`: a copy of the server and the SDK writer in `bin/`, the worker for the project's
+  `lean-toolchain` in `workers/`, a private `store/`, and a local `config.toml` that records their absolute paths under
+  `[install]`. `--dir` moves `bin/`, `workers/` and `store/`. It never writes a tracked file.
+- One server per store: a server with `--lake-root` locks `store/server.lock`, and a second one exits and names the pid
+  and Lake root of the first. `LEAN_HOST_MCP_STORE_DIR` and `[install] store_dir` move the store.
+
+### Changed
+
+- The server reads config only at its `--lake-root`: the tracked `lean-host-mcp.toml`, then the ignored
+  `.local/lean-host-mcp/config.toml`, whose keys win. Precedence is CLI > env > local file > tracked file > default.
+- The server and `install` share one worker directory: `LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir`, then
+  `.local/lean-host-mcp/workers` under the Lake root. `install-worker` needs `--lake-root`, `--workers-dir` or that env
+  var.
+- A missing or unusable worker gives one line naming the toolchain, the worker directory and the fix, `SERVER install
+  --lake-root PROJECT`. A protocol mismatch carries the same recovery command.
+- `config init` writes `lean-host-mcp.toml` in the working directory or at `--lake-root`.
+
 ### Removed
 
-- Remove the managed mode: the `lean_managed_admission` tool, the `managed_original` tool argument, the launcher and writer
-  setup subcommands, the managed serve flags, and the `managed-native-store` and `managed-warm-inspections` features. The
-  server always runs its ordinary mode, and `rusqlite` is no longer a dependency.
+- Remove the managed mode: the `lean_managed_admission` tool, the `managed_original` tool argument, the launcher and
+  writer setup subcommands, the managed serve flags, and the `managed-native-store` and `managed-warm-inspections`
+  features. The server always runs its ordinary mode, and `rusqlite` is no longer a dependency.
+- Remove config lookup in the home directory, the working directory and its parents, with `LEAN_HOST_MCP_CONFIG_DIR`,
+  `config init --home` and the `primary_project` key. Neither config lookup nor the worker directory depends on `HOME`.
+  The server ignores an old `[launcher]` table.
 
 ## [0.16.22] - 2026-11-25
 

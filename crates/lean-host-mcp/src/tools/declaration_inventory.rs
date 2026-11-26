@@ -579,7 +579,6 @@ mod tests {
 
     fn test_context(root: std::path::PathBuf) -> (ToolContext, std::sync::Arc<ProjectBroker>) {
         let broker = ProjectBroker::new(BrokerConfig {
-            config_default: None,
             env_default: Some(root.clone()),
             cwd: root,
             max_projects: BrokerConfig::default_max_projects(),

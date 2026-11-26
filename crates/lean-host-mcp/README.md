@@ -7,16 +7,17 @@ projects pinned to different Lean toolchains.
 ## Install and run
 
 ```sh
-cargo install lean-host-mcp --locked
-lean-host-mcp install-worker
-cd /path/to/your/lake/project
+cargo install --locked lean-host-mcp
+lean-host-mcp install --lake-root /path/to/project
+cd /path/to/project
 lake build
-lean-host-mcp
+.local/lean-host-mcp/bin/lean-host-mcp --lake-root /path/to/project
 ```
 
-Worker installation requires Rust on `PATH` and the project's Lean toolchain installed through elan. It builds a worker
-for each missing or stale supported toolchain. Stdio is the default transport; `--bind 127.0.0.1:8765` selects loopback
-Streamable HTTP at `/mcp`. Use `--lake-root /path/to/project` when the server starts outside the project.
+`install` requires Rust on `PATH` and the project's Lean toolchain installed through elan. It builds the worker for the
+project's `lean-toolchain` and puts it, a copy of the server, the server's store and a local config file under the
+project's `.local/lean-host-mcp/`, which Git ignores. It never writes a tracked file. Stdio is the default transport;
+`--bind 127.0.0.1:8765` selects loopback Streamable HTTP at `/mcp`.
 
 ## Tools
 

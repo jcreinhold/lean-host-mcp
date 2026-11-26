@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -34,9 +35,11 @@ LIMIT = 20.0
 CAPACITY = 4
 PROOF = "example (n : Nat) : n + 0 = n := Nat.add_zero n"
 HEADER_DIGEST = "eb951e1171d39b828e7ad60aed0b90759598b678bfe58cf85c65a1559c021bf9"
+# The warning ends with the server's own install command for the project:
+# "<server> install --lake-root <project>".
 DEVELOPMENT_PROVENANCE_WARNING = (
     "worker for v4.35.0 has no provenance record (installed by an older host); "
-    "reinstall to enable header-drift detection: lean-host-mcp install-worker --toolchain v4.35.0"
+    "reinstall to enable header-drift detection: "
 )
 
 
@@ -143,13 +146,13 @@ def trial_receipt(payload, project):
     # known warning; the frozen byte hashes and actual loaded ABI/header/runtime
     # receipts below remain mandatory. Never manufacture provenance metadata.
     for error in payload["errors"]:
+        message = error.get("message", "")
         require(
-            error
-            == {
-                "severity": "warning",
-                "code": "warning",
-                "message": DEVELOPMENT_PROVENANCE_WARNING,
-            },
+            error.keys() == {"severity", "code", "message"}
+            and error["severity"] == "warning"
+            and error["code"] == "warning"
+            and message.startswith(DEVELOPMENT_PROVENANCE_WARNING)
+            and message.endswith(f" install --lake-root {shlex.quote(str(project))}"),
             error,
         )
     require(payload["data"]["diagnostics"]["summary"]["errors"] == 0, payload)
@@ -532,7 +535,7 @@ class Harness:
             ):
                 self.env.pop(name)
         self.env.update(
-            LEAN_HOST_MCP_CONFIG_DIR=str(self.root / "config"),
+            LEAN_HOST_MCP_STORE_DIR=str(self.root / "store"),
             LEAN_HOST_MCP_PROCESS_REGISTRY_DIR=str(self.root / "server-processes"),
             LEAN_HOST_MCP_WORKERS_DIR=str(self.worker.path.parent),
             LEAN_HOST_MCP_MAX_WORKERS=str(CAPACITY),

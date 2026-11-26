@@ -141,7 +141,6 @@ async fn unchanged_query_observes_rebuilt_path_dependency_and_recycles_worker() 
     rebuild_import(&compiler, &dependency, 1)?;
     let ctx = ToolContext {
         broker: ProjectBroker::new(BrokerConfig {
-            config_default: None,
             env_default: Some(root.clone()),
             cwd: root.clone(),
             max_projects: BrokerConfig::default_max_projects(),

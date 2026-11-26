@@ -44,7 +44,6 @@ fn fixture_root() -> Option<PathBuf> {
 fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize, idle_timeout: Duration) -> Arc<ProjectBroker> {
     let cwd = env_default.clone().unwrap_or_else(|| PathBuf::from("/"));
     ProjectBroker::new(BrokerConfig {
-        config_default: None,
         env_default,
         cwd,
         max_projects,

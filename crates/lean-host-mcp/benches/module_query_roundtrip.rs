@@ -44,7 +44,6 @@ fn bench_module_query(c: &mut Criterion) {
         let rt = Runtime::new().unwrap();
         let imports = vec!["LeanRsFixture.Handles".to_owned()];
         let broker = ProjectBroker::new(BrokerConfig {
-            config_default: None,
             env_default: Some(root.clone()),
             cwd: root.clone(),
             max_projects: BrokerConfig::default_max_projects(),

@@ -787,12 +787,13 @@ impl McpServer {
     }
 
     async fn start_with_env(project_root: &Path, envs: &[(&str, &str)]) -> Self {
-        let config_dir = tempfile::tempdir().expect("temp config dir").keep();
+        // A store of its own, so servers on one fixture do not share its lock.
+        let store_dir = tempfile::tempdir().expect("temp store dir").keep();
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command
             .arg("--lake-root")
             .arg(project_root)
-            .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
+            .env("LEAN_HOST_MCP_STORE_DIR", store_dir)
             .env("RUST_LOG", "warn")
             // These tests read `structuredContent` and full telemetry; opt into both.
             .env("LEAN_HOST_MCP_RESPONSE_CARRIER", "both")

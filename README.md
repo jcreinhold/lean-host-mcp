@@ -34,28 +34,28 @@ response schemas, proof-position selectors, artifact freshness, and the
 
 ## Quick start
 
-Install the published server, then build a worker for each supported Lean toolchain you use. Worker installation needs
-Rust on `PATH` and the matching Lean toolchain installed through elan:
+Install the server, then install what one Lake project needs. `install` needs Rust on `PATH` and the project's Lean
+toolchain installed through elan:
 
 ```sh
-cargo install lean-host-mcp --locked
-lean-host-mcp install-worker                      # install missing or stale workers
-lean-host-mcp install-worker --toolchain v4.35.0  # install one toolchain
-lean-host-mcp install-worker --list               # inspect build/runtime/protocol status
+cargo install --locked lean-host-mcp   # from a checkout: cargo install --locked --path crates/lean-host-mcp
+lean-host-mcp install --lake-root /path/to/project
 ```
 
-Workers live under `~/.local/share/lean-host-mcp/workers/<toolchain>/`. From a source checkout, install the server with
-`cargo install --path crates/lean-host-mcp --locked`; `install-worker` then builds the worker from that workspace.
-`--source-dir` selects another checkout. Build each workspace member with `-p`; `cargo build --workspace` would link
-`libleanshared` into the parent and break multi-toolchain dispatch. See
+`install` reads `/path/to/project/lean-toolchain` and writes only under `/path/to/project/.local/lean-host-mcp/`, which
+Git ignores: a copy of the server in `bin/`, the worker for that toolchain in `workers/`, the server's private store in
+`store/`, and `config.toml`, which records their absolute paths. Rerun it after a toolchain bump. A server installed
+from a checkout builds the worker from that workspace; `--source-dir` selects another checkout. Build each workspace
+member with `-p`; `cargo build --workspace` would link `libleanshared` into the parent and break multi-toolchain
+dispatch. See [server installation](docs/operations.md#installing-the-server) and
 [development commands](docs/operations.md#build-test-lint).
 
-Run the server in a built Lake project:
+Build the project, then serve it with the installed copy:
 
 ```sh
-cd /path/to/your/lake/project
+cd /path/to/project
 lake build
-lean-host-mcp
+.local/lean-host-mcp/bin/lean-host-mcp --lake-root /path/to/project
 ```
 
 The project needs a `lakefile.lean` or `lakefile.toml`, a `lean-toolchain` pin, and built `.olean` files for requested
@@ -66,26 +66,27 @@ example.
 
 ## Connecting an MCP client
 
-Stdio is the default. Configure a client that launches a command with the installed executable's absolute path:
+Stdio is the default. Configure a client that launches the installed copy by its absolute path:
 
 ```jsonc
 {
   "mcpServers": {
     "lean-host": {
-      "command": "/abs/path/to/lean-host-mcp",
-      "args": ["--lake-root", "/abs/path/to/lake/project"]
+      "command": "/abs/path/to/project/.local/lean-host-mcp/bin/lean-host-mcp",
+      "args": ["--lake-root", "/abs/path/to/project"]
     }
   }
 }
 ```
 
-Omit `args` when the client launches the server inside the target Lake project. The server selects each project's worker
-and sets `LEAN_SYSROOT` per spawn; the client needs no toolchain environment override.
+`--lake-root` names the one project the server runs Lean for, and the directory whose config files it reads. Only one
+server runs per project store: a second one exits and names the pid of the first. The server selects each project's
+worker and sets `LEAN_SYSROOT` per spawn; the client needs no toolchain environment override.
 
 For a native local client that connects by URL, start Streamable HTTP:
 
 ```sh
-lean-host-mcp serve --lake-root /path/to/lake/project --bind 127.0.0.1:8765
+/path/to/project/.local/lean-host-mcp/bin/lean-host-mcp serve --lake-root /path/to/project --bind 127.0.0.1:8765
 ```
 
 ```jsonc
@@ -109,11 +110,13 @@ A per-call `project: "/abs/path"` selects that call's Lake root. When omitted, r
 
 1. `--lake-root` or `LEAN_HOST_MCP_PROJECT`.
 2. The nearest `lakefile.lean` or `lakefile.toml` above the server's working directory.
-3. `primary_project` in the discovered configuration file.
 
-Run `lean-host-mcp config init` to create a documented configuration file. The
-[operations guide](docs/operations.md#configuration-file) covers discovery and precedence, pool sizing, deadlines,
-memory budgets, response presentation, and durable request journals. By default a project uses one worker; configuring
+Lean itself runs only for the `--lake-root` project. The server reads two config files there: the tracked
+`lean-host-mcp.toml`, then the ignored `.local/lean-host-mcp/config.toml` that `install` writes, whose keys win. It
+reads no config file from its working directory or your home directory. Run
+`lean-host-mcp config init --lake-root PROJECT` to create a documented tracked file. The
+[operations guide](docs/operations.md#configuration-file) covers precedence, pool sizing, deadlines, memory budgets,
+response presentation, and durable request journals. By default a project uses one worker; configuring
 `broker.max_workers_per_project` allows concurrent calls in the same project within the global `broker.max_workers` cap.
 
 ## Versions

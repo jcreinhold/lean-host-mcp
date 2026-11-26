@@ -20,15 +20,16 @@ imported `.olean` files and the host shims bundled with `lean-rs-host`.
 From the repository root, install the matching worker and run the opt-in server tests:
 
 ```sh
-lean-host-mcp install-worker --toolchain "$(cat fixtures/lean/lean-toolchain)"
+lean-host-mcp install --lake-root fixtures/lean
 LEAN_HOST_MCP_TEST_FIXTURE="$PWD/fixtures/lean" \
   cargo test -p lean-host-mcp --test e2e -- --ignored
 ```
 
-For a worker built in this checkout, set `LEAN_HOST_MCP_WORKERS_DIR` to its build directory. When testing a non-default
-Lean toolchain, set `LEAN_SYSROOT` for the entire Rust build-and-test invocation so the compiled header fingerprint
-matches the worker. See [development guidance](../../AGENTS.md) and
-[operations](../../docs/operations.md#installing-workers).
+`install` reads the fixture's `lean-toolchain` and installs under `fixtures/lean/.local/lean-host-mcp/`, which Git
+ignores; the tests find the worker there. For a worker built in this checkout, set `LEAN_HOST_MCP_WORKERS_DIR` to its
+build directory instead. When testing a non-default Lean toolchain, set `LEAN_SYSROOT` for the entire Rust
+build-and-test invocation so the compiled header fingerprint matches the worker. See
+[development guidance](../../AGENTS.md) and [operations](../../docs/operations.md#installing-workers).
 
 Consumer projects need their own lakefile, `lean-toolchain`, and built imports. They do not need to copy this fixture,
 use a shared facet, or declare the host shim package.

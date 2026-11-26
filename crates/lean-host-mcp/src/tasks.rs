@@ -1894,7 +1894,6 @@ mod tests {
             assert_eq!(runtime.request_timeout_millis(), timeout_millis);
             let broker = crate::broker::ProjectBroker::new_with_runtime_config(
                 crate::broker::BrokerConfig {
-                    config_default: None,
                     env_default: None,
                     cwd: root.clone(),
                     max_projects: NonZeroUsize::MIN,

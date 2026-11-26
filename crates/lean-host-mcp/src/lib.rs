@@ -11,7 +11,7 @@
 //!   semantic tool returns.
 //! - [`broker`]: `ProjectBroker`, the mediator that resolves a per-call
 //!   project hint into typed operations on a private project runtime via the
-//!   env / cwd-walk / config-default chain.
+//!   `--lake-root` / cwd-walk chain.
 //! - `project`: private per-project serialized controller. Owns one worker
 //!   service handle and the bounded module-query cache for one Lake project.
 //! - [`projections`]: pure data-shuffle projection types and helpers from
@@ -48,6 +48,7 @@ pub mod server;
 pub mod shared_writer;
 mod smoke;
 pub mod status;
+pub mod store;
 mod tasks;
 pub mod toolchain;
 pub mod tools;

@@ -2,10 +2,10 @@
 //!
 //! The file body is generated from the one knob catalogue in
 //! [`crate::config_schema`], so it always documents the current options at
-//! their current defaults. By default it writes a project-local
-//! `lean-host-mcp.toml` in the working directory; `--home` targets the per-user
-//! `~/.config/lean-host-mcp/config.toml` instead, and `--path` an explicit
-//! location. It refuses to overwrite an existing file unless `--force` is given.
+//! their current defaults. By default it writes the tracked
+//! `lean-host-mcp.toml` in the working directory; `--lake-root` writes it at
+//! that root instead, and `--path` at an explicit location. It refuses to
+//! overwrite an existing file unless `--force` is given.
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 
-use crate::config_file::{LOCAL_FILE_NAME, home_config_path};
+use crate::config_file::TRACKED_FILE_NAME;
 use crate::config_schema;
 
 /// `config <command>` — generate and manage the config file.
@@ -26,10 +26,10 @@ pub enum ConfigCommand {
 /// Flags for `config init`.
 #[derive(Debug, Args)]
 pub struct ConfigInitArgs {
-    /// Write the per-user home config (`~/.config/lean-host-mcp/config.toml`)
-    /// instead of a project-local `lean-host-mcp.toml`.
-    #[arg(long, conflicts_with = "path")]
-    pub home: bool,
+    /// Write `lean-host-mcp.toml` at this Lake root instead of the working
+    /// directory.
+    #[arg(long, value_name = "DIR", conflicts_with = "path")]
+    pub lake_root: Option<PathBuf>,
 
     /// Write to an explicit path instead of the default location.
     #[arg(long, value_name = "FILE")]
@@ -53,7 +53,7 @@ pub fn run(command: &ConfigCommand) -> anyhow::Result<()> {
 }
 
 fn run_init(args: &ConfigInitArgs) -> anyhow::Result<()> {
-    let dest = resolve_dest(args)?;
+    let dest = resolve_dest(args);
     if dest.exists() && !args.force {
         bail!("{} already exists; pass --force to overwrite it", dest.display());
     }
@@ -63,25 +63,25 @@ fn run_init(args: &ConfigInitArgs) -> anyhow::Result<()> {
     fs::write(&dest, config_schema::render_default_toml())
         .with_context(|| format!("writing config to {}", dest.display()))?;
     println!("wrote {}", dest.display());
-    println!("Edit it, then launch the server from this directory (or pass --lake-root).");
+    println!(
+        "The server reads {TRACKED_FILE_NAME} at its --lake-root; keys in .local/lean-host-mcp/config.toml there win."
+    );
     Ok(())
 }
 
-/// Resolve where to write: an explicit `--path`, else the home config under
-/// `--home`, else the project-local file name in the current directory.
-fn resolve_dest(args: &ConfigInitArgs) -> anyhow::Result<PathBuf> {
+/// Resolve where to write: an explicit `--path`, else the tracked file at
+/// `--lake-root`, else the tracked file name in the current directory.
+fn resolve_dest(args: &ConfigInitArgs) -> PathBuf {
     if let Some(path) = args.path.as_deref() {
-        return Ok(path.to_path_buf());
+        return path.to_path_buf();
     }
-    if args.home {
-        return home_config_path()
-            .context("could not determine a home config directory; pass --path to choose a location");
-    }
-    Ok(PathBuf::from(LOCAL_FILE_NAME))
+    args.lake_root
+        .as_deref()
+        .map_or_else(|| PathBuf::from(TRACKED_FILE_NAME), |root| root.join(TRACKED_FILE_NAME))
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests assert the branch under test directly")]
 mod tests {
     use super::*;
     use clap::{Command, FromArgMatches};
@@ -92,20 +92,26 @@ mod tests {
     }
 
     #[test]
-    fn default_destination_is_the_project_local_file() {
+    fn default_destination_is_the_tracked_file() {
         let args = parse(&["init"]).expect("bare init parses");
-        assert_eq!(resolve_dest(&args).expect("dest"), PathBuf::from(LOCAL_FILE_NAME));
+        assert_eq!(resolve_dest(&args), PathBuf::from(TRACKED_FILE_NAME));
     }
 
     #[test]
-    fn explicit_path_wins_over_home() {
-        let args = parse(&["init", "--path", "/tmp/custom.toml"]).expect("path parses");
-        assert_eq!(resolve_dest(&args).expect("dest"), PathBuf::from("/tmp/custom.toml"));
+    fn lake_root_destination_is_the_tracked_file_there() {
+        let args = parse(&["init", "--lake-root", "/work/project"]).expect("lake root parses");
+        assert_eq!(resolve_dest(&args), PathBuf::from("/work/project/lean-host-mcp.toml"));
     }
 
     #[test]
-    fn home_and_path_conflict() {
-        let err = parse(&["init", "--home", "--path", "/tmp/x.toml"]).expect_err("home + path conflict");
+    fn explicit_path_is_used_as_given() {
+        let args = parse(&["init", "--path", "/work/custom.toml"]).expect("path parses");
+        assert_eq!(resolve_dest(&args), PathBuf::from("/work/custom.toml"));
+    }
+
+    #[test]
+    fn lake_root_and_path_conflict() {
+        let err = parse(&["init", "--lake-root", "/work", "--path", "/work/x.toml"]).expect_err("conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

@@ -146,7 +146,6 @@ mod tests {
         }
         fn broker(&self) -> Arc<ProjectBroker> {
             ProjectBroker::new(BrokerConfig {
-                config_default: None,
                 env_default: None,
                 cwd: self.root.clone(),
                 max_projects: std::num::NonZeroUsize::new(2).unwrap(),

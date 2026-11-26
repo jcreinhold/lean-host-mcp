@@ -162,7 +162,6 @@ async fn charged_setup_against_peer() -> std::result::Result<(), Box<dyn std::er
     );
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {
-            config_default: None,
             env_default: None,
             cwd: project.clone(),
             max_projects: std::num::NonZeroUsize::MIN,

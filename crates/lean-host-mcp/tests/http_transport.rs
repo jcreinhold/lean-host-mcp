@@ -346,10 +346,7 @@ async fn invalid_http_startup_config_exits() {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
             .args(args)
-            .env(
-                "LEAN_HOST_MCP_CONFIG_DIR",
-                tempfile::tempdir().expect("temp config dir").keep(),
-            )
+            .env_remove("LEAN_HOST_MCP_PROJECT")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -386,7 +383,6 @@ async fn conflicting_writer_aliases_refuse_http_startup_before_opening_state() {
         .arg(&journal)
         .env_remove("LEAN_HOST_MCP_PROJECT")
         .env_remove("LEAN_HOST_MCP_HTTP_PATH")
-        .env("LEAN_HOST_MCP_CONFIG_DIR", root.join("config"))
         .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", &processes)
         .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", &owners)
         .env(WRITER_ENV, root.join("sdk-writer"))
@@ -405,6 +401,50 @@ async fn conflicting_writer_aliases_refuse_http_startup_before_opening_state() {
     for path in [&owners, &processes, &journal] {
         assert!(!path.exists(), "refused startup opened {}", path.display());
     }
+}
+
+#[tokio::test]
+async fn second_server_on_one_store_names_the_first() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let store = scratch.path().join("store");
+    let root_s = root.to_str().unwrap();
+    let first = HttpMcpServer::start_with_env(
+        &[("--lake-root", root_s)],
+        &[("LEAN_HOST_MCP_STORE_DIR", store.to_str().unwrap())],
+    )
+    .await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--lake-root")
+        .arg(&root)
+        .env_remove(WRITER_ENV)
+        .env_remove(LEGACY_WRITER_ENV)
+        .env("LEAN_HOST_MCP_STORE_DIR", &store)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(10), output)
+        .await
+        .expect("the second server must exit instead of serving")
+        .expect("run the second server");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let expected = format!(
+        "another lean-host-mcp (pid {}, lake root {}) holds the store {}; stop it first",
+        first.pid(),
+        root.display(),
+        store.display()
+    );
+    assert!(stderr.contains(&expected), "expected `{expected}` in:\n{stderr}");
+    first.shutdown().await;
 }
 
 #[tokio::test]
@@ -1828,6 +1868,9 @@ struct HttpMcpServer {
     stderr_task: tokio::task::JoinHandle<String>,
     client: reqwest::Client,
     url: String,
+    /// The server's own store, so tests on one Lake root do not share its
+    /// lock. A test that passes `LEAN_HOST_MCP_STORE_DIR` replaces it.
+    _store: tempfile::TempDir,
 }
 
 impl HttpMcpServer {
@@ -1836,7 +1879,7 @@ impl HttpMcpServer {
     }
 
     async fn start_with_env(args: &[(&str, &str)], envs: &[(&str, &str)]) -> Self {
-        let config_dir = tempfile::tempdir().expect("temp config dir").keep();
+        let store = tempfile::tempdir().expect("temp store dir");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command
             .kill_on_drop(true)
@@ -1844,7 +1887,7 @@ impl HttpMcpServer {
             .arg("127.0.0.1:0")
             .env_remove(WRITER_ENV)
             .env_remove(LEGACY_WRITER_ENV)
-            .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
+            .env("LEAN_HOST_MCP_STORE_DIR", store.path())
             .env("RUST_LOG", "warn,lean_host_mcp::transport_http=info")
             .env("NO_COLOR", "1")
             // These tests read `structuredContent` and full telemetry; opt into both.
@@ -1894,7 +1937,12 @@ impl HttpMcpServer {
             stderr_task,
             client: reqwest::Client::new(),
             url: format!("http://{bind}/mcp"),
+            _store: store,
         }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id().expect("running HTTP test server has a pid")
     }
 
     async fn modern_request(&self, method: &str, name: Option<&str>, version: &str, body: Value) -> HttpMcpResponse {
@@ -2384,7 +2432,7 @@ async fn assert_drain_resumes(real_worker: bool) {
         assert_eq!(envelope_status(&response.json), "ok", "{:?}", response.json);
     } else {
         assert!(
-            response.json.to_string().contains("no worker binary for toolchain"),
+            response.json.to_string().contains("no worker for leanprover/lean4:"),
             "{:?}",
             response.json
         );

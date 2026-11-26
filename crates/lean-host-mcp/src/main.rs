@@ -1,10 +1,10 @@
 //! `lean-host-mcp`—Model Context Protocol server hosting Lean 4 via a
 //! supervised [`lean-rs-worker`] child.
 //!
-//! Stdio is the default transport. `--bind` selects Streamable HTTP. With a
-//! Lake project visible from the invocation directory (or one set via
-//! `LEAN_HOST_MCP_PROJECT` / `~/.config/lean-host-mcp/config.toml`), no
-//! project flags are required.
+//! Stdio is the default transport. `--bind` selects Streamable HTTP.
+//! `--lake-root` (or `LEAN_HOST_MCP_PROJECT`) names the primary Lake project;
+//! the server reads its config files from that root and locks its store.
+//! Without it, calls resolve the Lake project above the working directory.
 
 mod transport_http;
 
@@ -22,8 +22,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
 use lean_host_mcp::cli::config_init::{self, ConfigCommand};
+use lean_host_mcp::cli::install::{self, InstallArgs};
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
 use lean_host_mcp::cli::processes::{self, DoctorProcessesArgs};
+use lean_host_mcp::store::{self, StoreLock};
 use lean_host_mcp::{
     BrokerConfig, ConfigFile, LeanHostService, OutputBudgetOverrides, ProjectBroker, ProjectRuntimeConfig,
     ResponseCarrier, TelemetryVerbosity, ToolConfig,
@@ -77,6 +79,8 @@ enum Command {
         #[arg(long)]
         writer: PathBuf,
     },
+    /// Install everything one Lake root needs to serve, and record it in the root's local config.
+    Install(InstallArgs),
     /// Build and install a per-toolchain worker binary.
     InstallWorker(InstallWorkerArgs),
     /// Generate and manage the configuration file.
@@ -157,6 +161,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     match cli.command {
+        Some(Command::Install(args)) => match install::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("lean-host-mcp install: {err:#}");
+                ExitCode::FAILURE
+            }
+        },
         Some(Command::InstallWorker(args)) => match install_worker::run(&args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -487,13 +498,23 @@ fn logging_filter(directives: Option<&str>) -> EnvFilter {
     }
 }
 
-#[allow(clippy::significant_drop_tightening)]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the store lock, broker and service must live until the transport returns"
+)]
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    // Merged config file (project-local `lean-host-mcp.toml` over the home
-    // file). It is the layer beneath env/CLI: each knob is CLI > env > file >
-    // default.
-    let (file, home_primary) = ConfigFile::load_for_server(&cwd);
+    let lake_root = args
+        .lake_root
+        .as_deref()
+        .map(|root| {
+            root.canonicalize()
+                .with_context(|| format!("--lake-root {}", root.display()))
+        })
+        .transpose()?;
+    // The config files of the Lake root, local over tracked. They are the
+    // layer beneath env/CLI: each knob is CLI > env > local > tracked > default.
+    let file = ConfigFile::load(lake_root.as_deref());
     // Transport: clap already folds CLI-or-env into `args.*`, so `.or(file)`
     // yields CLI > env > file. The file's `bind` is a raw string, parsed here so
     // the library config schema stays transport-type-free.
@@ -510,25 +531,28 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let http_path = args.http_path.clone().or_else(|| file.server.http_path.clone());
     let http = http_config(bind, http_path.as_deref())?;
 
-    let env_default = args.lake_root;
-    let config_default = file.primary_project.clone();
     let (max_projects, idle_timeout) = BrokerConfig::pool_from_env_with_file(&file.broker)?;
     let (max_workers, max_workers_per_project) = BrokerConfig::worker_limits_from_file(&file.broker, max_projects)?;
     let max_projects = max_workers; // Legacy internal name; the limit counts worker processes.
-    let approved = env_default.clone().or(home_primary);
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?
-        .with_operator_primary(approved.as_deref())?
+        .with_operator_primary(lake_root.as_deref())?
         .with_verification_input(args.verification_approval)?
         .with_prepared_generation(args.prepared_generation)?
         .with_module_setup_writer(args.module_setup_writer, args.module_setup_storage_request)?;
     let tool_config = resolve_tool_config(&file)?;
+    // One server per store. Take the lock after the config checks, so a bad
+    // config leaves the store alone, and before the broker, the process record
+    // and the journal open.
+    let _store = lake_root
+        .as_deref()
+        .map(|root| StoreLock::acquire(&store::store_dir(root, None), root))
+        .transpose()?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
     let http_path_log = http.as_ref().map(|config| config.path.as_str());
 
     tracing::info!(
-        env_default = ?env_default,
-        config_default = ?config_default,
+        lake_root = ?lake_root,
         cwd = %cwd.display(),
         max_workers = %max_projects,
         max_workers_per_project = %max_workers_per_project,
@@ -544,8 +568,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let broker = build_broker(
         BrokerConfig {
-            config_default,
-            env_default,
+            env_default: lake_root,
             cwd,
             max_projects,
             max_workers_per_project,
@@ -754,7 +777,7 @@ fn validate_http_path(path: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests assert the branch under test directly")]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -814,7 +837,7 @@ mod tests {
         .expect("local settings");
         let cli = Cli::parse_from(["lean-host-mcp"]);
         assert!(cli.serve.verification_approval.is_none());
-        let (config, _) = ConfigFile::load_for_server(&project);
+        let config = ConfigFile::load(Some(&project));
         let runtime = ProjectRuntimeConfig::from_env_with_file(&config.runtime, 1)
             .expect("runtime")
             .with_operator_primary(Some(&project))

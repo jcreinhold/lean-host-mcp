@@ -8,19 +8,19 @@
 //!   either the bare short form or the elan-style `leanprover/lean4:<id>`.
 //!   [`ToolchainId::from_lake_root`] reads `<root>/lean-toolchain` and parses it.
 //! - [`WorkerBinary`] is the resolved path to a worker binary that links
-//!   the corresponding Lean shared library.
-//!   [`WorkerBinary::resolve_for`] consults (in order) the
-//!   `LEAN_HOST_MCP_WORKERS_DIR` developer override, then
-//!   `<install_root>/<id>/lean-host-mcp-worker`. Missing produces an
-//!   actionable [`ToolchainError::WorkerNotInstalled`] whose `install_cmd`
-//!   field names the exact `install-worker` invocation that will produce it.
+//!   the corresponding Lean shared library. It lives in the worker directory
+//!   [`workers_dir`] picks for a Lake root, at
+//!   `<dir>/<id>/lean-host-mcp-worker` (or a bare `<dir>/lean-host-mcp-worker`
+//!   for a developer build).
 //! - [`ToolchainError`] is the typed failure surface. Project-open code
-//!   maps it into [`crate::error::ServerError::BadProject`] so the install
-//!   command flows through to the client.
+//!   maps it into [`crate::error::ServerError::BadProject`] with the
+//!   [`install_fix`] command, so the fix flows through to the client.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::config_file::{self, ConfigFile};
 use crate::smoke::SmokeOutcome;
 
 /// Canonical short form of a Lean toolchain pin (e.g. `v4.30.0`,
@@ -28,13 +28,57 @@ use crate::smoke::SmokeOutcome;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ToolchainId(String);
 
-/// File name of the per-toolchain worker binary inside
-/// [`WorkerBinary::install_root`].
+/// File name of the per-toolchain worker binary inside a worker directory.
 pub const WORKER_FILE_NAME: &str = "lean-host-mcp-worker";
 
-/// Env var that lets a developer running `cargo run` point the parent at
-/// a worker binary outside the standard install layout.
+/// Env var that overrides the worker directory for every Lake root, for
+/// example to serve a worker built in this checkout. It beats the config
+/// files' `[install] workers_dir`.
 pub const WORKERS_DIR_ENV: &str = "LEAN_HOST_MCP_WORKERS_DIR";
+
+/// The worker directory for Lake root `root`: `flag` (a CLI flag), then
+/// `LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir` from the root's
+/// config files, then `<root>/.local/lean-host-mcp/workers`.
+///
+/// `install`, `install-worker` and the server all pick the directory here, so
+/// the server looks where install put the worker.
+#[must_use]
+pub fn workers_dir(root: &Path, flag: Option<&Path>) -> PathBuf {
+    workers_dir_with(root, flag, std::env::var_os(WORKERS_DIR_ENV))
+}
+
+/// [`workers_dir`] with the env var's value passed in.
+pub(crate) fn workers_dir_with(root: &Path, flag: Option<&Path>, env: Option<OsString>) -> PathBuf {
+    config_file::pick_dir(
+        flag,
+        env,
+        || ConfigFile::load(Some(root)).install.workers_dir(root),
+        || config_file::local_dir(root).join("workers"),
+    )
+}
+
+/// The command that installs what Lake root `root` needs to serve:
+/// `<this executable> install --lake-root <root>`, quoted for a POSIX shell.
+#[must_use]
+pub fn install_fix(root: &Path) -> String {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("lean-host-mcp"));
+    format!(
+        "{} install --lake-root {}",
+        shell_word(&exe.to_string_lossy()),
+        shell_word(&root.to_string_lossy())
+    )
+}
+
+/// `word` as one POSIX shell word: unchanged when it holds only safe
+/// characters, else single-quoted.
+pub(crate) fn shell_word(word: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
 
 impl ToolchainId {
     /// Parse from a `lean-toolchain` line. Accepts the elan-style
@@ -135,7 +179,7 @@ impl ToolchainId {
     /// [`WindowVerdict::Unknown`] — allowed, never a crash.
     ///
     /// Used by `install-worker` *before* it spends minutes building (the
-    /// worker does not exist yet, so the full [`WorkerBinary::resolve_ready_for`]
+    /// worker does not exist yet, so the full [`WorkerBinary::resolve_ready`]
     /// gate cannot answer), by `--list`, and internally by the gate.
     #[must_use]
     pub fn window_verdict(&self) -> WindowVerdict {
@@ -167,47 +211,31 @@ pub struct WorkerBinary {
 }
 
 impl WorkerBinary {
-    /// Look up the worker binary for `toolchain`.
-    ///
-    /// Resolution order:
-    ///
-    /// 1. If `LEAN_HOST_MCP_WORKERS_DIR` is set and
-    ///    `<dir>/lean-host-mcp-worker` exists, return that.
-    /// 2. If `LEAN_HOST_MCP_WORKERS_DIR` is set and
-    ///    `<dir>/<id>/lean-host-mcp-worker` exists, return that.
-    /// 3. Otherwise look under [`Self::install_root`].
+    /// Look up the worker binary for `toolchain` in the worker directory
+    /// `dir`: a bare developer build at `<dir>/lean-host-mcp-worker` wins,
+    /// else the selected generation of `<dir>/<id>/`.
     ///
     /// # Errors
     ///
     /// [`ToolchainError::WorkerNotInstalled`] when no candidate exists.
-    /// The error carries the exact `install-worker` command needed to fix
-    /// the situation.
-    pub fn resolve_for(toolchain: &ToolchainId) -> Result<Self, ToolchainError> {
-        let override_dir = std::env::var_os(WORKERS_DIR_ENV).map(PathBuf::from);
-        Self::resolve_with_override(toolchain, override_dir.as_deref())
+    pub fn resolve_in(toolchain: &ToolchainId, dir: &Path) -> Result<Self, ToolchainError> {
+        Self::resolve_location(toolchain, dir).map(|(worker, _)| worker)
     }
 
-    /// Resolution variant that lets the caller inject the
-    /// `LEAN_HOST_MCP_WORKERS_DIR` value rather than reading the env.
-    /// Used by the test suite (env mutation is forbidden by the
-    /// workspace `unsafe-code` lint) and by tooling that wants to
-    /// override resolution without touching the process environment.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::resolve_for`].
-    pub fn resolve_with_override(toolchain: &ToolchainId, override_dir: Option<&Path>) -> Result<Self, ToolchainError> {
-        Self::resolve_location(toolchain, override_dir).map(|(worker, _)| worker)
-    }
-
-    fn resolve_location(toolchain: &ToolchainId, override_dir: Option<&Path>) -> Result<(Self, bool), ToolchainError> {
-        let root = override_dir.map_or_else(Self::install_root, Path::to_path_buf);
-        let direct = override_dir.is_some() && root.join(WORKER_FILE_NAME).is_file();
-        let slot = if direct { root } else { root.join(toolchain.as_str()) };
-        let generation = Self::selected_dir(&slot).map_err(|_| Self::not_installed(toolchain))?;
+    fn resolve_location(toolchain: &ToolchainId, dir: &Path) -> Result<(Self, bool), ToolchainError> {
+        let not_installed = || ToolchainError::WorkerNotInstalled {
+            toolchain: toolchain.clone(),
+            dir: dir.to_path_buf(),
+        };
+        let slot = if dir.join(WORKER_FILE_NAME).is_file() {
+            dir.to_path_buf()
+        } else {
+            dir.join(toolchain.as_str())
+        };
+        let generation = Self::selected_dir(&slot).map_err(|_| not_installed())?;
         let path = generation.join(WORKER_FILE_NAME);
         if !path.is_file() {
-            return Err(Self::not_installed(toolchain));
+            return Err(not_installed());
         }
         Ok((
             Self {
@@ -246,27 +274,6 @@ impl WorkerBinary {
         Ok(path)
     }
 
-    /// `~/.local/share/lean-host-mcp/workers` (or
-    /// `$XDG_DATA_HOME/lean-host-mcp/workers`).
-    ///
-    /// Falls back to the current directory if no data dir can be located;
-    /// the calling code will then fail soon after with a concrete
-    /// `WorkerNotInstalled`.
-    #[must_use]
-    pub fn install_root() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("lean-host-mcp")
-            .join("workers")
-    }
-
-    fn not_installed(toolchain: &ToolchainId) -> ToolchainError {
-        ToolchainError::WorkerNotInstalled {
-            toolchain: toolchain.clone(),
-            install_cmd: install_cmd(toolchain),
-        }
-    }
-
     /// The one answer project-open needs about a pinned toolchain: window
     /// membership, elan + worker install presence, and header-digest
     /// provenance, folded into a single [`Readiness`] verdict the caller maps
@@ -275,7 +282,7 @@ impl WorkerBinary {
     /// This hides five independently-volatile decisions behind one call — the
     /// window source ([`ToolchainId::window_verdict`]), the elan layout
     /// ([`ToolchainId::elan_dir`]), the worker install layout
-    /// ([`Self::resolve_with_override`]), the header-digest provenance
+    /// ([`Self::resolve_in`]), the header-digest provenance
     /// mechanism, and the recorded runtime smoke result (both via the private
     /// `WorkerSidecar`) — so no call site consults a classifier and a separate
     /// provenance check. An out-of-window pin short-circuits before any
@@ -284,10 +291,10 @@ impl WorkerBinary {
     ///
     /// On the happy path it hashes `<elan_dir>/include/lean/lean.h` once (a
     /// few-KB SHA-256); this belongs on the cold resolve/open path, not the
-    /// warm per-call path. The `LEAN_HOST_MCP_WORKERS_DIR` override is read
-    /// from the environment.
+    /// warm per-call path. `dir` is the worker directory and `fix` the command
+    /// that soft advisories name.
     #[must_use]
-    pub fn resolve_ready_for(pin: &ToolchainId) -> Readiness {
+    pub fn resolve_ready(pin: &ToolchainId, dir: &Path, fix: &str) -> Readiness {
         // Window first: an out-of-window pin can never load, and the bogus
         // toolchain is usually not installed, so checking elan first would
         // bury the useful "outside the window" message.
@@ -307,20 +314,19 @@ impl WorkerBinary {
             }
         };
         let current = hash_lean_header(&elan_dir).ok();
-        let override_dir = std::env::var_os(WORKERS_DIR_ENV).map(PathBuf::from);
-        Self::resolve_ready_with_override(pin, override_dir.as_deref(), elan_dir, current.as_deref())
+        Self::resolve_ready_with(pin, dir, fix, elan_dir, current.as_deref())
     }
 
-    /// Resolution variant that injects the `LEAN_HOST_MCP_WORKERS_DIR` value,
-    /// the resolved `lean_sysroot` (the toolchain's `elan_dir`), and the
-    /// already-computed current `lean.h` digest rather than reading the
-    /// environment and filesystem. Mirrors [`Self::resolve_with_override`];
-    /// the test suite drives the gate's window/install/provenance logic
-    /// through this seam without a real toolchain on disk.
+    /// [`Self::resolve_ready`] with the resolved `lean_sysroot` (the
+    /// toolchain's `elan_dir`) and the already-computed current `lean.h`
+    /// digest injected rather than read from the filesystem. The test suite
+    /// drives the gate's window/install/provenance logic through this seam
+    /// without a real toolchain on disk.
     #[must_use]
-    pub fn resolve_ready_with_override(
+    pub fn resolve_ready_with(
         pin: &ToolchainId,
-        override_dir: Option<&Path>,
+        dir: &Path,
+        fix: &str,
         lean_sysroot: PathBuf,
         current_digest: Option<&str>,
     ) -> Readiness {
@@ -330,11 +336,8 @@ impl WorkerBinary {
         if let WindowVerdict::OutOfWindow { window, nearest } = window {
             return Readiness::Unsupported { window, nearest };
         }
-        let Ok((worker, selected_generation)) = Self::resolve_location(pin, override_dir) else {
-            return Readiness::NotInstalled {
-                toolchain: pin.clone(),
-                install_cmd: install_cmd(pin),
-            };
+        let Ok((worker, selected_generation)) = Self::resolve_location(pin, dir) else {
+            return Readiness::NotInstalled { toolchain: pin.clone() };
         };
         // Provenance, in order of severity:
         //   1. header drift     → Stale
@@ -362,7 +365,6 @@ impl WorkerBinary {
                 return Readiness::Unusable {
                     toolchain: pin.clone(),
                     detail: "selected worker generation is incomplete or differs from its installed deployment".into(),
-                    install_cmd: install_cmd(pin),
                 };
             }
         }
@@ -375,10 +377,7 @@ impl WorkerBinary {
                 if let Some(current) = current_digest
                     && !sidecar.header_matches(current)
                 {
-                    return Readiness::Stale {
-                        toolchain: pin.clone(),
-                        install_cmd: install_cmd(pin),
-                    };
+                    return Readiness::Stale { toolchain: pin.clone() };
                 }
                 if let Some(worker_protocol) = sidecar.protocol_version()
                     && worker_protocol != lean_rs_worker_protocol::protocol::PROTOCOL_VERSION
@@ -387,7 +386,6 @@ impl WorkerBinary {
                         toolchain: pin.clone(),
                         worker_protocol,
                         host_protocol: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
-                        install_cmd: install_cmd(pin),
                     };
                 }
                 match sidecar.smoke() {
@@ -398,7 +396,6 @@ impl WorkerBinary {
                         return Readiness::Unusable {
                             toolchain: pin.clone(),
                             detail: detail.to_owned(),
-                            install_cmd: install_cmd(pin),
                         };
                     }
                     Some(SmokeOutcome::Passed) => None,
@@ -407,8 +404,7 @@ impl WorkerBinary {
                     // runtime — nudge a reinstall to record a smoke result.
                     None => Some(format!(
                         "worker for {pin} has no runtime smoke record (installed by an older host); \
-                         reinstall to verify it can run: {}",
-                        install_cmd(pin)
+                         reinstall to verify it can run: {fix}"
                     )),
                 }
             }
@@ -416,8 +412,7 @@ impl WorkerBinary {
             // just unknown provenance worth a soft nudge to reinstall.
             None => Some(format!(
                 "worker for {pin} has no provenance record (installed by an older host); \
-                 reinstall to enable header-drift detection: {}",
-                install_cmd(pin)
+                 reinstall to enable header-drift detection: {fix}"
             )),
         };
         if matches!(window, WindowVerdict::Unknown) {
@@ -433,12 +428,6 @@ impl WorkerBinary {
             note,
         }
     }
-}
-
-/// `lean-host-mcp install-worker --toolchain <id>` — the exact command that
-/// produces a missing or stale worker for `toolchain`.
-fn install_cmd(toolchain: &ToolchainId) -> String {
-    format!("lean-host-mcp install-worker --toolchain {}", toolchain.as_str())
 }
 
 /// Where a pin sits relative to the lean-rs supported window. Pure data
@@ -474,7 +463,7 @@ impl WindowVerdict {
 
 /// Single verdict for a pinned toolchain at project-open time.
 ///
-/// Produced by [`WorkerBinary::resolve_ready_for`]; each variant maps to
+/// Produced by [`WorkerBinary::resolve_ready`]; each variant maps to
 /// exactly one caller outcome (spawn, warn-and-spawn, or a typed
 /// `BadProject`).
 #[derive(Debug)]
@@ -492,17 +481,13 @@ pub enum Readiness {
     /// the nearest supported version.
     Unsupported { window: String, nearest: String },
     /// The toolchain's `lean.h` changed since the worker was built: rebuild it.
-    Stale {
-        toolchain: ToolchainId,
-        install_cmd: String,
-    },
+    Stale { toolchain: ToolchainId },
     /// The installed worker records a different wire protocol. Refuse it
     /// before spawn and provide the exact reinstall action.
     Incompatible {
         toolchain: ToolchainId,
         worker_protocol: u16,
         host_protocol: u16,
-        install_cmd: String,
     },
     /// The worker built and its header digest matches, but it failed its
     /// post-build runtime smoke test — the toolchain's `libleanshared` is
@@ -510,16 +495,9 @@ pub enum Readiness {
     /// loads Lean. `detail` is the recorded failure (e.g. `signal: 11
     /// (SIGSEGV)`). A hard verdict: serving it would only produce per-call
     /// `runtime_unavailable` crashes.
-    Unusable {
-        toolchain: ToolchainId,
-        detail: String,
-        install_cmd: String,
-    },
+    Unusable { toolchain: ToolchainId, detail: String },
     /// No worker binary installed for this pin.
-    NotInstalled {
-        toolchain: ToolchainId,
-        install_cmd: String,
-    },
+    NotInstalled { toolchain: ToolchainId },
     /// The pinned elan toolchain itself is not installed under `~/.elan`.
     ToolchainNotInstalled { toolchain: ToolchainId, elan_dir: PathBuf },
     /// Pin is installed and header-fresh but unrecognized (`nightly-*`):
@@ -636,12 +614,12 @@ pub(crate) fn hash_lean_header(elan_dir: &Path) -> std::io::Result<String> {
 }
 
 /// File name of the per-worker provenance sidecar inside
-/// `<install_root>/<id>/`.
+/// `<workers_dir>/<id>/`.
 const SIDECAR_FILE_NAME: &str = "worker.json";
 
 /// Private provenance record written next to an installed worker binary.
 ///
-/// Records what the worker was built against so [`WorkerBinary::resolve_ready_for`]
+/// Records what the worker was built against so [`WorkerBinary::resolve_ready`]
 /// can detect header drift (the toolchain's `lean.h` changing under a worker
 /// that keeps being selected). Fields stay private; callers go through the
 /// query methods.
@@ -862,14 +840,8 @@ impl WorkerSidecar {
 pub enum ToolchainError {
     UnparseableToolchainString(String),
     LeanToolchainFileMissing(PathBuf),
-    ElanToolchainNotInstalled {
-        toolchain: ToolchainId,
-        elan_dir: PathBuf,
-    },
-    WorkerNotInstalled {
-        toolchain: ToolchainId,
-        install_cmd: String,
-    },
+    ElanToolchainNotInstalled { toolchain: ToolchainId, elan_dir: PathBuf },
+    WorkerNotInstalled { toolchain: ToolchainId, dir: PathBuf },
 }
 
 impl fmt::Display for ToolchainError {
@@ -887,8 +859,8 @@ impl fmt::Display for ToolchainError {
                 toolchain,
                 elan_dir.display()
             ),
-            Self::WorkerNotInstalled { toolchain, install_cmd } => {
-                write!(f, "no worker binary for toolchain {toolchain}; run: {install_cmd}")
+            Self::WorkerNotInstalled { toolchain, dir } => {
+                write!(f, "no worker for leanprover/lean4:{toolchain} in {}", dir.display())
             }
         }
     }
@@ -907,6 +879,9 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    /// The fix command the readiness tests pass; notes must repeat it.
+    const FIX: &str = "lean-host-mcp install --lake-root /project";
 
     #[test]
     fn parse_accepts_elan_prefix_and_bare_short_form() {
@@ -960,20 +935,45 @@ mod tests {
     }
 
     #[test]
-    fn worker_binary_missing_under_override_returns_install_cmd() {
+    fn missing_worker_names_the_toolchain_and_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("v4.30.0").unwrap();
-        let err = WorkerBinary::resolve_with_override(&id, Some(tmp.path())).unwrap_err();
-        match err {
-            ToolchainError::WorkerNotInstalled { install_cmd, .. } => {
-                assert!(install_cmd.contains("v4.30.0"), "got: {install_cmd}");
-            }
-            ToolchainError::UnparseableToolchainString(_)
-            | ToolchainError::LeanToolchainFileMissing(_)
-            | ToolchainError::ElanToolchainNotInstalled { .. } => {
-                panic!("unexpected ToolchainError variant");
-            }
-        }
+        let err = WorkerBinary::resolve_in(&id, tmp.path()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("no worker for leanprover/lean4:v4.30.0 in {}", tmp.path().display())
+        );
+    }
+
+    #[test]
+    fn workers_dir_reads_the_lake_root_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pick = |flag: Option<&Path>| workers_dir_with(root, flag, None);
+        assert_eq!(pick(None), root.join(".local/lean-host-mcp/workers"));
+        fs::write(root.join("lean-host-mcp.toml"), "[install]\nworkers_dir = 'tracked'\n").unwrap();
+        assert_eq!(pick(None), root.join("tracked"));
+        config_file::ensure_local_dir(root).unwrap();
+        fs::write(
+            config_file::local_file(root),
+            "[install]\nworkers_dir = '/local/workers'\n",
+        )
+        .unwrap();
+        assert_eq!(pick(None), Path::new("/local/workers"));
+        assert_eq!(
+            workers_dir_with(root, None, Some("/env".into())),
+            Path::new("/env"),
+            "the env var beats both files"
+        );
+        assert_eq!(pick(Some(Path::new("/flag"))), Path::new("/flag"));
+    }
+
+    #[test]
+    fn install_fix_is_one_shell_command() {
+        let fix = install_fix(Path::new("/work/my project"));
+        assert!(fix.ends_with(" install --lake-root '/work/my project'"), "got: {fix}");
+        assert_eq!(shell_word("/plain/path-1.2"), "/plain/path-1.2");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
     }
 
     #[test]
@@ -983,7 +983,7 @@ mod tests {
         let nested = tmp.path().join("v4.30.0");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        let resolved = WorkerBinary::resolve_with_override(&id, Some(tmp.path())).unwrap();
+        let resolved = WorkerBinary::resolve_in(&id, tmp.path()).unwrap();
         assert_eq!(resolved.path, nested.join(WORKER_FILE_NAME));
     }
 
@@ -992,7 +992,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = ToolchainId::parse("v4.30.0").unwrap();
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
-        let resolved = WorkerBinary::resolve_with_override(&id, Some(tmp.path())).unwrap();
+        let resolved = WorkerBinary::resolve_in(&id, tmp.path()).unwrap();
         assert_eq!(resolved.path, tmp.path().join(WORKER_FILE_NAME));
     }
 
@@ -1168,9 +1168,7 @@ mod tests {
         fs::write(slot.join("current-generation"), "generation-example").unwrap();
         let worker = generation.join(WORKER_FILE_NAME);
         fs::write(&worker, b"qualified worker").unwrap();
-        let ready = || {
-            WorkerBinary::resolve_ready_with_override(&pin, Some(root.path()), root.path().to_owned(), Some("header"))
-        };
+        let ready = || WorkerBinary::resolve_ready_with(&pin, root.path(), FIX, root.path().to_owned(), Some("header"));
         assert!(matches!(ready(), Readiness::Unusable { .. }));
         let digest = crate::cli::install_worker::sha256_prefix(&worker, 64).unwrap();
         let mut record = WorkerSidecar::candidate(&pin, "header".into(), Some(digest.clone()));
@@ -1211,7 +1209,7 @@ mod tests {
         )
         .unwrap();
         let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
         let Readiness::Unusable { detail, .. } = readiness else {
             panic!("expected Unusable, got {readiness:?}");
         };
@@ -1231,11 +1229,11 @@ mod tests {
         );
         fs::write(tmp.path().join(SIDECAR_FILE_NAME), legacy).unwrap();
         let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
         let Readiness::Ready { note: Some(note), .. } = readiness else {
             panic!("expected Ready with a reinstall note, got {readiness:?}");
         };
-        assert!(note.contains("smoke"), "got: {note}");
+        assert!(note.contains("smoke") && note.ends_with(FIX), "got: {note}");
     }
 
     #[test]
@@ -1245,7 +1243,7 @@ mod tests {
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
         WorkerSidecar::record(tmp.path(), &id, "digest".to_owned(), SmokeOutcome::Passed).unwrap();
         let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
         assert!(
             matches!(readiness, Readiness::Ready { note: None, .. }),
             "expected Ready with no note, got {readiness:?}"
@@ -1286,7 +1284,7 @@ mod tests {
         );
         fs::write(tmp.path().join(SIDECAR_FILE_NAME), skewed).unwrap();
         let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("digest"));
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("digest"));
         assert!(
             matches!(readiness, Readiness::Ready { note: None, .. }),
             "expected compatible package skew to be silent, got {readiness:?}"
@@ -1304,7 +1302,7 @@ mod tests {
         );
         fs::write(tmp.path().join(SIDECAR_FILE_NAME), skewed).unwrap();
         let readiness =
-            WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), tmp.path().to_path_buf(), Some("digest"));
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, tmp.path().to_path_buf(), Some("digest"));
         assert!(matches!(
             readiness,
             Readiness::Incompatible {
@@ -1322,7 +1320,7 @@ mod tests {
         WorkerSidecar::record(tmp.path(), &id, "built-digest".to_owned(), SmokeOutcome::Passed).unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("drifted-digest")),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("drifted-digest")),
             Readiness::Stale { .. }
         ));
     }
@@ -1333,11 +1331,11 @@ mod tests {
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
         fs::write(tmp.path().join(WORKER_FILE_NAME), b"#!/bin/sh\n").unwrap();
         let sysroot = tmp.path().to_path_buf();
-        let readiness = WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("whatever"));
+        let readiness = WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("whatever"));
         let Readiness::Ready { note: Some(note), .. } = readiness else {
             panic!("expected Ready with a soft note, got {readiness:?}");
         };
-        assert!(note.contains("provenance"), "got: {note}");
+        assert!(note.contains("provenance") && note.ends_with(FIX), "got: {note}");
     }
 
     #[test]
@@ -1348,7 +1346,7 @@ mod tests {
         WorkerSidecar::record(tmp.path(), &id, "d".to_owned(), SmokeOutcome::Passed).unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, Some("d")),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, Some("d")),
             Readiness::UnknownPin { .. }
         ));
     }
@@ -1359,7 +1357,7 @@ mod tests {
         let id = ToolchainId::parse(&format!("v{}", window_bounds().1)).unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, None),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, None),
             Readiness::NotInstalled { .. }
         ));
     }
@@ -1371,7 +1369,7 @@ mod tests {
         let id = ToolchainId::parse("v0.0.0").unwrap();
         let sysroot = tmp.path().to_path_buf();
         assert!(matches!(
-            WorkerBinary::resolve_ready_with_override(&id, Some(tmp.path()), sysroot, None),
+            WorkerBinary::resolve_ready_with(&id, tmp.path(), FIX, sysroot, None),
             Readiness::Unsupported { .. }
         ));
     }

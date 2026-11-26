@@ -10,14 +10,13 @@
 //! default to the built-in constant it documents, and another asserts the
 //! committed docs table matches what this module renders.
 //!
-//! The schema *structs* and discovery/merge live next door in
+//! The schema *structs* and the file loading live next door in
 //! [`crate::config_file`]; this module is their human-facing companion.
 
 /// One configuration knob: everything a reader or a generator needs to know
 /// about it, in one place.
 struct FieldDoc {
-    /// Dotted TOML path, e.g. `"runtime.worker_rss_post_job_restart_kib"`. A
-    /// key with no `.` is a top-level key (only `primary_project`).
+    /// Dotted TOML path, e.g. `"runtime.request_timeout_millis"`.
     key: &'static str,
     /// Human-readable type and unit, e.g. `"integer (KiB)"`.
     ty: &'static str,
@@ -26,12 +25,13 @@ struct FieldDoc {
     /// is that default; for an optional knob it is an illustrative example.
     value: &'static str,
     /// Whether the generated file comments the line out. `true` for optional
-    /// knobs that have no built-in default (their absence selects a behaviour —
-    /// stdio, cwd-resolved project), so a fresh file changes nothing until the
-    /// user opts in.
+    /// knobs that have no built-in literal default (their absence selects a
+    /// behaviour, such as stdio or a path under the Lake root), so a fresh file
+    /// changes nothing until the user opts in.
     commented: bool,
-    /// The env var, and CLI flag where one exists, that override this knob.
-    /// Precedence is CLI flag > env var > file > built-in default.
+    /// The env var, and CLI flag where one exists, that override this knob;
+    /// empty when nothing does. Precedence is CLI flag > env var > local file >
+    /// tracked file > built-in default.
     overrides: &'static str,
     /// One-line description. Single line so it serves both the file comment and
     /// the Markdown table cell; must not contain `|`.
@@ -39,16 +39,8 @@ struct FieldDoc {
 }
 
 /// Every knob, in the order it appears in the generated file and docs table:
-/// the top-level project default, then `[runtime]`, `[broker]`, `[server]`.
+/// `[runtime]`, `[broker]`, `[server]`, `[telemetry]`, `[output]`, `[install]`.
 const SCHEMA_FIELDS: &[FieldDoc] = &[
-    FieldDoc {
-        key: "primary_project",
-        ty: "path",
-        value: "\"/abs/path/to/lake/project\"",
-        commented: true,
-        overrides: "--lake-root / LEAN_HOST_MCP_PROJECT",
-        description: "Default Lake project for calls that omit an explicit project= argument. Lowest-priority fallback, after the flag/env and the nearest lakefile above the working directory.",
-    },
     // ---- [runtime] — worker memory + lifecycle --------------------------
     FieldDoc {
         key: "runtime.lean_max_memory_kib",
@@ -198,6 +190,31 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         overrides: "LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS",
         description: "Worker-call CPU time above which every tool response carries a warning naming the elapsed milliseconds and recommending refactoring (splitting the declaration, explicit type annotations, extracted lemmas). Keys on call_cpu_millis, not wallclock, so machine contention never triggers it. Default 10 s.",
     },
+    // ---- [install] — paths `lean-host-mcp install` records ---------------
+    FieldDoc {
+        key: "install.binary",
+        ty: "path",
+        value: "\"/abs/path/to/project/.local/lean-host-mcp/bin/lean-host-mcp\"",
+        commented: true,
+        overrides: "",
+        description: "The server executable that install copied, for MCP client configs and scripts that run the server by absolute path. The server itself ignores it.",
+    },
+    FieldDoc {
+        key: "install.workers_dir",
+        ty: "path",
+        value: "\"/abs/path/to/project/.local/lean-host-mcp/workers\"",
+        commented: true,
+        overrides: "LEAN_HOST_MCP_WORKERS_DIR",
+        description: "Directory of per-toolchain worker installs, shared by install, install-worker and the server. Unset uses .local/lean-host-mcp/workers under the Lake root. A relative path is relative to the Lake root.",
+    },
+    FieldDoc {
+        key: "install.store_dir",
+        ty: "path",
+        value: "\"/abs/path/to/project/.local/lean-host-mcp/store\"",
+        commented: true,
+        overrides: "LEAN_HOST_MCP_STORE_DIR",
+        description: "Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root.",
+    },
 ];
 
 /// Split a dotted key into `(table, leaf)`. A top-level key (no `.`) returns an
@@ -209,20 +226,21 @@ fn split_key(key: &str) -> (&str, &str) {
 /// Render the documented starter config `config init` writes.
 ///
 /// Every knob with a built-in default is emitted active at that default;
-/// optional knobs with no default (`primary_project`, `server.bind`,
-/// `server.http_path`) are emitted commented out, so a freshly-generated file
-/// reproduces the current defaults and changes nothing until edited.
+/// optional knobs with no literal default (`server.bind`, `server.http_path`,
+/// the `[install]` paths) are emitted commented out, so a freshly-generated
+/// file reproduces the current defaults and changes nothing until edited.
 #[must_use]
 pub fn render_default_toml() -> String {
     let mut out = String::with_capacity(4096);
     out.push_str(
         "# lean-host-mcp configuration. Generated by `lean-host-mcp config init`.\n\
          #\n\
-         # Place this file at `lean-host-mcp.toml` in (or above) the directory you\n\
-         # launch the server from, or at `~/.config/lean-host-mcp/config.toml` for a\n\
-         # per-user default. When both exist they merge per key, the local file\n\
-         # winning. Precedence for every knob is: CLI flag > env var > this file >\n\
-         # built-in default, so an env var still overrides what you set here.\n\
+         # The server reads `lean-host-mcp.toml` at its Lake root (`--lake-root`),\n\
+         # then `.local/lean-host-mcp/config.toml` under the same root, which\n\
+         # `lean-host-mcp install` writes. The two merge per key and the local\n\
+         # file wins. Precedence for every knob is: CLI flag > env var > local\n\
+         # file > tracked file > built-in default, so an env var still overrides\n\
+         # what you set here.\n\
          #\n\
          # Active lines below are set to the current built-in defaults. Commented\n\
          # lines are optional knobs with no default; uncomment to opt in.\n",
@@ -248,8 +266,10 @@ pub fn render_default_toml() -> String {
         out.push_str(field.description);
         out.push_str("\n# Type: ");
         out.push_str(field.ty);
-        out.push_str(". Override: ");
-        out.push_str(field.overrides);
+        if !field.overrides.is_empty() {
+            out.push_str(". Override: ");
+            out.push_str(field.overrides);
+        }
         out.push_str(".\n");
         if field.commented {
             out.push_str("# ");
@@ -276,15 +296,20 @@ pub fn render_reference_table() -> String {
         } else {
             format!("`{}`", field.value)
         };
+        let overrides = if field.overrides.is_empty() {
+            "none".to_owned()
+        } else {
+            format!("`{}`", field.overrides)
+        };
         out.push_str("| `");
         out.push_str(field.key);
         out.push_str("` | ");
         out.push_str(field.ty);
         out.push_str(" | ");
         out.push_str(&default);
-        out.push_str(" | `");
-        out.push_str(field.overrides);
-        out.push_str("` | ");
+        out.push_str(" | ");
+        out.push_str(&overrides);
+        out.push_str(" | ");
         out.push_str(field.description);
         out.push_str(" |\n");
     }
@@ -323,9 +348,11 @@ mod tests {
         let config: ConfigFile =
             toml::from_str(&toml).unwrap_or_else(|e| panic!("generated TOML is invalid: {e}\n{toml}"));
         // The optional, commented knobs stay unset.
-        assert!(config.primary_project.is_none());
         assert!(config.server.bind.is_none());
         assert!(config.server.http_path.is_none());
+        assert!(config.install.binary.is_none());
+        assert!(config.install.workers_dir.is_none());
+        assert!(config.install.store_dir.is_none());
     }
 
     /// Each active default in the catalogue must equal the built-in constant it

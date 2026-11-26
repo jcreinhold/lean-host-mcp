@@ -1,6 +1,9 @@
-//! `lean-host-mcp install-worker`: build the worker binary against a
-//! specific Lean toolchain and place it under
-//! [`WorkerBinary::install_root`].
+//! `lean-host-mcp install-worker`: build the worker binary for one Lean
+//! toolchain and place it in a worker directory.
+//!
+//! The directory is `--workers-dir`, else the one
+//! [`crate::toolchain::workers_dir`] picks for `--lake-root`. Without either,
+//! `LEAN_HOST_MCP_WORKERS_DIR` must name it.
 //!
 //! Actions:
 //!
@@ -34,7 +37,10 @@ use std::time::SystemTime;
 use clap::Args;
 use sha2::{Digest, Sha256};
 
-use crate::toolchain::{ToolchainId, WORKER_FILE_NAME, WindowVerdict, WorkerBinary, WorkerSidecar, hash_lean_header};
+use crate::config_file;
+use crate::toolchain::{
+    self, ToolchainId, WORKER_FILE_NAME, WORKERS_DIR_ENV, WindowVerdict, WorkerBinary, WorkerSidecar, hash_lean_header,
+};
 
 /// Flags for `install-worker`.
 ///
@@ -88,9 +94,15 @@ pub struct InstallWorkerArgs {
     #[arg(long)]
     pub force: bool,
 
-    /// Installation root containing per-toolchain generations. Applies to installs and listing.
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["clean", "prune"])]
+    /// Worker directory containing per-toolchain generations. It beats
+    /// `LEAN_HOST_MCP_WORKERS_DIR` and the `--lake-root` config.
+    #[arg(long, value_name = "DIR")]
     pub workers_dir: Option<PathBuf>,
+
+    /// Lake root whose worker directory to use: `LEAN_HOST_MCP_WORKERS_DIR`,
+    /// else its `[install] workers_dir`, else `<root>/.local/lean-host-mcp/workers`.
+    #[arg(long, value_name = "DIR")]
+    pub lake_root: Option<PathBuf>,
 
     /// Extracted lean-rs-host package containing the pinned published shim sources.
     #[arg(long)]
@@ -115,17 +127,17 @@ pub struct InstallWorkerArgs {
 /// a non-zero exit-code-equivalent error when any auto install fails.
 pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     check_arg_combination(args)?;
-    let root = args.workers_dir.clone().unwrap_or_else(WorkerBinary::install_root);
+    let root = workers_root(args)?;
     if args.list {
         return run_list(&root);
     }
     if args.prune {
-        return run_prune();
+        return prune_in(&root);
     }
     if args.clean {
         // `--clean --toolchain x` removes one; `--clean` alone removes all.
         let target = args.toolchain.as_deref().map(ToolchainId::parse).transpose()?;
-        return run_clean(target.as_ref());
+        return clean_in(&root, target.as_ref());
     }
     // Default action (no flag) and `--auto` both scan and install.
     let source = resolve_worker_source(args.source_dir.as_deref())?;
@@ -133,10 +145,50 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
         // `check_arg_combination` ruled out `--toolchain --auto`, so this is a
         // single-toolchain install (always overwrites — no freshness check).
         let id = ToolchainId::parse(raw)?;
-        install_one(&root, &id, &source, args)?;
+        install_one(&root, &id, &source, &args.writer_inputs())?;
         return Ok(());
     }
     run_auto(&root, &source, args)
+}
+
+/// The worker directory this run acts on. With `--lake-root` it is the one
+/// the server uses for that root; without, `--workers-dir` or
+/// `LEAN_HOST_MCP_WORKERS_DIR` must name it.
+fn workers_root(args: &InstallWorkerArgs) -> anyhow::Result<PathBuf> {
+    if let Some(root) = args.lake_root.as_deref() {
+        let root = root
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("--lake-root {}: {e}", root.display()))?;
+        return Ok(toolchain::workers_dir(&root, args.workers_dir.as_deref()));
+    }
+    args.workers_dir
+        .clone()
+        .or_else(|| config_file::env_dir(WORKERS_DIR_ENV))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no worker directory; pass --lake-root <project> or --workers-dir <dir>, or set {WORKERS_DIR_ENV}"
+            )
+        })
+}
+
+/// The shim sources and SDK writer a worker install qualifies its shims with.
+#[derive(Debug, Default)]
+pub(super) struct WriterInputs {
+    /// Extracted lean-rs-host package with the pinned shim sources; `None`
+    /// finds the published package in the Cargo registry.
+    pub(super) shim_source: Option<PathBuf>,
+    /// The standalone SDK writer; `None` uses `lean-rs-writer` beside this
+    /// executable.
+    pub(super) writer: Option<PathBuf>,
+}
+
+impl InstallWorkerArgs {
+    fn writer_inputs(&self) -> WriterInputs {
+        WriterInputs {
+            shim_source: self.shim_source.clone(),
+            writer: self.standalone_writer.clone(),
+        }
+    }
 }
 
 /// Validate the `--toolchain` target modifier against the chosen action. The
@@ -272,7 +324,7 @@ fn run_auto(root: &Path, source: &WorkerSource, args: &InstallWorkerArgs) -> any
             AutoDecision::SkipCurrent => {
                 println!("{id}: current; skipping (use --force to rebuild)");
             }
-            AutoDecision::Install(reason) => match install_one(root, &id, source, args) {
+            AutoDecision::Install(reason) => match install_one(root, &id, source, &args.writer_inputs()) {
                 Ok(_) => println!("{id}: installed ({reason})"),
                 Err(err) => {
                     eprintln!("{id}: failed: {err}");
@@ -318,17 +370,15 @@ fn auto_decision(root: &Path, id: &ToolchainId, force: bool) -> AutoDecision {
 
 /// Whether the worker already installed under the selected root for
 /// `id` is current, stale, or absent. Mirrors the runtime open-gate's provenance
-/// checks ([`WorkerBinary::resolve_ready_with_override`]).
-enum Freshness {
+/// checks ([`WorkerBinary::resolve_ready_with`]).
+pub(super) enum Freshness {
     Absent,
     Current,
     Stale(&'static str),
 }
 
-/// Freshness against an explicit `root`. Split out of [`worker_freshness`] so
-/// the staleness decision is testable against a temp root (mirroring
-/// [`clean_in`] / [`prune_in`]).
-fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
+/// Freshness of the worker for `id` in the worker directory `root`.
+pub(super) fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
     let Ok(dir) = WorkerBinary::selected_dir(&root.join(id.as_str())) else {
         return Freshness::Stale("invalid generation selector");
     };
@@ -359,15 +409,8 @@ fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
     Freshness::Current
 }
 
-/// `--clean`: remove installed workers — all of them, or just `target`.
-/// Idempotent. Thin wrapper over [`clean_in`] with the real install root.
-fn run_clean(target: Option<&ToolchainId>) -> anyhow::Result<()> {
-    clean_in(&WorkerBinary::install_root(), target)
-}
-
-/// Remove worker install dirs under `root`. Pulled out of [`run_clean`] so the
-/// removal can be tested against a temp root without redirecting the real one
-/// (`install_root` reads no env override).
+/// `--clean`: remove the worker install dirs under `root` — all of them, or
+/// just `target`. Idempotent.
 fn clean_in(root: &Path, target: Option<&ToolchainId>) -> anyhow::Result<()> {
     if !root.is_dir() {
         println!("(no workers installed under {})", root.display());
@@ -481,14 +524,8 @@ fn retire_slot(slot: &Path, expected: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--prune`: remove only *unservable* workers, leaving servable ones (even if
-/// stale) in place. Idempotent. Thin wrapper over [`prune_in`].
-fn run_prune() -> anyhow::Result<()> {
-    prune_in(&WorkerBinary::install_root())
-}
-
-/// Remove unservable worker install dirs under `root`. Pulled out of
-/// [`run_prune`] for the same testability reason as [`clean_in`].
+/// `--prune`: remove only *unservable* worker install dirs under `root`,
+/// leaving servable ones (even if stale) in place. Idempotent.
 fn prune_in(root: &Path) -> anyhow::Result<()> {
     if !root.is_dir() {
         println!("(no workers installed under {})", root.display());
@@ -541,11 +578,12 @@ fn prune_reason(name: &str, install_dir: &Path) -> Option<&'static str> {
     None
 }
 
-fn install_one(
+/// Build, qualify and select a worker for `id` in the worker directory `root`.
+pub(super) fn install_one(
     root: &Path,
     id: &ToolchainId,
     source: &WorkerSource,
-    args: &InstallWorkerArgs,
+    inputs: &WriterInputs,
 ) -> anyhow::Result<PathBuf> {
     // Classify against the supported window *before* the multi-minute build —
     // an out-of-window worker would only fail lean-rs-sys's header-digest
@@ -571,7 +609,7 @@ fn install_one(
     let elan_dir = id.elan_dir()?;
 
     let dest_dir = root.join(id.as_str());
-    let registry_source = match &args.shim_source {
+    let registry_source = match &inputs.shim_source {
         Some(path) => path.canonicalize()?,
         None => {
             let cargo = std::env::var_os("CARGO_HOME")
@@ -592,7 +630,7 @@ fn install_one(
             package.join(sdk_package).canonicalize()?
         }
     };
-    let writer = match &args.standalone_writer {
+    let writer = match &inputs.writer {
         Some(path) => path.clone(),
         None => std::env::current_exe()?.with_file_name("lean-rs-writer"),
     }
@@ -687,7 +725,7 @@ fn discover_elan_toolchains() -> anyhow::Result<Vec<ToolchainId>> {
 
 /// Where the worker crate's source comes from for a build. Resolved once per
 /// run; the install path never learns which arm produced the binary.
-enum WorkerSource {
+pub(super) enum WorkerSource {
     /// A local checkout: build the worker in place, reusing cargo's incremental
     /// cache. Carries the workspace root.
     LocalWorkspace(PathBuf),
@@ -701,7 +739,7 @@ enum WorkerSource {
 /// it), build locally; anything else (a registry-installed binary) uses the
 /// published crate. A missing checkout is not an error — it is the registry
 /// path.
-fn resolve_worker_source(explicit: Option<&Path>) -> anyhow::Result<WorkerSource> {
+pub(super) fn resolve_worker_source(explicit: Option<&Path>) -> anyhow::Result<WorkerSource> {
     if let Some(p) = explicit {
         if !p.is_dir() {
             return Err(anyhow::anyhow!(
@@ -934,7 +972,11 @@ mod humantime {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::panic)]
+    #![allow(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "tests assert the branch under test directly"
+    )]
 
     use clap::{Args as _, Command, FromArgMatches};
 
@@ -1019,7 +1061,7 @@ mod tests {
         let id = ToolchainId::parse("v4.36.0")?;
         fake_worker(&root, id.as_str(), "old");
         let slot = root.join(id.as_str());
-        let resolve = || crate::toolchain::WorkerBinary::resolve_with_override(&id, Some(&root));
+        let resolve = || crate::toolchain::WorkerBinary::resolve_in(&id, &root);
         let old = resolve()?.path;
         let generation = slot.join("generation-new");
         std::fs::create_dir(&generation)?;

@@ -1,35 +1,102 @@
-//! Optional TOML config file holding every tunable knob.
+//! TOML config files holding every tunable knob.
 //!
-//! One file can set the runtime/worker, broker/pool, and server/transport
-//! knobs that are otherwise `LEAN_HOST_MCP_*` env vars, plus the existing
-//! `primary_project`. Discovery prefers a project-local `lean-host-mcp.toml`
-//! (found by walking up from the invocation cwd, like the lakefile) and falls
-//! back to the home file `<config-dir>/lean-host-mcp/config.toml`. When both
-//! exist they merge **per key** (local overlays home), so a project file need
-//! only restate the knobs it changes.
+//! The server reads two files from its Lake root (`--lake-root`): first the
+//! tracked `<root>/lean-host-mcp.toml`, then the ignored
+//! `<root>/.local/lean-host-mcp/config.toml` that `lean-host-mcp install`
+//! writes. They merge **per key** and the local file wins, so each file need
+//! only state the knobs it changes. Without a Lake root the server reads no
+//! file. Nothing here reads the home or the working directory.
 //!
-//! The file is one layer in the precedence stack `CLI > env > file > default`:
-//! every field here is `Option`, and a present env var still wins over a file
-//! value (see `ProjectRuntimeConfig::from_env_with_file` /
-//! `BrokerConfig::pool_from_env_with_file`). Missing files and parse failures
-//! are non-fatal — a malformed file is logged and ignored, leaving env + the
+//! The files are one layer in the precedence stack
+//! `CLI > env > local file > tracked file > default`: every field here is
+//! `Option`, and a set env var still wins over a file value (see
+//! `ProjectRuntimeConfig::from_env_with_file` /
+//! `BrokerConfig::pool_from_env_with_file`). A missing file contributes
+//! nothing; a malformed file is logged and ignored, leaving env and the
 //! built-in defaults in charge.
 
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Project-local file name, discovered by walking up from the cwd. Also the
-/// default destination `config init` writes to.
-pub(crate) const LOCAL_FILE_NAME: &str = "lean-host-mcp.toml";
+/// Tracked file name at the Lake root. Also the file `config init` writes.
+pub const TRACKED_FILE_NAME: &str = "lean-host-mcp.toml";
 
-/// Merged view of the config file(s). All fields optional: an absent field
+/// Ignored local file name inside [`local_dir`]. `lean-host-mcp install`
+/// writes it.
+pub const LOCAL_FILE_NAME: &str = "config.toml";
+
+/// `<root>/.local/lean-host-mcp`: the machine-local directory for one Lake
+/// root. It holds the local config file and, by default, the installed
+/// binaries, workers and server store.
+#[must_use]
+pub fn local_dir(root: &Path) -> PathBuf {
+    root.join(".local").join("lean-host-mcp")
+}
+
+/// `<root>/.local/lean-host-mcp/config.toml`.
+#[must_use]
+pub fn local_file(root: &Path) -> PathBuf {
+    local_dir(root).join(LOCAL_FILE_NAME)
+}
+
+/// Create [`local_dir`] for `root` with a `.gitignore` that ignores all of it,
+/// so what install and the server write there never shows in `git status`,
+/// even in a project that does not ignore `.local/`.
+///
+/// # Errors
+///
+/// Returns the I/O error when the directory or its `.gitignore` cannot be
+/// written.
+pub fn ensure_local_dir(root: &Path) -> io::Result<PathBuf> {
+    let dir = local_dir(root);
+    fs::create_dir_all(&dir)?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(".gitignore"))
+    {
+        Ok(mut file) => file.write_all(b"*\n")?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    Ok(dir)
+}
+
+/// The directory an env var names, if it is set and not empty.
+#[must_use]
+pub fn env_dir(name: &str) -> Option<PathBuf> {
+    nonempty(std::env::var_os(name))
+}
+
+fn nonempty(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+/// Pick a directory by the config precedence.
+///
+/// The order is a CLI flag, then an env var's value, then the config files'
+/// value, then the default. An empty env value counts as unset. The env value
+/// is an argument so tests need not set the process environment.
+pub fn pick_dir(
+    flag: Option<&Path>,
+    env: Option<OsString>,
+    configured: impl FnOnce() -> Option<PathBuf>,
+    default: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    flag.map(Path::to_path_buf)
+        .or_else(|| nonempty(env))
+        .or_else(configured)
+        .unwrap_or_else(default)
+}
+
+/// Merged view of the config files. All fields optional: an absent field
 /// defers to the env var, then the built-in default.
 #[derive(Debug, Default, Deserialize)]
 pub struct ConfigFile {
-    /// Default Lake project for calls without a `project=` argument. Kept for
-    /// backward compatibility with the original `primary_project`-only file.
-    pub primary_project: Option<PathBuf>,
     #[serde(default)]
     pub runtime: RuntimeFileConfig,
     #[serde(default)]
@@ -40,6 +107,8 @@ pub struct ConfigFile {
     pub telemetry: TelemetryFileConfig,
     #[serde(default)]
     pub output: OutputFileConfig,
+    #[serde(default)]
+    pub install: InstallFileConfig,
 }
 
 /// `[runtime]` — worker policy knobs (mirrors `ProjectRuntimeConfig`).
@@ -65,8 +134,8 @@ pub struct BrokerFileConfig {
 
 /// `[server]` — transport knobs.
 ///
-/// `lake_root` is intentionally absent: the project default lives in the
-/// top-level `primary_project` key. `bind` is a raw string (e.g.
+/// `lake_root` is absent: the files live in the Lake root, so the root must be
+/// known before either is read. `bind` is a raw string (e.g.
 /// `"127.0.0.1:8765"`); the binary parses and validates it as a `SocketAddr`,
 /// so this library schema stays free of transport types.
 #[derive(Debug, Default, Deserialize)]
@@ -98,75 +167,65 @@ pub struct OutputFileConfig {
     pub slow_call_warning_millis: Option<u64>,
 }
 
+/// `[install]` — the paths `lean-host-mcp install` records in the local file.
+///
+/// A relative path is relative to the Lake root.
+#[derive(Debug, Default, Deserialize)]
+pub struct InstallFileConfig {
+    /// The installed server executable, for MCP client configs and scripts
+    /// that run the server by absolute path. The server itself ignores it.
+    pub binary: Option<PathBuf>,
+    /// Directory of per-toolchain worker installs.
+    pub workers_dir: Option<PathBuf>,
+    /// Private directory for server state, including the lock that admits
+    /// one server.
+    pub store_dir: Option<PathBuf>,
+}
+
+impl InstallFileConfig {
+    /// The configured worker directory, resolved against `root`.
+    #[must_use]
+    pub fn workers_dir(&self, root: &Path) -> Option<PathBuf> {
+        self.workers_dir.as_deref().map(|path| root.join(path))
+    }
+
+    /// The configured store directory, resolved against `root`.
+    #[must_use]
+    pub fn store_dir(&self, root: &Path) -> Option<PathBuf> {
+        self.store_dir.as_deref().map(|path| root.join(path))
+    }
+}
+
 impl ConfigFile {
-    /// Load and merge the home and project-local files. Home is the base; the
-    /// nearest `lean-host-mcp.toml` at or above `cwd` overlays it per key. A
-    /// missing file contributes nothing; a malformed file is logged and
-    /// skipped. Never fails: the worst case is an empty config (env + defaults).
+    /// Load and merge the config files of the Lake root `root`: the tracked
+    /// file is the base and the local file overlays it per key. `None` reads
+    /// nothing. A missing file contributes nothing; a malformed file is logged
+    /// and skipped. Never fails: the worst case is an empty config (env +
+    /// defaults).
     #[must_use]
-    pub fn load(cwd: &Path) -> Self {
-        Self::load_for_server(cwd).0
-    }
-
-    /// Return merged settings and the independent primary project from the home file.
-    #[must_use]
-    pub fn load_for_server(cwd: &Path) -> (Self, Option<PathBuf>) {
-        Self::load_from(cwd, home_config_path().as_deref())
-    }
-
-    fn load_from(cwd: &Path, home: Option<&Path>) -> (Self, Option<PathBuf>) {
-        let mut merged = home
-            .and_then(read_toml)
-            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
-        let approved = merged
-            .get("primary_project")
-            .and_then(toml::Value::as_str)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute());
-        if let Some(local) = walk_up_for(cwd, LOCAL_FILE_NAME)
-            && let Some(value) = read_toml(&local)
-        {
-            merge_toml(&mut merged, value);
+    pub fn load(root: Option<&Path>) -> Self {
+        let Some(root) = root else {
+            return Self::default();
+        };
+        let mut merged =
+            read_toml(&root.join(TRACKED_FILE_NAME)).unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+        if let Some(local) = read_toml(&local_file(root)) {
+            merge_toml(&mut merged, local);
         }
-        let settings = match merged.try_into() {
+        match merged.try_into() {
             Ok(config) => config,
             Err(err) => {
                 tracing::warn!(error = %err, "merged config did not match the schema; ignoring it");
                 Self::default()
             }
-        };
-        (settings, approved)
-    }
-}
-
-/// `<config-dir>/lean-host-mcp/config.toml`. `LEAN_HOST_MCP_CONFIG_DIR`
-/// overrides the base dir (used by the test suite to avoid the developer's
-/// real config). Shared with `config init --home`, so discovery and
-/// generation target the same path.
-pub(crate) fn home_config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LEAN_HOST_MCP_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(dirs::config_dir)?;
-    Some(base.join("lean-host-mcp").join("config.toml"))
-}
-
-/// Walk upward from `start` looking for `filename`; return the first match.
-fn walk_up_for(start: &Path, filename: &str) -> Option<PathBuf> {
-    let mut cur: Option<&Path> = Some(start);
-    while let Some(dir) = cur {
-        let candidate = dir.join(filename);
-        if candidate.is_file() {
-            return Some(candidate);
         }
-        cur = dir.parent();
     }
-    None
 }
 
 /// Read and parse one TOML file. Missing file → `None` (silent); parse error
 /// → `None` with a warning, so a typo in one file can't take down startup.
 fn read_toml(path: &Path) -> Option<toml::Value> {
-    let contents = std::fs::read_to_string(path).ok()?;
+    let contents = fs::read_to_string(path).ok()?;
     match toml::from_str::<toml::Value>(&contents) {
         Ok(value) => Some(value),
         Err(err) => {
@@ -177,8 +236,8 @@ fn read_toml(path: &Path) -> Option<toml::Value> {
 }
 
 /// Deep-merge `overlay` onto `base` in place: tables merge key-by-key
-/// (recursing), any non-table value replaces wholesale. So `[runtime]` in a
-/// local file overrides only the keys it sets, leaving sibling home keys.
+/// (recursing), any non-table value replaces wholesale. So `[runtime]` in the
+/// local file overrides only the keys it sets, leaving sibling tracked keys.
 fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
     match (base, overlay) {
         (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
@@ -204,36 +263,93 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn operator_primary_is_independent_of_the_local_overlay() {
+    fn project() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home.toml");
-        std::fs::write(&home, "primary_project = '/approved'").unwrap();
-        std::fs::write(dir.path().join(LOCAL_FILE_NAME), "primary_project = '/other'").unwrap();
-        let (merged, approved) = ConfigFile::load_from(dir.path(), Some(&home));
-        assert_eq!(merged.primary_project.as_deref(), Some(Path::new("/other")));
-        assert_eq!(approved.as_deref(), Some(Path::new("/approved")));
-        assert!(ConfigFile::load_from(dir.path(), None).1.is_none());
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        (dir, root)
     }
 
     #[test]
-    fn merge_overlays_local_over_home_per_key() {
-        let mut base = toml::from_str::<toml::Value>(
-            "primary_project = \"/home/proj\"\n[runtime]\nlean_max_memory_kib = 5\n[broker]\nmax_projects = 8\n",
+    fn local_file_overrides_the_tracked_file_per_key() {
+        let (_dir, root) = project();
+        fs::write(
+            root.join(TRACKED_FILE_NAME),
+            "[runtime]\nlean_max_memory_kib = 5\n[broker]\nmax_workers = 8\n",
         )
         .unwrap();
-        let overlay =
-            toml::from_str::<toml::Value>("[runtime]\nlean_max_memory_kib = 8\nrequest_timeout_millis = 16\n").unwrap();
-        merge_toml(&mut base, overlay);
-        let config: ConfigFile = base.try_into().unwrap();
+        ensure_local_dir(&root).unwrap();
+        fs::write(
+            local_file(&root),
+            "[runtime]\nlean_max_memory_kib = 8\nrequest_timeout_millis = 16\n",
+        )
+        .unwrap();
+        let config = ConfigFile::load(Some(&root));
 
         // Local overrode the one runtime key it set...
         assert_eq!(config.runtime.lean_max_memory_kib, Some(8));
         // ...added its own...
         assert_eq!(config.runtime.request_timeout_millis, Some(16));
-        // ...and left untouched home keys (runtime sibling + other sections) intact.
-        assert_eq!(config.broker.max_projects, Some(8));
-        assert_eq!(config.primary_project.as_deref(), Some(Path::new("/home/proj")));
+        // ...and left the other tracked keys in place.
+        assert_eq!(config.broker.max_workers, Some(8));
+    }
+
+    #[test]
+    fn only_the_lake_root_is_read() {
+        let (dir, root) = project();
+        // A file in an ancestor of the root, or in the working directory, is
+        // not a config file of this root.
+        fs::write(dir.path().join(TRACKED_FILE_NAME), "[broker]\nmax_workers = 3\n").unwrap();
+        assert!(ConfigFile::load(Some(&root)).broker.max_workers.is_none());
+        assert!(ConfigFile::load(None).broker.max_workers.is_none());
+    }
+
+    #[test]
+    fn install_paths_resolve_against_the_root() {
+        let (_dir, root) = project();
+        fs::write(root.join(TRACKED_FILE_NAME), "[install]\nworkers_dir = 'workers'\n").unwrap();
+        ensure_local_dir(&root).unwrap();
+        fs::write(local_file(&root), "[install]\nstore_dir = '/state/store'\n").unwrap();
+        let install = ConfigFile::load(Some(&root)).install;
+        assert_eq!(install.workers_dir(&root), Some(root.join("workers")));
+        assert_eq!(install.store_dir(&root), Some(PathBuf::from("/state/store")));
+        assert!(install.binary.is_none());
+    }
+
+    #[test]
+    fn pick_dir_follows_flag_env_file_default() {
+        let flag = Path::new("/flag");
+        let env = || Some(OsString::from("/env"));
+        let file = || Some(PathBuf::from("/file"));
+        let default = || PathBuf::from("/default");
+        assert_eq!(pick_dir(Some(flag), env(), file, default), flag);
+        assert_eq!(pick_dir(None, env(), file, default), Path::new("/env"));
+        assert_eq!(pick_dir(None, Some(OsString::new()), file, default), Path::new("/file"));
+        assert_eq!(pick_dir(None, None, file, default), Path::new("/file"));
+        assert_eq!(pick_dir(None, None, || None, default), Path::new("/default"));
+    }
+
+    #[test]
+    fn local_dir_ignores_itself() {
+        let (_dir, root) = project();
+        let dir = ensure_local_dir(&root).unwrap();
+        assert_eq!(dir, root.join(".local/lean-host-mcp"));
+        assert_eq!(fs::read_to_string(dir.join(".gitignore")).unwrap(), "*\n");
+        // A second call keeps an edited ignore file.
+        fs::write(dir.join(".gitignore"), "*\n!keep\n").unwrap();
+        ensure_local_dir(&root).unwrap();
+        assert_eq!(fs::read_to_string(dir.join(".gitignore")).unwrap(), "*\n!keep\n");
+    }
+
+    #[test]
+    fn unknown_tables_are_ignored() {
+        let (_dir, root) = project();
+        fs::write(
+            root.join(TRACKED_FILE_NAME),
+            "[launcher]\nmode = 'managed'\n[broker]\nmax_workers = 2\n",
+        )
+        .unwrap();
+        assert_eq!(ConfigFile::load(Some(&root)).broker.max_workers, Some(2));
     }
 
     #[test]
@@ -257,21 +373,9 @@ mod tests {
     #[test]
     fn empty_config_is_all_none() {
         let config = ConfigFile::default();
-        assert!(config.primary_project.is_none());
         assert!(config.runtime.lean_max_memory_kib.is_none());
         assert!(config.broker.max_projects.is_none());
         assert!(config.server.bind.is_none());
-    }
-
-    #[test]
-    fn walk_up_finds_nearest_then_ancestor() {
-        let tmp = std::env::temp_dir().join(format!("lhm-cfg-walk-{}", std::process::id()));
-        let nested = tmp.join("a").join("b");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(tmp.join(LOCAL_FILE_NAME), "max_projects_unused = 1\n").unwrap();
-        // No file in nested or a/: walk-up should find the one at tmp.
-        let found = walk_up_for(&nested, LOCAL_FILE_NAME).unwrap();
-        assert_eq!(found, tmp.join(LOCAL_FILE_NAME));
-        std::fs::remove_dir_all(&tmp).ok();
+        assert!(config.install.workers_dir.is_none());
     }
 }

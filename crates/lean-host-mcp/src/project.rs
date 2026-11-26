@@ -1869,14 +1869,21 @@ struct ActorConfig {
     /// record). The actor carries them so a `runtime_unavailable` it produces
     /// after worker death still flags a suspect worker. Mirrors
     /// [`LeanProject::open_warnings`]; both come from the one
-    /// [`WorkerBinary::resolve_ready_for`] verdict at open.
+    /// [`WorkerBinary::resolve_ready`] verdict at open.
     toolchain_advisories: Vec<String>,
 }
 
 /// Resolve one spawnable worker before taking broker admission resources.
+///
+/// The worker comes from the worker directory of the project's own Lake root
+/// ([`crate::toolchain::workers_dir`]). Every refusal is one line that ends
+/// with the command that fixes it.
 pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf, Vec<String>)> {
     let toolchain_id = ToolchainId::parse(&meta.toolchain).map_err(|e| ServerError::BadProject(e.to_string()))?;
-    let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready_for(&toolchain_id) {
+    let dir = crate::toolchain::workers_dir(&meta.canonical_root, None);
+    let fix = crate::toolchain::install_fix(&meta.canonical_root);
+    let worker = format!("worker for leanprover/lean4:{toolchain_id} in {}", dir.display());
+    let (worker_path, lean_sysroot, open_warnings) = match WorkerBinary::resolve_ready(&toolchain_id, &dir, &fix) {
         Readiness::Ready {
             worker,
             lean_sysroot,
@@ -1900,44 +1907,40 @@ pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf
                  nearest supported: {nearest}. Pin a supported toolchain (or bump lean-rs) and reopen."
             )));
         }
-        Readiness::Stale { toolchain, install_cmd } => {
+        Readiness::Stale { .. } => {
             return Err(ServerError::BadProject(format!(
-                "worker for {toolchain} was built against a different lean.h than the toolchain now \
-                 provides (header drift); rebuild it: {install_cmd}"
+                "{worker} was built against another lean.h than the toolchain now has; run: {fix}"
             )));
         }
         Readiness::Incompatible {
-            toolchain,
             worker_protocol,
             host_protocol,
-            install_cmd: _,
+            ..
         } => {
             return Err(ServerError::IncompatibleWorker {
                 message: format!(
-                    "worker for {toolchain} uses protocol {worker_protocol}, but this host requires \
-                     protocol {host_protocol}"
+                    "{worker} uses protocol {worker_protocol}, but this host requires protocol {host_protocol}"
                 ),
-                recovery_command: "lean-host-mcp install-worker --auto".to_owned(),
+                recovery_command: fix,
             });
         }
-        Readiness::Unusable {
-            toolchain,
-            detail,
-            install_cmd,
-        } => {
+        Readiness::Unusable { detail, .. } => {
             CallCancellation::current().begin_operation().not_started();
+            let detail = detail.lines().next().unwrap_or_default().trim();
             return Err(ServerError::BadProject(format!(
-                "worker for {toolchain} is unusable ({detail}); reinstall it: {install_cmd}"
+                "{worker} is unusable ({detail}); run: {fix}"
             )));
         }
-        Readiness::NotInstalled { toolchain, install_cmd } => {
+        Readiness::NotInstalled { .. } => {
             return Err(ServerError::BadProject(format!(
-                "no worker binary for toolchain {toolchain}; run: {install_cmd}"
+                "no worker for leanprover/lean4:{toolchain_id} in {}; run: {fix}",
+                dir.display()
             )));
         }
         Readiness::ToolchainNotInstalled { toolchain, elan_dir } => {
             return Err(ServerError::BadProject(format!(
-                "elan toolchain {toolchain} is not installed (expected {})",
+                "elan toolchain leanprover/lean4:{toolchain} is not installed (expected {}); \
+                 run: elan toolchain install leanprover/lean4:{toolchain}",
                 elan_dir.display()
             )));
         }
@@ -1954,7 +1957,7 @@ pub(crate) fn resolve_worker(meta: &LakeProjectMeta) -> Result<(PathBuf, PathBuf
 impl ActorConfig {
     /// Resolve the pinned toolchain into a spawnable config plus any
     /// open-time provenance advisories. All version-drift situations collapse
-    /// into the one [`WorkerBinary::resolve_ready_for`] verdict: hard failures
+    /// into the one [`WorkerBinary::resolve_ready`] verdict: hard failures
     /// become a typed [`ServerError::BadProject`] carrying the corrective
     /// command; soft ones (unknown pin, missing sidecar) ride along as
     /// warnings the project surfaces in every envelope.
@@ -4146,7 +4149,6 @@ mod tests {
         let config = ProjectRuntimeConfig::default().with_import_residue_budget_bytes(4 * 1024 * 1024 * 1024);
         let broker = crate::broker::ProjectBroker::new_with_runtime_config(
             crate::broker::BrokerConfig {
-                config_default: None,
                 env_default: None,
                 cwd: std::path::PathBuf::from("."),
                 max_projects: crate::broker::BrokerConfig::default_max_projects(),

@@ -644,8 +644,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = LeanHostService::new(
             ProjectBroker::new(crate::broker::BrokerConfig {
-                config_default: Some(dir.path().to_path_buf()),
-                env_default: None,
+                env_default: Some(dir.path().to_path_buf()),
                 cwd: dir.path().to_path_buf(),
                 max_projects: crate::broker::BrokerConfig::default_max_projects(),
                 max_workers_per_project: std::num::NonZeroUsize::MIN,
@@ -730,8 +729,7 @@ mod tests {
         std::fs::write(dir.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
         std::fs::write(dir.path().join("lake-manifest.json"), "{}\n").unwrap();
         let broker = ProjectBroker::new(crate::broker::BrokerConfig {
-            config_default: Some(dir.path().to_path_buf()),
-            env_default: None,
+            env_default: Some(dir.path().to_path_buf()),
             cwd: dir.path().to_path_buf(),
             max_projects: crate::broker::BrokerConfig::default_max_projects(),
             max_workers_per_project: std::num::NonZeroUsize::MIN,

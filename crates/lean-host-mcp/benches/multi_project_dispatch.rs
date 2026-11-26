@@ -51,7 +51,6 @@ fn make_synthetic_project(fixture_root: &Path) -> (tempfile::TempDir, PathBuf) {
 fn make_broker(env_default: Option<PathBuf>, max_projects: NonZeroUsize) -> Arc<ProjectBroker> {
     let cwd = env_default.clone().unwrap_or_else(|| PathBuf::from("/"));
     ProjectBroker::new(BrokerConfig {
-        config_default: None,
         env_default,
         cwd,
         max_projects,

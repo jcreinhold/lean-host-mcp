@@ -29,7 +29,6 @@ async fn open_call_shutdown_round_trip() {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
     let broker = ProjectBroker::new(BrokerConfig {
-        config_default: None,
         env_default: Some(root.clone()),
         cwd: root,
         max_projects: BrokerConfig::default_max_projects(),

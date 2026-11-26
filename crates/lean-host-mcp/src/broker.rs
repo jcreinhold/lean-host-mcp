@@ -99,7 +99,7 @@ const ARTIFACT_HANDOFF_TICK: Duration = Duration::from_millis(100);
 /// without `std::env::set_current_dir`.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
-    pub config_default: Option<PathBuf>,
+    /// The primary Lake root from `--lake-root` / `LEAN_HOST_MCP_PROJECT`.
     pub env_default: Option<PathBuf>,
     pub cwd: PathBuf,
     /// Global worker cap. Historical API name; config prefers `max_workers`.
@@ -434,8 +434,8 @@ impl ProjectBroker {
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError::BadProject`] when the explicit / env /
-    /// config path is unusable or no lakefile is reachable from `cwd`.
+    /// Returns [`ServerError::BadProject`] when the explicit or
+    /// `--lake-root` path is unusable or no lakefile is reachable from `cwd`.
     pub fn resolve(&self, hint: &ProjectHint) -> Result<PathBuf> {
         if let ProjectHint::Explicit(p) = hint {
             return canonicalise(p);
@@ -446,11 +446,8 @@ impl ProjectBroker {
         if let Some(found) = walk_up_for_lakefile(&self.config.cwd) {
             return canonicalise(&found);
         }
-        if let Some(cfg) = &self.config.config_default {
-            return canonicalise(cfg);
-        }
         Err(ServerError::BadProject(format!(
-            "no lakefile found from {} and no env/config default set",
+            "no lakefile found from {} and no --lake-root given",
             self.config.cwd.display()
         )))
     }
@@ -1549,9 +1546,8 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
-    fn cfg(cwd: PathBuf, env: Option<PathBuf>, conf: Option<PathBuf>) -> BrokerConfig {
+    fn cfg(cwd: PathBuf, env: Option<PathBuf>) -> BrokerConfig {
         BrokerConfig {
-            config_default: conf,
             env_default: env,
             cwd,
             max_projects: BrokerConfig::default_max_projects(),
@@ -1572,7 +1568,7 @@ mod tests {
         let runtime = ProjectRuntimeConfig::default()
             .with_operator_primary(Some(&approved))
             .unwrap();
-        let broker = ProjectBroker::new_with_runtime_config(cfg(other.clone(), None, None), runtime);
+        let broker = ProjectBroker::new_with_runtime_config(cfg(other.clone(), None), runtime);
         for hint in [ProjectHint::Default, ProjectHint::Explicit(other.clone())] {
             let err = broker
                 .prepare_check(hint, LeanWorkerElabOptions::new())
@@ -1597,7 +1593,7 @@ mod tests {
         let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
             .canonicalize()
             .unwrap();
-        let mut config = cfg(root.clone(), Some(root.clone()), None);
+        let mut config = cfg(root.clone(), Some(root.clone()));
         config.max_projects = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
         let broker = ProjectBroker::new(config);
@@ -1647,8 +1643,9 @@ mod tests {
     async fn same_project_checks_run_on_distinct_workers() {
         let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap());
         let runtime =
-            ProjectRuntimeConfig::from_env_with_file(&crate::config_file::ConfigFile::load(&root).runtime, 2).unwrap();
-        let mut config = cfg(root.clone(), Some(root), None);
+            ProjectRuntimeConfig::from_env_with_file(&crate::config_file::ConfigFile::load(Some(&root)).runtime, 2)
+                .unwrap();
+        let mut config = cfg(root.clone(), Some(root));
         config.max_projects = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
         let broker = ProjectBroker::new_with_runtime_config(config, runtime);
@@ -1703,7 +1700,7 @@ mod tests {
     #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
     async fn cancelling_one_project_worker_preserves_its_sibling() {
         let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap());
-        let mut config = cfg(root.clone(), Some(root), None);
+        let mut config = cfg(root.clone(), Some(root));
         config.max_projects = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
         let broker = ProjectBroker::new(config);
@@ -1780,7 +1777,7 @@ mod tests {
     fn resolve_returns_canonicalised_path_when_no_resolution_needed() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "explicit");
-        let resolved = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None, None))
+        let resolved = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None))
             .resolve(&ProjectHint::Explicit(proj.clone()))
             .unwrap();
         assert_eq!(resolved, proj);
@@ -1804,7 +1801,7 @@ mod tests {
 
     #[test]
     fn shutdown_all_without_resident_projects_is_idempotent() {
-        let broker = ProjectBroker::new(cfg(PathBuf::from("/"), None, None));
+        let broker = ProjectBroker::new(cfg(PathBuf::from("/"), None));
         broker.shutdown_all();
         broker.shutdown_all();
         assert!(broker.resident_paths().is_empty());
@@ -1815,7 +1812,7 @@ mod tests {
     fn identity_without_worker_does_not_open_resident_project() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "identity");
-        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None, None));
+        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None));
 
         let call = broker
             .project_identity_without_worker(&ProjectHint::Explicit(proj.clone()), vec!["Init".to_owned()])
@@ -1842,7 +1839,7 @@ mod tests {
     fn resolve_meta_reflects_a_manifest_edit_on_the_next_call() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "memo");
-        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None, None));
+        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None));
         let hint = ProjectHint::Explicit(proj.clone());
 
         let first = broker.resolve_meta(&hint).unwrap();
@@ -1866,7 +1863,7 @@ mod tests {
     fn resolve_meta_is_stable_while_the_project_is_untouched() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "stable");
-        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None, None));
+        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None));
         let hint = ProjectHint::Explicit(proj.clone());
 
         let first = broker.resolve_meta(&hint).unwrap();
@@ -1929,7 +1926,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_root_opening_waiters_preserve_their_original_admission_deadline() {
-        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        let mut config = cfg(PathBuf::from("/unused"), None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let occupied = broker
@@ -1974,7 +1971,7 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_waiters_are_fifo_and_cancelled_waiters_do_not_steal_slots() {
-        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        let mut config = cfg(PathBuf::from("/unused"), None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let occupied = broker
@@ -2016,7 +2013,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_rejects_waiting_capacity_without_releasing_unconfirmed_workers() {
-        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        let mut config = cfg(PathBuf::from("/unused"), None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let occupied = broker
@@ -2036,7 +2033,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_retirement_wait_preserves_admission_timeout_and_owned_capacity() {
-        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        let mut config = cfg(PathBuf::from("/unused"), None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let retiring = broker
@@ -2059,7 +2056,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_interrupts_retirement_wait_without_unconfirmed_slot_release() {
-        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        let mut config = cfg(PathBuf::from("/unused"), None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let retiring = broker
@@ -2080,7 +2077,7 @@ mod tests {
 
     #[tokio::test]
     async fn opening_locks_survive_shutdown_and_a_disappearing_caller() {
-        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None, None));
+        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None));
         let root = PathBuf::from("/project");
         let original = broker.opening_lock(&root).unwrap();
         let waiting = Arc::clone(&original);
@@ -2095,7 +2092,7 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelling_capacity_wait_keeps_the_retiring_workers_slot_reserved() {
-        let mut config = cfg(PathBuf::from("/unused"), None, None);
+        let mut config = cfg(PathBuf::from("/unused"), None);
         config.max_projects = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let retiring = broker
@@ -2124,7 +2121,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_same_project_waiter_does_not_wait_for_startup_or_take_capacity() {
-        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None, None));
+        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None));
         let root = PathBuf::from("/blocked-startup");
         let held = broker.opening_lock(&root).unwrap().lock_owned().await;
         let request = tokio_util::sync::CancellationToken::new();

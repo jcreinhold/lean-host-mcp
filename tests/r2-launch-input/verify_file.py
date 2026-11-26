@@ -31,6 +31,7 @@ def main():
         "LEAN_RS_WORKER_OWNERS_DIRECTORY": str(fixture / "owners"),
         "LEAN_HOST_MCP_WORKERS_DIR": str(fixture / "workers"),
         "LEAN_HOST_MCP_PROCESS_REGISTRY_DIR": str(fixture / "server-owners"),
+        "LEAN_HOST_MCP_STORE_DIR": str(fixture / "store"),
         "TMPDIR": str(fixture / "tmp"),
     }
     command = [

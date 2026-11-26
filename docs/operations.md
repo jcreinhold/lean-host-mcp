@@ -8,7 +8,8 @@ the [tool catalog](tool-catalog.md) for request and response contracts.
 - [Concurrency and admission](#concurrency-and-admission)
 - [Logging](#request-activity-in-the-terminal) and [worker recycles](#observing-worker-recycles)
 - [Process lifetime](#process-lifetime) and [runtime failures](#runtime-error-contract)
-- [Worker installation](#installing-workers) and [test harnesses](#build-test-lint)
+- [Server installation](#installing-the-server), [worker installation](#installing-workers) and
+  [test harnesses](#build-test-lint)
 
 
 Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set,
@@ -26,29 +27,35 @@ The server still selects its embedded writer for ordinary operations and honors 
 
 ## Configuration file
 
-Generate a commented TOML file with the current defaults:
+The server reads two TOML files at its `--lake-root`, and no others:
+
+- `lean-host-mcp.toml`, tracked with the project;
+- `.local/lean-host-mcp/config.toml`, which [`lean-host-mcp install`](#installing-the-server) writes. Its directory
+  holds a `.gitignore` that ignores everything in it.
+
+Keys in the local file win over the tracked file one key at a time, so each file need only set what it changes. The
+server does not look in its working directory, its parent directories or your home directory. Without `--lake-root` it
+reads no file. Missing files are ignored; parse failures are logged and skipped. A merged value with the wrong type
+causes the merged file configuration to be ignored. Tables the server does not know, such as an old `[launcher]`, are
+ignored.
+
+Generate a commented tracked file with the current defaults:
 
 ```sh
-lean-host-mcp config init          # ./lean-host-mcp.toml
-lean-host-mcp config init --home   # platform user config directory
+lean-host-mcp config init                       # ./lean-host-mcp.toml
+lean-host-mcp config init --lake-root PROJECT   # PROJECT/lean-host-mcp.toml
 ```
 
 `--path FILE` selects another destination. Existing files require `--force` to overwrite.
 
-Startup loads `<config-dir>/lean-host-mcp/config.toml`, then overlays the nearest `lean-host-mcp.toml` found by walking
-upward from the server's working directory. Files merge per key, so a local file need only set its overrides.
-`LEAN_HOST_MCP_CONFIG_DIR` replaces the platform config directory. Missing files are ignored; parse failures are logged
-and skipped. A merged value with the wrong type causes the merged file configuration to be ignored.
-
 ## Configuration reference
 
-For each setting, precedence is **CLI flag > environment variable > configuration file > built-in default**. Units are
-shown in the table; GiB figures in descriptions are explanatory, not literal setting values.
+For each setting, precedence is **CLI flag > environment variable > local file > tracked file > built-in default**.
+Units are shown in the table; GiB figures in descriptions are explanatory, not literal setting values.
 
 <!-- BEGIN GENERATED: do not edit by hand. Regenerate from `config_schema::render_reference_table`; the `operations_md_reference_table_is_in_sync` test fails when this block drifts. -->
 | Key | Type | Default | Override | Description |
 | --- | --- | --- | --- | --- |
-| `primary_project` | path | unset | `--lake-root / LEAN_HOST_MCP_PROJECT` | Default Lake project for calls that omit an explicit project= argument. Lowest-priority fallback, after the flag/env and the nearest lakefile above the working directory. |
 | `runtime.lean_max_memory_kib` | integer (KiB) | unset | `LEAN_HOST_MCP_LEAN_MAX_MEMORY_KIB` | Lean heap ceiling per worker child. Allocator exhaustion can abort the child when a C++ exception reaches the Rust FFI boundary. Unset derives the residue budget plus max(residue budget, 8 GiB), converted to KiB, leaving headroom above clean import recycling. Startup warns when an explicit ceiling is at or below the residue budget. |
 | `runtime.request_timeout_millis` | integer (ms) | `120000` | `LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS` | One shared budget for worker-capacity admission, mailbox admission and queued waiting for each worker operation. After dispatch, worker execution has a separate timeout of the same length; execution expiry recycles the worker. Admission expiry does not dispatch that queued operation. This is not a whole-tool deadline: preparation and multiple operations can take longer. Default 120 s. |
 | `runtime.project_mailbox_capacity` | integer | `16` | `LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY` | Maximum queued calls in each worker actor's mailbox. Further callers wait in FIFO order for mailbox space within the same original request_timeout_millis admission deadline. Cancellation removes only that caller. |
@@ -67,6 +74,9 @@ shown in the table; GiB figures in descriptions are explanatory, not literal set
 | `output.max_total_bytes` | integer (bytes) | unset | `LEAN_HOST_MCP_OUTPUT_MAX_TOTAL_BYTES` | Override the total output byte cap for all tools. Unset keeps the built-in 64 KiB default. Clamped to 1 KiB to 64 KiB. |
 | `output.heartbeat_limit` | integer (heartbeats) | unset | `LEAN_HOST_MCP_OUTPUT_HEARTBEAT_LIMIT` | Default elaboration heartbeat budget for lean_trial proof_step and lean_verify target groups. Unset uses the worker default. Bounds runaway tactics. |
 | `output.slow_call_warning_millis` | integer (ms) | `10000` | `LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS` | Worker-call CPU time above which every tool response carries a warning naming the elapsed milliseconds and recommending refactoring (splitting the declaration, explicit type annotations, extracted lemmas). Keys on call_cpu_millis, not wallclock, so machine contention never triggers it. Default 10 s. |
+| `install.binary` | path | unset | none | The server executable that install copied, for MCP client configs and scripts that run the server by absolute path. The server itself ignores it. |
+| `install.workers_dir` | path | unset | `LEAN_HOST_MCP_WORKERS_DIR` | Directory of per-toolchain worker installs, shared by install, install-worker and the server. Unset uses .local/lean-host-mcp/workers under the Lake root. A relative path is relative to the Lake root. |
+| `install.store_dir` | path | unset | `LEAN_HOST_MCP_STORE_DIR` | Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root. |
 <!-- END GENERATED -->
 
 `output.max_field_bytes` and `output.max_total_bytes` bound model-facing payloads before they leave the worker. Tight
@@ -300,6 +310,20 @@ does not kill live processes and does not infer ownership from an executable nam
 not use broad process-name cleanup; identify the exact PID from the registry or from
 `ps -axo pid,ppid,pgid,stat,rss,command` before terminating a live process.
 
+### One server per store
+
+A server started with `--lake-root` takes an exclusive `flock` on `server.lock` in its store and writes its pid and Lake
+root into that file. The kernel drops the lock when the process exits, however it exits. A second server on the same
+store exits at startup and names the first:
+
+```text
+another lean-host-mcp (pid 4242, lake root /work/project) holds the store /work/project/.local/lean-host-mcp/store; stop it first
+```
+
+The store is `LEAN_HOST_MCP_STORE_DIR`, else `[install] store_dir` from the config files, else
+`.local/lean-host-mcp/store` under the Lake root. The server creates it with mode 0700 after its config checks pass. A
+server without `--lake-root` has no store and takes no lock.
+
 ## Runtime-error contract
 
 Recoverable runtime and controller failures return a semantic response with `data: null` and an issue in `errors`. The
@@ -343,6 +367,38 @@ Unlike an external LSP process, the host can still start when unrelated project 
 avoid the broken module continue to work; a broken target file reports structured Lean diagnostics instead of a
 bootstrap failure.
 
+## Installing the server
+
+`lean-host-mcp install --lake-root PROJECT` makes one Lake project ready to serve. It reads the toolchain from
+`PROJECT/lean-toolchain` and writes only under `PROJECT/.local/lean-host-mcp/`, never a tracked file:
+
+| Path | Contents |
+| --- | --- |
+| `.gitignore` | `*`, so Git ignores the directory even when the project does not ignore `.local/` |
+| `bin/lean-host-mcp` | a copy of the running executable |
+| `bin/lean-rs-writer` | the SDK writer that builds and checks the worker's shims |
+| `workers/` | the worker for the project's toolchain, built as `install-worker` builds it |
+| `store/` | the server's private state, mode 0700 |
+| `config.toml` | the local config file, with `[install]` set to the absolute `binary`, `workers_dir` and `store_dir` |
+
+Serve with the installed copy:
+
+```sh
+PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
+```
+
+- `--dir DIR` puts `bin/`, `workers/` and `store/` under `DIR`. The config file stays at
+  `PROJECT/.local/lean-host-mcp/config.toml`, where the server reads it.
+- Without `--dir`, the worker and store directories follow the server's order: `LEAN_HOST_MCP_WORKERS_DIR` or
+  `LEAN_HOST_MCP_STORE_DIR`, then an `[install]` value already in the config files, then the default above.
+- A current worker or writer stays; `--force` replaces both.
+- `--standalone-writer PATH` installs that writer. Otherwise install keeps a current `bin/lean-rs-writer`, copies a
+  current one from beside the running executable, or runs `cargo install lean-rs-writer` at the pinned SDK version.
+- `--shim-source DIR` and `--source-dir DIR` pass to the worker build, as for `install-worker`.
+
+Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
+file that is not valid TOML before it builds anything.
+
 ## Installing workers
 
 The target Lake project's requested imports must have built `.olean` files. Any ordinary Lake project can be served; it
@@ -350,7 +406,10 @@ need not copy the [test fixture](../fixtures/lean/README.md), declare host shims
 server. The worker uses the shims bundled with `lean-rs-host`.
 
 `install-worker` compiles a worker for each Lean toolchain. Its `build.rs` embeds an absolute rpath to that toolchain's
-`lib/lean`. Source selection is automatic:
+`lib/lean`. It installs into `--workers-dir DIR`, or into the worker directory of `--lake-root PROJECT`:
+`LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir`, then `PROJECT/.local/lean-host-mcp/workers`. The server finds
+workers through the same function. With neither flag, `install-worker` uses `LEAN_HOST_MCP_WORKERS_DIR` and fails when
+it is unset. Source selection is automatic:
 
 - **Registry** (the default for a `cargo install lean-host-mcp` binary): fetch and build the published
   `lean-host-mcp-worker` crate at the server's own version (`cargo install lean-host-mcp-worker --version =<ver>`).
@@ -386,8 +445,13 @@ The provenance sidecar records the worker wire-protocol version independently of
   smoke-test failure. Other stale workers are kept; rebuild those with `--auto`.
 
 At runtime, package-version skew is silent when the protocol matches. A recorded protocol mismatch is a non-retryable
-`runtime_unavailable` response with `lean-host-mcp install-worker --auto` as the exact recovery command. Header drift or
-smoke failure is also a hard refusal with an actionable reinstall command.
+`runtime_unavailable` response whose recovery command is `SERVER install --lake-root PROJECT`, where `SERVER` is the
+running executable. A missing worker, header drift and smoke failure are also hard refusals. Each is one line that names
+the worker directory and ends with the same command:
+
+```text
+no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/workers; run: /work/project/.local/lean-host-mcp/bin/lean-host-mcp install --lake-root /work/project
+```
 
 ### Source-bound writer cutover
 
@@ -477,7 +541,10 @@ generation 1 throughout, 0 restarts, residue 1786 MiB peak and final against a 9
 baseline exercises a repeated import profile; it does not predict the residue growth of a changed-file sweep. The latter
 is bounded by the residue budget and covered by `crates/lean-host-mcp/tests/kanproofs_eval.rs`.
 
-Native worker admission requires an operator-selected primary project. Set `--lake-root`, `LEAN_HOST_MCP_PROJECT`, or an absolute `primary_project` in the home configuration. CLI and environment selection take precedence over the home setting. Filesystem discovery and project-local configuration can select a project for metadata. A native request using discovery or an explicit `project=` must resolve to the approved canonical directory before the broker prepares Lake options or opens a worker. Worker-side source and capability checks still apply.
+Native worker admission requires an operator-selected primary project: `--lake-root` or `LEAN_HOST_MCP_PROJECT`.
+Filesystem discovery can select a project for metadata. A native request using discovery or an explicit `project=` must
+resolve to the approved canonical directory before the broker prepares Lake options or opens a worker. Worker-side
+source and capability checks still apply.
 
 To verify a file in an already-built project, start the stdio server with `lean-host-mcp --lake-root /absolute/path/to/project`. Call `lean_verify` with a project-relative file and a declaration, for example:
 

@@ -151,9 +151,11 @@ selects cache roots and toolchain/sysroot. Consumers do not declare, link, or im
 
 ### Toolchain-Readiness Gate
 
-`WorkerBinary::resolve_ready_for` checks the supported table, elan/worker layout, recorded header digest, wire protocol,
-and runtime smoke result before spawn. Project discovery first checks the lakefile and manifest, so readiness tests need
-a real pinned Lake root.
+`WorkerBinary::resolve_ready` checks the supported table, elan/worker layout, recorded header digest, wire protocol, and
+runtime smoke result before spawn. It looks in the project's worker directory, which `toolchain::workers_dir` picks for
+both the server and `install`: `LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir` from the project's config
+files, then `.local/lean-host-mcp/workers` under the Lake root. Project discovery first checks the lakefile and
+manifest, so readiness tests need a real pinned Lake root.
 
 | Verdict | Meaning |
 | --- | --- |
@@ -166,10 +168,11 @@ a real pinned Lake root.
 | `Ready` | May spawn, with an advisory if provenance or runtime smoke evidence is missing |
 
 Header drift takes precedence over protocol mismatch, which precedes failed smoke. Hard verdicts refuse before spawn
-with corrective actions. Protocol mismatch maps to `IncompatibleWorker` and `install-worker --auto`; the other hard
-verdicts map to `BadProject`. Advisories survive runtime failure and are projected into public warning issues.
-Installation checks the pure supported-window verdict before building. Resident actor selection uses metadata and
-health, while source-option resolution also rechecks worker readiness, including the current header digest.
+with one line that names the worker directory and the fix, `SERVER install --lake-root PROJECT`. Protocol mismatch maps
+to `IncompatibleWorker` with that command as its recovery command; the other hard verdicts map to `BadProject`.
+Advisories survive runtime failure and are projected into public warning issues. Installation checks the pure
+supported-window verdict before building. Resident actor selection uses metadata and health, while source-option
+resolution also rechecks worker readiness, including the current header digest.
 
 ### Worker Provenance Sidecar
 

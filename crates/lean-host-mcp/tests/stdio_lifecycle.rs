@@ -171,8 +171,8 @@ impl StdioServer {
         // The native owner directory needs a canonical ancestor; macOS temp
         // directories sit under the `/var` symlink.
         let registry = registry.canonicalize().expect("canonical registry");
-        let config_dir = registry.join("config");
-        std::fs::create_dir(&config_dir).expect("private server config directory");
+        let state_dir = registry.join("server");
+        std::fs::create_dir(&state_dir).expect("private server state directory");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         // Cargo injects its test library search path. Start the installed app with
         // the ordinary loader environment so it uses its verified Elan rpath.
@@ -182,8 +182,8 @@ impl StdioServer {
         command
             .arg("--lake-root")
             .arg(project_root)
-            .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", config_dir.join("native-owners"))
-            .env("LEAN_HOST_MCP_CONFIG_DIR", config_dir)
+            .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", state_dir.join("native-owners"))
+            .env("LEAN_HOST_MCP_STORE_DIR", state_dir.join("store"))
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", &registry)
             .env("RUST_LOG", "warn");
         if let Some(dir) = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR") {

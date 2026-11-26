@@ -56,9 +56,10 @@ LEAN_HOST_MCP_TEST_FIXTURE=$PWD/fixtures/lean \
     cargo test -p lean-host-mcp --test e2e -- --ignored
 ```
 
-Alternatively, install through `lean-host-mcp install-worker --toolchain vX.Y.Z` and test that installed worker.
-`scripts/prerelease.sh` adds documentation, formatting, link-set, and dependency checks; its full run is required before
-tagging. Refresh goldens only after confirming the changed behavior is intended.
+Alternatively, install through `lean-host-mcp install --lake-root fixtures/lean` and test that installed worker; it
+reads the toolchain from the fixture's `lean-toolchain`. `scripts/prerelease.sh` adds documentation, formatting,
+link-set, and dependency checks; its full run is required before tagging. Refresh goldens only after confirming the
+changed behavior is intended.
 
 ## Record the result
 

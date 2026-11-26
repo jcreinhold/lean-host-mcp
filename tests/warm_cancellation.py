@@ -123,6 +123,7 @@ def check(parent, workers, scope, mode):
         LEAN_RS_WORKER_OWNERS_DIRECTORY=str(scope / "owners"),
         LAKE_CACHE_DIR=str(scope / "cache"),
         LEAN_HOST_MCP_PROCESS_REGISTRY_DIR=str(scope / "process"),
+        LEAN_HOST_MCP_STORE_DIR=str(scope / "store"),
         LEAN_HOST_MCP_MAX_WORKERS="1",
         LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT="1",
     )

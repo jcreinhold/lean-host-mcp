@@ -75,7 +75,6 @@ fn bench_cache_hit(c: &mut Criterion) {
     };
     let rt = Runtime::new().unwrap();
     let broker = ProjectBroker::new(BrokerConfig {
-        config_default: None,
         env_default: Some(root.clone()),
         cwd: root.clone(),
         max_projects: BrokerConfig::default_max_projects(),

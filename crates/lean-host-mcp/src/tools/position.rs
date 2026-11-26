@@ -2177,7 +2177,6 @@ import Init -- comment
         let root = root.canonicalize().unwrap();
 
         let broker = crate::broker::ProjectBroker::new(crate::broker::BrokerConfig {
-            config_default: None,
             env_default: Some(root.clone()),
             cwd: root,
             max_projects: crate::broker::BrokerConfig::default_max_projects(),

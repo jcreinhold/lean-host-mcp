@@ -66,7 +66,6 @@ fn open_ctx(root: &Path) -> ToolContext {
 fn open_ctx_with_residue_budget(root: &Path, budget_bytes: u64) -> ToolContext {
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {
-            config_default: None,
             env_default: Some(root.to_path_buf()),
             cwd: root.to_path_buf(),
             max_projects: BrokerConfig::default_max_projects(),
@@ -86,7 +85,6 @@ fn open_ctx_with_residue_budget(root: &Path, budget_bytes: u64) -> ToolContext {
 
 fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
     let broker = ProjectBroker::new(BrokerConfig {
-        config_default: None,
         env_default: Some(root.to_path_buf()),
         cwd: root.to_path_buf(),
         max_projects: BrokerConfig::default_max_projects(),
