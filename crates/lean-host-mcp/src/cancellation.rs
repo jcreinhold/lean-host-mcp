@@ -3,9 +3,11 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lean_rs_worker_parent::LeanWorkerCancellationToken;
 use parking_lot::Mutex;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::envelope::{TargetCheckNotStarted, WorkerStopReceipt};
@@ -19,6 +21,9 @@ pub(crate) struct CallCancellation {
     worker: LeanWorkerCancellationToken,
     signal: CancellationToken,
     execution: Arc<Mutex<CallExecutionEvidence>>,
+    /// The request's deadline. The worker token holds the same deadline, but
+    /// the SDK does not expose it, so the host keeps its own copy.
+    deadline: Option<Instant>,
 }
 
 /// Aggregate operation evidence, independent of semantic results and carriers.
@@ -177,6 +182,30 @@ impl CallCancellation {
         self.signal.cancelled().await;
     }
 
+    /// The request deadline, or `fallback` from now outside a bounded request.
+    /// `None` only when that sum overflows the clock.
+    pub(crate) fn deadline_or(&self, fallback: Duration) -> Option<Instant> {
+        self.deadline.or_else(|| Instant::now().checked_add(fallback))
+    }
+
+    /// Time left before the request deadline, or `fallback` outside one.
+    pub(crate) fn remaining_or(&self, fallback: Duration) -> Duration {
+        self.deadline
+            .map_or(fallback, |deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// A clone that shares cancellation and evidence and stops at `deadline`,
+    /// or at an earlier deadline it already has.
+    fn bounded(&self, deadline: Instant) -> Self {
+        let deadline = self.deadline.map_or(deadline, |earlier| earlier.min(deadline));
+        Self {
+            worker: self.worker.with_deadline(deadline.into_std()),
+            signal: self.signal.clone(),
+            execution: Arc::clone(&self.execution),
+            deadline: Some(deadline),
+        }
+    }
+
     /// Retain uncertainty even when a tool degrades a failed worker call into
     /// another successful semantic result. The outer lifecycle must not lose it.
     pub(crate) fn mark_uncertain(&self) {
@@ -269,20 +298,36 @@ pub(crate) async fn with_cancellation_evidence<T>(
     if request.is_cancelled() {
         cancellation.cancel();
     }
+    // The project turn slot lives inside this scope, so a request's read turn
+    // ends with the request.
     let result = CURRENT
-        .scope(cancellation.clone(), async {
-            tokio::pin!(operation);
-            tokio::select! {
-                result = &mut operation => result,
-                () = request.cancelled() => {
-                    cancellation.cancel();
-                    operation.await
+        .scope(
+            cancellation.clone(),
+            crate::project_lock::scope(async {
+                tokio::pin!(operation);
+                tokio::select! {
+                    result = &mut operation => result,
+                    () = request.cancelled() => {
+                        cancellation.cancel();
+                        operation.await
+                    }
                 }
-            }
-        })
+            }),
+        )
         .await;
     let evidence = cancellation.execution.lock().clone();
     (result, evidence)
+}
+
+/// Bound a request by `timeout` from now. Worker calls stop at the deadline
+/// and report a timeout; lock waits and native readers use the time left.
+pub(crate) async fn with_deadline<T>(timeout: Duration, operation: impl Future<Output = T>) -> T {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return operation.await;
+    };
+    CURRENT
+        .scope(CallCancellation::current().bounded(deadline), operation)
+        .await
 }
 
 #[cfg(test)]
@@ -415,6 +460,29 @@ mod tests {
             42
         };
         assert_eq!(with_cancellation(&request, operation).await, 42);
+    }
+
+    #[tokio::test]
+    async fn a_nested_deadline_keeps_the_earlier_one_and_shares_cancellation() {
+        let request = CancellationToken::new();
+        with_cancellation(&request, async {
+            let outer = CallCancellation::current();
+            assert!(outer.deadline.is_none());
+            assert_eq!(outer.remaining_or(Duration::from_secs(7)), Duration::from_secs(7));
+            with_deadline(Duration::from_secs(60), async {
+                let bounded = CallCancellation::current();
+                assert!(bounded.deadline.is_some());
+                assert!(bounded.remaining_or(Duration::ZERO) <= Duration::from_secs(60));
+                with_deadline(Duration::from_secs(3600), async {
+                    assert_eq!(CallCancellation::current().deadline, bounded.deadline);
+                })
+                .await;
+                outer.cancel();
+                assert!(bounded.is_cancelled() && bounded.worker().is_cancelled());
+            })
+            .await;
+        })
+        .await;
     }
 
     #[tokio::test]

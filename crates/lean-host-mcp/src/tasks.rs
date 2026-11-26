@@ -1861,7 +1861,8 @@ mod tests {
     }
 
     /// A private warm controller keeps genuine SH custody while writer demand
-    /// excludes new readers. No Lean process, installed helper, or live registry
+    /// stands. Once a test calls `observe`, a proxy write turn excludes new
+    /// readers. No Lean process, installed helper, or live registry
     /// participates; constructing outside Tokio disables automatic retirement.
     struct AdmissionExpiryFixture {
         _directory: tempfile::TempDir,
@@ -1929,6 +1930,11 @@ mod tests {
                 _demand: demand,
             }
         }
+
+        /// Do the reaper's work once: see the demand and take a proxy turn.
+        fn observe(&self) {
+            self.broker.observe_writer_demand(&tokio::runtime::Handle::current());
+        }
     }
 
     async fn verify_after_admission(
@@ -1972,6 +1978,7 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
+                fixture.observe();
                 let tasks = RequestTasks::open(&journal).unwrap();
                 let prepared = tasks.prepare(binding(1)).unwrap();
                 let id = prepared.fields["taskId"].as_str().unwrap().to_owned();
@@ -2089,6 +2096,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
+            fixture.observe();
             let tasks = RequestTasks::default();
             let prepared = tasks.prepare(binding(1)).unwrap();
             let id = prepared.fields["taskId"].as_str().unwrap().to_owned();

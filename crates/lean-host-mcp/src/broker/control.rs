@@ -249,30 +249,40 @@ impl MaintenanceAccess {
         Arc::clone(&self.active_jobs)
     }
 
-    pub(crate) fn try_begin(&self, root: &Path, session_id: &str) -> Option<crate::project::ActiveJobGuard> {
+    pub(crate) fn try_begin(&self, root: &Path, session_id: &str) -> Option<MaintenanceGuard> {
         let inner = self.inner.upgrade()?;
         let mut registry = inner.lock();
         if registry.control.remaining(Instant::now()).is_some() {
             return None;
         }
-        // Demand and a brief reader admission gate both defer new idle work.
-        let _artifact_admission = ProjectBroker::check_artifact_admission(&registry, root).ok()?;
+        // Idle work never waits for a turn. It runs only when no writer holds
+        // or waits for the project.
+        let turn = registry.locks.get(root).try_read()?;
         // An evicted/replaced controller cannot start another idle recycle.
-        let guard = registry
+        let job = registry
             .registry
             .iter()
             .filter(|(key, _)| key.root == root)
             .find_map(|(_, actor)| actor.begin_maintenance(session_id));
         drop(registry);
-        guard
+        Some(MaintenanceGuard {
+            _job: job?,
+            _turn: turn,
+        })
     }
+}
+
+/// Idle work's hold on a project: one active job on the actor and a read
+/// turn, so no idle cycle or pre-warm overlaps a write turn.
+pub(crate) struct MaintenanceGuard {
+    _job: crate::project::ActiveJobGuard,
+    _turn: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 impl ProjectBroker {
     fn try_begin_preparation_activity(&self, root: &Path) -> crate::error::Result<PreparationActivityGuard> {
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;
-        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         // The lease check and count change are one registry critical section.
         // Acquire cannot observe idle and win between admission and child spawn.
         let active_jobs = Arc::clone(&inner.control.active_jobs);
@@ -282,11 +292,7 @@ impl ProjectBroker {
     }
 
     pub(crate) async fn preparation_activity(&self, root: &Path) -> crate::error::Result<PreparationActivityGuard> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(Duration::from_millis(self.request_timeout_millis()))
-            .ok_or_else(|| {
-                crate::error::ServerError::Internal("preparation admission deadline is out of range".into())
-            })?;
+        let deadline = self.request_deadline()?;
         self.preparation_activity_until(root, deadline).await
     }
 
@@ -304,7 +310,7 @@ impl ProjectBroker {
                 return Err(Self::pool_unavailable(root, "project_admission_timeout", true));
             }
             let result = self.try_begin_preparation_activity(root);
-            if !matches!(&result, Err(crate::error::ServerError::WorkerUnavailable(info)) if matches!(info.reason.as_str(), "worker_pool_draining" | "artifact_admission_busy"))
+            if !matches!(&result, Err(crate::error::ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining")
             {
                 return result;
             }

@@ -166,7 +166,7 @@ pub(crate) enum IleanError {
 /// [`IndexStatus::NotBuilt`]; an individual unreadable or malformed `.ilean`
 /// is counted in [`ReferenceIndex::modules_skipped`] and skipped. Never panics.
 pub(crate) fn references_to(project_root: &Path, name: &str, files: Option<&[PathBuf]>) -> ReferenceIndex {
-    let Ok(guard) = crate::artifact_reads::ArtifactReadGuard::for_project(project_root) else {
+    let Ok(guard) = crate::artifact_reads::ArtifactReadGuard::try_acquire(project_root) else {
         return ReferenceIndex {
             status: IndexStatus::Unavailable,
             references: Vec::new(),
@@ -318,7 +318,7 @@ fn indices_for(project_root: &Path, build_dir: &Path, files: &[PathBuf]) -> Opti
 }
 
 pub(crate) fn declarations_in_module(project_root: &Path, module: &str) -> ModuleDeclarationIndex {
-    let Ok(guard) = crate::artifact_reads::ArtifactReadGuard::for_project(project_root) else {
+    let Ok(guard) = crate::artifact_reads::ArtifactReadGuard::try_acquire(project_root) else {
         return ModuleDeclarationIndex {
             status: ModuleDeclarationIndexStatus::Unavailable,
             module: module.to_owned(),

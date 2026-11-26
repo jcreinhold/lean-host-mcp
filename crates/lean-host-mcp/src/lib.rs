@@ -39,6 +39,7 @@ mod lake_options;
 pub mod native_reader;
 mod native_socket;
 mod project;
+mod project_lock;
 pub mod projections;
 mod request_journal;
 mod request_log;

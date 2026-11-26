@@ -280,6 +280,9 @@ pub struct RuntimeFailure {
     pub worker_restarted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_stop_receipt: Option<WorkerStopReceipt>,
+    /// The writer that the request waited behind until its deadline, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_cause: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -504,13 +504,22 @@ impl ServerHandler for LeanHostService {
 impl LeanHostService {
     async fn run_task(&self, call: TaskCall) -> Result<CallToolResult, McpError> {
         let mut log = call.request_log();
-        let result = match call {
-            TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
-            TaskCall::Trial(req) => tools::semantic::lean_trial(&self.ctx, req.into_inner()).await,
-            TaskCall::Verify(req) => tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await,
-            TaskCall::Lookup(req) => tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await,
-            TaskCall::Status(req) => tools::semantic::lean_status(&self.ctx, req.into_inner()).await,
-        };
+        // One deadline covers the wait for a project turn and the work after it.
+        // The box keeps this future small; the work's own future is large.
+        let timeout = Duration::from_millis(self.ctx.broker.request_timeout_millis());
+        let result = crate::cancellation::with_deadline(
+            timeout,
+            Box::pin(async {
+                match call {
+                    TaskCall::Context(req) => tools::semantic::lean_context(&self.ctx, req.into_inner()).await,
+                    TaskCall::Trial(req) => tools::semantic::lean_trial(&self.ctx, req.into_inner()).await,
+                    TaskCall::Verify(req) => tools::semantic::lean_verify_raw(&self.ctx, req.into_inner()).await,
+                    TaskCall::Lookup(req) => tools::semantic::lean_lookup(&self.ctx, req.into_inner()).await,
+                    TaskCall::Status(req) => tools::semantic::lean_status(&self.ctx, req.into_inner()).await,
+                }
+            }),
+        )
+        .await;
         log.finish(&result);
         self.respond_semantic(result)
     }
@@ -849,6 +858,7 @@ mod tests {
             lean_toolchain: "leanprover/lean4:v4.30.0".to_owned(),
             worker_generation: 7,
             reason: "worker_death".to_owned(),
+            blocked_by: None,
             restart_cause: Some("child_exit".to_owned()),
             rss_kib: Some(42),
             limit_kib: Some(100),

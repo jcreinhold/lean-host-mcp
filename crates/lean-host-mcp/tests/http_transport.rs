@@ -1582,7 +1582,9 @@ fn shell_quote_path(path: &Path) -> String {
 #[tokio::test]
 async fn streamable_http_runtime_lease_is_immediate_and_owned_across_connections() {
     let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
+    // A check takes guard G over the manifest's packages before it reaches
+    // the pool, so the manifest must list them.
+    std::fs::write(root.path().join("lake-manifest.json"), "{\"packages\":[]}\n").unwrap();
     std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
     std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
     let root_s = root.path().to_string_lossy();
@@ -2337,7 +2339,9 @@ async fn streamable_http_drain_resumes_real_worker() {
 
 async fn assert_drain_resumes(real_worker: bool) {
     let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("lake-manifest.json"), "{}\n").unwrap();
+    // A check takes guard G over the manifest's packages before it waits for
+    // the drain, so the manifest must list them.
+    std::fs::write(root.path().join("lake-manifest.json"), "{\"packages\":[]}\n").unwrap();
     std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
     std::fs::copy(
         fixture_root().join("lean-toolchain"),

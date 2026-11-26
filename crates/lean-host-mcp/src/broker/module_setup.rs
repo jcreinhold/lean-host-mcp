@@ -190,6 +190,8 @@ impl ProjectBroker {
         if root != meta.canonical_root {
             return Err(ServerError::BadProject("project selection changed".into()));
         }
+        // The turn and guard G hold from setup-file until the check ends.
+        self.ensure_read(&root).await?;
         let setup = self.setup_file(&root, Path::new(file), source).await?;
         let activity = self.preparation_activity(&root).await?;
         let reader = Self::installed_reader(&root, meta)?;
@@ -226,13 +228,14 @@ impl ProjectBroker {
             .canonicalize()?;
         let domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
         let activity = self.preparation_activity(root).await?;
-        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root)?;
+        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root)?;
         let lake = sysroot.join("bin/lake");
         let (cwd, source_file) = (root.to_owned(), file.to_owned());
         let bytes = crate::lake_options::reader_output(
             SETUP_FILE,
             root.to_owned(),
-            Duration::from_millis(self.request_timeout_millis()),
+            crate::cancellation::CallCancellation::current()
+                .remaining_or(Duration::from_millis(self.request_timeout_millis())),
             self.config.max_projects.get(),
             custody,
             None,
@@ -291,13 +294,13 @@ mod tests {
             inputs: BTreeMap::from([(leaf.clone(), Identity::read(&leaf)?)]),
         };
         {
-            let guard = crate::artifact_reads::ArtifactReadGuard::for_project(&root)?;
+            let guard = crate::artifact_reads::ArtifactReadGuard::try_acquire(&root)?;
             setup.check(&root, &setup.sysroot, &guard)?;
         }
         let replacement = output.join("replacement");
         fs::write(&replacement, b"same bytes")?;
         fs::rename(replacement, leaf)?;
-        let guard = crate::artifact_reads::ArtifactReadGuard::for_project(&root)?;
+        let guard = crate::artifact_reads::ArtifactReadGuard::try_acquire(&root)?;
         assert!(
             matches!(setup.check(&root, &setup.sysroot, &guard), Err(error) if error.kind() == io::ErrorKind::InvalidData)
         );

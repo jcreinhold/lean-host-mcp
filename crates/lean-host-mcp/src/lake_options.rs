@@ -22,6 +22,7 @@ use crate::toolchain::ToolchainId;
 
 const HELPER: &str = include_str!("lake/ModuleOptions.lean");
 const LAKE_OPTIONS: &str = "Lake option discovery";
+/// Option discovery's bound outside a request; a request uses its own deadline.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +179,7 @@ async fn resolve_inner(
     // There is no partial lock set or lock-order upgrade across the handoff.
     let preflight = CallCancellation::current().begin_operation();
     let context: PreparationResult<_> = (|| {
-        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root).map_err(bad_project)?;
+        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).map_err(bad_project)?;
         let toolchain = ToolchainId::from_lake_root(root).map_err(bad_project)?;
         let sysroot = toolchain.elan_dir().map_err(bad_project)?;
         let file = source_path(root, &options.file_label);
@@ -202,7 +203,7 @@ async fn resolve_inner(
     let output = reader_output(
         LAKE_OPTIONS,
         root,
-        TIMEOUT,
+        CallCancellation::current().remaining_or(TIMEOUT),
         capacity_limit,
         custody,
         contract,
@@ -711,7 +712,7 @@ lean_lib Loose
         );
         // A resident generation retains these same SH domains. Old EX-based
         // discovery would wait its full 30-second deadline on the second call.
-        let warm = crate::artifact_reads::ArtifactReadGuard::for_project(&root).unwrap();
+        let warm = crate::artifact_reads::ArtifactReadGuard::try_acquire(&root).unwrap();
         let loose = tokio::time::timeout(Duration::from_secs(8), fixture_resolve(&root, "Loose.lean"))
             .await
             .unwrap()
@@ -1072,7 +1073,7 @@ lean_lib Demo
     #[tokio::test]
     async fn pre_cancelled_reader_admission_records_no_start_without_preparing_inputs() {
         let root = tempfile::tempdir().unwrap();
-        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root.path()).unwrap();
+        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root.path()).unwrap();
         let request = tokio_util::sync::CancellationToken::new();
         request.cancel();
         let (result, evidence) = crate::cancellation::with_cancellation_evidence(&request, async {

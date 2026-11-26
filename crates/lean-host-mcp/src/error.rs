@@ -34,6 +34,9 @@ pub struct WorkerUnavailable {
     pub(crate) lean_toolchain: String,
     pub(crate) worker_generation: u64,
     pub(crate) reason: String,
+    /// The writer that a request waited behind until its deadline, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) blocked_by: Option<String>,
     pub(crate) restart_cause: Option<String>,
     pub(crate) rss_kib: Option<u64>,
     pub(crate) limit_kib: Option<u64>,
@@ -75,6 +78,7 @@ impl WorkerUnavailable {
             worker_generation: self.worker_generation,
             worker_restarted: self.worker_restarted,
             worker_stop_receipt: self.worker_stop_receipt.clone(),
+            blocked_by: self.blocked_by.clone(),
             restart_cause: self.restart_cause.clone(),
             rss_kib: self.rss_kib,
             limit_kib: self.limit_kib,
@@ -141,6 +145,7 @@ impl From<ServerError> for McpError {
                     "lean_toolchain": &info.lean_toolchain,
                     "worker_generation": info.worker_generation,
                     "reason": &info.reason,
+                    "blocked_by": &info.blocked_by,
                     "restart_cause": &info.restart_cause,
                     "rss_kib": info.rss_kib,
                     "limit_kib": info.limit_kib,

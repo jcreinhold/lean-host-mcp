@@ -55,7 +55,7 @@ impl ImportArtifactStamp {
     /// explicitly so creating it changes the stamp. Roots are searched in the
     /// same order as the actor's artifact freshness check.
     pub(crate) fn capture_for_project(root: &Path, imports: &[String]) -> Option<Self> {
-        let guard = crate::artifact_reads::ArtifactReadGuard::for_project(root).ok()?;
+        let guard = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).ok()?;
         let roots = crate::lake_meta::artifact_roots(root);
         if roots.iter().any(|root| !guard.covers_artifact_root(root)) {
             return None;

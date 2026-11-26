@@ -1079,7 +1079,11 @@ pub async fn find_references(ctx: &ToolContext, req: FindReferencesRequest) -> R
     // with no worker query. The freshness asymmetry is the point, not a bug.
     match req.scope {
         ReferenceScope::File => find_references_in_file(ctx, hint, &root, &req, freshness, runtime, limit).await,
-        ReferenceScope::Project => find_references_in_project(&root, &req, freshness, runtime, limit).await,
+        ReferenceScope::Project => {
+            // The scan reads build products, so it takes a read turn first.
+            ctx.broker.ensure_read(&root).await?;
+            find_references_in_project(&root, &req, freshness, runtime, limit).await
+        }
     }
 }
 

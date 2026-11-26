@@ -10,7 +10,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const READ_WAIT: Duration = Duration::from_millis(250);
 const POLL: Duration = Duration::from_millis(5);
 
 /// Lexically complete custody for one parent-side artifact read, closed on drop.
@@ -20,8 +19,11 @@ pub(crate) struct ArtifactReadGuard {
 }
 
 impl ArtifactReadGuard {
-    pub(crate) fn for_project(root: &Path) -> io::Result<Self> {
-        Self::acquire(root, READ_WAIT)
+    /// Take the guard without waiting. A request already holds its project
+    /// turn and guard G, so no writer can hold the lock; any wait belongs in
+    /// the project's fair lock, not here.
+    pub(crate) fn try_acquire(root: &Path) -> io::Result<Self> {
+        Self::acquire(root, Duration::ZERO)
     }
 
     #[cfg(unix)]

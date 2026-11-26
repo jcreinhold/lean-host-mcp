@@ -131,6 +131,8 @@ async fn inventory(
             if path.is_file() {
                 worker_declarations(ctx, hint, &meta.canonical_root, &path, Some(module), limit, supervised).await
             } else {
+                // The index lives in build products; read it under a project turn.
+                ctx.broker.ensure_read(&meta.canonical_root).await?;
                 index_declarations(ctx, hint, &meta.canonical_root, &module, limit)
             }
         }

@@ -1,18 +1,20 @@
-//! Cross-process artifact handoff uses the existing actor admission boundary.
+//! Hand artifacts to a writer in another process.
 //!
-//! Writer demand and brief fresh-reader gates use the same kernel lock. A busy
-//! gate is contention, not proof of a writer's identity. It prevents new calls
-//! from pinning a warm actor while its already-admitted calls finish.
+//! A writer announces demand before it takes the kernel lock exclusively. The
+//! reaper sees that demand, queues a proxy write turn so new checks wait in
+//! the project's fair lock, and retires idle workers whose shared locks would
+//! keep the writer out. A busy reader gate is contention, not proof of a
+//! writer, so it changes nothing.
 
 use std::collections::BTreeSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use lean_toolchain::writer_demand::ReadAdmission;
 
-use super::{BrokerInner, ProjectBroker};
-use crate::error::{Result, ServerError};
+use super::ProjectBroker;
+use crate::project_lock::Demand;
 
 fn try_domains(domains: &[PathBuf]) -> io::Result<Option<Vec<ReadAdmission>>> {
     let mut paths = domains
@@ -34,27 +36,43 @@ fn try_domains(domains: &[PathBuf]) -> io::Result<Option<Vec<ReadAdmission>>> {
 }
 
 impl ProjectBroker {
-    /// Hold only through the synchronous Arc/activity admission operation.
-    /// No preparation, child startup or actor operation may run with this gate.
-    pub(super) fn check_artifact_admission(inner: &BrokerInner, root: &Path) -> Result<Vec<ReadAdmission>> {
-        // A prospective/nonexistent cold root owns no native read scope yet.
-        // Its normal opening path validates it before any target can run.
-        let mut domains = BTreeSet::new();
-        if root.is_dir() {
-            domains.insert(root.to_path_buf());
-        }
-        for (_, actor) in inner.registry.iter().filter(|(key, _)| key.root == root) {
-            domains.extend(actor.protected_artifact_domains());
-        }
-        match try_domains(&domains.into_iter().collect::<Vec<_>>()) {
-            Ok(Some(admission)) => Ok(admission),
-            Ok(None) => Err(Self::pool_unavailable(root, "artifact_admission_busy", true)),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                Err(Self::pool_unavailable(root, "artifact_admission_busy", true))
+    /// Hold a proxy write turn on each project where another process's writer
+    /// announced demand, until that demand ends. The domains are those guard G
+    /// covers, plus every domain the project's live workers still protect.
+    pub(crate) fn observe_writer_demand(&self, handle: &tokio::runtime::Handle) {
+        let projects: Vec<_> = {
+            let inner = self.inner.lock();
+            inner
+                .locks
+                .iter()
+                .map(|(root, lock)| {
+                    let domains: BTreeSet<PathBuf> = inner
+                        .registry
+                        .iter()
+                        .filter(|(key, _)| key.root == *root)
+                        .flat_map(|(_, actor)| actor.protected_artifact_domains())
+                        .collect();
+                    (root.clone(), Arc::clone(lock), domains)
+                })
+                .collect()
+        };
+        for (root, lock, mut domains) in projects {
+            // A root that is not a directory has no lock file to watch. A
+            // manifest that does not parse leaves the root and worker domains.
+            if root.is_dir() {
+                if let Ok(roots) = lean_toolchain::shared_writer::project_artifact_roots(&root) {
+                    domains.extend(roots);
+                }
+                domains.insert(root);
             }
-            Err(error) => Err(ServerError::BadProject(format!(
-                "artifact admission gate unavailable: {error}"
-            ))),
+            let demand = match try_domains(&domains.into_iter().collect::<Vec<_>>()) {
+                Ok(Some(_)) => Demand::Absent,
+                Ok(None) => Demand::Present,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Demand::Unknown,
+                // A failed look must not keep a proxy turn held.
+                Err(_) => Demand::Absent,
+            };
+            lock.observe_demand(demand, handle);
         }
     }
 
@@ -105,6 +123,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
     use std::fs::{self, File, OpenOptions};
+    use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -112,8 +131,10 @@ mod tests {
 
     use super::*;
     use crate::broker::{BrokerConfig, RuntimeAction, RuntimeControlRequest, RuntimeControlStatus};
+    use crate::error::ServerError;
     use crate::lake_meta::LakeProjectMeta;
     use crate::project::LeanProject;
+    use crate::project_lock::EXTERNAL_WRITER;
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -283,18 +304,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_call_finishes_before_handoff_and_matching_new_calls_cannot_pin_actor() {
+    async fn admitted_call_finishes_before_handoff_and_new_calls_wait_behind_a_proxy_turn() {
         let f = Fixture::new();
         let broker = f.broker();
         let actor = Fixture::actor(&f.project, vec![f.project.clone(), f.dependency.clone()]);
         broker.test_register_actor(Arc::clone(&actor));
+        let lock = broker.inner.lock().locks.get(&f.project);
         let writer = WriterChild::start(
             &f.root,
             &lean_toolchain::shared_writer::project_lock_path(&f.dependency).unwrap(),
         );
         wait_for(|| f.root.join("writer-demand").exists()).await;
-        let error = broker.select_worker(&f.project).unwrap_err();
-        assert!(matches!(error, ServerError::WorkerUnavailable(info) if info.reason == "artifact_admission_busy"));
+        // The reaper queues a proxy write turn: new checks and idle work wait
+        // in the project's fair lock instead of pinning the actor.
+        wait_for(|| lock.try_read().is_none()).await;
         assert!(
             broker
                 .test_maintenance_access()
@@ -310,6 +333,12 @@ mod tests {
         drop(actor); // the admitted call's existing Arc finishes normally
         wait_for(|| f.root.join("writer-admitted").exists()).await;
         writer.finish().await;
+        wait_for(|| lock.try_read().is_some()).await;
+        assert_eq!(
+            broker.ensure_read(&f.project).await.unwrap(),
+            1,
+            "the proxy turn counts as one finished build"
+        );
         broker.shutdown_all();
     }
 
@@ -340,42 +369,51 @@ mod tests {
     }
 
     #[test]
-    fn handoff_waits_keep_the_original_deadline_and_observe_cancellation_without_dispatch() {
+    fn waits_behind_a_proxy_turn_keep_the_request_deadline_and_observe_cancellation_without_dispatch() {
         let f = Fixture::new();
-        // Construct outside Tokio so this focused admission test does not run
-        // the automatic retirement being exercised by the other regressions.
+        // Construct outside Tokio so no reaper runs; the test observes writer
+        // demand itself.
         let broker = f.broker();
         broker.test_register_actor(Fixture::actor(&f.project, vec![f.project.clone()]));
-        let lock = lean_toolchain::shared_writer::project_lock_path(&f.project).unwrap();
-        let _demand = WriterDemand::announce(&[lock], WAIT, &|| false).unwrap();
+        let lock = broker.inner.lock().locks.get(&f.project);
+        let path = lean_toolchain::shared_writer::project_lock_path(&f.project).unwrap();
+        let demand = WriterDemand::announce(&[path], WAIT, &|| false).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let error = broker
-                .acquire_until(
-                    f.project.clone(),
-                    tokio::time::Instant::now() + Duration::from_millis(60),
-                )
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(error, ServerError::WorkerUnavailable(info) if info.reason == "project_admission_timeout")
-            );
+            broker.observe_writer_demand(&tokio::runtime::Handle::current());
+            assert!(lock.try_read().is_none(), "writer demand queues a proxy turn");
+            let request = tokio_util::sync::CancellationToken::new();
+            let error = crate::cancellation::with_cancellation(
+                &request,
+                crate::cancellation::with_deadline(
+                    Duration::from_millis(60),
+                    Box::pin(broker.acquire(f.project.clone())),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ServerError::WorkerUnavailable(info)
+                    if info.reason == "project_admission_timeout"
+                        && info.blocked_by.as_deref() == Some(EXTERNAL_WRITER)
+            ));
             let cancellation = tokio_util::sync::CancellationToken::new();
-            let wait = crate::cancellation::with_cancellation(
-                &cancellation,
-                broker.acquire_until(f.project.clone(), tokio::time::Instant::now() + WAIT),
-            );
+            let wait = crate::cancellation::with_cancellation(&cancellation, broker.acquire(f.project.clone()));
             tokio::pin!(wait);
             tokio::select! {
-                result = &mut wait => panic!("writer-fenced call was admitted before cancellation: {result:?}"),
+                result = &mut wait => panic!("a call behind a proxy turn was admitted before cancellation: {result:?}"),
                 () = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
             cancellation.cancel();
             let error = wait.await.unwrap_err();
             assert!(matches!(error, ServerError::WorkerUnavailable(info) if info.reason == "request_cancelled"));
+            drop(demand);
+            broker.observe_writer_demand(&tokio::runtime::Handle::current());
+            wait_for(|| lock.try_read().is_some()).await;
         });
         assert_eq!(broker.resident_paths(), vec![f.project]);
         broker.shutdown_all();
@@ -395,22 +433,30 @@ mod tests {
             .collect();
         locks.sort();
         broker.test_register_actor(Fixture::actor(&f.project, domains));
-        drop(
-            broker
-                .select_worker(&f.project)
-                .unwrap()
-                .expect("all historical domains can be gated"),
-        );
-        let last = locks.last().unwrap();
-        let demand = WriterDemand::announce(std::slice::from_ref(last), WAIT, &|| false).unwrap();
-        let error = broker.select_worker(&f.project).unwrap_err();
-        assert!(matches!(error, ServerError::WorkerUnavailable(info) if info.reason == "artifact_admission_busy"));
-        let gate = ReadAdmission::try_acquire(&locks[..32]).unwrap();
-        assert!(
-            gate.is_some(),
-            "a later blocked chunk releases every earlier transient gate"
-        );
-        drop((gate, demand));
+        let lock = broker.inner.lock().locks.get(&f.project);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            broker.observe_writer_demand(&tokio::runtime::Handle::current());
+            assert!(lock.try_read().is_some(), "every historical domain can be gated");
+            let last = locks.last().unwrap();
+            let demand = WriterDemand::announce(std::slice::from_ref(last), WAIT, &|| false).unwrap();
+            broker.observe_writer_demand(&tokio::runtime::Handle::current());
+            assert!(
+                lock.try_read().is_none(),
+                "demand in the last chunk queues a proxy turn"
+            );
+            let gate = ReadAdmission::try_acquire(&locks[..32]).unwrap();
+            assert!(
+                gate.is_some(),
+                "a later blocked chunk releases every earlier transient gate"
+            );
+            drop((gate, demand));
+            broker.observe_writer_demand(&tokio::runtime::Handle::current());
+            wait_for(|| lock.try_read().is_some()).await;
+        });
         broker.shutdown_all();
     }
 }

@@ -95,7 +95,7 @@ impl ProjectBroker {
     }
 
     pub(super) fn installed_reader(root: &Path, meta: &crate::lake_meta::LakeProjectMeta) -> Result<PreparedReader> {
-        let custody = crate::artifact_reads::ArtifactReadGuard::for_project(root).map_err(invalid)?;
+        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).map_err(invalid)?;
         let shims = VerifierShims::select(meta)?;
         let shim_guards = lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(&shims.domains)?;
         shims.validate()?;
@@ -199,6 +199,7 @@ impl ProjectBroker {
         {
             return Err(invalid("unapproved verification path"));
         }
+        self.ensure_read(&root).await?;
         let (options, reader, setup, activity) = if let Some(selection) = self.prepared_generation() {
             let options = self.resolve_options(&meta, options).await?;
             let activity = self.preparation_activity(&root).await?;
@@ -337,7 +338,8 @@ impl ProjectBroker {
         crate::lake_options::reader_output(
             "Lean file driver",
             root.clone(),
-            Duration::from_millis(self.request_timeout_millis()),
+            crate::cancellation::CallCancellation::current()
+                .remaining_or(Duration::from_millis(self.request_timeout_millis())),
             self.config.max_projects.get(),
             custody,
             None,

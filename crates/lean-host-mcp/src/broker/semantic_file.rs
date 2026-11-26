@@ -28,6 +28,7 @@ impl ProjectBroker {
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
         let root = self.native_root(&hint)?;
         let meta = self.meta(&root)?;
+        self.ensure_read(&root).await?;
         let (reader, setup, activity) = if let Some(input) = input {
             let activity = self.preparation_activity(&root).await?;
             let mut selected = imports;
@@ -83,7 +84,7 @@ impl ProjectBroker {
         // Dropping the build writer closes its input. Its observer can still be
         // reaping the helper when the completed build returns.
         let started = std::time::Instant::now();
-        let budget = Duration::from_millis(self.request_timeout_millis());
+        let budget = CallCancellation::current().remaining_or(Duration::from_millis(self.request_timeout_millis()));
         let runtime_guard = loop {
             match lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(std::slice::from_ref(&package)) {
                 Ok(guard) => break guard,
@@ -107,7 +108,7 @@ impl ProjectBroker {
         let bytes = crate::lake_options::reader_output(
             "Lean semantic feature reader",
             root,
-            Duration::from_millis(self.request_timeout_millis()),
+            CallCancellation::current().remaining_or(Duration::from_millis(self.request_timeout_millis())),
             self.config.max_projects.get(),
             custody,
             None,

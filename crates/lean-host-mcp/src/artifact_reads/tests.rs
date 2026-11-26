@@ -142,7 +142,7 @@ fn parent_read_guard_holds_complete_dependency_union_until_drop() {
     std::fs::write(root.join("lake-manifest.json"), serde_json::to_vec(&serde_json::json!({
         "version":"1.1.0", "packages":[{"name":"dependency","type":"path","dir":dependency,"manifestFile":"lake-manifest.json"}]
     })).unwrap()).unwrap();
-    let guard = ArtifactReadGuard::for_project(&root).unwrap();
+    let guard = ArtifactReadGuard::try_acquire(&root).unwrap();
     for root in [&root, &dependency] {
         let file = open(&lean_toolchain::shared_writer::project_lock_path(root).unwrap());
         assert!(matches!(file.try_lock(), Err(TryLockError::WouldBlock)));
@@ -170,7 +170,7 @@ fn unsupported_dependency_closure_refuses_parent_reads() {
     let root = tempfile::tempdir().unwrap();
     stage_index(root.path());
     std::fs::write(root.path().join("lakefile.lean"), "import Lake").unwrap();
-    let error = ArtifactReadGuard::for_project(root.path()).err().unwrap();
+    let error = ArtifactReadGuard::try_acquire(root.path()).err().unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("no dependency manifest"));
     assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
@@ -192,7 +192,7 @@ fn artifact_symlink_escape_refuses_parent_reads() {
         root.path().join(crate::lake_meta::BUILD_LIB_REL),
     )
     .unwrap();
-    let guard = ArtifactReadGuard::for_project(root.path()).unwrap();
+    let guard = ArtifactReadGuard::try_acquire(root.path()).unwrap();
     assert!(!guard.covers_artifact_root(&root.path().join(crate::lake_meta::BUILD_LIB_REL)));
     assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
     assert_eq!(
@@ -210,7 +210,7 @@ fn malformed_committed_writer_evidence_refuses_parent_reads() {
     let root = tempfile::tempdir().unwrap();
     let path = lean_toolchain::shared_writer::project_lock_path(root.path()).unwrap();
     std::fs::write(path, b"{}\n").unwrap();
-    let error = ArtifactReadGuard::for_project(root.path()).err().unwrap();
+    let error = ArtifactReadGuard::try_acquire(root.path()).err().unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("no exact owner"));
 }
@@ -223,7 +223,7 @@ fn malformed_committed_writer_evidence_refuses_parent_reads() {
 )]
 fn parent_read_descriptors_are_close_on_exec() {
     let root = tempfile::tempdir().unwrap();
-    let guard = ArtifactReadGuard::for_project(root.path()).unwrap();
+    let guard = ArtifactReadGuard::try_acquire(root.path()).unwrap();
     assert!(guard._locks.iter().all(|file| {
         rustix::io::fcntl_getfd(file)
             .unwrap()
@@ -244,7 +244,7 @@ fn undeclared_nested_workspace_symlink_refuses_parent_reads() {
         root.path().join(crate::lake_meta::BUILD_LIB_REL),
     )
     .unwrap();
-    let guard = ArtifactReadGuard::for_project(root.path()).unwrap();
+    let guard = ArtifactReadGuard::try_acquire(root.path()).unwrap();
     assert!(!guard.covers_artifact_root(&root.path().join(crate::lake_meta::BUILD_LIB_REL)));
     assert!(crate::cache::ImportArtifactStamp::capture_for_project(root.path(), &["Demo".into()]).is_none());
     assert_eq!(

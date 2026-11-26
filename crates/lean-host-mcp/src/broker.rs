@@ -285,6 +285,8 @@ struct BrokerInner {
     /// the project pool — a root the pool cannot hold is a root whose metadata we
     /// need only for the cheap non-worker paths, where a rebuild is affordable.
     meta_cache: LruCache<PathBuf, (ProjectInputStamp, LakeProjectMeta)>,
+    /// Fair read and write turns per canonical root.
+    locks: crate::project_lock::ProjectLocks,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +349,7 @@ impl ProjectBroker {
                 opening_locks: HashMap::new(),
                 shutdown_epoch: 0,
                 meta_cache: LruCache::new(config.max_projects),
+                locks: crate::project_lock::ProjectLocks::default(),
             })),
             runtime_config,
             worker_slots: Arc::new(Semaphore::new(config.max_projects.get())),
@@ -360,7 +363,10 @@ impl ProjectBroker {
     #[cfg(test)]
     pub(crate) fn test_register_actor(&self, project: Arc<LeanProject>) {
         let root = project.canonical_root().to_path_buf();
-        self.inner.lock().registry.put(WorkerKey { root, lane: 0 }, project);
+        let mut inner = self.inner.lock();
+        // As after `acquire`, the actor's root has a project lock.
+        inner.locks.get(&root);
+        inner.registry.put(WorkerKey { root, lane: 0 }, project);
     }
 
     #[cfg(test)]
@@ -396,6 +402,7 @@ impl ProjectBroker {
             return;
         };
         let weak: Weak<Self> = Arc::downgrade(self);
+        let runtime = handle.clone();
         handle.spawn(async move {
             let mut idle = tokio::time::interval(REAPER_TICK);
             let mut handoff = tokio::time::interval(ARTIFACT_HANDOFF_TICK);
@@ -413,11 +420,13 @@ impl ProjectBroker {
                 };
                 // Filesystem/lock observation and retirement stay off the async
                 // executor. Writer handoff remains enabled when idle expiry is 0.
+                let runtime = runtime.clone();
                 if let Err(error) = tokio::task::spawn_blocking(move || {
                     if reap_idle {
                         broker.reap_idle();
                     } else {
                         broker.reap_artifact_handoffs();
+                        broker.observe_writer_demand(&runtime);
                     }
                 })
                 .await
@@ -963,6 +972,7 @@ impl ProjectBroker {
         meta: &LakeProjectMeta,
         options: LeanWorkerElabOptions,
     ) -> Result<LeanWorkerElabOptions> {
+        self.ensure_read(&meta.canonical_root).await?;
         let activity = self.preparation_activity(&meta.canonical_root).await?;
         // Resolve availability before evaluating arbitrary project configuration.
         // This is metadata-only and preserves ordinary missing-worker precedence.
@@ -987,13 +997,43 @@ impl ProjectBroker {
         self.acquire(root).await
     }
 
+    /// The current request's deadline, or the configured request timeout from
+    /// now outside a bounded request.
+    pub(crate) fn request_deadline(&self) -> Result<tokio::time::Instant> {
+        CallCancellation::current()
+            .deadline_or(Duration::from_millis(self.request_timeout_millis()))
+            .ok_or_else(|| ServerError::Internal("request deadline is out of range".to_owned()))
+    }
+
+    /// Give this request its read turn on `root`, and the shared kernel guard,
+    /// before it pins a worker or starts a reader. Both last until the request
+    /// ends. Returns the finished-build count at the grant.
+    pub(crate) async fn ensure_read(&self, root: &Path) -> Result<u64> {
+        use crate::project_lock::TurnRefused;
+        let lock = self.inner.lock().locks.get(root);
+        let deadline = self.request_deadline()?;
+        crate::project_lock::ensure_read(&lock, root, deadline, &CallCancellation::current())
+            .await
+            .map_err(|refused| match refused {
+                TurnRefused::Expired { blocked_by } => {
+                    Self::pool_unavailable_behind(root, "project_admission_timeout", true, blocked_by)
+                }
+                TurnRefused::Cancelled => Self::pool_unavailable(root, "request_cancelled", false),
+                TurnRefused::Guard(error) => {
+                    ServerError::BadProject(format!("artifact read lock unavailable: {error}"))
+                }
+                TurnRefused::OtherRoot(held) => {
+                    ServerError::Internal(format!("request already holds a project turn on {}", held.display()))
+                }
+            })
+    }
+
     /// Look up or open the project for `root`. Mutex is released around
     /// the slow path so concurrent calls for different roots parallelize. The
-    /// original deadline continues through the returned actor's queue admission.
+    /// request deadline continues through the returned actor's queue admission.
     async fn acquire(&self, root: PathBuf) -> Result<(Arc<LeanProject>, Instant)> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(Duration::from_millis(self.request_timeout_millis()))
-            .ok_or_else(|| ServerError::Internal("admission deadline is out of range".to_owned()))?;
+        self.ensure_read(&root).await?;
+        let deadline = self.request_deadline()?;
         let project = self.acquire_until(root, deadline).await?;
         Ok((project, deadline.into_std()))
     }
@@ -1002,11 +1042,11 @@ impl ProjectBroker {
         let cancellation = CallCancellation::current();
         loop {
             let result = self.acquire_attempt(root.clone(), deadline).await;
-            if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if matches!(info.reason.as_str(), "worker_pool_draining" | "artifact_admission_busy"))
-            {
+            if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining") {
                 return result;
             }
-            // Waiting callers own no project Arc, opening lock, or worker slot.
+            // Waiting callers own no project Arc, opening lock, or worker slot;
+            // they keep their read turn and guard G until the request ends.
             // A bounded local timer also observes expiry without another API call.
             tokio::select! {
                 biased;
@@ -1155,7 +1195,6 @@ impl ProjectBroker {
         {
             let mut inner = self.inner.lock();
             Self::check_runtime_admission(&mut inner, root)?;
-            let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
             if !inner.registry.iter().any(|(key, _)| key.root == root) {
                 return Ok(None);
             }
@@ -1163,7 +1202,6 @@ impl ProjectBroker {
         let manifest_hash = self.meta(root)?.manifest_hash;
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;
-        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         let stale: Vec<_> = inner
             .registry
             .iter()
@@ -1206,7 +1244,6 @@ impl ProjectBroker {
     fn select_existing_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
         let mut inner = self.inner.lock();
         Self::check_runtime_admission(&mut inner, root)?;
-        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         let key = inner
             .registry
             .iter()
@@ -1227,7 +1264,6 @@ impl ProjectBroker {
         // Claim acquisition uses this same mutex. A cold caller must either
         // retain its opening lock before the claim, or observe the held lease.
         Self::check_runtime_admission(&mut inner, root)?;
-        let _artifact_admission = Self::check_artifact_admission(&inner, root)?;
         inner.opening_locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = inner.opening_locks.get(root).and_then(Weak::upgrade) {
             return Ok(lock);
@@ -1337,7 +1373,13 @@ impl ProjectBroker {
     }
 
     fn pool_unavailable(root: &Path, reason: &str, retryable: bool) -> ServerError {
+        Self::pool_unavailable_behind(root, reason, retryable, None)
+    }
+
+    /// `blocked_by` names the writer that a request waited behind, if known.
+    fn pool_unavailable_behind(root: &Path, reason: &str, retryable: bool, blocked_by: Option<String>) -> ServerError {
         ServerError::worker_unavailable(crate::error::WorkerUnavailable {
+            blocked_by,
             retryable,
             worker_restarted: false,
             worker_stop_receipt: None,
