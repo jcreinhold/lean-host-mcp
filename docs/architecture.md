@@ -30,18 +30,34 @@ crates/lean-host-mcp/src/
   broker/module_setup.rs lake setup-file as a native reader; the import closure for lean_imports
   broker/verify_file.rs  file checks through one-shot Lean programs
   project.rs             LeanProject actor: one serialized controller and worker
+  worker_retirement.rs   keeps an actor's capacity until each tracked child has exited
   project_lock.rs        fair read and write turns per Lake root, the shared kernel guard, proxy turns
   build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, the run in one helper
   shared_writer.rs       the SDK writer helper, including its build log mode
   native_reader.rs       one-shot Lean programs in the SDK's native reader scope
+  host_preparation.rs    the worker's host artifacts, prepared before any guarded generation
+  native_socket.rs       where the SDK's short-lived sockets live
+  artifact_reads.rs      parent-only artifact reads that hold shared descriptors until parsing ends
+  runtime_compatibility.rs the one native compatibility contract for writers and workers
   tools/                 semantic.rs facade; declaration/proof_search/proof_action/position internals; build.rs
   projections.rs         stable MCP projections from lean-rs worker types
   lake_meta.rs           minimal Lake-project metadata
+  lake_options.rs, lake/ Lake compile options and setup through Lake's own API, without building imports
+  toolchain.rs           the project's lean-toolchain pin, its elan toolchain and its worker
   cache.rs               bounded module-query cache, valid while the worker that computed an entry lives
   envelope.rs            internal operation envelope adapted to { data, errors, trust } at the public boundary
   requests/              named requests: the SQLite request table, one launch per id, recovery at start
+  request_log.rs         content-free summaries of semantic calls
   store.rs               the server store: one-server lock, build logs
   config_file.rs         the tracked and local config files at the Lake root
+  config_schema.rs       every config setting, in one table
+  cli/                   install, install-worker, config init and doctor processes
+  status.rs              build identity and resolved settings for the status reply
+  cancellation.rs        request cancellation shared by async callers and the worker owner
+  error.rs, trust.rs     the one error type of tool handlers; the trust facts in each reply
+  ilean.rs               a reader for Lean's .ilean reference indices
+  semantic_search.rs     the lean-semantic-search runtime adapter
+  smoke.rs, diagnosis.rs a smoke test for an installed worker; resolution-health messages
 
 crates/lean-host-mcp-worker/src/
   main.rs, authority.rs  worker child; serves one Lake project from its own build through the roots named at launch
