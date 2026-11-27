@@ -659,6 +659,10 @@ done
 The empty-HOME test clears its children's environment, so it runs under `cargo test`. The parent library tests start
 native work too, so give each run of them a new owner directory, as above.
 
+The tests keep worker sockets in the target directory, not under `HOME`. The servers a test starts use a new `sXXXXXX`
+there. The suites that start workers in their own process share `s`, or use `LEAN_HOST_MCP_SOCKET_DIR` when it is set. A
+directory deeper in `target/` would make socket paths longer than the 103 bytes macOS allows.
+
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
 `cargo package --workspace --locked` to verify the archives and installs from the unpacked sources in the target
