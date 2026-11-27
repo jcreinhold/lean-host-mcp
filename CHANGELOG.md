@@ -71,8 +71,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` still move each one. Install, then serve, write nothing under `HOME` but the
   socket directory.
 - Breaking: build against lean-rs 0.11.0 and lean-semantic-search 0.8.0. The server, its writer and its workers must
-  come from one SDK release. A worker built against lean-rs 0.10 still reports protocol 13, so reinstall it with
-  `install --force` after upgrading. A lock record or owner-directory entry that a 0.10 storage turn left now refuses
+  come from one SDK release. A worker built against lean-rs 0.10 still reports protocol 13; a plain `install` replaces
+  it, since another release built it. A lock record or owner-directory entry that a 0.10 storage turn left now refuses
   writer admission; [operations](docs/operations.md#upgrading-from-lean-rs-010) gives the steps to clear them.
 - Breaking: the server binary serves the SDK's own writer, reader and guardian helpers (`lean_rs_writer::HelperCommand`)
   in place of the host's copy, so their subcommands, frames and messages are the SDK's. A helper started without
@@ -86,6 +86,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Cargo source cache or checks the shim files against a pinned list.
 - The semantic runtime comes from lean-semantic-search 0.8, which builds its Lean modules with `lake build` under the
   server's writer and no longer links a shared library.
+- `install` and `install-worker --auto` count a worker that another `lean-host-mcp` release built as stale and rebuild
+  it, even when its protocol matches: the worker and host crates release together, and a release can keep the protocol.
+  The server still serves such a worker.
 
 ### Removed
 

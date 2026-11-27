@@ -488,7 +488,8 @@ PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
   `PROJECT/.local/lean-host-mcp/config.toml`, where the server reads it.
 - Without `--dir`, the worker and store directories follow the server's order: `LEAN_HOST_MCP_WORKERS_DIR` or
   `LEAN_HOST_MCP_STORE_DIR`, then an `[install]` value already in the config files, then the default above.
-- A current worker stays; `--force` replaces it.
+- A current worker stays; `--force` replaces it. A worker that another `lean-host-mcp` release built is stale, so
+  install replaces it after an upgrade.
 - `--source-dir DIR` passes to the worker build, as for `install-worker`.
 
 Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
@@ -521,12 +522,15 @@ elan; the freshly built worker is smoke-tested before it is recorded as usable.
 
 ### Keeping workers compatible with the host
 
-The provenance sidecar records the worker wire-protocol version independently of the package version:
+The provenance sidecar records the worker wire-protocol version and, apart from it, the `lean-host-mcp` version that
+built the worker:
 
 - `install-worker --auto` (the default) scans `toolchains/` in the elan home and (re)builds any worker that is **missing
-  or stale** — protocol mismatch, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that
-  are current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current
-  workers too (e.g. to re-run the smoke test or replace a corrupted binary).
+  or stale** — protocol mismatch, `lean.h` header drift, a failed/absent runtime smoke record, or a build by another
+  `lean-host-mcp` release — and skips ones that are current. The worker and host crates release together, and a release
+  can keep the protocol version. The server still serves a worker whose protocol matches. Out-of-window toolchains are
+  skipped (a worker for them could never load). `--force` rebuilds current workers too (e.g. to re-run the smoke test or
+  replace a corrupted binary).
 - `install-worker --toolchain <id>` builds a fresh generation in its final directory. The new worker writes the shim
   sources compiled into it to the generation's `shims/` directory and builds them there with the installer's own
   executable as the SDK writer; the installer records their identities in `worker.json`. After the builtin
@@ -561,8 +565,8 @@ ownership record has unknown fields` or `unrecognized native registry directory 
 2. Delete `.writer-storage-v1` from the owner directory: `owners` in the store, or `LEAN_RS_WORKER_OWNERS_DIRECTORY`.
 3. If the project's writer lock file holds a record with a field other than `version`, `owner` and `process`, such as
    `storage_turn`, empty the file. `lean-host-mcp writer-lock-path PROJECT` prints its path as `lock_path`.
-4. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT --force` replaces the worker, and
-   `install-worker --force` replaces a worker installed on its own.
+4. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT` replaces the worker, since another release
+   built it, and `install-worker` does the same for a worker installed on its own.
 5. Delete an old `bin/lean-rs-writer` from the install directory, `PROJECT/.local/lean-host-mcp` unless install ran with
    `--dir`. Nothing runs it now.
 

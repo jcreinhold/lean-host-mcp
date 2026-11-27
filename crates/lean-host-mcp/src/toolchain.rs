@@ -681,8 +681,10 @@ pub(crate) struct WorkerSidecar {
     header_digest: String,
     /// `lean_toolchain::LEAN_VERSION` the host was built against.
     built_against_lean_version: String,
-    /// The `lean-host-mcp` package version that built this worker. Informational:
-    /// compatibility is determined by `worker_protocol_version`, not `SemVer`.
+    /// The `lean-host-mcp` package version that built this worker. The worker
+    /// and host crates release together, so install replaces a worker that
+    /// another release built. The server's gate still serves one whose
+    /// `worker_protocol_version` matches.
     #[serde(default)]
     built_by_host_version: String,
     /// `lean-rs-worker-protocol` wire version. Zero for a legacy sidecar; the
@@ -842,6 +844,12 @@ impl WorkerSidecar {
     /// Whether the recorded build-time digest still matches the toolchain.
     pub(crate) fn header_matches(&self, current_digest: &str) -> bool {
         self.header_digest == current_digest
+    }
+
+    /// Whether this `lean-host-mcp` release built the worker. A sidecar older
+    /// than the field records no release, so it never matches.
+    pub(crate) fn built_by_this_host(&self) -> bool {
+        self.built_by_host_version == env!("CARGO_PKG_VERSION")
     }
 
     /// Recorded worker wire protocol, or `None` for a legacy sidecar.

@@ -54,9 +54,9 @@ moves `bin/`, `workers/` and `store/`; without it, `LEAN_HOST_MCP_WORKERS_DIR` a
 worker directory and the store for both `install` and the server. The store also holds the native owner records, the
 semantic runtime cache and the server's process records, and `config.toml` records the elan home, so neither `install`
 nor the server keeps state under `HOME` except its socket directory (see [operations](docs/operations.md)). Rerun
-`install` after a toolchain bump. A server installed from a checkout builds the worker from that workspace;
-`--source-dir` selects another checkout. Build each workspace member with `-p`; `cargo build --workspace` would link
-`libleanshared` into the parent and break multi-toolchain dispatch. See
+`install` after a toolchain bump or a `lean-host-mcp` upgrade. A server installed from a checkout builds the worker from
+that workspace; `--source-dir` selects another checkout. Build each workspace member with `-p`;
+`cargo build --workspace` would link `libleanshared` into the parent and break multi-toolchain dispatch. See
 [server installation](docs/operations.md#installing-the-server) and
 [development commands](docs/operations.md#build-test-lint).
 
@@ -140,7 +140,7 @@ concurrent calls within the `broker.max_workers` slots.
 | Supported Lean window | 4.30.0 through 4.36.0 |
 
 Install the parent and workers together; protocol 13 rejects older workers before requests. A worker built against
-lean-rs 0.10 also speaks protocol 13, so after that upgrade reinstall it with `install --force` (see
+lean-rs 0.10 also speaks protocol 13; after that upgrade a plain `install` replaces it (see
 [upgrading](docs/operations.md#upgrading-from-lean-rs-010)). Registry installations may differ from the source
 requirements shown here. The development fixture uses Lean 4.36.0; a local install does not qualify the full
 toolchain/platform release matrix.

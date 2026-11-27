@@ -10,9 +10,10 @@
 //! - `--toolchain <id>`: build for one toolchain (always overwrites).
 //! - no flag / `--auto`: scan `<elan home>/toolchains/leanprover--lean4---*`
 //!   and build for any that are missing or stale (protocol mismatch, header
-//!   drift, failed/absent smoke); `--force` rebuilds current ones too. The
-//!   elan home is [`toolchain::elan_home`], which with `--lake-root` includes
-//!   the root's recorded `[install] elan_home`.
+//!   drift, failed/absent smoke, built by another release); `--force`
+//!   rebuilds current ones too. The elan home is [`toolchain::elan_home`],
+//!   which with `--lake-root` includes the root's recorded
+//!   `[install] elan_home`.
 //!
 //! A build uses this executable as the SDK writer for the worker's shims, and
 //! runs the worker's smoke test, which is native work. With `--lake-root` its
@@ -381,7 +382,10 @@ fn auto_decision(root: &Path, id: &ToolchainId, force: bool) -> AutoDecision {
 
 /// Whether the worker already installed under the selected root for
 /// `id` is current, stale, or absent. Mirrors the runtime open-gate's provenance
-/// checks ([`WorkerBinary::resolve_ready_with`]).
+/// checks ([`WorkerBinary::resolve_ready_with`]), and also counts a worker that
+/// another `lean-host-mcp` release built as stale. The worker and host crates
+/// release together, and a release can keep the protocol version, so the
+/// gate still serves such a worker but install replaces it.
 pub(super) enum Freshness {
     Absent,
     Current,
@@ -416,6 +420,9 @@ pub(super) fn worker_freshness_in(root: &Path, id: &ToolchainId) -> Freshness {
         .is_some_and(|version| version != lean_rs_worker_protocol::protocol::PROTOCOL_VERSION)
     {
         return Freshness::Stale("protocol mismatch");
+    }
+    if !sidecar.built_by_this_host() {
+        return Freshness::Stale("built by another lean-host-mcp release");
     }
     Freshness::Current
 }
@@ -1400,6 +1407,26 @@ mod tests {
         assert!(matches!(
             worker_freshness_in(root.path(), &id),
             Freshness::Stale("protocol mismatch")
+        ));
+    }
+
+    #[test]
+    fn freshness_stale_when_another_release_built_it() {
+        // A release can keep the protocol version, as the move from lean-rs
+        // 0.10 to 0.11 did, so a matching protocol is not enough.
+        let root = tempfile::tempdir().expect("tmp root");
+        let dir = root.path().join("v4.99.99");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(WORKER_FILE_NAME), b"#!/bin/sh\n").expect("stub");
+        let other = format!(
+            r#"{{"toolchain":"v4.99.99","header_digest":"d","built_against_lean_version":"x","built_by_host_version":"0.0.1-old","worker_protocol_version":{},"digest_supported_at_build":true,"smoke":{{"result":"passed"}}}}"#,
+            lean_rs_worker_protocol::protocol::PROTOCOL_VERSION
+        );
+        std::fs::write(dir.join("worker.json"), other).expect("sidecar");
+        let id = ToolchainId::parse("v4.99.99").expect("parse");
+        assert!(matches!(
+            worker_freshness_in(root.path(), &id),
+            Freshness::Stale("built by another lean-host-mcp release")
         ));
     }
 }
