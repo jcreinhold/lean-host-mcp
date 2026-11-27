@@ -9,6 +9,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-27
+
+### Breaking
+
+- Build against lean-rs 0.12.0 and lean-semantic-search 0.9.0, with worker protocol 14. Upgrade the server and its
+  workers together; `install` replaces a worker that 0.17 built. See
+  [upgrading to 0.18](docs/operations.md#upgrading-to-018).
+- One server owns a Lake checkout, and the SDK's cross-process artifact protocol is gone: shared reader locks, the
+  project writer lock, writer demand, the native guardian, owner records and worker lifeline sockets. A build no longer
+  runs in an SDK writer helper, and a check takes no kernel lock.
+- Remove the subcommands `writer`, `writer-lock-path`, `reader`, `read-proxy`, `native-guardian`, `writer-exec`,
+  `native-reader`, `native-reader-exec` and `native-reader-wait`.
+- Remove `LEAN_HOST_MCP_SOCKET_DIR`, `LEAN_RS_WORKER_OWNERS_DIRECTORY` and the `LEAN_RS_WRITER_*` settings. Nothing
+  reads them.
+- Remove the library's `native_reader` module, `socket_directory`, `use_socket_directory`, `store::OWNERS_DIR_NAME`,
+  `store::use_for_native_state`, `store::native_store` and `store::owner_directory`. `store::hold` takes a store for the
+  process, and `store::process_store` names it.
+- `lean_compatibility` loses `shared_writer`, `expected.writer_protocol`, `loaded.artifact_read_epochs` and the
+  capabilities `worker_owned_shared_artifact_reads_v1` and `native_reader_stdout_frame_v1`, so its contract digests
+  change. The `artifact_identity_sha256` of a file check's receipt now binds the project's packages in place of its
+  artifact domains, so its values change too.
+- A server opens the semantic search runtime that `install` built in the store's `semantic-runtimes/` and never builds
+  it. A semantic call that finds it unbuilt fails and says to rerun `lean-host-mcp install --lake-root`.
+- `install` and `install-worker --lake-root` take the store as a server does, so each refuses while a server serves the
+  project. `install-worker --list` takes no store.
+
+### Added
+
+- `broker.max_lean_runs` (`LEAN_HOST_MCP_MAX_LEAN_RUNS`, default 2) bounds the short runs at once: file checks,
+  `lake setup-file` runs, options probes and semantic file runs. Each keeps its permit until its process group has
+  exited; a run that gets no permit by its deadline does not start.
+- The store's `children.lock`, which every process the server starts inherits, and `children/`, with one locked file for
+  each build step or short run.
+
+### Changed
+
+- A starting server waits for the processes a dead server started. If `children.lock` is free, it clears `children/` and
+  serves. If the lock is held, it stops each recorded group whose file is locked (SIGTERM, up to 5 seconds, then
+  SIGKILL), waits up to 30 seconds for the lock, and serves once it is free. It never signals a group whose file is
+  free. If the lock stays held, the server exits with an error that names the groups still running and the `lsof`
+  command that lists every holder.
+- A build stops the project's workers, then runs each step as `lake <args>` in its own process group. Cancellation or
+  the deadline stops the step's whole group, and the write turn ends only after each group has exited. A step whose
+  `lake` exits while other members of its group still run gets one second, then ends the build with no exit code.
+- Each file check, setup-file run, options probe and semantic file run is one process group with capped output and
+  private inputs under the store's `runs/`. It keeps a share of the read turn until its group exits.
+- A worker exits with status 125 when the pipe to its server closes, so a killed server's workers exit and the next
+  server gets every slot.
+- A starting server marks an earlier server's `running` rows `interrupted` at once: holding the store has already waited
+  for that server's processes.
+- A worker whose launch roots are not Lake build outputs refuses each import with the reason. Workers hold no locks on
+  the project's build.
+- Reference and declaration index reads run under the request's read turn and no longer report `unavailable` for want of
+  custody.
+
 ## [0.17.0] - 2026-11-27
 
 ### Added
@@ -953,7 +1008,8 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.22...v0.17.0
 [0.16.22]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.21...v0.16.22
 [0.16.21]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.20...v0.16.21

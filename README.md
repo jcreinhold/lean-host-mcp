@@ -48,15 +48,15 @@ lean-host-mcp install --lake-root /path/to/project
 ```
 
 `install` reads `/path/to/project/lean-toolchain` and installs under `/path/to/project/.local/lean-host-mcp/`, which Git
-ignores: a copy of the server in `bin/`, which is also the SDK writer; the worker for that toolchain in `workers/`; the
-server's private store in `store/`; and `config.toml`, which records their absolute paths under `[install]`. `--dir`
-moves `bin/`, `workers/` and `store/`; without it, `LEAN_HOST_MCP_WORKERS_DIR` and `LEAN_HOST_MCP_STORE_DIR` move the
-worker directory and the store for both `install` and the server. The store also holds the native owner records, the
-semantic runtime cache and the server's process records, and `config.toml` records the elan home, so neither `install`
-nor the server keeps state under `HOME` except its socket directory (see [operations](docs/operations.md)). Rerun
-`install` after a toolchain bump or a `lean-host-mcp` upgrade. A server installed from a checkout builds the worker from
-that workspace; `--source-dir` selects another checkout. Build each workspace member with `-p`;
-`cargo build --workspace` would link `libleanshared` into the parent and break multi-toolchain dispatch. See
+ignores: a copy of the server in `bin/`; the worker for that toolchain in `workers/`; the server's private store in
+`store/`; and `config.toml`, which records their absolute paths under `[install]`. `--dir` moves `bin/`, `workers/` and
+`store/`; without it, `LEAN_HOST_MCP_WORKERS_DIR` and `LEAN_HOST_MCP_STORE_DIR` move the worker directory and the store
+for both `install` and the server. `install` builds the semantic search runtime into the store, which also holds the
+server's lock and process records, and `config.toml` records the elan home, so neither `install` nor the server keeps
+state under `HOME` (see [operations](docs/operations.md)). `install` takes the store as a server does, so stop the
+server before you rerun it. Rerun `install` after a toolchain bump or a `lean-host-mcp` upgrade. A server installed from
+a checkout builds the worker from that workspace; `--source-dir` selects another checkout. Build each workspace member
+with `-p`; `cargo build --workspace` would link `libleanshared` into the parent and break multi-toolchain dispatch. See
 [server installation](docs/operations.md#installing-the-server) and
 [development commands](docs/operations.md#build-test-lint).
 
@@ -68,8 +68,9 @@ lake build
 .local/lean-host-mcp/bin/lean-host-mcp --lake-root /path/to/project
 ```
 
-While the server runs, build through `lean_build` rather than a raw `lake build`: a raw build takes no lock, so it can
-rewrite `.olean` files while the server reads them, which is outside the server's contract.
+One server serves a checkout: a second server on the same store exits and names the first. While the server runs, build
+through `lean_build` rather than a raw `lake build`. The server orders only the Lake and Lean runs it starts, so a raw
+build can rewrite `.olean` files while the server reads them, which is outside its contract.
 
 The project needs a `lakefile.lean` or `lakefile.toml`, a `lean-toolchain` pin, and built `.olean` files for requested
 imports. The server reads dependency paths from `lake-manifest.json`. Project dependencies follow their usual build or
@@ -133,17 +134,16 @@ concurrent calls within the `broker.max_workers` slots.
 
 | Component | Current source requirement |
 | --- | --- |
-| `lean-host-mcp` | 0.17.0 |
-| `lean-rs` stack and `lean-toolchain` | 0.11.1 |
-| `lean-semantic-search` stack | 0.8.0 |
-| Worker protocol | 13 |
+| `lean-host-mcp` | 0.18.0 |
+| `lean-rs` stack and `lean-toolchain` | 0.12.0 |
+| `lean-semantic-search` stack | 0.9.0 |
+| Worker protocol | 14 |
 | Supported Lean window | 4.30.0 through 4.36.0 |
 
-Install the parent and workers together; protocol 13 rejects older workers before requests. A worker built against
-lean-rs 0.10 also speaks protocol 13; after that upgrade a plain `install` replaces it (see
-[upgrading](docs/operations.md#upgrading-from-lean-rs-010)). Registry installations may differ from the source
-requirements shown here. The development fixture uses Lean 4.36.0; a local install does not qualify the full
-toolchain/platform release matrix.
+Install the parent and workers together; protocol 14 rejects older workers before requests. After an upgrade from 0.17,
+a plain `install` replaces the worker (see [upgrading](docs/operations.md#upgrading-to-018)). Registry installations may
+differ from the source requirements shown here. The development fixture uses Lean 4.36.0; a local install does not
+qualify the full toolchain/platform release matrix.
 
 The exact supported releases come from `lean_toolchain::SUPPORTED_TOOLCHAINS`, re-exported from
 [`lean-rs-abi`](https://github.com/jcreinhold/lean-rs/blob/main/crates/lean-rs-abi/src/supported.rs). Numbered pins
@@ -154,7 +154,8 @@ Widening support starts in `lean-rs`, followed by dependency and worker updates 
 
 - [Tool catalog](docs/tool-catalog.md): public tool contracts and proof workflow.
 - [Operations](docs/operations.md): configuration, installation, runtime failures, and development checks.
-- [Architecture](docs/architecture.md): contributor boundaries, worker ownership, caching, and artifact custody.
+- [Architecture](docs/architecture.md): contributor boundaries, worker ownership, caching, and how one server owns a
+  checkout.
 - [Reference indices](docs/architecture.md#reference-indices): project-scope reference lookup, schema, and performance
   evidence.
 - [Changelog](CHANGELOG.md): release history.
