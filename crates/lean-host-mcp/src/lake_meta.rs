@@ -134,7 +134,7 @@ pub(crate) const BUILD_LIB_REL: &str = ".lake/build/lib/lean";
 /// The project's own import roots in Lean's search order: its build output,
 /// then each manifest package's, as the SDK's session import computes them.
 /// A project worker gets these at launch and admits no other import, and a
-/// native reader searches them. The server refuses to start with `LEAN_PATH`
+/// short run searches them. The server refuses to start with `LEAN_PATH`
 /// set, so nothing else joins them.
 ///
 /// Mirrors `lean-rs-host`'s `LakeProject::olean_search_paths` and
@@ -143,7 +143,31 @@ pub(crate) const BUILD_LIB_REL: &str = ".lake/build/lib/lean";
 /// `subDir` respected. Unbuilt paths stay in the list so a reader finds later
 /// builds.
 pub(crate) fn manifest_artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![lake_root.join(BUILD_LIB_REL)];
+    manifest_package_dirs(lake_root)
+        .into_iter()
+        .map(|package| package.join(BUILD_LIB_REL))
+        .collect()
+}
+
+/// The project's packages as canonical directories, project first, then
+/// manifest order, without the ones that do not exist or repeat: the
+/// directories whose `.lake/build` a module setup may name.
+pub(crate) fn manifest_package_roots(lake_root: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for package in manifest_package_dirs(lake_root) {
+        if let Ok(package) = package.canonicalize()
+            && !roots.contains(&package)
+        {
+            roots.push(package);
+        }
+    }
+    roots
+}
+
+/// The project's directory, then each manifest package's, as
+/// [`manifest_artifact_roots`] describes.
+fn manifest_package_dirs(lake_root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![lake_root.to_path_buf()];
     let Ok(bytes) = std::fs::read(lake_root.join("lake-manifest.json")) else {
         return roots;
     };
@@ -171,14 +195,14 @@ pub(crate) fn manifest_artifact_roots(lake_root: &Path) -> Vec<PathBuf> {
         if package.get("type").and_then(serde_json::Value::as_str) == Some("path")
             && let Some(dir) = package.get("dir").and_then(serde_json::Value::as_str)
         {
-            roots.push(lake_root.join(dir).join(BUILD_LIB_REL));
+            roots.push(lake_root.join(dir));
             continue;
         }
         let mut package_root = lake_root.join(packages_dir).join(name);
         if let Some(sub_dir) = package.get("subDir").and_then(serde_json::Value::as_str) {
             package_root.push(sub_dir);
         }
-        roots.push(package_root.join(BUILD_LIB_REL));
+        roots.push(package_root);
     }
     roots
 }

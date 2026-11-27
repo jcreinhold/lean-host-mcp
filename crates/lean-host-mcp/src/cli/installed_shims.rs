@@ -12,9 +12,9 @@ const PREPARE_TIMEOUT: Duration = Duration::from_mins(30);
 const MODULE_SUFFIXES: [&str; 4] = [".olean", ".olean.private", ".olean.server", ".ir"];
 
 /// Run the candidate's worker in its preparation mode: it writes the shim
-/// sources it was built with to `<candidate>/shims`, builds them there under
-/// `writer`, and prints their descriptor.
-fn prepare(candidate: &Path, sysroot: &Path, writer: &Path) -> Result<LeanWorkerPreparedHostArtifacts> {
+/// sources it was built with to `<candidate>/shims`, builds them there with
+/// plain Lake, and prints their descriptor.
+fn prepare(candidate: &Path, sysroot: &Path) -> Result<LeanWorkerPreparedHostArtifacts> {
     let destination = candidate.join("shims");
     let flags = [
         OsStr::new(crate::host_preparation::PREPARE_FLAG),
@@ -23,7 +23,6 @@ fn prepare(candidate: &Path, sysroot: &Path, writer: &Path) -> Result<LeanWorker
     crate::host_preparation::run_artifact_mode(
         &candidate.join(crate::toolchain::WORKER_FILE_NAME),
         sysroot,
-        writer,
         &flags,
         PREPARE_TIMEOUT,
         &|| false,
@@ -41,11 +40,6 @@ pub(super) fn bind(
     let project = candidate.join("smoke-project");
     fs::create_dir(&project)?;
     fs::create_dir_all(project.join(".lake/build/lib/lean"))?;
-    // Initialize the smoke project's canonical writer domain before worker admission.
-    let _lock = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(lean_toolchain::shared_writer::project_lock_path(&project)?)?;
     let manifest = Path::new(&prepared.shim_manifest_path);
     let data = lean_toolchain::CapabilityManifest::from_bytes(manifest, prepared.shim_manifest_json.as_bytes())
         .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
@@ -114,13 +108,8 @@ pub(super) fn probe(
     let worker = candidate.join(crate::toolchain::WORKER_FILE_NAME);
     let tracker = LeanWorkerProcessTracker::new();
     let child = LeanWorkerChild::for_toolchain(&worker, sysroot)
-        .lifetime_directory(candidate.join("probe-owners"))
-        .lifetime_socket_directory(crate::native_socket::directory()?)
         .checked_native_loader_environment()
         .prepared_host_artifacts(prepared);
-    // A Mac installer must leave a durable generation the SDK can collect after shutdown.
-    #[cfg(target_os = "macos")]
-    let child = child.native_guardian(probe_guardian()?);
     let run = || -> Result<()> {
         let mut handle =
             LeanWorkerHostHandleBuilder::shims_only(candidate.join("smoke-project"), std::iter::empty::<String>())
@@ -160,40 +149,12 @@ pub(super) fn probe(
         );
         Ok(())
     };
-    let result = run();
-    #[cfg(target_os = "macos")]
-    {
-        let owners = candidate.join("probe-owners");
-        lean_toolchain::native_guardian::collect_closed_owner_records(&owners, Duration::from_secs(5)).with_context(
-            || match &result {
-                Ok(()) => "installer probe returned; closure unconfirmed".to_owned(),
-                Err(error) => format!("installer probe failed ({error:#}); closure unconfirmed"),
-            },
-        )?;
-    }
-    result
-}
-
-#[cfg(target_os = "macos")]
-fn probe_guardian() -> Result<std::path::PathBuf> {
-    // Unit-test executables have a libtest entry point instead of the host CLI.
-    #[cfg(test)]
-    return Ok(
-        std::path::PathBuf::from(std::env::var_os("R2_HOST").context("set R2_HOST to the matching host CLI")?)
-            .canonicalize()?,
-    );
-    #[cfg(not(test))]
-    Ok(std::env::current_exe()?.canonicalize()?)
+    run()
 }
 
 /// Prepare and qualify a worker in its final candidate directory. Absolute image
 /// paths in the generated manifest make this directory part of its identity.
-pub(super) fn qualify(
-    candidate: &Path,
-    id: &crate::toolchain::ToolchainId,
-    sysroot: &Path,
-    writer: &Path,
-) -> Result<()> {
+pub(super) fn qualify(candidate: &Path, id: &crate::toolchain::ToolchainId, sysroot: &Path) -> Result<()> {
     let mut entries = fs::read_dir(candidate)?;
     let worker = entries.next().transpose()?.context("missing staged worker")?;
     ensure!(
@@ -202,7 +163,7 @@ pub(super) fn qualify(
             && entries.next().is_none(),
         "expected a fresh candidate containing only its worker executable"
     );
-    let prepared = prepare(candidate, sysroot, writer)?;
+    let prepared = prepare(candidate, sysroot)?;
     let mut record = bind(candidate, id, sysroot, prepared)?;
     let snapshot = crate::toolchain::WorkerSidecar::load(candidate)
         .and_then(crate::toolchain::WorkerSidecar::into_runtime)
@@ -277,7 +238,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "requires a disposable installed generation and matching R2_HOST"]
+    #[ignore = "requires a disposable installed generation"]
     fn rejected_probe_retires_its_generation() -> Result<()> {
         let generation =
             std::path::PathBuf::from(std::env::var_os("R2_GENERATION").context("missing disposable generation")?);
@@ -294,14 +255,8 @@ mod tests {
             anyhow::bail!("shadow must refuse the actual smoke request");
         };
         ensure!(
-            !format!("{error:#}").contains("closure unconfirmed"),
-            "cleanup failed: {error:#}"
-        );
-        let owners = generation.join("probe-owners");
-        lean_toolchain::native_guardian::collect_closed_owner_records(&owners, std::time::Duration::from_secs(5))?;
-        ensure!(
-            fs::read_dir(owners)?.all(|e| e.is_ok_and(|e| e.file_name() == ".admission.lock")),
-            "probe did not retire"
+            !format!("{error:#}").contains("actual worker must retire"),
+            "the probe's worker did not retire: {error:#}"
         );
         Ok(())
     }
@@ -317,16 +272,10 @@ mod tests {
         let slot = env_path("R2_CANDIDATE")?;
         let id = crate::toolchain::ToolchainId::parse("v4.36.0")?;
         let prepare = || {
-            super::super::install_worker::prepare_generation(
-                &slot,
-                &id,
-                &id.elan_dir()?.canonicalize()?,
-                &env_path("R2_WRITER")?,
-                |dir| {
-                    fs::copy(env_path("R2_WORKER")?, dir.join(crate::toolchain::WORKER_FILE_NAME))?;
-                    Ok(())
-                },
-            )
+            super::super::install_worker::prepare_generation(&slot, &id, &id.elan_dir()?.canonicalize()?, |dir| {
+                fs::copy(env_path("R2_WORKER")?, dir.join(crate::toolchain::WORKER_FILE_NAME))?;
+                Ok(())
+            })
         };
         let previous = prepare()?;
         let selector = slot.join("current-generation");

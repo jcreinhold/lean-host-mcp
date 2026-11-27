@@ -8,8 +8,9 @@
 //! server, which gives one to each call that comes without an id; such a call
 //! gets no row.
 //!
-//! A build takes the project's write turn, then the writer lock; a check takes
-//! the read turn. Then the row says `running`, and only then does work start.
+//! A build takes the project's write turn and stops the project's workers; a
+//! check takes the read turn. Then the row says `running`, and only then does
+//! work start.
 //! A request ends when it finishes, at its deadline, or in recovery at the next
 //! start (see `recover`). Nothing cancels it, so a dropped connection ends only
 //! the client's wait.

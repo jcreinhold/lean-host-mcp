@@ -731,7 +731,7 @@ impl InstalledRuntime {
         };
         let p = &mut self.prepared;
         string(&mut p.shim_manifest_path)?;
-        for path in p.shim_search_paths.iter_mut().chain(&mut p.artifact_roots) {
+        for path in &mut p.shim_search_paths {
             string(path)?;
         }
         self.files = std::mem::take(&mut self.files)
@@ -1261,7 +1261,6 @@ mod tests {
                     protocol: 1,
                     shim_manifest_path: "shims/test".into(),
                     shim_manifest_json: "{}".into(),
-                    artifact_roots: vec![],
                     shim_search_paths: vec![],
                 },
                 files: std::collections::BTreeMap::new(),

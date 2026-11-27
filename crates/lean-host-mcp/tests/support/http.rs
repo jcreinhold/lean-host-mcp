@@ -28,34 +28,24 @@ pub(crate) const SERVER: &str = env!("CARGO_BIN_EXE_lean-host-mcp");
 /// The protocol the client speaks: one HTTP request per call, no session.
 const PROTOCOL: &str = "2026-07-28";
 
-/// The writer helper setting a test server must not inherit.
-const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
-
 /// The row states after which a request never changes.
 pub(crate) const FINAL_STATES: [&str; 3] = ["done", "timed_out", "interrupted"];
 
-/// The directories a test server keeps, removed when the value drops, except
-/// a socket directory the caller names.
+/// The store a test server keeps, removed when the value drops.
 pub(crate) struct Scratch {
-    /// The server's store: request table, build logs and native state.
+    /// The server's store: request table, build logs and child records.
     pub(crate) store: PathBuf,
-    /// A directory for sockets, from [`super::socket_dir`].
-    pub(crate) sockets: PathBuf,
     _store: tempfile::TempDir,
-    _sockets: super::SocketDir,
 }
 
 impl Scratch {
-    /// A new, empty store under the target directory, and a socket directory.
+    /// A new, empty store under the target directory.
     pub(crate) fn new() -> TestResult<Self> {
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let store = tempfile::Builder::new().prefix("store-").tempdir_in(tmp)?;
-        let sockets = super::socket_dir()?;
         Ok(Self {
             store: store.path().canonicalize()?,
-            sockets: sockets.path().canonicalize()?,
             _store: store,
-            _sockets: sockets,
         })
     }
 }
@@ -67,8 +57,6 @@ pub(crate) struct Launch {
     pub(crate) root: PathBuf,
     /// Its store.
     pub(crate) store: PathBuf,
-    /// Its socket directory.
-    pub(crate) sockets: PathBuf,
     /// The loopback address it listens on.
     pub(crate) bind: SocketAddr,
     /// More environment, set last.
@@ -76,12 +64,11 @@ pub(crate) struct Launch {
 }
 
 impl Launch {
-    /// A launch for `root` with the directories of `scratch`, on a free port.
+    /// A launch for `root` with the store of `scratch`, on a free port.
     pub(crate) fn new(root: &Path, scratch: &Scratch) -> TestResult<Self> {
         Ok(Self {
             root: root.to_path_buf(),
             store: scratch.store.clone(),
-            sockets: scratch.sockets.clone(),
             bind: free_port()?,
             envs: Vec::new(),
         })
@@ -127,7 +114,6 @@ impl Server {
             .arg("--lake-root")
             .arg(&launch.root)
             .env("LEAN_HOST_MCP_STORE_DIR", &launch.store)
-            .env("LEAN_HOST_MCP_SOCKET_DIR", &launch.sockets)
             .env("LEAN_HOST_MCP_RESPONSE_CARRIER", "both")
             .env("RUST_LOG", "warn,lean_host_mcp=info")
             .env("NO_COLOR", "1")
@@ -135,7 +121,6 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        command.env_remove(WRITER_ENV);
         // `cargo test` adds its library path (`DYLD_FALLBACK_LIBRARY_PATH` on
         // macOS, `LD_LIBRARY_PATH` on Linux). A server started by hand has
         // none, and workers refuse to start with one.
@@ -492,13 +477,15 @@ pub(crate) fn table(store: &Path) -> TestResult<Vec<TableRow>> {
 pub(crate) struct Process {
     pub(crate) pid: u32,
     pub(crate) ppid: u32,
+    /// Its process group.
+    pub(crate) pgid: u32,
     pub(crate) command: String,
 }
 
 /// Every process on the machine.
 pub(crate) fn processes() -> TestResult<Vec<Process>> {
     let output = std::process::Command::new("ps")
-        .args(["-axwwo", "pid=,ppid=,command="])
+        .args(["-axwwo", "pid=,ppid=,pgid=,command="])
         .output()?;
     if !output.status.success() {
         return Err(format!("ps failed: {}", String::from_utf8_lossy(&output.stderr)).into());
@@ -509,8 +496,14 @@ pub(crate) fn processes() -> TestResult<Vec<Process>> {
             let mut words = line.split_whitespace();
             let pid = words.next()?.parse().ok()?;
             let ppid = words.next()?.parse().ok()?;
+            let pgid = words.next()?.parse().ok()?;
             let command = words.collect::<Vec<_>>().join(" ");
-            Some(Process { pid, ppid, command })
+            Some(Process {
+                pid,
+                ppid,
+                pgid,
+                command,
+            })
         })
         .collect())
 }
@@ -586,21 +579,24 @@ pub(crate) fn watch_until_gone(processes: &[Process], since: Instant, limit: Dur
     lines
 }
 
-/// The Lake processes that writer helpers for `root` run. A writer helper
-/// runs `<server> writer <root> ...` and Lake runs as its child.
-pub(crate) fn lake_writers<'a>(processes: &'a [Process], root: &Path) -> Vec<&'a Process> {
-    let root = root.to_string_lossy();
-    let helpers: BTreeSet<u32> = processes
-        .iter()
-        .filter(|process| {
-            let mut words = process.command.split_whitespace().skip(1);
-            words.next() == Some("writer") && process.command.contains(root.as_ref())
-        })
-        .map(|process| process.pid)
+/// The Lake build steps of the server whose store is `store`, even after
+/// that server has died. Each step leads a process group that a file in
+/// `<store>/children/` names. Only the server's short runs and its build
+/// guard pass `--no-build`, and neither writes build products.
+pub(crate) fn lake_builds<'a>(processes: &'a [Process], store: &Path) -> Vec<&'a Process> {
+    let groups: BTreeSet<u32> = std::fs::read_dir(store.join("children"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
         .collect();
     processes
         .iter()
-        .filter(|process| helpers.contains(&process.ppid) && is_lake(&process.command))
+        .filter(|process| {
+            groups.contains(&process.pgid)
+                && is_lake(&process.command)
+                && !process.command.split_whitespace().any(|word| word == "--no-build")
+        })
         .collect()
 }
 
@@ -612,18 +608,18 @@ fn is_lake(command: &str) -> bool {
         .is_some_and(|program| program == "lake" || program.ends_with("/lake"))
 }
 
-/// The processes server `parent` runs Lean in for its calls: workers, and the
-/// native readers (`<server> native-reader-exec`) that run file checks. Both
-/// count against `broker.max_workers`.
+/// The workers server `parent` runs, which count against
+/// `broker.max_workers`.
 pub(crate) fn workers(processes: &[Process], parent: u32) -> Vec<&Process> {
     processes
         .iter()
         .filter(|process| {
-            let mut words = process.command.split_whitespace();
-            let worker = words
-                .next()
-                .is_some_and(|program| program.ends_with("lean-host-mcp-worker"));
-            process.ppid == parent && (worker || words.next() == Some("native-reader-exec"))
+            process.ppid == parent
+                && process
+                    .command
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|program| program.ends_with("lean-host-mcp-worker"))
         })
         .collect()
 }

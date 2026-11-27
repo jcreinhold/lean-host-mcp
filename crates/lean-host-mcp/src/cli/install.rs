@@ -4,12 +4,13 @@
 //! and, under the install directory (`--dir`, default
 //! `<root>/.local/lean-host-mcp`):
 //!
-//! - copies this executable to `bin/lean-host-mcp`, which also serves the
-//!   SDK's writer, reader and guardian helpers;
-//! - creates the private server store `store/` (mode 0700);
+//! - copies this executable to `bin/lean-host-mcp`;
+//! - creates the private server store `store/` (mode 0700) and holds it, as a
+//!   server does, so install refuses to run while a server serves the root;
 //! - installs the worker for the toolchain in `workers/`, by the
-//!   `install-worker` code path, with the copy in `bin/` as the writer that
-//!   builds its shims, and keeps the worker's native state in the store.
+//!   `install-worker` code path;
+//! - builds the semantic search runtime for the toolchain into the store's
+//!   `semantic-runtimes/`, which a serving server only opens.
 //!
 //! Without `--dir`, `LEAN_HOST_MCP_WORKERS_DIR` and `LEAN_HOST_MCP_STORE_DIR`
 //! and an earlier install's paths still apply, as they do for the server. The
@@ -131,13 +132,15 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
         std::env::var_os(store::STORE_DIR_ENV),
         toolchain::elan_home(),
     )?;
-    let config = install(&plan, args, &exe, |workers, id, writer| {
-        // The worker's smoke test is native work; keep its state in the store.
-        store::use_for_native_state(&plan.store_dir)
-            .with_context(|| format!("cannot keep native state in the store {}", plan.store_dir.display()))?;
+    // Install writes what a server reads, so it holds the store as a server
+    // does: it refuses while one serves, and waits for the processes a dead
+    // one started.
+    let held = store::hold(&plan.store_dir, &plan.root)?;
+    let config = install(&plan, args, &exe, |workers, id| {
         let source = install_worker::resolve_worker_source(args.source_dir.as_deref())?;
-        install_worker::install_one(workers, id, &source, writer).map(drop)
+        install_worker::install_one(workers, id, &source).map(drop)
     })?;
+    let semantic = build_semantic_runtime(&plan, held.dir())?;
     let binary = plan.binary();
     println!(
         "installed lean-host-mcp for {} (leanprover/lean4:{})",
@@ -147,6 +150,7 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
     println!("  server   {}", binary.display());
     println!("  workers  {}", plan.workers_dir.display());
     println!("  store    {}", plan.store_dir.display());
+    println!("  semantic {}", semantic.display());
     println!("  config   {}", config.display());
     println!(
         "serve with: {} --lake-root {}",
@@ -156,26 +160,35 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the semantic search runtime for the toolchain of `plan`'s root, keyed
+/// as the server opens it, into the cache of the held store `store`. Returns
+/// the runtime's package directory.
+fn build_semantic_runtime(plan: &Plan, store: &Path) -> anyhow::Result<PathBuf> {
+    let meta = crate::lake_meta::LakeProjectMeta::from_explicit(&plan.root)?;
+    let (_, sysroot, _) = crate::project::resolve_worker(&meta)?;
+    let runtime =
+        crate::project::build_semantic_runtime(&store.join(store::SEMANTIC_CACHE_DIR_NAME), &meta.toolchain, &sysroot)?;
+    Ok(runtime.package_root().to_owned())
+}
+
 /// Carry out `plan`. `build_worker` installs the worker for a toolchain in a
-/// worker directory, qualifying it with the given writer, the copy of `exe`
-/// in `bin/`; tests replace it. Returns the local config file it wrote.
+/// worker directory; tests replace it. Returns the local config file it
+/// wrote.
 fn install(
     plan: &Plan,
     args: &InstallArgs,
     exe: &Path,
-    build_worker: impl FnOnce(&Path, &ToolchainId, &Path) -> anyhow::Result<()>,
+    build_worker: impl FnOnce(&Path, &ToolchainId) -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     // Read the local file first, so a broken one stops install before it
     // builds anything.
     let local = read_local_config(&plan.root)?;
     config_file::ensure_local_dir(&plan.root)?;
     fs::create_dir_all(&plan.bin).with_context(|| format!("creating {}", plan.bin.display()))?;
-    // The worker build keeps its native state in the store, so make it first.
     store::create_store_dir(&plan.store_dir, &plan.root)
         .with_context(|| format!("creating store {}", plan.store_dir.display()))?;
 
-    // Copy the server before the worker build: the copy is the writer that
-    // builds the worker's shims, the file the server will run as.
+    // The copy is the file the server will run as.
     let binary = plan.binary();
     copy_executable(exe, &binary)?;
 
@@ -185,7 +198,7 @@ fn install(
             println!("worker for {}: current (use --force to rebuild)", plan.toolchain);
         }
         Freshness::Current | Freshness::Absent | Freshness::Stale(_) => {
-            build_worker(&plan.workers_dir, &plan.toolchain, &binary)?;
+            build_worker(&plan.workers_dir, &plan.toolchain)?;
         }
     }
 
@@ -298,19 +311,11 @@ mod tests {
     const ELAN_HOME: &str = "/opt/elan";
 
     /// Install with a fake worker build that records its inputs.
-    fn run_install(args: &InstallArgs, exe: &Path) -> anyhow::Result<(Plan, Vec<(PathBuf, String, PathBuf)>)> {
+    fn run_install(args: &InstallArgs, exe: &Path) -> anyhow::Result<(Plan, Vec<(PathBuf, String)>)> {
         let plan = Plan::resolve(args, None, None, Some(PathBuf::from(ELAN_HOME)))?;
         let mut builds = Vec::new();
-        install(&plan, args, exe, |workers, id, writer| {
-            anyhow::ensure!(
-                plan.store_dir.is_dir(),
-                "the worker build keeps native state in the store, so it must exist first"
-            );
-            anyhow::ensure!(
-                fs::read(writer)? == b"server",
-                "the worker build runs the server copy as its writer, so the copy must exist first"
-            );
-            builds.push((workers.to_path_buf(), id.to_string(), writer.to_path_buf()));
+        install(&plan, args, exe, |workers, id| {
+            builds.push((workers.to_path_buf(), id.to_string()));
             let slot = workers.join(id.as_str());
             fs::create_dir_all(&slot)?;
             fs::write(slot.join(WORKER_FILE_NAME), b"worker")?;
@@ -334,14 +339,7 @@ mod tests {
         let (_, builds) = run_install(&args(&fixture, None), &fixture.exe)?;
 
         let local = config_file::local_dir(root);
-        assert_eq!(
-            builds,
-            [(
-                local.join("workers"),
-                "v4.36.0".to_owned(),
-                local.join("bin/lean-host-mcp")
-            )]
-        );
+        assert_eq!(builds, [(local.join("workers"), "v4.36.0".to_owned())]);
         let text = fs::read_to_string(config_file::local_file(root))?;
         assert!(text.starts_with(LOCAL_FILE_HEADER), "{text}");
         let config = ConfigFile::load(Some(root));
@@ -369,7 +367,7 @@ mod tests {
         let bin: Vec<_> = fs::read_dir(local.join("bin"))?
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<io::Result<_>>()?;
-        assert_eq!(bin, ["lean-host-mcp"], "the server copy is also the writer");
+        assert_eq!(bin, ["lean-host-mcp"], "install copies only the server");
         assert_eq!(mode(&local.join("store"))?, 0o700);
         assert_eq!(fs::read_to_string(local.join(".gitignore"))?, "*\n");
         assert_eq!(

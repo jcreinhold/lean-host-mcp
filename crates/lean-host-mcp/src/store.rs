@@ -1,16 +1,20 @@
-//! The server store: a private directory for server state, and the lock that
-//! admits one server per store.
+//! The server store: a private directory for server state, and the locks that
+//! give one server a Lake checkout.
 //!
-//! The lock is an exclusive `flock` on `<store>/server.lock`, held for the
-//! server's lifetime. The kernel drops it when the process exits, however it
-//! exits, so a crashed server never leaves the store locked. The holder writes
-//! its pid and Lake root into the same file; a second server that cannot take
-//! the lock reads them to name the server that holds it.
+//! Requirement: one server serves a store, and so a checkout, at a time. The
+//! lock is an exclusive `flock` on `<store>/server.lock`, held for the
+//! server's lifetime and closed on exec, so no child holds it. The kernel
+//! drops it when the process exits, however it exits, so a crashed server
+//! never leaves the store locked. The holder writes its pid and Lake root into
+//! the same file; a server that cannot take the lock names that holder and
+//! refuses to start.
 //!
-//! The store also keeps the state that would otherwise go under `HOME`: the
-//! SDK owner directory `owners/`, the semantic runtime cache
-//! `semantic-runtimes/` and the server process records `processes/`. A server
-//! or install selects it for this with [`use_for_native_state`].
+//! After `server.lock`, [`hold`] takes `children.lock` (`children.rs`),
+//! which waits for the processes an earlier server started. The store keeps
+//! the semantic runtime cache `semantic-runtimes/`, the server process records
+//! `processes/`, build logs `logs/`, the files of running children
+//! `children/` and `children.lock`, the inputs of short runs `runs/`, and the
+//! named requests table.
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -19,8 +23,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use lean_toolchain::native_guardian::{OWNERS_DIRECTORY_ENV, bind_registry_directory};
-
+use crate::children::{self, ChildrenLock};
 use crate::config_file::{self, ConfigFile};
 
 /// Env var that overrides the store directory for every Lake root. It beats
@@ -30,10 +33,6 @@ pub const STORE_DIR_ENV: &str = "LEAN_HOST_MCP_STORE_DIR";
 /// The lock file inside the store.
 const LOCK_FILE_NAME: &str = "server.lock";
 
-/// The SDK owner directory inside the store, unless
-/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` names another.
-pub const OWNERS_DIR_NAME: &str = "owners";
-
 /// The semantic runtime cache inside the store, unless
 /// `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` names another.
 pub const SEMANTIC_CACHE_DIR_NAME: &str = "semantic-runtimes";
@@ -42,62 +41,77 @@ pub const SEMANTIC_CACHE_DIR_NAME: &str = "semantic-runtimes";
 /// `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` names another directory.
 pub const PROCESSES_DIR_NAME: &str = "processes";
 
-/// The canonical store this process keeps its native state in, set by
-/// [`use_for_native_state`].
-static NATIVE_STORE: OnceLock<PathBuf> = OnceLock::new();
+/// The inputs of short runs inside the store. A server deletes what an
+/// earlier one left there.
+pub(crate) const RUNS_DIR_NAME: &str = "runs";
 
-/// Keep this process's native state in the existing store `store`.
-///
-/// It binds the SDK owner directory `<store>/owners`, unless
-/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` names another, and makes
-/// `<store>/semantic-runtimes` the semantic runtime cache. Call it once,
-/// before any native work. It creates neither directory; the SDK creates the
-/// owner directory with the mode it checks. Returns the canonical store.
-///
-/// # Errors
-///
-/// Fails when `store` cannot be resolved, when an earlier call chose another
-/// store, or when the SDK refuses the owner directory.
-pub fn use_for_native_state(store: &Path) -> io::Result<PathBuf> {
-    let store = store.canonicalize()?;
-    if *NATIVE_STORE.get_or_init(|| store.clone()) != store {
-        return Err(io::Error::other(
-            "this process already keeps its native state in another store",
-        ));
-    }
-    owner_directory()?;
-    Ok(store)
-}
+/// The canonical store this process holds, set by [`hold`].
+static PROCESS_STORE: OnceLock<PathBuf> = OnceLock::new();
 
-/// The canonical store set by [`use_for_native_state`], if any.
+/// The canonical store this process holds through [`hold`], if any.
 #[must_use]
-pub fn native_store() -> Option<&'static Path> {
-    NATIVE_STORE.get().map(PathBuf::as_path)
+pub fn process_store() -> Option<&'static Path> {
+    PROCESS_STORE.get().map(PathBuf::as_path)
 }
 
-/// Bind the SDK to the owner directory of this process's workers and writers,
-/// and return it.
+/// A server's or an install's hold on its store: `server.lock`, then
+/// `children.lock`. Dropping it frees `server.lock`; `children.lock` stays
+/// held until the last process this one started exits.
+#[derive(Debug)]
+pub struct HeldStore {
+    dir: PathBuf,
+    // Fields drop in order: children first, so the next server that takes
+    // `server.lock` finds this process's copy of `children.lock` closed.
+    _children: ChildrenLock,
+    _server: StoreLock,
+}
+
+impl HeldStore {
+    /// The canonical store directory.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+/// Take the store `store` of Lake root `root` for this process.
 ///
-/// That is `LEAN_RS_WORKER_OWNERS_DIRECTORY`, else `owners` in the store set
-/// by [`use_for_native_state`]. The host never falls back to the SDK's
-/// directory under the user's data directory. Binding creates nothing: the SDK
-/// creates the directory, with the mode it checks.
+/// Create the store if needed, take `server.lock`, wait for the processes an
+/// earlier server started, delete what that server left, and make the store
+/// this process's home for children and caches. Call it once per process.
 ///
 /// # Errors
 ///
-/// Fails when neither names a directory, or when the SDK refuses it.
-pub fn owner_directory() -> io::Result<PathBuf> {
-    let directory = if let Some(path) = std::env::var_os(OWNERS_DIRECTORY_ENV) {
-        PathBuf::from(path)
-    } else if let Some(store) = native_store() {
-        store.join(OWNERS_DIR_NAME)
-    } else {
-        return Err(io::Error::other(format!(
-            "no native owner directory: serve or install with --lake-root, or set {OWNERS_DIRECTORY_ENV}"
-        )));
-    };
-    bind_registry_directory(&directory)?;
-    Ok(directory)
+/// Fails when another server holds the store, naming it; when processes an
+/// earlier server started still run after the startup waits, naming them;
+/// when this process already holds another store; or on an I/O error.
+pub fn hold(store: &Path, root: &Path) -> anyhow::Result<HeldStore> {
+    let held = lock(store, root, children::STARTUP)?;
+    if *PROCESS_STORE.get_or_init(|| held.dir.clone()) != held.dir {
+        return Err(anyhow::anyhow!("this process already holds another store"));
+    }
+    Ok(held)
+}
+
+/// [`hold`] without making the store this process's home, with the waits
+/// passed in.
+fn lock(store: &Path, root: &Path, waits: children::Waits) -> anyhow::Result<HeldStore> {
+    let server = StoreLock::acquire(store, root)?;
+    let dir = store
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("cannot resolve store {}: {error}", store.display()))?;
+    let children = ChildrenLock::take_with(&dir, waits)?;
+    let runs = dir.join(RUNS_DIR_NAME);
+    match fs::remove_dir_all(&runs) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(anyhow::anyhow!("cannot clear {}: {error}", runs.display())),
+    }
+    Ok(HeldStore {
+        dir,
+        _children: children,
+        _server: server,
+    })
 }
 
 /// The store directory for Lake root `root`: `flag` (a CLI flag), then
@@ -255,6 +269,33 @@ mod tests {
         let mode = fs::metadata(&store)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         assert!(config_file::local_dir(&root).join(".gitignore").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_start_names_the_holder_and_leaves_children_alone() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("project");
+        let store = config_file::local_dir(&root).join("store");
+        fs::create_dir(&root)?;
+        let waits = children::Waits {
+            grace: std::time::Duration::ZERO,
+            bound: std::time::Duration::ZERO,
+        };
+        let held = lock(&store, &root, waits)?;
+        let file = held.dir().join(children::DIR_NAME).join("4242");
+        fs::write(&file, b"")?;
+
+        let refusal = lock(&store, &root, waits).err().map(|e| e.to_string());
+
+        let expected = format!(
+            "another lean-host-mcp (pid {}, lake root {}) holds the store {}; stop it first",
+            std::process::id(),
+            root.display(),
+            store.display()
+        );
+        assert_eq!(refusal, Some(expected));
+        assert!(file.exists(), "a refused server touches no child's file");
         Ok(())
     }
 

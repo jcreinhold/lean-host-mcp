@@ -1,6 +1,6 @@
-//! Semantic proof search for a goal in one source file. A native reader runs
-//! the semantic feature driver with the module setup that `lake setup-file`
-//! prints for that file.
+//! Semantic proof search for a goal in one source file. A short run
+//! ([`crate::lean_run`]) runs the semantic feature driver with the module
+//! setup that `lake setup-file` prints for that file.
 use super::verify_file::PreparedReader;
 use super::{BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError, reader_freshness};
 use crate::cancellation::CallCancellation;
@@ -21,8 +21,8 @@ impl ProjectBroker {
     ///
     /// # Errors
     ///
-    /// Returns resolution, `lake setup-file`, semantic runtime build, or
-    /// reader failures.
+    /// Returns resolution, `lake setup-file`, semantic runtime, or short-run
+    /// failures.
     pub(crate) async fn semantic_proof_search(
         &self,
         hint: ProjectHint,
@@ -41,53 +41,24 @@ impl ProjectBroker {
             .file_reader_with_setup(&hint, &meta, file, &request.goal.source_text)
             .await?;
         reader.roots = crate::lake_meta::manifest_artifact_roots(&root);
-        if reader.roots.iter().any(|p| !reader.custody.covers_artifact_root(p)) {
-            return Err(invalid("semantic declaration root outside held project domains"));
-        }
         reader.roots.push(reader.sysroot.join("lib/lean"));
-        let PreparedReader {
-            custody,
-            sysroot,
-            mut domains,
-            shim_guards,
-            roots,
-            ..
-        } = reader;
+        let PreparedReader { sysroot, roots, .. } = reader;
         let cancellation = CallCancellation::current();
-        let build_cancellation = cancellation.clone();
         let label = meta.toolchain.clone();
         let prefix = sysroot.clone();
-        let (activity, runtime) = tokio::task::spawn_blocking(move || {
-            (
-                activity,
-                crate::project::semantic_runtime(&label, &prefix, &build_cancellation),
-            )
-        })
-        .await
-        .map_err(invalid)?;
-        let runtime = runtime.map_err(|failure| {
-            // The build ran under the shared writer. Unless the writer reports
-            // that it never started or stopped, its command may still run.
-            if !failure.closed() {
-                cancellation.mark_uncertain();
-            }
-            invalid(failure)
-        })?;
-        let package = runtime.package_root().to_owned();
-        // Dropping the build writer closes its input. Its observer can still be
-        // reaping the helper when the completed build returns.
-        let runtime_guard = self.read_when_admitted(std::slice::from_ref(&package)).await?;
-        let bootstrap = select_semantic_runtime(|| Ok(runtime_guard.validate()?), &package, runtime.module_dir())?;
+        // Opening asks Lake whether install built the runtime; it builds
+        // nothing.
+        let runtime = tokio::task::spawn_blocking(move || crate::project::semantic_runtime(&label, &prefix))
+            .await
+            .map_err(invalid)??;
+        let bootstrap = select_semantic_runtime(runtime.package_root(), runtime.module_dir())?;
         let body = request.reader_input(&roots)?;
-        domains.push(package);
         let bytes = crate::lake_options::reader_output(
             "Lean semantic feature reader",
-            root,
+            &root,
             cancellation.remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_workers.get(),
-            custody,
-            None,
-            Some(Box::new((activity, shim_guards, runtime_guard))),
+            self.lean_runs(),
+            Some(Box::new(activity)),
             move |assets| {
                 let driver = assets.join("SemanticFeatures.lean");
                 fs::write(assets.join("module.setup.json"), setup.bytes)?;
@@ -101,7 +72,7 @@ impl ProjectBroker {
                 )?;
                 let data = assets.join("semantic.json");
                 fs::write(&data, body)?;
-                Ok(crate::native_reader::NativeReaderProgram {
+                Ok(crate::lean_run::Program {
                     command: vec![
                         sysroot.join("bin/lean").into_os_string(),
                         "--run".into(),
@@ -116,8 +87,7 @@ impl ProjectBroker {
                         ("LEAN_SYSROOT".into(), sysroot.into_os_string()),
                     ],
                     cwd: assets.into(),
-                    artifact_roots: domains,
-                    max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                    max_stdout_bytes: crate::lean_run::OUTPUT_LIMIT,
                     stdin: None,
                 })
             },
@@ -133,19 +103,13 @@ impl ProjectBroker {
 }
 
 /// Return the directory that holds the semantic runtime's compiled Lean
-/// modules, checking that it lies in the package the read turn covers.
-fn select_semantic_runtime(
-    validate_custody: impl Fn() -> Result<()>,
-    package: &Path,
-    modules: &Path,
-) -> Result<PathBuf> {
-    validate_custody()?;
+/// modules, checking that it lies in the runtime's package.
+fn select_semantic_runtime(package: &Path, modules: &Path) -> Result<PathBuf> {
     if !modules.starts_with(package) {
         return Err(invalid("semantic runtime modules outside their package"));
     }
     if !modules.join("LeanSemanticSearch/Capability.olean").is_file() {
         return Err(invalid("missing compiled semantic capability"));
     }
-    validate_custody()?;
     Ok(modules.to_owned())
 }

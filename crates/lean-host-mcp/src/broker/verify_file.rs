@@ -1,6 +1,6 @@
 //! One-shot checks of current source against the project's build products.
-//! Each check runs as a native reader with the module setup that `lake
-//! setup-file` prints for the file.
+//! Each check is a short run ([`crate::lean_run`]) of `lean` with the module
+//! setup that `lake setup-file` prints for the file.
 use super::{
     BrokerCall, Duration, LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
     LeanWorkerElabOptions, Path, PathBuf, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError,
@@ -22,70 +22,35 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+/// The installed verification shims a file check reads, and their identity.
 pub(super) struct PreparedReader {
-    pub(super) custody: crate::artifact_reads::ArtifactReadGuard,
     pub(super) sysroot: PathBuf,
     pub(super) shims: Vec<PathBuf>,
-    pub(super) domains: Vec<PathBuf>,
-    pub(super) shim_guards: lean_toolchain::shared_writer::LocalArtifactRead,
     pub(super) roots: Vec<PathBuf>,
     shim_identity_sha256: String,
 }
 
-impl ProjectBroker {
-    pub(super) async fn installed_reader(
-        &self,
-        root: &Path,
-        meta: &crate::lake_meta::LakeProjectMeta,
-    ) -> Result<PreparedReader> {
-        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).map_err(invalid)?;
+impl PreparedReader {
+    /// The shims installed for `meta`'s toolchain, each checked against the
+    /// hash the install recorded.
+    pub(super) fn installed(meta: &crate::lake_meta::LakeProjectMeta) -> Result<Self> {
         let shims = VerifierShims::select(meta)?;
-        let shim_guards = self.read_when_admitted(&shims.domains).await?;
         shims.validate()?;
         let shim_identity_sha256 = crate::digest::sha256_hex(
-            &serde_json::to_vec(&(&shims.sysroot, &shims.paths, &shims.domains, &shims.files)).map_err(invalid)?,
+            &serde_json::to_vec(&(&shims.sysroot, &shims.paths, &shims.files)).map_err(invalid)?,
         );
-        Ok(PreparedReader {
+        Ok(Self {
             shim_identity_sha256,
-            custody,
             sysroot: shims.sysroot,
             shims: shims.paths,
-            domains: shims.domains,
-            shim_guards,
             roots: Vec::new(),
         })
-    }
-
-    /// Take shared custody of the artifacts under `roots` for this request.
-    /// The SDK refuses with `WouldBlock` while another reader holds its
-    /// admission gate, while a writer has announced or holds these artifacts,
-    /// or while an ended writer's helper still runs. Every file check reads
-    /// the same installed shims, so checks that start together meet the first
-    /// case. After each refusal this waits 20 ms and tries again, until the
-    /// request's time runs out.
-    pub(super) async fn read_when_admitted(
-        &self,
-        roots: &[PathBuf],
-    ) -> io::Result<lean_toolchain::shared_writer::LocalArtifactRead> {
-        let started = std::time::Instant::now();
-        let budget = crate::cancellation::CallCancellation::current()
-            .remaining_or(Duration::from_millis(self.request_timeout_millis()));
-        loop {
-            match lean_toolchain::shared_writer::LocalArtifactRead::try_acquire(roots) {
-                Ok(guard) => return Ok(guard),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < budget => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
     }
 }
 
 pub(crate) struct VerifierShims {
     pub(crate) sysroot: PathBuf,
     pub(crate) paths: Vec<PathBuf>,
-    pub(crate) domains: Vec<PathBuf>,
     files: std::collections::BTreeMap<PathBuf, String>,
 }
 
@@ -101,7 +66,6 @@ impl VerifierShims {
         }
         Ok(Self {
             sysroot,
-            domains: installed.prepared.artifact_roots.iter().map(PathBuf::from).collect(),
             paths: installed.prepared.shim_search_paths.iter().map(PathBuf::from).collect(),
             files: installed.files,
         })
@@ -217,7 +181,7 @@ impl ProjectBroker {
         let request_sha256 = crate::digest::sha256_hex(&body);
         let source_sha256 = crate::digest::sha256_hex(request.source.as_bytes());
         let bytes = self
-            .run_file_driver(root.clone(), reader, activity, setup, entry, body)
+            .run_file_driver(&root, reader, activity, setup, entry, body)
             .await?;
         let mut runtime = RuntimeFacts::default();
         let mut freshness = reader_freshness(&meta, freshness);
@@ -257,39 +221,32 @@ impl ProjectBroker {
         })
     }
 
+    /// Run the Lean driver `entry` on request `body` with the module setup of
+    /// `setup` and the installed shims, as one short run.
     async fn run_file_driver(
         &self,
-        root: PathBuf,
+        root: &Path,
         reader: PreparedReader,
         activity: super::control::PreparationActivityGuard,
         setup: super::module_setup::StagedSetup,
         entry: String,
         body: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        let PreparedReader {
-            custody,
-            sysroot,
-            shims,
-            domains,
-            shim_guards,
-            ..
-        } = reader;
+        let PreparedReader { sysroot, shims, .. } = reader;
         crate::lake_options::reader_output(
             "Lean file driver",
-            root.clone(),
+            root,
             crate::cancellation::CallCancellation::current()
                 .remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_workers.get(),
-            custody,
-            None,
-            Some(Box::new((activity, shim_guards))),
+            self.lean_runs(),
+            Some(Box::new(activity)),
             move |assets| {
                 let driver = assets.join("FileDriver.lean");
                 fs::write(assets.join("module.setup.json"), setup.bytes)?;
                 fs::write(&driver, entry)?;
                 let data = assets.join("request.json");
                 fs::write(&data, body)?;
-                Ok(crate::native_reader::NativeReaderProgram {
+                Ok(crate::lean_run::Program {
                     command: vec![
                         sysroot.join("bin/lean").into_os_string(),
                         "-j1".into(),
@@ -305,8 +262,7 @@ impl ProjectBroker {
                         ("LEAN_SYSROOT".into(), sysroot.into_os_string()),
                     ],
                     cwd: assets.into(),
-                    artifact_roots: domains,
-                    max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                    max_stdout_bytes: crate::lean_run::OUTPUT_LIMIT,
                     stdin: None,
                 })
             },
@@ -343,7 +299,9 @@ impl ProjectBroker {
             include_str!("../lake/OutlineSetup.lean"),
         ]
         .concat();
-        let bytes = self.run_file_driver(root, reader, activity, setup, entry, body).await?;
+        let bytes = self
+            .run_file_driver(&root, reader, activity, setup, entry, body)
+            .await?;
         let mut result: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
         let object = result
             .as_object_mut()
@@ -386,28 +344,21 @@ impl ProjectBroker {
         let options = LeanWorkerElabOptions::new()
             .file_label(file)
             .lean_options(setup.options.clone());
-        let PreparedReader {
-            custody,
-            sysroot,
-            shim_guards,
-            ..
-        } = reader;
+        let PreparedReader { sysroot, .. } = reader;
         let (cwd, path, snapshot) = (root.clone(), PathBuf::from(file), source.as_bytes().to_vec());
         let output = crate::lake_options::reader_run(
             "Lean file diagnostics",
-            root,
+            &root,
             crate::cancellation::CallCancellation::current()
                 .remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_workers.get(),
-            custody,
-            None,
-            Some(Box::new((activity, shim_guards))),
+            self.lean_runs(),
+            Some(Box::new(activity)),
             // `lean` exits 1 when the file has an error.
             &[0, 1],
             move |assets| {
                 let setup_file = assets.join("module.setup.json");
                 fs::write(&setup_file, setup.bytes)?;
-                Ok(crate::native_reader::NativeReaderProgram {
+                Ok(crate::lean_run::Program {
                     command: vec![
                         sysroot.join("bin/lean").into_os_string(),
                         "-j1".into(),
@@ -423,8 +374,7 @@ impl ProjectBroker {
                     environment: Vec::new(),
                     // Lake runs `lean` from the project root.
                     cwd,
-                    artifact_roots: Vec::new(),
-                    max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                    max_stdout_bytes: crate::lean_run::OUTPUT_LIMIT,
                     stdin: Some(snapshot),
                 })
             },

@@ -14,8 +14,7 @@
 //! shim deployment file checks run Lean from. Set `LEAN_HOST_MCP_TEST_FIXTURE`
 //! or `LEAN_SYSROOT`, and `LEAN_HOST_MCP_WORKERS_DIR` to a directory that
 //! `lean-host-mcp install-worker --workers-dir` wrote, to run it on a chain
-//! project (`support::chain`). Workers and native readers both count as
-//! workers. To run the same clients against a running server, with
+//! project (`support::chain`). To run the same clients against a running server, with
 //! no edits or kills, set `LEAN_HOST_MCP_MANY_CLIENTS_URL` to its endpoint,
 //! `LEAN_HOST_MCP_MANY_CLIENTS_ROOT` to its Lake root, and
 //! `LEAN_HOST_MCP_MANY_CLIENTS_FILES` and `LEAN_HOST_MCP_MANY_CLIENTS_MODULES`
@@ -136,7 +135,7 @@ async fn on_fixture() -> TestResult {
         .env("LEAN_HOST_MCP_MAX_WORKERS", &max)
         .env("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT", &max);
     let server = Server::start(&launch, RESTART).await?;
-    let sampler = Sampler::start(&chain.root, server.pid()?);
+    let sampler = Sampler::start(&scratch.store, server.pid()?);
     let work = Arc::new(Work {
         url: launch.url(),
         root: chain.root.clone(),
@@ -252,7 +251,8 @@ async fn on_running_server(url: String) -> TestResult {
     if work.files.is_empty() || work.modules.is_empty() {
         return Err("name at least one file and one module".into());
     }
-    let sampler = Sampler::start(&work.root, 0);
+    // The sampler finds builds through the server's store: the default one.
+    let sampler = Sampler::start(&lean_host_mcp::store::store_dir(&work.root, None), 0);
     let control = Client::new(&work.url, "pool")?;
     let stop = Arc::new(AtomicBool::new(false));
     let watched = Arc::clone(&stop);
@@ -484,8 +484,8 @@ struct Sampled {
     most_workers: usize,
 }
 
-/// A thread that lists the processes every 50 ms and counts Lake writers for
-/// the root and the workers of the server.
+/// A thread that lists the processes every 50 ms and counts the Lake builds
+/// of the servers on a store and the workers of the server.
 struct Sampler {
     stop: Arc<AtomicBool>,
     /// The server whose workers it counts; 0 for none.
@@ -495,13 +495,13 @@ struct Sampler {
 }
 
 impl Sampler {
-    fn start(root: &Path, server: u32) -> Self {
+    fn start(store: &Path, server: u32) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let server = Arc::new(AtomicU32::new(server));
         let sampled = Arc::new(Mutex::new(Sampled::default()));
         let thread = std::thread::spawn({
-            let (root, stop, server, sampled) = (
-                root.to_path_buf(),
+            let (store, stop, server, sampled) = (
+                store.to_path_buf(),
                 Arc::clone(&stop),
                 Arc::clone(&server),
                 Arc::clone(&sampled),
@@ -511,7 +511,7 @@ impl Sampler {
                     let seen = http::processes().ok().map(|all| {
                         let pid = server.load(Ordering::SeqCst);
                         let workers = if pid == 0 { 0 } else { http::workers(&all, pid).len() };
-                        (http::lake_writers(&all, &root).len(), workers)
+                        (http::lake_builds(&all, &store).len(), workers)
                     });
                     {
                         let mut sampled = sampled.lock();

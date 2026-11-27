@@ -2,16 +2,15 @@
 //!
 //! The host names the project's import roots at launch, in Lean's search
 //! order, through `LEAN_RS_WORKER_APPLICATION_INPUT`. Without that input the
-//! worker serves the installer's empty smoke project. For its whole life the
-//! worker holds shared the lock of every artifact domain of the project and of
-//! the installed shims. A worker that cannot take custody of the project at
-//! launch holds only the shims' locks and refuses each import with the reason,
-//! rather than exit before the SDK child connects. It admits an import or a
-//! source request only when Lean searches exactly the launch roots, then the
-//! shim roots, then the release, and only while no launch root holds a module
-//! package whose compiled code this process runs: the release's or the shims'.
-//! It refuses project libraries, plugins, terms, kernel requests and worker
-//! commands.
+//! worker serves the installer's empty smoke project. The server that launched
+//! the worker owns the project's checkout: no other server builds it, and this
+//! one stops the worker before each build it runs. A worker whose launch roots
+//! are not Lake build outputs refuses each import with the reason, rather than
+//! exit before the SDK child connects. It admits an import or a source request
+//! only when Lean searches exactly the launch roots, then the shim roots, then
+//! the release, and only while no launch root holds a module package whose
+//! compiled code this process runs: the release's or the shims'. It refuses
+//! project libraries, plugins, terms, kernel requests and worker commands.
 use lean_rs::host_bridge::{
     HostCachedModuleBatch, HostModuleBatch, HostModuleQuery, HostSourceOptions, TrustedHostKernelRequest,
     TrustedHostTerm, TrustedModuleSource,
@@ -36,8 +35,8 @@ use std::{
 
 /// Where Lake writes a package's `.olean` files, relative to the package.
 const BUILD_LIB: &str = ".lake/build/lib/lean";
-/// Most launch roots: the SDK takes custody of at most 32 packages of one Lake
-/// workspace, and each package gives one root.
+/// Most launch roots the worker accepts, one for each package of the project's
+/// Lake workspace. A worker launched with more refuses every import.
 const MAX_LAUNCH_ROOTS: usize = 32;
 
 #[derive(Deserialize)]
@@ -67,7 +66,7 @@ impl Deployment {
         };
         let p = &mut self.prepared;
         p.shim_manifest_path = expand(&p.shim_manifest_path)?;
-        for path in p.artifact_roots.iter_mut().chain(&mut p.shim_search_paths) {
+        for path in &mut p.shim_search_paths {
             *path = expand(path)?;
         }
         self.files = std::mem::take(&mut self.files)
@@ -95,9 +94,8 @@ pub(super) struct Installed {
     release: Vec<String>,
     /// Module packages of the release and of the shims.
     native: Vec<String>,
-    guards: Vec<fs::File>,
-    /// Why this worker could not take custody of its project at launch. While
-    /// set, it holds no project lock and refuses every import.
+    /// Why this worker's launch roots are invalid. While set, it serves no
+    /// project and refuses every import.
     refusal: Option<io::Error>,
 }
 pub(super) fn deny() -> lean_rs::LeanError {
@@ -153,92 +151,6 @@ fn launch_roots(dir: &Path) -> io::Result<Vec<String>> {
     }
     Ok(roots)
 }
-/// The package directory whose Lake build output is `root`.
-fn package(root: &Path) -> io::Result<&Path> {
-    root.ancestors()
-        .nth(4)
-        .ok_or_else(|| invalid("launch root has no package directory"))
-}
-/// `path` with every symbolic link in its longest existing prefix resolved.
-fn resolve(path: &Path) -> io::Result<PathBuf> {
-    let mut missing = Vec::new();
-    let mut ancestor = path;
-    loop {
-        match ancestor.canonicalize() {
-            Ok(resolved) => return Ok(missing.iter().rev().fold(resolved, |path, name| path.join(name))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(
-                    ancestor
-                        .file_name()
-                        .ok_or_else(|| invalid("import root has no existing ancestor"))?,
-                );
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| invalid("import root has no existing ancestor"))?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-/// Whether `root`, with its symbolic links resolved, lies in the `.lake`
-/// directory of a held domain, as the host's own readers require.
-fn covered(root: &Path, domains: &[PathBuf]) -> io::Result<bool> {
-    Ok(resolve(root)?
-        .ancestors()
-        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == ".lake"))
-        .and_then(Path::parent)
-        .is_some_and(|package| domains.iter().any(|domain| domain == package)))
-}
-/// Take the lock of each artifact domain shared and keep it. The host holds
-/// the same locks shared for the request that starts this worker, so no
-/// cooperating writer holds one now, and none can take one while this lives.
-fn hold(domains: &[PathBuf]) -> io::Result<Vec<fs::File>> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut locks = domains
-        .iter()
-        .map(|root| lean_toolchain::shared_writer::project_lock_path(root))
-        .collect::<io::Result<Vec<_>>>()?;
-    locks.sort();
-    locks.dedup();
-    locks
-        .iter()
-        .map(|lock| {
-            let file = fs::File::open(lock)?;
-            file.try_lock_shared().map_err(io::Error::from)?;
-            let held = file.metadata()?;
-            let named = fs::symlink_metadata(lock)?;
-            if !named.is_file() || held.nlink() != 1 || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
-                return Err(invalid("artifact lock identity changed"));
-            }
-            if !lean_toolchain::shared_writer::previous_writer_stopped(&file)? {
-                return Err(invalid("an earlier artifact writer may still run"));
-            }
-            Ok(file)
-        })
-        .collect()
-}
-/// Take custody of the project whose build the launch roots `launch` name:
-/// hold shared the lock of each of its artifact domains, and check that each
-/// launch root lies in one of them.
-fn custody(launch: &[String]) -> io::Result<Vec<fs::File>> {
-    let project = package(Path::new(launch.first().ok_or_else(|| invalid("no launch root"))?))?;
-    if project.canonicalize()? != project {
-        return Err(invalid("launch project is not canonical"));
-    }
-    let domains = lean_toolchain::shared_writer::project_artifact_roots(project)?;
-    let guards = hold(&domains)?;
-    if lean_toolchain::shared_writer::project_artifact_roots(project)? != domains {
-        return Err(invalid(
-            "project artifact domains changed while the worker took custody",
-        ));
-    }
-    for root in launch {
-        if !covered(Path::new(root), &domains)? {
-            return Err(invalid("launch root outside the project's artifact domains"));
-        }
-    }
-    Ok(guards)
-}
 /// Module packages a root offers Lean, which gives a whole package to the
 /// first root that holds a directory or an `.olean` file of that name.
 fn module_packages(root: &Path) -> io::Result<Vec<String>> {
@@ -275,10 +187,10 @@ impl Installed {
         Ok(&self.record.prepared)
     }
 
-    /// Check the installation and take custody of the project. When custody
-    /// fails, the worker still starts, holds only the shims' locks and refuses
-    /// every import with the reason, since a worker that exits before the SDK
-    /// child connects makes the server wait out its startup deadline.
+    /// Check the installation and read the launch roots. When the roots are
+    /// invalid, the worker still starts and refuses every import with the
+    /// reason, since a worker that exits before the SDK child connects makes
+    /// the server wait out its startup deadline.
     pub(super) fn open() -> io::Result<Self> {
         let worker = std::env::current_exe()?.canonicalize()?;
         let dir = worker.parent().ok_or_else(|| invalid("missing install directory"))?;
@@ -294,21 +206,8 @@ impl Installed {
         if digest(&worker)? != record.worker_sha256 {
             return Err(invalid("installed worker digest mismatch"));
         }
-        let shim_domains: Vec<_> = record.prepared.artifact_roots.iter().map(PathBuf::from).collect();
-        if shim_domains
-            != [
-                dir.join("shims/lean-rs-host-shims"),
-                dir.join("shims/lean-rs-interop-shims"),
-            ]
-        {
-            return Err(invalid("invalid installed shim domains"));
-        }
-        let mut guards = hold(&shim_domains)?;
-        let (launch, refusal) = match launch_roots(dir).and_then(|roots| Ok((custody(&roots)?, roots))) {
-            Ok((project, roots)) => {
-                guards.extend(project);
-                (roots, None)
-            }
+        let (launch, refusal) = match launch_roots(dir) {
+            Ok(roots) => (roots, None),
             Err(error) => (Vec::new(), Some(error)),
         };
         let compiled = option_env!("LEAN_HOST_COMPILED_SYSROOT")
@@ -405,7 +304,6 @@ impl Installed {
             release_root: format!("{sysroot}/lib/lean"),
             release,
             native,
-            guards,
             refusal,
         })
     }
@@ -472,9 +370,10 @@ macro_rules! grant_source {
             // worker's `imports` scope with default options and no plugin, that
             // Lean searched exactly the launch roots, the shim roots and the
             // release root, and that no launch root holds a release or shim
-            // package. `resolved` passes those roots in that order. No
-            // cooperating writer can change an artifact under them while the
-            // worker holds their domains, and the process-wide caches hold only
+            // package. `resolved` passes those roots in that order. Only the
+            // server that launched this worker builds the project, and it stops
+            // the worker before each build, so no build changes an artifact
+            // under them while the worker lives. The process-wide caches hold only
             // environments this worker imported through them. The caller's
             // source, header and options run in the release's own elaborator
             // and kernel, with no plugin or project library loaded, as Lean
@@ -494,7 +393,7 @@ macro_rules! grant_source {
 impl WorkerAuthority for Installed {
     #[allow(
         unsafe_code,
-        reason = "the installer binds the exact shipped shim products, runtime and held artifact domains"
+        reason = "the installer binds the exact shipped shim products and runtime"
     )]
     fn host(
         &self,
@@ -504,35 +403,29 @@ impl WorkerAuthority for Installed {
         let d = &self.record.prepared;
         if p.manifest_path() != Path::new(&d.shim_manifest_path)
             || p.manifest_json() != d.shim_manifest_json
-            || p.artifact_roots().iter().ne(d.artifact_roots.iter().map(Path::new))
             || p.shim_search_paths()
                 .iter()
                 .ne(d.shim_search_paths.iter().map(Path::new))
         {
             return Err(deny());
         }
-        let guards = self
-            .guards
-            .iter()
-            .map(fs::File::try_clone)
-            .collect::<io::Result<Vec<_>>>()
-            .map_err(|_| deny())?;
-        // SAFETY: only the verified installer-produced SDK manifest and images pass the comparisons.
-        // Guards retain the cooperating workspaces while the official runtime remains installed.
+        // SAFETY: only the verified installer-produced SDK manifest and images
+        // pass the comparisons. A run that changes the install directory holds
+        // the store of the root it serves, so it refuses while this worker's
+        // server runs.
         unsafe {
             LoadedHostArtifacts::load(
                 runtime,
                 p.manifest_path().into(),
                 p.manifest_json().as_bytes().to_vec(),
-                p.artifact_roots().to_vec(),
                 p.shim_search_paths().to_vec(),
-                guards,
+                (),
             )
         }
     }
     #[allow(
         unsafe_code,
-        reason = "the worker checks the exact roots it was launched for and holds every domain under them"
+        reason = "the worker checks the exact roots it was launched for, and only its server builds under them"
     )]
     fn imports<'c>(
         &self,
@@ -553,10 +446,10 @@ impl WorkerAuthority for Installed {
         // SAFETY: `paths` are this worker's launch roots in the host's order,
         // then the verified shim roots; Lean searches the installed release
         // after them. The launch roots hold the build of the project the host
-        // serves, which `lean` itself would load for the same imports. The
-        // worker holds every artifact domain under these roots shared for its
-        // whole life, so no cooperating writer can replace an artifact while
-        // this scope lives. No launch root holds a release or shim package, so
+        // serves, which `lean` itself would load for the same imports. Only
+        // the server that launched this worker builds the project, and it
+        // stops the worker before each build, so no build replaces an artifact
+        // while this scope lives. No launch root holds a release or shim package, so
         // each module whose compiled code runs here loads its own release or
         // shim `.olean`. No plugin or project library loads, so project modules
         // have no compiled code here and only Lean's interpreter can run

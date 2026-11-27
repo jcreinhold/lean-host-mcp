@@ -142,6 +142,7 @@ pub struct RuntimeFileConfig {
 pub struct BrokerFileConfig {
     pub max_workers: Option<usize>,
     pub max_workers_per_project: Option<usize>,
+    pub max_lean_runs: Option<usize>,
     pub idle_timeout_secs: Option<u64>,
 }
 

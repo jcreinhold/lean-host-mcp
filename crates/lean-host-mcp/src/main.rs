@@ -16,8 +16,6 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use lean_rs_writer::HelperCommand;
-use lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
@@ -28,7 +26,7 @@ use lean_host_mcp::cli::install::{self, InstallArgs};
 use lean_host_mcp::cli::install_worker::{self, InstallWorkerArgs};
 use lean_host_mcp::cli::processes::{self, DoctorProcessesArgs};
 use lean_host_mcp::requests::{RequestRunner, RequestSettings};
-use lean_host_mcp::store::{self, StoreLock};
+use lean_host_mcp::store;
 use lean_host_mcp::toolchain;
 use lean_host_mcp::tools::ToolContext;
 use lean_host_mcp::{
@@ -52,18 +50,6 @@ enum Command {
     /// Run the stdio MCP server (default when no subcommand is given).
     Serve(ServeArgs),
 
-    // The SDK's writer, reader and guardian helpers, which this server's own
-    // Lake runs, reads and workers start from this executable.
-    #[command(flatten)]
-    Helper(HelperCommand),
-    /// Internal guardian-owned execution of one prebuilt native reader.
-    #[command(hide = true)]
-    NativeReader(lean_host_mcp::native_reader::NativeReaderArgs),
-    #[command(hide = true)]
-    NativeReaderExec(lean_host_mcp::native_reader::NativeReaderArgs),
-    #[cfg(target_os = "linux")]
-    #[command(hide = true)]
-    NativeReaderWait(lean_host_mcp::native_reader::NativeReaderArgs),
     /// Install everything one Lake root needs to serve, and record it in the root's local config.
     Install(InstallArgs),
     /// Build and install a per-toolchain worker binary.
@@ -108,10 +94,6 @@ const DEFAULT_HTTP_PATH: &str = "/mcp";
 fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
-    if let Err(error) = configure_native_startup(cli.command.as_ref()) {
-        eprintln!("lean-host-mcp native settings: {error}");
-        return ExitCode::FAILURE;
-    }
     match cli.command {
         Some(Command::Install(args)) => match install::run(&args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -143,57 +125,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some(Command::NativeReader(args)) => match lean_host_mcp::native_reader::run_cli(&args) {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::FAILURE,
-            Err(error) => {
-                eprintln!("lean-host-mcp native-reader: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Some(Command::NativeReaderExec(args)) => match lean_host_mcp::native_reader::run_exec(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp native-reader-exec: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        #[cfg(target_os = "linux")]
-        Some(Command::NativeReaderWait(args)) => match lean_host_mcp::native_reader::run_waiter(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp native-reader-wait: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Some(Command::Helper(helper)) => helper.run("lean-host-mcp"),
         Some(Command::Serve(args)) => run_serve(args),
         None => run_serve(cli.serve),
-    }
-}
-
-/// Bind the SDK owner directory before a helper or native work reads it.
-///
-/// A helper has no store, so it takes the directory its parent names in
-/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` and refuses to run without one. The server
-/// and the installers bind that variable here when it is set, and otherwise
-/// their store's directory once they know the store. Commands that start no
-/// native work skip the check, so a bad setting cannot block them.
-fn configure_native_startup(command: Option<&Command>) -> std::io::Result<()> {
-    match command {
-        Some(
-            Command::Config { .. }
-            | Command::Doctor { .. }
-            | Command::Helper(
-                HelperCommand::WriterLockPath(_) | HelperCommand::WriterExec | HelperCommand::NativeGuardian,
-            ),
-        ) => Ok(()),
-        Some(Command::InstallWorker(args)) if args.list || args.clean || args.prune => Ok(()),
-        #[cfg(target_os = "linux")]
-        Some(Command::NativeReaderWait(_)) => Ok(()),
-        Some(Command::Helper(_)) => store::owner_directory().map(drop),
-        _ if std::env::var_os(OWNERS_DIRECTORY_ENV).is_some() => store::owner_directory().map(drop),
-        _ => Ok(()),
     }
 }
 
@@ -277,22 +210,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, broker_config.max_workers.get())?;
     let tool_config = resolve_tool_config(&file)?;
     let request_settings = RequestSettings::from_file(&file.requests).map_err(anyhow::Error::msg)?;
-    // Workers make their sockets here. Check it now, so a bad or long socket
-    // directory stops the server rather than its first check.
-    lean_host_mcp::socket_directory()?;
-    // One server per store. Take the lock after the config checks, so a bad
-    // config leaves the store alone, and before the broker, the process record
-    // and the request table open. The store then keeps the native state, before
-    // any native work starts.
+    // One server per store. Take it after the config checks, so a bad config
+    // leaves the store alone, and before the broker, the process record and
+    // the request table open. Taking it waits until every process an earlier
+    // server started has exited.
     let store = lake_root
         .as_deref()
-        .map(|root| -> anyhow::Result<_> {
-            let dir = store::store_dir(root, None);
-            let lock = StoreLock::acquire(&dir, root)?;
-            let dir = store::use_for_native_state(&dir)
-                .with_context(|| format!("cannot keep native state in the store {}", dir.display()))?;
-            Ok((lock, dir))
-        })
+        .map(|root| store::hold(&store::store_dir(root, None), root))
         .transpose()?;
     let transport = if http.is_some() { "http" } else { "stdio" };
     let bind_display = http.as_ref().map(|config| config.bind.to_string());
@@ -317,13 +241,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         transport,
         bind_display.clone(),
         http_path_log,
-        store.as_ref().map(|(_, dir)| dir.as_path()),
+        store.as_ref().map(store::HeldStore::dir),
     )?;
     let mut service = LeanHostService::new(Arc::clone(&broker), tool_config);
     // The request table lives in the store. Recovery ends what the last server
     // left and starts what it queued, before this server takes a call.
-    let runner = match &store {
-        Some((_, dir)) => {
+    let runner = match store.as_ref().map(store::HeldStore::dir) {
+        Some(dir) => {
             let ctx = ToolContext {
                 broker: Arc::clone(&broker),
                 config: tool_config,

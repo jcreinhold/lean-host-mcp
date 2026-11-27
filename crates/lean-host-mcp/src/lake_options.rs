@@ -8,16 +8,18 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lean_rs_worker_parent::LeanWorkerElabOptions;
 use lean_toolchain::LeanOptionValue;
-use lean_toolchain::shared_writer::{WriterDisposition, WriterFailure};
 use serde::Deserialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::cancellation::CallCancellation;
 use crate::envelope::TargetCheckNotStarted;
 use crate::error::{Result, ServerError};
+use crate::lean_run::{self, Disposition};
 use crate::toolchain::ToolchainId;
 
 const HELPER: &str = include_str!("lake/ModuleOptions.lean");
@@ -35,7 +37,7 @@ struct ModuleOptions {
 #[derive(Debug)]
 pub(crate) struct PreparationFailure {
     pub(crate) error: ServerError,
-    disposition: WriterDisposition,
+    disposition: Disposition,
 }
 
 type PreparationResult<T> = std::result::Result<T, PreparationFailure>;
@@ -44,58 +46,41 @@ impl PreparationFailure {
     fn stopped(error: ServerError) -> Self {
         Self {
             error,
-            disposition: WriterDisposition::Stopped,
+            disposition: Disposition::Stopped,
         }
     }
 
     fn unknown(error: ServerError) -> Self {
         Self {
             error,
-            disposition: WriterDisposition::Unknown,
-        }
-    }
-
-    fn writer(label: &str, error: std::io::Error) -> Self {
-        let disposition =
-            WriterFailure::from_io(&error).map_or(WriterDisposition::Unknown, |failure| failure.disposition);
-        Self {
-            error: reader_error(label, error),
-            disposition,
+            disposition: Disposition::Unknown,
         }
     }
 }
 
 impl From<ServerError> for PreparationFailure {
     fn from(error: ServerError) -> Self {
-        // These conversions precede command delivery: metadata reads and private
-        // helper inputs cannot have evaluated Lake configuration. Post-delivery
-        // failures use the writer's typed evidence or an explicit closed outcome.
+        // These conversions precede the run: metadata reads and private inputs
+        // cannot have evaluated Lake configuration. Failures after the start
+        // carry the run's own disposition.
         Self {
             error,
-            disposition: WriterDisposition::NotStarted,
+            disposition: Disposition::NotStarted,
         }
     }
 }
 
-/// Evaluate the owning package, then carry its options through every worker/cache path.
+/// Evaluate the owning package, then carry its options through every
+/// worker and cache path. The evaluation is a short run and takes one of
+/// `runs`.
 pub(crate) async fn resolve(
     root: &Path,
     options: LeanWorkerElabOptions,
-    capacity_limit: usize,
-    keepalive: Option<Box<dyn Send>>,
-) -> Result<LeanWorkerElabOptions> {
-    resolve_using(root, options, capacity_limit, None, keepalive).await
-}
-
-async fn resolve_using(
-    root: &Path,
-    options: LeanWorkerElabOptions,
-    capacity_limit: usize,
-    contract: Option<lean_rs_writer::WriterContract>,
+    runs: Arc<Semaphore>,
     keepalive: Option<Box<dyn Send>>,
 ) -> Result<LeanWorkerElabOptions> {
     let file_label = options.file_label.clone();
-    resolve_inner(root, options, capacity_limit, contract, keepalive)
+    resolve_inner(root, options, runs, keepalive)
         .await
         .map_err(|failure| preparation_failed(file_label, failure.error))
 }
@@ -113,11 +98,11 @@ async fn observe_preparation(
         }
         Err(PreparationFailure { error, disposition }) => {
             match disposition {
-                WriterDisposition::NotStarted => operation.not_started(),
+                Disposition::NotStarted => operation.not_started(),
                 // Confirmed closure settles execution even though this failed
                 // preparation supplies no option data or native-worker receipt.
-                WriterDisposition::Stopped => operation.returned(),
-                WriterDisposition::Unknown => operation.unknown(),
+                Disposition::Stopped => operation.returned(),
+                Disposition::Unknown => operation.unknown(),
             }
             Err(preparation_failed(file_label, error))
         }
@@ -144,48 +129,32 @@ fn preparation_failed(file_label: String, error: ServerError) -> ServerError {
 async fn resolve_inner(
     root: &Path,
     options: LeanWorkerElabOptions,
-    capacity_limit: usize,
-    contract: Option<lean_rs_writer::WriterContract>,
+    runs: Arc<Semaphore>,
     keepalive: Option<Box<dyn Send>>,
 ) -> PreparationResult<LeanWorkerElabOptions> {
-    // This is the SAME full project union the utility guardian will acquire.
-    // Retain it in the blocking owner until guardian custody/closure, so package
-    // and toolchain metadata cannot change between resolution and execution.
-    // There is no partial lock set or lock-order upgrade across the handoff.
     let preflight = CallCancellation::current().begin_operation();
     let context: PreparationResult<_> = (|| {
-        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root).map_err(bad_project)?;
         let toolchain = ToolchainId::from_lake_root(root).map_err(bad_project)?;
         let sysroot = toolchain.elan_dir().map_err(bad_project)?;
         let file = source_path(root, &options.file_label);
         let (package, config_file, dependency_name) = owning_config(root, file.as_deref())?;
         let canonical_root = root.canonicalize().map_err(bad_project)?;
-        Ok((
-            custody,
-            sysroot,
-            file,
-            package,
-            config_file,
-            dependency_name,
-            canonical_root,
-        ))
+        Ok((sysroot, file, package, config_file, dependency_name, canonical_root))
     })();
-    // Pure metadata and lock admission have not released a configuration command.
+    // Metadata reads have not started a configuration command.
     preflight.not_started();
-    let (custody, sysroot, file, package, config_file, dependency_name, root) = context?;
+    let (sysroot, file, package, config_file, dependency_name, root) = context?;
     let command_root = root.clone();
     let command_package = package.clone();
     let output = reader_output(
         LAKE_OPTIONS,
-        root,
+        &root,
         CallCancellation::current().remaining_or(TIMEOUT),
-        capacity_limit,
-        custody,
-        contract,
+        runs,
         keepalive,
         move |assets| {
-            // The native-reader owner retains these private inputs until actual
-            // scope closure, including a lost or cancelled async waiter.
+            // The run keeps these private inputs until its group has exited,
+            // including after a lost or cancelled async waiter.
             let helper = assets.join("ModuleOptions.lean");
             std::fs::write(&helper, HELPER)?;
             let config_workspace = assets.join("config");
@@ -208,12 +177,11 @@ async fn resolve_inner(
                 config_workspace.into_os_string(),
                 file.as_deref().unwrap_or_else(|| Path::new("")).as_os_str().to_owned(),
             ];
-            Ok(crate::native_reader::NativeReaderProgram {
+            Ok(lean_run::Program {
                 command,
                 environment: vec![("LEAN_SYSROOT".into(), sysroot.into_os_string())],
                 cwd: command_package,
-                artifact_roots: Vec::new(),
-                max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                max_stdout_bytes: lean_run::OUTPUT_LIMIT,
                 stdin: None,
             })
         },
@@ -232,34 +200,24 @@ async fn resolve_inner(
     Ok(options.lean_options(resolved.options))
 }
 
-/// Cancellation signals the owner rather than dropping its process evidence.
-/// The same deadline covers preparation, native admission, and command delivery.
+/// Run one short program for a request on canonical root `root` and return
+/// its stdout, when it exits 0. Cancellation stops the run rather than
+/// dropping its process evidence. One deadline covers the wait for a permit
+/// from `runs` and the run.
 pub(crate) async fn reader_output(
     label: &'static str,
-    root: PathBuf,
+    root: &Path,
     timeout: Duration,
-    capacity_limit: usize,
-    custody: crate::artifact_reads::ArtifactReadGuard,
-    contract: Option<lean_rs_writer::WriterContract>,
+    runs: Arc<Semaphore>,
     keepalive: Option<Box<dyn Send>>,
-    prepare: impl FnOnce(&Path) -> std::io::Result<crate::native_reader::NativeReaderProgram> + Send + 'static,
+    prepare: impl FnOnce(&Path) -> std::io::Result<lean_run::Program> + Send + 'static,
 ) -> PreparationResult<Vec<u8>> {
-    let output = reader_run(
-        label,
-        root,
-        timeout,
-        capacity_limit,
-        custody,
-        contract,
-        keepalive,
-        &[0],
-        prepare,
-    )
-    .await?;
+    let output = reader_run(label, root, timeout, runs, keepalive, &[0], prepare).await?;
     Ok(output.stdout)
 }
 
-/// How a reader's program ended, when it ended with an exit code the caller accepts.
+/// How a short run's program ended, when it ended with an exit code the
+/// caller accepts.
 #[derive(Debug)]
 pub(crate) struct ReaderOutput {
     pub(crate) exit_code: i32,
@@ -269,57 +227,47 @@ pub(crate) struct ReaderOutput {
 
 /// [`reader_output`] for a program whose exit codes in `accepted` all carry a
 /// result, such as `lean`, which exits 1 when the file it checks has errors.
+///
+/// The run holds a permit from `runs` and a share of the request's read turn
+/// on `root` until its process group has exited, even past the reply.
 pub(crate) async fn reader_run(
     label: &'static str,
-    root: PathBuf,
+    root: &Path,
     timeout: Duration,
-    capacity_limit: usize,
-    custody: crate::artifact_reads::ArtifactReadGuard,
-    contract: Option<lean_rs_writer::WriterContract>,
+    runs: Arc<Semaphore>,
     keepalive: Option<Box<dyn Send>>,
     accepted: &'static [i32],
-    prepare: impl FnOnce(&Path) -> std::io::Result<crate::native_reader::NativeReaderProgram> + Send + 'static,
+    prepare: impl FnOnce(&Path) -> std::io::Result<lean_run::Program> + Send + 'static,
 ) -> PreparationResult<ReaderOutput> {
     let cancellation = CallCancellation::current();
-    let operation = cancellation.begin_operation();
     let mut on_drop = cancellation.cancel_on_drop();
     let started = Instant::now();
+    let permit = match run_permit(&cancellation, runs, timeout).await {
+        Ok(permit) => permit,
+        Err(detail) => {
+            cancellation.begin_operation().not_started();
+            on_drop.disarm();
+            return Err(reader_error(label, with_note(label, detail)).into());
+        }
+    };
+    let operation = cancellation.begin_operation();
+    let share = crate::project_lock::read_share(root).await;
+    let remaining = timeout.saturating_sub(started.elapsed());
     let result = tokio::task::spawn_blocking(move || {
-        // The actual native/reaper owner retains both the broker admission and
-        // this complete read union through Unknown, until scope closure.
-        let keepalive: Option<Box<dyn Send>> = Some(Box::new((custody, keepalive)));
-        let cancelled = || cancellation.is_cancelled();
-        let remaining = timeout.saturating_sub(started.elapsed());
-        let result = if remaining.is_zero() {
-            Err(reader_error(label, "deadline expired before native reader admission").into())
-        } else if cancelled() {
-            Err(reader_error(label, "cancelled before native reader admission").into())
-        } else {
-            let reader = match contract {
-                Some(contract) => crate::native_reader::run_program_with_contract(
-                    &contract,
-                    &root,
-                    remaining,
-                    capacity_limit,
-                    &cancelled,
-                    keepalive,
-                    prepare,
-                ),
-                None => {
-                    crate::native_reader::run_program(&root, remaining, capacity_limit, &cancelled, keepalive, prepare)
-                }
-            };
-            reader
-                .map_err(|error| PreparationFailure::writer(label, error))
-                .and_then(|result| reader_bytes(label, result, accepted))
-        };
+        let keepalive: Box<dyn Send> = Box::new((permit, share, keepalive));
+        let result = lean_run::run(remaining, || cancellation.is_cancelled(), keepalive, prepare)
+            .map_err(|failure| PreparationFailure {
+                disposition: failure.disposition,
+                error: reader_error(label, with_note(label, failure.detail)),
+            })
+            .and_then(|exit| accepted_exit(label, exit, accepted));
         match result
             .as_ref()
-            .map_or_else(|failure| failure.disposition, |_| WriterDisposition::Stopped)
+            .map_or_else(|failure| failure.disposition, |_| Disposition::Stopped)
         {
-            WriterDisposition::NotStarted => operation.not_started(),
-            WriterDisposition::Stopped => operation.returned(),
-            WriterDisposition::Unknown => operation.unknown(),
+            Disposition::NotStarted => operation.not_started(),
+            Disposition::Stopped => operation.returned(),
+            Disposition::Unknown => operation.unknown(),
         }
         result
     })
@@ -328,51 +276,58 @@ pub(crate) async fn reader_run(
     result.map_err(|error| PreparationFailure::unknown(reader_error(label, error)))?
 }
 
-fn reader_bytes(
-    label: &str,
-    reader: crate::native_reader::NativeReaderResult,
-    accepted: &[i32],
-) -> PreparationResult<ReaderOutput> {
-    if reader.protocol == crate::native_reader::PROTOCOL
-        && reader.state == "completed"
-        && reader.scope_closed
-        && reader.target_started == Some(true)
-        && let Some(exit_code) = reader.exit_code.filter(|code| accepted.contains(code))
-        && reader.exit_status.is_some()
-        && !reader.output_truncated
-        && !reader.intervened
-    {
+/// Wait up to `timeout` for a permit from `runs`, the pool's bound on short
+/// runs, or say why none came.
+async fn run_permit(
+    cancellation: &CallCancellation,
+    runs: Arc<Semaphore>,
+    timeout: Duration,
+) -> std::result::Result<OwnedSemaphorePermit, String> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err("cancelled before a short-run permit came free".to_owned()),
+        permit = tokio::time::timeout(timeout, runs.acquire_owned()) => match permit {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(closed)) => Err(format!("the short-run permits closed: {closed}")),
+            Err(_) => Err(format!(
+                "no short-run permit came free within {} s; raise broker.max_lean_runs or retry",
+                timeout.as_secs_f64()
+            )),
+        },
+    }
+}
+
+/// The output of a program that exited on its own, if `accepted` lists its
+/// exit code.
+fn accepted_exit(label: &str, exit: lean_run::Exit, accepted: &[i32]) -> PreparationResult<ReaderOutput> {
+    if accepted.contains(&exit.code) {
         return Ok(ReaderOutput {
-            exit_code,
-            stdout: reader.stdout.into_bytes(),
-            stderr: reader.stderr,
+            exit_code: exit.code,
+            stdout: exit.stdout,
+            stderr: exit.stderr,
         });
     }
-    let disposition = if !reader.scope_closed {
-        WriterDisposition::Unknown
-    } else if reader.state == "not_started" && reader.target_started == Some(false) {
-        WriterDisposition::NotStarted
-    } else {
-        WriterDisposition::Stopped
-    };
-    let target_note = if label == LAKE_OPTIONS {
-        "; no proof check ran"
-    } else {
-        ""
-    };
-    Err(PreparationFailure {
-        disposition,
-        error: reader_error(
+    Err(PreparationFailure::stopped(reader_error(
+        label,
+        with_note(
             label,
             format!(
-                "native reader did not return a complete result{target_note}: state={} {}{}{}",
-                reader.state,
-                reader.detail.unwrap_or_default(),
-                reader.stdout,
-                reader.stderr,
+                "the program exited with code {}: {}{}",
+                exit.code,
+                String::from_utf8_lossy(&exit.stdout),
+                exit.stderr
             ),
         ),
-    })
+    )))
+}
+
+/// `detail`, with the note that option discovery ran no proof check.
+fn with_note(label: &str, detail: String) -> String {
+    if label == LAKE_OPTIONS {
+        format!("{detail}; no proof check ran")
+    } else {
+        detail
+    }
 }
 
 #[cfg(test)]
@@ -498,90 +453,65 @@ fn owning_package(root: &Path, file: Option<&Path>) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn reader_result() -> crate::native_reader::NativeReaderResult {
-        crate::native_reader::NativeReaderResult {
-            protocol: 1,
-            state: "completed".into(),
-            target_started: Some(true),
-            exit_code: Some(0),
-            exit_status: Some("exit status: 0".into()),
-            stdout: "{\"module\":\"Demo\",\"options\":{}}".into(),
-            stderr: String::new(),
-            output_truncated: false,
-            diagnostic_preview: None,
-            intervened: false,
-            scope_closed: true,
-            protected_domains: Vec::new(),
-            runtime_compatibility: serde_json::Value::Null,
-            stdin_sha256: None,
-            stdin_bytes: None,
-            payload_usage: None,
-            detail: None,
+    fn exit(code: i32, stderr: &str) -> lean_run::Exit {
+        lean_run::Exit {
+            code,
+            stdout: b"{\"module\":\"Demo\",\"options\":{}}".to_vec(),
+            stderr: stderr.to_owned(),
         }
     }
 
     #[test]
-    fn discovery_requires_complete_uninterrupted_closed_reader_result() {
-        assert!(reader_bytes(LAKE_OPTIONS, reader_result(), &[0]).is_ok());
-        for mutation in 0..5 {
-            let mut reader = reader_result();
-            match mutation {
-                0 => reader.intervened = true,
-                1 => reader.output_truncated = true,
-                2 => reader.exit_status = None,
-                3 => reader.exit_code = Some(1),
-                _ => reader.state = "stopped".into(),
-            }
-            let error = reader_bytes(LAKE_OPTIONS, reader, &[0]).unwrap_err();
-            assert_eq!(error.disposition, WriterDisposition::Stopped);
-            assert!(error.error.to_string().contains("no proof check ran"));
-        }
+    fn discovery_accepts_only_exit_zero_and_says_no_check_ran() {
+        assert!(accepted_exit(LAKE_OPTIONS, exit(0, ""), &[0]).is_ok());
+        let error = accepted_exit(LAKE_OPTIONS, exit(1, "why"), &[0]).unwrap_err();
+        assert_eq!(error.disposition, Disposition::Stopped);
+        let message = error.error.to_string();
+        assert!(message.contains("exited with code 1"), "{message}");
+        assert!(message.contains("why"), "{message}");
+        assert!(message.contains("no proof check ran"), "{message}");
     }
 
     #[test]
     fn a_caller_that_accepts_an_exit_code_gets_it_with_the_output() {
-        let mut reader = reader_result();
-        reader.exit_code = Some(1);
-        reader.stderr = "why".into();
-        let output = reader_bytes("Lean file diagnostics", reader, &[0, 1]).unwrap();
+        let output = accepted_exit("Lean file diagnostics", exit(1, "why"), &[0, 1]).unwrap();
         assert_eq!((output.exit_code, output.stderr.as_str()), (1, "why"));
-        let mut reader = reader_result();
-        reader.exit_code = Some(2);
-        assert!(reader_bytes("Lean file diagnostics", reader, &[0, 1]).is_err());
+        assert!(accepted_exit("Lean file diagnostics", exit(2, ""), &[0, 1]).is_err());
     }
 
-    #[test]
-    fn stopped_file_driver_reports_its_own_error_without_a_target_verdict() {
-        let mut reader = reader_result();
-        reader.state = "stopped".into();
-        reader.intervened = true;
-        reader.stdout.clear();
-        reader.detail = Some("native reader deadline elapsed".into());
-        let failure = reader_bytes("Lean file driver", reader, &[0]).unwrap_err();
-        assert_eq!(failure.disposition, WriterDisposition::Stopped);
-        let error = rmcp::ErrorData::from(failure.error);
-        assert_eq!(
-            error,
-            rmcp::ErrorData::internal_error(
-                "lake project not usable: Lean file driver: native reader did not return a complete result: state=stopped native reader deadline elapsed",
+    #[tokio::test]
+    async fn a_short_run_reports_its_own_error_and_disposition() {
+        for (script, disposition, detail) in [
+            ("exit 4", Disposition::Stopped, "exited with code 4"),
+            ("sleep 30", Disposition::Stopped, "limit"),
+        ] {
+            let failure = reader_output(
+                "Lean file driver",
+                Path::new("/"),
+                Duration::from_millis(300),
+                Arc::new(Semaphore::new(1)),
                 None,
+                move |inputs| {
+                    Ok(lean_run::Program {
+                        command: vec!["sh".into(), "-c".into(), script.into()],
+                        environment: Vec::new(),
+                        cwd: inputs.to_path_buf(),
+                        max_stdout_bytes: lean_run::OUTPUT_LIMIT,
+                        stdin: None,
+                    })
+                },
             )
-        );
-    }
-
-    #[test]
-    fn discovery_distinguishes_unstarted_from_unclosed_preparation() {
-        let mut reader = reader_result();
-        reader.state = "not_started".into();
-        reader.target_started = Some(false);
-        let error = reader_bytes(LAKE_OPTIONS, reader, &[0]).unwrap_err();
-        assert_eq!(error.disposition, WriterDisposition::NotStarted);
-        let mut reader = reader_result();
-        reader.state = "unknown".into();
-        reader.target_started = Some(false);
-        reader.scope_closed = false;
-        let error = reader_bytes(LAKE_OPTIONS, reader, &[0]).unwrap_err();
-        assert_eq!(error.disposition, WriterDisposition::Unknown);
+            .await
+            .unwrap_err();
+            assert_eq!(failure.disposition, disposition);
+            let error = rmcp::ErrorData::from(failure.error);
+            assert!(
+                error.message.starts_with("lake project not usable: Lean file driver: "),
+                "{error:?}"
+            );
+            assert!(error.message.contains(detail), "{error:?}");
+            assert!(!error.message.contains("no proof check ran"), "{error:?}");
+        }
     }
 
     #[tokio::test]
@@ -651,28 +581,11 @@ mod tests {
         assert_eq!(owning_package(temp.path(), None), temp.path());
     }
 
-    fn fixture_contract(root: &Path) -> lean_rs_writer::WriterContract {
-        use std::os::unix::fs::PermissionsExt as _;
-        crate::native_socket::use_test_directory().unwrap();
-        let executable = PathBuf::from(std::env::var_os("LEAN_HOST_MCP_OPTIONS_TEST_HELPER").unwrap())
-            .canonicalize()
-            .unwrap();
-        let registry = root.parent().unwrap().join("Owners");
-        std::fs::create_dir_all(&registry).unwrap();
-        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
-        lean_rs_writer::WriterContract {
-            protocol: 1,
-            executable,
-            ownership_registry: registry,
-        }
-    }
-
     async fn fixture_resolve(root: &Path, label: &str) -> Result<LeanWorkerElabOptions> {
-        resolve_using(
+        resolve(
             root,
             LeanWorkerElabOptions::new().file_label(label),
-            1,
-            Some(fixture_contract(root)),
+            Arc::new(Semaphore::new(1)),
             None,
         )
         .await
@@ -690,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires pinned Lean plus actual H via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN/HELPER"]
+    #[ignore = "requires pinned Lean via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN"]
     async fn lake_module_options_follow_config_without_builds() {
         let temp = tempfile::Builder::new()
             .prefix("lake-options-")
@@ -743,15 +656,11 @@ lean_lib Loose
             resolved.lean_options["weak.testUnused"],
             LeanOptionValue::String("true".into())
         );
-        // A resident generation retains these same SH domains. Old EX-based
-        // discovery would wait its full 30-second deadline on the second call.
-        let warm = crate::artifact_reads::ArtifactReadGuard::try_acquire(&root).unwrap();
         let loose = tokio::time::timeout(Duration::from_secs(8), fixture_resolve(&root, "Loose.lean"))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(loose.lean_options["autoImplicit"], LeanOptionValue::Bool(true));
-        drop(warm);
         assert!(!root.join(".lake/build").exists());
         assert!(!root.join(".lake/config").exists());
         let shared_root = root.join(".lake/config/0");
@@ -818,7 +727,7 @@ lean_lib Loose
     }
 
     #[tokio::test]
-    #[ignore = "requires pinned Lean plus actual H via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN/HELPER"]
+    #[ignore = "requires pinned Lean via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN"]
     async fn cold_options_evaluate_external_inputs_fresh_with_real_package_paths() {
         let temp = tempfile::Builder::new()
             .prefix("lake-options-")
@@ -872,105 +781,8 @@ lean_lib Demo
         .unwrap();
     }
 
-    struct ResidentFixture {
-        child: Option<std::process::Child>,
-        directory: Option<tempfile::TempDir>,
-        closed: bool,
-    }
-    impl Drop for ResidentFixture {
-        fn drop(&mut self) {
-            if let Some(child) = &mut self.child {
-                if matches!(child.try_wait(), Ok(None)) {
-                    drop(child.kill());
-                }
-                drop(child.wait());
-            }
-            if !self.closed
-                && let Some(directory) = self.directory.take()
-            {
-                let retained = directory.keep();
-                eprintln!(
-                    "retained native fixture inputs after unconfirmed completion: {}",
-                    retained.display()
-                );
-            }
-        }
-    }
-
     #[tokio::test]
-    #[ignore = "requires pinned Lean plus actual H via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN/HELPER"]
-    async fn resident_native_scope_at_limit_one_allows_warm_options_without_recycle() {
-        let temp = tempfile::Builder::new()
-            .prefix("lake-options-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let base = temp.path().canonicalize().unwrap();
-        let root = base.join("Project");
-        stage_root(
-            &root,
-            "import Lake\nopen Lake DSL\npackage warm_options\nlean_lib Demo\n",
-        );
-        std::fs::write(root.join("Demo.lean"), "def sample := 1\n").unwrap();
-        let contract = fixture_contract(&root);
-        let started = base.join("resident-started");
-        let release = base.join("release-resident");
-        let child = std::process::Command::new(&contract.executable)
-            .args(["native-reader", "--project-root"])
-            .arg(&root)
-            .args(["--capacity-limit", "1", "--timeout-millis", "30000", "--"])
-            .arg(Path::new("/bin/sh").canonicalize().unwrap())
-            .args([
-                "-c",
-                "printf '%s' \"$$\" > \"$1\"; while [ ! -f \"$2\" ]; do /bin/sleep 0.01; done",
-                "resident-native-fixture",
-            ])
-            .arg(&started)
-            .arg(&release)
-            .env(
-                lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV,
-                &contract.ownership_registry,
-            )
-            .env(crate::native_socket::ENV, crate::native_socket::directory().unwrap())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut resident = ResidentFixture {
-            child: Some(child),
-            directory: Some(temp),
-            closed: false,
-        };
-        wait_for_file(&started).await;
-        let original_pid = resident.child.as_ref().unwrap().id();
-        let original_payload = std::fs::read_to_string(&started).unwrap();
-        for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(8), fixture_resolve(&root, "Demo.lean"))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(resident.child.as_ref().unwrap().id(), original_pid);
-            assert!(resident.child.as_mut().unwrap().try_wait().unwrap().is_none());
-            assert_eq!(std::fs::read_to_string(&started).unwrap(), original_payload);
-        }
-        std::fs::write(&release, "done").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while resident.child.as_mut().unwrap().try_wait().unwrap().is_none() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let output = resident.child.take().unwrap().wait_with_output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(result["state"], "completed");
-        resident.closed = true;
-        assert!(!root.join(".lake").exists());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires pinned Lean plus actual H via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN/HELPER"]
+    #[ignore = "requires pinned Lean via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN"]
     async fn configuration_cancellation_confirms_closed_scope_without_claiming_a_proof_result() {
         let temp = tempfile::Builder::new()
             .prefix("lake-options-")
@@ -1012,7 +824,7 @@ lean_lib Demo
     }
 
     #[tokio::test]
-    #[ignore = "requires pinned Lean plus actual H via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN/HELPER"]
+    #[ignore = "requires pinned Lean via LEAN_HOST_MCP_OPTIONS_TEST_TOOLCHAIN"]
     async fn dropped_configuration_awaiter_cancels_its_actual_owned_scope() {
         let temp = tempfile::Builder::new()
             .prefix("lake-options-")
@@ -1036,17 +848,17 @@ lean_lib Demo
             lake_root: None,
             max_workers: std::num::NonZeroUsize::MIN,
             max_workers_per_project: std::num::NonZeroUsize::MIN,
+            max_lean_runs: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         });
         let activity = broker.preparation_activity();
         let task_root = root.clone();
-        let contract = fixture_contract(&root);
+        let runs = broker.lean_runs();
         let task = tokio::spawn(async move {
-            resolve_using(
+            resolve(
                 &task_root,
                 LeanWorkerElabOptions::new().file_label("Demo.lean"),
-                1,
-                Some(contract),
+                runs,
                 Some(Box::new(activity)),
             )
             .await
@@ -1057,16 +869,10 @@ lean_lib Demo
         assert!(!busy.pool.workers_stopped);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        // EX is only obtainable after every native guardian loan has closed.
-        let path = lean_toolchain::shared_writer::project_lock_path(&root).unwrap();
-        let lock = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        // The run returns its permit only once its process group has exited.
         tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                match lock.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(5)).await,
-                    Err(error) => panic!("native scope cleanup lock failed: {error}"),
-                }
+            while broker.lean_runs().available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -1091,26 +897,48 @@ lean_lib Demo
     #[tokio::test]
     async fn pre_cancelled_reader_admission_records_no_start_without_preparing_inputs() {
         let root = tempfile::tempdir().unwrap();
-        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root.path()).unwrap();
         let request = tokio_util::sync::CancellationToken::new();
         request.cancel();
         let (result, evidence) = crate::cancellation::with_cancellation_evidence(&request, async {
             reader_output(
                 LAKE_OPTIONS,
-                root.path().to_path_buf(),
+                root.path(),
                 Duration::from_secs(1),
-                1,
-                custody,
-                None,
+                Arc::new(Semaphore::new(1)),
                 None,
                 |_| panic!("pre-cancelled reader must not prepare inputs"),
             )
             .await
         })
         .await;
-        assert_eq!(result.unwrap_err().disposition, WriterDisposition::NotStarted);
+        assert_eq!(result.unwrap_err().disposition, Disposition::NotStarted);
         assert_eq!(evidence.not_started, 1);
         assert_eq!(evidence.pending, 0);
+        assert!(!evidence.uncertain);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_gets_no_permit_by_its_deadline_never_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let runs = Arc::new(Semaphore::new(1));
+        let _held = Arc::clone(&runs).acquire_owned().await.unwrap();
+        let request = tokio_util::sync::CancellationToken::new();
+        let (result, evidence) = crate::cancellation::with_cancellation_evidence(&request, async {
+            reader_output(
+                "Lean file driver",
+                root.path(),
+                Duration::from_millis(50),
+                runs,
+                None,
+                |_| panic!("a run without a permit must not prepare inputs"),
+            )
+            .await
+        })
+        .await;
+        let failure = result.unwrap_err();
+        assert_eq!(failure.disposition, Disposition::NotStarted);
+        assert!(failure.error.to_string().contains("broker.max_lean_runs"));
+        assert_eq!(evidence.not_started, 1);
         assert!(!evidence.uncertain);
     }
 }

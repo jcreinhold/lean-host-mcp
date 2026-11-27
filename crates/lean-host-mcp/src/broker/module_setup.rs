@@ -85,40 +85,36 @@ impl Identity {
     }
 }
 
+/// What `lake setup-file` printed for one file, with the identity of every
+/// file it names, taken when Lake answered.
 pub(crate) struct StagedSetup {
     pub(crate) bytes: Vec<u8>,
     pub(crate) options: BTreeMap<String, lean_toolchain::LeanOptionValue>,
     sysroot: PathBuf,
-    domains: Vec<PathBuf>,
+    /// The project's package roots ([`crate::lake_meta::manifest_package_roots`]).
+    packages: Vec<PathBuf>,
     inputs: BTreeMap<PathBuf, Identity>,
 }
 
 impl StagedSetup {
     pub(super) fn artifact_identity_sha256(&self, shim_digest: &str) -> io::Result<String> {
         let executable = Identity::read(&self.sysroot.join("bin/lean"))?;
-        let bytes = serde_json::to_vec(&(&self.sysroot, executable, &self.domains, &self.inputs, shim_digest))?;
+        let bytes = serde_json::to_vec(&(&self.sysroot, executable, &self.packages, &self.inputs, shim_digest))?;
         Ok(crate::digest::sha256_hex(&bytes))
     }
 
-    pub(super) fn check(
-        &self,
-        root: &Path,
-        sysroot: &Path,
-        custody: &crate::artifact_reads::ArtifactReadGuard,
-    ) -> io::Result<()> {
-        if self.sysroot != sysroot || self.domains != lean_toolchain::shared_writer::project_artifact_roots(root)? {
-            return Err(invalid("setup domains or toolchain changed during reader transfer"));
+    /// Refuse the setup when the toolchain, the project's packages or any
+    /// file it names changed since Lake answered, such as a build outside
+    /// this server that replaced an import.
+    pub(super) fn check(&self, root: &Path, sysroot: &Path) -> io::Result<()> {
+        if self.sysroot != sysroot || self.packages != crate::lake_meta::manifest_package_roots(root) {
+            return Err(invalid(
+                "the project's packages or toolchain changed after Lake's setup",
+            ));
         }
         for (p, identity) in &self.inputs {
-            if p != &root.join("lean-toolchain")
-                && !p.starts_with(sysroot)
-                && !p.starts_with(root)
-                && !custody.covers_artifact_root(p)
-            {
-                return Err(invalid("setup path outside reader custody"));
-            }
             if Identity::read(p)? != *identity {
-                return Err(invalid("setup input changed during reader transfer"));
+                return Err(invalid("a file Lake's setup names changed after Lake answered"));
             }
         }
         Ok(())
@@ -144,7 +140,7 @@ fn parse_sources(stdout: &[u8], count: usize) -> io::Result<Vec<PathBuf>> {
 }
 
 fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
-    if bytes.len() > crate::native_reader::PROGRAM_OUTPUT_LIMIT {
+    if bytes.len() > crate::lean_run::PROGRAM_OUTPUT_LIMIT {
         return Err(invalid("Lake module setup exceeds capture limit"));
     }
     let setup: ModuleSetup =
@@ -157,7 +153,7 @@ fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
 
 pub(crate) fn stage(
     bytes: Vec<u8>,
-    domains: &[PathBuf],
+    packages: &[PathBuf],
     sysroot: &Path,
     root: &Path,
     file: &Path,
@@ -170,10 +166,10 @@ pub(crate) fn stage(
         if !p.is_absolute()
             || p.canonicalize()? != p
             || !p.is_file()
-            || !(p.starts_with(&release_lib) || domains.iter().any(|r| p.starts_with(r.join(".lake/build"))))
+            || !(p.starts_with(&release_lib) || packages.iter().any(|r| p.starts_with(r.join(".lake/build"))))
         {
             return Err(invalid(
-                "Lake setup artifact outside held project outputs or selected release",
+                "Lake setup artifact outside the project's package outputs or the selected release",
             ));
         }
         inputs.insert(p.to_owned(), Identity::read(p)?);
@@ -216,7 +212,7 @@ pub(crate) fn stage(
         bytes,
         options: setup.options,
         inputs,
-        domains: domains.to_vec(),
+        packages: packages.to_vec(),
         sysroot: sysroot.to_owned(),
     })
 }
@@ -237,12 +233,12 @@ impl ProjectBroker {
         if root != meta.canonical_root {
             return Err(ServerError::BadProject("project selection changed".into()));
         }
-        // The turn and guard G hold from setup-file until the check ends.
+        // The read turn holds from setup-file until the check ends.
         self.ensure_read(&root).await?;
         let setup = self.setup_file(&root, Path::new(file), source).await?;
         let activity = self.preparation_activity();
-        let reader = self.installed_reader(&root, meta).await?;
-        setup.check(&root, &reader.sysroot, &reader.custody)?;
+        let reader = super::verify_file::PreparedReader::installed(meta)?;
+        setup.check(&root, &reader.sysroot)?;
         if fs::read(file)? != source.as_bytes() {
             return Err(ServerError::BadProject("source changed during setup transfer".into()));
         }
@@ -294,8 +290,8 @@ impl ProjectBroker {
         Ok(parse_sources(&output.stdout, modules.len())?)
     }
 
-    /// Run `lake setup-file` as a native reader. When an import is out of
-    /// date, Lake builds nothing and this returns [`ServerError::OutOfDate`].
+    /// Run `lake setup-file` as a short run. When an import is out of date,
+    /// Lake builds nothing and this returns [`ServerError::OutOfDate`].
     async fn setup_file(&self, root: &Path, file: &Path, source: &str) -> Result<StagedSetup> {
         if !file.starts_with(root)
             || file.canonicalize()? != file
@@ -306,17 +302,16 @@ impl ProjectBroker {
                 "current source differs from selected verification file".into(),
             ));
         }
-        let domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
+        let packages = crate::lake_meta::manifest_package_roots(root);
         let args = vec!["setup-file".into(), file.as_os_str().to_owned()];
         let (sysroot, output) = self.lake_reader(root, SETUP_FILE, args, &[0, NO_BUILD_EXIT]).await?;
-        Ok(stage(setup_output(output)?, &domains, &sysroot, root, file)?)
+        Ok(stage(setup_output(output)?, &packages, &sysroot, root, file)?)
     }
 
     /// Run the project's `lake --no-build --no-cache ARGS` in `root` as a
-    /// native reader, with Lake's caches pointed at the reader's private
-    /// inputs, and return the toolchain prefix with Lake's output. The
-    /// guardian holds the project lock shared while Lake reads; no step takes
-    /// it exclusively.
+    /// short run, with Lake's caches pointed at the run's private inputs, and
+    /// return the toolchain prefix with Lake's output. The run holds a share
+    /// of the request's read turn, so no build starts while Lake reads.
     async fn lake_reader(
         &self,
         root: &Path,
@@ -336,34 +331,30 @@ impl ProjectBroker {
             .map_err(|e| ServerError::BadProject(e.to_string()))?
             .canonicalize()?;
         let activity = self.preparation_activity();
-        let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root)?;
         let lake = sysroot.join("bin/lake");
         let cwd = root.to_owned();
         let output = crate::lake_options::reader_run(
             label,
-            root.to_owned(),
+            root,
             crate::cancellation::CallCancellation::current()
                 .remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_workers.get(),
-            custody,
-            None,
+            self.lean_runs(),
             Some(Box::new(activity)),
             accepted,
             move |assets| {
-                // Point any Lake cache at the reader's private inputs.
+                // Point any Lake cache at the run's private inputs.
                 let cache = assets.join("lake-cache");
                 fs::create_dir(&cache)?;
                 let mut command = vec![lake.into_os_string(), "--no-build".into(), "--no-cache".into()];
                 command.extend(args);
-                Ok(crate::native_reader::NativeReaderProgram {
+                Ok(crate::lean_run::Program {
                     command,
                     environment: vec![
                         ("LAKE_CACHE_DIR".into(), cache.into_os_string()),
                         ("LAKE_ARTIFACT_CACHE".into(), "false".into()),
                     ],
                     cwd,
-                    artifact_roots: Vec::new(),
-                    max_stdout_bytes: crate::native_reader::PROGRAM_OUTPUT_LIMIT,
+                    max_stdout_bytes: crate::lean_run::PROGRAM_OUTPUT_LIMIT,
                     stdin: None,
                 })
             },
@@ -438,20 +429,14 @@ mod tests {
             bytes: Vec::new(),
             options: BTreeMap::new(),
             sysroot: root.join("release"),
-            domains: lean_toolchain::shared_writer::project_artifact_roots(&root)?,
+            packages: crate::lake_meta::manifest_package_roots(&root),
             inputs: BTreeMap::from([(leaf.clone(), Identity::read(&leaf)?)]),
         };
-        {
-            let guard = crate::artifact_reads::ArtifactReadGuard::try_acquire(&root)?;
-            setup.check(&root, &setup.sysroot, &guard)?;
-        }
+        setup.check(&root, &setup.sysroot)?;
         let replacement = output.join("replacement");
         fs::write(&replacement, b"same bytes")?;
         fs::rename(replacement, leaf)?;
-        let guard = crate::artifact_reads::ArtifactReadGuard::try_acquire(&root)?;
-        assert!(
-            matches!(setup.check(&root, &setup.sysroot, &guard), Err(error) if error.kind() == io::ErrorKind::InvalidData)
-        );
+        assert!(matches!(setup.check(&root, &setup.sysroot), Err(error) if error.kind() == io::ErrorKind::InvalidData));
         Ok(())
     }
 }

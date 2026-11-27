@@ -21,7 +21,6 @@ use tokio::process::{Child, ChildStderr, Command};
 
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
 const EXPECTED_TOOLS: [&str; 11] = [
     "lean_build",
     "lean_compatibility",
@@ -438,16 +437,12 @@ async fn second_server_on_one_store_names_the_first() {
     )
     .await;
 
-    // It checks its socket directory before it meets the lock.
-    let sockets = support::socket_dir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
         .arg("--bind")
         .arg("127.0.0.1:0")
         .arg("--lake-root")
         .arg(&root)
-        .env_remove(WRITER_ENV)
         .env("LEAN_HOST_MCP_STORE_DIR", &store)
-        .env("LEAN_HOST_MCP_SOCKET_DIR", sockets.path())
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
@@ -592,10 +587,7 @@ async fn streamable_http_fixture_tool_call() {
 /// `request_id`, so each reply names a server-made `srv-` id.
 ///
 /// `ELAN_HOME`, `CARGO_HOME` and `RUSTUP_HOME` keep their real values, and
-/// install builds the release worker offline; the installed server copy is
-/// the SDK writer, so install downloads nothing. The sockets go to a short
-/// directory in the target directory: `$HOME/.lean-host-mcp-ipc` with `HOME`
-/// there makes socket paths too long for macOS.
+/// install builds the release worker offline, so install downloads nothing.
 #[tokio::test]
 #[ignore = "builds the release worker"]
 async fn install_and_serve_keep_no_state_in_an_empty_home() {
@@ -610,7 +602,6 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         .prefix("empty-home-")
         .tempdir_in(target_tmp)
         .unwrap();
-    let sockets = support::socket_dir().unwrap();
     let scratch_dir = scratch.path().canonicalize().unwrap();
     let home = scratch_dir.join("home");
     let tmp = scratch_dir.join("tmp");
@@ -629,7 +620,6 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         ("RUSTUP_HOME", real("RUSTUP_HOME", ".rustup").into()),
         ("TMPDIR", tmp.into()),
         ("CARGO_NET_OFFLINE", "true".into()),
-        ("LEAN_HOST_MCP_SOCKET_DIR", sockets.path().into()),
         ("NO_COLOR", "1".into()),
     ];
     let git = |args: &[&str]| {
@@ -756,7 +746,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
     );
     // The state that once went under `HOME` is in the store, with the
     // request table.
-    for dir in ["owners", "semantic-runtimes", "processes"] {
+    for dir in ["children", "semantic-runtimes", "processes"] {
         assert!(local.join("store").join(dir).is_dir(), "the store has no {dir}/");
     }
     assert!(
@@ -765,10 +755,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
     );
     let left = list_tree(&home);
     eprintln!("under the empty HOME: {left:?}");
-    assert!(
-        left.iter().all(|path| path.starts_with(".lean-host-mcp-ipc")),
-        "install and serve wrote under HOME: {left:?}"
-    );
+    assert!(left.is_empty(), "install and serve wrote under HOME: {left:?}");
 }
 
 /// Copy the fixture's sources from `from` into the existing directory `to`,
@@ -1387,10 +1374,10 @@ struct HttpMcpServer {
     client: reqwest::Client,
     url: String,
     /// The server's own store, so tests on one Lake root do not share its
-    /// lock, and its process registry, then its socket directory. A test that
-    /// passes `LEAN_HOST_MCP_STORE_DIR` replaces the store; an installed
-    /// server keeps its store under its Lake root.
-    _scratch: Option<(tempfile::TempDir, support::SocketDir)>,
+    /// lock, and its process registry. A test that passes
+    /// `LEAN_HOST_MCP_STORE_DIR` replaces the store; an installed server
+    /// keeps its store under its Lake root.
+    _scratch: Option<tempfile::TempDir>,
 }
 
 impl HttpMcpServer {
@@ -1400,19 +1387,16 @@ impl HttpMcpServer {
 
     async fn start_with_env(args: &[(&str, &str)], envs: &[(&str, &str)]) -> Self {
         let store = tempfile::tempdir().expect("temp store dir");
-        let sockets = support::socket_dir().expect("socket dir");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command
             .kill_on_drop(true)
             .arg("--bind")
             .arg("127.0.0.1:0")
-            .env_remove(WRITER_ENV)
             .env("LEAN_HOST_MCP_STORE_DIR", store.path())
             // A server without `--lake-root` has no store, so it would keep
             // its process record in the user's cache, and a killed test
             // server never removes it.
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", store.path().join("processes"))
-            .env("LEAN_HOST_MCP_SOCKET_DIR", sockets.path())
             .env("RUST_LOG", "warn,lean_host_mcp::transport_http=info")
             .env("NO_COLOR", "1")
             // These tests read `structuredContent` and full telemetry; opt into both.
@@ -1430,13 +1414,13 @@ impl HttpMcpServer {
         for (key, value) in envs {
             command.env(key, value);
         }
-        Self::spawn(command, Some((store, sockets))).await
+        Self::spawn(command, Some(store)).await
     }
 
     /// Spawn `command`, a server that binds `127.0.0.1:0` with stderr piped
     /// and logs `lean_host_mcp::transport_http` at info, and wait for the
     /// address it listens on.
-    async fn spawn(mut command: Command, scratch: Option<(tempfile::TempDir, support::SocketDir)>) -> Self {
+    async fn spawn(mut command: Command, scratch: Option<tempfile::TempDir>) -> Self {
         let mut child = command.spawn().expect("spawn lean-host-mcp HTTP server");
         let stderr = child.stderr.take().expect("server stderr");
         let mut stderr = BufReader::new(stderr);
@@ -1862,22 +1846,11 @@ async fn streamable_http_pure_compatibility_never_opens_a_worker() {
             .unwrap();
             std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let helper_marker = root.join("helper-started");
-        let helper_trap = root.join("helper-trap");
-        std::fs::write(
-            &helper_trap,
-            format!("#!/bin/sh\ntouch {}\nexit 88\n", shell_quote_path(&helper_marker)),
-        )
-        .unwrap();
-        std::fs::set_permissions(&helper_trap, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let namespace = root.join("native-owners");
         let processes = root.join("processes");
         let root_s = root.to_str().unwrap();
         let settings = [
             ("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap()),
             ("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", processes.to_str().unwrap()),
-            ("LEAN_RS_WORKER_OWNERS_DIRECTORY", namespace.to_str().unwrap()),
-            (WRITER_ENV, helper_trap.to_str().unwrap()),
         ];
         let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s)], &settings).await;
         let owner = StatelessClient::new(&server.url);
@@ -1900,7 +1873,7 @@ async fn streamable_http_pure_compatibility_never_opens_a_worker() {
         assert_eq!(native["server_instance_id"], before["pool"]["instance_id"]);
         assert_eq!(native["project_root"], root_s);
         assert_eq!(native["lean_toolchain"], "leanprover/lean4:v4.35.0");
-        assert_eq!(native["worker_protocol_version"], 13);
+        assert_eq!(native["worker_protocol_version"], 14);
         assert!(native.get("loaded").is_none());
         assert!(native.get("worker_generation").is_none());
         let expected = &native["expected"];
@@ -1913,31 +1886,15 @@ async fn streamable_http_pure_compatibility_never_opens_a_worker() {
             &expected["capabilities"],
             &bindings,
             &expected["enforcement"],
-            &expected["writer_protocol"],
         ))
         .unwrap();
         assert_eq!(native["contract_sha256"], sha256_hex(&digest_input));
-        assert_eq!(native["shared_writer"]["protocol"], 1);
-        let server_executable = Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")).canonicalize().unwrap();
-        assert_eq!(
-            native["shared_writer"]["executable"],
-            server_executable.to_str().unwrap()
-        );
-        assert_eq!(
-            native["shared_writer"]["ownership_registry"],
-            namespace.to_str().unwrap()
-        );
         let status = owner.control(json!({})).await;
         assert_eq!(status["pool"]["occupied_slots"], 0);
         assert_eq!(status["pool"]["outstanding_jobs"], 0);
         assert!(status["pool"]["projects"].as_array().unwrap().is_empty());
         assert!(!marker.exists(), "pure discovery must not invoke a worker");
-        assert!(
-            !helper_marker.exists(),
-            "pure discovery must not invoke a preparation helper"
-        );
         assert!(!root.join(".lake").exists());
-        assert!(!namespace.exists(), "pure discovery cannot reserve native capacity");
         server.shutdown().await;
     }
 }
@@ -1950,13 +1907,9 @@ async fn streamable_http_pure_compatibility_rejects_unknown_mode_before_worker_a
     std::fs::write(root.join("lake-manifest.json"), "{}\n").unwrap();
     std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
     let workers = root.join("absent-workers");
-    let namespace = root.join("absent-native-owners");
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root.to_str().unwrap())],
-        &[
-            ("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap()),
-            ("LEAN_RS_WORKER_OWNERS_DIRECTORY", namespace.to_str().unwrap()),
-        ],
+        &[("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap())],
     )
     .await;
     let mut session = server.new_session().await;
@@ -1983,6 +1936,5 @@ async fn streamable_http_pure_compatibility_rejects_unknown_mode_before_worker_a
     assert_eq!(status["pool"]["outstanding_jobs"], 0);
     assert!(status["pool"]["projects"].as_array().unwrap().is_empty());
     assert!(!root.join(".lake").exists());
-    assert!(!namespace.exists());
     server.shutdown().await;
 }

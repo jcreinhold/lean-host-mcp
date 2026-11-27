@@ -2,18 +2,14 @@
 //! of a path dependency and prints its axioms, a proof position and a
 //! declaration lookup, a check of a module that has no source file, the
 //! refusal of an import whose roots differ from the worker's launch roots or
-//! hold `Init`, a worker whose launch roots leave the project, builds that
-//! stop the project's workers before Lake starts, and checks that wait for a
-//! build in the server or a writer in another process.
+//! hold `Init`, builds that stop the project's workers before Lake starts,
+//! checks that wait for a build in the server, and a server killed while a
+//! worker starts that leaves the next server every worker slot.
 //!
 //! The tests are ignored: each builds a chain project (`support::chain`) and
 //! needs an installed worker. Set `LEAN_HOST_MCP_TEST_FIXTURE` or
 //! `LEAN_SYSROOT`, and `LEAN_HOST_MCP_WORKERS_DIR` to a directory that
 //! `lean-host-mcp install-worker --workers-dir` wrote.
-//!
-//! The tests run one at a time. The SDK's writer helper refuses to start
-//! while any process in the shared owner registry is starting, so a build in
-//! one test would fail whenever another test starts a worker at that moment.
 
 #![cfg(unix)]
 
@@ -25,7 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use serial_test::serial;
 use support::TestResult;
 use support::chain::{Chain, chain_project};
 use support::http::{self, Client, Launch, Scratch, Server};
@@ -226,7 +221,6 @@ fn now_ms() -> TestResult<u64> {
 /// it, in the form the stack gate's axiom check reads.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
 async fn a_trial_imports_a_dependency_module_and_prints_its_axioms() -> TestResult {
     let chain = project()?;
     chain.write(
@@ -259,7 +253,6 @@ async fn a_trial_imports_a_dependency_module_and_prints_its_axioms() -> TestResu
 /// goal, and a declaration lookup returns the type of a project declaration.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
 async fn a_proof_position_and_a_lookup_answer_from_the_project_build() -> TestResult {
     let chain = project()?;
     chain.write(
@@ -301,7 +294,6 @@ async fn a_proof_position_and_a_lookup_answer_from_the_project_build() -> TestRe
 /// The command trial that the stack gate then sends prints the axioms.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
 async fn a_module_without_a_source_file_is_checked_in_a_worker() -> TestResult {
     let chain = project()?;
     std::fs::remove_file(chain.root.join("Chain/C.lean"))?;
@@ -351,7 +343,6 @@ async fn a_module_without_a_source_file_is_checked_in_a_worker() -> TestResult {
 /// worker refuses that import. With the manifest restored, the import answers.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
 async fn an_import_through_other_roots_is_refused() -> TestResult {
     let chain = project()?;
     chain.write("lakefile.lean", TWO_DEPENDENCIES)?;
@@ -390,46 +381,10 @@ async fn an_import_through_other_roots_is_refused() -> TestResult {
     Ok(())
 }
 
-/// A worker whose project drops a dependency while a check waits on it
-/// restarts for the project's new artifact domains. Its launch roots still
-/// name the dropped package's build, which no domain covers, so the restarted
-/// worker refuses the check at once rather than exit before it connects. That
-/// leaves nothing that blocks a writer: with the manifest restored, the next
-/// check answers and a build runs.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
-async fn a_worker_whose_launch_roots_leave_the_project_refuses_at_once() -> TestResult {
-    let chain = project()?;
-    let dropped = manifest_with(&chain, Vec::clear)?;
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
-    let client = Client::new(&server.url, "dropped")?;
-    let second = behind_a_manifest_change(&chain, &client, &dropped, trial(&["Dep"], "#check dep")).await?;
-    assert!(
-        second
-            .to_string()
-            .contains("launch root outside the project's artifact domains"),
-        "{second}\n{}",
-        server.log()
-    );
-    let statement = statement(&client, "dep", &["Dep"]).await?;
-    assert!(statement.contains("Nat"), "{statement}");
-    let build = tokio::time::timeout(
-        Duration::from_mins(1),
-        client.call("lean_build", &json!({"targets": ["Chain.A"]})),
-    )
-    .await??;
-    assert_eq!(http::structured(&build)?.get("ok"), Some(&json!(true)), "{build}");
-    server.stop().await?;
-    Ok(())
-}
-
 /// A worker refuses an import while one of its roots holds `Init.olean`, which
 /// Lean would load in place of the release's.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
 async fn an_import_root_that_holds_init_is_refused() -> TestResult {
     let chain = project()?;
     let scratch = Scratch::new()?;
@@ -456,7 +411,6 @@ async fn an_import_root_that_holds_init_is_refused() -> TestResult {
 /// sees the new type.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
 async fn a_build_stops_the_project_workers_before_lake_starts() -> TestResult {
     let chain = project()?;
     let scratch = Scratch::new()?;
@@ -469,7 +423,7 @@ async fn a_build_stops_the_project_workers_before_lake_starts() -> TestResult {
     assert!(!old.is_empty(), "no worker after the first lookup");
 
     chain.write("Chain/A.lean", EDITED_A)?;
-    let sampler = Sampler::start(&chain.root, pid)?;
+    let sampler = Sampler::start(&scratch.store, pid)?;
     let build = client.call("lean_build", &json!({"targets": ["Chain.A"]})).await;
     let seen = sampler.stop()?;
     let build = build?;
@@ -499,7 +453,6 @@ async fn a_build_stops_the_project_workers_before_lake_starts() -> TestResult {
 /// then answers from what the build wrote.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
 async fn a_check_sent_during_a_build_waits_and_answers_from_the_new_build() -> TestResult {
     let chain = project()?;
     chain.write("lean-host-mcp.toml", SLOW_BUILD)?;
@@ -534,86 +487,73 @@ async fn a_check_sent_during_a_build_waits_and_answers_from_the_new_build() -> T
     Ok(())
 }
 
-/// A lookup sent while a writer in another process holds the project waits
-/// until that writer closes, then answers from what it built. The writer here
-/// is the test process itself, through the SDK's shared writer, as a
-/// `lake build` run by another server or tool would be.
+/// A server killed while its first worker starts takes the worker with it,
+/// and the next server on the same store has every worker slot: with
+/// `broker.max_workers` and `broker.max_workers_per_project` at 2, two trials
+/// that each hold a worker until released run on two workers at once.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
-#[serial]
-async fn a_check_waits_for_a_writer_in_another_process() -> TestResult {
-    /// How long the writer may take to open and to close.
-    const LIMIT: Duration = Duration::from_mins(1);
-    /// How long the writer holds the project after the lookup is sent.
-    const HOLD: Duration = Duration::from_secs(2);
+async fn after_a_kill_during_worker_start_the_next_server_has_every_slot() -> TestResult {
     let chain = project()?;
     let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
-    let client = Client::new(&server.url, "outside")?;
-    let before = statement(&client, "a", &["Chain.A"]).await?;
-    assert!(before.contains("Nat"), "{before}");
-
-    chain.write("Chain/A.lean", EDITED_A)?;
-    let (held, holding) = tokio::sync::oneshot::channel();
-    let (release, released) = std::sync::mpsc::channel();
-    let (root, sysroot) = (chain.root.clone(), chain.sysroot.clone());
-    // `open` waits until the server has stopped its idle worker.
-    let writer = tokio::task::spawn_blocking(move || -> Result<u64, String> {
-        let helper = Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
-        let writer = lean_toolchain::shared_writer::SharedWriter::open(helper, &root, LIMIT)
-            .map_err(|error| format!("the outside writer did not open: {error}"))?;
-        held.send(()).ok();
-        released.recv_timeout(PATIENCE).map_err(|error| error.to_string())?;
-        let output = std::process::Command::new(sysroot.join("bin/lake"))
-            .args(["build", "Chain.A"])
-            .current_dir(&root)
-            .env("LEAN_SYSROOT", &sysroot)
-            .env("LAKE_ARTIFACT_CACHE", "false")
-            .env_remove("LEAN_PATH")
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(format!(
-                "lake build failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+    let launch = Launch::new(&chain.root, &scratch)?
+        .env("LEAN_HOST_MCP_MAX_WORKERS", "2")
+        .env("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT", "2");
+    let server = Server::start(&launch, STARTUP).await?;
+    let pid = server.pid()?;
+    let client = Client::new(&server.url, "starting")?;
+    let pending = spawn_send(&client, "lean_trial", trial(&["Chain.A"], "#check a"));
+    let until = Instant::now().checked_add(PATIENCE).ok_or("patience is too long")?;
+    let starting = loop {
+        let workers = http::worker_processes(&http::processes()?, pid);
+        if !workers.is_empty() {
+            break workers;
         }
-        let built = now_ms().map_err(|error| error.to_string())?;
-        writer
-            .close(LIMIT)
-            .map_err(|error| format!("the outside writer did not close: {error}"))?;
-        Ok(built)
-    });
-    holding.await?;
-    let lookup = {
-        let client = client.clone();
-        tokio::spawn(async move {
-            let response = client
-                .send("lean_lookup", &lookup("a", &["Chain.A"]))
-                .await
-                .map_err(|error| error.to_string());
-            (response, now_ms().ok())
-        })
+        if pending.is_finished() || Instant::now() >= until {
+            return Err(format!("no worker started for the trial:\n{}", server.log()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     };
-    tokio::time::sleep(HOLD).await;
+    assert!(!pending.is_finished(), "the trial answered, so its worker had started");
+    server.kill().await?;
+    pending.abort();
+
+    let server = Server::start(&launch, STARTUP).await?;
+    let live = http::processes()?;
+    let left: Vec<&http::Process> = starting
+        .iter()
+        .filter(|worker| live.iter().any(|process| process.pid == worker.pid))
+        .collect();
     assert!(
-        !lookup.is_finished(),
-        "the lookup answered while the outside writer held the project"
+        left.is_empty(),
+        "the killed server's worker ran when the next server listened: {left:?}"
     );
-    release.send(())?;
-    let built = writer.await??;
-    let (response, answered) = lookup.await?;
-    let response = response?;
-    let answered = answered.ok_or("no answer time")?;
-    assert!(
-        answered >= built,
-        "the lookup answered at {answered} ms, before the writer built at {built} ms"
-    );
-    let after = data(result(&response)?)?
-        .pointer("/declaration/statement/value")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("no statement: {response}"))?;
-    assert!(after.contains("Int"), "{after}");
+
+    let pid = server.pid()?;
+    let client = Client::new(&server.url, "after")?;
+    let release = chain.root.join("release.txt");
+    let mut trials = Vec::new();
+    let mut finished = Vec::new();
+    for name in ["one", "two"] {
+        let started = chain.root.join(format!("started-{name}.txt"));
+        let end = chain.root.join(format!("finished-{name}.txt"));
+        let commands = holder(&started, &release, &end)?;
+        trials.push(spawn_send(&client, "lean_trial", trial(&["Chain.A"], &commands)));
+        // The first trial holds its worker, so the second needs another.
+        wait_for(&started).await?;
+        finished.push(end);
+    }
+    let workers = http::workers(&http::processes()?, pid).len();
+    let status = client.runtime().await?;
+    std::fs::write(&release, "release")?;
+    for trial in trials {
+        data(result(&trial.await??)?)?;
+    }
+    assert_eq!(workers, 2, "{status}");
+    assert_eq!(status.pointer("/pool/occupied_slots"), Some(&json!(2)), "{status}");
+    for end in &finished {
+        assert!(end.exists(), "{} is missing", end.display());
+    }
     server.stop().await?;
     Ok(())
 }
@@ -622,7 +562,7 @@ async fn a_check_waits_for_a_writer_in_another_process() -> TestResult {
 #[derive(Clone, Debug, Default)]
 struct Seen {
     samples: u64,
-    /// Samples with a Lake writer for the root.
+    /// Samples with a Lake build of the server.
     lake: u64,
     /// Samples with a worker under the server.
     workers: u64,
@@ -630,8 +570,8 @@ struct Seen {
     both: Vec<String>,
 }
 
-/// A thread that lists the processes every 50 ms and notes Lake writers for
-/// the root and workers under the server.
+/// A thread that lists the processes every 50 ms and notes the server's Lake
+/// builds and its workers.
 struct Sampler {
     stop: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<Seen>,
@@ -639,16 +579,16 @@ struct Sampler {
 
 impl Sampler {
     /// Start sampling, and return after the first sample.
-    fn start(root: &Path, server: u32) -> TestResult<Self> {
+    fn start(store: &Path, server: u32) -> TestResult<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let (first, sampled) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::spawn({
-            let (root, stop): (PathBuf, _) = (root.to_path_buf(), Arc::clone(&stop));
+            let (store, stop): (PathBuf, _) = (store.to_path_buf(), Arc::clone(&stop));
             move || {
                 let mut seen = Seen::default();
                 while !stop.load(Ordering::SeqCst) {
                     if let Ok(all) = http::processes() {
-                        let lake = http::lake_writers(&all, &root);
+                        let lake = http::lake_builds(&all, &store);
                         let workers = http::worker_processes(&all, server);
                         seen.samples = seen.samples.saturating_add(1);
                         if !lake.is_empty() {

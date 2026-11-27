@@ -18,18 +18,10 @@ LEAN_SYSROOT=$(scripts/fixture-lean-prefix.sh)
 export LEAN_SYSROOT
 mkdir -p "$target"
 scratch=$(mktemp -d "$target/stdio-install.XXXXXX")
-trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch" ${sockets:+"$sockets"}' EXIT
-# Worker sockets, for the install probe and the tests: the default is under
-# HOME, and a path in the scratch is too long for macOS. A caller whose target
-# directory is too deep for socket paths, as on CI, names a shorter one.
-if [[ -z ${LEAN_HOST_MCP_SOCKET_DIR:-} ]]; then
-    sockets=$(mktemp -d "$(cd -- "$target" && pwd -P)/s.XXXXXX")
-    export LEAN_HOST_MCP_SOCKET_DIR="$sockets"
-fi
+trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch"' EXIT
 local_sdk_enable "$scratch"
 if [[ -z ${LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR:-} ]]; then
     export LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$scratch/workers"
-    export LEAN_RS_WORKER_OWNERS_DIRECTORY="$scratch/owners"
     local_sdk_cargo build -p lean-host-mcp --bin lean-host-mcp
     local_sdk_check Cargo.toml
     # The source worker installer expects Cargo's native profile directories.

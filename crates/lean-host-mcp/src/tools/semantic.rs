@@ -1142,10 +1142,6 @@ mod tests {
             worker_version: "test".into(),
             protocol_version: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
             loaded: LoadedHostRuntime {
-                artifact_read_epochs: Some(vec![crate::runtime_compatibility::ArtifactReadEpoch {
-                    project_root: root.to_string_lossy().into_owned(),
-                    epoch: "fixture-writer-17".into(),
-                }]),
                 compiled_lean_version: "4.35.0".into(),
                 compiled_header_sha256: "b".repeat(64),
                 runtime_lean_version: Some("4.35.0".into()),

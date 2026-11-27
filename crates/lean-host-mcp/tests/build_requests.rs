@@ -4,11 +4,6 @@
 //! Every test here is ignored. Set `LEAN_HOST_MCP_TEST_FIXTURE` or
 //! `LEAN_SYSROOT` to run them; the tests that check files also need a worker
 //! installed for the fixture's toolchain.
-//!
-//! The tests run one at a time. The SDK's writer helper refuses to start
-//! while any process in the shared owner registry is starting, even one for
-//! another project, so a build in one test would fail whenever another test
-//! starts a reader or a worker at that moment.
 
 mod support;
 
@@ -24,7 +19,6 @@ use lean_host_mcp::tools::semantic::{SemanticResponse, SemanticToolRequest, lean
 use lean_host_mcp::tools::{ToolConfig, ToolContext, as_call};
 use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectRuntimeConfig};
 use serde_json::{Value, json};
-use serial_test::serial;
 use support::TestResult;
 use support::chain::{Chain, chain_project};
 
@@ -57,7 +51,6 @@ const PATIENCE: Duration = Duration::from_mins(2);
 fn project() -> TestResult<(Chain, ToolContext)> {
     let chain = chain_project()?;
     chain.write("lean-host-mcp.toml", CONFIG)?;
-    support::set_up_native_work()?;
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {
             max_workers_per_project: NonZeroUsize::new(2).ok_or("two workers")?,
@@ -168,7 +161,6 @@ fn epoch_millis() -> TestResult<u64> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_failing_step_ends_the_build_and_its_tail_shows_the_error() -> TestResult {
     let (chain, ctx) = project()?;
@@ -184,7 +176,6 @@ async fn a_failing_step_ends_the_build_and_its_tail_shows_the_error() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_stale_guard_stops_the_build_before_lake_writes() -> TestResult {
     let (chain, ctx) = project()?;
@@ -199,7 +190,6 @@ async fn a_stale_guard_stops_the_build_before_lake_writes() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn builds_run_one_at_a_time_in_arrival_order() -> TestResult {
     let (chain, ctx) = project()?;
@@ -221,7 +211,6 @@ async fn builds_run_one_at_a_time_in_arrival_order() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_large_output_completes_and_the_reply_carries_its_end() -> TestResult {
     let (_chain, ctx) = project()?;
@@ -235,7 +224,6 @@ async fn a_large_output_completes_and_the_reply_carries_its_end() -> TestResult 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn the_deadline_stops_a_build_and_frees_the_project() -> TestResult {
     let (chain, ctx) = project()?;
@@ -249,7 +237,7 @@ async fn the_deadline_stops_a_build_and_frees_the_project() -> TestResult {
     assert!(!outcome.ok);
     assert_eq!(outcome.exit_code, None);
     assert!(started.elapsed() < Duration::from_secs(20));
-    // A reader gets its turn and the shared kernel lock again.
+    // A reader gets its turn again.
     let reply = imports(&ctx, &["Chain/C.lean"])
         .await
         .map_err(|error| format!("{error:?}"))?;
@@ -258,12 +246,11 @@ async fn the_deadline_stops_a_build_and_frees_the_project() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_step_cannot_leave_work_running_past_its_build() -> TestResult {
     let (chain, ctx) = project()?;
     let outcome = build(&ctx, recipe("late")).await?;
-    // The writer stops work that outlives the step's own process and reports
+    // The build stops work that outlives the step's own process and reports
     // no result for the step.
     let step = outcome.steps.last().ok_or("the step ran")?;
     assert_eq!(step.exit_code, None, "{outcome:?}");
@@ -279,7 +266,6 @@ async fn a_step_cannot_leave_work_running_past_its_build() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn reads_after_a_lakefile_edit_leave_the_config_cache_to_lake() -> TestResult {
     let (chain, ctx) = project()?;
@@ -311,7 +297,6 @@ async fn reads_after_a_lakefile_edit_leave_the_config_cache_to_lake() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn imports_list_the_whole_closure_with_first_party_sources() -> TestResult {
     let (chain, ctx) = project()?;
@@ -345,7 +330,6 @@ async fn imports_list_the_whole_closure_with_first_party_sources() -> TestResult
 /// A library with its own `srcDir` keeps its files off the path its module
 /// names give. Lake names where they are.
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn imports_name_sources_under_a_library_src_dir() -> TestResult {
     let (chain, ctx) = project()?;
@@ -379,7 +363,6 @@ async fn imports_name_sources_under_a_library_src_dir() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn imports_of_a_file_with_a_stale_import_are_an_error_naming_the_file() -> TestResult {
     let (chain, ctx) = project()?;
@@ -406,7 +389,6 @@ async fn imports_of_a_file_with_a_stale_import_are_an_error_naming_the_file() ->
 /// A file check builds nothing, so a stale import makes it a needs-build reply
 /// whose `stale_build` row names the module Lake reported.
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
 async fn a_file_check_with_a_stale_import_names_the_module_to_build() -> TestResult {
     let (chain, ctx) = project()?;
@@ -427,7 +409,6 @@ async fn a_file_check_with_a_stale_import_names_the_module_to_build() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT and a matching installed worker"]
 async fn a_check_sent_during_a_build_waits_and_sees_what_it_built() -> TestResult {
     let (chain, ctx) = project()?;

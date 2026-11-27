@@ -6,11 +6,11 @@
 //! root's workers. The five semantic tools reply with `{data, errors, trust}`.
 //! `docs/architecture.md` maps each module.
 
-mod artifact_reads;
 pub mod broker;
 pub mod build;
 mod cache;
 mod cancellation;
+mod children;
 pub mod cli;
 mod config_file;
 mod config_schema;
@@ -22,8 +22,7 @@ mod host_preparation;
 mod ilean;
 mod lake_meta;
 mod lake_options;
-pub mod native_reader;
-mod native_socket;
+mod lean_run;
 mod project;
 mod project_lock;
 mod projections;
@@ -45,7 +44,6 @@ pub use config_file::ConfigFile;
 pub use envelope::ResponseStatus;
 pub use error::{Result, ServerError};
 pub use lake_meta::LakeProjectMeta;
-pub use native_socket::{directory as socket_directory, use_directory as use_socket_directory};
 pub use project::ProjectRuntimeConfig;
 pub use projections::{
     CoordinateSpace, DeclarationInspectionResult, DeclarationSearchResult, DeclarationSearchTimings,

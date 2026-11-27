@@ -8,7 +8,7 @@
 
 #![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,7 +47,7 @@ use restart::{
 };
 pub use runtime_config::ProjectRuntimeConfig;
 use runtime_config::RESTART_WINDOW;
-pub(crate) use semantic_runtime::semantic_runtime;
+pub(crate) use semantic_runtime::{build_semantic_runtime, semantic_runtime};
 
 /// LRU capacity for exact bounded module-query results, applied to the single
 /// and batch caches separately.
@@ -325,9 +325,6 @@ impl ProjectMessage {
 
 #[derive(Debug, Clone)]
 struct RuntimeSnapshot {
-    /// Physical domains observed from actual worker read receipts. Keep the
-    /// actor-lifetime union: metadata drift cannot erase a still-held domain.
-    protected_artifact_domains: BTreeSet<PathBuf>,
     worker_generation: u64,
     last_restart: Option<RuntimeRestartEvent>,
     rss_kib: Option<u64>,
@@ -363,21 +360,6 @@ impl RuntimeSnapshot {
             import_residue_bytes: self.import_residue_bytes,
             import_residue_limit_bytes: self.import_residue_limit_bytes,
         }
-    }
-}
-
-/// Preserve physical read domains before a read alias or companion is closed.
-/// A confirmed group stop may make an old entry redundant, but retaining it
-/// until actor retirement is conservative and avoids guessing after failure.
-fn retain_artifact_domains(
-    runtime: &Mutex<RuntimeSnapshot>,
-    actual: Option<&lean_rs_worker_protocol::types::LeanWorkerHostRuntimeMetadata>,
-) {
-    if let Some(epochs) = actual.and_then(|metadata| metadata.artifact_read_epochs.as_ref()) {
-        runtime
-            .lock()
-            .protected_artifact_domains
-            .extend(epochs.iter().map(|epoch| PathBuf::from(&epoch.project_root)));
     }
 }
 
@@ -441,18 +423,10 @@ impl LeanProject {
         slot: OwnedSemaphorePermit,
         maintenance: crate::broker::MaintenanceAccess,
         prepared_host_artifacts: lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts,
-        native_capacity_limit: usize,
         initialization: CallOperation,
     ) -> Result<Arc<Self>> {
         let session_id = uuid::Uuid::new_v4().to_string();
-        let mut protected_artifact_domains = BTreeSet::from([meta.canonical_root.clone()]);
-        // The worker holds every domain of the project shared, packages too.
-        if let Ok(domains) = lean_toolchain::shared_writer::project_artifact_roots(&meta.canonical_root) {
-            protected_artifact_domains.extend(domains);
-        }
-        protected_artifact_domains.extend(prepared_host_artifacts.artifact_roots.iter().map(PathBuf::from));
         let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
-            protected_artifact_domains,
             worker_generation: 1,
             last_restart: None,
             rss_kib: None,
@@ -481,7 +455,6 @@ impl LeanProject {
         };
         config.maintenance = maintenance;
         config.prepared_host_artifacts = Some(prepared_host_artifacts);
-        config.native_capacity_limit = native_capacity_limit;
         type InitMsg = std::result::Result<(String, mpsc::Sender<ProjectMessage>), ServerError>;
         let (init_tx, init_rx) = std::sync::mpsc::channel::<InitMsg>();
         let thread_name = actor_thread_name(&meta.canonical_root);
@@ -533,50 +506,6 @@ impl LeanProject {
             actor_scope,
             process_tracker,
         }))
-    }
-
-    /// A test controller whose real shared-lock owner exits with its mailbox.
-    #[cfg(test)]
-    pub(crate) fn test_handoff_actor(
-        root: &Path,
-        manifest_hash: String,
-        domains: Vec<PathBuf>,
-        keepalive: Box<dyn Send>,
-    ) -> Arc<Self> {
-        let (tx, mut rx) = mpsc::channel::<ProjectMessage>(1);
-        let scope = Arc::new(());
-        let actor_scope = Arc::downgrade(&scope);
-        thread::spawn(move || {
-            let _keepalive = keepalive;
-            while rx.blocking_recv().is_some() {}
-            drop(scope);
-        });
-        Arc::new(Self {
-            canonical_root: root.to_path_buf(),
-            toolchain: "test".into(),
-            manifest_hash,
-            session_id: "handoff-test".into(),
-            open_warnings: Vec::new(),
-            actor_tx: Mutex::new(Some(tx)),
-            active_jobs: Arc::new(AtomicUsize::new(0)),
-            pool_active_jobs: Arc::new(AtomicUsize::new(0)),
-            healthy: Arc::new(AtomicBool::new(true)),
-            runtime: Arc::new(Mutex::new(RuntimeSnapshot {
-                protected_artifact_domains: domains.into_iter().collect(),
-                worker_generation: 1,
-                last_restart: None,
-                rss_kib: None,
-                import_profile: None,
-                profile_switch_count: 0,
-                restarts_total: 0,
-                restarts_by_cause: BTreeMap::new(),
-                import_residue_bytes: None,
-                import_residue_limit_bytes: None,
-            })),
-            module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
-            actor_scope,
-            process_tracker: LeanWorkerProcessTracker::new(),
-        })
     }
 
     /// Process one module query through this project's serialized worker actor.
@@ -932,13 +861,6 @@ impl LeanProject {
         self.runtime.lock().facts()
     }
 
-    /// Domains retained by this actor's ordinary or companion native scopes.
-    /// These come from captured admission inputs and actual worker receipts,
-    /// never from a fresh manifest that may have dropped a frozen dependency.
-    pub(crate) fn protected_artifact_domains(&self) -> Vec<PathBuf> {
-        self.runtime.lock().protected_artifact_domains.iter().cloned().collect()
-    }
-
     pub(crate) fn shutdown(&self) {
         self.healthy.store(false, Ordering::Release);
         let _ = self.actor_tx.lock().take();
@@ -1032,7 +954,6 @@ struct ActorConfig {
     worker_path: PathBuf,
     lean_sysroot: PathBuf,
     prepared_host_artifacts: Option<lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts>,
-    native_capacity_limit: usize,
     session_id: String,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
     healthy: Arc<AtomicBool>,
@@ -1166,7 +1087,6 @@ impl ActorConfig {
             worker_path,
             lean_sysroot,
             prepared_host_artifacts: None,
-            native_capacity_limit: crate::broker::DEFAULT_MAX_WORKERS,
             session_id,
             runtime,
             healthy,
@@ -1392,31 +1312,7 @@ impl ProjectActorState {
         }
     }
 
-    fn finish_host_read(&mut self) {
-        retain_artifact_domains(&self.runtime, self.handle.host_runtime_metadata());
-        if let Err(error) = self.handle.release_host_read() {
-            // This is resource cleanup after the recorded body outcome. Keep
-            // that outcome, seal this owner, and retain its actual process slot.
-            self.config.healthy.store(false, Ordering::Release);
-            tracing::warn!(error = %error, "host read cleanup unconfirmed; retiring its owned worker");
-        }
-    }
-
     fn run_job<R>(
-        &mut self,
-        meta: JobMeta,
-        job: impl Fn(
-            &mut LeanWorkerHostHandle,
-            Vec<String>,
-            &LeanWorkerCancellationToken,
-        ) -> std::result::Result<R, LeanWorkerError>,
-    ) -> Result<ProjectCall<R>> {
-        let result = self.run_job_inner(meta, job);
-        self.finish_host_read();
-        result
-    }
-
-    fn run_job_inner<R>(
         &mut self,
         meta: JobMeta,
         job: impl Fn(
@@ -1500,7 +1396,6 @@ impl ProjectActorState {
                             });
                     }
                 }
-                self.seal_artifact_refusal(error);
                 if metadata_refusal {
                     self.config.healthy.store(false, Ordering::Release);
                 }
@@ -1778,14 +1673,6 @@ impl ProjectActorState {
         }
     }
 
-    /// An immutable admission snapshot is refreshed by a new broker actor.
-    /// This only retires the owner; it never replays the refused request.
-    fn seal_artifact_refusal(&self, error: &LeanWorkerError) {
-        if matches!(error, LeanWorkerError::Worker { code, .. } if code == "lean_rs.worker.artifact_read_unavailable") {
-            self.config.healthy.store(false, Ordering::Release);
-        }
-    }
-
     /// Retain one exact unresolved direct child for an eventual owned reap.
     /// A receipt already confirmed before another cleanup failure cannot settle
     /// that independent replacement uncertainty.
@@ -1814,8 +1701,6 @@ impl ProjectActorState {
                         &receipt,
                         cause,
                     ))
-                } else if pending.scope_closed_without_status() {
-                    DeferredStopState::ScopeClosedWithoutStatus
                 } else {
                     DeferredStopState::Pending
                 }
@@ -1834,7 +1719,7 @@ impl ProjectActorState {
     /// job runs on a fresh worker instead, which is why `artifacts_rebuilt` is
     /// not an execution taint.
     ///
-    /// A worker holds the shared kernel lock for its whole life, so no writer
+    /// A build stops every worker of the project before Lake runs, so no build
     /// can finish under a live generation and this check is a backstop. A job
     /// sent without a read turn is not checked.
     fn cycle_if_build_finished(&mut self, meta: &JobMeta) -> Result<Option<RuntimeRestartEvent>> {
@@ -2062,13 +1947,11 @@ impl ProjectActorState {
                 self.note_loaded_at(activity.builds_finished());
             }
             Err(err) => {
-                self.seal_artifact_refusal(&err);
                 // Same posture as a failed cycle: nobody is waiting, and the
                 // next real call imports this itself.
                 tracing::debug!(error = %err, "idle pre-warm failed; the next call will import normally");
             }
         }
-        self.finish_host_read();
     }
 
     /// Forget every pooled profile except the one the current job is serving.
@@ -2299,9 +2182,7 @@ impl ProjectActorState {
     }
 
     fn publish_runtime(&self, runtime: &RuntimeFacts) {
-        let mut snapshot = self.runtime.lock();
-        *snapshot = RuntimeSnapshot {
-            protected_artifact_domains: std::mem::take(&mut snapshot.protected_artifact_domains),
+        *self.runtime.lock() = RuntimeSnapshot {
             worker_generation: runtime.worker_generation,
             last_restart: runtime.last_restart.clone().or_else(|| runtime.call_restart.clone()),
             rss_kib: runtime.rss_kib,
@@ -2611,35 +2492,26 @@ fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
         .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW)
 }
 
-/// One explicit owner namespace and actor slot for ordinary and companion
-/// generations. Prepared storage facts never substitute for loaded checks.
+/// The worker child of one actor generation, ordinary or companion: the
+/// project's worker and toolchain with the installed shims. Prepared storage
+/// facts never substitute for loaded checks.
 fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerChild> {
-    let writer = lean_rs_writer::contract()?;
     // Unit actor tests use a framed Python child that never loads Lean. The
-    // production and integration-test binaries always require prepared custody.
+    // production and integration-test binaries always require prepared shims.
     #[cfg(test)]
     if config.prepared_host_artifacts.is_none() {
-        return Ok(
-            LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
-                .shared_writer_executable(writer.executable)
-                .shared_artifact_reads(true),
-        );
+        return Ok(LeanWorkerChild::for_toolchain(
+            config.worker_path.clone(),
+            config.lean_sysroot.clone(),
+        ));
     }
-    if config.prepared_host_artifacts.is_none() {
+    let Some(artifacts) = &config.prepared_host_artifacts else {
         return Err(ServerError::BadProject(
             "native actor requires prepared host artifacts".to_owned(),
         ));
-    }
+    };
     let mut child = LeanWorkerChild::for_toolchain(config.worker_path.clone(), config.lean_sysroot.clone())
-        .shared_writer_executable(writer.executable.clone())
-        .native_guardian(writer.executable)
-        .lifetime_directory(writer.ownership_registry)
-        .lifetime_socket_directory(crate::native_socket::directory()?)
-        .native_capacity_slot(config.session_id.clone(), scope, config.native_capacity_limit)
-        .shared_artifact_reads(true);
-    if let Some(artifacts) = &config.prepared_host_artifacts {
-        child = child.prepared_host_artifacts(artifacts.clone());
-    }
+        .prepared_host_artifacts(artifacts.clone());
     if scope == "main" {
         // The worker admits an import only through exactly these roots.
         let roots = crate::lake_meta::manifest_artifact_roots(&config.lake_root)

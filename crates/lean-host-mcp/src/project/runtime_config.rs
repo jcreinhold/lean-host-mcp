@@ -574,6 +574,7 @@ mod tests {
                 lake_root: None,
                 max_workers: std::num::NonZeroUsize::MIN,
                 max_workers_per_project: std::num::NonZeroUsize::MIN,
+                max_lean_runs: std::num::NonZeroUsize::MIN,
                 idle_timeout: Duration::ZERO,
             },
             config,

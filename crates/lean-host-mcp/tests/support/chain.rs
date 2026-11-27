@@ -73,8 +73,7 @@ const FILES: &[(&str, &str)] = &[
         "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n\n[[lean_lib]]\nname = \"Dep\"\n",
     ),
     ("dep/Dep.lean", "def dep : Nat := 1\n"),
-    // Builds and checks lock every package a manifest names, and each needs a
-    // manifest of its own. Lake writes only the root's.
+    // The dependency's own manifest, which Lake does not write.
     (
         "dep/lake-manifest.json",
         "{\"version\": \"1.3.0\", \"packagesDir\": \".lake/packages\", \"packages\": [], \"name\": \"dep\", \

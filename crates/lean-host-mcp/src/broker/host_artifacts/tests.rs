@@ -40,7 +40,6 @@ struct Fixture {
     root: PathBuf,
     worker: PathBuf,
     sysroot: PathBuf,
-    writer: PathBuf,
     artifacts: LeanWorkerPreparedHostArtifacts,
 }
 
@@ -53,8 +52,6 @@ impl Fixture {
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
         let sysroot = root.join("sysroot");
         fs::create_dir(&sysroot).unwrap();
-        let writer = root.join("writer");
-        fs::write(&writer, "test-owned writer").unwrap();
         let manifest = root.join("manifest.json");
         let manifest_json = "{\"fixture\":true}";
         fs::write(&manifest, manifest_json).unwrap();
@@ -62,7 +59,6 @@ impl Fixture {
             protocol: 1,
             shim_manifest_path: manifest.to_string_lossy().into_owned(),
             shim_manifest_json: manifest_json.into(),
-            artifact_roots: vec![sysroot.to_string_lossy().into_owned()],
             shim_search_paths: vec![sysroot.to_string_lossy().into_owned()],
         };
         fs::write(root.join("response"), serde_json::to_vec(&artifacts).unwrap()).unwrap();
@@ -71,7 +67,6 @@ impl Fixture {
             root,
             worker,
             sysroot,
-            writer,
             artifacts,
         }
     }
@@ -81,7 +76,6 @@ impl Fixture {
             &self.root,
             &self.worker,
             &self.sysroot,
-            &self.writer,
             tokio::time::Instant::now().checked_add(LIMIT).unwrap(),
             cancellation,
         )
@@ -103,6 +97,7 @@ fn broker() -> Arc<ProjectBroker> {
         lake_root: None,
         max_workers: std::num::NonZeroUsize::MIN,
         max_workers_per_project: std::num::NonZeroUsize::MIN,
+        max_lean_runs: std::num::NonZeroUsize::MIN,
         idle_timeout: Duration::ZERO,
     })
 }
@@ -202,7 +197,6 @@ fn readiness_queued_past_admission_deadline_never_starts_helper() {
                     &fixture.root,
                     &fixture.worker,
                     &fixture.sysroot,
-                    &fixture.writer,
                     deadline,
                     &cancellation,
                 );

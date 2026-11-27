@@ -30,7 +30,6 @@ async fn open_call_shutdown_round_trip() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    support::set_up_native_work().expect("native setup");
     let broker = ProjectBroker::new(BrokerConfig::serving(root.clone()));
 
     // Trivial operation: just confirm we can dispatch typed work to the actor

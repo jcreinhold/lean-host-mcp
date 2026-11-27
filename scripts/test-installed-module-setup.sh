@@ -29,17 +29,10 @@ export CARGO_TARGET_DIR
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
 mkdir -p "$CARGO_TARGET_DIR"
 scratch=$(mktemp -d "$CARGO_TARGET_DIR/module-setup.XXXXXX")
-trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch" ${sockets:+"$sockets"}' EXIT
-# Worker sockets: the default is under HOME, and a path in the scratch is too
-# long for macOS. A caller whose target directory is too deep for socket
-# paths, as on CI, names a shorter one.
-if [[ -z ${LEAN_HOST_MCP_SOCKET_DIR:-} ]]; then
-    sockets=$(mktemp -d "$(cd -- "$CARGO_TARGET_DIR" && pwd -P)/s.XXXXXX")
-    export LEAN_HOST_MCP_SOCKET_DIR="$sockets"
-fi
-export TMPDIR="$scratch/tmp" LEAN_RS_WORKER_OWNERS_DIRECTORY="$scratch/owners"
+trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch"' EXIT
+export TMPDIR="$scratch/tmp"
 export LEAN_HOST_MCP_SEMANTIC_CACHE_DIR="$scratch/semantic-cache"
-mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache" "$scratch/server-owners"
+mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache"
 # Verify the actual archives below with the dependency locks they ship. A checkout's crates are not
 # published yet, so the archives can only be made against it.
 local_sdk_enable "$scratch"
@@ -105,12 +98,12 @@ if [[ ! -x $built_parent ]]; then
 fi
 parent="$scratch/shipping-lean-host-mcp"
 cp "$built_parent" "$parent"
-# The packaged parent serves the SDK writer for the worker's shims and the
-# bundled Lean capability. Cold compilation has its own SDK budget.
+# The packaged parent builds the worker's shims and the bundled Lean
+# capability with plain Lake.
 "$parent" install-worker --toolchain "$id" --workers-dir "$scratch/workers" \
     --source-dir "$worker_source"
 local_sdk_cargo run --manifest-path "$parent_manifest" --example prepare_semantic_smoke -- \
-    "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$parent"
+    "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT"
 if "$release"; then
     scripts/check-parent-link.sh "$parent"
     LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$scratch/workers" scripts/test-installed-stdio.sh --all-targets

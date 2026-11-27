@@ -34,14 +34,14 @@ elif mode == 'not_ready':
     sys.exit(75)
 elif mode == 'probe_only':
     if sys.argv[1:] != ['--lean-rs-ready-host-artifacts']:
-        (root / 'writer-started').write_text('unexpected preparation')
+        (root / 'prepare-started').write_text('unexpected preparation')
         sys.exit(17)
     os.write(1, (root / 'response').read_bytes())
 elif mode == 'double_json':
     os.write(1, (root / 'response').read_bytes())
     os.write(1, b'{}')
 elif mode == 'failed':
-    os.write(2, b'independent writer closure is unknown')
+    os.write(2, b'lake closure is unknown')
     sys.exit(17)
 else:
     os.write(1, (root / 'response').read_bytes() + b'\n')
@@ -52,7 +52,6 @@ struct Fixture {
     root: PathBuf,
     worker: PathBuf,
     sysroot: PathBuf,
-    writer: PathBuf,
     artifacts: LeanWorkerPreparedHostArtifacts,
 }
 impl Fixture {
@@ -66,8 +65,6 @@ impl Fixture {
         let search = root.join("search");
         fs::create_dir(&sysroot).unwrap();
         fs::create_dir(&search).unwrap();
-        let writer = root.join("writer");
-        fs::write(&writer, "private writer identity").unwrap();
         let manifest = root.join("shim.json");
         let manifest_json = "{\"storage_fixture\":true}";
         fs::write(&manifest, manifest_json).unwrap();
@@ -75,7 +72,6 @@ impl Fixture {
             protocol: 1,
             shim_manifest_path: manifest.to_string_lossy().into_owned(),
             shim_manifest_json: manifest_json.to_owned(),
-            artifact_roots: vec![sysroot.to_string_lossy().into_owned()],
             shim_search_paths: vec![search.to_string_lossy().into_owned()],
         };
         fs::write(root.join("response"), serde_json::to_vec(&artifacts).unwrap()).unwrap();
@@ -85,21 +81,13 @@ impl Fixture {
             root,
             worker,
             sysroot,
-            writer,
             artifacts,
         }
     }
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.worker);
-        configure(
-            &mut command,
-            &self.sysroot,
-            &self.writer,
-            &self.root,
-            &[OsStr::new(PREPARE_FLAG)],
-        )
-        .unwrap();
+        configure(&mut command, &self.sysroot, &[OsStr::new(PREPARE_FLAG)]);
         command
     }
 }
@@ -118,59 +106,37 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
 #[test]
 fn success_requires_real_child_exit_and_exact_disk_snapshot() {
     let fixture = Fixture::new("success");
-    let actual = prepare(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT).unwrap();
+    let actual = prepare(&fixture.worker, &fixture.sysroot, LIMIT).unwrap();
     assert_eq!(actual, fixture.artifacts);
     let args: Vec<String> = serde_json::from_slice(&fs::read(fixture.root.join("arguments")).unwrap()).unwrap();
     assert_eq!(args, ["--lean-rs-prepare-host-artifacts"]);
 }
 
 #[test]
-fn actual_preparation_command_scrubs_inherited_native_ownership() {
-    use lean_toolchain::shared_writer::SHARED_WRITER_EXECUTABLE_ENV;
-
+fn actual_preparation_command_scrubs_inherited_sdk_variables() {
     let fixture = Fixture::new("success");
     let mut command = Command::new(&fixture.worker);
-    for key in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
+    for key in SCRUB_ENV {
         command.env(key, "must-not-reach-preparation");
     }
-    command
-        .env(OWNERS_DIRECTORY_ENV, "ignored-registry")
-        .env("LEAN_SYSROOT", "wrong");
-    configure(
-        &mut command,
-        &fixture.sysroot,
-        &fixture.writer,
-        &fixture.root,
-        &[OsStr::new(PREPARE_FLAG)],
-    )
-    .unwrap();
+    command.env("LEAN_SYSROOT", "wrong");
+    configure(&mut command, &fixture.sysroot, &[OsStr::new(PREPARE_FLAG)]);
     start(command, LIMIT).unwrap().wait().unwrap();
     let environment: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.root.join("environment")).unwrap()).unwrap();
-    for key in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
+    for key in SCRUB_ENV {
         assert!(environment.get(*key).is_none(), "inherited {key} must be removed");
     }
-    assert_eq!(environment[OWNERS_DIRECTORY_ENV].as_str(), fixture.root.to_str());
     assert_eq!(environment["LEAN_SYSROOT"].as_str(), fixture.sysroot.to_str());
-    assert_eq!(
-        environment[SHARED_WRITER_EXECUTABLE_ENV].as_str(),
-        fixture.writer.to_str()
-    );
 }
 
 #[test]
-fn timeout_reaps_actual_preparation_child_but_does_not_certify_writers() {
+fn timeout_reaps_actual_preparation_child_but_does_not_certify_its_lake_runs() {
     let fixture = Fixture::new("timeout");
     let started = Instant::now();
-    let error = prepare(
-        &fixture.worker,
-        &fixture.sysroot,
-        &fixture.writer,
-        Duration::from_millis(80),
-    )
-    .unwrap_err();
+    let error = prepare(&fixture.worker, &fixture.sysroot, Duration::from_millis(80)).unwrap_err();
     assert!(started.elapsed() < LIMIT);
-    assert_eq!(error.disposition, WriterDisposition::Unknown);
+    assert_eq!(error.disposition, Disposition::Unknown);
     assert!(error.preparation_child_stopped, "actual owned child was waited on");
 }
 
@@ -178,9 +144,9 @@ fn timeout_reaps_actual_preparation_child_but_does_not_certify_writers() {
 fn output_limits_apply_to_both_pipes_and_do_not_authorize_a_result() {
     for mode in ["stdout_limit", "stderr_limit"] {
         let fixture = Fixture::new(mode);
-        let error = prepare(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT).unwrap_err();
+        let error = prepare(&fixture.worker, &fixture.sysroot, LIMIT).unwrap_err();
         assert!(error.message.contains("exceeded"), "{error}");
-        assert_eq!(error.disposition, WriterDisposition::Unknown);
+        assert_eq!(error.disposition, Disposition::Unknown);
         assert!(error.preparation_child_stopped);
     }
 }
@@ -200,22 +166,16 @@ fn abandoned_wait_signals_the_existing_owner_and_keeps_actual_reaping() {
 #[test]
 fn no_spawn_is_distinct_from_failed_or_invalid_post_spawn_output() {
     let fixture = Fixture::new("failed");
-    let error = prepare(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT).unwrap_err();
-    assert_eq!(error.disposition, WriterDisposition::Unknown);
+    let error = prepare(&fixture.worker, &fixture.sysroot, LIMIT).unwrap_err();
+    assert_eq!(error.disposition, Disposition::Unknown);
     assert!(error.preparation_child_stopped);
-    assert!(error.message.contains("independent writer closure is unknown"));
-    let error = prepare(
-        &fixture.root.join("missing-worker"),
-        &fixture.sysroot,
-        &fixture.writer,
-        LIMIT,
-    )
-    .unwrap_err();
-    assert_eq!(error.disposition, WriterDisposition::NotStarted);
+    assert!(error.message.contains("lake closure is unknown"));
+    let error = prepare(&fixture.root.join("missing-worker"), &fixture.sysroot, LIMIT).unwrap_err();
+    assert_eq!(error.disposition, Disposition::NotStarted);
     assert!(!error.preparation_child_stopped);
     let fixture = Fixture::new("double_json");
-    let error = prepare(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT).unwrap_err();
-    assert_eq!(error.disposition, WriterDisposition::Unknown);
+    let error = prepare(&fixture.worker, &fixture.sysroot, LIMIT).unwrap_err();
+    assert_eq!(error.disposition, Disposition::Unknown);
     assert!(error.preparation_child_stopped);
 }
 
@@ -233,7 +193,7 @@ fn strict_storage_validation_rejects_wrong_protocol_paths_shape_and_snapshot() {
     invalid.shim_manifest_path = fixture.root.join(".").join("shim.json").to_string_lossy().into_owned();
     assert!(validate(&encode(&invalid)).is_err());
     invalid = fixture.artifacts.clone();
-    invalid.artifact_roots = vec![fixture.sysroot.to_string_lossy().into_owned(); 33];
+    invalid.shim_search_paths = vec![fixture.sysroot.to_string_lossy().into_owned(); 33];
     assert!(validate(&encode(&invalid)).is_err());
     invalid = fixture.artifacts.clone();
     invalid.shim_search_paths = vec![fixture.root.join("missing").to_string_lossy().into_owned()];
@@ -244,22 +204,22 @@ fn strict_storage_validation_rejects_wrong_protocol_paths_shape_and_snapshot() {
 }
 
 #[test]
-fn readiness_probe_uses_only_read_mode_and_never_falls_through_to_a_writer() {
+fn readiness_probe_uses_only_read_mode_and_never_falls_through_to_preparation() {
     let fixture = Fixture::new("probe_only");
-    let actual = probe_ready(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT, &|| false).unwrap();
+    let actual = probe_ready(&fixture.worker, &fixture.sysroot, LIMIT, &|| false).unwrap();
     assert_eq!(actual, Some(fixture.artifacts.clone()));
-    assert!(!fixture.root.join("writer-started").exists());
+    assert!(!fixture.root.join("prepare-started").exists());
     let args: Vec<String> = serde_json::from_slice(&fs::read(fixture.root.join("arguments")).unwrap()).unwrap();
     assert_eq!(args, ["--lean-rs-ready-host-artifacts"]);
 
     fs::write(fixture.root.join("mode"), "not_ready").unwrap();
     assert!(
-        probe_ready(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT, &|| false)
+        probe_ready(&fixture.worker, &fixture.sysroot, LIMIT, &|| false)
             .unwrap()
             .is_none()
     );
-    let error = prepare(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT).unwrap_err();
-    assert_eq!(error.disposition, WriterDisposition::Unknown);
+    let error = prepare(&fixture.worker, &fixture.sysroot, LIMIT).unwrap_err();
+    assert_eq!(error.disposition, Disposition::Unknown);
     assert!(error.preparation_child_stopped);
 }
 
@@ -269,16 +229,15 @@ fn caller_cancellation_before_launch_does_not_spawn() {
     let error = run_artifact_mode(
         &fixture.worker,
         &fixture.sysroot,
-        &fixture.writer,
         &[OsStr::new(PREPARE_FLAG)],
         LIMIT,
         &|| true,
     )
     .unwrap_err();
-    assert_eq!(error.disposition, WriterDisposition::NotStarted);
+    assert_eq!(error.disposition, Disposition::NotStarted);
     assert!(!fixture.root.join("pid").exists());
-    let error = probe_ready(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT, &|| true).unwrap_err();
-    assert_eq!(error.disposition, WriterDisposition::NotStarted);
+    let error = probe_ready(&fixture.worker, &fixture.sysroot, LIMIT, &|| true).unwrap_err();
+    assert_eq!(error.disposition, Disposition::NotStarted);
     assert!(!fixture.root.join("pid").exists());
 }
 
@@ -289,17 +248,15 @@ fn caller_cancellation_reaps_both_modes_before_their_long_deadline() {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker = fixture.worker.clone();
         let sysroot = fixture.sysroot.clone();
-        let writer = fixture.writer.clone();
         let token = Arc::clone(&cancelled);
         let wait = thread::spawn(move || {
             let cancelled = || token.load(Ordering::Acquire);
             if ready {
-                probe_ready(&worker, &sysroot, &writer, Duration::from_secs(30), &cancelled)
+                probe_ready(&worker, &sysroot, Duration::from_secs(30), &cancelled)
             } else {
                 run_artifact_mode(
                     &worker,
                     &sysroot,
-                    &writer,
                     &[OsStr::new(PREPARE_FLAG)],
                     Duration::from_secs(30),
                     &cancelled,
@@ -311,7 +268,7 @@ fn caller_cancellation_reaps_both_modes_before_their_long_deadline() {
         cancelled.store(true, Ordering::Release);
         let error = wait.join().unwrap().unwrap_err();
         assert!(started.elapsed() < LIMIT);
-        assert_eq!(error.disposition, WriterDisposition::Unknown);
+        assert_eq!(error.disposition, Disposition::Unknown);
         assert!(error.preparation_child_stopped);
     }
 }
@@ -335,18 +292,11 @@ async fn abandoned_async_waiter_token_reaches_the_blocking_child_owner() {
 fn readiness_probe_timeout_and_pipe_limits_do_not_report_ready() {
     for mode in ["stdout_limit", "stderr_limit"] {
         let fixture = Fixture::new(mode);
-        let error = probe_ready(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT, &|| false).unwrap_err();
+        let error = probe_ready(&fixture.worker, &fixture.sysroot, LIMIT, &|| false).unwrap_err();
         assert!(error.message.contains("exceeded"), "{error}");
         assert!(error.preparation_child_stopped);
     }
     let fixture = Fixture::new("timeout");
-    let error = probe_ready(
-        &fixture.worker,
-        &fixture.sysroot,
-        &fixture.writer,
-        Duration::from_millis(80),
-        &|| false,
-    )
-    .unwrap_err();
+    let error = probe_ready(&fixture.worker, &fixture.sysroot, Duration::from_millis(80), &|| false).unwrap_err();
     assert!(error.preparation_child_stopped);
 }

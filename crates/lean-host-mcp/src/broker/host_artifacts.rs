@@ -1,20 +1,20 @@
 //! The host artifacts `install` built for a worker, read before the worker
 //! opens.
 //!
-//! The worker's readiness mode checks its shims under shared locks and prints
-//! their descriptor; it builds nothing. The server never builds shims: when
+//! The worker's readiness mode checks its shims and prints their descriptor;
+//! it builds nothing. The server never builds shims: when
 //! they are missing or stale, the open fails with the install command.
 
 use std::path::Path;
 use std::time::Duration;
 
 use lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts;
-use lean_toolchain::shared_writer::WriterDisposition;
 
 use super::ProjectBroker;
 use crate::cancellation::CallCancellation;
 use crate::envelope::TargetCheckNotStarted;
 use crate::error::{Result, ServerError};
+use crate::lean_run::Disposition;
 
 /// The stage a failed readiness check names in its `target_check`.
 const STAGE: &str = "host_artifact_readiness";
@@ -25,7 +25,6 @@ pub(super) async fn installed_host_artifacts(
     root: &Path,
     worker: &Path,
     sysroot: &Path,
-    writer: &Path,
     deadline: tokio::time::Instant,
     cancellation: &CallCancellation,
 ) -> Result<LeanWorkerPreparedHostArtifacts> {
@@ -34,7 +33,6 @@ pub(super) async fn installed_host_artifacts(
     let cancellation = cancellation.clone();
     let worker = worker.to_path_buf();
     let sysroot = sysroot.to_path_buf();
-    let writer = writer.to_path_buf();
     let root = root.to_owned();
     // Keep evidence on the blocking owner, including after a dropped await.
     let operation = cancellation.begin_operation();
@@ -47,8 +45,7 @@ pub(super) async fn installed_host_artifacts(
                 return Err(error);
             }
         };
-        match crate::host_preparation::probe_ready(&worker, &sysroot, &writer, budget, &|| cancellation.is_cancelled())
-        {
+        match crate::host_preparation::probe_ready(&worker, &sysroot, budget, &|| cancellation.is_cancelled()) {
             Ok(Some(artifacts)) => {
                 operation.returned();
                 Ok(artifacts)
@@ -62,7 +59,7 @@ pub(super) async fn installed_host_artifacts(
                 )))
             }
             Err(failure) => {
-                if failure.disposition == WriterDisposition::NotStarted {
+                if failure.disposition == Disposition::NotStarted {
                     operation.not_started();
                 } else {
                     operation.unknown();

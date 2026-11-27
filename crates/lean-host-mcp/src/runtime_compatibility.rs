@@ -3,7 +3,7 @@
 //! `ExpectedContract` is safe on a cold status path: it says what the broker
 //! requires, not what any child has loaded. `LoadedReceipt` can only be made
 //! after a child host session reports its manifest-checked bindings. Package
-//! versions are recorded rather than pinned. Only the shared-writer executable identity is observed here; no backend work is submitted.
+//! versions are recorded rather than pinned.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,25 +16,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const SCHEMA: &str = "lean-host-native-compatibility-v1";
 
-/// Actual helper location and required semantic interface, not a binary pin.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct SharedWriterObservation {
-    pub protocol: u32,
-    pub executable: PathBuf,
-    /// Namespace bound to this broker's native generation ownership.
-    pub ownership_registry: PathBuf,
-}
-
-impl From<lean_rs_writer::WriterContract> for SharedWriterObservation {
-    fn from(writer: lean_rs_writer::WriterContract) -> Self {
-        Self {
-            protocol: writer.protocol,
-            executable: writer.executable,
-            ownership_registry: writer.ownership_registry,
-        }
-    }
-}
-
 /// Successful `lean_compatibility` evidence, including an actual loaded worker.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct CompatibilityEvidence {
@@ -42,14 +23,13 @@ pub struct CompatibilityEvidence {
     pub contract_sha256: String,
     pub expected: ExpectedContract,
     pub loaded: Vec<LoadedReceipt>,
-    pub shared_writer: SharedWriterObservation,
 }
 
 impl CompatibilityEvidence {
-    /// Bind nonempty loaded receipts and the current helper observation.
+    /// Bind nonempty loaded receipts from this broker.
     ///
     /// # Errors
-    /// Refuses absent or mismatched receipts and an incompatible helper protocol.
+    /// Refuses absent or mismatched receipts.
     pub fn new(
         server_instance_id: String,
         expected: ExpectedContract,
@@ -63,17 +43,11 @@ impl CompatibilityEvidence {
         {
             return Err("actual compatible worker receipts from this broker are required".into());
         }
-        let writer = lean_rs_writer::contract().map_err(|error| error.to_string())?;
-        if writer.protocol != expected.writer_protocol {
-            return Err("shared writer helper protocol is incompatible".into());
-        }
-        let shared_writer = SharedWriterObservation::from(writer);
         Ok(Self {
             server_instance_id,
             contract_sha256,
             expected,
             loaded,
-            shared_writer,
         })
     }
 }
@@ -89,7 +63,6 @@ pub struct ExpectedContract {
     /// binding signatures. These are interface fingerprints, not file hashes.
     pub required_host_bindings: BTreeMap<String, String>,
     pub enforcement: String,
-    pub writer_protocol: u32,
 }
 
 impl ExpectedContract {
@@ -113,12 +86,9 @@ impl ExpectedContract {
                 "durable_requests_v1".into(),
                 "generation_bound_worker_stop_v1".into(),
                 "capacity_until_reaped_v1".into(),
-                "worker_owned_shared_artifact_reads_v1".into(),
-                "native_reader_stdout_frame_v1".into(),
             ],
             required_host_bindings,
             enforcement: "every-host-session-before-body-commands".into(),
-            writer_protocol: lean_rs_writer::PROTOCOL,
         })
     }
 
@@ -145,25 +115,15 @@ impl ExpectedContract {
             &self.capabilities,
             &self.required_host_bindings,
             &self.enforcement,
-            self.writer_protocol,
         ))?;
         Ok(crate::digest::sha256_hex(&bytes))
     }
-}
-
-/// Read epoch observed from an actual worker-held shared lock during this session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ArtifactReadEpoch {
-    pub project_root: String,
-    pub epoch: String,
 }
 
 /// Actual facts emitted by the worker child after checked host-session opening.
 /// No constructor fills these from status, configured paths, or worker.json.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LoadedHostRuntime {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_read_epochs: Option<Vec<ArtifactReadEpoch>>,
     /// Compile identity of the running child, not a runtime C-ABI version query.
     pub compiled_lean_version: String,
     pub compiled_header_sha256: String,
@@ -232,29 +192,6 @@ pub(crate) fn validate_loaded(
     {
         return Err("worker toolchain or actor identity mismatch".into());
     }
-    let epochs = loaded
-        .artifact_read_epochs
-        .as_ref()
-        .ok_or("worker did not report actual read custody")?;
-    let mut domains = std::collections::BTreeSet::new();
-    if epochs.is_empty()
-        || epochs.iter().any(|epoch| {
-            let root = std::path::Path::new(&epoch.project_root);
-            !root.is_absolute()
-                || root.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::ParentDir | std::path::Component::CurDir
-                    )
-                })
-                || epoch.epoch.is_empty()
-                || epoch.epoch.len() > 4096
-                || !domains.insert(epoch.project_root.as_str())
-        })
-        || !domains.contains(binding.project_root)
-    {
-        return Err("actual read custody does not cover unique canonical project domains".into());
-    }
     for (operation, abi) in &expected.required_host_bindings {
         if loaded.checked_host_bindings.get(operation) != Some(abi) {
             return Err(format!("incompatible loaded host binding: {operation}"));
@@ -291,10 +228,6 @@ mod tests {
 
     fn loaded() -> Result<LoadedHostRuntime, String> {
         Ok(LoadedHostRuntime {
-            artifact_read_epochs: Some(vec![ArtifactReadEpoch {
-                project_root: "/proofs".into(),
-                epoch: "writer-turn-17".into(),
-            }]),
             compiled_lean_version: "4.35.0".into(),
             compiled_header_sha256: "b".repeat(64),
             runtime_lean_version: Some("4.35.0".into()),
@@ -373,19 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_unrelated_read_custody_is_rejected() -> Result<(), String> {
-        let mut actual = loaded()?;
-        actual.artifact_read_epochs = None;
-        assert!(receipt(Some(&actual), 1).is_err());
-        actual.artifact_read_epochs = Some(vec![ArtifactReadEpoch {
-            project_root: "/other-project".into(),
-            epoch: "writer-turn-17".into(),
-        }]);
-        assert!(receipt(Some(&actual), 1).is_err());
-        Ok(())
-    }
-
-    #[test]
     fn an_absent_upstream_contract_is_not_a_compatibility_claim() {
         assert!(ExpectedContract::new(BTreeMap::new()).is_err());
     }
@@ -394,7 +314,7 @@ mod tests {
     fn digest_matches_the_python_client_fixed_tuple_encoding() -> Result<(), String> {
         assert_eq!(
             contract()?.digest().map_err(|error| error.to_string())?,
-            "37c16087fce0de8a2f9795b89e2af9b289f7e224110b6cf30c33200731cf17f6"
+            "af6178b25acb0b9821a6bc8f9211ca268ba3c0b1b5fc3ecafa5be15f0296dd88"
         );
         Ok(())
     }
@@ -437,7 +357,6 @@ pub struct PureCompatibilityDescription {
     pub worker_protocol_version: u16,
     pub contract_sha256: String,
     pub expected: ExpectedContract,
-    pub shared_writer: SharedWriterObservation,
 }
 
 /// Worker-free response; intentionally has no `loaded` evidence field.
@@ -451,12 +370,11 @@ impl PureCompatibilityResponse {
     /// Describe only static requirements and the broker's resolved project identity.
     ///
     /// # Errors
-    /// Returns unsupported toolchain, SDK contract or helper-identity errors.
+    /// Returns unsupported toolchain or SDK contract errors.
     pub fn describe(server_instance_id: String, project_root: PathBuf, lean_toolchain: String) -> Result<Self, String> {
         let expected = ExpectedContract::compiled()?;
         session_expectation(&lean_toolchain, Some(&expected))?;
         let contract_sha256 = expected.digest().map_err(|error| error.to_string())?;
-        let writer = lean_rs_writer::contract().map_err(|error| error.to_string())?;
         Ok(Self {
             status: "ok",
             native_compatibility: PureCompatibilityDescription {
@@ -467,7 +385,6 @@ impl PureCompatibilityResponse {
                 worker_protocol_version: lean_rs_worker_protocol::protocol::PROTOCOL_VERSION,
                 contract_sha256,
                 expected,
-                shared_writer: writer.into(),
             },
         })
     }
@@ -532,15 +449,6 @@ pub(crate) fn evidence(
     let expectation = session_expectation(toolchain, Some(&contract))?;
     expectation.validate(actual)?;
     let loaded = LoadedHostRuntime {
-        artifact_read_epochs: actual.artifact_read_epochs.as_ref().map(|epochs| {
-            epochs
-                .iter()
-                .map(|epoch| ArtifactReadEpoch {
-                    project_root: epoch.project_root.clone(),
-                    epoch: epoch.epoch.clone(),
-                })
-                .collect()
-        }),
         compiled_lean_version: actual.compiled_lean_version.clone(),
         compiled_header_sha256: actual.compiled_header_sha256.clone(),
         runtime_lean_version: actual.runtime_lean_version.clone(),
@@ -600,8 +508,6 @@ mod pure_tests {
         );
         assert_eq!(expected.checked_host_bindings.len(), 3);
         let mut actual = LeanWorkerHostRuntimeMetadata {
-            effective_import_roots: None,
-            artifact_read_epochs: None,
             compiled_lean_version: "4.35.0".into(),
             compiled_header_sha256: expected.compiled_header_sha256.clone().ok_or("header missing")?,
             runtime_lean_version: expected.runtime_lean_version.clone(),
@@ -629,8 +535,6 @@ mod pure_tests {
     fn actual_metadata_cannot_teach_the_compiled_contract() -> Result<(), String> {
         let expectation = session_expectation("v4.35.0", None)?;
         let mut actual = LeanWorkerHostRuntimeMetadata {
-            effective_import_roots: None,
-            artifact_read_epochs: None,
             compiled_lean_version: "4.35.0".into(),
             compiled_header_sha256: expectation.compiled_header_sha256.ok_or("header missing")?,
             runtime_lean_version: expectation.runtime_lean_version,

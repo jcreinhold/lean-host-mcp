@@ -3,8 +3,9 @@
 //! descriptor, and preparation, which builds them.
 //!
 //! One pre-created thread owns the actual child from spawn through reap. Its
-//! exit is independent of writer helpers the child started: failures after
-//! spawn therefore remain Unknown even when this child stopped.
+//! exit does not show that the Lake runs the preparation mode started have
+//! exited: failures after spawn therefore remain Unknown even when this child
+//! stopped.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -19,9 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts;
-use lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV;
-use lean_toolchain::shared_writer::{WRITER_HANDOFF_ENV, WriterDisposition, configure_writer_executable};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+use crate::lean_run::Disposition;
 
 const STDOUT_LIMIT: usize = 64 * 1024;
 const STDERR_LIMIT: usize = 32 * 1024;
@@ -35,27 +36,18 @@ const READY_FLAG: &str = "--lean-rs-ready-host-artifacts";
 /// The worker flag that builds the shims compiled into the worker. Followed by
 /// a directory that does not exist yet, it writes their sources there first.
 pub(crate) const PREPARE_FLAG: &str = "--lean-rs-prepare-host-artifacts";
-// Keep the shared owners-directory registry binding: preparation writers must
-// consult the same orphan/fence namespace as native generations. Only remove
-// inherited lifetime activation and private capabilities here.
-const SCRUB_ENV: &[&str] = &[
-    "LEAN_RS_WORKER_PARENT_SOCKET",
-    "LEAN_RS_WORKER_PARENT_NONCE",
-    "LEAN_RS_WORKER_GUARDIAN_EXECUTABLE",
-    "LEAN_RS_NATIVE_GUARDIAN_CONTROL_FD",
-    "LEAN_RS_NATIVE_GUARDIAN_WORKER_PID",
-    "LEAN_RS_WORKER_SHARED_ARTIFACT_READS",
-    "LEAN_RS_PREPARED_HOST_ARTIFACTS",
-];
+// The SDK variables this process may have inherited that would change an
+// artifact mode: a parent's lifeline and a parent's prepared artifacts.
+const SCRUB_ENV: &[&str] = &["LEAN_RS_WORKER_PARENT_LIFELINE", "LEAN_RS_PREPARED_HOST_ARTIFACTS"];
 
 /// Failed preparation supplies no native check result or independent-H exit proof.
 #[derive(Debug)]
 pub(crate) struct PreparationFailure {
     pub(crate) message: String,
     /// Snapshot of an actual wait on this child, not a late-reap observer and
-    /// never evidence that independent writer scopes stopped.
+    /// never evidence that the Lake runs it started have exited.
     pub(crate) preparation_child_stopped: bool,
-    pub(crate) disposition: WriterDisposition,
+    pub(crate) disposition: Disposition,
 }
 
 impl fmt::Display for PreparationFailure {
@@ -70,7 +62,7 @@ impl PreparationFailure {
         Self {
             message: message.to_string(),
             preparation_child_stopped: false,
-            disposition: WriterDisposition::NotStarted,
+            disposition: Disposition::NotStarted,
         }
     }
 
@@ -78,7 +70,7 @@ impl PreparationFailure {
         Self {
             message: message.to_string(),
             preparation_child_stopped: stopped,
-            disposition: WriterDisposition::Unknown,
+            disposition: Disposition::Unknown,
         }
     }
 }
@@ -93,21 +85,19 @@ impl PreparationFailure {
 pub(crate) fn probe_ready(
     worker: &Path,
     sysroot: &Path,
-    writer: &Path,
     timeout: Duration,
     cancelled: &impl Fn() -> bool,
 ) -> PreparationResult {
-    run_artifact_mode(worker, sysroot, writer, &[OsStr::new(READY_FLAG)], timeout, cancelled)
+    run_artifact_mode(worker, sysroot, &[OsStr::new(READY_FLAG)], timeout, cancelled)
 }
 
 #[cfg(test)]
 fn prepare(
     worker: &Path,
     sysroot: &Path,
-    writer: &Path,
     timeout: Duration,
 ) -> Result<LeanWorkerPreparedHostArtifacts, PreparationFailure> {
-    run_artifact_mode(worker, sysroot, writer, &[OsStr::new(PREPARE_FLAG)], timeout, &|| false)?
+    run_artifact_mode(worker, sysroot, &[OsStr::new(PREPARE_FLAG)], timeout, &|| false)?
         .ok_or_else(|| PreparationFailure::unknown("preparation returned no artifacts", true))
 }
 
@@ -117,11 +107,11 @@ type Reply = Option<SyncSender<PreparationResult>>;
 /// Run `worker` with the host-artifact `flags`, such as
 /// `--lean-rs-ready-host-artifacts`, and parse the descriptor it prints.
 ///
-/// The child gets `LEAN_SYSROOT`, the writer helper and the owner directory,
-/// and none of the handoff or native-lifetime variables this process may have
-/// inherited. `Ok(None)` is the readiness mode's not-ready exit, 75. This is
-/// the one place that runs these modes; an installer that builds shims with
-/// the worker's preparation mode calls it too.
+/// The child gets `LEAN_SYSROOT` and elan's home, and none of the SDK
+/// variables in `SCRUB_ENV` this process may have inherited. `Ok(None)` is the
+/// readiness mode's not-ready exit, 75. This is the one place that runs these
+/// modes; an installer that builds shims with the worker's preparation mode,
+/// which runs Lake itself, calls it too.
 ///
 /// The caller must cancel its token when abandoning an async waiter: dropping a
 /// `spawn_blocking` handle alone cannot interrupt its running closure. The token
@@ -129,11 +119,10 @@ type Reply = Option<SyncSender<PreparationResult>>;
 ///
 /// # Errors
 /// Returns bounded launch, capture, cancellation or artifact-validation failures.
-/// A stopped child cannot certify closure of independent writers.
+/// A stopped child cannot certify that the Lake runs it started have exited.
 pub(crate) fn run_artifact_mode(
     worker: &Path,
     sysroot: &Path,
-    writer: &Path,
     flags: &[&OsStr],
     timeout: Duration,
     cancelled: &impl Fn() -> bool,
@@ -141,31 +130,22 @@ pub(crate) fn run_artifact_mode(
     if cancelled() {
         return Err(PreparationFailure::no_spawn("host preparation cancelled before launch"));
     }
-    let registry = crate::store::owner_directory().map_err(PreparationFailure::no_spawn)?;
     let mut command = Command::new(worker);
-    configure(&mut command, sysroot, writer, &registry, flags).map_err(PreparationFailure::no_spawn)?;
+    configure(&mut command, sysroot, flags);
     start(command, timeout)?.wait_cancellable(cancelled)
 }
 
-fn configure(
-    command: &mut Command,
-    sysroot: &Path,
-    writer: &Path,
-    registry: &Path,
-    flags: &[&OsStr],
-) -> io::Result<()> {
+fn configure(command: &mut Command, sysroot: &Path, flags: &[&OsStr]) {
     command
         .args(flags)
         .env("LEAN_SYSROOT", sysroot)
-        .env(OWNERS_DIRECTORY_ENV, registry)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for name in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
+    for name in SCRUB_ENV {
         command.env_remove(name);
     }
     crate::toolchain::pass_elan_home(command);
-    configure_writer_executable(command, Some(writer))
 }
 
 #[derive(Default)]
@@ -466,7 +446,7 @@ fn retire(child: &mut Child, control: &Control, reply: &mut Reply, message: &str
                 deliver(
                     reply,
                     Err(PreparationFailure::unknown(
-                        format!("{message}; child custody lost"),
+                        format!("{message}; another process reaped the child"),
                         false,
                     )),
                 );
@@ -491,13 +471,12 @@ fn validate(bytes: &[u8]) -> Result<LeanWorkerPreparedHostArtifacts, String> {
     if artifacts.protocol != 1 {
         return Err("unsupported preparation protocol".to_owned());
     }
-    for paths in [&artifacts.artifact_roots, &artifacts.shim_search_paths] {
-        if paths.is_empty() || paths.len() > PATH_LIMIT {
-            return Err("preparation requires one to 32 paths per array".to_owned());
-        }
-        for path in paths {
-            canonical(Path::new(path), true)?;
-        }
+    let paths = &artifacts.shim_search_paths;
+    if paths.is_empty() || paths.len() > PATH_LIMIT {
+        return Err("preparation requires one to 32 shim search paths".to_owned());
+    }
+    for path in paths {
+        canonical(Path::new(path), true)?;
     }
     let manifest = Path::new(&artifacts.shim_manifest_path);
     canonical(manifest, false)?;

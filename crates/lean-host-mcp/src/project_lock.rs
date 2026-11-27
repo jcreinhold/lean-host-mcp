@@ -1,33 +1,31 @@
-//! Fair turns between checks and writers on one project.
+//! Fair turns between checks and builds on one project.
 //!
-//! Each canonical project root has one fair read-write lock. A check takes a
-//! read turn before it pins a worker or starts a native reader, then the
-//! shared kernel guard G, and keeps both until the request ends. A writer
-//! takes the write turn. Tokio grants turns in arrival order, so a queued
-//! writer holds back later checks, and a waiting check keeps its place in line
-//! until its deadline.
+//! Requirement: checks share the project and a build runs alone. Each
+//! canonical project root has one fair read-write lock. A check takes a read
+//! turn before it pins a worker or starts a short run and keeps it until the
+//! request ends; a short run keeps a share of that turn until its process
+//! group has exited, even past the request. A build takes the write turn.
+//! Tokio grants turns in arrival order, so a queued build holds back later
+//! checks, and a waiting check keeps its place in line until its deadline.
 //!
-//! The reaper queues a proxy write turn for a writer in another process while
-//! that writer's demand lasts, so new checks queue behind it here as well.
+//! Only this server runs Lake in the checkout (see [`crate::store`]), so these
+//! turns are the only lock between checks and builds.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, Waker};
 
 use parking_lot::Mutex;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 
-use crate::artifact_reads::ArtifactReadGuard;
 use crate::cancellation::CallCancellation;
 
-/// The writer a proxy turn names to the checks that wait behind it.
-pub(crate) const EXTERNAL_WRITER: &str = "external_writer";
+/// A share of a request's read turn. The turn passes to a build only when
+/// every share has dropped.
+pub(crate) type ReadShare = Arc<OwnedRwLockReadGuard<()>>;
 
 tokio::task_local! {
     static TURN: Arc<tokio::sync::Mutex<Option<HeldRead>>>;
@@ -43,10 +41,6 @@ impl ProjectLocks {
     pub(crate) fn get(&mut self, root: &Path) -> Arc<ProjectLock> {
         Arc::clone(self.roots.entry(root.to_path_buf()).or_default())
     }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&PathBuf, &Arc<ProjectLock>)> {
-        self.roots.iter()
-    }
 }
 
 /// Turns on one project root.
@@ -58,8 +52,6 @@ pub(crate) struct ProjectLock {
     builds_finished: AtomicU64,
     /// Writers that hold or wait for the write turn, in arrival order.
     writers: Mutex<Writers>,
-    /// Ends the current proxy turn.
-    proxy: Mutex<Option<CancellationToken>>,
 }
 
 #[derive(Default)]
@@ -77,28 +69,15 @@ pub(crate) enum TurnRefused {
         blocked_by: Option<String>,
     },
     Cancelled,
-    /// The kernel guard failed for a reason other than time.
-    Guard(io::Error),
     /// The request already holds a turn on this other root.
     OtherRoot(PathBuf),
     /// The request holds a read turn, so its write turn would wait for itself.
     HoldsRead,
 }
 
-/// What the reaper saw of writer demand on a root.
-#[derive(Clone, Copy)]
-pub(crate) enum Demand {
-    Present,
-    Absent,
-    /// Another reader held its brief gate, so nothing was learned.
-    Unknown,
-}
-
-/// A request's read turn and guard G. Fields drop in order, so G closes
-/// before the turn passes to a writer.
+/// A request's read turn.
 struct HeldRead {
-    _guard: ArtifactReadGuard,
-    _turn: OwnedRwLockReadGuard<()>,
+    turn: ReadShare,
     root: PathBuf,
     granted_at: u64,
 }
@@ -170,43 +149,6 @@ impl ProjectLock {
             id,
         }
     }
-
-    /// Hold a proxy write turn while another process's writer demand lasts.
-    /// Skips a root whose write turn this server holds or waits for. Once
-    /// queued, a proxy turn always ends with `finish`, even when the demand
-    /// ends before the grant, since that writer may have changed artifacts.
-    pub(crate) fn observe_demand(self: &Arc<Self>, demand: Demand, handle: &tokio::runtime::Handle) {
-        let mut proxy = self.proxy.lock();
-        match demand {
-            Demand::Unknown => {}
-            Demand::Absent => {
-                if let Some(ended) = proxy.take() {
-                    ended.cancel();
-                }
-            }
-            Demand::Present => {
-                if proxy.is_some() || !self.writers.lock().line.is_empty() {
-                    return;
-                }
-                let ticket = self.enter_writer(EXTERNAL_WRITER);
-                // Poll once here so the turn takes its place in line now, not
-                // when the task first runs.
-                let mut grant = Box::pin(Arc::clone(&self.rw).write_owned());
-                let first = grant.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-                let ended = CancellationToken::new();
-                let watch = ended.clone();
-                handle.spawn(async move {
-                    let guard = match first {
-                        Poll::Ready(guard) => guard,
-                        Poll::Pending => grant.await,
-                    };
-                    watch.cancelled().await;
-                    WriteTurn { ticket, _guard: guard }.finish();
-                });
-                *proxy = Some(ended);
-            }
-        }
-    }
 }
 
 /// Run a request with a turn slot. A scope made inside another shares the
@@ -217,9 +159,8 @@ pub(crate) fn scope<F: Future>(operation: F) -> impl Future<Output = F::Output> 
     TURN.scope(slot, operation)
 }
 
-/// Give the current request a read turn on `root`, then the kernel guard G,
-/// and hold both until the request ends. Returns the finished-build count at
-/// the grant. A request reuses its turn: a second turn queued behind a
+/// Give the current request a read turn on `root` and hold it until the
+/// request ends. Returns the finished-build count at the grant. A request reuses its turn: a second turn queued behind a
 /// waiting writer would never be granted. Outside a request scope this takes
 /// nothing and returns the current count.
 pub(crate) async fn ensure_read(
@@ -246,31 +187,23 @@ pub(crate) async fn ensure_read(
             .map_err(|_| TurnRefused::Expired { blocked_by: lock.blocked_by() })?,
     };
     let granted_at = lock.builds_finished();
-    let guard_root = root.to_path_buf();
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let guard = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return Err(TurnRefused::Cancelled),
-        guard = tokio::task::spawn_blocking(move || ArtifactReadGuard::acquire(&guard_root, remaining)) => guard,
-    };
-    let guard = match guard {
-        Ok(Ok(guard)) => guard,
-        // Only a writer outside this server's turns holds the kernel lock now.
-        Ok(Err(error)) if error.kind() == io::ErrorKind::TimedOut => {
-            return Err(TurnRefused::Expired {
-                blocked_by: Some(EXTERNAL_WRITER.to_owned()),
-            });
-        }
-        Ok(Err(error)) => return Err(TurnRefused::Guard(error)),
-        Err(error) => return Err(TurnRefused::Guard(io::Error::other(error))),
-    };
     *held = Some(HeldRead {
-        _guard: guard,
-        _turn: turn,
+        turn: Arc::new(turn),
         root: root.to_path_buf(),
         granted_at,
     });
     Ok(granted_at)
+}
+
+/// A share of the current request's read turn on `root`, for a short run to
+/// keep until its process group has exited. `None` outside a request scope or
+/// before the request holds a turn there.
+pub(crate) async fn read_share(root: &Path) -> Option<ReadShare> {
+    let slot = TURN.try_with(Arc::clone).ok()?;
+    let held = slot.lock().await;
+    held.as_ref()
+        .filter(|read| read.root == root)
+        .map(|read| Arc::clone(&read.turn))
 }
 
 /// Give the current request the write turn on `lock`'s root, naming it `name`

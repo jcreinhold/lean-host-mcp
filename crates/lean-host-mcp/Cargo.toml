@@ -77,7 +77,6 @@ walkdir = "2"
 
 lean-rs-worker-parent.workspace = true
 lean-rs-worker-protocol.workspace = true
-lean-rs-writer.workspace = true
 lean-semantic-search-contract.workspace = true
 lean-semantic-search-retrieval.workspace = true
 lean-semantic-search-runtime.workspace = true

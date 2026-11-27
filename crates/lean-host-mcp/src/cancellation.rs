@@ -320,7 +320,7 @@ pub(crate) async fn with_cancellation_evidence<T>(
 }
 
 /// Bound a request by `timeout` from now. Worker calls stop at the deadline
-/// and report a timeout; lock waits and native readers use the time left.
+/// and report a timeout; turn waits and short runs use the time left.
 pub(crate) async fn with_deadline<T>(timeout: Duration, operation: impl Future<Output = T>) -> T {
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return operation.await;

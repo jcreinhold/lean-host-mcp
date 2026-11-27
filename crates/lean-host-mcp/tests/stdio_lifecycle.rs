@@ -50,33 +50,7 @@ async fn stdio_shutdown_on_stdin_eof_exits_parent() {
     );
 }
 
-/// `serve` checks the worker socket directory before it takes a call, so a
-/// directory too long for a worker socket stops the server, not its first check.
-#[test]
-fn serve_refuses_a_socket_directory_too_long_for_worker_sockets() {
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .canonicalize()
-        .expect("canonical test scratch");
-    let long = scratch.join("s".repeat(120));
-    let registry = tempfile::tempdir_in(&scratch).expect("temp registry");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
-        .arg("serve")
-        .env("LEAN_HOST_MCP_SOCKET_DIR", &long)
-        .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", registry.path())
-        .env_remove("LEAN_PATH")
-        .env_remove("LEAN_HOST_MCP_PROJECT")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run serve");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "serve started; stderr: {stderr}");
-    assert!(stderr.contains("socket path is too long"), "stderr: {stderr}");
-    assert!(!long.exists(), "serve made the directory it refused");
-}
-
-// Serialize with the other tests that take exclusive custody of the installed shim roots.
 #[tokio::test]
-#[serial_test::serial(installed_shim_custody)]
 async fn stdio_shutdown_after_tool_call_exits_worker_child() {
     let project = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_PROJECT")
         .map(PathBuf::from)
@@ -190,17 +164,15 @@ struct StdioServer {
     stdout: BufReader<ChildStdout>,
     stderr_task: tokio::task::JoinHandle<String>,
     next_id: u64,
-    _sockets: support::SocketDir,
 }
 
 impl StdioServer {
     fn start(project_root: &Path, registry: &Path) -> Self {
-        // The native owner directory needs a canonical ancestor; macOS temp
-        // directories sit under the `/var` symlink.
+        // The store needs a canonical ancestor; macOS temp directories sit
+        // under the `/var` symlink.
         let registry = registry.canonicalize().expect("canonical registry");
         let state_dir = registry.join("server");
         std::fs::create_dir(&state_dir).expect("private server state directory");
-        let sockets = support::socket_dir().expect("socket dir");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         // Cargo injects its test library search path. Start the installed app with
         // the ordinary loader environment so it uses its verified Elan rpath.
@@ -210,18 +182,16 @@ impl StdioServer {
         command
             .arg("--lake-root")
             .arg(project_root)
-            .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", state_dir.join("native-owners"))
             .env("LEAN_HOST_MCP_STORE_DIR", state_dir.join("store"))
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", &registry)
-            .env("LEAN_HOST_MCP_SOCKET_DIR", sockets.path())
             .env("RUST_LOG", "warn");
         if let Some(dir) = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR") {
             command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
         }
-        Self::spawn(&mut command, sockets)
+        Self::spawn(&mut command)
     }
 
-    fn spawn(command: &mut Command, sockets: support::SocketDir) -> Self {
+    fn spawn(command: &mut Command) -> Self {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -237,7 +207,6 @@ impl StdioServer {
             stdout,
             stderr_task,
             next_id: 1,
-            _sockets: sockets,
         }
     }
 

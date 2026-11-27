@@ -117,6 +117,14 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         description: "Workers that may serve the project at once. An extra worker opens only when a slot is free; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks: each worker keeps its own imports and cache. Default 1.",
     },
     FieldDoc {
+        key: "broker.max_lean_runs",
+        ty: "integer",
+        value: "2",
+        commented: false,
+        overrides: "LEAN_HOST_MCP_MAX_LEAN_RUNS",
+        description: "Short lean and lake runs the server may run at once: file checks, setup-file runs, options probes and semantic file runs. Each takes a permit before it starts and keeps it until its process group has exited; a run that finds no permit by its deadline does not start. Default 2.",
+    },
+    FieldDoc {
         key: "broker.idle_timeout_secs",
         ty: "integer (s)",
         value: "600",
@@ -214,7 +222,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "\"/abs/path/to/project/.local/lean-host-mcp/store\"",
         commented: true,
         overrides: "LEAN_HOST_MCP_STORE_DIR",
-        description: "Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. It also holds the native owner records (owners/), the semantic runtime cache (semantic-runtimes/) and the server process records (processes/). Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root.",
+        description: "Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. It also holds the lock that every process the server starts inherits (children.lock, with one file per running group in children/), the semantic runtime cache that install builds (semantic-runtimes/) and the server process records (processes/). Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root.",
     },
     FieldDoc {
         key: "install.elan_home",
@@ -520,6 +528,7 @@ mod tests {
 
         assert_eq!(config.broker.max_workers, Some(broker::DEFAULT_MAX_WORKERS));
         assert_eq!(config.broker.max_workers_per_project, Some(1));
+        assert_eq!(config.broker.max_lean_runs, Some(broker::DEFAULT_MAX_LEAN_RUNS));
         assert_eq!(config.broker.idle_timeout_secs, Some(broker::DEFAULT_IDLE_TIMEOUT_SECS));
         assert_eq!(
             config.output.slow_call_warning_millis,

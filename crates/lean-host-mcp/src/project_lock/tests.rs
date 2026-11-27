@@ -1,4 +1,4 @@
-//! Turn order, reuse, expiry and proxy turns, without Lean.
+//! Turn order, reuse, expiry and read shares, without Lean.
 
 use std::time::Duration;
 
@@ -31,10 +31,10 @@ async fn a_queued_writer_goes_before_a_later_reader_which_sees_its_finish() -> T
     let directory = tempfile::tempdir()?;
     let root = directory.path().canonicalize()?;
     let lock = Arc::new(ProjectLock::default());
-    let handle = tokio::runtime::Handle::current();
     let first = lock.try_read().ok_or("a free lock grants a read turn")?;
-    lock.observe_demand(Demand::Present, &handle);
-    assert!(lock.try_read().is_none(), "a queued writer holds back new readers");
+    let build = spawn_write(&lock, "build-1", deadline(WAIT)?, CallCancellation::default());
+    wait_for(|| line(&lock) == 1).await?;
+    wait_for(|| lock.try_read().is_none()).await?;
     let later = {
         let lock = Arc::clone(&lock);
         let until = deadline(WAIT)?;
@@ -45,10 +45,13 @@ async fn a_queued_writer_goes_before_a_later_reader_which_sees_its_finish() -> T
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(!later.is_finished());
     drop(first);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!later.is_finished(), "the later reader waits for the writer too");
-    assert_eq!(finished(&lock), 0);
-    lock.observe_demand(Demand::Absent, &handle);
+    finish_after(build.await?.map_err(|refused| format!("{refused:?}"))?, async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!later.is_finished(), "the later reader waits for the writer too");
+        assert_eq!(finished(&lock), 0);
+        Ok(())
+    })
+    .await?;
     let granted = later.await?.map_err(|refused| format!("{refused:?}"))?;
     assert_eq!(granted, 1, "the next reader sees the finished write turn");
     Ok(())
@@ -79,20 +82,38 @@ async fn two_requests_hold_read_turns_at_once() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_proxy_turn_queued_before_its_demand_ended_still_finishes() -> TestResult {
+async fn a_read_share_keeps_a_build_waiting_after_its_request_ends() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
     let lock = Arc::new(ProjectLock::default());
-    let handle = tokio::runtime::Handle::current();
-    let first = lock.try_read().ok_or("a free lock grants a read turn")?;
-    lock.observe_demand(Demand::Present, &handle);
-    lock.observe_demand(Demand::Absent, &handle);
-    assert_eq!(lock.blocked_by().as_deref(), Some(EXTERNAL_WRITER));
-    // While that turn waits, new demand queues no second proxy.
-    lock.observe_demand(Demand::Present, &handle);
-    assert_eq!(lock.writers.lock().line.len(), 1);
-    drop(first);
-    wait_for(|| finished(&lock) == 1).await?;
-    wait_for(|| lock.try_read().is_some()).await?;
-    assert_eq!(lock.blocked_by(), None);
+    let until = deadline(WAIT)?;
+    let cancellation = CallCancellation::default();
+    let (outside, share, elsewhere) = scope(async {
+        let outside = read_share(&root).await;
+        ensure_read(&lock, &root, until, &cancellation)
+            .await
+            .map_err(|refused| format!("{refused:?}"))?;
+        Ok::<_, String>((outside, read_share(&root).await, read_share(&root.join("other")).await))
+    })
+    .await?;
+    assert!(outside.is_none(), "no share before the request holds a turn");
+    assert!(elsewhere.is_none(), "no share of a turn on another root");
+    let share = share.ok_or("a request with a turn gives a share")?;
+    assert!(read_share(&root).await.is_none(), "no share outside a request");
+    // The request ended, but a short run still holds its share.
+    let build_cancellation = CallCancellation::default();
+    let build = ensure_write(&lock, "build-1", deadline(WAIT)?, &build_cancellation);
+    tokio::pin!(build);
+    tokio::select! {
+        turn = &mut build => {
+            let refused = turn.err();
+            return Err(format!("a build's wait ended while a share was held: {refused:?}").into());
+        }
+        () = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    drop(share);
+    build.await.map_err(|refused| format!("{refused:?}"))?.finish();
+    assert_eq!(finished(&lock), 1);
     Ok(())
 }
 
@@ -102,17 +123,17 @@ async fn a_nested_read_reuses_the_turn_while_a_writer_waits() -> TestResult {
     let root = directory.path().canonicalize()?;
     let other = root.join("other");
     let lock = Arc::new(ProjectLock::default());
-    let handle = tokio::runtime::Handle::current();
     let cancellation = CallCancellation::default();
     let until = deadline(WAIT)?;
-    let (first, nested, elsewhere, seen) = scope(async {
+    let (first, build, nested, elsewhere, seen) = scope(async {
         let first = ensure_read(&lock, &root, until, &cancellation).await;
-        lock.observe_demand(Demand::Present, &handle);
+        let build = spawn_write(&lock, "build-1", until, CallCancellation::default());
+        wait_for(|| line(&lock) == 1).await?;
         let nested = ensure_read(&lock, &root, until, &cancellation).await;
         let elsewhere = ensure_read(&lock, &other, until, &cancellation).await;
-        (first, nested, elsewhere, (granted_at(&root), granted_at(&other)))
+        Ok::<_, Box<dyn std::error::Error>>((first, build, nested, elsewhere, (granted_at(&root), granted_at(&other))))
     })
-    .await;
+    .await?;
     assert!(matches!(first, Ok(0)), "{first:?}");
     assert!(
         matches!(nested, Ok(0)),
@@ -122,8 +143,9 @@ async fn a_nested_read_reuses_the_turn_while_a_writer_waits() -> TestResult {
     assert_eq!(seen, (Some(0), None), "a request reads the count of its own turn");
     assert_eq!(granted_at(&root), None, "no turn outside a request");
     // The request ended, so the writer gets its turn.
-    lock.observe_demand(Demand::Absent, &handle);
-    wait_for(|| finished(&lock) == 1).await
+    build.await?.map_err(|refused| format!("{refused:?}"))?.finish();
+    assert_eq!(finished(&lock), 1);
+    Ok(())
 }
 
 #[tokio::test]
@@ -131,26 +153,29 @@ async fn a_read_wait_ends_at_its_deadline_or_on_cancel() -> TestResult {
     let directory = tempfile::tempdir()?;
     let root = directory.path().canonicalize()?;
     let lock = Arc::new(ProjectLock::default());
-    let handle = tokio::runtime::Handle::current();
-    lock.observe_demand(Demand::Present, &handle);
-    let short = deadline(Duration::from_millis(30))?;
-    let expired = scope(ensure_read(&lock, &root, short, &CallCancellation::default())).await;
-    assert!(
-        matches!(&expired, Err(TurnRefused::Expired { blocked_by: Some(name) }) if name == EXTERNAL_WRITER),
-        "{expired:?}"
-    );
-    let cancellation = CallCancellation::default();
-    let waiting = scope(ensure_read(&lock, &root, deadline(WAIT)?, &cancellation));
-    tokio::pin!(waiting);
-    tokio::select! {
-        result = &mut waiting => return Err(format!("read granted during a write turn: {result:?}").into()),
-        () = tokio::time::sleep(Duration::from_millis(20)) => {}
-    }
-    cancellation.cancel();
-    let cancelled = waiting.await;
-    assert!(matches!(cancelled, Err(TurnRefused::Cancelled)), "{cancelled:?}");
-    lock.observe_demand(Demand::Absent, &handle);
-    wait_for(|| finished(&lock) == 1).await
+    let build = spawn_write(&lock, "build-1", deadline(WAIT)?, CallCancellation::default());
+    finish_after(build.await?.map_err(|refused| format!("{refused:?}"))?, async {
+        let short = deadline(Duration::from_millis(30))?;
+        let expired = scope(ensure_read(&lock, &root, short, &CallCancellation::default())).await;
+        assert!(
+            matches!(&expired, Err(TurnRefused::Expired { blocked_by: Some(name) }) if name == "build-1"),
+            "{expired:?}"
+        );
+        let cancellation = CallCancellation::default();
+        let waiting = scope(ensure_read(&lock, &root, deadline(WAIT)?, &cancellation));
+        tokio::pin!(waiting);
+        tokio::select! {
+            result = &mut waiting => return Err(format!("read granted during a write turn: {result:?}").into()),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        cancellation.cancel();
+        let cancelled = waiting.await;
+        assert!(matches!(cancelled, Err(TurnRefused::Cancelled)), "{cancelled:?}");
+        Ok(())
+    })
+    .await?;
+    assert_eq!(finished(&lock), 1);
+    Ok(())
 }
 
 fn line(lock: &ProjectLock) -> usize {
@@ -264,7 +289,7 @@ async fn a_write_wait_ends_at_its_deadline_or_on_cancel_and_leaves_the_line() ->
 }
 
 #[tokio::test]
-async fn a_check_cannot_build_and_the_proxy_skips_a_root_with_a_build() -> TestResult {
+async fn a_check_cannot_build() -> TestResult {
     let directory = tempfile::tempdir()?;
     let root = directory.path().canonicalize()?;
     let lock = Arc::new(ProjectLock::default());
@@ -281,8 +306,6 @@ async fn a_check_cannot_build_and_the_proxy_skips_a_root_with_a_build() -> TestR
     assert_eq!(line(&lock), 0);
     let build = spawn_write(&lock, "build-2", deadline(WAIT)?, CallCancellation::default());
     finish_after(build.await?.map_err(|refused| format!("{refused:?}"))?, async {
-        lock.observe_demand(Demand::Present, &tokio::runtime::Handle::current());
-        assert!(lock.proxy.lock().is_none(), "no proxy turn while this server builds");
         assert_eq!(lock.blocked_by().as_deref(), Some("build-2"));
         Ok(())
     })

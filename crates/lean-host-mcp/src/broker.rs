@@ -30,9 +30,13 @@
 //!
 //! **Admission.** Each worker owns a serialized thread with a bounded
 //! mailbox. [`BrokerConfig::max_workers`] slots count resident, opening and
-//! retiring workers until each exit is confirmed. A writer's demand in another
-//! process retires idle workers; [`ProjectBroker::runtime_status`] observes the
-//! pool.
+//! retiring workers until each exit is confirmed;
+//! [`ProjectBroker::runtime_status`] observes the pool.
+//!
+//! **Short runs.** A `lean` or `lake` process the server starts for a check
+//! (a file check, a setup-file run, an options probe or a semantic file run)
+//! first takes one of [`BrokerConfig::max_lean_runs`] permits. Requirement: at
+//! most that many short runs execute at once, whatever the number of clients.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -65,12 +69,14 @@ mod host_artifacts;
 pub(crate) mod module_setup;
 pub(crate) mod semantic_file;
 pub(crate) mod verify_file;
-mod writer_handoff;
 pub(crate) use control::MaintenanceAccess;
 pub use control::{RuntimeStatus, WorkerActivity, WorkerPoolStatus};
 
 /// Default worker slots when `LEAN_HOST_MCP_MAX_WORKERS` is unset.
 pub const DEFAULT_MAX_WORKERS: usize = 4;
+
+/// Default short-run permits when `LEAN_HOST_MCP_MAX_LEAN_RUNS` is unset.
+pub const DEFAULT_MAX_LEAN_RUNS: usize = 2;
 
 /// Default idle window (10 min) when `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` is
 /// unset.
@@ -80,7 +86,6 @@ pub const DEFAULT_MAX_WORKERS: usize = 4;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
 const REAPER_TICK: Duration = Duration::from_mins(1);
-const ARTIFACT_HANDOFF_TICK: Duration = Duration::from_millis(100);
 /// How often a build checks whether the workers it stopped have exited.
 const WORKER_EXIT_POLL: Duration = Duration::from_millis(25);
 
@@ -95,6 +100,8 @@ pub struct BrokerConfig {
     pub max_workers: NonZeroUsize,
     /// Workers that may serve the project at once.
     pub max_workers_per_project: NonZeroUsize,
+    /// Short `lean` and `lake` runs that may execute at once.
+    pub max_lean_runs: NonZeroUsize,
     /// Idle window after which the reaper retires a worker.
     /// [`Duration::ZERO`] turns idle retirement off.
     pub idle_timeout: Duration,
@@ -102,13 +109,24 @@ pub struct BrokerConfig {
 
 impl BrokerConfig {
     /// A broker serving `lake_root` with the default pool: one worker, the
-    /// default slots and the default idle window.
+    /// default slots, the default short-run permits and the default idle
+    /// window.
     #[must_use]
     pub fn serving(lake_root: PathBuf) -> Self {
         Self {
             lake_root: Some(lake_root),
+            ..Self::unserved()
+        }
+    }
+
+    /// A broker that serves no root, with the default pool.
+    #[must_use]
+    pub fn unserved() -> Self {
+        Self {
+            lake_root: None,
             max_workers: NonZeroUsize::new(DEFAULT_MAX_WORKERS).unwrap_or(NonZeroUsize::MIN),
             max_workers_per_project: NonZeroUsize::MIN,
+            max_lean_runs: NonZeroUsize::new(DEFAULT_MAX_LEAN_RUNS).unwrap_or(NonZeroUsize::MIN),
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         }
     }
@@ -119,11 +137,12 @@ impl BrokerConfig {
     /// # Errors
     ///
     /// [`ServerError::Internal`] when an env var does not parse or a worker
-    /// limit is zero. An idle timeout of zero turns idle retirement off.
+    /// or short-run limit is zero. An idle timeout of zero turns idle retirement off.
     pub fn from_env_with_file(lake_root: Option<PathBuf>, file: &BrokerFileConfig) -> Result<Self> {
         let env = PoolEnv {
             max_workers: std::env::var("LEAN_HOST_MCP_MAX_WORKERS").ok(),
             max_workers_per_project: std::env::var("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT").ok(),
+            max_lean_runs: std::env::var("LEAN_HOST_MCP_MAX_LEAN_RUNS").ok(),
             idle_timeout_secs: std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok(),
         };
         parse_pool_config(lake_root, &env, file)
@@ -135,6 +154,7 @@ impl BrokerConfig {
 struct PoolEnv {
     max_workers: Option<String>,
     max_workers_per_project: Option<String>,
+    max_lean_runs: Option<String>,
     idle_timeout_secs: Option<String>,
 }
 
@@ -158,6 +178,15 @@ fn parse_pool_config(lake_root: Option<PathBuf>, env: &PoolEnv, file: &BrokerFil
         )?,
         "max_workers_per_project must be positive",
     )?;
+    let max_lean_runs = nonzero(
+        resolve_usize(
+            "LEAN_HOST_MCP_MAX_LEAN_RUNS",
+            env.max_lean_runs.as_deref(),
+            file.max_lean_runs,
+            DEFAULT_MAX_LEAN_RUNS,
+        )?,
+        "max_lean_runs must be positive",
+    )?;
     let idle_timeout = Duration::from_secs(resolve_u64(
         "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS",
         env.idle_timeout_secs.as_deref(),
@@ -168,6 +197,7 @@ fn parse_pool_config(lake_root: Option<PathBuf>, env: &PoolEnv, file: &BrokerFil
         lake_root,
         max_workers,
         max_workers_per_project,
+        max_lean_runs,
         idle_timeout,
     })
 }
@@ -257,6 +287,8 @@ pub struct ProjectBroker {
     config: BrokerConfig,
     runtime_config: ProjectRuntimeConfig,
     worker_slots: Arc<Semaphore>,
+    /// One permit per short run; see the module docs.
+    lean_runs: Arc<Semaphore>,
     capacity_admission: AsyncMutex<()>,
 }
 
@@ -272,8 +304,8 @@ impl ProjectBroker {
     /// Construct a broker and spawn the background idle reaper.
     ///
     /// The reaper is only spawned when a tokio runtime is available
-    /// ([`tokio::runtime::Handle::try_current`]). Artifact handoff remains active
-    /// when `idle_timeout` is zero; only ordinary expiry is disabled.
+    /// ([`tokio::runtime::Handle::try_current`]). It still collects retired
+    /// workers when `idle_timeout` is zero; only idle expiry is off.
     /// Sync test contexts get a working broker without a reaper, which is
     /// fine because tests call [`Self::reap_idle`] directly.
     #[must_use]
@@ -300,6 +332,7 @@ impl ProjectBroker {
             })),
             runtime_config,
             worker_slots: Arc::new(Semaphore::new(config.max_workers.get())),
+            lean_runs: Arc::new(Semaphore::new(config.max_lean_runs.get())),
             capacity_admission: AsyncMutex::new(()),
             config,
         });
@@ -343,41 +376,28 @@ impl ProjectBroker {
         }
     }
 
+    /// The permits every short run takes before it starts.
+    pub(crate) fn lean_runs(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.lean_runs)
+    }
+
     fn spawn_reaper(self: &Arc<Self>) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let weak: Weak<Self> = Arc::downgrade(self);
-        let runtime = handle.clone();
         handle.spawn(async move {
             let mut idle = tokio::time::interval(REAPER_TICK);
-            let mut handoff = tokio::time::interval(ARTIFACT_HANDOFF_TICK);
             idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            handoff.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             idle.tick().await;
-            handoff.tick().await;
             loop {
-                let reap_idle = tokio::select! {
-                    _ = idle.tick() => true,
-                    _ = handoff.tick() => false,
-                };
+                idle.tick().await;
                 let Some(broker) = weak.upgrade() else {
                     break;
                 };
-                // Filesystem/lock observation and retirement stay off the async
-                // executor. Writer handoff remains enabled when idle expiry is 0.
-                let runtime = runtime.clone();
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    if reap_idle {
-                        broker.reap_idle();
-                    } else {
-                        broker.reap_artifact_handoffs();
-                        broker.observe_writer_demand(&runtime);
-                    }
-                })
-                .await
-                {
-                    tracing::warn!(%error, "broker housekeeping failed; later ticks will observe again");
+                // Retirement stays off the async executor.
+                if let Err(error) = tokio::task::spawn_blocking(move || broker.reap_idle()).await {
+                    tracing::warn!(%error, "idle reaper failed; the next tick tries again");
                 }
             }
         });
@@ -859,7 +879,7 @@ impl ProjectBroker {
         crate::lake_options::resolve(
             &meta.canonical_root,
             options,
-            self.config.max_workers.get(),
+            self.lean_runs(),
             Some(Box::new(activity)),
         )
         .await
@@ -878,9 +898,9 @@ impl ProjectBroker {
             .ok_or_else(|| ServerError::Internal("request deadline is out of range".to_owned()))
     }
 
-    /// Give this request its read turn on `root`, and the shared kernel guard,
-    /// before it pins a worker or starts a reader. Both last until the request
-    /// ends. Returns the finished-build count at the grant.
+    /// Give this request its read turn on `root` before it pins a worker or
+    /// starts a short run. The turn lasts until the request and every short
+    /// run it started end. Returns the finished-build count at the grant.
     pub(crate) async fn ensure_read(&self, root: &Path) -> Result<u64> {
         let lock = self.project_lock(root);
         let deadline = self.request_deadline()?;
@@ -902,7 +922,6 @@ impl ProjectBroker {
                 Self::pool_unavailable_behind(root, "project_admission_timeout", true, blocked_by)
             }
             TurnRefused::Cancelled => Self::pool_unavailable(root, "request_cancelled", false),
-            TurnRefused::Guard(error) => ServerError::BadProject(format!("artifact read lock unavailable: {error}")),
             TurnRefused::OtherRoot(held) => {
                 ServerError::Internal(format!("request already holds a project turn on {}", held.display()))
             }
@@ -938,10 +957,8 @@ impl ProjectBroker {
             .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
         let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
         let cancellation = CallCancellation::current();
-        let writer = lean_rs_writer::contract()?.executable;
         let prepared =
-            host_artifacts::installed_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
-                .await?;
+            host_artifacts::installed_host_artifacts(&root, &worker, &sysroot, deadline, &cancellation).await?;
         let open_guard = self.acquire_opening_guard(&root, deadline, &cancellation).await?;
 
         // Root-local startup serialization closes the race between callers that
@@ -992,7 +1009,6 @@ impl ProjectBroker {
         let runtime_config = self.runtime_config.clone();
         let inner = Arc::clone(&self.inner);
         let maintenance = MaintenanceAccess::new(&self.inner);
-        let native_capacity_limit = self.config.max_workers.get();
         let root = root.clone();
         // The blocking startup keeps running if this async caller disappears.
         // The actor owns initialization evidence independently of this waiter.
@@ -1001,9 +1017,7 @@ impl ProjectBroker {
             // Hold same-root serialization through registration even when the
             // async caller disappears while blocking startup is still running.
             let _open_guard = open_guard;
-            let opened = LeanProject::open(
-                meta, runtime_config, slot, maintenance, prepared, native_capacity_limit, initialization,
-            )?;
+            let opened = LeanProject::open(meta, runtime_config, slot, maintenance, prepared, initialization)?;
             let mut registry = inner.lock();
             if registry.shutdown_epoch != epoch {
                 drop(registry);
@@ -1185,7 +1199,7 @@ impl ProjectBroker {
         Self::pool_unavailable_behind(root, reason, retryable, None)
     }
 
-    /// `blocked_by` names the writer that a request waited behind, if known.
+    /// `blocked_by` names the build that a request waited behind, if known.
     fn pool_unavailable_behind(root: &Path, reason: &str, retryable: bool, blocked_by: Option<String>) -> ServerError {
         ServerError::worker_unavailable(crate::error::WorkerUnavailable {
             blocked_by,
@@ -1381,8 +1395,8 @@ fn freshness_from_meta(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshnes
     }
 }
 
-/// Freshness of a reply that a native reader elaborated. Each reader is one
-/// `lean` process, so each run has its own session id.
+/// Freshness of a reply that a short run elaborated. Each run is one `lean`
+/// process, so each has its own session id.
 fn reader_freshness(meta: &LakeProjectMeta, imports: Vec<String>) -> Freshness {
     Freshness {
         session_id: format!("native-reader-{}", uuid::Uuid::new_v4()),
@@ -1401,15 +1415,8 @@ mod tests {
 
     use super::*;
 
-    /// The fixture root of an ignored test that starts workers. A worker start
-    /// runs the writer helper's hidden subcommands, which the lib test binary
-    /// lacks, so this names the built server in `LEAN_RS_WRITER_EXECUTABLE`
-    /// as the helper. The worker sockets go to the target directory.
+    /// The fixture root of an ignored test that starts workers.
     pub(super) fn worker_fixture() -> PathBuf {
-        let server = std::env::var_os(lean_toolchain::shared_writer::SHARED_WRITER_EXECUTABLE_ENV)
-            .unwrap_or_else(|| panic!("set LEAN_RS_WRITER_EXECUTABLE to the built lean-host-mcp"));
-        lean_rs_writer::use_helper_executable(Path::new(&server)).unwrap();
-        crate::native_socket::use_test_directory().unwrap();
         PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
             .canonicalize()
             .unwrap()
@@ -1431,9 +1438,8 @@ mod tests {
     fn cfg(lake_root: Option<PathBuf>) -> BrokerConfig {
         BrokerConfig {
             lake_root,
-            max_workers: NonZeroUsize::new(DEFAULT_MAX_WORKERS).unwrap(),
-            max_workers_per_project: NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
+            ..BrokerConfig::unserved()
         }
     }
 
@@ -1481,7 +1487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and a matching installed worker"]
     async fn same_project_workers_share_capacity_and_stop_together() {
         let root = worker_fixture();
         let mut config = cfg(Some(root.clone()));
@@ -1518,7 +1524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and a matching installed worker"]
     async fn same_project_checks_run_on_distinct_workers() {
         let root = worker_fixture();
         let runtime =
@@ -1570,7 +1576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and a matching installed worker"]
     async fn cancelling_one_project_worker_preserves_its_sibling() {
         let root = worker_fixture();
         let mut config = cfg(Some(root));
@@ -1618,6 +1624,7 @@ mod tests {
         PoolEnv {
             max_workers: max_workers.map(str::to_owned),
             max_workers_per_project: per_project.map(str::to_owned),
+            max_lean_runs: None,
             idle_timeout_secs: idle.map(str::to_owned),
         }
     }

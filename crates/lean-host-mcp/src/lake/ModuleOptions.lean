@@ -53,8 +53,9 @@ def freshWorkspace (cfg : LoadConfig) : IO Workspace := do
 
 -- Preserve only the root's saved -K settings. Dependency settings come from
 -- the freshly evaluated parent's `require ... with`, never a standalone cache.
--- This bounded read runs after the native guardian acknowledged the full SH
--- union, and does not import or modify the original cached configuration.
+-- This bounded read runs in the project's read turn, so no build the server
+-- runs changes the file, and it neither imports nor modifies the original
+-- cached configuration.
 def savedRootLakeOptions (cfg : LoadConfig) : IO (NameMap String) := do
   let some resolved ← (resolveConfigFile "[root]" cfg).toBaseIO
     | throw <| IO.userError "cannot resolve root Lake package configuration"

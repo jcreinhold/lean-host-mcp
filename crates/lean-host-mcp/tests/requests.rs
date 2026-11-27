@@ -12,16 +12,18 @@
 mod support;
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use support::TestResult;
 use support::chain::{Chain, chain_project};
-use support::http::{self, Client, Launch, Scratch, Server};
+use support::http::{self, Client, Launch, Process, Scratch, Server};
 
-/// How long a test waits for a server to listen. A restart first waits for
-/// the helpers of the server it replaces.
-const STARTUP: Duration = Duration::from_mins(16);
+/// How long a test waits for a server to listen. A restart first stops what
+/// the server it replaces left running, which takes up to 35 seconds.
+const STARTUP: Duration = Duration::from_mins(2);
 /// How long a test waits for a request to end.
 const PATIENCE: Duration = Duration::from_mins(5);
 
@@ -248,6 +250,18 @@ fn marker_lines(root: &Path) -> TestResult<Vec<String>> {
     }
 }
 
+/// Wait until `path` exists.
+async fn wait_for_path(path: &Path) -> TestResult {
+    let until = Instant::now().checked_add(PATIENCE).ok_or("patience")?;
+    while !path.exists() {
+        if Instant::now() >= until {
+            return Err(format!("{} did not appear within {PATIENCE:?}", path.display()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
 /// Wait until a build with `tag` has reached its step.
 async fn wait_for_marker(root: &Path, tag: &str) -> TestResult {
     let until = Instant::now().checked_add(PATIENCE).ok_or("patience")?;
@@ -369,9 +383,97 @@ async fn a_killed_server_interrupts_its_build_and_runs_the_queued_one() -> TestR
     Ok(())
 }
 
-/// A server killed while its worker is warm and a file check runs takes both
-/// with it, guardians included, and the next server's build runs without
-/// waiting for them.
+/// A recipe whose one step ignores SIGTERM, writes `stuck.txt` in the root,
+/// then sleeps for ten minutes. Lake runs the shell, which passes on its
+/// ignored SIGTERM to `sleep`.
+const STUCK: &str = r#"
+[recipes.stuck]
+steps = [["env", "sh", "-c", "trap '' TERM; echo stuck > stuck.txt; sleep 600"]]
+"#;
+
+/// Whether server log `log` says the server sent `signal` to process group
+/// `group`.
+fn signalled(log: &str, group: u32, signal: i32) -> bool {
+    log.lines().any(|line| {
+        line.contains("signalled a process group of an earlier server")
+            && line.split_whitespace().any(|word| word == format!("group={group}"))
+            && line.split_whitespace().any(|word| word == format!("signal={signal}"))
+    })
+}
+
+/// A server killed during a build leaves the build step's process group
+/// running, and this group ignores SIGTERM. The next server on the same store
+/// sends the group SIGTERM, then SIGKILL once its grace period ends, and
+/// listens only after the group has exited: a `ps` sample every 20 ms saw the
+/// group last before the server listened. Then the server serves: the killed
+/// build's row is `interrupted`, and a new build runs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Lean toolchain: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
+async fn the_next_server_serves_only_after_a_killed_servers_build_exits() -> TestResult {
+    let chain = chain_project()?;
+    chain.write("lean-host-mcp.toml", &format!("{MARK}{STUCK}"))?;
+    let scratch = Scratch::new()?;
+    let launch = Launch::new(&chain.root, &scratch)?;
+    let server = Server::start(&launch, STARTUP).await?;
+    let client = Client::new(&server.url, "before")?;
+    let id = "stuck-build-0001";
+    client.run(id, "lean_build", &json!({"recipe": "stuck"})).await?;
+    wait_for_path(&chain.root.join("stuck.txt")).await?;
+    let all = http::processes()?;
+    let group = match http::lake_builds(&all, &scratch.store)[..] {
+        [build] => build.pgid,
+        ref builds => return Err(format!("expected one Lake build step: {builds:?}").into()),
+    };
+    let in_group = move |all: &[Process]| all.iter().filter(|process| process.pgid == group).count();
+    server.kill().await?;
+    let killed_at = Instant::now();
+    assert!(
+        in_group(&http::processes()?) > 0,
+        "the build step's group exited with its server"
+    );
+    // The time before the last sample that saw the group.
+    let watch = std::thread::spawn(move || -> Result<Instant, String> {
+        let mut seen = killed_at;
+        loop {
+            let at = Instant::now();
+            let all = http::processes().map_err(|error| error.to_string())?;
+            if in_group(&all) == 0 {
+                return Ok(seen);
+            }
+            seen = at;
+            if killed_at.elapsed() > Duration::from_mins(3) {
+                return Err(format!("group {group} still runs 3 minutes after the kill"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    let restarted = Instant::now();
+    let server = Server::start(&launch, STARTUP).await?;
+    let listened = Instant::now();
+    let seen = watch.join().map_err(|_| "the group watch failed")??;
+    eprintln!(
+        "the next server listened {:?} after it started; a sample saw the group {:?} before that",
+        listened.duration_since(restarted),
+        listened.duration_since(seen)
+    );
+    assert!(seen < listened, "the next server listened while the group ran");
+    let log = server.log();
+    assert!(signalled(&log, group, 15), "no SIGTERM to group {group}:\n{log}");
+    assert!(signalled(&log, group, 9), "no SIGKILL to group {group}:\n{log}");
+
+    let client = Client::new(&server.url, "after")?;
+    let interrupted = client.get(id, 0).await?;
+    assert_eq!(http::state(&interrupted), Some("interrupted"), "{interrupted}");
+    client.run("after-mark-0001", "lean_build", &mark("after", 0)).await?;
+    assert_passed(&client.ended("after-mark-0001", PATIENCE).await?);
+    server.stop().await?;
+    Ok(())
+}
+
+/// A server killed while its worker is warm and a file check runs: the worker
+/// exits with its server, the check's Lean process outlives it, and the next
+/// server stops that process before it listens. Its build then runs at once.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
 async fn a_killed_servers_workers_exit_and_the_next_build_runs() -> TestResult {
@@ -389,15 +491,15 @@ async fn a_killed_servers_workers_exit_and_the_next_build_runs() -> TestResult {
     let check = json!({"kind": "file_diagnostics", "file": "Slow.lean"});
     client.run("slow-check-0001", "lean_status", &check).await?;
     let until = Instant::now().checked_add(PATIENCE).ok_or("patience")?;
+    let lean = |command: &str| {
+        command.contains("Slow.lean")
+            && command
+                .split_whitespace()
+                .next()
+                .is_some_and(|program| program.ends_with("/lean"))
+    };
     let tree = loop {
         let tree = http::descendants(server.pid()?)?;
-        let lean = |command: &str| {
-            command.contains("Slow.lean")
-                && command
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|program| program.ends_with("/lean"))
-        };
         if tree.iter().any(|process| lean(&process.command)) {
             break tree;
         }
@@ -406,21 +508,27 @@ async fn a_killed_servers_workers_exit_and_the_next_build_runs() -> TestResult {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let guardians = tree
-        .iter()
-        .filter(|process| process.command.contains("native-guardian"))
-        .count();
-    assert!(guardians >= 2, "a guardian for the worker and the check: {tree:#?}");
+    let workers: Vec<Process> = http::workers(&tree, server.pid()?).into_iter().cloned().collect();
+    assert!(!workers.is_empty(), "no warm worker: {tree:#?}");
+    let checks: Vec<Process> = tree.iter().filter(|process| lean(&process.command)).cloned().collect();
     server.kill().await?;
     let killed_at = Instant::now();
-    let report = http::watch_until_gone(&tree, killed_at, Duration::from_secs(30));
+    let report = http::watch_until_gone(&workers, killed_at, Duration::from_secs(30));
     for line in &report {
         eprintln!("after the kill: {line}");
     }
     let left: Vec<&String> = report.iter().filter(|line| line.contains("still running")).collect();
     assert!(left.is_empty(), "30 s after the kill: {left:#?}");
+    let running = |checks: &[Process]| -> TestResult<bool> {
+        let live = http::processes()?;
+        Ok(checks
+            .iter()
+            .any(|check| live.iter().any(|process| process.pid == check.pid)))
+    };
+    assert!(running(&checks)?, "the check's Lean process exited with its server");
 
     let server = Server::start(&launch, STARTUP).await?;
+    assert!(!running(&checks)?, "the check still ran when the next server listened");
     let client = Client::new(&server.url, "after")?;
     let started = Instant::now();
     client.run("after-build-0001", "lean_build", &mark("after", 0)).await?;
@@ -448,27 +556,74 @@ fn span(reply: &Value) -> TestResult<(i64, i64)> {
     Ok((at("started_at")?, at("finished_at")?))
 }
 
-/// Two checks on one project run at once: each takes the shared read turn and
-/// marks its row `running`, so neither row waits for the other to end. Their
-/// Lean processes do not overlap: each file check takes the SDK's one native
-/// preparation slot in turn. Each check holds Lean for two seconds, so the
-/// rows must overlap by more than one; with one turn at a time they would
-/// overlap by a few milliseconds at most. File checks run Lean from an
-/// installed worker's shim deployment.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
-async fn checks_on_one_project_run_at_once() -> TestResult {
-    std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
-    let chain = chain_project()?;
-    let files = ["SlowOne.lean", "SlowTwo.lean"];
-    for file in files {
-        std::fs::write(chain.root.join(file), SLOW)?;
+/// The files [`checks_at_once`] checks, each with [`SLOW`].
+const SLOW_FILES: [&str; 2] = ["SlowOne.lean", "SlowTwo.lean"];
+
+/// Whether `process` is a Lean process that checks `file`.
+fn checks_file(process: &Process, file: &str) -> bool {
+    process.command.contains(file)
+        && process
+            .command
+            .split_whitespace()
+            .next()
+            .is_some_and(|program| program.ends_with("/lean"))
+}
+
+/// When a `ps` sample every 20 ms saw a Lean process check each of
+/// [`SLOW_FILES`], in milliseconds from the first call.
+#[derive(Debug)]
+struct LeanRuns {
+    /// For each file, the first and last sample that saw its Lean process.
+    spans: [Option<(u128, u128)>; 2],
+    /// The samples that saw both files' Lean processes at once.
+    together: u32,
+}
+
+impl LeanRuns {
+    /// How long the samples saw both Lean processes run at once, in
+    /// milliseconds: zero when one ended before the other started.
+    fn overlap(&self) -> TestResult<u128> {
+        let [Some(one), Some(two)] = self.spans else {
+            return Err(format!("a Lean process was never seen: {self:?}").into());
+        };
+        Ok(one.1.min(two.1).saturating_sub(one.0.max(two.0)))
     }
-    let scratch = Scratch::new()?;
-    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+}
+
+/// Check each of [`SLOW_FILES`] as a named request on `server`, both at
+/// once, while a thread lists the processes every 20 ms. Returns each row's
+/// start and end and what the thread saw.
+async fn checks_at_once(server: &Server) -> TestResult<(Vec<(i64, i64)>, LeanRuns)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let since = Instant::now();
+    let sampler = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let mut runs = LeanRuns {
+                spans: [None; 2],
+                together: 0,
+            };
+            while !stop.load(Ordering::SeqCst) {
+                let at = since.elapsed().as_millis();
+                if let Ok(all) = http::processes() {
+                    let seen = SLOW_FILES.map(|file| all.iter().any(|process| checks_file(process, file)));
+                    for (span, seen) in runs.spans.iter_mut().zip(seen) {
+                        if seen {
+                            *span = Some(span.map_or((at, at), |(first, _)| (first, at)));
+                        }
+                    }
+                    if seen.iter().all(|seen| *seen) {
+                        runs.together = runs.together.saturating_add(1);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            runs
+        }
+    });
     let client = Client::new(&server.url, "checks")?;
-    let ids = ["overlap-one-0001", "overlap-two-0001"];
-    for (id, file) in ids.into_iter().zip(files) {
+    let ids = ["lean-runs-one-0001", "lean-runs-two-0001"];
+    for (id, file) in ids.into_iter().zip(SLOW_FILES) {
         client
             .run(id, "lean_status", &json!({"kind": "file_diagnostics", "file": file}))
             .await?;
@@ -480,15 +635,61 @@ async fn checks_on_one_project_run_at_once() -> TestResult {
         assert_eq!(reply.pointer("/result/isError"), Some(&json!(false)), "{reply}");
         spans.push(span(&reply)?);
     }
-    let [first, second] = spans[..] else {
-        return Err("expected two rows".into());
-    };
-    let overlap = first.1.min(second.1).saturating_sub(first.0.max(second.0));
-    eprintln!("the check rows overlapped by {overlap} ms: {first:?} {second:?}");
-    assert!(
-        overlap > 1000,
-        "the checks were not running at once: {first:?} {second:?}"
-    );
+    stop.store(true, Ordering::SeqCst);
+    let runs = sampler.join().map_err(|_| "the process sampler failed")?;
+    eprintln!("check rows (start, end) in ms since the epoch: {spans:?}");
+    eprintln!("Lean processes (first, last seen) in ms after the first call: {runs:?}");
+    Ok((spans, runs))
+}
+
+/// A chain project with [`SLOW_FILES`].
+fn slow_chain() -> TestResult<Chain> {
+    let chain = chain_project()?;
+    for file in SLOW_FILES {
+        chain.write(file, SLOW)?;
+    }
+    Ok(chain)
+}
+
+/// Two file checks on one project, sent at once, run Lean at once under the
+/// default `broker.max_lean_runs` of 2: each Lean process holds Lean for two
+/// seconds, and the samples see both run together for more than one second.
+/// File checks need an installed worker's shim deployment.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
+async fn two_file_checks_run_lean_at_once() -> TestResult {
+    std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
+    let chain = slow_chain()?;
+    let scratch = Scratch::new()?;
+    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let (_, runs) = checks_at_once(&server).await?;
+    let overlap = runs.overlap()?;
+    eprintln!("the Lean processes ran at once for {overlap} ms");
+    assert!(runs.together > 0, "no sample saw both Lean processes: {runs:?}");
+    assert!(overlap > 1000, "the Lean processes barely overlapped: {runs:?}");
+    server.stop().await?;
+    Ok(())
+}
+
+/// With `broker.max_lean_runs` at 1, the same two checks take turns: no
+/// sample sees both Lean processes, and the checks take more than the four
+/// seconds the two Lean processes hold Lean in turn.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
+async fn with_one_lean_run_two_file_checks_take_turns() -> TestResult {
+    std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
+    let chain = slow_chain()?;
+    let scratch = Scratch::new()?;
+    let launch = Launch::new(&chain.root, &scratch)?.env("LEAN_HOST_MCP_MAX_LEAN_RUNS", "1");
+    let server = Server::start(&launch, STARTUP).await?;
+    let (spans, runs) = checks_at_once(&server).await?;
+    assert_eq!(runs.together, 0, "a sample saw both Lean processes: {runs:?}");
+    assert_eq!(runs.overlap()?, 0, "the Lean processes overlapped: {runs:?}");
+    let start = spans.iter().map(|span| span.0).min().ok_or("no rows")?;
+    let end = spans.iter().map(|span| span.1).max().ok_or("no rows")?;
+    let total = end.saturating_sub(start);
+    eprintln!("the two checks took {total} ms from the first start to the last end");
+    assert!(total > 4000, "the checks took {total} ms: {spans:?}");
     server.stop().await?;
     Ok(())
 }

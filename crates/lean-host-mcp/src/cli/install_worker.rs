@@ -15,15 +15,18 @@
 //!   which with `--lake-root` includes the root's recorded
 //!   `[install] elan_home`.
 //!
-//! A build uses this executable as the SDK writer for the worker's shims, and
-//! runs the worker's smoke test, which is native work. With `--lake-root` its
-//! state goes in that root's store; without, set
-//! `LEAN_RS_WORKER_OWNERS_DIRECTORY`.
+//!   A build has the new worker build its shims with plain Lake in its own
+//!   generation directory, then runs the worker's smoke test.
 //! - `--list`: print a table of currently-installed workers, including a
 //!   `protocol` column that reports wire compatibility.
 //! - `--clean [--toolchain <id>]`: remove all installed workers, or just one.
 //! - `--prune`: remove only unservable workers (outside the supported window,
 //!   or with a failed smoke test), keeping servable-but-stale ones.
+//!
+//! With `--lake-root`, every action but `--list` holds the root's store, as
+//! `install` does, so it refuses while a server serves the root and its
+//! workers run from the directory. A run given only a worker directory cannot
+//! tell which server uses it; stop those servers first.
 //!
 //! The worker is always compiled locally per toolchain (its `build.rs` bakes an
 //! absolute rpath, so binaries don't travel), with `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>`
@@ -144,6 +147,12 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     if args.list {
         return run_list(&root);
     }
+    // Workers of a server on this root run from the directory this run
+    // changes; holding the root's store refuses while that server runs.
+    let _held = lake_root
+        .as_deref()
+        .map(|root| store::hold(&store::store_dir(root, None), root))
+        .transpose()?;
     if args.prune {
         return prune_in(&root);
     }
@@ -152,38 +161,16 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
         let target = args.toolchain.as_deref().map(ToolchainId::parse).transpose()?;
         return clean_in(&root, target.as_ref());
     }
-    // Default action (no flag) and `--auto` both scan and install. Check where
-    // the smoke test keeps its native state before a long build.
-    use_native_state(lake_root.as_deref())?;
+    // Default action (no flag) and `--auto` both scan and install.
     let source = resolve_worker_source(args.source_dir.as_deref())?;
-    // This executable serves the SDK writer that builds the worker's shims.
-    let writer = std::env::current_exe().map_err(|e| anyhow::anyhow!("cannot find this executable: {e}"))?;
     if let Some(raw) = args.toolchain.as_deref() {
         // `check_arg_combination` ruled out `--toolchain --auto`, so this is a
         // single-toolchain install (always overwrites — no freshness check).
         let id = ToolchainId::parse(raw)?;
-        install_one(&root, &id, &source, &writer)?;
+        install_one(&root, &id, &source)?;
         return Ok(());
     }
-    run_auto(&root, &source, &writer, args.force)
-}
-
-/// Keep the native state of a worker's smoke test in the store of the
-/// canonical Lake root `lake_root`, creating the store. Without a root,
-/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` must name the owner directory.
-fn use_native_state(lake_root: Option<&Path>) -> anyhow::Result<()> {
-    match lake_root {
-        Some(root) => {
-            let dir = store::store_dir(root, None);
-            store::create_store_dir(&dir, root)
-                .and_then(|()| store::use_for_native_state(&dir))
-                .map_err(|e| anyhow::anyhow!("cannot keep native state in the store {}: {e}", dir.display()))?;
-        }
-        None => {
-            store::owner_directory()?;
-        }
-    }
-    Ok(())
+    run_auto(&root, &source, args.force)
 }
 
 /// The worker directory this run acts on. With the canonical `lake_root` it
@@ -322,7 +309,7 @@ struct ListRow {
     sort_key: (u8, (u32, u32, u32, u8, u32), String),
 }
 
-fn run_auto(root: &Path, source: &WorkerSource, writer: &Path, force: bool) -> anyhow::Result<()> {
+fn run_auto(root: &Path, source: &WorkerSource, force: bool) -> anyhow::Result<()> {
     let toolchains = discover_elan_toolchains()?;
     if toolchains.is_empty() {
         let home = toolchain::elan_home().map_or_else(|| "$ELAN_HOME".to_owned(), |home| home.display().to_string());
@@ -336,7 +323,7 @@ fn run_auto(root: &Path, source: &WorkerSource, writer: &Path, force: bool) -> a
             AutoDecision::SkipCurrent => {
                 println!("{id}: current; skipping (use --force to rebuild)");
             }
-            AutoDecision::Install(reason) => match install_one(root, &id, source, writer) {
+            AutoDecision::Install(reason) => match install_one(root, &id, source) {
                 Ok(_) => println!("{id}: installed ({reason})"),
                 Err(err) => {
                     eprintln!("{id}: failed: {err}");
@@ -502,43 +489,15 @@ fn verify_named_handle(path: &Path, file: &fs::File, directory: bool) -> anyhow:
     Ok(())
 }
 
-/// Take all reader domains before removing anything, including for superseded workers.
+/// Remove the worker slot `slot`, under its slot lock, while its selected
+/// generation is still `expected`.
 fn retire_slot(slot: &Path, expected: &Path) -> anyhow::Result<()> {
     let _mutation = lock_slot(slot)?;
-    let mut guards = Vec::new();
-    for entry in fs::read_dir(slot)? {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with("generation-") {
-            continue;
-        }
-        anyhow::ensure!(entry.file_type()?.is_dir(), "invalid worker generation directory");
-        let dir = entry.path();
-        for domain in [
-            "shims/lean-rs-host-shims",
-            "shims/lean-rs-interop-shims",
-            "smoke-project",
-        ] {
-            let root = dir.join(domain);
-            anyhow::ensure!(
-                root.canonicalize()? == root && root.is_dir(),
-                "invalid installed artifact domain"
-            );
-            let path = lean_toolchain::shared_writer::project_lock_path(&root)?;
-            let guard = InstallationLock::acquire(fs::File::open(&path)?)?;
-            verify_named_handle(&path, &guard.0, false)?;
-            anyhow::ensure!(
-                lean_toolchain::shared_writer::previous_writer_stopped(&guard.0)?,
-                "installed artifact writer still active"
-            );
-            guards.push(guard);
-        }
-    }
     anyhow::ensure!(
         WorkerBinary::selected_dir(slot)? == expected,
         "selected generation changed before retirement"
     );
     fs::remove_dir_all(slot)?;
-    drop(guards);
     Ok(())
 }
 
@@ -597,14 +556,7 @@ fn prune_reason(name: &str, install_dir: &Path) -> Option<&'static str> {
 }
 
 /// Build, qualify and select a worker for `id` in the worker directory `root`.
-/// `writer`, a host executable that serves the SDK helper subcommands, builds
-/// the worker's shims.
-pub(super) fn install_one(
-    root: &Path,
-    id: &ToolchainId,
-    source: &WorkerSource,
-    writer: &Path,
-) -> anyhow::Result<PathBuf> {
+pub(super) fn install_one(root: &Path, id: &ToolchainId, source: &WorkerSource) -> anyhow::Result<PathBuf> {
     // Classify against the supported window *before* the multi-minute build —
     // an out-of-window worker would only fail lean-rs-sys's header-digest
     // check minutes later.
@@ -629,12 +581,9 @@ pub(super) fn install_one(
     let elan_dir = id.elan_dir()?;
 
     let dest_dir = root.join(id.as_str());
-    let writer = writer
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("cannot find the SDK writer {}: {e}", writer.display()))?;
     fs::create_dir_all(&dest_dir)?;
     let _mutation = lock_slot(&dest_dir)?;
-    let generation = prepare_generation(&dest_dir, id, &elan_dir.canonicalize()?, &writer, |dir| {
+    let generation = prepare_generation(&dest_dir, id, &elan_dir.canonicalize()?, |dir| {
         build_worker(source, id, &elan_dir, dir)
     })?;
     select_generation(&dest_dir, &generation)?;
@@ -645,7 +594,6 @@ pub(super) fn prepare_generation(
     slot: &Path,
     id: &ToolchainId,
     sysroot: &Path,
-    writer: &Path,
     build: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(slot)?;
@@ -654,7 +602,7 @@ pub(super) fn prepare_generation(
     // The generated manifests contain absolute paths, including during the smoke.
     // Keep the generation if a native operation leaves cleanup uncertain.
     let generation = generation.keep().canonicalize()?;
-    super::installed_shims::qualify(&generation, id, sysroot, writer)?;
+    super::installed_shims::qualify(&generation, id, sysroot)?;
     Ok(generation)
 }
 
@@ -979,7 +927,7 @@ mod tests {
         let slot = root.path().join(id.as_str());
         let sidecar = std::fs::read(slot.join("worker.json"))?;
         for fail_build in [true, false] {
-            let failed = super::prepare_generation(&slot, &id, root.path(), root.path(), |dir| {
+            let failed = super::prepare_generation(&slot, &id, root.path(), |dir| {
                 anyhow::ensure!(!fail_build, "build failed");
                 std::fs::write(dir.join(WORKER_FILE_NAME), b"candidate")?;
                 Ok(())
@@ -1070,39 +1018,20 @@ mod tests {
     }
 
     #[test]
-    fn active_generation_refuses_retirement_until_reader_closes() -> anyhow::Result<()> {
+    fn retirement_refuses_a_slot_whose_selection_changed() -> anyhow::Result<()> {
         let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let root = temp.path().canonicalize()?;
         let id = ToolchainId::parse("v4.23.0")?;
         let slot = root.join(id.as_str());
         std::fs::create_dir(&slot)?;
-        let mut locks = Vec::new();
         for name in ["generation-old", "generation-current"] {
             let dir = slot.join(name);
-            for domain in [
-                "shims/lean-rs-host-shims",
-                "shims/lean-rs-interop-shims",
-                "smoke-project",
-            ] {
-                let path = dir.join(domain);
-                std::fs::create_dir_all(&path)?;
-                locks.push(std::fs::File::create_new(
-                    lean_toolchain::shared_writer::project_lock_path(&path)?,
-                )?);
-            }
+            std::fs::create_dir(&dir)?;
             std::fs::write(dir.join(WORKER_FILE_NAME), b"worker")?;
             super::select_generation(&slot, &dir)?;
         }
-        let selected = slot.join("generation-current");
         assert!(super::retire_slot(&slot, &slot.join("generation-old")).is_err());
-        for reader in &locks {
-            reader.try_lock_shared().map_err(std::io::Error::from)?;
-            assert!(super::clean_in(&root, Some(&id)).is_err());
-            assert!(super::prune_in(&root).is_err());
-            assert_eq!(crate::toolchain::WorkerBinary::selected_dir(&slot)?, selected);
-            assert!(slot.join("generation-old").join(WORKER_FILE_NAME).is_file());
-            reader.unlock()?;
-        }
+        assert!(slot.join("generation-old").join(WORKER_FILE_NAME).is_file());
         super::prune_in(&root)?;
         assert!(!slot.exists());
         Ok(())

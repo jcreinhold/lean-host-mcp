@@ -88,8 +88,9 @@ impl Default for ControlState {
     }
 }
 
-/// One admitted preparation, retained by its actual native cleanup owner.
-/// It counts in the pool's activity without taking a worker slot.
+/// One admitted preparation: a short run, or a file's module setup, that
+/// counts in the pool's activity without taking a worker slot. The run's
+/// group holds it until the group has exited.
 #[derive(Debug)]
 pub(crate) struct PreparationActivityGuard {
     active_jobs: Arc<AtomicUsize>,
@@ -278,6 +279,7 @@ mod tests {
             lake_root: None,
             max_workers: std::num::NonZeroUsize::MIN,
             max_workers_per_project: std::num::NonZeroUsize::MIN,
+            max_lean_runs: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         })
     }
@@ -330,13 +332,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and a matching installed worker"]
     async fn background_maintenance_and_detached_activity_stay_counted() -> TestResult {
         let root = super::super::tests::worker_fixture();
         let broker = ProjectBroker::new(super::super::BrokerConfig {
             lake_root: Some(root.clone()),
             max_workers: std::num::NonZeroUsize::MIN,
             max_workers_per_project: std::num::NonZeroUsize::MIN,
+            max_lean_runs: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         });
         let call = broker

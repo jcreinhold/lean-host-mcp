@@ -207,20 +207,6 @@ fn index_declarations(
     let index = crate::ilean::declarations_in_module(root, module);
     let base = ctx.broker.project_identity_without_worker(&hint, Vec::new())?;
     let mut response = match index.status {
-        crate::ilean::ModuleDeclarationIndexStatus::Unavailable => Response::ok(
-            DeclarationInventoryResult {
-                status: "unavailable".to_owned(),
-                declarations: Vec::new(),
-                truncated: false,
-                source: "ilean".to_owned(),
-                files_scanned: 0,
-                message: Some("artifact read custody is unavailable; no declaration index was read".to_owned()),
-                diagnostics: None,
-            },
-            base.freshness,
-        )
-        .with_runtime(base.runtime)
-        .warn("artifact read custody is unavailable; retry when the artifact workspace is ready"),
         crate::ilean::ModuleDeclarationIndexStatus::ProjectNotBuilt => Response::ok(
             missing_build_result(format!(
                 "project build tree is absent; no .ilean declaration index is available for module `{module}`"
@@ -824,29 +810,5 @@ mod tests {
         assert!(broker.resident_paths().is_empty());
         drop(ctx);
         drop(broker);
-    }
-
-    #[test]
-    fn blocked_declaration_index_reports_unavailable_without_freshness_claim() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = make_lake_dir(temp.path());
-        copy_ilean(&root, "Demo.A", "demo_a.ilean");
-        let (ctx, broker) = test_context(root.clone());
-        let lock_path = lean_toolchain::shared_writer::project_lock_path(&root).unwrap();
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-            .unwrap();
-        lock.lock().unwrap();
-        let response = index_declarations(&ctx, ProjectHint::from_request(None), &root, "Demo.A", 10).unwrap();
-        let result = response.result_ref().unwrap();
-        assert_eq!(result.status, "unavailable");
-        assert_eq!(result.files_scanned, 0);
-        assert!(result.declarations.is_empty());
-        assert!(response.trust_artifacts.is_empty());
-        broker.shutdown_all();
     }
 }

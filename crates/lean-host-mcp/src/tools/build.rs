@@ -23,8 +23,8 @@ pub const MAX_IMPORT_FILES: usize = 16;
 ///
 /// # Errors
 /// Returns invalid params when the request does not fit the project's
-/// config, and the broker's error when the build gets no turn, its writer
-/// does not open, or the request is cancelled.
+/// config, and the broker's error when the build gets no turn, a worker does
+/// not exit, or the request is cancelled.
 pub async fn lean_build(ctx: &ToolContext, request: BuildRequest) -> Result<BuildOutcome, McpError> {
     lean_build_as(ctx, request, &new_id()).await
 }
@@ -69,7 +69,7 @@ pub(crate) fn plan_build(ctx: &ToolContext, request: &BuildRequest) -> Result<Pl
 }
 
 /// Run `build` as build `id`, writing its output to `log`. `on_running` runs
-/// once the build holds the write turn and the writer lock.
+/// once the build holds the write turn and the project's workers have exited.
 ///
 /// # Errors
 /// As [`lean_build`], and when `on_running` fails.
@@ -80,8 +80,7 @@ pub(crate) async fn run_planned(
     log: &Path,
     on_running: Option<OnRunning>,
 ) -> Result<BuildOutcome, McpError> {
-    let helper = lean_rs_writer::contract().map_err(ServerError::Io)?.executable;
-    Ok(run_build(&ctx.broker, &build.root, build.plan, id, log, &helper, on_running).await?)
+    Ok(run_build(&ctx.broker, &build.root, build.plan, id, log, on_running).await?)
 }
 
 /// `lean_imports` arguments.

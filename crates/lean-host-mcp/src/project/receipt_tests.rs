@@ -82,8 +82,6 @@ while True:
         if (root / 'change_artifact_epoch_once').exists():
             (root / 'change_artifact_epoch_once').unlink()
             send('artifact_epoch_changed')
-        elif (root / 'refuse_artifact_read').exists():
-            send('artifact_refusal')
         elif (root / 'require_missing_import').exists() and not (root / '.lake/build/lib/lean/B.olean').exists():
             send('missing_import')
         else:
@@ -92,11 +90,6 @@ while True:
         while (root / 'hold_runtime_metadata').exists():
             time.sleep(0.005)
         send('metadata')
-    elif operation == 'release_host_read':
-        if (root / 'hang_read_release').exists():
-            while True:
-                time.sleep(60)
-        send('read_released')
     elif operation == 'terminate':
         send('terminating')
         sys.exit(0)
@@ -135,7 +128,6 @@ fn fake_worker(root: &Path, remove_executable: bool) -> PathBuf {
     );
     write_message(root, "healthy", Message::Response(Response::HealthOk));
     write_message(root, "terminating", Message::Response(Response::Terminating));
-    write_message(root, "read_released", Message::Response(Response::HostReadReleased));
     write_message(
         root,
         "artifact_epoch_changed",
@@ -154,14 +146,6 @@ fn fake_worker(root: &Path, remove_executable: bool) -> PathBuf {
                     },
                 ),
             },
-        }),
-    );
-    write_message(
-        root,
-        "artifact_refusal",
-        Message::Response(Response::Error {
-            code: "lean_rs.worker.artifact_read_unavailable".to_owned(),
-            message: "fixture prepared snapshot changed before body".to_owned(),
         }),
     );
     write_message(
@@ -201,11 +185,6 @@ fn fake_worker(root: &Path, remove_executable: bool) -> PathBuf {
         "metadata",
         Message::Response(Response::HostRuntimeMetadata {
             metadata: lean_rs_worker_parent::LeanWorkerHostRuntimeMetadata {
-                effective_import_roots: None,
-                artifact_read_epochs: Some(vec![lean_rs_worker_parent::LeanWorkerArtifactReadEpoch {
-                    project_root: root.to_string_lossy().into_owned(),
-                    epoch: "fake-owned-writer-17".into(),
-                }]),
                 compiled_lean_version: "4.35.0".into(),
                 compiled_header_sha256: expectation.compiled_header_sha256.expect("fixture header"),
                 runtime_lean_version: Some("4.35.0".into()),
@@ -234,7 +213,6 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
         pool_active_jobs: Arc::new(AtomicUsize::new(0)),
         healthy: Arc::new(AtomicBool::new(true)),
         runtime: Arc::new(Mutex::new(RuntimeSnapshot {
-            protected_artifact_domains: BTreeSet::new(),
             worker_generation: 1,
             last_restart: None,
             rss_kib: None,
@@ -266,7 +244,6 @@ fn fixture_config(
         worker_path: executable,
         lean_sysroot: root.join("unused-sysroot"),
         prepared_host_artifacts: None,
-        native_capacity_limit: crate::broker::DEFAULT_MAX_WORKERS,
         session_id: project.session_id.clone(),
         runtime: Arc::clone(&project.runtime),
         healthy: Arc::clone(&project.healthy),
@@ -474,8 +451,7 @@ async fn query(project: &LeanProject) -> Result<ProjectCall<LeanWorkerModuleQuer
 
 /// One refused warm open replaces the worker before the target body, and the
 /// body runs once, on the replacement. This tests pre-body generation cycling,
-/// not physical artifact-lock custody or Lean elaboration; those have separate
-/// real-worker coverage.
+/// not Lean elaboration, which has separate real-worker coverage.
 #[tokio::test]
 async fn one_warm_prebody_cycle_runs_the_target_body_once() {
     let harness = ActorHarness::start(false);
@@ -884,8 +860,6 @@ async fn incompatible_session_metadata_refuses_before_target_body() {
         "metadata",
         Message::Response(Response::HostRuntimeMetadata {
             metadata: lean_rs_worker_parent::LeanWorkerHostRuntimeMetadata {
-                effective_import_roots: None,
-                artifact_read_epochs: None,
                 compiled_lean_version: "4.35.0".into(),
                 compiled_header_sha256: incompatible.compiled_header_sha256.expect("header"),
                 runtime_lean_version: Some("4.35.0".into()),
@@ -1008,28 +982,24 @@ async fn call_under_turn(harness: &ActorHarness, lock: &crate::project_lock::Pro
     .await
 }
 
-/// The fake worker holds no kernel lock, so a write turn can finish while it
-/// lives, which a real worker prevents. The count then makes the actor
-/// replace it once, before the next job.
+/// A build stops the project's workers before Lake runs; this fake worker
+/// lives through a finished write turn instead. The count then makes the
+/// actor replace it once, before the next job.
 #[tokio::test]
 async fn a_build_finished_since_load_replaces_the_worker_once() {
-    use crate::project_lock::{Demand, ProjectLock};
+    use crate::project_lock::{ProjectLock, ensure_write};
 
     let harness = ActorHarness::start_with_runtime(false, None, None, Some(TEST_DEADLINE));
     let lock = Arc::new(ProjectLock::default());
     let (granted, first) = call_under_turn(&harness, &lock).await;
     assert_eq!(granted, 0);
     assert!(first.runtime.call_restart.is_none(), "{:?}", first.runtime.call_restart);
-    let handle = tokio::runtime::Handle::current();
-    lock.observe_demand(Demand::Present, &handle);
-    lock.observe_demand(Demand::Absent, &handle);
-    tokio::time::timeout(TEST_DEADLINE, async {
-        while lock.builds_finished() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the outside writer's turn finishes");
+    let until = tokio::time::Instant::now() + TEST_DEADLINE;
+    ensure_write(&lock, "build", until, &crate::cancellation::CallCancellation::default())
+        .await
+        .expect("a free write turn")
+        .finish();
+    assert_eq!(lock.builds_finished(), 1);
     let (granted, second) = call_under_turn(&harness, &lock).await;
     assert_eq!(granted, 1);
     let restart = second
@@ -1046,33 +1016,6 @@ async fn a_build_finished_since_load_replaces_the_worker_once() {
         third.runtime.call_restart
     );
     assert_eq!(harness.requests("spawn").len(), 2, "one replacement");
-    harness.finish().await;
-}
-
-#[tokio::test]
-async fn known_metadata_result_survives_read_release_failure_without_replay() {
-    let harness = ActorHarness::start(false);
-    fs::write(harness.root.path().join("hang_read_release"), "").expect("configure resource cleanup hang");
-    let call = harness
-        .project
-        .native_compatibility(admission_deadline())
-        .await
-        .expect("known metadata outcome survives cleanup failure");
-    let ((), runtime) = call.into_parts();
-    let evidence = runtime.native_compatibility.expect("actual observed metadata");
-    assert_eq!(evidence.loaded[0].worker_generation, 1);
-    assert!(
-        harness
-            .project
-            .protected_artifact_domains()
-            .contains(&harness.root.path().to_path_buf()),
-        "actual read domains survive a failed release independently of returned runtime facts"
-    );
-    harness.wait_for_retirement().await;
-    assert_eq!(harness.requests("host_runtime_metadata").len(), 1);
-    assert_eq!(harness.requests("release_host_read").len(), 1);
-    assert!(harness.requests("process_module_query").is_empty());
-    assert!(!harness.project.is_healthy());
     harness.finish().await;
 }
 
@@ -1129,50 +1072,6 @@ async fn missing_import_after_replacement_refuses_before_the_target_body() {
         "only the healthy replacement is resident"
     );
     harness.finish().await;
-}
-
-#[tokio::test]
-async fn artifact_refusal_returns_once_then_retires_actor_without_body_or_replay() {
-    let harness = ActorHarness::start(false);
-    fs::write(harness.root.path().join("refuse_artifact_read"), "").expect("refuse stale admission");
-    let request = CancellationToken::new();
-    let (result, evidence) = crate::cancellation::with_cancellation_evidence(&request, query(&harness.project)).await;
-    let failure = failure(result.expect_err("stale snapshot must refuse before body"));
-    assert!(failure.reason.contains("artifact_read_unavailable"));
-    assert_eq!(failure.runtime.final_attempt, FinalAttemptStatus::Completed);
-    assert!(failure.worker_stop_receipt.is_none());
-    assert_eq!(evidence.returned, 1);
-    assert_eq!(evidence.pending, 0);
-    assert!(!evidence.uncertain);
-    harness.wait_for_retirement().await;
-    assert_eq!(harness.requests("open_host_session").len(), 1);
-    assert!(harness.requests("process_module_query").is_empty());
-    assert!(!harness.project.is_healthy());
-    assert_eq!(
-        harness.requests("spawn").len(),
-        1,
-        "refusal never replays into a replacement"
-    );
-    harness.finish().await;
-}
-
-#[test]
-fn semantic_artifact_refusal_retires_common_actor_before_error_projection() {
-    let root = tempfile::tempdir().expect("semantic refusal fixture");
-    let tracker = LeanWorkerProcessTracker::new();
-    let (project, state) = ordinary_state(root.path(), &tracker);
-    state.seal_artifact_refusal(&LeanWorkerError::Worker {
-        code: "fixture.ordinary_error".to_owned(),
-        message: "unchanged".to_owned(),
-    });
-    assert!(project.healthy.load(Ordering::Acquire));
-    state.seal_artifact_refusal(&LeanWorkerError::Worker {
-        code: "lean_rs.worker.artifact_read_unavailable".to_owned(),
-        message: "stale semantic descriptor".to_owned(),
-    });
-    assert!(!project.healthy.load(Ordering::Acquire));
-    state.handle.shutdown().expect("reap real companion fixture");
-    assert_eq!(tracker.active_processes(), 0);
 }
 
 #[tokio::test]
@@ -1378,7 +1277,6 @@ fn compiled_abi_guard_survives_an_actual_worker_replacement() {
             .open_session(None, None)
             .expect("valid first loaded session");
     }
-    state.handle.release_host_read().expect("known first logical release");
     assert_eq!(requests_at(root.path(), "spawn").len(), 1);
     alter_runtime_metadata(root.path(), |actual| {
         actual
