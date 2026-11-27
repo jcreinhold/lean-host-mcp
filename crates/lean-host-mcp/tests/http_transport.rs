@@ -1415,9 +1415,13 @@ impl HttpMcpServer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        // Prefer the worker built alongside this test over the developer's
-        // installed set. See `support::built_workers_dir`.
-        if let Some(dir) = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp")) {
+        // A worker directory the caller names, such as a test install's, wins,
+        // as in `support::http`: a worker serves only from its installed
+        // deployment. Else the worker built with this test, not the
+        // developer's installed one. See `support::built_workers_dir`.
+        if std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").is_none()
+            && let Some(dir) = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp"))
+        {
             command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
         }
         for (key, value) in args {
