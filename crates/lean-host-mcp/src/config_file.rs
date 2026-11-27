@@ -23,23 +23,23 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Tracked file name at the Lake root. Also the file `config init` writes.
-pub const TRACKED_FILE_NAME: &str = "lean-host-mcp.toml";
+pub(crate) const TRACKED_FILE_NAME: &str = "lean-host-mcp.toml";
 
 /// Ignored local file name inside [`local_dir`]. `lean-host-mcp install`
 /// writes it.
-pub const LOCAL_FILE_NAME: &str = "config.toml";
+pub(crate) const LOCAL_FILE_NAME: &str = "config.toml";
 
 /// `<root>/.local/lean-host-mcp`: the machine-local directory for one Lake
 /// root. It holds the local config file and, by default, the installed
 /// binaries, workers and server store.
 #[must_use]
-pub fn local_dir(root: &Path) -> PathBuf {
+pub(crate) fn local_dir(root: &Path) -> PathBuf {
     root.join(".local").join("lean-host-mcp")
 }
 
 /// `<root>/.local/lean-host-mcp/config.toml`.
 #[must_use]
-pub fn local_file(root: &Path) -> PathBuf {
+pub(crate) fn local_file(root: &Path) -> PathBuf {
     local_dir(root).join(LOCAL_FILE_NAME)
 }
 
@@ -51,7 +51,7 @@ pub fn local_file(root: &Path) -> PathBuf {
 ///
 /// Returns the I/O error when the directory or its `.gitignore` cannot be
 /// written.
-pub fn ensure_local_dir(root: &Path) -> io::Result<PathBuf> {
+pub(crate) fn ensure_local_dir(root: &Path) -> io::Result<PathBuf> {
     let dir = local_dir(root);
     fs::create_dir_all(&dir)?;
     match fs::OpenOptions::new()
@@ -68,7 +68,7 @@ pub fn ensure_local_dir(root: &Path) -> io::Result<PathBuf> {
 
 /// The directory an env var names, if it is set and not empty.
 #[must_use]
-pub fn env_dir(name: &str) -> Option<PathBuf> {
+pub(crate) fn env_dir(name: &str) -> Option<PathBuf> {
     nonempty(std::env::var_os(name))
 }
 
@@ -81,7 +81,7 @@ fn nonempty(value: Option<OsString>) -> Option<PathBuf> {
 /// The order is a CLI flag, then an env var's value, then the config files'
 /// value, then the default. An empty env value counts as unset. The env value
 /// is an argument so tests need not set the process environment.
-pub fn pick_dir(
+pub(crate) fn pick_dir(
     flag: Option<&Path>,
     env: Option<OsString>,
     configured: impl FnOnce() -> Option<PathBuf>,

@@ -1,7 +1,7 @@
 //! `lean-host-mcp config init` and `config check`.
 //!
 //! `init` writes a documented starter config file. The file body is generated
-//! from the one knob catalogue in [`crate::config_schema`], so it always
+//! from the one knob catalogue in `config_schema`, so it always
 //! documents the current options at their current defaults. By default it
 //! writes the tracked `lean-host-mcp.toml` in the working directory;
 //! `--lake-root` writes it at that root instead, and `--path` at an explicit

@@ -148,7 +148,7 @@ impl LeanHostService {
 /// `lean_run` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct LeanRunRequest {
+pub(crate) struct LeanRunRequest {
     /// Names the request: 8 to 128 characters from A-Z, a-z, 0-9, '.', '_', ':' and '-', not starting with `srv-`.
     pub request_id: String,
     /// The tool to run: any tool except `lean_run`, `lean_get` and `lean_runtime`.
@@ -161,7 +161,7 @@ pub struct LeanRunRequest {
 /// `lean_get` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct LeanGetRequest {
+pub(crate) struct LeanGetRequest {
     /// The request to read.
     pub request_id: String,
     /// Wait up to this many seconds for the request to end. The server caps the wait at its `[requests]

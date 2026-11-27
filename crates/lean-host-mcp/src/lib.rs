@@ -1,26 +1,10 @@
-//! Library surface for `lean-host-mcp`.
+//! The `lean-host-mcp` server as a library, for its binary, tests and benches.
 //!
-//! The MCP server is one binary, but its pieces are crate-public for
-//! integration tests and for downstream consumers who want to embed the
-//! handlers in their own transport (e.g. SSE instead of stdio).
-//!
-//! Layout:
-//!
-//! - [`envelope`]: the uniform
-//!   `{result, freshness, runtime, warnings, next_actions}` wrapper every
-//!   semantic tool returns.
-//! - [`broker`]: `ProjectBroker`, which checks that a call names the one
-//!   Lake root the server serves and sends its work to that root's workers.
-//! - `project`: private per-project serialized controller. Owns one worker
-//!   service handle and the bounded module-query cache for one Lake project.
-//! - [`projections`]: pure data-shuffle projection types and helpers from
-//!   `lean-rs-worker` shapes into the wire shapes the MCP envelope carries.
-//! - [`lake_meta`]: `LakeProjectMeta`, the minimal description of a Lake
-//!   project that the private project runtime consumes.
-//! - [`error`]: `ServerError`, the one error type tool handlers return.
-//! - [`tools`]: tool implementations, grouped by proof workflow stage.
-//! - [`requests`]: the request table, which runs each named request once.
-//! - [`server`]: rmcp glue.
+//! The binary serves MCP over stdio, or over Streamable HTTP with `--bind`. A
+//! call enters the rmcp glue in `server`, runs in [`tools`], and reaches Lean
+//! through [`ProjectBroker`], which serves one Lake root and sends work to that
+//! root's workers. The five semantic tools reply with `{data, errors, trust}`.
+//! `docs/architecture.md` maps each module.
 
 mod artifact_reads;
 pub mod broker;
@@ -28,51 +12,47 @@ pub mod build;
 mod cache;
 mod cancellation;
 pub mod cli;
-pub mod config_file;
-pub mod config_schema;
+mod config_file;
+mod config_schema;
 mod diagnosis;
 mod digest;
-pub mod envelope;
-pub mod error;
+mod envelope;
+mod error;
 mod host_preparation;
 mod ilean;
-pub mod lake_meta;
+mod lake_meta;
 mod lake_options;
 pub mod native_reader;
 mod native_socket;
 mod project;
 mod project_lock;
-pub mod projections;
+mod projections;
 mod request_log;
 pub mod requests;
-pub mod runtime_compatibility;
+mod runtime_compatibility;
 mod semantic_search;
-pub mod server;
+mod server;
 pub mod shared_writer;
 mod smoke;
-pub mod status;
+mod status;
 pub mod store;
 pub mod toolchain;
 pub mod tools;
-pub mod trust;
+mod trust;
 mod worker_retirement;
 
 pub use broker::{BrokerConfig, ProjectBroker, ProjectHint};
 pub use config_file::ConfigFile;
-pub use envelope::{Freshness, Response, ResponseStatus, RuntimeFacts, RuntimeFailure};
+pub use envelope::ResponseStatus;
 pub use error::{Result, ServerError};
 pub use lake_meta::LakeProjectMeta;
 pub use native_socket::directory as socket_directory;
 pub use project::ProjectRuntimeConfig;
 pub use projections::{
-    CoordinateSpace, DeclarationFlags, DeclarationInspection, DeclarationInspectionResult, DeclarationProofSearchFacts,
-    DeclarationRow, DeclarationSearchFacts, DeclarationSearchPruning, DeclarationSearchResult,
-    DeclarationSearchTimings, DeclarationSummary, DeclarationVerificationFacts, DeclarationVerificationResult,
-    Diagnostic, ElabFailure, ElabSuccess, KernelOutcome, KernelSummary, MetaOutcome, ModuleSourceSpan, Position,
-    ProofActionDeclarationTarget, ProofAttemptCandidate, ProofAttemptEnvelope, ProofAttemptResult, RenderedText,
-    Severity, SourceRange,
+    CoordinateSpace, DeclarationInspectionResult, DeclarationSearchResult, DeclarationSearchTimings,
+    DeclarationVerificationResult, ProofAttemptEnvelope, ProofAttemptResult, Severity,
 };
 pub use server::LeanHostService;
-pub use toolchain::{ToolchainError, ToolchainId, WorkerBinary};
+pub use toolchain::ToolchainId;
 pub use tools::{OutputBudgetOverrides, ResponseCarrier, TelemetryVerbosity, ToolConfig};
-pub use trust::{ArtifactKind, ArtifactTrust, TrustScope, TrustStatus};
+pub use trust::{ArtifactKind, TrustScope, TrustStatus};

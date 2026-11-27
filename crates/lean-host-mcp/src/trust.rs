@@ -273,7 +273,7 @@ pub(crate) fn checked_source_sha256(artifacts: &[ArtifactTrust]) -> Option<Strin
     only.content_sha256.clone()
 }
 
-pub fn display_path(root: &Path, path: &Path) -> String {
+pub(crate) fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
 }
 

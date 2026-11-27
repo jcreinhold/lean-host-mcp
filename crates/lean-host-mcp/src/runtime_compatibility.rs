@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-pub const SCHEMA: &str = "lean-host-native-compatibility-v1";
+pub(crate) const SCHEMA: &str = "lean-host-native-compatibility-v1";
 
 /// Actual helper location and required semantic interface, not a binary pin.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -288,7 +288,7 @@ pub struct LoadedReceipt {
 }
 
 #[derive(Clone, Copy)]
-pub struct WorkerBinding<'a> {
+pub(crate) struct WorkerBinding<'a> {
     pub server_instance_id: &'a str,
     pub project_root: &'a str,
     pub lean_toolchain: &'a str,
@@ -306,7 +306,7 @@ pub struct WorkerBinding<'a> {
 ///
 /// # Errors
 /// Refuses absent or incompatible metadata, toolchain or generation identity.
-pub fn validate_loaded(
+pub(crate) fn validate_loaded(
     expected: &ExpectedContract,
     expected_protocol: u16,
     binding: WorkerBinding<'_>,
@@ -547,7 +547,7 @@ mod tests {
 /// Explicit project for the compatibility handshake; it never selects a target proof.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CompatibilityRequest {
+pub(crate) struct CompatibilityRequest {
     pub project: String,
     /// Explicit versioned discovery never falls back to a loaded handshake.
     #[serde(default)]
@@ -557,7 +557,7 @@ pub struct CompatibilityRequest {
 /// Pure discovery is opt-in so old deny-unknown-field requests refuse it safely.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum CompatibilityMode {
+pub(crate) enum CompatibilityMode {
     /// Existing manual API: open and verify an actual native worker.
     #[default]
     Loaded,

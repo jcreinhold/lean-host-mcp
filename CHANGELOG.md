@@ -99,6 +99,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove the server's own lakefile parse, with `LakeProjectMeta`'s `package`, `library` and `umbrella_module` fields,
   `LakeProjectMeta::discover_from`, and the `regex` dependency. Nothing read those fields; Lake evaluates the
   configuration itself. A root still needs a `lakefile.toml` or `lakefile.lean`.
+- The library exports less. `config_file`, `config_schema`, `envelope`, `error`, `lake_meta`, `projections`,
+  `runtime_compatibility`, `server`, `status` and `trust` are private, and the crate root re-exports only the types the
+  binary, tests and benches name. The projections `project_elab_result`, `project_kernel_result`,
+  `project_meta_rendered`, `project_meta_bool` and `project_declaration_row`, which nothing called, are gone with their
+  types `ElabSuccess`, `KernelOutcome`, `KernelSummary`, `MetaOutcome` and `DeclarationRow`.
 
 ### Fixed
 

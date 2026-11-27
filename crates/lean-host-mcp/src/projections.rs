@@ -12,14 +12,12 @@
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationFlags, LeanWorkerDeclarationInspection as WorkerDeclarationInspection,
-    LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationProofSearchFacts, LeanWorkerDeclarationRow,
-    LeanWorkerDeclarationSearchFacts, LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult,
-    LeanWorkerDeclarationSearchRow, LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationTargetInfo,
-    LeanWorkerDeclarationVerificationFacts, LeanWorkerDeclarationVerificationResult,
-    LeanWorkerDeclarationVerificationStatus, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerElabResult,
-    LeanWorkerKernelResult, LeanWorkerKernelStatus, LeanWorkerMetaResult, LeanWorkerModuleSourceSpan,
-    LeanWorkerProofAttemptEnvelope, LeanWorkerProofAttemptResult, LeanWorkerProofAttemptRow,
-    LeanWorkerProofAttemptStatus, LeanWorkerRendered, LeanWorkerRenderedInfo, LeanWorkerRendering,
+    LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationProofSearchFacts, LeanWorkerDeclarationSearchFacts,
+    LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationSearchRow,
+    LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationTargetInfo, LeanWorkerDeclarationVerificationFacts,
+    LeanWorkerDeclarationVerificationResult, LeanWorkerDeclarationVerificationStatus, LeanWorkerDiagnostic,
+    LeanWorkerElabFailure, LeanWorkerModuleSourceSpan, LeanWorkerProofAttemptEnvelope, LeanWorkerProofAttemptResult,
+    LeanWorkerProofAttemptRow, LeanWorkerProofAttemptStatus, LeanWorkerRenderedInfo, LeanWorkerRendering,
     LeanWorkerSourceCoordinateSpace, LeanWorkerSourceRange,
 };
 
@@ -107,57 +105,6 @@ pub struct ElabFailure {
     pub diagnostics: Vec<Diagnostic>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct ElabSuccess {
-    pub ok: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct KernelOutcome {
-    /// One of `Checked`, `Rejected`, `Unavailable`, or `Unsupported`.
-    pub status: String,
-    pub summary: Option<KernelSummary>,
-    pub failure: Option<ElabFailure>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct KernelSummary {
-    pub declaration_name: String,
-    pub kind: String,
-    /// Pretty-printed declaration type via Lean's `PrettyPrinter`
-    /// (notation-aware), as the worker's `LeanWorkerKernelSummary` reports
-    /// it.
-    pub type_signature: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct MetaOutcome {
-    /// One of `Ok`, `Failed`, `TimeoutOrHeartbeat`, or `Unsupported`.
-    pub status: String,
-    pub rendered: Option<String>,
-    pub definitionally_equal: Option<bool>,
-    pub failure: Option<ElabFailure>,
-    /// Set when the worker reported `LeanWorkerRendering::Raw`: the
-    /// optional `meta_pp_expr` shim was missing or reported `Unsupported`,
-    /// and the rendering fell back to `Expr.toString`. Internal; tool
-    /// handlers translate this into an envelope warning, and the field
-    /// never serialises.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub raw_fallback_used: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct DeclarationRow {
-    pub name: String,
-    pub kind: String,
-    /// Pretty-printed type signature as the worker's
-    /// `LeanWorkerDeclarationRow` reports it. `None` only when the
-    /// declaration has no recoverable type (typically internal artifacts).
-    pub type_signature: Option<String>,
-    pub source: Option<SourceRange>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -456,7 +403,7 @@ pub enum DeclarationVerificationResult {
 
 // --- projection helpers -------------------------------------------------
 
-pub fn project_diagnostic(d: &LeanWorkerDiagnostic) -> Diagnostic {
+pub(crate) fn project_diagnostic(d: &LeanWorkerDiagnostic) -> Diagnostic {
     let position = d.line.map(|line| Position {
         line,
         column: d.column.unwrap_or(0),
@@ -498,7 +445,7 @@ fn project_coordinate_space(space: LeanWorkerSourceCoordinateSpace) -> Coordinat
     }
 }
 
-pub fn project_failure(failure: &LeanWorkerElabFailure) -> ElabFailure {
+pub(crate) fn project_failure(failure: &LeanWorkerElabFailure) -> ElabFailure {
     ElabFailure {
         diagnostics: failure.diagnostics.iter().map(project_diagnostic).collect(),
         truncated: failure.truncated,
@@ -523,113 +470,6 @@ fn meaningful_file_label(label: &str) -> Option<String> {
         None
     } else {
         Some(label.to_owned())
-    }
-}
-
-/// # Errors
-///
-/// Returns the projected [`ElabFailure`] in the error arm when the
-/// upstream `LeanWorkerElabResult.success` is `false`. Never an
-/// infrastructure error.
-pub fn project_elab_result(result: LeanWorkerElabResult) -> std::result::Result<ElabSuccess, ElabFailure> {
-    if result.success {
-        Ok(ElabSuccess { ok: true })
-    } else {
-        Err(ElabFailure {
-            diagnostics: result.diagnostics.iter().map(project_diagnostic).collect(),
-            truncated: result.truncated,
-        })
-    }
-}
-
-pub fn project_kernel_result(result: LeanWorkerKernelResult) -> KernelOutcome {
-    let status = match result.status {
-        LeanWorkerKernelStatus::Checked => "Checked",
-        LeanWorkerKernelStatus::Rejected => "Rejected",
-        LeanWorkerKernelStatus::Unavailable => "Unavailable",
-        LeanWorkerKernelStatus::Unsupported => "Unsupported",
-        _ => "Unsupported",
-    };
-    let summary = result.summary.map(|s| KernelSummary {
-        declaration_name: s.declaration_name,
-        kind: s.kind,
-        type_signature: s.type_signature,
-    });
-    let failure = if matches!(result.status, LeanWorkerKernelStatus::Checked) {
-        None
-    } else {
-        Some(ElabFailure {
-            diagnostics: result.diagnostics.iter().map(project_diagnostic).collect(),
-            truncated: result.truncated,
-        })
-    };
-    KernelOutcome {
-        status: status.to_owned(),
-        summary,
-        failure,
-    }
-}
-
-pub fn project_meta_rendered(result: LeanWorkerMetaResult<LeanWorkerRendered>) -> MetaOutcome {
-    match result {
-        LeanWorkerMetaResult::Ok { value } => MetaOutcome {
-            status: "Ok".into(),
-            rendered: Some(value.value),
-            definitionally_equal: None,
-            failure: None,
-            raw_fallback_used: matches!(value.rendering, LeanWorkerRendering::Raw),
-        },
-        LeanWorkerMetaResult::Failed { failure } => meta_failure("Failed", &failure),
-        LeanWorkerMetaResult::TimeoutOrHeartbeat { failure } => meta_failure("TimeoutOrHeartbeat", &failure),
-        LeanWorkerMetaResult::Unsupported { failure } => meta_failure("Unsupported", &failure),
-        _ => MetaOutcome {
-            status: "Unsupported".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: None,
-            raw_fallback_used: false,
-        },
-    }
-}
-
-pub fn project_meta_bool(result: LeanWorkerMetaResult<bool>) -> MetaOutcome {
-    match result {
-        LeanWorkerMetaResult::Ok { value } => MetaOutcome {
-            status: "Ok".into(),
-            rendered: None,
-            definitionally_equal: Some(value),
-            failure: None,
-            raw_fallback_used: false,
-        },
-        LeanWorkerMetaResult::Failed { failure } => meta_failure("Failed", &failure),
-        LeanWorkerMetaResult::TimeoutOrHeartbeat { failure } => meta_failure("TimeoutOrHeartbeat", &failure),
-        LeanWorkerMetaResult::Unsupported { failure } => meta_failure("Unsupported", &failure),
-        _ => MetaOutcome {
-            status: "Unsupported".into(),
-            rendered: None,
-            definitionally_equal: None,
-            failure: None,
-            raw_fallback_used: false,
-        },
-    }
-}
-
-fn meta_failure(status: &str, failure: &LeanWorkerElabFailure) -> MetaOutcome {
-    MetaOutcome {
-        status: status.to_owned(),
-        rendered: None,
-        definitionally_equal: None,
-        failure: Some(project_failure(failure)),
-        raw_fallback_used: false,
-    }
-}
-
-pub fn project_declaration_row(row: LeanWorkerDeclarationRow) -> DeclarationRow {
-    DeclarationRow {
-        name: row.name,
-        kind: row.kind,
-        type_signature: row.type_signature,
-        source: row.source.map(project_source_range),
     }
 }
 
@@ -728,7 +568,7 @@ fn project_declaration_search_facts(facts: LeanWorkerDeclarationSearchFacts) -> 
     }
 }
 
-pub fn project_declaration_search(result: LeanWorkerDeclarationSearchResult) -> DeclarationSearchResult {
+pub(crate) fn project_declaration_search(result: LeanWorkerDeclarationSearchResult) -> DeclarationSearchResult {
     DeclarationSearchResult {
         declarations: result
             .declarations
@@ -740,7 +580,9 @@ pub fn project_declaration_search(result: LeanWorkerDeclarationSearchResult) -> 
     }
 }
 
-pub fn project_declaration_inspection(result: LeanWorkerDeclarationInspectionResult) -> DeclarationInspectionResult {
+pub(crate) fn project_declaration_inspection(
+    result: LeanWorkerDeclarationInspectionResult,
+) -> DeclarationInspectionResult {
     match result {
         LeanWorkerDeclarationInspectionResult::Found { declaration } => DeclarationInspectionResult::Found {
             declaration: Box::new(project_inspection(*declaration)),
@@ -759,7 +601,7 @@ pub fn project_declaration_inspection(result: LeanWorkerDeclarationInspectionRes
     }
 }
 
-pub fn project_proof_attempt(result: LeanWorkerProofAttemptResult) -> ProofAttemptResult {
+pub(crate) fn project_proof_attempt(result: LeanWorkerProofAttemptResult) -> ProofAttemptResult {
     match result {
         LeanWorkerProofAttemptResult::Ok { result, imports } => ProofAttemptResult::Ok {
             result: project_proof_attempt_envelope(result),
@@ -910,7 +752,7 @@ fn proof_attempt_summary(
     summary
 }
 
-pub fn project_declaration_verification(
+pub(crate) fn project_declaration_verification(
     result: LeanWorkerDeclarationVerificationResult,
 ) -> DeclarationVerificationResult {
     match result {
