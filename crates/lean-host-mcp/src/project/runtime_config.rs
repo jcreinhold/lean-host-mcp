@@ -393,7 +393,7 @@ impl ProjectRuntimeConfig {
     /// The one knob an embedder that bypasses [`Self::from_env`] still has to
     /// be able to set: every other default is a policy constant that holds on
     /// any machine, while this one is a share of the host's RAM and the default
-    /// can only guess at how many projects will actually be resident. Also how
+    /// can only guess at how many workers will actually be resident. Also how
     /// a test forces the residue path to fire without a Mathlib-scale import.
     ///
     /// Moves the Lean heap ceiling with it (see [`Self::lean_max_memory_kib`]):

@@ -19,12 +19,12 @@ use crate::error::{Result, ServerError};
 /// thread — where it blocks the worker — on every semantic call. The result is
 /// a pure function of the key, so it is computed once per process instead.
 ///
-/// Process-wide rather than per project because that is the true scope: two
-/// projects pinned to the same toolchain build the identical runtime into the
-/// identical cache directory, and today they each pay for it.
+/// Process-wide rather than per worker because that is the true scope: every
+/// worker of the served project, and each one that replaces it, needs the
+/// identical runtime from the identical cache directory.
 ///
 /// The build itself runs *outside* the lock. Holding it would serialize every
-/// project behind one Lake invocation; upstream's own filesystem lock already
+/// worker behind one Lake invocation; upstream's own filesystem lock already
 /// makes a concurrent duplicate build safe, and the loser simply overwrites an
 /// equal value.
 static SEMANTIC_RUNTIMES: std::sync::LazyLock<
