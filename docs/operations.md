@@ -422,6 +422,53 @@ The store is `LEAN_HOST_MCP_STORE_DIR`, else `[install] store_dir` from the conf
 `.local/lean-host-mcp/store` under the Lake root. The server creates it with mode 0700 after its config checks pass. A
 server without `--lake-root` has no store and takes no lock.
 
+### A stuck `dispatching` owner record
+
+The SDK records each worker the server starts in the owner directory: `STORE/owners`, unless
+`LEAN_RS_WORKER_OWNERS_DIRECTORY` names another. A record is `worker-<generation id>/owner.json`, and it holds one slot
+of `broker.max_workers` until the SDK sees its worker stop. A server that dies, for example by `SIGKILL`, while a worker
+starts and before that worker reports its process leaves a record with `"phase":"dispatching"` and `"process":null`. The
+SDK cannot tell whether that worker exists, so no later server collects the record. This is an SDK limitation.
+
+Each such record takes a slot from every later server on the owner directory. Once they fill `broker.max_workers`, every
+call that needs a worker fails with:
+
+```text
+lake project not usable: worker child setup failed: could not prepare worker parent lifeline: native actor capacity occupied
+```
+
+When the record's limit differs from the server's `broker.max_workers`, one record blocks every worker:
+
+```text
+lake project not usable: worker child setup failed: could not prepare worker parent lifeline: occupied native actor capacity uses a different limit
+```
+
+A call that first reads the Lake options then waits 30 seconds and fails at stage `lake_option_discovery`:
+
+```text
+lake project not usable: Lake option discovery: native reader did not return a complete result; no proof check ran: state=not_started native utility refused before bootstrap spawn: native-reader deadline elapsed
+```
+
+To recover:
+
+1. Stop the server that uses the store.
+2. Confirm that no `lean-host-mcp` or `lean-host-mcp-worker` process remains from the dead server.
+   `ps -axo pid,ppid,pgid,stat,command | grep '[l]ean-host-mcp'` lists them. A process with parent PID 1 has outlived
+   its server; stop it by its exact PID.
+3. Find the stuck records and delete each one's directory:
+
+   ```sh
+   grep -l '"phase":"dispatching"' STORE/owners/worker-*/owner.json
+   rm -r STORE/owners/worker-<generation id>
+   ```
+
+   Leave the other records and `.admission.lock`. A server collects a record by itself once it can confirm that the
+   record's worker stopped.
+4. Start the server.
+
+The dead start also leaves `lean-worker-<first 24 hex digits of the generation id>/parent.sock` in the socket directory.
+It blocks nothing, and you may delete it.
+
 ## Runtime-error contract
 
 Recoverable runtime and controller failures return a semantic response with `data: null` and an issue in `errors`. The
@@ -591,7 +638,8 @@ CARGO_NET_OFFLINE=true \
 
 Run the ignored tests that start workers one at a time, each with a new owner directory. On macOS a few at once use up
 the SDK's native actor capacity, and the rest fail with "native actor capacity occupied" or "deadline elapsed". A test
-that dies can leave an owner record that holds back every later test on the same directory.
+that dies can leave an owner record that holds back every later test on the same directory; see
+[A stuck `dispatching` owner record](#a-stuck-dispatching-owner-record).
 
 On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs, and the installed worker refuses any
 `DYLD_*` variable, so opt-in tests that check files or start a worker fail under `cargo test`. Build them with
