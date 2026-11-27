@@ -22,9 +22,9 @@ records in `owners/`, the semantic runtime cache in `semantic-runtimes/`, and in
 `doctor processes` reads. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
 `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` move each one. The server binds the owner directory before any native work, the SDK
 creates it, and the server passes it to its SDK helpers as `LEAN_RS_WORKER_OWNERS_DIRECTORY`. Keep the same canonical
-owner directory when restarting the server, including across binary changes. A server without `--lake-root` has no
-store: its native work then needs `LEAN_RS_WORKER_OWNERS_DIRECTORY`, its semantic tools need
-`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, and its PID records go under the per-user cache directory.
+owner directory when restarting the server, including across binary changes. `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` must be
+a canonical absolute path; the server creates the directory if it is missing. A server without `--lake-root` has no
+store and fails every project call; its PID records go under the per-user cache directory.
 
 The server finds the Lean toolchain under `ELAN_HOME`, else under the elan home that install recorded as
 `[install] elan_home`, else under `$HOME/.elan`. It passes that home to Lake, Cargo and its helpers as `ELAN_HOME`.

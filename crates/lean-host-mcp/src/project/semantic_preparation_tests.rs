@@ -92,3 +92,20 @@ fn semantic_cancellation_returns_before_cache_or_toolchain_preparation() {
             .contains_key(&(toolchain.to_owned(), sysroot.to_path_buf()))
     );
 }
+
+#[test]
+fn a_missing_semantic_cache_directory_is_created_and_a_bad_one_is_named() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let root = directory.path().canonicalize().expect("canonical scratch");
+    let missing = root.join("semantic").join("cache");
+    assert_eq!(env_cache_dir(missing.clone()).expect("created"), missing);
+    assert!(missing.is_dir());
+
+    let file = root.join("file");
+    std::fs::write(&file, "not a directory").expect("file");
+    let error = env_cache_dir(file.join("cache")).expect_err("under a file");
+    assert!(error.to_string().contains(&file.display().to_string()), "{error}");
+
+    let relative = env_cache_dir(PathBuf::from("relative-cache")).expect_err("relative");
+    assert!(relative.to_string().contains("canonical absolute path"), "{relative}");
+}

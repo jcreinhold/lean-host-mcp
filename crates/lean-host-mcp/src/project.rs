@@ -3482,19 +3482,13 @@ pub(crate) fn semantic_runtime(
     Ok(runtime)
 }
 
-/// The semantic runtime cache: `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, an existing
-/// canonical directory, else `semantic-runtimes` in the server's store.
+/// The semantic runtime cache: `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, a canonical
+/// path created if missing, else `semantic-runtimes` in the server's store.
 fn semantic_runtime_cache_root() -> Result<PathBuf> {
     // This changes only the destination of the released runtime builder. It
     // still checks the package inputs and uses the same supervised writer.
     if let Some(dir) = std::env::var_os("LEAN_HOST_MCP_SEMANTIC_CACHE_DIR") {
-        let dir = PathBuf::from(dir);
-        if dir.canonicalize()? != dir || !dir.is_dir() {
-            return Err(ServerError::BadProject(
-                "expected canonical semantic cache directory".into(),
-            ));
-        }
-        return Ok(dir);
+        return env_cache_dir(PathBuf::from(dir));
     }
     crate::store::native_store()
         .map(|store| store.join(crate::store::SEMANTIC_CACHE_DIR_NAME))
@@ -3503,6 +3497,23 @@ fn semantic_runtime_cache_root() -> Result<PathBuf> {
                 "no semantic runtime cache: serve with --lake-root, or set LEAN_HOST_MCP_SEMANTIC_CACHE_DIR".into(),
             )
         })
+}
+
+/// Create `dir` if it is missing and check that it is canonical, naming the
+/// variable and the path in each failure.
+fn env_cache_dir(dir: PathBuf) -> Result<PathBuf> {
+    const VAR: &str = "LEAN_HOST_MCP_SEMANTIC_CACHE_DIR";
+    let not_canonical =
+        || ServerError::BadProject(format!("{VAR} must be a canonical absolute path: {}", dir.display()));
+    if !dir.is_absolute() {
+        return Err(not_canonical());
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| ServerError::BadProject(format!("cannot create {VAR} {}: {error}", dir.display())))?;
+    if dir.canonicalize().ok().as_ref() != Some(&dir) {
+        return Err(not_canonical());
+    }
+    Ok(dir)
 }
 
 #[cfg(test)]

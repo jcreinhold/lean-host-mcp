@@ -112,6 +112,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   body without its header, so a header linter such as Mathlib's warned on every file, and it reported messages Lean
   marks silent, such as those of a compiler plugin. Lean reads the hashed text on stdin under the file's name, so an
   edit during the check does not change what it checked.
+- The server creates a missing `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`. A relative path, or one it cannot create, fails with
+  an error that names the variable and the path, in place of a bare `io: No such file or directory`.
 
 ## [0.16.22] - 2026-11-25
 
