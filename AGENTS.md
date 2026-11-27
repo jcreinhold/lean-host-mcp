@@ -1,8 +1,8 @@
 # lean-host-mcp
 
 MCP server hosting Lean 4 in supervised worker children through `lean-rs-worker-parent` and `lean-rs-worker-child`.
-Calls reach Lean's elaborator and kernel directly. Each Lake project's toolchain selects its worker; one server can host
-several toolchains.
+Calls reach Lean's elaborator and kernel directly. A server serves one Lake project, and that project's toolchain
+selects its worker.
 
 Read [README.md](README.md) for setup and the version matrix, [docs/tool-catalog.md](docs/tool-catalog.md) for public
 schemas, [docs/operations.md](docs/operations.md) for configuration and troubleshooting, and
@@ -31,12 +31,15 @@ stdio EOF check. Opt-in e2e and build tests require built fixture `.olean` files
 ```sh
 LEAN_HOST_MCP_WORKERS_DIR=$PWD/target/release \
 LEAN_HOST_MCP_TEST_FIXTURE=$PWD/fixtures/lean \
-    cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation -- --ignored
+    cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation \
+    -- --ignored --test-threads=1
 ```
 
-On macOS this command cannot reach a worker: Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for test binaries, and the worker
-refuses any `DYLD_*` variable. Run the binaries that `cargo test --no-run` prints under
-`env -u DYLD_FALLBACK_LIBRARY_PATH` instead; see `docs/operations.md`.
+Run these tests one at a time. On macOS a few at once use up the SDK's native actor capacity, and the rest fail with
+"native actor capacity occupied" or "deadline elapsed". On macOS this command also cannot reach a worker: Cargo sets
+`DYLD_FALLBACK_LIBRARY_PATH` for test binaries, and the worker refuses any `DYLD_*` variable. Run the binaries that
+`cargo test --no-run` prints, with the same arguments, under `env -u DYLD_FALLBACK_LIBRARY_PATH` instead; see
+`docs/operations.md`.
 
 For a non-default toolchain, export `LEAN_SYSROOT=${ELAN_HOME:-$HOME/.elan}/toolchains/leanprover--lean4---<id>` for the
 whole build-and-test invocation. Set `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` for the worker build too. The latter chooses
@@ -50,6 +53,9 @@ cargo-deny and is for iteration. Release and toolchain-bump procedures live in `
 under `.agents/skills/`.
 
 ## Release rule
+
+Version by semver. While the version is 0.x, a breaking change to the tools, the configuration, the CLI or the library
+bumps the minor version; any other change bumps the patch version.
 
 Test changes spanning the SDK and this repo together locally before pushing or tagging. Use temporary Cargo
 `[patch.crates-io]` overrides; both installed-worker scripts take `LEAN_RS_CHECKOUT=<SDK checkout>` and build the

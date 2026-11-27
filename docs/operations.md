@@ -29,8 +29,10 @@ store and fails every project call; its PID records go under the per-user cache 
 The server finds the Lean toolchain under `ELAN_HOME`, else under the elan home that install recorded as
 `[install] elan_home`, else under `$HOME/.elan`. It passes that home to Lake, Cargo and its helpers as `ELAN_HOME`.
 
-The SDK writer executable setting is `LEAN_RS_WRITER_EXECUTABLE`. The server still selects its embedded writer for
-ordinary operations and honors explicit standalone-writer selections.
+The server uses its own executable as the writer helper for its builds, checks and workers, and names it in
+`LEAN_RS_WRITER_EXECUTABLE` for the children it starts. It checks a value in its own environment at startup but does not
+use it. `install` and `install-worker` build and check the worker's shims with the standalone SDK writer:
+`lean-rs-writer` beside the server executable, or the file `--standalone-writer` names.
 
 ## Configuration file
 
@@ -579,11 +581,15 @@ scripts/test-installed-stdio.sh --all-targets                  # includes instal
 scripts/test-installed-module-setup.sh                         # packaged pair and semantic search
 scripts/check-parent-link.sh                                  # build and inspect the release parent
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
-    cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation -- --ignored
+    cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation \
+    -- --ignored --test-threads=1                              # one at a time; see below
 LEAN_HOST_MCP_MATCHED_SDK_WRITER=/path/to/lean-rs-writer CARGO_NET_OFFLINE=true \
     cargo test --locked -p lean-host-mcp --test http_transport install_and_serve_keep_no_state_in_an_empty_home \
     -- --ignored                                               # install and serve with an empty HOME
 ```
+
+Run the ignored tests that start workers one at a time. On macOS a few at once use up the SDK's native actor capacity,
+and the rest fail with "native actor capacity occupied" or "deadline elapsed".
 
 On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs, and the installed worker refuses any
 `DYLD_*` variable, so opt-in tests that check files or start a worker fail under `cargo test`. Build them with

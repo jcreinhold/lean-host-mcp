@@ -34,7 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   named request and replies at once; `lean_get` returns its row and, once it has ended, its result. A build's row says
   `running` only once it holds the write turn and the writer lock, and a check's once it holds its read turn. At start
   the server ends the rows an earlier server left: `running` rows become `interrupted` and never run again, and `queued`
-  rows run. A call without an id gets a `srv-` id in its reply. `rusqlite`, with SQLite built in, is a dependency again.
+  rows run. A call without an id gets a `srv-` id in its reply. `rusqlite`, with SQLite built in, is now a required
+  dependency.
 - Config table `[requests]` (`retention_hours`, `max_rows`, `wait_max_secs`) and the key `recipes.<name>.timeout_secs`.
   `lean_runtime` reports `requests: {queued, running}` and the capability `durable_requests_v1`.
 
@@ -73,7 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Remove the managed mode: the `lean_managed_admission` tool, the `managed_original` tool argument, the launcher and
   writer setup subcommands, the managed serve flags, and the `managed-native-store` and `managed-warm-inspections`
-  features. The server always runs its ordinary mode, and `rusqlite` is no longer a dependency.
+  features. The server always runs its ordinary mode.
 - Remove config lookup in the home directory, the working directory and its parents, with `LEAN_HOST_MCP_CONFIG_DIR`,
   `config init --home` and the `primary_project` key. Neither config lookup nor the worker directory depends on `HOME`.
   The server ignores an old `[launcher]` table.

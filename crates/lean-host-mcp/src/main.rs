@@ -1,5 +1,5 @@
-//! `lean-host-mcp`—Model Context Protocol server hosting Lean 4 via a
-//! supervised [`lean-rs-worker`] child.
+//! `lean-host-mcp`, a Model Context Protocol server that runs Lean 4 in
+//! supervised `lean-host-mcp-worker` children, one build per toolchain.
 //!
 //! Stdio is the default transport. `--bind` selects Streamable HTTP.
 //! `--lake-root` (or `LEAN_HOST_MCP_PROJECT`) names the one Lake project the
@@ -34,7 +34,7 @@ use lean_host_mcp::{
     ResponseCarrier, TelemetryVerbosity, ToolConfig,
 };
 
-/// Stdio MCP server that hosts a Lean 4 environment via a worker child.
+/// MCP server, over stdio or Streamable HTTP, that runs Lean 4 in worker children.
 #[derive(Debug, Parser)]
 #[command(name = "lean-host-mcp", version, about)]
 struct Cli {

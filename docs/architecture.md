@@ -36,7 +36,7 @@ crates/lean-host-mcp/src/
   worker_retirement.rs   keeps an actor's capacity until each tracked child has exited
   project_lock.rs        fair read and write turns per Lake root, the shared kernel guard, proxy turns
   build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, the run in one helper
-  shared_writer.rs       the SDK writer helper, including its build log mode
+  shared_writer.rs       the host's fork of the SDK writer, run as hidden subcommands of the server; its build log mode
   native_reader.rs       one-shot Lean programs in the SDK's native reader scope
   host_preparation.rs    the worker's host-artifact modes: readiness, and the preparation an installer runs
   native_socket.rs       where the SDK's short-lived sockets live
@@ -58,6 +58,7 @@ crates/lean-host-mcp/src/
   status.rs              build identity and resolved settings for the status reply
   cancellation.rs        request cancellation shared by async callers and the worker owner
   error.rs, trust.rs     the one error type of tool handlers; the trust facts in each reply
+  digest.rs              SHA-256 as lowercase hex, for every receipt, stamp and fingerprint
   ilean.rs               a reader for Lean's .ilean reference indices
   semantic_search.rs     the lean-semantic-search runtime adapter
   smoke.rs, diagnosis.rs the install smoke verdict in worker.json; resolution-health messages
@@ -132,10 +133,11 @@ roots and of the installed shims. It admits an import only when the request's ro
 order, then the installed shim roots, and while no root holds a package whose compiled code the worker runs, such as
 `Init` or `Init.olean`; any module names are allowed. A worker that cannot take custody of its project at launch, for
 example after the manifest dropped a package, starts anyway and refuses each import with the reason. A child that exits
-before it connects makes the server wait out the 30-second startup deadline it gives the SDK, and leaves an owner record
-in phase `dispatching` that the SDK never closes: every later build that uses that owners directory waits until someone
-removes the record. The server refuses to start with `LEAN_PATH` set for this reason, since the worker would refuse it
-before connecting. The host copies no files, hashes no build outputs, and writes no import plan.
+before it connects makes the server wait out the 30-second startup deadline it gives the SDK. SDK 0.10.17 then leaves an
+owner record in phase `dispatching` that it never closes, and every later build that uses that owners directory waits
+until someone removes the record. That is an SDK bug, fixed in the next SDK release. The server refuses to start with
+`LEAN_PATH` set, since the worker would refuse it before connecting and leave such a record. The host copies no files,
+hashes no build outputs, and writes no import plan.
 
 Startup stays serialized after caller disconnects and rechecks the per-project limit. Idle retirement skips a borrowed
 actor and one with queued work. Metadata-only degraded responses and pure `.ilean` reads use
@@ -442,9 +444,9 @@ without an id keeps the old rule and is cancelled when its connection drops.
 keeps it in a task-local slot, so a nested check in the same request reuses its read turn instead of queueing behind a
 waiting writer. A check takes its read turn before it pins an actor or starts a native reader, then the shared kernel
 guard on the project's artifacts, and holds both until the request ends. A build takes the write turn, then the
-exclusive kernel lock through the SDK writer helper; a request that holds a read turn cannot take the write turn. Tokio
-grants turns in arrival order, so a queued build holds back later checks, and each waiter keeps its place until its
-deadline. Each finished write turn adds one to the root's finished-build count.
+exclusive kernel lock through the server's own writer helper (`shared_writer.rs`); a request that holds a read turn
+cannot take the write turn. Tokio grants turns in arrival order, so a queued build holds back later checks, and each
+waiter keeps its place until its deadline. Each finished write turn adds one to the root's finished-build count.
 
 Workers hold the shared kernel lock for their whole generation. When a writer in another process announces demand, the
 reaper queues a proxy write turn on that root, so new checks wait behind it, and retires the idle, unborrowed actors
@@ -528,8 +530,8 @@ never waits for a later domain while retaining an earlier partial set, and never
 full-set gate preflight avoids spawning repeated helpers while known writer demand remains; it grants no read custody,
 and the actual nonblocking transfer checks close the following race. Native payload bootstrap and cold worker admission
 finish the full set before guardian acknowledgement. A warm worker's guardian retains earlier generation locks, so warm
-contention uses the existing confirmed pre-body generation cycle instead of waiting behind its own custody. Graph,
-epoch, inheritance and guardian failures after admission are not retried.
+contention uses the existing confirmed pre-body generation cycle instead of waiting behind its own custody. No failure
+after admission is retried.
 
 The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
 cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the

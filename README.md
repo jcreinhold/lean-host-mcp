@@ -93,8 +93,8 @@ Stdio is the default. Configure a client that launches the installed copy by its
 ```
 
 `--lake-root` names the one project the server runs Lean for, and the directory whose config files it reads. Only one
-server runs per project store: a second one exits and names the pid of the first. The server selects each project's
-worker and sets `LEAN_SYSROOT` per spawn; the client needs no toolchain environment override.
+server runs per project store: a second one exits and names the pid of the first. The server selects the project's
+worker and sets `LEAN_SYSROOT` for each worker it starts; the client needs no toolchain environment override.
 
 For a native local client that connects by URL, start Streamable HTTP:
 
