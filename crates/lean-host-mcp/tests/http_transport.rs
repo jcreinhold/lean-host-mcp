@@ -1383,8 +1383,9 @@ struct HttpMcpServer {
     client: reqwest::Client,
     url: String,
     /// The server's own store, so tests on one Lake root do not share its
-    /// lock. A test that passes `LEAN_HOST_MCP_STORE_DIR` replaces it; an
-    /// installed server keeps its store under its Lake root.
+    /// lock, and its process registry. A test that passes
+    /// `LEAN_HOST_MCP_STORE_DIR` replaces the store; an installed server keeps
+    /// its store under its Lake root.
     _store: Option<tempfile::TempDir>,
 }
 
@@ -1402,6 +1403,10 @@ impl HttpMcpServer {
             .arg("127.0.0.1:0")
             .env_remove(WRITER_ENV)
             .env("LEAN_HOST_MCP_STORE_DIR", store.path())
+            // A server without `--lake-root` has no store, so it would keep
+            // its process record in the user's cache, and a killed test
+            // server never removes it.
+            .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", store.path().join("processes"))
             .env("RUST_LOG", "warn,lean_host_mcp::transport_http=info")
             .env("NO_COLOR", "1")
             // These tests read `structuredContent` and full telemetry; opt into both.
