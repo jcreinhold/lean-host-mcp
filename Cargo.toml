@@ -17,6 +17,8 @@ version = "0.16.22"
 # here (members reference them via `.workspace = true`) removes per-crate drift;
 # `deny.toml` enforces the no-duplicate-version invariant across the full graph.
 [workspace.dependencies]
+lean-rs = "=0.10.17"
+lean-rs-host = "=0.10.17"
 lean-rs-worker-child = "=0.10.17"
 lean-rs-worker-parent = "=0.10.17"
 lean-rs-worker-protocol = "=0.10.17"

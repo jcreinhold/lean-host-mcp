@@ -20,8 +20,8 @@ default = ["native-worker"]
 native-worker = ["dep:lean-rs", "dep:lean-rs-host", "dep:lean-rs-worker-child", "dep:lean-rs-worker-protocol"]
 
 [dependencies]
-lean-rs = { version = "0.10.6", optional = true }
-lean-rs-host = { version = "0.10.6", optional = true }
+lean-rs = { workspace = true, optional = true }
+lean-rs-host = { workspace = true, optional = true }
 lean-rs-worker-child = { workspace = true, optional = true }
 lean-rs-worker-protocol = { workspace = true, optional = true }
 lean-toolchain.workspace = true
