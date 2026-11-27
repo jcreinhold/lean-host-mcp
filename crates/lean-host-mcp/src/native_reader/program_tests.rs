@@ -37,6 +37,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        crate::native_socket::use_test_directory().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let project = root.join("Project");
@@ -177,6 +178,7 @@ fn concurrent_utilities_wait_before_spawn_while_resident_capacity_is_full() {
             .arg(&resident_assets)
             .arg("resident")
             .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", &contract.ownership_registry)
+            .env(crate::native_socket::ENV, crate::native_socket::directory().unwrap())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

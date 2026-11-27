@@ -9,6 +9,8 @@
     reason = "manual ignored field-eval harness prints compact JSON summaries and keeps one ToolContext per run"
 )]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -29,6 +31,7 @@ fn kanproofs_unbuilt_root() -> Option<PathBuf> {
 }
 
 fn open_ctx(root: &Path) -> ToolContext {
+    support::set_up_native_work().expect("native setup");
     let broker = ProjectBroker::new(BrokerConfig::serving(root.to_path_buf()));
     ToolContext {
         broker,

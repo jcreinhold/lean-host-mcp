@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -508,6 +509,11 @@ class Harness:
                 tempfile.mkdtemp(prefix="writer-handoff-", dir="/tmp")
             ).resolve(strict=True)
         self.evidence = Evidence(self.root)
+        # Worker sockets: the default is under HOME, /tmp is refused, and a
+        # path under the evidence root can exceed the 103 bytes macOS allows.
+        target = Path(__file__).resolve().parents[1] / "target"
+        target.mkdir(exist_ok=True)
+        self.sockets = Path(tempfile.mkdtemp(prefix="s", dir=target)).resolve(strict=True)
         self.evidence.update(
             images={
                 "parent": {
@@ -546,6 +552,7 @@ class Harness:
             LEAN_HOST_MCP_IDLE_TIMEOUT_SECS="0",
             LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS="30000",
             LEAN_RS_WORKER_OWNERS_DIRECTORY=str(self.root / "owners"),
+            LEAN_HOST_MCP_SOCKET_DIR=str(self.sockets),
         )
 
     def start(self):
@@ -1027,6 +1034,10 @@ class Harness:
             self.evidence.update(cleanup_native_scopes=observations)
         if self.server_log is not None:
             self.server_log.close()
+        if self.server is None or self.server.poll() is not None:
+            # A directory left with sockets in it names workers that never closed.
+            with contextlib.suppress(OSError):
+                self.sockets.rmdir()
         self.evidence.update(
             cleanup={
                 "errors": errors,

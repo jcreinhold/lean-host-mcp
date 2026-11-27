@@ -832,6 +832,8 @@ fn run_internal(
         command.env_remove(name);
     }
     command.env(OWNERS_DIRECTORY_ENV, &helper.ownership_registry);
+    // The helper's reader sockets go where this process keeps its own.
+    command.env(crate::native_socket::ENV, crate::native_socket::directory()?);
     crate::toolchain::pass_elan_home(&mut command);
     if let Some(program) = program {
         command

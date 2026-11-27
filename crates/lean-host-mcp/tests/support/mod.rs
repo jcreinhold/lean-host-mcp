@@ -1,4 +1,5 @@
 //! Helpers the integration suites share: the fixture's Lean sysroot, the
+//! socket directories and native setup that keep tests out of `HOME`, the
 //! worker built with the tests, the chain project (`chain`), the HTTP server
 //! harness (`http`), and the response sizes the smoke and performance
 //! baselines report against.
@@ -51,6 +52,41 @@ pub(crate) fn sysroot_and_pin() -> TestResult<(PathBuf, String)> {
         format!("leanprover/lean4:v{version}")
     };
     Ok((sysroot, pin))
+}
+
+/// The target directory, canonical: the parent of `CARGO_TARGET_TMPDIR`.
+fn target_dir() -> TestResult<PathBuf> {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    Ok(tmp.parent().ok_or("the target directory")?.canonicalize()?)
+}
+
+/// A new private directory for one spawned server's sockets: `s` and six
+/// random characters in the target directory, mode 0700.
+///
+/// A server given none makes its sockets under `HOME`. One in the test's own
+/// temporary directory makes a socket path longer than the 103 bytes macOS
+/// allows.
+pub(crate) fn socket_dir() -> TestResult<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Ok(tempfile::Builder::new()
+        .prefix("s")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(target_dir()?)?)
+}
+
+/// Set this test process up for native work as the server sets itself up.
+///
+/// The helper subcommands run from the server binary, since the test harness
+/// lacks them. The worker sockets go to `LEAN_HOST_MCP_SOCKET_DIR` when it is
+/// set, else to `s` in the target directory, for the reasons [`socket_dir`]
+/// gives. Both settings hold for the whole process, so its tests share the one
+/// socket directory; each worker names its own socket in it.
+pub(crate) fn set_up_native_work() -> TestResult {
+    lean_rs_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
+    if std::env::var_os("LEAN_HOST_MCP_SOCKET_DIR").is_none() {
+        lean_host_mcp::use_socket_directory(&target_dir()?.join("s"))?;
+    }
+    Ok(())
 }
 
 /// The worker directory a spawned test server must be pinned to.

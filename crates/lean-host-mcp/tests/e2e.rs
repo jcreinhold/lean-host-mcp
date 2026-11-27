@@ -14,6 +14,8 @@
     clippy::arithmetic_side_effects
 )]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -79,10 +81,9 @@ fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
 }
 
 /// A context set up as the server sets itself up for `--lake-root root`: the
-/// broker serves `root`, and the helper subcommands run from the server
-/// binary, since the test harness lacks them.
+/// broker serves `root`, in a process set up by [`support::set_up_native_work`].
 fn open_broker(root: &Path, runtime: ProjectRuntimeConfig, config: ToolConfig) -> ToolContext {
-    lean_rs_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"))).expect("helper executable");
+    support::set_up_native_work().expect("native setup");
     let broker = ProjectBroker::new_with_runtime_config(BrokerConfig::serving(root.to_path_buf()), runtime);
     ToolContext { broker, config }
 }

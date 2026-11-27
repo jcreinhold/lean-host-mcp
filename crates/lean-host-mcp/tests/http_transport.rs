@@ -438,6 +438,8 @@ async fn second_server_on_one_store_names_the_first() {
     )
     .await;
 
+    // It checks its socket directory before it meets the lock.
+    let sockets = support::socket_dir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
         .arg("--bind")
         .arg("127.0.0.1:0")
@@ -445,6 +447,7 @@ async fn second_server_on_one_store_names_the_first() {
         .arg(&root)
         .env_remove(WRITER_ENV)
         .env("LEAN_HOST_MCP_STORE_DIR", &store)
+        .env("LEAN_HOST_MCP_SOCKET_DIR", sockets.path())
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
@@ -607,11 +610,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         .prefix("empty-home-")
         .tempdir_in(target_tmp)
         .unwrap();
-    let sockets = tempfile::Builder::new()
-        .prefix("s")
-        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-        .tempdir_in(target_tmp.parent().expect("target directory"))
-        .unwrap();
+    let sockets = support::socket_dir().unwrap();
     let scratch_dir = scratch.path().canonicalize().unwrap();
     let home = scratch_dir.join("home");
     let tmp = scratch_dir.join("tmp");
@@ -630,10 +629,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         ("RUSTUP_HOME", real("RUSTUP_HOME", ".rustup").into()),
         ("TMPDIR", tmp.into()),
         ("CARGO_NET_OFFLINE", "true".into()),
-        (
-            "LEAN_HOST_MCP_SOCKET_DIR",
-            sockets.path().canonicalize().unwrap().into(),
-        ),
+        ("LEAN_HOST_MCP_SOCKET_DIR", sockets.path().into()),
         ("NO_COLOR", "1".into()),
     ];
     let git = |args: &[&str]| {
@@ -701,7 +697,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let server = HttpMcpServer::spawn(command, None).await;
+    let server = HttpMcpServer::spawn(command, Vec::new()).await;
     let mut session = server.new_session().await;
     // The installed worker serves no project request, so the semantic call is
     // a proof search, which a native reader runs.
@@ -1383,10 +1379,10 @@ struct HttpMcpServer {
     client: reqwest::Client,
     url: String,
     /// The server's own store, so tests on one Lake root do not share its
-    /// lock, and its process registry. A test that passes
-    /// `LEAN_HOST_MCP_STORE_DIR` replaces the store; an installed server keeps
-    /// its store under its Lake root.
-    _store: Option<tempfile::TempDir>,
+    /// lock, and its process registry, then its socket directory. A test that
+    /// passes `LEAN_HOST_MCP_STORE_DIR` replaces the store; an installed
+    /// server keeps its store under its Lake root.
+    _scratch: Vec<tempfile::TempDir>,
 }
 
 impl HttpMcpServer {
@@ -1396,6 +1392,7 @@ impl HttpMcpServer {
 
     async fn start_with_env(args: &[(&str, &str)], envs: &[(&str, &str)]) -> Self {
         let store = tempfile::tempdir().expect("temp store dir");
+        let sockets = support::socket_dir().expect("socket dir");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         command
             .kill_on_drop(true)
@@ -1407,6 +1404,7 @@ impl HttpMcpServer {
             // its process record in the user's cache, and a killed test
             // server never removes it.
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", store.path().join("processes"))
+            .env("LEAN_HOST_MCP_SOCKET_DIR", sockets.path())
             .env("RUST_LOG", "warn,lean_host_mcp::transport_http=info")
             .env("NO_COLOR", "1")
             // These tests read `structuredContent` and full telemetry; opt into both.
@@ -1430,13 +1428,13 @@ impl HttpMcpServer {
         for (key, value) in envs {
             command.env(key, value);
         }
-        Self::spawn(command, Some(store)).await
+        Self::spawn(command, vec![store, sockets]).await
     }
 
     /// Spawn `command`, a server that binds `127.0.0.1:0` with stderr piped
     /// and logs `lean_host_mcp::transport_http` at info, and wait for the
     /// address it listens on.
-    async fn spawn(mut command: Command, store: Option<tempfile::TempDir>) -> Self {
+    async fn spawn(mut command: Command, scratch: Vec<tempfile::TempDir>) -> Self {
         let mut child = command.spawn().expect("spawn lean-host-mcp HTTP server");
         let stderr = child.stderr.take().expect("server stderr");
         let mut stderr = BufReader::new(stderr);
@@ -1466,7 +1464,7 @@ impl HttpMcpServer {
             stderr_task,
             client: reqwest::Client::new(),
             url: format!("http://{bind}/mcp"),
-            _store: store,
+            _scratch: scratch,
         }
     }
 

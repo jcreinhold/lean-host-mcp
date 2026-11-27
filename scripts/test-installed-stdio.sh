@@ -18,7 +18,11 @@ LEAN_SYSROOT=$(scripts/fixture-lean-prefix.sh)
 export LEAN_SYSROOT
 mkdir -p "$target"
 scratch=$(mktemp -d "$target/stdio-install.XXXXXX")
-trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch"' EXIT
+trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch" ${sockets:+"$sockets"}' EXIT
+# Worker sockets, for the install probe and any test that names none: the
+# default is under HOME, and a path in the scratch is too long for macOS.
+sockets=$(mktemp -d "$(cd -- "$target" && pwd -P)/s.XXXXXX")
+export LEAN_HOST_MCP_SOCKET_DIR="$sockets"
 local_sdk_enable "$scratch"
 if [[ -z ${LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR:-} ]]; then
     export LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR="$scratch/workers"

@@ -653,6 +653,7 @@ mod tests {
 
     fn fixture_contract(root: &Path) -> lean_rs_writer::WriterContract {
         use std::os::unix::fs::PermissionsExt as _;
+        crate::native_socket::use_test_directory().unwrap();
         let executable = PathBuf::from(std::env::var_os("LEAN_HOST_MCP_OPTIONS_TEST_HELPER").unwrap())
             .canonicalize()
             .unwrap();
@@ -929,6 +930,7 @@ lean_lib Demo
                 lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV,
                 &contract.ownership_registry,
             )
+            .env(crate::native_socket::ENV, crate::native_socket::directory().unwrap())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

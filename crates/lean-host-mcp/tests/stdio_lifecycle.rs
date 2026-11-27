@@ -7,6 +7,8 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -188,6 +190,7 @@ struct StdioServer {
     stdout: BufReader<ChildStdout>,
     stderr_task: tokio::task::JoinHandle<String>,
     next_id: u64,
+    _sockets: tempfile::TempDir,
 }
 
 impl StdioServer {
@@ -197,6 +200,7 @@ impl StdioServer {
         let registry = registry.canonicalize().expect("canonical registry");
         let state_dir = registry.join("server");
         std::fs::create_dir(&state_dir).expect("private server state directory");
+        let sockets = support::socket_dir().expect("socket dir");
         let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
         // Cargo injects its test library search path. Start the installed app with
         // the ordinary loader environment so it uses its verified Elan rpath.
@@ -209,14 +213,15 @@ impl StdioServer {
             .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", state_dir.join("native-owners"))
             .env("LEAN_HOST_MCP_STORE_DIR", state_dir.join("store"))
             .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", &registry)
+            .env("LEAN_HOST_MCP_SOCKET_DIR", sockets.path())
             .env("RUST_LOG", "warn");
         if let Some(dir) = std::env::var_os("LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR") {
             command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
         }
-        Self::spawn(&mut command)
+        Self::spawn(&mut command, sockets)
     }
 
-    fn spawn(command: &mut Command) -> Self {
+    fn spawn(command: &mut Command, sockets: tempfile::TempDir) -> Self {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -232,6 +237,7 @@ impl StdioServer {
             stdout,
             stderr_task,
             next_id: 1,
+            _sockets: sockets,
         }
     }
 

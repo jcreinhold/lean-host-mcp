@@ -3,9 +3,42 @@ use std::{
     fs, io,
     os::unix::{fs::DirBuilderExt as _, fs::MetadataExt as _, net::SocketAddr},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
+/// The env var that names the socket directory.
+pub(crate) const ENV: &str = "LEAN_HOST_MCP_SOCKET_DIR";
+
+/// The directory set by [`use_directory`].
+static CHOSEN: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep this process's worker sockets in `root`, made mode 0700 if absent.
+///
+/// It is for a process that cannot set `LEAN_HOST_MCP_SOCKET_DIR`, such as a
+/// test harness, and it beats that variable. The native-reader helpers this
+/// process starts use `root` too. Call it once, before native work; calling it
+/// again with the same path changes nothing.
+///
+/// # Errors
+///
+/// Fails when [`directory`] would refuse `root`, or when an earlier call chose
+/// another directory.
+pub fn use_directory(root: &Path) -> io::Result<()> {
+    prepare(root)?;
+    if *CHOSEN.get_or_init(|| root.to_path_buf()) == root {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "this process already keeps its sockets in another directory",
+        ))
+    }
+}
+
 /// The private directory that holds worker sockets, made mode 0700 if absent.
+///
+/// That is the directory set by [`use_directory`], else
+/// `LEAN_HOST_MCP_SOCKET_DIR`, else `$XDG_RUNTIME_DIR/lean-host-mcp`, else
+/// `~/.lean-host-mcp-ipc`.
 ///
 /// # Errors
 ///
@@ -13,7 +46,9 @@ use std::{
 /// user-owned mode-0700 directory outside `/tmp`, or when a worker socket path
 /// in it would pass the Unix length limit.
 pub fn directory() -> io::Result<PathBuf> {
-    let root = if let Some(path) = std::env::var_os("LEAN_HOST_MCP_SOCKET_DIR") {
+    let root = if let Some(path) = CHOSEN.get() {
+        path.clone()
+    } else if let Some(path) = std::env::var_os(ENV) {
         PathBuf::from(path)
     } else if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
         PathBuf::from(path).join("lean-host-mcp")
@@ -24,6 +59,27 @@ pub fn directory() -> io::Result<PathBuf> {
     };
     prepare(&root)?;
     Ok(root)
+}
+
+/// Keep this test process's worker sockets in `LEAN_HOST_MCP_SOCKET_DIR`,
+/// else in `s` in the Cargo directory that holds the test binary. The default
+/// is under `HOME`, and a temporary directory makes too long a socket path on
+/// macOS.
+///
+/// That Cargo directory is the binary's nearest ancestor with a
+/// `.rustc_info.json`: the target directory, whatever layout Cargo gives the
+/// binary under it.
+#[cfg(test)]
+pub(crate) fn use_test_directory() -> io::Result<()> {
+    if std::env::var_os(ENV).is_some() {
+        return Ok(());
+    }
+    let binary = std::env::current_exe()?.canonicalize()?;
+    let cargo_dir = binary
+        .ancestors()
+        .find(|dir| dir.join(".rustc_info.json").is_file())
+        .ok_or_else(|| io::Error::other("no Cargo directory holds the test binary; set LEAN_HOST_MCP_SOCKET_DIR"))?;
+    use_directory(&cargo_dir.join("s"))
 }
 
 const PARENT_SOCKET: &str = "lean-worker-000000000000000000000000/parent.sock";

@@ -2,6 +2,8 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
+mod support;
+
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
@@ -52,6 +54,8 @@ print('payload result')
 
 struct Fixture {
     directory: tempfile::TempDir,
+    /// Every reader's sockets, so none go under `HOME`.
+    sockets: tempfile::TempDir,
     root: PathBuf,
     project: PathBuf,
     dependency: PathBuf,
@@ -81,6 +85,7 @@ impl Fixture {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
             directory,
+            sockets: support::socket_dir().unwrap(),
             root,
             project,
             dependency,
@@ -111,6 +116,7 @@ impl Fixture {
             .arg("--")
             .arg(&self.executable)
             .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", self.root.join("owners"))
+            .env("LEAN_HOST_MCP_SOCKET_DIR", self.sockets.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -352,6 +358,7 @@ fn bootstrap_without_authenticated_parent_never_executes_target() -> io::Result<
     command
         .arg("native-reader-exec")
         .args(args)
+        .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
         .env_remove("LEAN_RS_WORKER_PARENT_SOCKET")
         .env_remove("LEAN_RS_WORKER_PARENT_NONCE")
         .stdout(Stdio::piped());
@@ -382,6 +389,7 @@ os._exit(0)
     let mut caller_command = Command::new("/usr/bin/python3");
     caller_command
         .args(["-c", caller])
+        .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
         .arg(&fixture.root)
         .arg(serde_json::to_string(&argv).unwrap());
     let mut caller = OwnedChild::spawn(caller_command);
@@ -500,6 +508,7 @@ fn explicit_stdin_offers_exact_bytes_after_custody_and_reports_the_same_receipt(
         .arg("--stdin")
         .args(original.get_args().skip(1))
         .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", fixture.root.join("owners"))
+        .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
         .env("NATIVE_READER_STDIN_FIXTURE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -542,6 +551,7 @@ fn missing_stdin_eof_refuses_before_any_native_bootstrap_or_payload() {
         .arg("--stdin")
         .args(original.get_args().skip(1))
         .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", fixture.root.join("owners"))
+        .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -566,7 +576,9 @@ fn stdin_offer_from_another_directory_is_refused_before_payload() {
         scope: "main".into(),
         limit: 1,
     };
-    let scope = LeanWorkerNativeScope::prepare(&registry, LIMIT, Some(&slot)).unwrap();
+    let scope =
+        LeanWorkerNativeScope::prepare_with_socket_directory(&registry, LIMIT, Some(&slot), fixture.sockets.path())
+            .unwrap();
     let _owned_inputs = scope.input_directory().unwrap();
     let foreign = fixture.root.join("foreign");
     fs::create_dir(&foreign).unwrap();
@@ -579,6 +591,7 @@ fn stdin_offer_from_another_directory_is_refused_before_payload() {
         .arg(&fixture.project)
         .args(["--capacity-limit", "1", "--timeout-millis", "3000", "--stdin", "--"])
         .arg(&fixture.executable)
+        .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
         .env(
             "LEAN_RS_WORKER_GUARDIAN_EXECUTABLE",
             Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")).canonicalize().unwrap(),
@@ -657,6 +670,7 @@ os._exit(0)
     let mut caller_command = Command::new("/usr/bin/python3");
     caller_command
         .args(["-c", caller])
+        .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
         .arg(&fixture.root)
         .arg(serde_json::to_string(&argv).unwrap())
         .stdin(Stdio::from(std::fs::File::from(reader)));
@@ -712,6 +726,7 @@ sys.stdout.buffer.write(output)
         let mut driver = Command::new("/usr/bin/python3");
         driver
             .args(["-c", caller])
+            .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
             .arg(&fixture.root)
             .arg(serde_json::to_string(&argv).unwrap())
             .arg(mode)
@@ -763,6 +778,7 @@ sys.stdout.buffer.write(output)
     let mut driver = Command::new("/usr/bin/python3");
     driver
         .args(["-c", caller])
+        .env("LEAN_HOST_MCP_SOCKET_DIR", fixture.sockets.path())
         .arg(&fixture.root)
         .arg(serde_json::to_string(&argv).unwrap())
         .stdout(Stdio::piped())

@@ -45,7 +45,7 @@ pub use config_file::ConfigFile;
 pub use envelope::ResponseStatus;
 pub use error::{Result, ServerError};
 pub use lake_meta::LakeProjectMeta;
-pub use native_socket::directory as socket_directory;
+pub use native_socket::{directory as socket_directory, use_directory as use_socket_directory};
 pub use project::ProjectRuntimeConfig;
 pub use projections::{
     CoordinateSpace, DeclarationInspectionResult, DeclarationSearchResult, DeclarationSearchTimings,

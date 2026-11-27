@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::net::{SocketAddr, TcpListener};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -39,9 +38,7 @@ pub(crate) const FINAL_STATES: [&str; 3] = ["done", "timed_out", "interrupted"];
 pub(crate) struct Scratch {
     /// The server's store: request table, build logs and native state.
     pub(crate) store: PathBuf,
-    /// A directory for sockets, mode 0700, in the target directory. A path
-    /// under the test's own temporary directory is too long for a socket on
-    /// macOS.
+    /// A directory for sockets, from [`super::socket_dir`].
     pub(crate) sockets: PathBuf,
     _store: tempfile::TempDir,
     _sockets: tempfile::TempDir,
@@ -52,10 +49,7 @@ impl Scratch {
     pub(crate) fn new() -> TestResult<Self> {
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let store = tempfile::Builder::new().prefix("store-").tempdir_in(tmp)?;
-        let sockets = tempfile::Builder::new()
-            .prefix("s")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(tmp.parent().ok_or("the target directory")?)?;
+        let sockets = super::socket_dir()?;
         Ok(Self {
             store: store.path().canonicalize()?,
             sockets: sockets.path().canonicalize()?,

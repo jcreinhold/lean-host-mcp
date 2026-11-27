@@ -1404,11 +1404,12 @@ mod tests {
     /// The fixture root of an ignored test that starts workers. A worker start
     /// runs the writer helper's hidden subcommands, which the lib test binary
     /// lacks, so this names the built server in `LEAN_RS_WRITER_EXECUTABLE`
-    /// as the helper.
+    /// as the helper. The worker sockets go to the target directory.
     pub(super) fn worker_fixture() -> PathBuf {
         let server = std::env::var_os(lean_toolchain::shared_writer::SHARED_WRITER_EXECUTABLE_ENV)
             .unwrap_or_else(|| panic!("set LEAN_RS_WRITER_EXECUTABLE to the built lean-host-mcp"));
         lean_rs_writer::use_helper_executable(Path::new(&server)).unwrap();
+        crate::native_socket::use_test_directory().unwrap();
         PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
             .canonicalize()
             .unwrap()
