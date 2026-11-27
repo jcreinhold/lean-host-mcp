@@ -74,8 +74,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove the serve flags `--module-setup-writer`, `--module-setup-storage-request`, `--prepared-generation` and
   `--verification-approval`, with prepared worker generations and the writer's setup-file path.
 - Remove the owner directory's fallback to the platform's local data directory and the semantic cache's fallback to the
-  user cache directory. Without a store, native work and `doctor writer-rollback` need
-  `LEAN_RS_WORKER_OWNERS_DIRECTORY`, and semantic tools need `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`.
+  user cache directory. Without a store, native work needs `LEAN_RS_WORKER_OWNERS_DIRECTORY`, and semantic tools need
+  `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`.
+- Remove `doctor writer-rollback`.
 - Remove MCP Tasks; the `lean_request` tool with its tickets, cancel and acknowledge; the request journal with
   `--request-journal` and `LEAN_HOST_MCP_REQUEST_JOURNAL`; `request_registry` in `lean_runtime`; and the capabilities
   `retained_request_lifecycle_v3` and `retained_request_binding_v1`. Named requests replace them and have no cancel.
