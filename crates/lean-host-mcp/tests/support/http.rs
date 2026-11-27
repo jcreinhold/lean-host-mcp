@@ -300,7 +300,11 @@ impl Client {
         if !status.is_success() {
             return Err(format!("{tool}: HTTP {status}: {text}").into());
         }
-        message(&text, id)
+        let mut response = message(&text, id)?;
+        if let Some(result) = response.get_mut("result") {
+            fill_structured(result);
+        }
+        Ok(response)
     }
 
     /// Call `tool` and return its result. Fails on a JSON-RPC error.
@@ -401,6 +405,27 @@ fn message(body: &str, id: u64) -> TestResult<Value> {
         }
     }
     Err(format!("no reply with id {id} in: {body}").into())
+}
+
+/// Give a tool result that holds its reply only as JSON text, as a server on
+/// the default `text` carrier sends it, the `structuredContent` that the
+/// `both` carrier sends, so tests read one shape from any server. The stored
+/// tool result in a `lean_get` reply's `result` gets the same.
+fn fill_structured(result: &mut Value) {
+    if let Some(map) = result.as_object_mut()
+        && !map.contains_key("structuredContent")
+        && let Some(reply) = map
+            .get("content")
+            .and_then(|content| content.pointer("/0/text"))
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object)
+    {
+        map.insert("structuredContent".to_owned(), reply);
+    }
+    if let Some(stored) = result.pointer_mut("/structuredContent/result") {
+        fill_structured(stored);
+    }
 }
 
 /// The structured content of a tool result.
