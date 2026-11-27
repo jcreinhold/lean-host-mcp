@@ -473,7 +473,7 @@ that checks the code. "None yet" marks a gap.
 | Rule | Test |
 | --- | --- |
 | Within one server, turns go in arrival order. | `project_lock/tests.rs`: `builds_and_checks_take_turns_in_arrival_order` |
-| No check loads imports while a build runs. | `project_lock/tests.rs`: `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build`; across processes, none yet |
+| No check loads imports while a build runs. | `project_lock/tests.rs`: `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build`, and across processes `a_check_waits_for_a_writer_in_another_process` |
 | A build stops the project's workers, and each has exited before Lake starts; the next check starts a fresh worker on the new build. | `tests/project_workers.rs`: `a_build_stops_the_project_workers_before_lake_starts` |
 | A worker serves trials, proof positions, lookups and checks of modules with no source file from the project's own build, path dependencies included. | `tests/project_workers.rs`: `a_trial_imports_a_dependency_module_and_prints_its_axioms`, `a_proof_position_and_a_lookup_answer_from_the_project_build`, `a_module_without_a_source_file_is_checked_in_a_worker` |
 | A worker admits an import only through its launch roots, in order, then the shim roots, while no root holds `Init`; a worker that cannot take custody of its project refuses at once. | `tests/project_workers.rs`: `an_import_through_other_roots_is_refused`, `an_import_root_that_holds_init_is_refused`, `a_worker_whose_launch_roots_leave_the_project_refuses_at_once` |

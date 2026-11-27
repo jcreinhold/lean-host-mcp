@@ -2,8 +2,9 @@
 //! of a path dependency and prints its axioms, a proof position and a
 //! declaration lookup, a check of a module that has no source file, the
 //! refusal of an import whose roots differ from the worker's launch roots or
-//! hold `Init`, a worker whose launch roots leave the project, and builds that
-//! stop the project's workers before Lake starts.
+//! hold `Init`, a worker whose launch roots leave the project, builds that
+//! stop the project's workers before Lake starts, and checks that wait for a
+//! build in the server or a writer in another process.
 //!
 //! The tests are ignored: each builds a chain project (`support::chain`) and
 //! needs an installed worker. Set `LEAN_HOST_MCP_TEST_FIXTURE` or
@@ -528,6 +529,90 @@ async fn a_check_sent_during_a_build_waits_and_answers_from_the_new_build() -> T
         answered >= finished,
         "the lookup answered at {answered} ms, before the build ended at {finished} ms"
     );
+    assert!(after.contains("Int"), "{after}");
+    server.stop().await?;
+    Ok(())
+}
+
+/// A lookup sent while a writer in another process holds the project waits
+/// until that writer closes, then answers from what it built. The writer here
+/// is the test process itself, through the SDK's shared writer, as a
+/// `lake build` run by another server or tool would be.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Lean toolchain and an installed worker; see the module docs"]
+#[serial]
+async fn a_check_waits_for_a_writer_in_another_process() -> TestResult {
+    /// How long the writer may take to open and to close.
+    const LIMIT: Duration = Duration::from_mins(1);
+    /// How long the writer holds the project after the lookup is sent.
+    const HOLD: Duration = Duration::from_secs(2);
+    let chain = project()?;
+    let scratch = Scratch::new()?;
+    let server = Server::start(&Launch::new(&chain.root, &scratch)?, STARTUP).await?;
+    let client = Client::new(&server.url, "outside")?;
+    let before = statement(&client, "a", &["Chain.A"]).await?;
+    assert!(before.contains("Nat"), "{before}");
+
+    chain.write("Chain/A.lean", EDITED_A)?;
+    let (held, holding) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (root, sysroot) = (chain.root.clone(), chain.sysroot.clone());
+    // `open` waits until the server has stopped its idle worker.
+    let writer = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+        let helper = Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
+        let writer = lean_toolchain::shared_writer::SharedWriter::open(helper, &root, LIMIT)
+            .map_err(|error| format!("the outside writer did not open: {error}"))?;
+        held.send(()).ok();
+        released.recv_timeout(PATIENCE).map_err(|error| error.to_string())?;
+        let output = std::process::Command::new(sysroot.join("bin/lake"))
+            .args(["build", "Chain.A"])
+            .current_dir(&root)
+            .env("LEAN_SYSROOT", &sysroot)
+            .env("LAKE_ARTIFACT_CACHE", "false")
+            .env_remove("LEAN_PATH")
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "lake build failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let built = now_ms().map_err(|error| error.to_string())?;
+        writer
+            .close(LIMIT)
+            .map_err(|error| format!("the outside writer did not close: {error}"))?;
+        Ok(built)
+    });
+    holding.await?;
+    let lookup = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let response = client
+                .send("lean_lookup", &lookup("a", &["Chain.A"]))
+                .await
+                .map_err(|error| error.to_string());
+            (response, now_ms().ok())
+        })
+    };
+    tokio::time::sleep(HOLD).await;
+    assert!(
+        !lookup.is_finished(),
+        "the lookup answered while the outside writer held the project"
+    );
+    release.send(())?;
+    let built = writer.await??;
+    let (response, answered) = lookup.await?;
+    let response = response?;
+    let answered = answered.ok_or("no answer time")?;
+    assert!(
+        answered >= built,
+        "the lookup answered at {answered} ms, before the writer built at {built} ms"
+    );
+    let after = data(result(&response)?)?
+        .pointer("/declaration/statement/value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("no statement: {response}"))?;
     assert!(after.contains("Int"), "{after}");
     server.stop().await?;
     Ok(())
