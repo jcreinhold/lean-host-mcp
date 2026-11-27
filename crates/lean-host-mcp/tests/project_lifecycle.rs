@@ -10,7 +10,7 @@
     clippy::significant_drop_tightening
 )]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectHint};
 use lean_rs_worker_parent::{
@@ -28,6 +28,9 @@ async fn open_call_shutdown_round_trip() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
+    // The helper subcommands run from the server binary, since the test
+    // harness lacks them.
+    lean_rs_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"))).expect("helper executable");
     let broker = ProjectBroker::new(BrokerConfig::serving(root.clone()));
 
     // Trivial operation: just confirm we can dispatch typed work to the actor
