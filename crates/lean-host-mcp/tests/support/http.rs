@@ -29,8 +29,8 @@ pub(crate) const SERVER: &str = env!("CARGO_BIN_EXE_lean-host-mcp");
 /// The protocol the client speaks: one HTTP request per call, no session.
 const PROTOCOL: &str = "2026-07-28";
 
-/// Writer helper settings a test server must not inherit.
-const WRITER_ENVS: [&str; 2] = ["LEAN_RS_WRITER_EXECUTABLE", "LEAN_HOST_MCP_WRITER_EXECUTABLE"];
+/// The writer helper setting a test server must not inherit.
+const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
 
 /// The row states after which a request never changes.
 pub(crate) const FINAL_STATES: [&str; 3] = ["done", "timed_out", "interrupted"];
@@ -140,9 +140,7 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        for name in WRITER_ENVS {
-            command.env_remove(name);
-        }
+        command.env_remove(WRITER_ENV);
         // `cargo test` adds its library path (`DYLD_FALLBACK_LIBRARY_PATH` on
         // macOS, `LD_LIBRARY_PATH` on Linux). A server started by hand has
         // none, and workers refuse to start with one.

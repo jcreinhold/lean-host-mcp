@@ -29,9 +29,8 @@ store: its native work then needs `LEAN_RS_WORKER_OWNERS_DIRECTORY`, its semanti
 The server finds the Lean toolchain under `ELAN_HOME`, else under the elan home that install recorded as
 `[install] elan_home`, else under `$HOME/.elan`. It passes that home to Lake, Cargo and its helpers as `ELAN_HOME`.
 
-The SDK writer executable setting is `LEAN_RS_WRITER_EXECUTABLE`. Launch environments may still use
-`LEAN_HOST_MCP_WRITER_EXECUTABLE` during the transition. A startup that supplies both must supply identical values. The
-server still selects its embedded writer for ordinary operations and honors explicit standalone-writer selections.
+The SDK writer executable setting is `LEAN_RS_WRITER_EXECUTABLE`. The server still selects its embedded writer for
+ordinary operations and honors explicit standalone-writer selections.
 
 ## Configuration file
 

@@ -22,7 +22,6 @@ use tokio::process::{Child, ChildStderr, Command};
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
-const LEGACY_WRITER_ENV: &str = "LEAN_HOST_MCP_WRITER_EXECUTABLE";
 const EXPECTED_TOOLS: [&str; 11] = [
     "lean_build",
     "lean_compatibility",
@@ -397,44 +396,6 @@ async fn invalid_http_startup_config_exits() {
     }
 }
 
-#[tokio::test]
-async fn conflicting_writer_aliases_refuse_http_startup_before_opening_state() {
-    let scratch = tempfile::tempdir().unwrap();
-    let root = scratch.path().canonicalize().unwrap();
-    let owners = root.join("native-owners");
-    let processes = root.join("processes");
-    let store = root.join("store");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"));
-    command
-        .kill_on_drop(true)
-        .current_dir(&root)
-        .arg("--bind")
-        .arg(reserve_loopback_addr().to_string())
-        .arg("--lake-root")
-        .arg(&root)
-        .env_remove("LEAN_HOST_MCP_PROJECT")
-        .env("LEAN_HOST_MCP_STORE_DIR", &store)
-        .env_remove("LEAN_HOST_MCP_HTTP_PATH")
-        .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", &processes)
-        .env("LEAN_RS_WORKER_OWNERS_DIRECTORY", &owners)
-        .env(WRITER_ENV, root.join("sdk-writer"))
-        .env(LEGACY_WRITER_ENV, root.join("former-writer"))
-        .stdin(Stdio::null());
-    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
-        .await
-        .expect("conflicting writer settings must exit before serving")
-        .expect("run lean-host-mcp with conflicting writer settings");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
-    assert!(
-        stderr.contains(WRITER_ENV) && stderr.contains(LEGACY_WRITER_ENV),
-        "{stderr}"
-    );
-    for path in [&owners, &processes, &store] {
-        assert!(!path.exists(), "refused startup opened {}", path.display());
-    }
-}
-
 /// Workers refuse an inherited `LEAN_PATH`, so a server started with one
 /// would fail every check. It refuses to start instead, before opening state.
 #[tokio::test]
@@ -483,7 +444,6 @@ async fn second_server_on_one_store_names_the_first() {
         .arg("--lake-root")
         .arg(&root)
         .env_remove(WRITER_ENV)
-        .env_remove(LEGACY_WRITER_ENV)
         .env("LEAN_HOST_MCP_STORE_DIR", &store)
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "warn")
@@ -1619,7 +1579,6 @@ impl HttpMcpServer {
             .arg("--bind")
             .arg("127.0.0.1:0")
             .env_remove(WRITER_ENV)
-            .env_remove(LEGACY_WRITER_ENV)
             .env("LEAN_HOST_MCP_STORE_DIR", store.path())
             .env("RUST_LOG", "warn,lean_host_mcp::transport_http=info")
             .env("NO_COLOR", "1")
@@ -2168,11 +2127,7 @@ async fn assert_drain_resumes(real_worker: bool) {
 async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
     use std::os::unix::fs::PermissionsExt;
 
-    for (trap, writer_keys) in [
-        (false, &[LEGACY_WRITER_ENV][..]),
-        (true, &[WRITER_ENV][..]),
-        (true, &[LEGACY_WRITER_ENV, WRITER_ENV][..]),
-    ] {
+    for trap in [false, true] {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().canonicalize().unwrap();
         std::fs::write(root.join("lakefile.toml"), "name = \"pure\"\n").unwrap();
@@ -2205,12 +2160,12 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
         let namespace = root.join("native-owners");
         let processes = root.join("processes");
         let root_s = root.to_str().unwrap();
-        let mut settings = vec![
+        let settings = [
             ("LEAN_HOST_MCP_WORKERS_DIR", workers.to_str().unwrap()),
             ("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", processes.to_str().unwrap()),
             ("LEAN_RS_WORKER_OWNERS_DIRECTORY", namespace.to_str().unwrap()),
+            (WRITER_ENV, helper_trap.to_str().unwrap()),
         ];
-        settings.extend(writer_keys.iter().map(|&key| (key, helper_trap.to_str().unwrap())));
         let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s)], &settings).await;
         let owner = StatelessClient::new(&server.url);
         let acquired = owner.control(json!({"action":"acquire"})).await;
