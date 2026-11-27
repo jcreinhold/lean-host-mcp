@@ -291,7 +291,6 @@ impl ProjectBroker {
     /// than having project open reread process environment on every miss.
     #[must_use]
     pub fn new_with_runtime_config(config: BrokerConfig, runtime_config: ProjectRuntimeConfig) -> Arc<Self> {
-        crate::lake_meta::prepare_project_discovery();
         runtime_config.log_advisories();
         let broker = Arc::new(Self {
             inner: Arc::new(Mutex::new(BrokerInner {

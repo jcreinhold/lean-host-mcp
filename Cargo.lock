@@ -1045,7 +1045,6 @@ dependencies = [
  "libproc",
  "lru",
  "parking_lot",
- "regex",
  "reqwest",
  "rmcp",
  "rusqlite",

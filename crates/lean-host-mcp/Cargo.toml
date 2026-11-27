@@ -54,7 +54,6 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 lru = "0.18"
 parking_lot = "0.12"
-regex = "1"
 rmcp = { version = "3.9", features = [
   "macros",
   "schemars",

@@ -226,8 +226,6 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
     Arc::new(LeanProject {
         canonical_root: root.to_path_buf(),
         toolchain: "leanprover/lean4:v4.35.0".into(),
-        package: None,
-        library: None,
         manifest_hash: "fixture".into(),
         session_id: uuid::Uuid::new_v4().to_string(),
         open_warnings: Vec::new(),

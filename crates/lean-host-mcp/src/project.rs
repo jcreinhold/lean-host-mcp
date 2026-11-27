@@ -1073,8 +1073,6 @@ fn retain_artifact_domains(
 pub(crate) struct LeanProject {
     canonical_root: PathBuf,
     toolchain: String,
-    package: Option<String>,
-    library: Option<String>,
     manifest_hash: String,
     session_id: String,
     /// Toolchain-provenance advisories captured at open (unknown pin, missing
@@ -1118,8 +1116,6 @@ impl std::fmt::Debug for LeanProject {
         f.debug_struct("LeanProject")
             .field("canonical_root", &self.canonical_root)
             .field("toolchain", &self.toolchain)
-            .field("package", &self.package)
-            .field("library", &self.library)
             .field("manifest_hash", &self.manifest_hash)
             .finish_non_exhaustive()
     }
@@ -1212,8 +1208,6 @@ impl LeanProject {
         Ok(Arc::new(Self {
             canonical_root: meta.canonical_root,
             toolchain: runtime_toolchain,
-            package: meta.package,
-            library: meta.library,
             manifest_hash: meta.manifest_hash,
             session_id,
             open_warnings,
@@ -1247,8 +1241,6 @@ impl LeanProject {
         Arc::new(Self {
             canonical_root: root.to_path_buf(),
             toolchain: "test".into(),
-            package: None,
-            library: None,
             manifest_hash,
             session_id: "handoff-test".into(),
             open_warnings: Vec::new(),
@@ -4202,8 +4194,6 @@ mod tests {
         let project = LeanProject {
             canonical_root: PathBuf::from("/test"),
             toolchain: "test".into(),
-            package: None,
-            library: None,
             manifest_hash: String::new(),
             session_id: String::new(),
             open_warnings: Vec::new(),

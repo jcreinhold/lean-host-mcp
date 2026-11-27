@@ -62,14 +62,11 @@ fn a_broker_without_a_root_refuses_every_hint() {
 }
 
 #[test]
-fn unparseable_lakefile_toml_surfaces_through_from_explicit() {
+fn a_root_without_a_lakefile_is_not_a_lake_project() {
     let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("broken");
-    fs::create_dir_all(&proj).unwrap();
-    fs::write(proj.join("lakefile.toml"), "not valid toml { { {").unwrap();
-    let err = LakeProjectMeta::from_explicit(&proj).unwrap_err();
+    let err = LakeProjectMeta::from_explicit(tmp.path()).unwrap_err();
     assert!(
-        matches!(err, ServerError::BadProject(_)),
-        "malformed lakefile.toml must surface as BadProject; got {err:?}"
+        matches!(&err, ServerError::BadProject(message) if message.contains("no lakefile.toml or lakefile.lean")),
+        "{err:?}"
     );
 }
