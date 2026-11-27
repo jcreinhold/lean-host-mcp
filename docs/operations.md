@@ -88,7 +88,7 @@ Units are shown in the table; GiB figures in descriptions are explanatory, not l
 | `requests.retention_hours` | integer (h) | `168` | none | Hours an ended request keeps its row, its stored result and its build log. The server prunes at start and every hour; it never prunes a request that has not ended. Default 7 days. |
 | `requests.max_rows` | integer | `10000` | none | Most rows the request table keeps. Past this, pruning deletes the ended rows that finished first. Default 10000. |
 | `requests.wait_max_secs` | integer (s) | `300` | none | Longest wait_seconds one lean_get may ask for. Default 300 s. |
-| `build.guard` | array of Lake targets | `[]` | none | Targets that must already be built. A guard step runs lake build --no-build on them, which fails without building anything when one is out of date. It runs before a build of targets; a recipe's guard key places it. Proofs uses ["@mathlib/+Mathlib:olean"]. Empty runs no guard. |
+| `build.guard` | array of Lake targets | `[]` | none | Targets that must already be built. A guard step runs lake build --no-build on them, which fails without building anything when one is out of date. It runs before a build of targets; a recipe's guard key places it. A project on Mathlib can use ["@mathlib/+Mathlib:olean"]. Empty runs no guard. |
 | `build.timeout_secs` | integer (s) | `14400` | none | Deadline for one build, counted from its request: the wait for the project's write turn and every step count. Default 4 hours. |
 | `build.log_limit_mib` | integer (MiB) | `16` | none | Cap on one build's log, which lives in the store's logs directory. Output past the cap is dropped, and the reply says so. Default 16 MiB. |
 | `recipes.<name>.steps` | array of arrays of strings | unset | none | The Lake runs of one recipe, in order. Each is the words after lake and may not be empty; Lake reports its own errors in them. The first run that fails ends the recipe. Steps run in the Lake root with the server's environment. lean_build runs a recipe by its name. |
@@ -204,7 +204,7 @@ timeout_secs = 14400                # from the request: the wait for the turn an
 log_limit_mib = 16
 
 [recipes.clean]
-steps = [["clean", "Proofs"]]
+steps = [["clean", "MyProject"]]
 guard = "none"
 
 [recipes.format]
@@ -292,8 +292,8 @@ verification counts when available. `completed` means a response is ready, not t
 `failed`, `diagnostic_errors`, and the actual client response for the verdict.
 
 ```text
-INFO Lean request received (preparing or waiting for worker) request=42 tool="lean_verify" kind="verification" project=proofs
-INFO Lean response ready request=42 tool="lean_verify" kind="verification" project=proofs elapsed_ms=1532 outcome="completed" tool_errors=0 tool_warnings=0 verified=3 failed=1 needs_build=0
+INFO Lean request received (preparing or waiting for worker) request=42 tool="lean_verify" kind="verification" project=myproject
+INFO Lean response ready request=42 tool="lean_verify" kind="verification" project=myproject elapsed_ms=1532 outcome="completed" tool_errors=0 tool_warnings=0 verified=3 failed=1 needs_build=0
 ```
 
 Direct calls and named requests share this boundary. A retry with the same `request_id` or a `lean_get` does not log a
@@ -646,10 +646,10 @@ uv run scripts/memory_stability.py \
   --repeats 15
 ```
 
-Measured on a Mathlib-scale project (kan-proofs, four tools against one file, 15 repeats — 60 calls): **60/60 `ok`,
-generation 1 throughout, 0 restarts, residue 1786 MiB peak and final against a 9216 MiB budget, RSS 5.46 GB.** This
-baseline exercises a repeated import profile; it does not predict the residue growth of a changed-file sweep. The latter
-is bounded by the residue budget and covered by `crates/lean-host-mcp/tests/kanproofs_eval.rs`.
+Measured on a Mathlib-scale project (four tools against one file, 15 repeats — 60 calls): **60/60 `ok`, generation 1
+throughout, 0 restarts, residue 1786 MiB peak and final against a 9216 MiB budget, RSS 5.46 GB.** This baseline
+exercises a repeated import profile; it does not predict the residue growth of a changed-file sweep. The latter is
+bounded by the residue budget and covered by `crates/lean-host-mcp/tests/kanproofs_eval.rs`.
 
 A server serves the one project that `--lake-root` or `LEAN_HOST_MCP_PROJECT` names. An explicit `project=` must resolve
 to that canonical directory before the broker reads the project or opens a worker; without a root every call fails.

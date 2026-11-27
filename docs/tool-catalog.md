@@ -247,7 +247,7 @@ independent work or wait for the existing owner; do not kill the active worker.
 
 ```json
 {"name":"lean_build","arguments":{"targets":["Chain.C"]}}
-{"name":"lean_build","arguments":{"recipe":"format","args":["Proofs/Foo.lean"]}}
+{"name":"lean_build","arguments":{"recipe":"format","args":["MyProject/Foo.lean"]}}
 ```
 
 The build waits for the project's write turn: checks already running finish first, and checks sent later wait until the
@@ -418,7 +418,7 @@ The decoder maps these aliases to the canonical request shapes before typed deco
   `lean_trial(kind="proof_step")` accepts `tactic` for `snippet` and `candidates` for `snippets`; a `proof_position`
   given as a string is the entry goal (`"start"`) or an `after_text` match, and as an integer an `index`.
 - `lean_verify` accepts one group at top level (`file` with `declarations`, `file` alone, or `module` alone), a singular
-  `target`, string groups (`"Proofs/A.lean"`, `"Proofs.A"`), and the group kinds `file` → `file_all`, `module` →
+  `target`, string groups (`"MyProject/A.lean"`, `"MyProject.A"`), and the group kinds `file` → `file_all`, `module` →
   `module_all`, `declarations` → `explicit`.
 - A `kind` that names another tool's job (`search`, `file`, `verify`, …) is still rejected, with the error naming the
   tool and mode to call instead.
