@@ -89,7 +89,7 @@ fn assert_evaluated(response: &SemanticResponse<Value>, expected: &str) -> TestR
 async fn unchanged_query_sees_a_dependency_rebuilt_by_another_writer() -> TestResult {
     let chain = chain_project()?;
     chain.write("Chain/Query.lean", "import Dep\n#eval dep\n")?;
-    lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
+    lean_rs_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
     let ctx = ToolContext {
         broker: ProjectBroker::new_with_runtime_config(
             BrokerConfig::serving(chain.root.clone()),

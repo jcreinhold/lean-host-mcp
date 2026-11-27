@@ -73,22 +73,11 @@ impl ProjectBroker {
             }
             invalid(failure)
         })?;
-        let path = runtime
-            .built
-            .resolved_manifest_path()
-            .map_err(invalid)?
-            .canonicalize()?;
-        let package = path
-            .ancestors()
-            .find(|p| p.file_name().is_some_and(|n| n == ".lake"))
-            .and_then(Path::parent)
-            .ok_or_else(|| invalid("missing semantic runtime package"))?
-            .to_owned();
+        let package = runtime.package_root().to_owned();
         // Dropping the build writer closes its input. Its observer can still be
         // reaping the helper when the completed build returns.
         let runtime_guard = self.read_when_admitted(std::slice::from_ref(&package)).await?;
-        let image = runtime.built.dylib_path().map_err(invalid)?.canonicalize()?;
-        let bootstrap = select_semantic_runtime(|| Ok(runtime_guard.validate()?), &package, &image)?;
+        let bootstrap = select_semantic_runtime(|| Ok(runtime_guard.validate()?), &package, runtime.module_dir())?;
         let body = request.reader_input(&roots)?;
         domains.push(package);
         let bytes = crate::lake_options::reader_output(
@@ -145,23 +134,18 @@ impl ProjectBroker {
 
 /// Return the directory that holds the semantic runtime's compiled Lean
 /// modules, checking that it lies in the package the read turn covers.
-fn select_semantic_runtime(validate_custody: impl Fn() -> Result<()>, package: &Path, image: &Path) -> Result<PathBuf> {
+fn select_semantic_runtime(
+    validate_custody: impl Fn() -> Result<()>,
+    package: &Path,
+    modules: &Path,
+) -> Result<PathBuf> {
     validate_custody()?;
-    if !image.starts_with(package) {
-        return Err(invalid("semantic runtime image outside its package"));
+    if !modules.starts_with(package) {
+        return Err(invalid("semantic runtime modules outside their package"));
     }
-    let bootstrap = semantic_bootstrap(image)?;
-    if !bootstrap.join("LeanSemanticSearch/Capability.olean").is_file() {
+    if !modules.join("LeanSemanticSearch/Capability.olean").is_file() {
         return Err(invalid("missing compiled semantic capability"));
     }
     validate_custody()?;
-    Ok(bootstrap)
-}
-
-fn semantic_bootstrap(image: &Path) -> Result<PathBuf> {
-    Ok(image
-        .parent()
-        .ok_or_else(|| invalid("missing semantic image directory"))?
-        .join("lean")
-        .canonicalize()?)
+    Ok(modules.to_owned())
 }

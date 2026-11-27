@@ -58,8 +58,9 @@ Version by semver. While the version is 0.x, a breaking change to the tools, the
 bumps the minor version; any other change bumps the patch version.
 
 Test changes spanning the SDK and this repo together locally before pushing or tagging. Use temporary Cargo
-`[patch.crates-io]` overrides; both installed-worker scripts take `LEAN_RS_CHECKOUT=<SDK checkout>` and build the
-writer, shims, worker and host from it. Check the resolved crates with `cargo metadata --format-version 1`, then run the
+`[patch.crates-io]` overrides; both installed-worker scripts take `LEAN_RS_CHECKOUT=<SDK checkout>` and
+`LEAN_SEMANTIC_SEARCH_CHECKOUT=<semantic search checkout>` and build the writer, worker and host from them, and the
+worker brings the SDK's shim sources. Check the resolved crates with `cargo metadata --format-version 1`, then run the
 affected real Lean operation and this repo's required `scripts/prerelease.sh` checks. Do not publish an SDK crate just
 to test it here. Do not commit local paths or an override lockfile. When the whole change passes locally, release the
 batch upstream first, resolve the published pins, and keep the required release checks.

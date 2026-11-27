@@ -97,7 +97,7 @@ impl StagedSetup {
     pub(super) fn artifact_identity_sha256(&self, shim_digest: &str) -> io::Result<String> {
         let executable = Identity::read(&self.sysroot.join("bin/lean"))?;
         let bytes = serde_json::to_vec(&(&self.sysroot, executable, &self.domains, &self.inputs, shim_digest))?;
-        Ok(crate::shared_writer::module_setup_digest(&bytes))
+        Ok(crate::digest::sha256_hex(&bytes))
     }
 
     pub(super) fn check(

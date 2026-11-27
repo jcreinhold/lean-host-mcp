@@ -789,7 +789,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
     if let Some(receipt) = &mut runtime.cli_file_verification {
         let ordered = serde_json::to_value(&data).map_err(|error| crate::ServerError::Internal(error.to_string()))?;
         let bytes = serde_json::to_vec(&ordered).map_err(|error| crate::ServerError::Internal(error.to_string()))?;
-        receipt.data_sha256 = crate::shared_writer::module_setup_digest(&bytes);
+        receipt.data_sha256 = crate::digest::sha256_hex(&bytes);
     }
     let mut response = Response::ok(data, freshness)
         .with_runtime(runtime)
@@ -1725,7 +1725,7 @@ mod tests {
     /// The reply names `Demo.lean` as read for this call, with the digest of
     /// the exact text it checked.
     fn assert_source_edit_fresh(response: &Response<impl serde::Serialize + JsonSchema>) {
-        let digest = crate::shared_writer::module_setup_digest(DEMO_SOURCE.as_bytes());
+        let digest = crate::digest::sha256_hex(DEMO_SOURCE.as_bytes());
         assert!(response.trust_artifacts.iter().any(|artifact| {
             artifact.artifact == ArtifactKind::Source
                 && artifact.scope == TrustScope::File

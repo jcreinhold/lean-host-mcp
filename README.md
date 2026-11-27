@@ -134,14 +134,16 @@ concurrent calls within the `broker.max_workers` slots.
 | Component | Current source requirement |
 | --- | --- |
 | `lean-host-mcp` | 0.16.22 |
-| `lean-rs` stack and `lean-toolchain` | 0.10.17 |
-| `lean-semantic-search` stack | 0.7.9 |
+| `lean-rs` stack and `lean-toolchain` | 0.11.0 |
+| `lean-semantic-search` stack | 0.8.0 |
 | Worker protocol | 13 |
 | Supported Lean window | 4.30.0 through 4.36.0 |
 
-Install the parent and workers together; protocol 13 rejects older workers before requests. Registry installations may
-differ from the source requirements shown here. The development fixture uses Lean 4.36.0; a local install does not
-qualify the full toolchain/platform release matrix.
+Install the parent and workers together; protocol 13 rejects older workers before requests. A worker built against
+lean-rs 0.10 also speaks protocol 13, so after that upgrade reinstall it with `install --force` (see
+[upgrading](docs/operations.md#upgrading-from-lean-rs-010)). Registry installations may differ from the source
+requirements shown here. The development fixture uses Lean 4.36.0; a local install does not qualify the full
+toolchain/platform release matrix.
 
 The exact supported releases come from `lean_toolchain::SUPPORTED_TOOLCHAINS`, re-exported from
 [`lean-rs-abi`](https://github.com/jcreinhold/lean-rs/blob/main/crates/lean-rs-abi/src/supported.rs). Numbered pins

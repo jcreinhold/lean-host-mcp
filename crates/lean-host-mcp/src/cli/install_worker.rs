@@ -109,10 +109,6 @@ pub struct InstallWorkerArgs {
     #[arg(long, value_name = "DIR")]
     pub lake_root: Option<PathBuf>,
 
-    /// Extracted lean-rs-host package containing the pinned published shim sources.
-    #[arg(long)]
-    pub shim_source: Option<PathBuf>,
-
     /// Explicit standalone writer for preparing the candidate's two shim packages.
     #[arg(long)]
     pub standalone_writer: Option<PathBuf>,
@@ -184,7 +180,7 @@ fn use_native_state(lake_root: Option<&Path>) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("cannot keep native state in the store {}: {e}", dir.display()))?;
         }
         None => {
-            crate::shared_writer::ownership_registry()?;
+            store::owner_directory()?;
         }
     }
     Ok(())
@@ -207,12 +203,9 @@ fn workers_root(args: &InstallWorkerArgs, lake_root: Option<&Path>) -> anyhow::R
         })
 }
 
-/// The shim sources and SDK writer a worker install qualifies its shims with.
+/// The SDK writer a worker install builds its shims with.
 #[derive(Debug, Default)]
 pub(super) struct WriterInputs {
-    /// Extracted lean-rs-host package with the pinned shim sources; `None`
-    /// finds the published package in the Cargo registry.
-    pub(super) shim_source: Option<PathBuf>,
     /// The standalone SDK writer; `None` uses `lean-rs-writer` beside this
     /// executable.
     pub(super) writer: Option<PathBuf>,
@@ -221,7 +214,6 @@ pub(super) struct WriterInputs {
 impl InstallWorkerArgs {
     fn writer_inputs(&self) -> WriterInputs {
         WriterInputs {
-            shim_source: self.shim_source.clone(),
             writer: self.standalone_writer.clone(),
         }
     }
@@ -646,27 +638,6 @@ pub(super) fn install_one(
     let elan_dir = id.elan_dir()?;
 
     let dest_dir = root.join(id.as_str());
-    let registry_source = match &inputs.shim_source {
-        Some(path) => path.canonicalize()?,
-        None => {
-            let cargo = std::env::var_os("CARGO_HOME")
-                .map(PathBuf::from)
-                .or_else(|| dirs::home_dir().map(|p| p.join(".cargo")))
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve Cargo home"))?;
-            let sdk_package = format!("lean-rs-host-{}", lean_toolchain::VERSION);
-            let package = fs::read_dir(cargo.join("registry/src"))?
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .find(|p| {
-                    p.file_name()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|s| s.starts_with("index.crates.io-"))
-                        && p.join(&sdk_package).join("shims").is_dir()
-                })
-                .ok_or_else(|| anyhow::anyhow!("provide --shim-source for published {sdk_package}"))?;
-            package.join(sdk_package).canonicalize()?
-        }
-    };
     let writer = match &inputs.writer {
         Some(path) => path.clone(),
         None => std::env::current_exe()?.with_file_name("lean-rs-writer"),
@@ -675,14 +646,9 @@ pub(super) fn install_one(
     .map_err(|e| anyhow::anyhow!("select the installed SDK writer with --standalone-writer: {e}"))?;
     fs::create_dir_all(&dest_dir)?;
     let _mutation = lock_slot(&dest_dir)?;
-    let generation = prepare_generation(
-        &dest_dir,
-        id,
-        &elan_dir.canonicalize()?,
-        &registry_source,
-        &writer,
-        |dir| build_worker(source, id, &elan_dir, dir),
-    )?;
+    let generation = prepare_generation(&dest_dir, id, &elan_dir.canonicalize()?, &writer, |dir| {
+        build_worker(source, id, &elan_dir, dir)
+    })?;
     select_generation(&dest_dir, &generation)?;
     Ok(generation.join(WORKER_FILE_NAME))
 }
@@ -691,7 +657,6 @@ pub(super) fn prepare_generation(
     slot: &Path,
     id: &ToolchainId,
     sysroot: &Path,
-    shim_source: &Path,
     writer: &Path,
     build: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
@@ -701,7 +666,7 @@ pub(super) fn prepare_generation(
     // The generated manifests contain absolute paths, including during the smoke.
     // Keep the generation if a native operation leaves cleanup uncertain.
     let generation = generation.keep().canonicalize()?;
-    super::installed_shims::qualify(&generation, id, shim_source, sysroot, writer)?;
+    super::installed_shims::qualify(&generation, id, sysroot, writer)?;
     Ok(generation)
 }
 
@@ -1026,7 +991,7 @@ mod tests {
         let slot = root.path().join(id.as_str());
         let sidecar = std::fs::read(slot.join("worker.json"))?;
         for fail_build in [true, false] {
-            let failed = super::prepare_generation(&slot, &id, root.path(), root.path(), root.path(), |dir| {
+            let failed = super::prepare_generation(&slot, &id, root.path(), root.path(), |dir| {
                 anyhow::ensure!(!fail_build, "build failed");
                 std::fs::write(dir.join(WORKER_FILE_NAME), b"candidate")?;
                 Ok(())

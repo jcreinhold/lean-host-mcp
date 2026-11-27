@@ -2028,10 +2028,7 @@ mod tests {
 
         let fact = profile.source_fact.expect("a search from a file names the file");
         assert_eq!(fact.path.as_deref(), Some("Demo.lean"));
-        assert_eq!(
-            fact.content_sha256,
-            Some(crate::shared_writer::module_setup_digest(text.as_bytes()))
-        );
+        assert_eq!(fact.content_sha256, Some(crate::digest::sha256_hex(text.as_bytes())));
         let from_text = profile_from_text(String::new(), None, Vec::new(), String::new(), None, Vec::new(), None);
         assert!(from_text.source_fact.is_none());
     }

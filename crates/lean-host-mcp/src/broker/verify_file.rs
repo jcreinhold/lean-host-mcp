@@ -42,7 +42,7 @@ impl ProjectBroker {
         let shims = VerifierShims::select(meta)?;
         let shim_guards = self.read_when_admitted(&shims.domains).await?;
         shims.validate()?;
-        let shim_identity_sha256 = crate::shared_writer::module_setup_digest(
+        let shim_identity_sha256 = crate::digest::sha256_hex(
             &serde_json::to_vec(&(&shims.sysroot, &shims.paths, &shims.domains, &shims.files)).map_err(invalid)?,
         );
         Ok(PreparedReader {
@@ -211,11 +211,11 @@ impl ProjectBroker {
             ]
             .concat()
         };
-        let module_setup_sha256 = crate::shared_writer::module_setup_digest(&setup.bytes);
+        let module_setup_sha256 = crate::digest::sha256_hex(&setup.bytes);
         let artifact_identity_sha256 = setup.artifact_identity_sha256(&reader.shim_identity_sha256)?;
         let lean_executable = reader.sysroot.join("bin/lean");
-        let request_sha256 = crate::shared_writer::module_setup_digest(&body);
-        let source_sha256 = crate::shared_writer::module_setup_digest(request.source.as_bytes());
+        let request_sha256 = crate::digest::sha256_hex(&body);
+        let source_sha256 = crate::digest::sha256_hex(request.source.as_bytes());
         let bytes = self
             .run_file_driver(root.clone(), reader, activity, setup, entry, body)
             .await?;

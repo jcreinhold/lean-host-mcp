@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
+use lean_rs_writer::HelperCommand;
+use lean_toolchain::native_guardian::OWNERS_DIRECTORY_ENV;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
@@ -50,20 +52,10 @@ enum Command {
     /// Run the stdio MCP server (default when no subcommand is given).
     Serve(ServeArgs),
 
-    /// Internal process-bound shared-writer supervisor.
-    Writer(lean_host_mcp::shared_writer::WriterArgs),
-    /// Resolve the shared project-lock domain without starting runtime work.
-    #[command(hide = true)]
-    WriterLockPath(lean_host_mcp::shared_writer::WriterLockPathArgs),
-    /// Internal transfer of shared read custody to an actual worker.
-    Reader(lean_host_mcp::shared_writer::ReaderArgs),
-    /// Internal parent-cache read without a parent locked descriptor.
-    ReadProxy(lean_host_mcp::shared_writer::ReadProxyArgs),
-    #[command(hide = true)]
-    WriterExec,
-    /// Internal independent owner for a native worker generation.
-    #[command(hide = true)]
-    NativeGuardian,
+    // The SDK's writer, reader and guardian helpers, which this server's own
+    // Lake runs, reads and workers start from this executable.
+    #[command(flatten)]
+    Helper(HelperCommand),
     /// Internal guardian-owned execution of one prebuilt native reader.
     #[command(hide = true)]
     NativeReader(lean_host_mcp::native_reader::NativeReaderArgs),
@@ -174,68 +166,35 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some(Command::NativeGuardian) => match lean_toolchain::native_guardian::run_guardian_cli() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp native-guardian: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Some(Command::WriterLockPath(args)) => match lean_host_mcp::shared_writer::run_lock_path_cli(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp writer-lock-path: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Some(Command::ReadProxy(args)) => match lean_host_mcp::shared_writer::run_read_proxy(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp read-proxy: {error}");
-                ExitCode::from(lean_host_mcp::shared_writer::reader_failure_exit_code(&error))
-            }
-        },
-        Some(Command::Reader(args)) => match lean_host_mcp::shared_writer::run_reader(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp reader: {error}");
-                ExitCode::from(lean_host_mcp::shared_writer::reader_failure_exit_code(&error))
-            }
-        },
-        Some(Command::WriterExec) => match lean_host_mcp::shared_writer::run_exec() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp writer-exec: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Some(Command::Writer(args)) => match lean_host_mcp::shared_writer::run_cli(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("lean-host-mcp writer: {error}");
-                ExitCode::FAILURE
-            }
-        },
+        Some(Command::Helper(helper)) => helper.run("lean-host-mcp"),
         Some(Command::Serve(args)) => run_serve(args),
         None => run_serve(cli.serve),
     }
 }
 
+/// Bind the SDK owner directory before a helper or native work reads it.
+///
+/// A helper has no store, so it takes the directory its parent names in
+/// `LEAN_RS_WORKER_OWNERS_DIRECTORY` and refuses to run without one. The server
+/// and the installers bind that variable here when it is set, and otherwise
+/// their store's directory once they know the store. Commands that start no
+/// native work skip the check, so a bad setting cannot block them.
 fn configure_native_startup(command: Option<&Command>) -> std::io::Result<()> {
     match command {
         Some(
             Command::Config { .. }
             | Command::Doctor { .. }
-            | Command::WriterLockPath(_)
-            | Command::WriterExec
-            | Command::NativeGuardian,
-        ) => return Ok(()),
-        Some(Command::InstallWorker(args)) if args.list || args.clean || args.prune => return Ok(()),
+            | Command::Helper(
+                HelperCommand::WriterLockPath(_) | HelperCommand::WriterExec | HelperCommand::NativeGuardian,
+            ),
+        ) => Ok(()),
+        Some(Command::InstallWorker(args)) if args.list || args.clean || args.prune => Ok(()),
         #[cfg(target_os = "linux")]
-        Some(Command::NativeReaderWait(_)) => return Ok(()),
-        _ => {}
+        Some(Command::NativeReaderWait(_)) => Ok(()),
+        Some(Command::Helper(_)) => store::owner_directory().map(drop),
+        _ if std::env::var_os(OWNERS_DIRECTORY_ENV).is_some() => store::owner_directory().map(drop),
+        _ => Ok(()),
     }
-    lean_host_mcp::shared_writer::configure_native_startup()
 }
 
 fn run_serve(args: ServeArgs) -> ExitCode {

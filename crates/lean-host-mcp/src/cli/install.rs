@@ -68,10 +68,6 @@ pub struct InstallArgs {
     #[arg(long)]
     pub standalone_writer: Option<PathBuf>,
 
-    /// Extracted lean-rs-host package containing the pinned published shim sources.
-    #[arg(long)]
-    pub shim_source: Option<PathBuf>,
-
     /// Workspace root to build the worker from. Defaults to the workspace
     /// this binary was compiled in, else the published crate.
     #[arg(long, value_name = "DIR")]
@@ -153,7 +149,6 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
             .with_context(|| format!("cannot keep native state in the store {}", plan.store_dir.display()))?;
         let source = install_worker::resolve_worker_source(args.source_dir.as_deref())?;
         let inputs = WriterInputs {
-            shim_source: args.shim_source.clone(),
             writer: Some(writer.to_path_buf()),
         };
         install_worker::install_one(workers, id, &source, &inputs).map(drop)
@@ -364,7 +359,6 @@ mod tests {
             dir,
             force: false,
             standalone_writer: Some(fixture.writer.clone()),
-            shim_source: None,
             source_dir: None,
         }
     }

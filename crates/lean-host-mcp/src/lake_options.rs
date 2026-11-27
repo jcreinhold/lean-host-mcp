@@ -91,7 +91,7 @@ async fn resolve_using(
     root: &Path,
     options: LeanWorkerElabOptions,
     capacity_limit: usize,
-    contract: Option<crate::shared_writer::WriterContract>,
+    contract: Option<lean_rs_writer::WriterContract>,
     keepalive: Option<Box<dyn Send>>,
 ) -> Result<LeanWorkerElabOptions> {
     let file_label = options.file_label.clone();
@@ -145,7 +145,7 @@ async fn resolve_inner(
     root: &Path,
     options: LeanWorkerElabOptions,
     capacity_limit: usize,
-    contract: Option<crate::shared_writer::WriterContract>,
+    contract: Option<lean_rs_writer::WriterContract>,
     keepalive: Option<Box<dyn Send>>,
 ) -> PreparationResult<LeanWorkerElabOptions> {
     // This is the SAME full project union the utility guardian will acquire.
@@ -240,7 +240,7 @@ pub(crate) async fn reader_output(
     timeout: Duration,
     capacity_limit: usize,
     custody: crate::artifact_reads::ArtifactReadGuard,
-    contract: Option<crate::shared_writer::WriterContract>,
+    contract: Option<lean_rs_writer::WriterContract>,
     keepalive: Option<Box<dyn Send>>,
     prepare: impl FnOnce(&Path) -> std::io::Result<crate::native_reader::NativeReaderProgram> + Send + 'static,
 ) -> PreparationResult<Vec<u8>> {
@@ -275,7 +275,7 @@ pub(crate) async fn reader_run(
     timeout: Duration,
     capacity_limit: usize,
     custody: crate::artifact_reads::ArtifactReadGuard,
-    contract: Option<crate::shared_writer::WriterContract>,
+    contract: Option<lean_rs_writer::WriterContract>,
     keepalive: Option<Box<dyn Send>>,
     accepted: &'static [i32],
     prepare: impl FnOnce(&Path) -> std::io::Result<crate::native_reader::NativeReaderProgram> + Send + 'static,
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(owning_package(temp.path(), None), temp.path());
     }
 
-    fn fixture_contract(root: &Path) -> crate::shared_writer::WriterContract {
+    fn fixture_contract(root: &Path) -> lean_rs_writer::WriterContract {
         use std::os::unix::fs::PermissionsExt as _;
         let executable = PathBuf::from(std::env::var_os("LEAN_HOST_MCP_OPTIONS_TEST_HELPER").unwrap())
             .canonicalize()
@@ -659,7 +659,7 @@ mod tests {
         let registry = root.parent().unwrap().join("Owners");
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
-        crate::shared_writer::WriterContract {
+        lean_rs_writer::WriterContract {
             protocol: 1,
             executable,
             ownership_registry: registry,

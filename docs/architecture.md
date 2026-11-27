@@ -22,7 +22,7 @@ privileges; the worker is not an OS sandbox.
 
 ```
 crates/lean-host-mcp/src/
-  main.rs                clap CLI, shared broker setup, rmcp stdio entry
+  main.rs                clap CLI, shared broker setup, rmcp stdio entry, the SDK's helper subcommands
   transport_http.rs      private axum/rmcp Streamable HTTP entry
   server.rs              LeanHostService tool registration
   broker.rs              ProjectBroker: the served root, worker slots, idle retirement, the reaper
@@ -39,7 +39,6 @@ crates/lean-host-mcp/src/
   worker_retirement.rs   keeps an actor's capacity until each tracked child has exited
   project_lock.rs        fair read and write turns per Lake root, the shared kernel guard, proxy turns
   build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, the run in one helper
-  shared_writer.rs       the host's fork of the SDK writer, run as hidden subcommands of the server; its build log mode
   native_reader.rs       one-shot Lean programs in the SDK's native reader scope
   host_preparation.rs    the worker's host-artifact modes: readiness, and the preparation an installer runs
   native_socket.rs       where the SDK's short-lived sockets live
@@ -54,7 +53,7 @@ crates/lean-host-mcp/src/
   envelope.rs            internal operation envelope adapted to { data, errors, trust } at the public boundary
   requests/              named requests: the SQLite request table, one launch per id, recovery at start
   request_log.rs         content-free summaries of semantic calls
-  store.rs               the server store: one-server lock, build logs
+  store.rs               the server store: one-server lock, build logs, the native owner directory
   config_file.rs         the tracked and local config files at the Lake root
   config_schema.rs       every config setting, in one table
   cli/                   install, install-worker, config init and doctor processes
@@ -130,11 +129,9 @@ roots and of the installed shims. It admits an import only when the request's ro
 order, then the installed shim roots, and while no root holds a package whose compiled code the worker runs, such as
 `Init` or `Init.olean`; any module names are allowed. A worker that cannot take custody of its project at launch, for
 example after the manifest dropped a package, starts anyway and refuses each import with the reason. A child that exits
-before it connects makes the server wait out the 30-second startup deadline it gives the SDK. SDK 0.10.17 then leaves an
-owner record in phase `dispatching` that it never closes, and every later build that uses that owners directory waits
-until someone removes the record. That is an SDK bug, fixed in the next SDK release. The server refuses to start with
-`LEAN_PATH` set, since the worker would refuse it before connecting and leave such a record. The host copies no files,
-hashes no build outputs, and writes no import plan.
+before it connects makes the server wait out the 30-second startup deadline it gives the SDK, which then closes the
+child's owner record once it reaps the child. The server refuses to start with `LEAN_PATH` set, since the worker would
+refuse it before connecting. The host copies no files, hashes no build outputs, and writes no import plan.
 
 Startup stays serialized after caller disconnects and rechecks the per-project limit. Idle retirement skips a borrowed
 actor and one with queued work. Metadata-only degraded responses and pure `.ilean` reads use
@@ -440,8 +437,8 @@ without an id keeps the old rule and is cancelled when its connection drops.
 keeps it in a task-local slot, so a nested check in the same request reuses its read turn instead of queueing behind a
 waiting writer. A check takes its read turn before it pins an actor or starts a native reader, then the shared kernel
 guard on the project's artifacts, and holds both until the request ends. A build takes the write turn, then the
-exclusive kernel lock through the server's own writer helper (`shared_writer.rs`); a request that holds a read turn
-cannot take the write turn. Tokio grants turns in arrival order, so a queued build holds back later checks, and each
+exclusive kernel lock through the SDK writer helper, which the server binary serves as a subcommand
+(`lean_rs_writer::HelperCommand`); a request that holds a read turn cannot take the write turn. Tokio grants turns in arrival order, so a queued build holds back later checks, and each
 waiter keeps its place until its deadline. Each finished write turn adds one to the root's finished-build count.
 
 Workers hold the shared kernel lock for their whole generation. When a writer in another process announces demand, the

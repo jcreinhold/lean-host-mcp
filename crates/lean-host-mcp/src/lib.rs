@@ -32,7 +32,6 @@ pub mod requests;
 mod runtime_compatibility;
 mod semantic_search;
 mod server;
-pub mod shared_writer;
 mod smoke;
 mod status;
 pub mod store;

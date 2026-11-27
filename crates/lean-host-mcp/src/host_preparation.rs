@@ -32,9 +32,9 @@ const NOT_READY_EXIT: i32 = 75;
 const CLEANUP_WAIT: Duration = Duration::from_millis(250);
 /// The worker flag that checks the installed shims without building them.
 const READY_FLAG: &str = "--lean-rs-ready-host-artifacts";
-/// The worker flag that builds the shims compiled into the worker.
-#[cfg(test)]
-const PREPARE_FLAG: &str = "--lean-rs-prepare-host-artifacts";
+/// The worker flag that builds the shims compiled into the worker. Followed by
+/// a directory that does not exist yet, it writes their sources there first.
+pub(crate) const PREPARE_FLAG: &str = "--lean-rs-prepare-host-artifacts";
 // Keep the shared owners-directory registry binding: preparation writers must
 // consult the same orphan/fence namespace as native generations. Only remove
 // inherited lifetime activation and private capabilities here.
@@ -141,7 +141,7 @@ pub(crate) fn run_artifact_mode(
     if cancelled() {
         return Err(PreparationFailure::no_spawn("host preparation cancelled before launch"));
     }
-    let registry = crate::shared_writer::ownership_registry().map_err(PreparationFailure::no_spawn)?;
+    let registry = crate::store::owner_directory().map_err(PreparationFailure::no_spawn)?;
     let mut command = Command::new(worker);
     configure(&mut command, sysroot, writer, &registry, flags).map_err(PreparationFailure::no_spawn)?;
     start(command, timeout)?.wait_cancellable(cancelled)

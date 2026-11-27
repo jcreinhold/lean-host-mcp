@@ -103,7 +103,7 @@ pub(crate) fn semantic_runtime(
     let cache_root = semantic_runtime_cache_root().map_err(SemanticRuntimeFailure::from_error)?;
     // This build runs in the parent, so a child-only environment binding cannot
     // provide writer custody. Select this executable's helper explicitly.
-    let writer = crate::shared_writer::contract().map_err(SemanticRuntimeFailure::from_error)?;
+    let writer = lean_rs_writer::contract().map_err(SemanticRuntimeFailure::from_error)?;
     let runtime = lean_semantic_search_runtime::build_cached_with_writer(
         SemanticSearchRuntimeBuild {
             cache_root,

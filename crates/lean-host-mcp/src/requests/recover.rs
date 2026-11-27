@@ -41,7 +41,7 @@ impl RequestRunner {
                 .push(row.id.clone());
         }
         if !running.is_empty() {
-            let helper = crate::shared_writer::contract()
+            let helper = lean_rs_writer::contract()
                 .context("cannot find the writer helper")?
                 .executable;
             for (root, ids) in running {

@@ -119,7 +119,7 @@ pub(crate) fn run_program(
     keepalive: Option<Box<dyn Send>>,
     prepare: impl FnOnce(&Path) -> io::Result<NativeReaderProgram>,
 ) -> io::Result<NativeReaderResult> {
-    let helper = match crate::shared_writer::contract() {
+    let helper = match lean_rs_writer::contract() {
         Ok(helper) => helper,
         Err(error) => return Ok(not_started(error)),
     };
@@ -136,7 +136,7 @@ pub(crate) fn run_program(
 
 /// Explicit helper/registry seam for owned private fixtures and configured hosts.
 pub(crate) fn run_program_with_contract(
-    helper: &crate::shared_writer::WriterContract,
+    helper: &lean_rs_writer::WriterContract,
     project_root: &Path,
     timeout: Duration,
     capacity_limit: usize,
@@ -163,7 +163,7 @@ pub(crate) fn run_program_with_contract(
         }
         canonical(project_root)?;
         canonical(&helper.executable)?;
-        if helper.protocol != crate::shared_writer::PROTOCOL {
+        if helper.protocol != lean_rs_writer::PROTOCOL {
             return Err(invalid("native utility helper protocol differs"));
         }
         let scope = reserve_scope(helper, capacity_limit, true, deadline, cancelled)?;
@@ -670,7 +670,7 @@ pub fn run_cli(args: &NativeReaderArgs) -> io::Result<bool> {
 }
 
 fn reserve_scope(
-    helper: &crate::shared_writer::WriterContract,
+    helper: &lean_rs_writer::WriterContract,
     capacity_limit: usize,
     utility: bool,
     deadline: Instant,
@@ -743,7 +743,7 @@ fn run(args: &NativeReaderArgs) -> io::Result<NativeReaderResult> {
 fn run_internal(
     args: &NativeReaderArgs,
     program: Option<&NativeReaderProgram>,
-    configured_helper: Option<&crate::shared_writer::WriterContract>,
+    configured_helper: Option<&lean_rs_writer::WriterContract>,
     prepared_scope: Option<(LeanWorkerNativeScope, Instant)>,
     mut keepalive: Option<Box<dyn Send>>,
     cancelled: &(impl Fn() -> bool + ?Sized),
@@ -783,13 +783,13 @@ fn run_internal(
     };
     let mut helper = match configured_helper {
         Some(helper) => helper.clone(),
-        None => crate::shared_writer::contract()?,
+        None => lean_rs_writer::contract()?,
     };
     // The OS may report our own executable through /tmp's Darwin alias. The
     // selected helper is normalized; caller payload and project paths stay strict.
     helper.executable = helper.executable.canonicalize()?;
     canonical(&helper.executable)?;
-    if helper.protocol != crate::shared_writer::PROTOCOL {
+    if helper.protocol != lean_rs_writer::PROTOCOL {
         return Err(invalid("native utility helper protocol differs"));
     }
     let scope = match prepared_scope {
@@ -1044,7 +1044,7 @@ fn wait_child(child: &mut MeasuredChild, deadline: Instant) -> io::Result<Option
 fn prepare_payload(args: &NativeReaderArgs, deadline: Instant) -> io::Result<(GuardianHandle, Vec<NativeReadDomain>)> {
     args.validate()?;
     rustix::process::setsid()?;
-    let helper = crate::shared_writer::contract()?;
+    let helper = lean_rs_writer::contract()?;
     let socket =
         std::env::var_os("LEAN_RS_WORKER_PARENT_SOCKET").ok_or_else(|| invalid("reader parent socket missing"))?;
     let nonce = std::env::var("LEAN_RS_WORKER_PARENT_NONCE").map_err(io::Error::other)?;

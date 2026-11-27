@@ -38,8 +38,8 @@ use crate::broker::ProjectBroker;
 use crate::cancellation::{CallCancellation, with_deadline};
 use crate::error::{Result, ServerError};
 use crate::project_lock::{ProjectLock, TurnRefused, WriteTurn, ensure_write};
-use crate::shared_writer::log::{CappedLog, LOG_ENV, LOG_LIMIT_ENV};
 use config::{Append, BuildConfig, GuardPlace};
+use lean_rs_writer::log::{CappedLog, LOG_ENV, LOG_LIMIT_ENV};
 
 /// How long the helper may take to confirm its cleanup after the last step.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);

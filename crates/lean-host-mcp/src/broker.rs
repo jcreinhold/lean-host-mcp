@@ -938,7 +938,7 @@ impl ProjectBroker {
             .map_err(|err| ServerError::Internal(format!("project metadata task failed: {err}")))??;
         let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
         let cancellation = CallCancellation::current();
-        let writer = crate::shared_writer::contract()?.executable;
+        let writer = lean_rs_writer::contract()?.executable;
         let prepared =
             host_artifacts::installed_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
                 .await?;
@@ -1408,7 +1408,7 @@ mod tests {
     pub(super) fn worker_fixture() -> PathBuf {
         let server = std::env::var_os(lean_toolchain::shared_writer::SHARED_WRITER_EXECUTABLE_ENV)
             .unwrap_or_else(|| panic!("set LEAN_RS_WRITER_EXECUTABLE to the built lean-host-mcp"));
-        crate::shared_writer::use_helper_executable(Path::new(&server)).unwrap();
+        lean_rs_writer::use_helper_executable(Path::new(&server)).unwrap();
         PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
             .canonicalize()
             .unwrap()

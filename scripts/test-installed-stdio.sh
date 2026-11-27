@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run the parent tests with a test-owned installed worker, including its verified shims.
-# Set LEAN_RS_CHECKOUT to build the writer, shims, worker and host from an SDK checkout.
+# Set LEAN_RS_CHECKOUT or LEAN_SEMANTIC_SEARCH_CHECKOUT to build the writer, worker and host from
+# those checkouts; the worker brings the shim sources of the SDK it was built with.
 set -euo pipefail
 CDPATH='' cd -- "$(dirname -- "$0")/.."
 # shellcheck source=scripts/local-sdk.sh
@@ -32,7 +33,7 @@ if [[ -z ${LEAN_HOST_MCP_STDIO_TEST_WORKERS_DIR:-} ]]; then
         printf 'Expected native parent binary at %s\n' "$parent" >&2
         exit 1
     fi
-    local_sdk_install_worker "$parent" --toolchain "$id" \
+    "$parent" install-worker --toolchain "$id" \
         --workers-dir "$scratch/workers" --source-dir "$PWD" \
         --standalone-writer "$scratch/tools/bin/lean-rs-writer"
 fi

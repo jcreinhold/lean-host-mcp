@@ -3,8 +3,8 @@
 //! `search_for_proof` is the only tool that touches *two* worker children: the
 //! elaboration worker for the proof state, and a second semantic-search child
 //! for ranking. That second child used to be built and torn down on every call,
-//! along with a re-run of `lean_semantic_search_runtime::build_cached` (an
-//! on-disk-cached Lake build, ~5.5 ms warm). Both are now resident, and this
+//! along with a re-run of the semantic runtime's Lake build, which finds
+//! nothing to do (~5.5 ms warm). Both are now resident, and this
 //! bench is what defends that: it measures the *repeat* call, where the
 //! difference is the entire per-call setup rather than a fraction of it.
 //!

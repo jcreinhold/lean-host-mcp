@@ -277,9 +277,8 @@ impl Installed {
 
     /// Check the installation and take custody of the project. When custody
     /// fails, the worker still starts, holds only the shims' locks and refuses
-    /// every import with the reason. A worker that exits before the SDK child
-    /// connects leaves its owner record in the startup phase, and every later
-    /// writer that uses the same owner registry then waits out its deadline.
+    /// every import with the reason, since a worker that exits before the SDK
+    /// child connects makes the server wait out its startup deadline.
     pub(super) fn open() -> io::Result<Self> {
         let worker = std::env::current_exe()?.canonicalize()?;
         let dir = worker.parent().ok_or_else(|| invalid("missing install directory"))?;

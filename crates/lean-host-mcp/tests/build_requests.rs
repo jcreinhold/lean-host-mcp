@@ -57,7 +57,7 @@ const PATIENCE: Duration = Duration::from_mins(2);
 fn project() -> TestResult<(Chain, ToolContext)> {
     let chain = chain_project()?;
     chain.write("lean-host-mcp.toml", CONFIG)?;
-    lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
+    lean_rs_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {
             max_workers_per_project: NonZeroUsize::new(2).ok_or("two workers")?,

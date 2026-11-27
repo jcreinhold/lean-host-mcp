@@ -69,6 +69,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   directory before any native work. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
   `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` still move each one. Install, then serve, write nothing under `HOME` but the
   socket directory.
+- Breaking: build against lean-rs 0.11.0 and lean-semantic-search 0.8.0. The server, its writer and its workers must come
+  from one SDK release. A worker built against lean-rs 0.10 still reports protocol 13, so reinstall it with `install
+  --force` after upgrading. A lock record or owner-directory entry that a 0.10 storage turn left now refuses writer
+  admission; [operations](docs/operations.md#upgrading-from-lean-rs-010) gives the steps to clear them.
+- Breaking: the server binary serves the SDK's own writer, reader and guardian helpers (`lean_rs_writer::HelperCommand`)
+  in place of the host's copy, so their subcommands, frames and messages are the SDK's. A helper started without
+  `LEAN_RS_WORKER_OWNERS_DIRECTORY` refuses to run; the SDK sets it on every helper it starts. The capped build log
+  takes `LEAN_RS_WRITER_LOG` and `LEAN_RS_WRITER_LOG_LIMIT`. The writer reads only its `LEAN_RS_*` settings, so
+  `LEAN_HOST_MCP_WRITER_LOCK_LOANS` and the other `LEAN_HOST_MCP_WRITER_*` names are gone.
+- Breaking: `install` and `install-worker` lose `--shim-source`. The new worker writes the shim sources compiled into it
+  to its generation's `shims/` directory and builds them there under the writer, so the installer no longer reads the
+  Cargo source cache or checks the shim files against a pinned list.
+- The semantic runtime comes from lean-semantic-search 0.8, which builds its Lean modules with `lake build` under the
+  server's writer and no longer links a shared library.
 
 ### Removed
 
@@ -111,6 +125,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `worker_pool_leased` and `worker_pool_draining`; the capability `draining_lease_v1`; and the library's
   `RuntimeAction`, `RuntimeControlRequest`, `RuntimeControlResult` and `RuntimeControlStatus`. With many sessions on one
   server, one session's lease paused every other session's calls.
+- Breaking: remove the library's `shared_writer` module, the host's copy of the SDK writer. Use
+  `lean_rs_writer::use_helper_executable`, `lean_rs_writer::contract` and `lean_rs_writer::WriterContract`;
+  `store::owner_directory` replaces `ownership_registry`. Its lifecycle and contract tests went with it, since
+  `lean-rs-writer` tests the same code, and so did `tests/writer_cli_domain.rs`, whose CLI clients are now the SDK's.
+- Remove the `build_development_shims` example; the worker's preparation mode builds the shims it carries.
 
 ### Fixed
 
@@ -130,6 +149,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   edit during the check does not change what it checked.
 - The server creates a missing `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`. A relative path, or one it cannot create, fails with
   an error that names the variable and the path, in place of a bare `io: No such file or directory`.
+- A worker that exits before it connects no longer leaves its owner record in phase `dispatching`, where it held back
+  every later build that used the owner directory until someone deleted it. lean-rs 0.11 closes the record once it
+  reaps the child.
 
 ## [0.16.22] - 2026-11-25
 

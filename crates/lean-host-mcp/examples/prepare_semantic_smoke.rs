@@ -14,7 +14,7 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| anyhow::anyhow!("expected cache, toolchain label, sysroot and packaged host"))?;
-    lean_host_mcp::shared_writer::configure_native_startup()?;
+    lean_host_mcp::store::owner_directory()?;
     let started = Instant::now();
     let runtime = build_cached_with_writer(
         SemanticSearchRuntimeBuild {
@@ -28,11 +28,11 @@ fn main() -> Result<()> {
         Duration::from_secs(120),
         || false,
     )
-    .context("prepare installed semantic smoke capability")?;
+    .context("build the semantic search modules for the installed-package smoke")?;
     println!(
-        "semantic smoke capability prepared in {:.1}s at {}",
+        "semantic search modules built in {:.1}s at {}",
         started.elapsed().as_secs_f64(),
-        runtime.built.dylib_path()?.display(),
+        runtime.module_dir().display(),
     );
     Ok(())
 }

@@ -1,100 +1,34 @@
-//! Build the two coupled SDK shim packages in a fresh installer-owned directory.
+//! Give a candidate worker its own built copy of the SDK shims, record their
+//! digests, and probe the result.
 use anyhow::{Context as _, Result, ensure};
 use lean_rs_worker_protocol::types::LeanWorkerPreparedHostArtifacts;
-use sha2::{Digest as _, Sha256};
-use std::{fs, path::Path};
+use std::{ffi::OsStr, fs, path::Path, time::Duration};
 
-pub(super) fn prepare(
-    source: &Path,
-    destination: &Path,
-    sysroot: &Path,
-    writer: &Path,
-) -> Result<(
-    LeanWorkerPreparedHostArtifacts,
-    lean_toolchain::shared_writer::SharedWriter,
-)> {
-    crate::shared_writer::ownership_registry()?;
-    fs::create_dir(destination)?;
-    for row in include_str!("shim-inputs-0.10.6.txt").lines() {
-        let (hash, name) = row.split_once(' ').context("invalid packaged shim inventory")?;
-        let path = source.join("shims").join(name);
-        ensure!(
-            path.canonicalize()? == path && path.metadata()?.len() <= 1024 * 1024,
-            "invalid packaged shim source {name}"
-        );
-        let bytes = fs::read(path)?;
-        let mut actual = String::with_capacity(64);
-        for byte in Sha256::digest(&bytes) {
-            use std::fmt::Write as _;
-            write!(actual, "{byte:02x}")?;
-        }
-        ensure!(actual == hash, "published shim input changed: {name}");
-        let output = destination.join(name);
-        fs::create_dir_all(output.parent().context("missing source directory")?)?;
-        fs::write(output, bytes)?;
-    }
-    let host = destination.join("lean-rs-host-shims");
-    let interop = destination.join("lean-rs-interop-shims");
-    let mut builder = lean_toolchain::CargoLeanCapability::new(&host, "LeanRsHostShims")
-        .package("lean_rs_host_shims")
-        .module("LeanRsHostShims")
-        .lean_sysroot(sysroot)
-        .writer_executable(writer)
-        .lean_num_threads(2);
-    if let Some(key) = lean_toolchain::generated_output_key_for_sysroot(sysroot)? {
-        builder = builder.generated_output_key(key);
-    }
-    for signature in lean_toolchain::host_shim_abi::compiled_host_binding_signatures().into_values() {
-        builder = builder.export_signature(signature);
-    }
-    let mut custody = lean_toolchain::shared_writer::SharedWriter::open_with_write_roots(
+/// How long the worker's preparation mode may take to build both shim packages.
+const PREPARE_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Files Lake writes for a compiled module that the worker may load: its
+/// `.olean`, the split data beside it, and its IR.
+const MODULE_SUFFIXES: [&str; 4] = [".olean", ".olean.private", ".olean.server", ".ir"];
+
+/// Run the candidate's worker in its preparation mode: it writes the shim
+/// sources it was built with to `<candidate>/shims`, builds them there under
+/// `writer`, and prints their descriptor.
+fn prepare(candidate: &Path, sysroot: &Path, writer: &Path) -> Result<LeanWorkerPreparedHostArtifacts> {
+    let destination = candidate.join("shims");
+    let flags = [
+        OsStr::new(crate::host_preparation::PREPARE_FLAG),
+        destination.as_os_str(),
+    ];
+    crate::host_preparation::run_artifact_mode(
+        &candidate.join(crate::toolchain::WORKER_FILE_NAME),
+        sysroot,
         writer,
-        &host,
-        std::slice::from_ref(&interop),
-        std::time::Duration::from_secs(30),
+        &flags,
+        PREPARE_TIMEOUT,
         &|| false,
-    )?;
-    let built = builder.build_quiet_with_writer(&mut custody, || false)?;
-    let manifest = built.manifest_path().canonicalize()?;
-    let json = fs::read_to_string(&manifest)?;
-    let parsed = lean_toolchain::CapabilityManifest::from_bytes(&manifest, json.as_bytes())
-        .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
-    let [dep] = parsed.dependencies.as_slice() else {
-        anyhow::bail!("expected the sole interop dependency")
-    };
-    ensure!(
-        dep.module_initializer()
-            .is_some_and(|i| i.module_name() == "LeanRsInterop" && i.package_name() == "lean_rs_interop_shims"),
-        "unexpected interop initializer"
-    );
-    let image = dep.path_ref().canonicalize()?;
-    let primary = built.dylib_path().canonicalize()?;
-    ensure!(
-        image.starts_with(&interop) && primary.starts_with(&host) && manifest.starts_with(&host),
-        "shim escaped installation"
-    );
-    let text = |p: &Path| -> Result<String> { Ok(p.to_str().context("non-UTF8 install path")?.to_owned()) };
-    let roots = lean_toolchain::shared_writer::project_artifact_root_union(&[host, interop])?;
-    Ok((
-        LeanWorkerPreparedHostArtifacts {
-            protocol: 1,
-            shim_manifest_path: text(&manifest)?,
-            shim_manifest_json: json,
-            artifact_roots: roots.iter().map(|p| text(p)).collect::<Result<_>>()?,
-            shim_search_paths: [&image, &primary]
-                .iter()
-                .map(|p| {
-                    text(
-                        &p.parent()
-                            .context("missing library directory")?
-                            .join("lean")
-                            .canonicalize()?,
-                    )
-                })
-                .collect::<Result<_>>()?,
-        },
-        custody,
-    ))
+    )?
+    .context("the worker's preparation mode reported no shims")
 }
 
 pub(super) fn bind(
@@ -126,44 +60,20 @@ pub(super) fn bind(
             paths.push(file.canonicalize()?);
         }
     }
-    let search: Vec<_> = prepared
-        .shim_search_paths
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
-    // Bind every compiled package module, including split olean data if emitted.
-    // Package order in the search path is part of the installation contract.
-    for row in include_str!("shim-inputs-0.10.6.txt").lines() {
-        let (_, name) = row.split_once(' ').context("invalid packaged shim inventory")?;
-        let (package, file) = name.split_once('/').context("missing shim package")?;
-        let Some(module) = file.strip_suffix(".lean").filter(|name| *name != "lakefile") else {
-            continue;
-        };
-        let root = match package {
-            "lean-rs-interop-shims" => search.first(),
-            "lean-rs-host-shims" => search.get(1),
-            _ => None,
-        }
-        .context("missing installed module root")?;
-        let leaf = root.join(module).with_extension("olean");
-        ensure!(
-            leaf.canonicalize()? == leaf && leaf.is_file(),
-            "invalid installed module {module}"
-        );
-        paths.push(leaf.clone());
-        for suffix in ["olean.private", "olean.server", "ir"] {
-            let companion = leaf.with_extension(suffix);
-            match fs::symlink_metadata(&companion) {
-                Ok(meta) => {
-                    ensure!(
-                        meta.is_file() && companion.canonicalize()? == companion,
-                        "invalid installed module companion"
-                    );
-                    paths.push(companion);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+    // Record every compiled shim module, so the worker refuses a changed one.
+    for root in &prepared.shim_search_paths {
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy();
+            if !MODULE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
+                continue;
             }
+            ensure!(
+                entry.file_type().is_file(),
+                "invalid installed module {}",
+                entry.path().display()
+            );
+            paths.push(entry.into_path());
         }
     }
     let files = paths
@@ -201,7 +111,6 @@ pub(super) fn probe(
         LeanWorkerChild, LeanWorkerDeclarationInspectionRequest, LeanWorkerHostHandleBuilder, LeanWorkerProcessTracker,
     };
     use lean_rs_worker_protocol::types::LeanWorkerDeclarationInspectionResult;
-    use std::time::Duration;
     let worker = candidate.join(crate::toolchain::WORKER_FILE_NAME);
     let tracker = LeanWorkerProcessTracker::new();
     let child = LeanWorkerChild::for_toolchain(&worker, sysroot)
@@ -282,7 +191,6 @@ fn probe_guardian() -> Result<std::path::PathBuf> {
 pub(super) fn qualify(
     candidate: &Path,
     id: &crate::toolchain::ToolchainId,
-    source: &Path,
     sysroot: &Path,
     writer: &Path,
 ) -> Result<()> {
@@ -294,10 +202,8 @@ pub(super) fn qualify(
             && entries.next().is_none(),
         "expected a fresh candidate containing only its worker executable"
     );
-    let (prepared, custody) = prepare(source, &candidate.join("shims"), sysroot, writer)?;
+    let prepared = prepare(candidate, sysroot, writer)?;
     let mut record = bind(candidate, id, sysroot, prepared)?;
-    // Keep both exclusive domains through the installer's image inventory and sidecar publication.
-    drop(custody);
     let snapshot = crate::toolchain::WorkerSidecar::load(candidate)
         .and_then(crate::toolchain::WorkerSidecar::into_runtime)
         .context("unreadable installed snapshot")?;
@@ -415,7 +321,6 @@ mod tests {
                 &slot,
                 &id,
                 &id.elan_dir()?.canonicalize()?,
-                &env_path("R2_SHIM_SOURCE")?,
                 &env_path("R2_WRITER")?,
                 |dir| {
                     fs::copy(env_path("R2_WORKER")?, dir.join(crate::toolchain::WORKER_FILE_NAME))?;

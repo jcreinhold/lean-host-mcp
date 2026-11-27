@@ -2614,7 +2614,7 @@ fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
 /// One explicit owner namespace and actor slot for ordinary and companion
 /// generations. Prepared storage facts never substitute for loaded checks.
 fn native_worker_child(config: &ActorConfig, scope: &str) -> Result<LeanWorkerChild> {
-    let writer = crate::shared_writer::contract()?;
+    let writer = lean_rs_writer::contract()?;
     // Unit actor tests use a framed Python child that never loads Lean. The
     // production and integration-test binaries always require prepared custody.
     #[cfg(test)]

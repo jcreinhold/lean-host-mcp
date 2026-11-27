@@ -122,8 +122,8 @@ fn source_handoff_for_pin(_registry: &Path, _pin: SourceHandoffCutover) -> Optio
     None
 }
 
-impl From<crate::shared_writer::WriterContract> for SharedWriterObservation {
-    fn from(writer: crate::shared_writer::WriterContract) -> Self {
+impl From<lean_rs_writer::WriterContract> for SharedWriterObservation {
+    fn from(writer: lean_rs_writer::WriterContract) -> Self {
         Self {
             source_handoff: source_handoff_observation(&writer.ownership_registry),
             protocol: writer.protocol,
@@ -161,7 +161,7 @@ impl CompatibilityEvidence {
         {
             return Err("actual compatible worker receipts from this broker are required".into());
         }
-        let writer = crate::shared_writer::contract().map_err(|error| error.to_string())?;
+        let writer = lean_rs_writer::contract().map_err(|error| error.to_string())?;
         if writer.protocol != expected.writer_protocol {
             return Err("shared writer helper protocol is incompatible".into());
         }
@@ -216,7 +216,7 @@ impl ExpectedContract {
             ],
             required_host_bindings,
             enforcement: "every-host-session-before-body-commands".into(),
-            writer_protocol: crate::shared_writer::PROTOCOL,
+            writer_protocol: lean_rs_writer::PROTOCOL,
         })
     }
 
@@ -594,7 +594,7 @@ impl PureCompatibilityResponse {
         let expected = ExpectedContract::compiled()?;
         session_expectation(&lean_toolchain, Some(&expected))?;
         let contract_sha256 = expected.digest().map_err(|error| error.to_string())?;
-        let writer = crate::shared_writer::contract().map_err(|error| error.to_string())?;
+        let writer = lean_rs_writer::contract().map_err(|error| error.to_string())?;
         Ok(Self {
             status: "ok",
             native_compatibility: PureCompatibilityDescription {

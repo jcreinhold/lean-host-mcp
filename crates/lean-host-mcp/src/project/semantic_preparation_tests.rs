@@ -4,8 +4,8 @@
 
 use std::io;
 
+use lean_toolchain::SourcePackageError;
 use lean_toolchain::shared_writer::{WriterDisposition, WriterFailure};
-use lean_toolchain::{LinkDiagnostics, SourcePackageError};
 use serde_json::json;
 
 use super::*;
@@ -24,35 +24,28 @@ fn writer_failure(disposition: WriterDisposition) -> WriterFailure {
 }
 
 fn source_failure(disposition: WriterDisposition) -> lean_semantic_search_runtime::Error {
-    lean_semantic_search_runtime::Error::SourcePackage {
-        source: SourcePackageError::Io {
-            action: "source writer transaction",
-            path: PathBuf::from("/unused-semantic-source"),
-            source: io::Error::new(io::ErrorKind::Interrupted, writer_failure(disposition)),
-        },
-    }
-}
-
-fn build_failure(disposition: WriterDisposition) -> lean_semantic_search_runtime::Error {
-    lean_semantic_search_runtime::Error::Build {
-        toolchain_label: "unused-test-toolchain".to_owned(),
-        source: LinkDiagnostics::LakeWriterFailure {
-            project_root: PathBuf::from("/unused-semantic-source"),
-            target_name: "LeanSemanticSearch".to_owned(),
-            failure: writer_failure(disposition).into(),
-        },
-    }
+    lean_semantic_search_runtime::Error::from(SourcePackageError::Io {
+        action: "source writer transaction",
+        path: PathBuf::from("/unused-semantic-source"),
+        source: io::Error::new(io::ErrorKind::Interrupted, writer_failure(disposition)),
+    })
 }
 
 #[test]
-fn source_and_build_error_chains_preserve_writer_evidence() {
+fn runtime_error_chains_preserve_writer_evidence() {
     for disposition in [
         WriterDisposition::NotStarted,
         WriterDisposition::Stopped,
         WriterDisposition::Unknown,
     ] {
-        for error in [source_failure(disposition), build_failure(disposition)] {
-            let failure = SemanticRuntimeFailure::from_error(error);
+        // The runtime's writer step keeps the evidence in an `io::Error` that its
+        // opaque `Error` wraps. Only the runtime can build that wrapper, and its
+        // own tests check it, so this checks the `io::Error` itself.
+        let failures = [
+            SemanticRuntimeFailure::from_error(source_failure(disposition)),
+            SemanticRuntimeFailure::from_error(io::Error::other(writer_failure(disposition))),
+        ];
+        for failure in failures {
             assert_eq!(failure.writer, Some(writer_failure(disposition)));
             assert_eq!(failure.closed(), disposition != WriterDisposition::Unknown);
         }

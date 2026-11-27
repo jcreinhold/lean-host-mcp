@@ -80,7 +80,7 @@ pub(crate) async fn run_planned(
     log: &Path,
     on_running: Option<OnRunning>,
 ) -> Result<BuildOutcome, McpError> {
-    let helper = crate::shared_writer::contract().map_err(ServerError::Io)?.executable;
+    let helper = lean_rs_writer::contract().map_err(ServerError::Io)?.executable;
     Ok(run_build(&ctx.broker, &build.root, build.plan, id, log, &helper, on_running).await?)
 }
 

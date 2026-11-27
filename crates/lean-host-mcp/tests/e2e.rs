@@ -82,8 +82,7 @@ fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
 /// broker serves `root`, and the helper subcommands run from the server
 /// binary, since the test harness lacks them.
 fn open_broker(root: &Path, runtime: ProjectRuntimeConfig, config: ToolConfig) -> ToolContext {
-    lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))
-        .expect("helper executable");
+    lean_rs_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp"))).expect("helper executable");
     let broker = ProjectBroker::new_with_runtime_config(BrokerConfig::serving(root.to_path_buf()), runtime);
     ToolContext { broker, config }
 }

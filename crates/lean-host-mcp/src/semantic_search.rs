@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use lean_semantic_search_contract::{
-    CAPABILITY_SCHEMA_VERSION, CommandResponse, DECLARATION_FEATURE_COMMAND_VERSION, DeclarationFeatureRow, Diagnostic,
-    DiagnosticSeverity, ModuleSpec, PROOF_GOAL_FEATURE_COMMAND_VERSION, ProofGoalFeatureRequest, ProofGoalFeatureRow,
-    SEMANTIC_FEATURE_VERSION,
+    CAPABILITY_SCHEMA_VERSION, CommandResponse, DECLARATION_FEATURE_COMMAND_VERSION, DECLARATION_FEATURES_COMMAND,
+    DeclarationFeatureRow, Diagnostic, DiagnosticSeverity, ModuleSpec, PROOF_GOAL_FEATURE_COMMAND_VERSION,
+    PROOF_GOAL_FEATURES_COMMAND, ProofGoalFeatureRequest, ProofGoalFeatureRow, SEMANTIC_FEATURE_VERSION,
 };
 use lean_semantic_search_retrieval::{Anchor, SemanticIndex, retrieve_across};
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,6 @@ impl SemanticProofSearchRequest {
                 .map(|module| ModuleSpec {
                     module: module.clone(),
                     origin: Some("lean-host-mcp".to_owned()),
-                    source_root: None,
                 })
                 .collect(),
             declaration_ids: Vec::new(),
@@ -102,12 +101,12 @@ impl SemanticProofSearchRequest {
             .map_err(|e| ServerError::Internal(format!("invalid semantic feature verdict: {e}")))?;
         validate_response(
             &out.goal,
-            lean_semantic_search_capability::PROOF_GOAL_FEATURES_COMMAND,
+            PROOF_GOAL_FEATURES_COMMAND,
             PROOF_GOAL_FEATURE_COMMAND_VERSION,
         )?;
         validate_response(
             &out.declarations,
-            lean_semantic_search_capability::DECLARATION_FEATURES_COMMAND,
+            DECLARATION_FEATURES_COMMAND,
             DECLARATION_FEATURE_COMMAND_VERSION,
         )?;
         Ok(rank_semantic_rows(&out.goal, &out.declarations, self.limit))

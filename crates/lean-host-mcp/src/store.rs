@@ -19,6 +19,8 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use lean_toolchain::native_guardian::{OWNERS_DIRECTORY_ENV, bind_registry_directory};
+
 use crate::config_file::{self, ConfigFile};
 
 /// Env var that overrides the store directory for every Lake root. It beats
@@ -63,7 +65,7 @@ pub fn use_for_native_state(store: &Path) -> io::Result<PathBuf> {
             "this process already keeps its native state in another store",
         ));
     }
-    crate::shared_writer::ownership_registry()?;
+    owner_directory()?;
     Ok(store)
 }
 
@@ -71,6 +73,31 @@ pub fn use_for_native_state(store: &Path) -> io::Result<PathBuf> {
 #[must_use]
 pub fn native_store() -> Option<&'static Path> {
     NATIVE_STORE.get().map(PathBuf::as_path)
+}
+
+/// Bind the SDK to the owner directory of this process's workers and writers,
+/// and return it.
+///
+/// That is `LEAN_RS_WORKER_OWNERS_DIRECTORY`, else `owners` in the store set
+/// by [`use_for_native_state`]. The host never falls back to the SDK's
+/// directory under the user's data directory. Binding creates nothing: the SDK
+/// creates the directory, with the mode it checks.
+///
+/// # Errors
+///
+/// Fails when neither names a directory, or when the SDK refuses it.
+pub fn owner_directory() -> io::Result<PathBuf> {
+    let directory = if let Some(path) = std::env::var_os(OWNERS_DIRECTORY_ENV) {
+        PathBuf::from(path)
+    } else if let Some(store) = native_store() {
+        store.join(OWNERS_DIR_NAME)
+    } else {
+        return Err(io::Error::other(format!(
+            "no native owner directory: serve or install with --lake-root, or set {OWNERS_DIRECTORY_ENV}"
+        )));
+    };
+    bind_registry_directory(&directory)?;
+    Ok(directory)
 }
 
 /// The store directory for Lake root `root`: `flag` (a CLI flag), then

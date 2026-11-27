@@ -1388,7 +1388,7 @@ mod tests {
 
         let json = serde_json::to_value(from_tool_response(response, ToolConfig::default()).unwrap()).unwrap();
 
-        let expected = crate::shared_writer::module_setup_digest(text.as_bytes());
+        let expected = crate::digest::sha256_hex(text.as_bytes());
         assert_eq!(
             json.pointer("/trust/source_sha256").and_then(serde_json::Value::as_str),
             Some(expected.as_str())

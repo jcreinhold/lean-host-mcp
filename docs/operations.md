@@ -492,7 +492,7 @@ PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
 - A current worker or writer stays; `--force` replaces both.
 - `--standalone-writer PATH` installs that writer. Otherwise install keeps a current `bin/lean-rs-writer`, copies a
   current one from beside the running executable, or runs `cargo install lean-rs-writer` at the pinned SDK version.
-- `--shim-source DIR` and `--source-dir DIR` pass to the worker build, as for `install-worker`.
+- `--source-dir DIR` passes to the worker build, as for `install-worker`.
 
 Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
 file that is not valid TOML before it builds anything. It records `elan_home` as `ELAN_HOME`, else `$HOME/.elan`, so a
@@ -530,13 +530,13 @@ The provenance sidecar records the worker wire-protocol version independently of
   or stale** — protocol mismatch, `lean.h` header drift, or a failed/absent runtime smoke record — and skips ones that
   are current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current
   workers too (e.g. to re-run the smoke test or replace a corrupted binary).
-- `install-worker --toolchain <id>` builds a fresh generation in its final directory. The installer verifies the
-  published SDK shim sources, builds them with the standalone SDK writer, and records their identities in `worker.json`.
-  Use `--shim-source DIR` or `--standalone-writer PATH` for explicit inputs. After the builtin `Nat.add_zero` inspection
-  and successful shutdown it atomically updates `current-generation`. Existing workers retain their original paths.
-  Installs without a selector continue to use the legacy directory. The installed shims and their compiled Lean imports
-  run without the source checkout or Cargo source cache. To use a different worker root, reinstall there. The SDK
-  manifest records absolute paths for its generation.
+- `install-worker --toolchain <id>` builds a fresh generation in its final directory. The new worker writes the shim
+  sources compiled into it to the generation's `shims/` directory and builds them there under the standalone SDK writer;
+  the installer records their identities in `worker.json`. Use `--standalone-writer PATH` to choose the writer. After
+  the builtin `Nat.add_zero` inspection and successful shutdown it atomically updates `current-generation`. Existing
+  workers retain their original paths. Installs without a selector continue to use the legacy directory. The installed
+  shims and their compiled Lean imports run without the source checkout or Cargo source cache. To use a different worker
+  root, reinstall there. The SDK manifest records absolute paths for its generation.
 - `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
   `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
 - `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are
@@ -554,20 +554,18 @@ the worker directory and ends with the same command:
 no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/workers; run: /work/project/.local/lean-host-mcp/bin/lean-host-mcp install --lake-root /work/project
 ```
 
-### Source-bound writer cutover
+### Upgrading from lean-rs 0.10
 
-Source-bound staging is opt-in. Stop the running servers, then install the matched digest-aware host and standalone SDK
-writer. Use that writer's `writer-storage approve-handoff` with the existing registry path, device, and inode. Set
-`LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` on the server to the approved JSON fields `ownership_registry`,
-`registry_device`, `registry_inode`, `executable`, `sha256`, and the returned `approval_generation`. The server reports
-that approval in its compatibility receipt. The SDK enforces the generation at admission. Startup does not issue
-approval.
+The server, its writer and its workers must come from one SDK release. A 0.10 writer could leave a storage-turn record
+that 0.11 refuses instead of reading as a stopped writer: a build fails with `writer ownership record has unknown
+fields` or `unrecognized native registry directory .../.writer-storage-v1`. To upgrade:
 
-To roll back, disable source-bound admission and stop the servers. Use the same pinned SDK writer's
-`writer-storage revoke-handoff` on the original registry. If revocation is busy or its result is unknown, keep the
-servers stopped and retry after custody closes. Once revocation succeeds, restart the matched digest-aware host with
-`LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` unset. Keep the same registry and lock inodes. This procedure has been qualified
-with source-built images. Published package identities require a repeat with the installed artifacts.
+1. Stop every server and build that uses the project.
+2. Delete `.writer-storage-v1` from the owner directory: `owners` in the store, or `LEAN_RS_WORKER_OWNERS_DIRECTORY`.
+3. If the project's writer lock file holds a record with a field other than `version`, `owner` and `process`, such as
+   `storage_turn`, empty the file. `lean-host-mcp writer-lock-path PROJECT` prints its path as `lock_path`.
+4. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT --force` replaces the writer and the
+   worker, and `install-worker --force` replaces a worker installed on its own.
 
 ## Build, test, lint
 

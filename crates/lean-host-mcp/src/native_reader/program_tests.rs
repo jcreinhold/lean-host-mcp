@@ -52,9 +52,9 @@ impl Fixture {
             script,
         }
     }
-    fn contract(&self, helper: PathBuf) -> crate::shared_writer::WriterContract {
-        crate::shared_writer::WriterContract {
-            protocol: crate::shared_writer::PROTOCOL,
+    fn contract(&self, helper: PathBuf) -> lean_rs_writer::WriterContract {
+        lean_rs_writer::WriterContract {
+            protocol: lean_rs_writer::PROTOCOL,
             executable: helper,
             ownership_registry: self.root.join("owners"),
         }
