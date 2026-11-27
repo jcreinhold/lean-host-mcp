@@ -22,11 +22,6 @@ pub struct WorkerUnavailable {
     pub(crate) worker_restarted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_stop_receipt: Option<WorkerStopReceipt>,
-    /// The failed predispatch preparation has no running owned command scope.
-    /// This says nothing about a Lean proof result or other request operations.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub(crate) preparation_closed: bool,
     pub(crate) project_root: String,
     pub(crate) project_hash: String,
     pub(crate) imports: Vec<String>,

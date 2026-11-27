@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lean_rs_worker_parent::{
-    LeanWorkerCancellationToken, LeanWorkerCapabilityBuilder, LeanWorkerChild, LeanWorkerDeclarationInspectionRequest,
+    LeanWorkerCancellationToken, LeanWorkerChild, LeanWorkerDeclarationInspectionRequest,
     LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationSearch, LeanWorkerDeclarationSearchResult,
     LeanWorkerDeclarationVerificationBatchRequest, LeanWorkerDeclarationVerificationBatchResult,
     LeanWorkerDeclarationVerificationRequest, LeanWorkerDeclarationVerificationResult, LeanWorkerElabOptions,
@@ -25,7 +25,7 @@ use lean_rs_worker_parent::{
     LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome,
     LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets, LeanWorkerProcessTracker,
     LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRequestStopReceipt, LeanWorkerRestartPolicy,
-    LeanWorkerRestartReason, LeanWorkerShutdownReport,
+    LeanWorkerRestartReason,
 };
 use lean_semantic_search_runtime::SemanticSearchRuntimeBuild;
 use parking_lot::Mutex;
@@ -37,7 +37,6 @@ use crate::config_file::RuntimeFileConfig;
 use crate::envelope::{FinalAttemptStatus, Freshness, RuntimeFacts, RuntimeRestartEvent, WorkerStopReceipt};
 use crate::error::{Result, ServerError, WorkerUnavailable, map_worker_err};
 use crate::lake_meta::LakeProjectMeta;
-use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::toolchain::{Readiness, ToolchainId, WorkerBinary};
 use crate::worker_retirement::WorkerSlot;
 
@@ -792,11 +791,6 @@ enum ProjectMessage {
         options: LeanWorkerElabOptions,
         reply: oneshot::Sender<Result<ProjectCall<LeanWorkerDeclarationVerificationBatchResult>>>,
     },
-    SemanticProofSearch {
-        meta: JobMeta,
-        request: SemanticProofSearchRequest,
-        reply: oneshot::Sender<Result<ProjectCall<SemanticProofSearchResult>>>,
-    },
 }
 
 impl ProjectMessage {
@@ -809,8 +803,7 @@ impl ProjectMessage {
             | Self::DeclarationSearch { meta, .. }
             | Self::ProofAttempt { meta, .. }
             | Self::DeclarationVerification { meta, .. }
-            | Self::DeclarationVerificationBatch { meta, .. }
-            | Self::SemanticProofSearch { meta, .. } => meta,
+            | Self::DeclarationVerificationBatch { meta, .. } => meta,
         }
     }
 
@@ -842,9 +835,6 @@ impl ProjectMessage {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
             Self::DeclarationVerificationBatch { meta, reply, .. } => {
-                let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
-            }
-            Self::SemanticProofSearch { meta, reply, .. } => {
                 let _ = reply.send(Err(state.shutdown_unavailable(&meta, reason)));
             }
         }
@@ -1400,27 +1390,6 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
-    /// Run source-backed semantic proof search through this project's actor.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ServerError` when semantic capability setup, mailbox enqueue,
-    /// actor reply, or worker execution fails.
-    pub(crate) async fn semantic_proof_search(
-        &self,
-        imports: Vec<String>,
-        request: SemanticProofSearchRequest,
-        admission_deadline: Instant,
-    ) -> Result<ProjectCall<SemanticProofSearchResult>> {
-        let (reply, rx) = oneshot::channel();
-        let message = ProjectMessage::SemanticProofSearch {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
-            request,
-            reply,
-        };
-        self.enqueue(message, rx).await
-    }
-
     /// Try proof fragments in-memory through this project's serialized worker actor.
     ///
     /// # Errors
@@ -1616,9 +1585,9 @@ impl LeanProject {
                     && receipt.worker_session_id == self.session_id
                 {
                     operation.stopped(receipt.clone());
-                } else if failure.preparation_closed || failure.runtime.final_attempt == FinalAttemptStatus::Completed {
-                    // This operation returned or its predispatch writer scope
-                    // closed. The unavailable payload carries no proof result.
+                } else if failure.runtime.final_attempt == FinalAttemptStatus::Completed {
+                    // This operation returned. The unavailable payload carries
+                    // no proof result.
                     operation.returned();
                 } else {
                     operation.unknown();
@@ -1729,7 +1698,6 @@ impl LeanProject {
             retryable: true,
             worker_restarted: false,
             worker_stop_receipt: None,
-            preparation_closed: false,
             project_root: self.canonical_root.to_string_lossy().into_owned(),
             project_hash: self.manifest_hash.clone(),
             imports: imports.to_vec(),
@@ -2097,10 +2065,6 @@ impl ProjectActorState {
                 let result = self.run_job(meta, |handle, imports, cancellation| {
                     handle.verify_declaration_batch_with_imports(imports, &request, &options, Some(cancellation), None)
                 });
-                let _ = reply.send(result);
-            }
-            ProjectMessage::SemanticProofSearch { meta, request, reply } => {
-                let result = self.run_semantic_job(meta, &request);
                 let _ = reply.send(result);
             }
         }
@@ -2523,86 +2487,6 @@ impl ProjectActorState {
         }
     }
 
-    fn run_semantic_job(
-        &self,
-        meta: JobMeta,
-        request: &SemanticProofSearchRequest,
-    ) -> Result<ProjectCall<SemanticProofSearchResult>> {
-        if meta.cancellation.is_cancelled() {
-            return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
-        }
-        let _span = tracing::debug_span!(
-            "semantic_job",
-            session_id = %self.config.session_id,
-            imports = meta.imports.len(),
-            queue_wait_millis = millis_u64(meta.queued_at.elapsed()),
-        )
-        .entered();
-        let queue_wait_millis = millis_u64(meta.queued_at.elapsed());
-        let generation_before = self.observed_generation();
-        let job_started = Instant::now();
-        let mut capability = self.open_semantic_capability(&meta)?;
-        // The semantic search runs in this separate capability child, so the
-        // CPU delta samples it rather than the main worker handle.
-        let cpu_baseline = capability.cumulative_cpu_millis();
-        let checkpoint = capability.request_checkpoint();
-        let result = (|| {
-            let mut session = capability
-                .open_session_with_imports(meta.imports.clone(), Some(meta.cancellation.worker()), None)
-                .map_err(|error| {
-                    self.seal_artifact_refusal(&error);
-                    map_worker_err(error)
-                })?;
-            crate::semantic_search::run_semantic_proof_search(&mut session, request, meta.cancellation.worker())
-        })();
-        let call_cpu_millis =
-            cpu_baseline.and_then(|start| capability.cumulative_cpu_millis().map(|end| end.saturating_sub(start)));
-        // A pool lease must not advertise confirmed exit after an unobserved
-        // companion shutdown. Retain the project's slot if its child is uncertain.
-        retain_artifact_domains(&self.runtime, capability.host_runtime_metadata());
-        let shutdown = capability.try_shutdown();
-        let after = capability.lifecycle_snapshot();
-        let deferred_stop = self.defer_stop_observation(
-            &meta,
-            capability.pending_request_stop_since(&checkpoint),
-            "semantic",
-            0,
-            "semantic_cleanup",
-        );
-        let worker_stop_receipt = self.finish_semantic_shutdown(
-            &meta,
-            &after,
-            shutdown,
-            capability.confirmed_request_stop_since(&checkpoint),
-            deferred_stop,
-        );
-        let runtime = self.runtime_facts(
-            &meta,
-            generation_before,
-            0,
-            queue_wait_millis,
-            millis_u64(job_started.elapsed()),
-            call_cpu_millis,
-            None,
-        );
-        self.publish_runtime(&runtime);
-        match result {
-            Ok(value) => Ok(ProjectCall::new(value, runtime)),
-            Err(error) => Err(with_stop_receipt(
-                self.worker_unavailable_for(
-                    &meta,
-                    format!("semantic operation failed: {error}"),
-                    false,
-                    after.restarts > 0,
-                    None,
-                    None,
-                    None,
-                ),
-                worker_stop_receipt,
-            )),
-        }
-    }
-
     /// Retain one exact unresolved direct child for an eventual owned reap.
     /// A receipt already confirmed before another cleanup failure cannot settle
     /// that independent replacement uncertainty.
@@ -2639,115 +2523,6 @@ impl ProjectActorState {
             }),
         );
         unresolved
-    }
-
-    /// Settle only this semantic companion's observed shutdown. An original
-    /// request receipt remains useful even when replacement cleanup is unknown.
-    fn finish_semantic_shutdown(
-        &self,
-        meta: &JobMeta,
-        after: &LeanWorkerLifecycleSnapshot,
-        shutdown: std::result::Result<LeanWorkerShutdownReport, LeanWorkerError>,
-        receipt: Option<&LeanWorkerRequestStopReceipt>,
-        deferred_stop: bool,
-    ) -> Option<WorkerStopReceipt> {
-        let worker_stop_receipt = receipt.map(|receipt| {
-            confirmed_stop_receipt(
-                &self.config.session_id,
-                meta.correlation_id,
-                "semantic",
-                0,
-                receipt,
-                after
-                    .last_restart_reason
-                    .as_ref()
-                    .map_or("worker_stopped", |reason| restart_cause_from_worker(reason).as_str()),
-            )
-        });
-        if let Err(error) = shutdown {
-            self.config.startup_uncertain.store(true, Ordering::Release);
-            self.config.healthy.store(false, Ordering::Release);
-            // An original request receipt does not certify a replacement or
-            // any other companion whose shutdown has not been observed.
-            if !deferred_stop {
-                meta.cancellation.mark_uncertain();
-            }
-            tracing::warn!(
-                %error,
-                session_id = %self.config.session_id,
-                operation_id = %meta.correlation_id,
-                "semantic capability shutdown uncertain"
-            );
-        }
-        worker_stop_receipt
-    }
-
-    /// Spawn the semantic-search child for one call. The child is dropped when
-    /// the caller's `LeanWorkerCapability` goes out of scope.
-    ///
-    /// **Keeping it resident between calls has now been measured twice, and
-    /// rejected twice for different reasons.**
-    ///
-    /// The first measurement — 2.71 s per-call spawn versus 3.30 s resident on
-    /// `benches/search_for_proof.rs`, a 15–22% regression — was taken against a
-    /// worker child that re-imported on every `open_session_with_imports`.
-    /// Residency saved the process spawn while letting one child accumulate
-    /// every call's unreclaimable import, and the accumulation cost more. That
-    /// reason is now obsolete: a session whose imports match the live one is
-    /// reused.
-    ///
-    /// So it was re-implemented — resident on the actor state, evicted by
-    /// import fingerprint — and re-measured on the same bench: **1.35 s
-    /// per-call spawn versus 1.49 s resident** (p = 0.11, confidence intervals
-    /// overlapping). No significant improvement, with the point estimate again
-    /// slightly worse, so the simpler per-call spawn stands. The spawn it would
-    /// save is smaller than `benches/worker_cold_spawn.rs`'s 845 ms suggests:
-    /// that figure is the *main* worker's cold spawn plus a first inspect, and
-    /// the semantic child imports a different, smaller set.
-    ///
-    /// Revisit only with a workload where the semantic child's spawn is a
-    /// measured majority of the call — and revert again unless the bench moves.
-    fn open_semantic_capability(&self, meta: &JobMeta) -> Result<lean_rs_worker_parent::LeanWorkerCapability> {
-        let runtime = semantic_runtime(
-            &self.config.toolchain_label,
-            &self.config.lean_sysroot,
-            &meta.cancellation,
-        )
-        .map_err(|err| {
-            let mut error = self.worker_unavailable_for(
-                meta,
-                format!("semantic runtime build failed for this toolchain: {err}"),
-                true,
-                false,
-                None,
-                None,
-                None,
-            );
-            if let ServerError::WorkerUnavailable(failure) = &mut error {
-                failure.preparation_closed = err.closed();
-            }
-            error
-        })?;
-        semantic_capability_builder(&self.config, &runtime.built)?
-            .open()
-            .map_err(|err| {
-                self.seal_artifact_refusal(&err);
-                if startup_outcome_uncertain(&err) {
-                    self.config.startup_uncertain.store(true, Ordering::Release);
-                }
-                self.worker_unavailable_for(
-                    meta,
-                    format!(
-                        "semantic capability open failed for this toolchain: {}",
-                        map_worker_err(err)
-                    ),
-                    true,
-                    false,
-                    None,
-                    None,
-                    None,
-                )
-            })
     }
 
     /// Replace the worker when a build finished after it loaded imports.
@@ -3255,7 +3030,6 @@ impl ProjectActorState {
             retryable,
             worker_restarted,
             worker_stop_receipt: None,
-            preparation_closed: false,
             project_root: self.config.lake_root.to_string_lossy().into_owned(),
             project_hash: self.config.manifest_hash.clone(),
             imports: meta.imports.clone(),
@@ -3293,7 +3067,6 @@ impl ProjectActorState {
             retryable: false,
             worker_restarted: false,
             worker_stop_receipt: None,
-            preparation_closed: false,
             project_root: self.config.lake_root.to_string_lossy().into_owned(),
             project_hash: self.config.manifest_hash.clone(),
             imports: imports.to_vec(),
@@ -3517,24 +3290,6 @@ fn open_worker(config: &ActorConfig) -> Result<(LeanWorkerHostHandle, String)> {
     Ok((handle, runtime_toolchain))
 }
 
-/// Only errors proving no spawn or an observed child exit release startup
-/// capacity. In particular, handshake/setup/protocol failures can follow spawn.
-fn startup_outcome_uncertain(error: &LeanWorkerError) -> bool {
-    !matches!(
-        error,
-        LeanWorkerError::Spawn { .. }
-            | LeanWorkerError::WorkerChildUnresolved { .. }
-            | LeanWorkerError::WorkerChildNotExecutable { .. }
-            | LeanWorkerError::Bootstrap { .. }
-            | LeanWorkerError::ChildExited { .. }
-            | LeanWorkerError::ChildPanicOrAbort { .. }
-            | LeanWorkerError::Timeout {
-                operation: "startup",
-                ..
-            }
-    )
-}
-
 /// One policy restart, on the one quantity that accumulates without bound: the
 /// bytes an import retains and the child cannot give back.
 ///
@@ -3624,35 +3379,6 @@ fn worker_builder(config: &ActorConfig) -> Result<LeanWorkerHostHandleBuilder> {
     )
 }
 
-fn semantic_capability_builder(
-    config: &ActorConfig,
-    built: &lean_toolchain::LeanBuiltCapability,
-) -> Result<LeanWorkerCapabilityBuilder> {
-    // See `residue_restart_policy`: bounded by retained bytes, one Lean heap
-    // ceiling.
-    let restart_policy = residue_restart_policy(config);
-    let contract =
-        crate::broker::MaintenanceAccess::native_contract(&config.toolchain_label).map_err(ServerError::BadProject)?;
-    let expectation = crate::runtime_compatibility::session_expectation(&config.toolchain_label, contract.as_ref())
-        .map_err(ServerError::BadProject)?;
-    let child = native_worker_child(config, "semantic")?;
-    let builder = LeanWorkerCapabilityBuilder::from_built_capability(built, std::iter::empty::<String>())
-        .map_err(map_worker_err)?
-        .require_host_runtime(expectation)
-        .import_workspace_root(config.lake_root.clone())
-        .worker_child(child)
-        .startup_timeout(Duration::from_secs(30))
-        .request_timeout(Duration::from_millis(config.request_timeout_millis))
-        .process_tracker(config.process_tracker.clone())
-        .restart_policy(restart_policy)
-        .session_pool_capacity(config.session_pool_capacity)
-        .lean_max_memory_kib(config.lean_max_memory_kib)
-        .module_cache_limits(module_cache_limits())
-        .json_command_export(lean_semantic_search_capability::DECLARATION_FEATURES_EXPORT)
-        .json_command_export(lean_semantic_search_capability::PROOF_GOAL_FEATURES_EXPORT);
-    Ok(builder)
-}
-
 /// Built semantic-search runtimes, one per `(toolchain label, Lean sysroot)`.
 ///
 /// `lean_semantic_search_runtime::build_cached_with_writer` is cached *on disk*, not in
@@ -3708,7 +3434,8 @@ impl SemanticRuntimeFailure {
         }
     }
 
-    fn closed(&self) -> bool {
+    /// Whether the writer reported that its command never started or stopped.
+    pub(crate) fn closed(&self) -> bool {
         matches!(
             self.writer.as_ref().map(|failure| failure.disposition),
             Some(
@@ -4296,79 +4023,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_capability_builder_omits_capability_import_module() {
-        let tmp = tempfile::tempdir().unwrap();
-        let capability_root = tmp.path().join("capability");
-        let lib_dir = capability_root.join(".lake").join("build").join("lib");
-        std::fs::create_dir_all(&lib_dir).unwrap();
-        let dylib_name = if cfg!(target_os = "macos") {
-            "libLeanSemanticSearch.dylib"
-        } else {
-            "libLeanSemanticSearch.so"
-        };
-        let dylib = lib_dir.join(dylib_name);
-        std::fs::write(&dylib, "").unwrap();
-        let built = lean_toolchain::LeanBuiltCapability::path(&dylib)
-            .package("lean_semantic_search")
-            .module("LeanSemanticSearch");
-        let runtime = Arc::new(Mutex::new(RuntimeSnapshot {
-            protected_artifact_domains: BTreeSet::new(),
-            worker_generation: 1,
-            last_restart: None,
-            rss_kib: None,
-            import_profile: None,
-            profile_switch_count: 0,
-            restarts_total: 0,
-            restarts_by_cause: BTreeMap::new(),
-            import_residue_bytes: None,
-            import_residue_limit_bytes: None,
-        }));
-        let mut config = ActorConfig {
-            maintenance: crate::broker::MaintenanceAccess::default(),
-            lake_root: tmp.path().join("consumer"),
-            manifest_hash: "sha256-test".to_owned(),
-            toolchain_label: "leanprover/lean4:v4.35.0".to_owned(),
-            worker_path: tmp.path().join("worker"),
-            lean_sysroot: tmp.path().join("lean"),
-            prepared_host_artifacts: None,
-            native_capacity_limit: crate::broker::DEFAULT_MAX_PROJECTS,
-            session_id: "session-test".to_owned(),
-            runtime,
-            healthy: Arc::new(AtomicBool::new(true)),
-            startup_uncertain: Arc::new(AtomicBool::new(false)),
-            process_tracker: LeanWorkerProcessTracker::new(),
-            lean_max_memory_kib: ProjectRuntimeConfig::default().lean_max_memory_kib(),
-            request_timeout_millis: REQUEST_TIMEOUT_MILLIS,
-            mailbox_capacity: PROJECT_MAILBOX_CAPACITY,
-            max_restarts_per_window: MAX_RESTARTS_PER_WINDOW,
-            restart_window: RESTART_WINDOW,
-            import_residue_budget_bytes: ProjectRuntimeConfig::default().import_residue_budget_bytes(),
-            import_residue_soft_bytes: ProjectRuntimeConfig::default().import_residue_soft_bytes(),
-            session_pool_capacity: WORKER_SESSION_POOL_CAPACITY,
-            tokio_handle: None,
-            toolchain_advisories: Vec::new(),
-        };
-
-        let builder = semantic_capability_builder(&config, &built).unwrap();
-        let debug = format!("{builder:?}");
-
-        assert!(debug.contains("imports: []"), "builder debug: {debug}");
-        assert!(
-            !debug.contains("LeanSemanticSearch.Capability"),
-            "builder must not import the capability module: {debug}"
-        );
-        assert!(
-            debug.contains("import_workspace_root: Some"),
-            "builder should import sessions against the consumer workspace: {debug}"
-        );
-        config.toolchain_label = "leanprover/lean4:test".to_owned();
-        assert!(
-            semantic_capability_builder(&config, &built).is_err(),
-            "unsupported toolchain cannot bypass the first-session expectation"
-        );
-    }
-
-    #[test]
     fn planned_restart_causes_do_not_consume_abnormal_restart_budget() {
         assert!(!RestartCause::RssPostJob.counts_toward_restart_limit());
         assert!(!RestartCause::MaxRequests.counts_toward_restart_limit());
@@ -4800,22 +4454,6 @@ mod tests {
         drop(message);
         assert_eq!(active.load(Ordering::Acquire), 0);
         assert_eq!(pool_active.load(Ordering::Acquire), 0);
-    }
-    #[test]
-    fn startup_capacity_requires_no_spawn_or_confirmed_exit_evidence() {
-        assert!(!startup_outcome_uncertain(&LeanWorkerError::Spawn {
-            executable: PathBuf::from("missing-worker"),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
-        }));
-        assert!(startup_outcome_uncertain(&LeanWorkerError::Handshake {
-            message: "reader disconnected".to_owned()
-        }));
-        assert!(startup_outcome_uncertain(&LeanWorkerError::Protocol {
-            message: "configuration write failed".to_owned()
-        }));
-        assert!(startup_outcome_uncertain(&LeanWorkerError::Setup {
-            message: "child stdout unavailable".to_owned()
-        }));
     }
 }
 

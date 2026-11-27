@@ -795,7 +795,6 @@ mod tests {
             retryable: true,
             worker_restarted: true,
             worker_stop_receipt: None,
-            preparation_closed: false,
             project_root: "/tmp/project".to_owned(),
             project_hash: "hash".to_owned(),
             imports: vec!["Init".to_owned()],

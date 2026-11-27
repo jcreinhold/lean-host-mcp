@@ -116,11 +116,11 @@ FIFO, cancellable, and deadline-bounded; a separate FIFO queue admits cold proje
 controller's host handle and stays within synchronous dispatch. It cannot cross `.await` or be shared between tasks.
 
 The broker reserves a slot before opening a worker. Opening, resident, and retiring actors count against the cap until
-confirmed shutdown. An actor-owned process tracker covers ordinary workers, semantic companions, and replacement
-generations. Once the actor seals, the retirement registry retains its slot until every direct child is reaped. Late
-exit observation restores capacity, including after cleanup-thread creation failure; uncertain cleanup retains the slot.
-This registry is process-local and does not reconcile server crashes or Lake descendants. The cap counts actor runtimes,
-not memory bytes or each transient companion process. External Lean processes are outside it.
+confirmed shutdown. An actor-owned process tracker covers each worker and its replacement generations. Once the actor
+seals, the retirement registry retains its slot until every direct child is reaped. Late exit observation restores
+capacity, including after cleanup-thread creation failure; uncertain cleanup retains the slot. This registry is
+process-local and does not reconcile server crashes or Lake descendants. The cap counts actor runtimes, not memory bytes
+or each transient companion process. External Lean processes are outside it.
 
 The installed worker reads the project's own build in place. At launch the broker names the project's import roots in
 Lean's search order, from `lake_meta::manifest_artifact_roots`: the root package's `.lake/build/lib/lean`, then each
@@ -491,11 +491,11 @@ that checks the code. "None yet" marks a gap.
 
 ## Native ownership and artifact custody
 
-Each project actor owns its actual worker child and its reaper. Ordinary and semantic generations share one durable
-actor quota in the canonical private ownership registry. A native guardian owns the generation's inherited process group
-and retains the complete set of shared artifact descriptors. It acknowledges durable custody before a worker loads a
-library, runs an initializer, imports a module, or executes a submitted body. Cooperating writers acquire the same
-canonical domains exclusively and check ownership fences before dispatch.
+Each project actor owns its actual worker child and its reaper. Its generations share one durable actor quota in the
+canonical private ownership registry. A native guardian owns the generation's inherited process group and retains the
+complete set of shared artifact descriptors. It acknowledges durable custody before a worker loads a library, runs an
+initializer, imports a module, or executes a submitted body. Cooperating writers acquire the same canonical domains
+exclusively and check ownership fences before dispatch.
 
 Cooperating artifact writers announce process-bound demand on the same canonical physical domains before waiting for
 exclusive artifact custody. The broker checks that handoff gate before borrowing a resident actor or admitting idle

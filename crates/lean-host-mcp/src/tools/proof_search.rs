@@ -448,12 +448,7 @@ async fn run_semantic_search(
     let hint = ProjectHint::from_request(project);
     let call = ctx
         .broker
-        .semantic_proof_search(
-            hint,
-            session_imports(profile.imports.clone()),
-            profile.imports.clone(),
-            request,
-        )
+        .semantic_proof_search(hint, profile.imports.clone(), request)
         .await?;
     Ok(Some(call))
 }

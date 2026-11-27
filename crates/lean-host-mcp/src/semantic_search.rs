@@ -1,13 +1,12 @@
 //! Private `lean-semantic-search` runtime adapter.
 //!
 //! The MCP tool surface stays proof-agent shaped. This module hides the
-//! downstream capability export names, command envelopes, feature rows, and
-//! retrieval policy behind one operation that returns candidate declarations
-//! plus key-free evidence labels.
+//! downstream command envelopes, feature rows, and retrieval policy: it writes
+//! the request the file reader sends, and turns the reader's reply into
+//! candidate declarations with key-free evidence labels.
 
 use std::collections::HashMap;
 
-use lean_rs_worker_parent::{LeanWorkerCancellationToken, LeanWorkerJsonCommand, LeanWorkerSession};
 use lean_semantic_search_contract::{
     CAPABILITY_SCHEMA_VERSION, CommandResponse, DECLARATION_FEATURE_COMMAND_VERSION, DeclarationFeatureRow, Diagnostic,
     DiagnosticSeverity, ModuleSpec, PROOF_GOAL_FEATURE_COMMAND_VERSION, ProofGoalFeatureRequest, ProofGoalFeatureRow,
@@ -113,45 +112,6 @@ impl SemanticProofSearchRequest {
         )?;
         Ok(rank_semantic_rows(&out.goal, &out.declarations, self.limit))
     }
-}
-/// Run source-backed semantic proof search in one manifest-backed worker session.
-///
-/// # Errors
-///
-/// Returns [`ServerError::Lean`] for worker command failures and
-/// [`ServerError::Internal`] for malformed semantic-search envelopes.
-pub(crate) fn run_semantic_proof_search(
-    session: &mut LeanWorkerSession<'_>,
-    request: &SemanticProofSearchRequest,
-    cancellation: &LeanWorkerCancellationToken,
-) -> Result<SemanticProofSearchResult> {
-    let goal_command = LeanWorkerJsonCommand::<ProofGoalFeatureRequest, ProofGoalResponse>::new(
-        lean_semantic_search_capability::PROOF_GOAL_FEATURES_EXPORT,
-    );
-    let declaration_command = LeanWorkerJsonCommand::<DeclarationFeatureCommandRequest, DeclarationResponse>::new(
-        lean_semantic_search_capability::DECLARATION_FEATURES_EXPORT,
-    );
-
-    let goal_response = session
-        .run_json_command(&goal_command, &request.goal, Some(cancellation), None)
-        .map_err(crate::error::map_worker_err)?;
-    validate_response(
-        &goal_response,
-        lean_semantic_search_capability::PROOF_GOAL_FEATURES_COMMAND,
-        PROOF_GOAL_FEATURE_COMMAND_VERSION,
-    )?;
-
-    let declaration_request = request.declarations();
-    let declaration_response = session
-        .run_json_command(&declaration_command, &declaration_request, Some(cancellation), None)
-        .map_err(crate::error::map_worker_err)?;
-    validate_response(
-        &declaration_response,
-        lean_semantic_search_capability::DECLARATION_FEATURES_COMMAND,
-        DECLARATION_FEATURE_COMMAND_VERSION,
-    )?;
-
-    Ok(rank_semantic_rows(&goal_response, &declaration_response, request.limit))
 }
 
 fn validate_response<Row>(response: &CommandResponse<Row>, command: &str, command_version: &str) -> Result<()> {

@@ -2,12 +2,9 @@
 //! the semantic feature driver with the module setup that `lake setup-file`
 //! prints for that file.
 use super::verify_file::PreparedReader;
-use super::{
-    BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, SemanticProofSearchRequest,
-    SemanticProofSearchResult, ServerError, reader_freshness,
-};
+use super::{BrokerCall, ProjectBroker, ProjectHint, Result, RuntimeFacts, ServerError, reader_freshness};
 use crate::cancellation::CallCancellation;
-use lean_semantic_search_runtime::SemanticSearchRuntimeProvenance;
+use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
 use std::{
     fs, io,
@@ -20,7 +17,13 @@ fn invalid(error: impl std::fmt::Display) -> ServerError {
 }
 
 impl ProjectBroker {
-    pub(super) async fn semantic_file(
+    /// Rank declarations that may close the goal at one proof position.
+    ///
+    /// # Errors
+    ///
+    /// Returns resolution, `lake setup-file`, semantic runtime build, or
+    /// reader failures.
+    pub(crate) async fn semantic_proof_search(
         &self,
         hint: ProjectHint,
         freshness: Vec<String>,
@@ -51,17 +54,25 @@ impl ProjectBroker {
             ..
         } = reader;
         let cancellation = CallCancellation::current();
+        let build_cancellation = cancellation.clone();
         let label = meta.toolchain.clone();
         let prefix = sysroot.clone();
         let (activity, runtime) = tokio::task::spawn_blocking(move || {
             (
                 activity,
-                crate::project::semantic_runtime(&label, &prefix, &cancellation),
+                crate::project::semantic_runtime(&label, &prefix, &build_cancellation),
             )
         })
         .await
         .map_err(invalid)?;
-        let runtime = runtime.map_err(invalid)?;
+        let runtime = runtime.map_err(|failure| {
+            // The build ran under the shared writer. Unless the writer reports
+            // that it never started or stopped, its command may still run.
+            if !failure.closed() {
+                cancellation.mark_uncertain();
+            }
+            invalid(failure)
+        })?;
         let path = runtime
             .built
             .resolved_manifest_path()
@@ -77,20 +88,13 @@ impl ProjectBroker {
         // reaping the helper when the completed build returns.
         let runtime_guard = self.read_when_admitted(std::slice::from_ref(&package)).await?;
         let image = runtime.built.dylib_path().map_err(invalid)?.canonicalize()?;
-        let bootstrap = select_semantic_runtime(
-            || Ok(runtime_guard.validate()?),
-            &package,
-            &path,
-            &image,
-            &meta.toolchain,
-            &runtime.provenance,
-        )?;
+        let bootstrap = select_semantic_runtime(|| Ok(runtime_guard.validate()?), &package, &image)?;
         let body = request.reader_input(&roots)?;
         domains.push(package);
         let bytes = crate::lake_options::reader_output(
             "Lean semantic feature reader",
             root,
-            CallCancellation::current().remaining_or(Duration::from_millis(self.request_timeout_millis())),
+            cancellation.remaining_or(Duration::from_millis(self.request_timeout_millis())),
             self.config.max_projects.get(),
             custody,
             None,
@@ -139,27 +143,12 @@ impl ProjectBroker {
     }
 }
 
-/// Check the built semantic runtime against its builder provenance and return
-/// the directory that holds its compiled Lean modules.
-fn select_semantic_runtime(
-    validate_custody: impl Fn() -> Result<()>,
-    package: &Path,
-    path: &Path,
-    image: &Path,
-    toolchain: &str,
-    provenance: &SemanticSearchRuntimeProvenance,
-) -> Result<PathBuf> {
+/// Return the directory that holds the semantic runtime's compiled Lean
+/// modules, checking that it lies in the package the read turn covers.
+fn select_semantic_runtime(validate_custody: impl Fn() -> Result<()>, package: &Path, image: &Path) -> Result<PathBuf> {
     validate_custody()?;
-    let manifest = lean_toolchain::CapabilityManifest::read(path).map_err(invalid)?;
-    if !image.starts_with(package)
-        || image != manifest.primary_dylib
-        || manifest.module != lean_semantic_search_runtime::LIBRARY_NAME
-        || manifest.package != provenance.materialized_package
-        || provenance.runtime_source_digest != lean_semantic_search_runtime::RUNTIME_SOURCE_DIGEST
-        || provenance.source_revision != lean_semantic_search_runtime::SOURCE_REVISION
-        || provenance.toolchain_label != toolchain
-    {
-        return Err(invalid("semantic runtime selection changed"));
+    if !image.starts_with(package) {
+        return Err(invalid("semantic runtime image outside its package"));
     }
     let bootstrap = semantic_bootstrap(image)?;
     if !bootstrap.join("LeanSemanticSearch/Capability.olean").is_file() {

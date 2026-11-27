@@ -1,17 +1,14 @@
-//! Preserve semantic preparation evidence through errors and call evidence.
+//! Preserve semantic runtime writer evidence through its error chain.
 
-#![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(clippy::expect_used)]
 
 use std::io;
 
 use lean_toolchain::shared_writer::{WriterDisposition, WriterFailure};
 use lean_toolchain::{LinkDiagnostics, SourcePackageError};
-use rmcp::ErrorData as McpError;
 use serde_json::json;
-use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::cancellation::with_cancellation_evidence;
 
 fn writer_failure(disposition: WriterDisposition) -> WriterFailure {
     WriterFailure {
@@ -94,100 +91,4 @@ fn semantic_cancellation_returns_before_cache_or_toolchain_preparation() {
             .lock()
             .contains_key(&(toolchain.to_owned(), sysroot.to_path_buf()))
     );
-}
-
-fn mailbox_project() -> (Arc<LeanProject>, mpsc::Receiver<ProjectMessage>) {
-    let (tx, rx) = mpsc::channel(1);
-    let project = LeanProject {
-        canonical_root: PathBuf::from("/unused-semantic-project"),
-        toolchain: "unused-test-toolchain".to_owned(),
-        package: None,
-        library: None,
-        manifest_hash: "semantic-preparation-test".to_owned(),
-        session_id: uuid::Uuid::new_v4().to_string(),
-        open_warnings: Vec::new(),
-        actor_tx: Mutex::new(Some(tx)),
-        active_jobs: Arc::new(AtomicUsize::new(0)),
-        pool_active_jobs: Arc::new(AtomicUsize::new(0)),
-        healthy: Arc::new(AtomicBool::new(true)),
-        runtime: Arc::new(Mutex::new(RuntimeSnapshot {
-            protected_artifact_domains: BTreeSet::new(),
-            worker_generation: 1,
-            last_restart: None,
-            rss_kib: None,
-            import_profile: None,
-            profile_switch_count: 0,
-            restarts_total: 0,
-            restarts_by_cause: BTreeMap::new(),
-            import_residue_bytes: None,
-            import_residue_limit_bytes: None,
-        })),
-        module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
-        actor_scope: std::sync::Weak::new(),
-        process_tracker: lean_rs_worker_parent::LeanWorkerProcessTracker::new(),
-    };
-    (Arc::new(project), rx)
-}
-
-/// A failed semantic preparation reaches the call as an error without a proof
-/// result, and its call evidence says whether its worker scope closed.
-async fn preparation_error(disposition: WriterDisposition, prior_unknown: bool) {
-    let (project, mut mailbox) = mailbox_project();
-    let actor_project = Arc::clone(&project);
-    let actor = tokio::spawn(async move {
-        let ProjectMessage::NativeCompatibility { meta, reply } = mailbox.recv().await.expect("one actor job") else {
-            panic!("unexpected actor job");
-        };
-        assert!(meta.queue.start(), "actor owns the dispatched operation");
-        if prior_unknown {
-            meta.cancellation.begin_operation().unknown();
-        }
-        let semantic = SemanticRuntimeFailure::from_error(build_failure(disposition));
-        let mut failure = actor_project.worker_error_context(&[]);
-        failure.reason = semantic.to_string();
-        failure.preparation_closed = semantic.closed();
-        assert_ne!(failure.runtime.final_attempt, FinalAttemptStatus::Completed);
-        assert!(failure.worker_stop_receipt.is_none());
-        reply
-            .send(Err(ServerError::worker_unavailable(failure)))
-            .expect("deliver failed preparation");
-    });
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(5))
-        .expect("finite test admission");
-    let (result, evidence) = with_cancellation_evidence(&CancellationToken::new(), async {
-        project.native_compatibility(deadline).await
-    })
-    .await;
-    actor.await.expect("actor completed");
-    let error =
-        serde_json::to_string(&McpError::from(result.expect_err("preparation failed"))).expect("serialize error");
-    assert!(error.contains("preparation has no proof result"), "{error}");
-    assert!(
-        !error.contains("preparation_closed"),
-        "internal classification stays private"
-    );
-    let unknown = prior_unknown || disposition == WriterDisposition::Unknown;
-    assert_eq!(
-        evidence.uncertain, unknown,
-        "{disposition:?}, prior unknown {prior_unknown}"
-    );
-    assert_eq!(evidence.pending, 0);
-    assert!(evidence.deferred.is_empty());
-    assert!(evidence.worker_stop_receipt.is_none());
-    if disposition != WriterDisposition::Unknown {
-        assert_eq!(evidence.returned, 1, "a closed preparation returned");
-    }
-}
-
-#[tokio::test]
-async fn semantic_preparation_dispositions_reach_call_evidence_without_proof_results() {
-    for disposition in [
-        WriterDisposition::NotStarted,
-        WriterDisposition::Stopped,
-        WriterDisposition::Unknown,
-    ] {
-        preparation_error(disposition, false).await;
-    }
-    preparation_error(WriterDisposition::Stopped, true).await;
 }

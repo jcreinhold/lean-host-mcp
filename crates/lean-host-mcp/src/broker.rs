@@ -65,7 +65,6 @@ use crate::envelope::{Freshness, RuntimeFacts};
 use crate::error::{Result, ServerError};
 use crate::lake_meta::{LakeProjectMeta, ProjectInputStamp};
 use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
-use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
 mod control;
 pub(crate) mod module_setup;
@@ -724,31 +723,6 @@ impl ProjectBroker {
         Ok(out)
     }
 
-    /// Run source-backed semantic proof search through the project runtime.
-    ///
-    /// # Errors
-    ///
-    /// Returns resolution, project-open, semantic capability, or
-    /// worker runtime failures.
-    pub(crate) async fn semantic_proof_search(
-        &self,
-        hint: ProjectHint,
-        session_imports: Vec<String>,
-        freshness_imports: Vec<String>,
-        request: SemanticProofSearchRequest,
-    ) -> Result<BrokerCall<SemanticProofSearchResult>> {
-        if request.goal.file_label.is_some() {
-            return self.semantic_file(hint, freshness_imports, request).await;
-        }
-        let (project, admission_deadline) = self.project_for(hint).await?;
-        let call = project
-            .semantic_proof_search(session_imports, request, admission_deadline)
-            .await?;
-        let out = broker_call(&project, &freshness_imports, call);
-        drop(project);
-        Ok(out)
-    }
-
     /// Try proof fragments through the project runtime.
     ///
     /// # Errors
@@ -1367,7 +1341,6 @@ impl ProjectBroker {
             retryable,
             worker_restarted: false,
             worker_stop_receipt: None,
-            preparation_closed: false,
             project_root: root.to_string_lossy().into_owned(),
             project_hash: String::new(),
             imports: Vec::new(),
