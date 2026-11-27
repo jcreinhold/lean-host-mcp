@@ -635,14 +635,20 @@ status, worker-reported output bytes, phase timings, and optional worker cache s
 test-only guardrails: ordinary model-facing responses should aim for 16–32 KiB, with 64 KiB as the default hard ceiling.
 Production truncation is still tool-specific policy.
 
+Every scenario starts workers, so set `LEAN_HOST_MCP_WORKERS_DIR` to an installed worker. The worker that Cargo builds
+refuses to serve without the files `install-worker` puts beside it. Run each test alone and outside `cargo test`, as
+[Build, test, lint](#build-test-lint) explains:
+
 ```sh
-cargo build -p lean-host-mcp
-cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
+cargo test -p lean-host-mcp --test smoke_perf --no-run   # prints the test binary, BINARY
+env -u DYLD_FALLBACK_LIBRARY_PATH LEAN_HOST_MCP_WORKERS_DIR=/path/to/installed/workers \
+  BINARY --ignored --exact black_box_mcp_smoke_perf_baseline --nocapture
 
 LEAN_HOST_MCP_SMOKE_PROJECT=/path/to/your/lake/project \
   LEAN_HOST_MCP_SMOKE_FILE=Relative/Module/File.lean \
   LEAN_HOST_MCP_SMOKE_DECLARATION=Your.Namespace.declaration \
-  cargo test -p lean-host-mcp --test smoke_perf -- --ignored --nocapture
+  env -u DYLD_FALLBACK_LIBRARY_PATH LEAN_HOST_MCP_WORKERS_DIR=/path/to/installed/workers \
+  BINARY --ignored --exact black_box_mcp_smoke_perf_baseline --nocapture
 ```
 
 Keep the JSONL output with performance changes so comparisons use the same workload, byte accounting, and cold/warm

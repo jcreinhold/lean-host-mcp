@@ -793,12 +793,12 @@ impl McpServer {
             .env("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Prefer the worker built alongside this test over the developer's
-        // installed set. See `support::built_workers_dir`.
-        if let Some(dir) = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp")) {
-            command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
-        }
+            .stderr(Stdio::piped())
+            // Every scenario starts workers. See `support::installed_workers_dir`.
+            .env(
+                "LEAN_HOST_MCP_WORKERS_DIR",
+                support::installed_workers_dir().expect("installed worker"),
+            );
         for (key, value) in envs {
             command.env(key, value);
         }

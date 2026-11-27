@@ -1,7 +1,7 @@
 //! Helpers the integration suites share: the fixture's Lean sysroot, the
 //! socket directories and native setup that keep tests out of `HOME`, the
-//! worker built with the tests, the chain project (`chain`), the HTTP server
-//! harness (`http`), and the response sizes the smoke and performance
+//! installed worker the tests name, the chain project (`chain`), the HTTP
+//! server harness (`http`), and the response sizes the smoke and performance
 //! baselines report against.
 
 // Each integration suite compiles its own copy of this module, so any item not
@@ -89,24 +89,20 @@ pub(crate) fn set_up_native_work() -> TestResult {
     Ok(())
 }
 
-/// The worker directory a spawned test server must be pinned to.
+/// The installed worker directory that `LEAN_HOST_MCP_WORKERS_DIR` names, for
+/// a test that starts workers.
 ///
-/// Without `LEAN_HOST_MCP_WORKERS_DIR` the server looks under the Lake root's
+/// The worker Cargo builds in `target/` refuses to serve: it needs the
+/// `worker.json` and shims that `install-worker` puts beside it. Without the
+/// variable the server looks under the Lake root's
 /// `.local/lean-host-mcp/workers`, whose worker, if any, has no tie to the
 /// tree under test: a suite can pass, or measure other behaviour, against a
 /// worker built months earlier. One worker-memory measurement here was lost
 /// that way.
-///
-/// Derived from `CARGO_BIN_EXE_lean-host-mcp` so it follows the profile the
-/// tests were built in; `target/debug` hardcoded is wrong under
-/// `cargo test --release`.
-///
-/// `None` when that profile has no worker built: `install-worker` moves it out
-/// of `target/`, and not every checkout builds it. Callers then leave the
-/// setting alone rather than point it at a directory with no worker.
-pub(crate) fn built_workers_dir(parent_binary: &str) -> Option<PathBuf> {
-    let dir = Path::new(parent_binary).parent()?;
-    dir.join("lean-host-mcp-worker").is_file().then(|| dir.to_path_buf())
+pub(crate) fn installed_workers_dir() -> TestResult<PathBuf> {
+    let dir =
+        std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
+    Ok(PathBuf::from(dir))
 }
 
 /// Lower end of the intended normal response-size range for model-controlled

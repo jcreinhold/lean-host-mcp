@@ -144,14 +144,9 @@ impl Server {
                 command.env_remove(&name);
             }
         }
-        // A worker directory the caller names, such as a test install's:
-        // file checks need an installed worker. Else the worker built with
-        // this test, not the developer's installed one.
-        if std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").is_none()
-            && let Some(dir) = super::built_workers_dir(SERVER)
-        {
-            command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
-        }
+        // The server inherits the caller's `LEAN_HOST_MCP_WORKERS_DIR`. The
+        // suites that start workers require it: see
+        // `super::installed_workers_dir`.
         for (name, value) in &launch.envs {
             command.env(name, value);
         }

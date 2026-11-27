@@ -528,7 +528,7 @@ async fn streamable_http_sigterm_shutdown_exits() {
 }
 
 #[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
+#[ignore = "needs the built Lean fixture and an installed worker: set LEAN_HOST_MCP_WORKERS_DIR"]
 async fn streamable_http_fixture_tool_call() {
     let root = fixture_root();
     let root_s = root.to_string_lossy().into_owned();
@@ -807,7 +807,7 @@ fn list_tree(root: &Path) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
+#[ignore = "needs the built Lean fixture and an installed worker: set LEAN_HOST_MCP_WORKERS_DIR"]
 async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
     let root = fixture_root();
     let root_s = root.to_string_lossy().into_owned();
@@ -914,7 +914,7 @@ async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
 }
 
 #[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
+#[ignore = "needs the built Lean fixture and an installed worker: set LEAN_HOST_MCP_WORKERS_DIR"]
 async fn streamable_http_five_clients_check_the_same_source_bytes() {
     let root = fixture_root();
     let root_s = root.to_string_lossy().into_owned();
@@ -1010,7 +1010,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
 }
 
 #[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
+#[ignore = "needs the built Lean fixture and an installed worker: set LEAN_HOST_MCP_WORKERS_DIR"]
 async fn streamable_http_named_requests_survive_conflicts_and_dropped_calls() {
     let scratch = tempfile::tempdir().unwrap();
     let running = scratch.path().join("running");
@@ -1066,7 +1066,7 @@ async fn streamable_http_named_requests_survive_conflicts_and_dropped_calls() {
 }
 
 #[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
+#[ignore = "needs the built Lean fixture and an installed worker: set LEAN_HOST_MCP_WORKERS_DIR"]
 async fn streamable_http_dropped_running_call_stops_lean_and_drains() {
     let scratch = tempfile::tempdir().expect("test-owned sentinels");
     let started = scratch.path().join("started");
@@ -1113,7 +1113,7 @@ async fn streamable_http_dropped_running_call_stops_lean_and_drains() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
+#[ignore = "needs the built Lean fixture and an installed worker: set LEAN_HOST_MCP_WORKERS_DIR"]
 async fn streamable_http_dropped_startup_preserves_coalesced_worker_at_capacity() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1121,26 +1121,34 @@ async fn streamable_http_dropped_startup_preserves_coalesced_worker_at_capacity(
         .prefix("lean-startup-'wrapper-")
         .tempdir()
         .expect("test-owned delayed worker");
-    let worker = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp"))
-        .expect("build the real worker alongside the parent before running this test")
-        .join("lean-host-mcp-worker")
+    let root = fixture_root();
+    let toolchain = lean_host_mcp::ToolchainId::from_lake_root(&root).expect("fixture toolchain");
+    let installed = support::installed_workers_dir().expect("installed worker");
+    let worker = lean_host_mcp::toolchain::WorkerBinary::resolve_in(&toolchain, &installed)
+        .expect("installed worker for the fixture's toolchain")
+        .path
         .canonicalize()
-        .expect("exact real worker path");
+        .expect("exact installed worker path");
     let starts = scratch.path().join("worker-starts");
     let release = scratch.path().join("release-startup");
     let wrapper = scratch.path().join("lean-host-mcp-worker");
     // Delay the worker handshake, not a Lean command, so the first caller
     // still holds the project's opening lock when its client leaves. Bound
-    // the wait so a failed assertion cannot leave a child stuck.
+    // the wait so a failed assertion cannot leave a child stuck. Each caller
+    // that finds no worker first runs this file with the readiness flag,
+    // before it takes the opening lock. That run checks the installed shims
+    // and opens no Lean, so it goes straight through, and `starts` counts
+    // worker children only. The server runs a worker file at the top of its
+    // worker directory as it finds it, and the installed worker it execs
+    // checks its own installation.
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nremaining=500\nwhile [ ! -f {} ]; do\n  remaining=$((remaining - 1))\n  [ \"$remaining\" -gt 0 ] || exit 75\n  sleep 0.01\ndone\nexec {} \"$@\"\n",
-        shell_quote_path(&starts),
-        shell_quote_path(&release),
-        shell_quote_path(&worker),
+        "#!/bin/sh\n[ \"$1\" != --lean-rs-ready-host-artifacts ] || exec {worker} \"$@\"\nprintf '%s\\n' \"$$\" >> {starts}\nremaining=500\nwhile [ ! -f {release} ]; do\n  remaining=$((remaining - 1))\n  [ \"$remaining\" -gt 0 ] || exit 75\n  sleep 0.01\ndone\nexec {worker} \"$@\"\n",
+        starts = shell_quote_path(&starts),
+        release = shell_quote_path(&release),
+        worker = shell_quote_path(&worker),
     );
     std::fs::write(&wrapper, script).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let root = fixture_root();
     let root_s = root.to_string_lossy();
     let wrapper_dir = scratch.path().to_str().expect("UTF-8 test path");
     let server = HttpMcpServer::start_with_env(
@@ -1413,15 +1421,9 @@ impl HttpMcpServer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        // A worker directory the caller names, such as a test install's, wins,
-        // as in `support::http`: a worker serves only from its installed
-        // deployment. Else the worker built with this test, not the
-        // developer's installed one. See `support::built_workers_dir`.
-        if std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").is_none()
-            && let Some(dir) = support::built_workers_dir(env!("CARGO_BIN_EXE_lean-host-mcp"))
-        {
-            command.env("LEAN_HOST_MCP_WORKERS_DIR", dir);
-        }
+        // The server inherits the caller's `LEAN_HOST_MCP_WORKERS_DIR`, as in
+        // `support::http`. The tests that start workers need it to name an
+        // installed one: see `support::installed_workers_dir`.
         for (key, value) in args {
             command.arg(key).arg(value);
         }
