@@ -268,7 +268,7 @@ impl ProjectBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -330,10 +330,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
     async fn background_maintenance_and_detached_activity_stay_counted() -> TestResult {
-        let broker = broker();
-        let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE")?);
+        let root = super::super::tests::worker_fixture();
+        let broker = ProjectBroker::new(super::super::BrokerConfig {
+            lake_root: Some(root.clone()),
+            max_workers: std::num::NonZeroUsize::MIN,
+            max_workers_per_project: std::num::NonZeroUsize::MIN,
+            idle_timeout: Duration::ZERO,
+        });
         let call = broker
             .admitted_project_runtime(super::super::ProjectHint::Explicit(root), vec![])
             .await?;

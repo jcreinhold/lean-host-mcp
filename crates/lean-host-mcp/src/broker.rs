@@ -1401,6 +1401,19 @@ mod tests {
 
     use super::*;
 
+    /// The fixture root of an ignored test that starts workers. A worker start
+    /// runs the writer helper's hidden subcommands, which the lib test binary
+    /// lacks, so this names the built server in `LEAN_RS_WRITER_EXECUTABLE`
+    /// as the helper.
+    pub(super) fn worker_fixture() -> PathBuf {
+        let server = std::env::var_os(lean_toolchain::shared_writer::SHARED_WRITER_EXECUTABLE_ENV)
+            .unwrap_or_else(|| panic!("set LEAN_RS_WRITER_EXECUTABLE to the built lean-host-mcp"));
+        crate::shared_writer::use_helper_executable(Path::new(&server)).unwrap();
+        PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
+            .canonicalize()
+            .unwrap()
+    }
+
     fn make_lake_dir(root: &Path, name: &str) -> PathBuf {
         let dir = root.join(name);
         fs::create_dir_all(&dir).unwrap();
@@ -1467,11 +1480,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
     async fn same_project_workers_share_capacity_and_stop_together() {
-        let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
-            .canonicalize()
-            .unwrap();
+        let root = worker_fixture();
         let mut config = cfg(Some(root.clone()));
         config.max_workers = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
@@ -1506,9 +1517,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
     async fn same_project_checks_run_on_distinct_workers() {
-        let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap());
+        let root = worker_fixture();
         let runtime =
             ProjectRuntimeConfig::from_env_with_file(&crate::config_file::ConfigFile::load(Some(&root)).runtime, 2)
                 .unwrap();
@@ -1558,9 +1569,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
+    #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE, LEAN_RS_WRITER_EXECUTABLE and a matching installed worker"]
     async fn cancelling_one_project_worker_preserves_its_sibling() {
-        let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap());
+        let root = worker_fixture();
         let mut config = cfg(Some(root));
         config.max_workers = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
