@@ -86,6 +86,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   finds the SDK's gate on the installed shims held tries again every 20 ms until its request's time runs out.
 - A native reader whose start finds an ended reader's input file gone tries again, up to three times, instead of failing
   with `native utility refused before bootstrap spawn: No such file or directory`.
+- `lean_status` `file_diagnostics` reports what `lake build` reports. It runs `lean --json` on the file from the project
+  root with the setup from `lake --no-build setup-file`, in place of the worker's file driver. That driver checked the
+  body without its header, so a header linter such as Mathlib's warned on every file, and it reported messages Lean
+  marks silent, such as those of a compiler plugin. Lean reads the hashed text on stdin under the file's name, so an
+  edit during the check does not change what it checked.
 
 ## [0.16.22] - 2026-11-25
 

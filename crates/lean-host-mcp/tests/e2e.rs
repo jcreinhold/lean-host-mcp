@@ -1337,6 +1337,46 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
             .is_some_and(|errors| errors > 0),
         "file diagnostics should report current-source errors: {diagnostics:?}"
     );
+
+    // `lake build` checks the whole file and drops messages marked silent, so
+    // file diagnostics must do the same.
+    fs::write(
+        work.join("LeanRsFixture/WholeFile.lean"),
+        [
+            "import Lean",
+            "open Lean Elab Command",
+            "elab \"#silent_note\" : command => do logAt (← getRef) m!\"silent note\" (severity := .information) (isSilent := true)",
+            "#silent_note",
+            "elab \"#file_start\" : command => do logInfo m!\"header seen: {toString ((← getFileMap).source.startsWith \"import\")}\"",
+            "#file_start",
+            "",
+        ]
+        .join("\n"),
+    )
+    .expect("write whole-file fixture");
+    let whole = semantic_data(
+        lean_status(
+            &ctx,
+            semantic_request(
+                "file_diagnostics",
+                serde_json::json!({ "file": "LeanRsFixture/WholeFile.lean" }),
+            ),
+        )
+        .await
+        .expect("lean_status whole-file diagnostics"),
+    );
+    let messages: Vec<&str> = whole
+        .pointer("/diagnostics/diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("message").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(
+        messages,
+        ["header seen: true"],
+        "file diagnostics should match `lake build`: {whole:?}"
+    );
 }
 
 #[tokio::test]

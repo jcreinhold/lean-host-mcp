@@ -937,9 +937,12 @@ Worker runtime generation is likewise `not_applicable` because this status mode 
 
 ### `kind: "file_diagnostics"`
 
-Elaborates the current source snapshot and returns the same bounded diagnostics block shape used by proof context. This
-surfaces Lean diagnostics and linter messages produced while elaborating the file; it does not run `lake build`,
-`lake exe lint`, or other external project-specific lint commands.
+Checks the file as `lake build` does: it runs `lean --json` from the project root with the module setup that
+`lake --no-build setup-file` prints, and returns each message Lean prints, at Lean's position, in the bounded
+diagnostics block used by proof context. Lean sees the whole file, header included, and skips messages marked silent, as
+in a build. It reads the text the server read and hashed, on stdin under the file's own name, so an edit during the
+check does not change what it checked. It writes no build output and does not run `lake exe lint` or other project lint
+commands.
 
 ```json
 {
@@ -948,9 +951,7 @@ surfaces Lean diagnostics and linter messages produced while elaborating the fil
 }
 ```
 
-The result includes `diagnostics` and the header `imports` used for the worker session, with a source `edit_fresh` trust
-fact for the file snapshot.
+The result includes `diagnostics` and the header `imports`, with a source `edit_fresh` trust fact for the file snapshot.
 
-A worker crash or timeout returns `data: null` and an `errors` issue with `code: "runtime_unavailable"`, with MCP
-`isError: true`. Interrupted results are not cached. Planned recycling before a successful check does not invalidate its
-result.
+The call fails and returns no diagnostics if the file changes while Lake prints its setup, if `lean` crashes or runs out
+of time, or if its exit code disagrees with its messages.

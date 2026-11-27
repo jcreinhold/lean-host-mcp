@@ -125,6 +125,7 @@ impl ProjectBroker {
                     cwd: assets.into(),
                     artifact_roots: domains,
                     max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                    stdin: None,
                 })
             },
         )

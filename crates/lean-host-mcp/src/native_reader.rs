@@ -103,6 +103,9 @@ pub(crate) struct NativeReaderProgram {
     pub(crate) artifact_roots: Vec<PathBuf>,
     /// At most [`PROGRAM_OUTPUT_LIMIT`]; more stdout fails the program.
     pub(crate) max_stdout_bytes: usize,
+    /// Bytes the program reads on stdin, staged before admission. `None`
+    /// closes its stdin.
+    pub(crate) stdin: Option<Vec<u8>>,
 }
 
 /// Run one private-input utility through the same native-reader scope.
@@ -173,7 +176,7 @@ pub(crate) fn run_program_with_contract(
             artifact_root: program.artifact_roots.clone(),
             timeout_millis: u64::try_from(remaining(deadline)?.as_millis()).map_err(io::Error::other)?,
             capacity_limit: u16::try_from(capacity_limit).map_err(io::Error::other)?,
-            stdin: false,
+            stdin: program.stdin.is_some(),
             cancel_fd: None,
             stdout_result_frame: false,
             diagnostic_preview: false,
@@ -799,7 +802,9 @@ fn run_internal(
             cancelled,
         )?,
     };
-    let staged_input = if args.stdin {
+    let staged_input = if let Some(bytes) = program.and_then(|program| program.stdin.as_deref()) {
+        Some(input::stage(&scope.input_directory()?, bytes)?)
+    } else if args.stdin {
         let directory = scope.input_directory()?;
         let still_alive = || {
             Ok(!cancelled()

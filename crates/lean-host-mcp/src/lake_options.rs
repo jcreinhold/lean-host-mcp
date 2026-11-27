@@ -214,6 +214,7 @@ async fn resolve_inner(
                 cwd: command_package,
                 artifact_roots: Vec::new(),
                 max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                stdin: None,
             })
         },
     )
@@ -243,6 +244,42 @@ pub(crate) async fn reader_output(
     keepalive: Option<Box<dyn Send>>,
     prepare: impl FnOnce(&Path) -> std::io::Result<crate::native_reader::NativeReaderProgram> + Send + 'static,
 ) -> PreparationResult<Vec<u8>> {
+    let output = reader_run(
+        label,
+        root,
+        timeout,
+        capacity_limit,
+        custody,
+        contract,
+        keepalive,
+        &[0],
+        prepare,
+    )
+    .await?;
+    Ok(output.stdout)
+}
+
+/// How a reader's program ended, when it ended with an exit code the caller accepts.
+#[derive(Debug)]
+pub(crate) struct ReaderOutput {
+    pub(crate) exit_code: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: String,
+}
+
+/// [`reader_output`] for a program whose exit codes in `accepted` all carry a
+/// result, such as `lean`, which exits 1 when the file it checks has errors.
+pub(crate) async fn reader_run(
+    label: &'static str,
+    root: PathBuf,
+    timeout: Duration,
+    capacity_limit: usize,
+    custody: crate::artifact_reads::ArtifactReadGuard,
+    contract: Option<crate::shared_writer::WriterContract>,
+    keepalive: Option<Box<dyn Send>>,
+    accepted: &'static [i32],
+    prepare: impl FnOnce(&Path) -> std::io::Result<crate::native_reader::NativeReaderProgram> + Send + 'static,
+) -> PreparationResult<ReaderOutput> {
     let cancellation = CallCancellation::current();
     let operation = cancellation.begin_operation();
     let mut on_drop = cancellation.cancel_on_drop();
@@ -274,7 +311,7 @@ pub(crate) async fn reader_output(
             };
             reader
                 .map_err(|error| PreparationFailure::writer(label, error))
-                .and_then(|result| reader_bytes(label, result))
+                .and_then(|result| reader_bytes(label, result, accepted))
         };
         match result
             .as_ref()
@@ -291,17 +328,25 @@ pub(crate) async fn reader_output(
     result.map_err(|error| PreparationFailure::unknown(reader_error(label, error)))?
 }
 
-fn reader_bytes(label: &str, reader: crate::native_reader::NativeReaderResult) -> PreparationResult<Vec<u8>> {
+fn reader_bytes(
+    label: &str,
+    reader: crate::native_reader::NativeReaderResult,
+    accepted: &[i32],
+) -> PreparationResult<ReaderOutput> {
     if reader.protocol == crate::native_reader::PROTOCOL
         && reader.state == "completed"
         && reader.scope_closed
         && reader.target_started == Some(true)
-        && reader.exit_code == Some(0)
+        && let Some(exit_code) = reader.exit_code.filter(|code| accepted.contains(code))
         && reader.exit_status.is_some()
         && !reader.output_truncated
         && !reader.intervened
     {
-        return Ok(reader.stdout.into_bytes());
+        return Ok(ReaderOutput {
+            exit_code,
+            stdout: reader.stdout.into_bytes(),
+            stderr: reader.stderr,
+        });
     }
     let disposition = if !reader.scope_closed {
         WriterDisposition::Unknown
@@ -477,7 +522,7 @@ mod tests {
 
     #[test]
     fn discovery_requires_complete_uninterrupted_closed_reader_result() {
-        assert!(reader_bytes(LAKE_OPTIONS, reader_result()).is_ok());
+        assert!(reader_bytes(LAKE_OPTIONS, reader_result(), &[0]).is_ok());
         for mutation in 0..5 {
             let mut reader = reader_result();
             match mutation {
@@ -487,10 +532,22 @@ mod tests {
                 3 => reader.exit_code = Some(1),
                 _ => reader.state = "stopped".into(),
             }
-            let error = reader_bytes(LAKE_OPTIONS, reader).unwrap_err();
+            let error = reader_bytes(LAKE_OPTIONS, reader, &[0]).unwrap_err();
             assert_eq!(error.disposition, WriterDisposition::Stopped);
             assert!(error.error.to_string().contains("no proof check ran"));
         }
+    }
+
+    #[test]
+    fn a_caller_that_accepts_an_exit_code_gets_it_with_the_output() {
+        let mut reader = reader_result();
+        reader.exit_code = Some(1);
+        reader.stderr = "why".into();
+        let output = reader_bytes("Lean file diagnostics", reader, &[0, 1]).unwrap();
+        assert_eq!((output.exit_code, output.stderr.as_str()), (1, "why"));
+        let mut reader = reader_result();
+        reader.exit_code = Some(2);
+        assert!(reader_bytes("Lean file diagnostics", reader, &[0, 1]).is_err());
     }
 
     #[test]
@@ -500,7 +557,7 @@ mod tests {
         reader.intervened = true;
         reader.stdout.clear();
         reader.detail = Some("native reader deadline elapsed".into());
-        let failure = reader_bytes("Lean file driver", reader).unwrap_err();
+        let failure = reader_bytes("Lean file driver", reader, &[0]).unwrap_err();
         assert_eq!(failure.disposition, WriterDisposition::Stopped);
         let error = rmcp::ErrorData::from(failure.error);
         assert_eq!(
@@ -517,13 +574,13 @@ mod tests {
         let mut reader = reader_result();
         reader.state = "not_started".into();
         reader.target_started = Some(false);
-        let error = reader_bytes(LAKE_OPTIONS, reader).unwrap_err();
+        let error = reader_bytes(LAKE_OPTIONS, reader, &[0]).unwrap_err();
         assert_eq!(error.disposition, WriterDisposition::NotStarted);
         let mut reader = reader_result();
         reader.state = "unknown".into();
         reader.target_started = Some(false);
         reader.scope_closed = false;
-        let error = reader_bytes(LAKE_OPTIONS, reader).unwrap_err();
+        let error = reader_bytes(LAKE_OPTIONS, reader, &[0]).unwrap_err();
         assert_eq!(error.disposition, WriterDisposition::Unknown);
     }
 

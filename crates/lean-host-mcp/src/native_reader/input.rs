@@ -196,8 +196,14 @@ pub(super) fn capture<F: AsFd>(
 ) -> io::Result<StagedInput> {
     let bytes = capture_bytes(input, deadline, still_alive)?;
     ready(deadline, still_alive)?;
-    let stored = store(directory, &bytes)?;
+    let staged = stage(directory, &bytes)?;
     ready(deadline, still_alive)?;
+    Ok(staged)
+}
+
+/// Stage `bytes` under `directory` as the payload's stdin.
+pub(super) fn stage(directory: &Path, bytes: &[u8]) -> io::Result<StagedInput> {
+    let stored = store(directory, bytes)?;
     Ok(StagedInput {
         path: directory.join("stdin"),
         sha256: stored.sha256,

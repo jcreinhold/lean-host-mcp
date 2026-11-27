@@ -289,6 +289,7 @@ impl ProjectBroker {
                     cwd,
                     artifact_roots: Vec::new(),
                     max_stdout_bytes: crate::native_reader::PROGRAM_OUTPUT_LIMIT,
+                    stdin: None,
                 })
             },
         )

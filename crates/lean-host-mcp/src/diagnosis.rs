@@ -24,7 +24,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::envelope::{Response, ResponseStatus, RuntimeFacts, RuntimeFailure, RuntimeRestartEvent};
+use crate::envelope::{Response, RuntimeFacts, RuntimeRestartEvent};
 use crate::error::{Result, ServerError};
 use crate::trust::ArtifactTrust;
 
@@ -276,34 +276,6 @@ where
     resp.warn(warning).hint(next_action)
 }
 
-/// Diagnostics are absent when the worker failed, not a successful empty list.
-#[must_use]
-pub(crate) fn unavailable_execution_result<T>(mut resp: Response<T>, event: &RuntimeRestartEvent) -> Response<T>
-where
-    T: Serialize + JsonSchema,
-{
-    let (warning, next_action) = execution_taint_text(event);
-    resp.status = ResponseStatus::RuntimeUnavailable;
-    resp.result = None;
-    resp.runtime_error = Some(RuntimeFailure {
-        reason: event.reason.clone(),
-        retryable: true,
-        project_root: resp.freshness.project_root.clone(),
-        session_id: resp.freshness.session_id.clone(),
-        worker_generation: event.worker_generation,
-        worker_restarted: true,
-        worker_stop_receipt: None,
-        blocked_by: None,
-        restart_cause: Some(event.cause.clone()),
-        rss_kib: event.rss_kib,
-        limit_kib: event.limit_kib,
-        retry_after_millis: None,
-        restarts_in_window: None,
-        window_millis: None,
-    });
-    resp.warn(warning).hint(next_action)
-}
-
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or(text).trim()
 }
@@ -448,42 +420,6 @@ mod tests {
                 "final-attempt abort must never be excused"
             );
         }
-    }
-
-    #[test]
-    fn interrupted_empty_result_is_unavailable_not_success() {
-        let runtime = facts_with_restart("child_abort");
-        let event = runtime.call_restart.clone().unwrap();
-        let response = Response::ok(
-            Vec::<String>::new(),
-            crate::envelope::Freshness {
-                elaboration_options: None,
-                project_root: "/project".into(),
-                project_hash: String::new(),
-                imports: Vec::new(),
-                session_id: "session".into(),
-                lean_toolchain: "test".into(),
-                toolchain_advisories: Vec::new(),
-            },
-        )
-        .with_runtime(runtime);
-        let response = unavailable_execution_result(response, &event);
-        let json = serde_json::to_value(response).unwrap();
-        assert_eq!(
-            json.get("status").and_then(serde_json::Value::as_str),
-            Some("runtime_unavailable")
-        );
-        assert!(json.get("result").is_some_and(serde_json::Value::is_null));
-        assert_eq!(
-            json.pointer("/runtime_error/restart_cause")
-                .and_then(serde_json::Value::as_str),
-            Some("child_abort")
-        );
-        assert_eq!(
-            json.pointer("/runtime_error/retryable")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
     }
 
     #[test]

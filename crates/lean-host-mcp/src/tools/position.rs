@@ -749,12 +749,11 @@ pub async fn file_diagnostics(
     let imports = input.imports.clone();
     let outcome = ctx
         .broker
-        .file_projection(
+        .file_diagnostics(
             &hint,
             &file_label,
             &input.source,
             imports.clone(),
-            crate::broker::FileProjection::Diagnostics,
             proof_agent_budgets(),
         )
         .await;
@@ -764,20 +763,15 @@ pub async fn file_diagnostics(
             return file_diagnostics_needs_build_response(ctx, hint, imports, source_fact, err);
         }
     };
-    let (block, missing_imports) = required_file_diagnostics(call.value)?;
-    let mut response = Response::ok(
+    Ok(Response::ok(
         FileDiagnosticsResult {
-            diagnostics: block,
+            diagnostics: diagnostics_block(call.value),
             imports,
         },
         call.freshness,
     )
     .with_runtime(call.runtime)
-    .with_trust_artifact(source_fact);
-    if let Some(event) = response.runtime().and_then(crate::diagnosis::execution_taint).cloned() {
-        response = crate::diagnosis::unavailable_execution_result(response, &event);
-    }
-    Ok(warn_file_diagnostics_missing_imports(response, missing_imports))
+    .with_trust_artifact(source_fact))
 }
 
 fn command_needs_build_response(
@@ -818,48 +812,6 @@ fn file_diagnostics_needs_build_response(
         response,
         &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
     ))
-}
-
-fn required_file_diagnostics(outcome: LeanWorkerModuleQueryBatchOutcome) -> Result<(DiagnosticsBlock, Vec<String>)> {
-    match route_batch_outcome(outcome) {
-        BatchQueryRun::HeaderParseFailed { diagnostics, .. } => Ok((diagnostics_block(diagnostics), Vec::new())),
-        BatchQueryRun::Ready {
-            result,
-            missing_imports,
-            ..
-        } => {
-            let mut items = result.items.into_iter();
-            let item = items
-                .next()
-                .ok_or_else(|| ServerError::Internal("file diagnostics item missing".into()))?;
-            if items.next().is_some() {
-                return Err(ServerError::Internal("unexpected extra file diagnostics item".into()));
-            }
-            match item {
-                LeanWorkerModuleQueryBatchItem::Ok { id, result: body } => {
-                    if id != PROOF_STATE_DIAGNOSTICS_ID {
-                        return Err(ServerError::Internal("unexpected file diagnostics selector ID".into()));
-                    }
-                    let LeanWorkerModuleQueryBatchResult::Diagnostics(failure) = *body else {
-                        return Err(ServerError::Internal(
-                            "file diagnostics response has wrong payload".into(),
-                        ));
-                    };
-                    let mut block = diagnostics_block(project_failure(&failure));
-                    block.truncated |= result.total_truncated;
-                    Ok((block, missing_imports))
-                }
-                LeanWorkerModuleQueryBatchItem::BudgetExceeded { id, message }
-                | LeanWorkerModuleQueryBatchItem::Unavailable { id, message } => Err(ServerError::Internal(format!(
-                    "file diagnostics incomplete ({id}): {message}"
-                ))),
-                _ => Err(ServerError::Internal(
-                    "unexpected file diagnostics selector result".into(),
-                )),
-            }
-        }
-        BatchQueryRun::Unsupported => Err(ServerError::Internal("file diagnostics unsupported".into())),
-    }
 }
 
 fn diagnostics_from_batch_outcome(outcome: LeanWorkerModuleQueryBatchOutcome) -> (DiagnosticsBlock, Vec<String>) {
@@ -940,20 +892,6 @@ fn warn_command_missing_imports(
     response: Response<CommandTrialResult>,
     missing_imports: Vec<String>,
 ) -> Response<CommandTrialResult> {
-    if missing_imports.is_empty() {
-        response
-    } else {
-        crate::diagnosis::warn_needs_build(
-            response,
-            &crate::diagnosis::IncompleteCause::MissingImports(missing_imports),
-        )
-    }
-}
-
-fn warn_file_diagnostics_missing_imports(
-    response: Response<FileDiagnosticsResult>,
-    missing_imports: Vec<String>,
-) -> Response<FileDiagnosticsResult> {
     if missing_imports.is_empty() {
         response
     } else {

@@ -40,11 +40,6 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) enum FileProjection {
-    Outline,
-    Diagnostics,
-}
-
 pub(super) struct PreparedReader {
     pub(super) custody: crate::artifact_reads::ArtifactReadGuard,
     pub(super) sysroot: PathBuf,
@@ -330,6 +325,7 @@ impl ProjectBroker {
                     cwd: assets.into(),
                     artifact_roots: domains,
                     max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                    stdin: None,
                 })
             },
         )
@@ -337,13 +333,13 @@ impl ProjectBroker {
         .map_err(|e| e.error)
     }
 
-    pub(crate) async fn file_projection(
+    /// The declaration outline of `file`'s current source.
+    pub(crate) async fn file_outline(
         &self,
         hint: &ProjectHint,
         file: &str,
         source: &str,
         imports: Vec<String>,
-        projection: FileProjection,
         budgets: lean_rs_worker_parent::LeanWorkerOutputBudgets,
     ) -> Result<super::CachedBrokerCall<lean_rs_worker_parent::LeanWorkerModuleQueryBatchOutcome>> {
         let root = self.native_root(hint)?;
@@ -361,10 +357,7 @@ impl ProjectBroker {
         .map_err(invalid)?;
         let entry = [
             include_str!("../lake/VerifyCommon.lean"),
-            match projection {
-                FileProjection::Outline => "private def projectFile (_ : Option Json) := declarationOutlineWithSetup\nprivate def extraItem (_ : ModuleQueryBatchItem) : Option Json := none\n",
-                FileProjection::Diagnostics => "private def projectFile (_ : Option Json) := fileDiagnosticsWithSetup\nprivate def extraItem (_ : ModuleQueryBatchItem) : Option Json := none\n",
-            },
+            "private def projectFile (_ : Option Json) := declarationOutlineWithSetup\nprivate def extraItem (_ : ModuleQueryBatchItem) : Option Json := none\n",
             include_str!("../lake/OutlineSetup.lean"),
         ]
         .concat();
@@ -389,5 +382,262 @@ impl ProjectBroker {
             runtime: RuntimeFacts::default(),
             freshness,
         })
+    }
+
+    /// The diagnostics of `source`, the current text of `file`, as `lean
+    /// --json` prints them when it checks that text with the module setup that
+    /// `lake setup-file` prints. Lean then runs its own frontend over the whole
+    /// file with Lake's imports, plugins and options, so the list holds what a
+    /// Lake build of the file prints. Lean leaves out silent messages, such as
+    /// the syntax records the lean-fmt plugin logs.
+    pub(crate) async fn file_diagnostics(
+        &self,
+        hint: &ProjectHint,
+        file: &str,
+        source: &str,
+        imports: Vec<String>,
+        budgets: lean_rs_worker_parent::LeanWorkerOutputBudgets,
+    ) -> Result<BrokerCall<crate::projections::ElabFailure>> {
+        let root = self.native_root(hint)?;
+        let meta = self.meta(&root)?;
+        let (setup, reader, activity) = self.file_reader_with_setup(hint, &meta, file, source).await?;
+        let options = LeanWorkerElabOptions::new()
+            .file_label(file)
+            .lean_options(setup.options.clone());
+        let PreparedReader {
+            custody,
+            sysroot,
+            shim_guards,
+            ..
+        } = reader;
+        let (cwd, path, snapshot) = (root.clone(), PathBuf::from(file), source.as_bytes().to_vec());
+        let output = crate::lake_options::reader_run(
+            "Lean file diagnostics",
+            root,
+            crate::cancellation::CallCancellation::current()
+                .remaining_or(Duration::from_millis(self.request_timeout_millis())),
+            self.config.max_projects.get(),
+            custody,
+            None,
+            Some(Box::new((activity, shim_guards))),
+            // `lean` exits 1 when the file has an error.
+            &[0, 1],
+            move |assets| {
+                let setup_file = assets.join("module.setup.json");
+                fs::write(&setup_file, setup.bytes)?;
+                Ok(crate::native_reader::NativeReaderProgram {
+                    command: vec![
+                        sysroot.join("bin/lean").into_os_string(),
+                        "-j1".into(),
+                        "--json".into(),
+                        "--setup".into(),
+                        setup_file.into_os_string(),
+                        // With a file name, `--stdin` keeps the name and reads
+                        // the text from stdin, so Lean checks the bytes the
+                        // reply hashes.
+                        "--stdin".into(),
+                        path.into_os_string(),
+                    ],
+                    environment: Vec::new(),
+                    // Lake runs `lean` from the project root.
+                    cwd,
+                    artifact_roots: Vec::new(),
+                    max_stdout_bytes: crate::native_reader::OUTPUT_LIMIT,
+                    stdin: Some(snapshot),
+                })
+            },
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+        let value = lean_messages(&output, file, &budgets)?;
+        let mut freshness = reader_freshness(&meta, imports);
+        freshness.elaboration_options = Some(crate::envelope::ElaborationOptions::from_worker(&options));
+        Ok(BrokerCall {
+            value,
+            runtime: RuntimeFacts::default(),
+            freshness,
+        })
+    }
+}
+
+/// One message as `lean --json` prints it: Lean's `SerialMessage`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeanMessage {
+    pos: LeanPosition,
+    #[serde(default)]
+    end_pos: Option<LeanPosition>,
+    severity: String,
+    #[serde(default)]
+    caption: String,
+    data: String,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct LeanPosition {
+    line: u32,
+    column: u32,
+}
+
+/// One row for each line `lean --json` printed; a line that is not a message,
+/// such as a print from an initializer, becomes an information row without a
+/// position. When the byte budget cannot hold every row, errors come first,
+/// then warnings, then the rest, and the list is marked truncated.
+fn lean_messages(
+    output: &crate::lake_options::ReaderOutput,
+    file: &str,
+    budgets: &lean_rs_worker_parent::LeanWorkerOutputBudgets,
+) -> Result<crate::projections::ElabFailure> {
+    use crate::projections::{CoordinateSpace, Diagnostic, ElabFailure, Position, Severity, SourceRange};
+    let stdout = std::str::from_utf8(&output.stdout).map_err(invalid)?;
+    let mut rows = Vec::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(message) = serde_json::from_str::<LeanMessage>(line) else {
+            rows.push(Diagnostic {
+                severity: Severity::Info,
+                message: line.to_owned(),
+                coordinate_space: CoordinateSpace::Unknown,
+                position: None,
+                original_range: None,
+                synthetic_range: None,
+                file: None,
+                coordinate_note: Some("Lean printed this line outside its message log".to_owned()),
+            });
+            continue;
+        };
+        let severity = match message.severity.as_str() {
+            "error" => Severity::Error,
+            "warning" => Severity::Warning,
+            "information" => Severity::Info,
+            other => return Err(invalid(format!("Lean sent a message of unknown severity {other:?}"))),
+        };
+        let (start, end) = (message.pos, message.end_pos.unwrap_or(message.pos));
+        rows.push(Diagnostic {
+            severity,
+            // Lean's own text output puts a caption on the line before the message.
+            message: if message.caption.is_empty() {
+                message.data
+            } else {
+                format!("{}:\n{}", message.caption, message.data)
+            },
+            coordinate_space: CoordinateSpace::OriginalSource,
+            position: Some(Position {
+                line: start.line,
+                column: start.column,
+                end_line: message.end_pos.map(|p| p.line),
+                end_column: message.end_pos.map(|p| p.column),
+            }),
+            original_range: Some(SourceRange {
+                file: file.to_owned(),
+                start_line: start.line,
+                start_column: start.column,
+                end_line: end.line,
+                end_column: end.column,
+            }),
+            synthetic_range: None,
+            file: Some(file.to_owned()),
+            coordinate_note: None,
+        });
+    }
+    let has_error = rows.iter().any(|row| matches!(row.severity, Severity::Error));
+    if has_error != (output.exit_code != 0) {
+        return Err(invalid(format!(
+            "lean exited with code {} after printing {} error: {}",
+            output.exit_code,
+            if has_error { "an" } else { "no" },
+            output.stderr.trim()
+        )));
+    }
+    rows.sort_by_key(|row| match row.severity {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+        Severity::Info => 2,
+    });
+    let per_field = usize::try_from(budgets.per_field_bytes).unwrap_or(usize::MAX);
+    let total = usize::try_from(budgets.total_bytes).unwrap_or(usize::MAX);
+    let (mut spent, mut truncated, mut diagnostics) = (0_usize, false, Vec::new());
+    for mut row in rows {
+        if row.message.len() > per_field {
+            let mut cut = per_field;
+            while !row.message.is_char_boundary(cut) {
+                cut = cut.saturating_sub(1);
+            }
+            row.message.truncate(cut);
+            truncated = true;
+        }
+        spent = spent.saturating_add(row.message.len());
+        if spent > total {
+            truncated = true;
+            break;
+        }
+        diagnostics.push(row);
+    }
+    Ok(ElabFailure { diagnostics, truncated })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::projections::Severity;
+
+    const FILE: &str = "/p/A.lean";
+    const ERROR: &str = r#"{"fileName":"/p/A.lean","pos":{"line":3,"column":2},"endPos":{"line":3,"column":7},"keepFullRange":false,"severity":"error","isSilent":false,"caption":"","data":"unknown identifier 'x'","kind":"lean.unknownIdentifier"}"#;
+    const INFO: &str = r#"{"fileName":"/p/A.lean","pos":{"line":1,"column":0},"endPos":null,"keepFullRange":false,"severity":"information","isSilent":false,"caption":"note","data":"hi","kind":"[anonymous]"}"#;
+
+    fn output(exit_code: i32, lines: &[&str]) -> crate::lake_options::ReaderOutput {
+        crate::lake_options::ReaderOutput {
+            exit_code,
+            stdout: lines.join("\n").into_bytes(),
+            stderr: "trace".to_owned(),
+        }
+    }
+
+    fn budgets(per_field_bytes: u32, total_bytes: u32) -> lean_rs_worker_parent::LeanWorkerOutputBudgets {
+        lean_rs_worker_parent::LeanWorkerOutputBudgets {
+            per_field_bytes,
+            total_bytes,
+        }
+    }
+
+    #[test]
+    fn each_lean_message_becomes_one_row_at_lean_s_position() {
+        let failure = lean_messages(&output(1, &[INFO, ERROR, "", "printed"]), FILE, &budgets(100, 1000)).unwrap();
+        assert!(!failure.truncated);
+        let [error, info, printed] = &failure.diagnostics[..] else {
+            panic!("{failure:?}");
+        };
+        assert!(matches!(error.severity, Severity::Error) && error.message == "unknown identifier 'x'");
+        let position = error.position.as_ref().unwrap();
+        assert_eq!(
+            (position.line, position.column, position.end_line, position.end_column),
+            (3, 2, Some(3), Some(7))
+        );
+        assert_eq!(error.original_range.as_ref().unwrap().file, FILE);
+        assert!(matches!(info.severity, Severity::Info) && info.message == "note:\nhi");
+        assert_eq!(info.position.as_ref().unwrap().end_line, None);
+        assert!(printed.message == "printed" && printed.position.is_none() && printed.coordinate_note.is_some());
+    }
+
+    #[test]
+    fn an_exit_code_that_disagrees_with_the_messages_decides_nothing() {
+        let error = lean_messages(&output(0, &[ERROR]), FILE, &budgets(100, 1000)).unwrap_err();
+        assert!(error.to_string().contains("code 0 after printing an error"), "{error}");
+        let error = lean_messages(&output(1, &[INFO]), FILE, &budgets(100, 1000)).unwrap_err();
+        assert!(
+            error.to_string().contains("code 1 after printing no error: trace"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_short_budget_keeps_errors_before_information_and_marks_the_cut() {
+        // The error's 22 bytes fit in 25; the information's 8 more do not.
+        let failure = lean_messages(&output(1, &[INFO, ERROR]), FILE, &budgets(100, 25)).unwrap();
+        assert!(failure.truncated);
+        assert_eq!(failure.diagnostics.len(), 1);
+        assert!(matches!(failure.diagnostics[0].severity, Severity::Error));
+        let failure = lean_messages(&output(1, &[ERROR]), FILE, &budgets(7, 1000)).unwrap();
+        assert!(failure.truncated && failure.diagnostics[0].message == "unknown");
     }
 }

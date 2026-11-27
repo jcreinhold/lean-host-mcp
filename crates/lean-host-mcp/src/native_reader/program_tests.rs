@@ -75,6 +75,7 @@ impl Fixture {
             cwd: self.project.clone(),
             artifact_roots: vec![],
             max_stdout_bytes: OUTPUT_LIMIT,
+            stdin: None,
         })
     }
     fn assert_exclusive_available(&self) {
@@ -402,6 +403,33 @@ fn guardian_self_exit_with_live_controller_reaps_group_and_recovers_capacity() {
     .unwrap();
     assert_eq!(next.state, "completed", "{next:?}");
     assert_eq!(next.exit_code, Some(0));
+}
+
+#[test]
+#[ignore = "requires LEAN_HOST_MCP_NATIVE_READER_TEST_HELPER actual parent binary"]
+fn a_program_reads_the_bytes_staged_as_its_stdin() {
+    let fixture = Fixture::new();
+    let result = run_program_with_contract(
+        &fixture.contract(helper()),
+        &fixture.project,
+        Duration::from_secs(5),
+        1,
+        &|| false,
+        None,
+        |_| {
+            Ok(NativeReaderProgram {
+                command: vec!["/bin/cat".into()],
+                environment: vec![],
+                cwd: fixture.project.clone(),
+                artifact_roots: vec![],
+                max_stdout_bytes: OUTPUT_LIMIT,
+                stdin: Some(b"staged text\n".to_vec()),
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(result.state, "completed", "{result:?}");
+    assert_eq!(result.stdout, "staged text\n");
 }
 
 #[test]

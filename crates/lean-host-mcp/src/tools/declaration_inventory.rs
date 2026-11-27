@@ -158,14 +158,7 @@ async fn worker_declarations(
     }];
     let outcome = if supervised {
         ctx.broker
-            .file_projection(
-                &hint,
-                &file_label,
-                &input.source,
-                input.imports,
-                crate::broker::FileProjection::Outline,
-                outline_budgets(),
-            )
+            .file_outline(&hint, &file_label, &input.source, input.imports, outline_budgets())
             .await
     } else {
         ctx.broker
