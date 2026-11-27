@@ -576,30 +576,40 @@ ownership record has unknown fields` or `unrecognized native registry directory 
 cargo build --locked -p lean-host-mcp                          # parent only
 cargo build --locked -p lean-host-mcp-worker                   # worker only (links libleanshared)
 cargo clippy --locked --workspace --all-targets -- -D warnings # safe; clippy doesn't link
-LEAN_RS_WORKER_OWNERS_DIRECTORY=$PWD/target/test-owners \
+LEAN_RS_WORKER_OWNERS_DIRECTORY=$(mktemp -d "$PWD/target/owners.XXXXXX") \
     cargo test --locked -p lean-host-mcp --lib                  # parent unit tests
 cargo test --locked -p lean-host-mcp-worker --all-targets       # worker tests
 scripts/test-installed-stdio.sh --all-targets                  # includes installed-worker EOF and exit
 scripts/test-installed-module-setup.sh                         # packaged pair and semantic search
 scripts/check-parent-link.sh                                  # build and inspect the release parent
-LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
-    cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation \
-    -- --ignored --test-threads=1                              # one at a time; see below
+cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation \
+    --no-run                                                   # ignored suites; run each test alone, below
 CARGO_NET_OFFLINE=true \
     cargo test --locked -p lean-host-mcp --test http_transport install_and_serve_keep_no_state_in_an_empty_home \
     -- --ignored                                               # install and serve with an empty HOME
 ```
 
-Run the ignored tests that start workers one at a time. On macOS a few at once use up the SDK's native actor capacity,
-and the rest fail with "native actor capacity occupied" or "deadline elapsed".
+Run the ignored tests that start workers one at a time, each with a new owner directory. On macOS a few at once use up
+the SDK's native actor capacity, and the rest fail with "native actor capacity occupied" or "deadline elapsed". A test
+that dies can leave an owner record that holds back every later test on the same directory.
 
 On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs, and the installed worker refuses any
 `DYLD_*` variable, so opt-in tests that check files or start a worker fail under `cargo test`. Build them with
-`cargo test --no-run`, then run each printed binary with `--ignored` under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
-`LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_RS_WORKER_OWNERS_DIRECTORY`,
-`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, `LEAN_HOST_MCP_STORE_DIR` and `TMPDIR` under the target directory. The empty-HOME
-test clears its children's environment, so it runs under `cargo test`. The parent library tests start native work too,
-so give them an owner directory under the target directory, as above.
+`cargo test --no-run`, then run each printed binary under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
+`LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and `TMPDIR` under the
+target directory. For one printed binary `BINARY`:
+
+```sh
+for name in $(BINARY --list --ignored | sed -n 's/: test$//p'); do
+    env -u DYLD_FALLBACK_LIBRARY_PATH LEAN_HOST_MCP_TEST_FIXTURE="$PWD/fixtures/lean" \
+        LEAN_RS_WORKER_OWNERS_DIRECTORY="$(mktemp -d "$PWD/target/owners.XXXXXX")" \
+        LEAN_HOST_MCP_STORE_DIR="$(mktemp -d "$PWD/target/store.XXXXXX")" \
+        BINARY --ignored --exact "$name"
+done
+```
+
+The empty-HOME test clears its children's environment, so it runs under `cargo test`. The parent library tests start
+native work too, so give each run of them a new owner directory, as above.
 
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
