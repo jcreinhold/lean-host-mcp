@@ -69,15 +69,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   directory before any native work. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
   `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` still move each one. Install, then serve, write nothing under `HOME` but the
   socket directory.
-- Breaking: build against lean-rs 0.11.0 and lean-semantic-search 0.8.0. The server, its writer and its workers must come
-  from one SDK release. A worker built against lean-rs 0.10 still reports protocol 13, so reinstall it with `install
-  --force` after upgrading. A lock record or owner-directory entry that a 0.10 storage turn left now refuses writer
-  admission; [operations](docs/operations.md#upgrading-from-lean-rs-010) gives the steps to clear them.
+- Breaking: build against lean-rs 0.11.0 and lean-semantic-search 0.8.0. The server, its writer and its workers must
+  come from one SDK release. A worker built against lean-rs 0.10 still reports protocol 13, so reinstall it with
+  `install --force` after upgrading. A lock record or owner-directory entry that a 0.10 storage turn left now refuses
+  writer admission; [operations](docs/operations.md#upgrading-from-lean-rs-010) gives the steps to clear them.
 - Breaking: the server binary serves the SDK's own writer, reader and guardian helpers (`lean_rs_writer::HelperCommand`)
   in place of the host's copy, so their subcommands, frames and messages are the SDK's. A helper started without
   `LEAN_RS_WORKER_OWNERS_DIRECTORY` refuses to run; the SDK sets it on every helper it starts. The capped build log
-  takes `LEAN_RS_WRITER_LOG` and `LEAN_RS_WRITER_LOG_LIMIT`. The writer reads only its `LEAN_RS_*` settings, so
-  `LEAN_HOST_MCP_WRITER_LOCK_LOANS` and the other `LEAN_HOST_MCP_WRITER_*` names are gone.
+  takes `LEAN_RS_WRITER_LOG` and `LEAN_RS_WRITER_LOG_LIMIT` in place of `LEAN_HOST_MCP_LOG` and
+  `LEAN_HOST_MCP_LOG_LIMIT`, and a cut log ends with `[lean-rs-writer: log limit reached; later output dropped]`. The
+  writer reads only its `LEAN_RS_*` settings, so `LEAN_HOST_MCP_WRITER_LOCK_LOANS` and the other
+  `LEAN_HOST_MCP_WRITER_*` names are gone.
 - Breaking: `install` and `install-worker` lose `--shim-source`. The new worker writes the shim sources compiled into it
   to its generation's `shims/` directory and builds them there under the writer, so the installer no longer reads the
   Cargo source cache or checks the shim files against a pinned list.

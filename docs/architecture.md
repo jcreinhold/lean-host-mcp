@@ -438,8 +438,9 @@ keeps it in a task-local slot, so a nested check in the same request reuses its 
 waiting writer. A check takes its read turn before it pins an actor or starts a native reader, then the shared kernel
 guard on the project's artifacts, and holds both until the request ends. A build takes the write turn, then the
 exclusive kernel lock through the SDK writer helper, which the server binary serves as a subcommand
-(`lean_rs_writer::HelperCommand`); a request that holds a read turn cannot take the write turn. Tokio grants turns in arrival order, so a queued build holds back later checks, and each
-waiter keeps its place until its deadline. Each finished write turn adds one to the root's finished-build count.
+(`lean_rs_writer::HelperCommand`); a request that holds a read turn cannot take the write turn. Tokio grants turns in
+arrival order, so a queued build holds back later checks, and each waiter keeps its place until its deadline. Each
+finished write turn adds one to the root's finished-build count.
 
 Workers hold the shared kernel lock for their whole generation. When a writer in another process announces demand, the
 reaper queues a proxy write turn on that root, so new checks wait behind it, and retires the idle, unborrowed actors
