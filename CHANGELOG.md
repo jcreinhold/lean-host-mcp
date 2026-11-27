@@ -165,9 +165,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A worker that exits before it connects no longer leaves its owner record in phase `dispatching`, where it held back
   every later build that used the owner directory until someone deleted it. lean-rs 0.11 closes the record once it reaps
   the child.
-- `lean_verify` and the declaration outline of a file check the whole file, header included, and drop the messages Lean
-  marks silent, as `lake build` does. lean-rs 0.10's file driver checked the body without its header, so a header linter
-  such as Mathlib's warned on every file. File-backed proof search still elaborates the body apart from its header.
+- `lean_verify`, the declaration outline of a file and file-backed proof search check the whole file, header included,
+  and drop the messages Lean marks silent, as `lake build` does. lean-rs 0.10's file driver and lean-semantic-search
+  0.7's goal elaboration checked the body without its header, so a header linter such as Mathlib's warned on every file.
 
 ## [0.16.22] - 2026-11-25
 
