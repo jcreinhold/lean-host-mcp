@@ -20,7 +20,6 @@ mod lake_args;
 #[cfg(test)]
 mod tests;
 
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::os::unix::fs::DirBuilderExt as _;
@@ -225,10 +224,7 @@ pub(crate) fn new_id() -> String {
 pub(crate) fn log_path(store: &Path, id: &str) -> io::Result<PathBuf> {
     let logs = store.join("logs");
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&logs)?;
-    let mut name = String::with_capacity(36);
-    for byte in Sha256::digest(id.as_bytes()).iter().take(16) {
-        let _ = write!(name, "{byte:02x}");
-    }
+    let mut name = crate::digest::hex(Sha256::digest(id.as_bytes()).into_iter().take(16));
     name.push_str(".log");
     Ok(logs.canonicalize()?.join(name))
 }

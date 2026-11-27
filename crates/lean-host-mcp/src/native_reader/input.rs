@@ -1,6 +1,5 @@
 //! Explicit bounded stdin, stored in the existing native generation's inputs.
 
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
 use std::os::fd::AsFd;
@@ -10,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{FileType, Mode, OFlags, fcntl_getfl, fcntl_setfl, fstat, open, openat};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(5);
@@ -99,12 +97,8 @@ fn capture_bytes<F: AsFd>(
 }
 
 fn receipt(bytes: &[u8]) -> io::Result<Receipt> {
-    let mut sha256 = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        write!(&mut sha256, "{byte:02x}").map_err(io::Error::other)?;
-    }
     Ok(Receipt {
-        sha256,
+        sha256: crate::digest::sha256_hex(bytes),
         bytes: bytes.len().try_into().map_err(io::Error::other)?,
     })
 }

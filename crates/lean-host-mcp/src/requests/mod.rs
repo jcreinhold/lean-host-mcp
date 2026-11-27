@@ -29,7 +29,6 @@ use rmcp::model::{CallToolResult, ContentBlock, ErrorCode, ResultType};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -264,7 +263,7 @@ pub fn intent(tool: &str, arguments: &Map<String, Value>) -> String {
     whole.insert("tool".to_owned(), Value::from(tool));
     let mut text = String::new();
     canonical_json(&Value::Object(whole), &mut text);
-    crate::runtime_compatibility::digest_hex(Sha256::digest(text.as_bytes()))
+    crate::digest::sha256_hex(text.as_bytes())
 }
 
 fn canonical_json(value: &Value, out: &mut String) {

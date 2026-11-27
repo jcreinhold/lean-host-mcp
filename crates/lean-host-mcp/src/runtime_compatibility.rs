@@ -6,7 +6,6 @@
 //! versions are recorded rather than pinned. Only the shared-writer executable identity is observed here; no backend work is submitted.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use lean_rs_worker_parent::{
@@ -103,7 +102,7 @@ fn source_handoff_for_pin(registry: &Path, pin: SourceHandoffCutover) -> Option<
         helper.consume(size);
     }
     let named = std::fs::symlink_metadata(&pin.executable).ok()?;
-    if named.dev() != opened.dev() || named.ino() != opened.ino() || digest_hex(hash.finalize()) != pin.sha256 {
+    if named.dev() != opened.dev() || named.ino() != opened.ino() || crate::digest::hex(hash.finalize()) != pin.sha256 {
         return None;
     }
     approved()?;
@@ -246,7 +245,7 @@ impl ExpectedContract {
             &self.enforcement,
             self.writer_protocol,
         ))?;
-        Ok(digest_hex(Sha256::digest(bytes)))
+        Ok(crate::digest::sha256_hex(&bytes))
     }
 }
 
@@ -373,14 +372,6 @@ pub fn validate_loaded(
     })
 }
 
-pub(crate) fn digest_hex(bytes: impl IntoIterator<Item = u8>) -> String {
-    let mut digest = String::with_capacity(64);
-    for byte in bytes {
-        let _ = write!(digest, "{byte:02x}");
-    }
-    digest
-}
-
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -401,7 +392,7 @@ mod tests {
         let other = registry.join("other");
         std::fs::create_dir(&other)?;
         let executable = Path::new("/usr/bin/true").canonicalize()?;
-        let sha256 = digest_hex(Sha256::digest(std::fs::read(&executable)?));
+        let sha256 = crate::digest::sha256_hex(&std::fs::read(&executable)?);
         use std::os::unix::fs::MetadataExt as _;
         let approved_registry = std::fs::metadata(&registry)?;
         let pin = |ownership_registry: PathBuf, sha256: String| SourceHandoffCutover {

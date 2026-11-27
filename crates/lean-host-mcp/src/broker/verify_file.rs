@@ -7,7 +7,6 @@ use super::{
     reader_freshness,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{fs, io};
 
 fn invalid(message: impl std::fmt::Display) -> ServerError {
@@ -17,24 +16,7 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     if path.canonicalize()? != path || !fs::symlink_metadata(path)?.is_file() {
         return Err(invalid("noncanonical prepared file"));
     }
-    let mut h = Sha256::new();
-    use std::io::Read as _;
-    let mut f = fs::File::open(path)?;
-    let mut buf = [0u8; 8192];
-    loop {
-        let count = f.read(&mut buf)?;
-        if count == 0 {
-            break;
-        }
-        h.update(buf.get(..count).ok_or_else(|| invalid("invalid read count"))?);
-    }
-
-    use std::fmt::Write as _;
-    let mut actual = String::with_capacity(64);
-    for byte in h.finalize() {
-        write!(actual, "{byte:02x}").map_err(invalid)?;
-    }
-    if actual != expected {
+    if crate::digest::file_sha256_hex(path)? != expected {
         return Err(invalid("prepared verification artifact changed"));
     }
     Ok(())

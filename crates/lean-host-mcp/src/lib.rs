@@ -31,6 +31,7 @@ pub mod cli;
 pub mod config_file;
 pub mod config_schema;
 mod diagnosis;
+mod digest;
 pub mod envelope;
 pub mod error;
 mod host_preparation;

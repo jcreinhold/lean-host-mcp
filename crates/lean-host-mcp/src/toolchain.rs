@@ -659,16 +659,7 @@ fn out_of_window_bounds(pin: (u32, u32, u32, u8, u32)) -> (String, String) {
 /// robust toolchain-identity check: a version string can lie (an rc
 /// republished under the same id), the header digest cannot.
 pub(crate) fn hash_lean_header(elan_dir: &Path) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
-    let path = elan_dir.join("include").join("lean").join("lean.h");
-    let bytes = std::fs::read(path)?;
-    let digest = Sha256::digest(&bytes);
-    use std::fmt::Write as _;
-    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
-    for b in &digest {
-        let _ = write!(hex, "{b:02x}");
-    }
-    Ok(hex)
+    crate::digest::file_sha256_hex(&elan_dir.join("include").join("lean").join("lean.h"))
 }
 
 /// File name of the per-worker provenance sidecar inside

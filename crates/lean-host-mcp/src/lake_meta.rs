@@ -22,12 +22,10 @@
 //! calibration target. Anything more elaborate is the user's job to
 //! declare via the explicit hint.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::error::{Result, ServerError};
 
@@ -317,12 +315,7 @@ fn fingerprint_lake_project(lake_root: &Path) -> Result<String> {
     let manifest = lake_root.join("lake-manifest.json");
     let bytes =
         std::fs::read(&manifest).map_err(|e| ServerError::BadProject(format!("read {}: {e}", manifest.display())))?;
-    let digest = Sha256::digest(&bytes);
-    let mut s = String::with_capacity(digest.len().saturating_mul(2));
-    for byte in &digest {
-        let _ = write!(s, "{byte:02x}");
-    }
-    Ok(s)
+    Ok(crate::digest::sha256_hex(&bytes))
 }
 
 /// Project-relative directory holding built module artifacts: `.olean` for the

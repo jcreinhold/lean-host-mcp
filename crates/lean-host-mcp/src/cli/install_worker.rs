@@ -35,13 +35,11 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
 use clap::Args;
-use sha2::{Digest, Sha256};
 
 use crate::config_file::{self, ConfigFile};
 use crate::store;
@@ -907,23 +905,7 @@ fn stage_registry_worker(candidate: &Path, install: impl FnOnce(&Path) -> anyhow
 }
 
 pub(crate) fn sha256_prefix(path: &Path, hex_chars: usize) -> anyhow::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut buf = [0u8; 8192];
-    let mut hasher = Sha256::new();
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(buf.get(..n).unwrap_or(&[]));
-    }
-    use std::fmt::Write as _;
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len().saturating_mul(2));
-    for b in &digest {
-        let _ = write!(hex, "{b:02x}");
-    }
-    Ok(hex.chars().take(hex_chars).collect())
+    Ok(crate::digest::file_sha256_hex(path)?.chars().take(hex_chars).collect())
 }
 
 /// Format a byte count as MiB with two decimals for the `--list` `size`
