@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-27
+
 ### Added
 
 - `lean-host-mcp install --lake-root PROJECT` installs everything one project needs under
@@ -70,7 +72,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   directory before any native work. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
   `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` still move each one. Install, then serve, write nothing under `HOME` but the
   socket directory.
-- Breaking: build against lean-rs 0.11.0 and lean-semantic-search 0.8.0. The server, its writer and its workers must
+- Breaking: build against lean-rs 0.11.1 and lean-semantic-search 0.8.0. The server, its writer and its workers must
   come from one SDK release. A worker built against lean-rs 0.10 still reports protocol 13; a plain `install` replaces
   it, since another release built it. A lock record or owner-directory entry that a 0.10 storage turn left now refuses
   writer admission; [operations](docs/operations.md#upgrading-from-lean-rs-010) gives the steps to clear them.
@@ -168,6 +170,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `lean_verify`, the declaration outline of a file and file-backed proof search check the whole file, header included,
   and drop the messages Lean marks silent, as `lake build` does. lean-rs 0.10's file driver and lean-semantic-search
   0.7's goal elaboration checked the body without its header, so a header linter such as Mathlib's warned on every file.
+- A warm worker no longer restarts when its session open meets another reader's brief admission gate, such as the
+  server's own writer-demand probe or another worker's open. lean-rs 0.11.1 waits out the gate and still stops at once
+  for writer demand.
 
 ## [0.16.22] - 2026-11-25
 
@@ -948,7 +953,11 @@ Version 0.16.0 stopped in CI before publication. This release includes its chang
 
 - Pre-1.0: minor versions may carry breaking changes; patch releases stay compatible.
 
-[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.19...HEAD
+[Unreleased]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.22...v0.17.0
+[0.16.22]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.21...v0.16.22
+[0.16.21]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.20...v0.16.21
+[0.16.20]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.19...v0.16.20
 [0.16.19]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.18...v0.16.19
 [0.16.18]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.17...v0.16.18
 [0.16.17]: https://github.com/jcreinhold/lean-host-mcp/compare/v0.16.16...v0.16.17
