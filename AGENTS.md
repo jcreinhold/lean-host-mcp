@@ -19,14 +19,15 @@ cargo build --locked -p lean-host-mcp-worker
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p lean-host-mcp
-cargo test --locked -p lean-host-mcp --lib
+LEAN_RS_WORKER_OWNERS_DIRECTORY=$PWD/target/test-owners cargo test --locked -p lean-host-mcp --lib
 cargo test --locked -p lean-host-mcp-worker --all-targets
 scripts/test-installed-stdio.sh --all-targets
 cargo test --locked -p lean-host-mcp --test http_transport
 ```
 
-The parent library tests need no Lean fixture. The all-target runner provisions a disposable installed worker for the
-stdio EOF check. Opt-in e2e and build tests require built fixture `.olean` files and a matching worker:
+The parent library tests need no Lean fixture, but their native work needs an owner directory, so the command puts one
+under `target/`. The all-target runner provisions a disposable installed worker for the stdio EOF check. Opt-in e2e and
+build tests require built fixture `.olean` files and a matching worker:
 
 ```sh
 LEAN_HOST_MCP_WORKERS_DIR=$PWD/target/release \

@@ -576,7 +576,8 @@ ownership record has unknown fields` or `unrecognized native registry directory 
 cargo build --locked -p lean-host-mcp                          # parent only
 cargo build --locked -p lean-host-mcp-worker                   # worker only (links libleanshared)
 cargo clippy --locked --workspace --all-targets -- -D warnings # safe; clippy doesn't link
-cargo test --locked -p lean-host-mcp --lib                      # parent unit tests
+LEAN_RS_WORKER_OWNERS_DIRECTORY=$PWD/target/test-owners \
+    cargo test --locked -p lean-host-mcp --lib                  # parent unit tests
 cargo test --locked -p lean-host-mcp-worker --all-targets       # worker tests
 scripts/test-installed-stdio.sh --all-targets                  # includes installed-worker EOF and exit
 scripts/test-installed-module-setup.sh                         # packaged pair and semantic search
@@ -597,7 +598,8 @@ On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs,
 `cargo test --no-run`, then run each printed binary with `--ignored` under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
 `LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_RS_WORKER_OWNERS_DIRECTORY`,
 `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, `LEAN_HOST_MCP_STORE_DIR` and `TMPDIR` under the target directory. The empty-HOME
-test clears its children's environment, so it runs under `cargo test`.
+test clears its children's environment, so it runs under `cargo test`. The parent library tests start native work too,
+so give them an owner directory under the target directory, as above.
 
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
