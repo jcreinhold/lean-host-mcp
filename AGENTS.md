@@ -94,7 +94,8 @@ Otherwise add one check at the one point where the requirement can fail, and del
 
 ## Memory and imported sessions
 
-`project.rs` owns memory policy. Preserve these distinctions when changing either worker builder:
+`project/runtime_config.rs` sets memory policy and `project.rs` applies it. Preserve these distinctions when changing
+either worker builder:
 
 - RSS is telemetry only: shared, clean, mapped `.olean` pages make it unsuitable for restart, recycle, or refusal
   thresholds. Do not add RSS or request-count restart limits.

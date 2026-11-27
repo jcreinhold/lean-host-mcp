@@ -251,7 +251,7 @@ pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 /// classifier that silently reclassifies a cause it stops expecting is worse
 /// than one that keeps a quiet arm.
 ///
-/// The cause strings mirror `crate::project::RestartCause::as_str`; the unit
+/// The cause strings mirror `crate::project::restart::RestartCause::as_str`; the unit
 /// test below pins the disrupting set so a new cause there is a conscious
 /// decision here.
 pub(crate) fn execution_taint(runtime: &RuntimeFacts) -> Option<&RuntimeRestartEvent> {

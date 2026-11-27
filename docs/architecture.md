@@ -33,6 +33,9 @@ crates/lean-host-mcp/src/
   broker/verify_file.rs  file checks through one-shot Lean programs
   broker/writer_handoff.rs idle workers retired for a writer in another process
   project.rs             LeanProject actor: one serialized controller and worker
+  project/runtime_config.rs the actor's memory budget, Lean heap ceiling, deadline, mailbox and restart limits
+  project/restart.rs     why a worker cycled: cause names, which causes count toward the restart limit, the tally
+  project/semantic_runtime.rs the semantic-search runtime, built once per toolchain, and its cache directory
   worker_retirement.rs   keeps an actor's capacity until each tracked child has exited
   project_lock.rs        fair read and write turns per Lake root, the shared kernel guard, proxy turns
   build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, the run in one helper
