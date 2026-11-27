@@ -769,7 +769,7 @@ struct McpServer {
     stdout: BufReader<ChildStdout>,
     stderr_task: tokio::task::JoinHandle<String>,
     next_id: u64,
-    _sockets: tempfile::TempDir,
+    _sockets: support::SocketDir,
 }
 
 impl McpServer {

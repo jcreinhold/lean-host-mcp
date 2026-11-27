@@ -190,7 +190,7 @@ struct StdioServer {
     stdout: BufReader<ChildStdout>,
     stderr_task: tokio::task::JoinHandle<String>,
     next_id: u64,
-    _sockets: tempfile::TempDir,
+    _sockets: support::SocketDir,
 }
 
 impl StdioServer {
@@ -221,7 +221,7 @@ impl StdioServer {
         Self::spawn(&mut command, sockets)
     }
 
-    fn spawn(command: &mut Command, sockets: tempfile::TempDir) -> Self {
+    fn spawn(command: &mut Command, sockets: support::SocketDir) -> Self {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

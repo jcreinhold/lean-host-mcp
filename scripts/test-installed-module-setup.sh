@@ -31,9 +31,12 @@ mkdir -p "$CARGO_TARGET_DIR"
 scratch=$(mktemp -d "$CARGO_TARGET_DIR/module-setup.XXXXXX")
 trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch" ${sockets:+"$sockets"}' EXIT
 # Worker sockets: the default is under HOME, and a path in the scratch is too
-# long for macOS.
-sockets=$(mktemp -d "$(cd -- "$CARGO_TARGET_DIR" && pwd -P)/s.XXXXXX")
-export LEAN_HOST_MCP_SOCKET_DIR="$sockets"
+# long for macOS. A caller whose target directory is too deep for socket
+# paths, as on CI, names a shorter one.
+if [[ -z ${LEAN_HOST_MCP_SOCKET_DIR:-} ]]; then
+    sockets=$(mktemp -d "$(cd -- "$CARGO_TARGET_DIR" && pwd -P)/s.XXXXXX")
+    export LEAN_HOST_MCP_SOCKET_DIR="$sockets"
+fi
 export TMPDIR="$scratch/tmp" LEAN_RS_WORKER_OWNERS_DIRECTORY="$scratch/owners"
 export LEAN_HOST_MCP_SEMANTIC_CACHE_DIR="$scratch/semantic-cache"
 mkdir -p "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$TMPDIR" "$scratch/cache" "$scratch/server-owners"

@@ -55,7 +55,7 @@ print('payload result')
 struct Fixture {
     directory: tempfile::TempDir,
     /// Every reader's sockets, so none go under `HOME`.
-    sockets: tempfile::TempDir,
+    sockets: support::SocketDir,
     root: PathBuf,
     project: PathBuf,
     dependency: PathBuf,

@@ -697,7 +697,7 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let server = HttpMcpServer::spawn(command, Vec::new()).await;
+    let server = HttpMcpServer::spawn(command, None).await;
     let mut session = server.new_session().await;
     // The installed worker serves no project request, so the semantic call is
     // a proof search, which a native reader runs.
@@ -1390,7 +1390,7 @@ struct HttpMcpServer {
     /// lock, and its process registry, then its socket directory. A test that
     /// passes `LEAN_HOST_MCP_STORE_DIR` replaces the store; an installed
     /// server keeps its store under its Lake root.
-    _scratch: Vec<tempfile::TempDir>,
+    _scratch: Option<(tempfile::TempDir, support::SocketDir)>,
 }
 
 impl HttpMcpServer {
@@ -1430,13 +1430,13 @@ impl HttpMcpServer {
         for (key, value) in envs {
             command.env(key, value);
         }
-        Self::spawn(command, vec![store, sockets]).await
+        Self::spawn(command, Some((store, sockets))).await
     }
 
     /// Spawn `command`, a server that binds `127.0.0.1:0` with stderr piped
     /// and logs `lean_host_mcp::transport_http` at info, and wait for the
     /// address it listens on.
-    async fn spawn(mut command: Command, scratch: Vec<tempfile::TempDir>) -> Self {
+    async fn spawn(mut command: Command, scratch: Option<(tempfile::TempDir, support::SocketDir)>) -> Self {
         let mut child = command.spawn().expect("spawn lean-host-mcp HTTP server");
         let stderr = child.stderr.take().expect("server stderr");
         let mut stderr = BufReader::new(stderr);

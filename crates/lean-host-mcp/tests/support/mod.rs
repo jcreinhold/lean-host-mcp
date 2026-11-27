@@ -60,18 +60,47 @@ fn target_dir() -> TestResult<PathBuf> {
     Ok(tmp.parent().ok_or("the target directory")?.canonicalize()?)
 }
 
-/// A new private directory for one spawned server's sockets: `s` and six
-/// random characters in the target directory, mode 0700.
+/// The directory one spawned server keeps its worker sockets in.
+#[derive(Debug)]
+pub(crate) struct SocketDir {
+    path: PathBuf,
+    /// The directory, when this test made it; it goes when the value drops.
+    _own: Option<tempfile::TempDir>,
+}
+
+impl SocketDir {
+    /// The directory to pass as `LEAN_HOST_MCP_SOCKET_DIR`.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// The socket directory for one spawned server: `LEAN_HOST_MCP_SOCKET_DIR`
+/// when the caller sets it, else a new private directory, `s` and six random
+/// characters in the target directory, mode 0700.
 ///
 /// A server given none makes its sockets under `HOME`. One in the test's own
 /// temporary directory makes a socket path longer than the 103 bytes macOS
-/// allows.
-pub(crate) fn socket_dir() -> TestResult<tempfile::TempDir> {
+/// allows, and so does the target directory of a deep checkout, such as a CI
+/// runner's; such a caller names a shorter directory. Each worker names its
+/// own socket, so the servers can share it.
+pub(crate) fn socket_dir() -> TestResult<SocketDir> {
     use std::os::unix::fs::PermissionsExt as _;
-    Ok(tempfile::Builder::new()
+    if std::env::var_os("LEAN_HOST_MCP_SOCKET_DIR").is_some() {
+        // This makes and checks the directory as a server would.
+        return Ok(SocketDir {
+            path: lean_host_mcp::socket_directory()?,
+            _own: None,
+        });
+    }
+    let own = tempfile::Builder::new()
         .prefix("s")
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(target_dir()?)?)
+        .tempdir_in(target_dir()?)?;
+    Ok(SocketDir {
+        path: own.path().to_path_buf(),
+        _own: Some(own),
+    })
 }
 
 /// Set this test process up for native work as the server sets itself up.
@@ -80,7 +109,7 @@ pub(crate) fn socket_dir() -> TestResult<tempfile::TempDir> {
 /// lacks them. The worker sockets go to `LEAN_HOST_MCP_SOCKET_DIR` when it is
 /// set, else to `s` in the target directory, for the reasons [`socket_dir`]
 /// gives. Both settings hold for the whole process, so its tests share the one
-/// socket directory; each worker names its own socket in it.
+/// socket directory.
 pub(crate) fn set_up_native_work() -> TestResult {
     lean_rs_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
     if std::env::var_os("LEAN_HOST_MCP_SOCKET_DIR").is_none() {

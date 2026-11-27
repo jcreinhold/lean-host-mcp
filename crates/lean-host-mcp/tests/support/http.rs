@@ -34,18 +34,19 @@ const WRITER_ENV: &str = "LEAN_RS_WRITER_EXECUTABLE";
 /// The row states after which a request never changes.
 pub(crate) const FINAL_STATES: [&str; 3] = ["done", "timed_out", "interrupted"];
 
-/// The directories a test server keeps, removed when the value drops.
+/// The directories a test server keeps, removed when the value drops, except
+/// a socket directory the caller names.
 pub(crate) struct Scratch {
     /// The server's store: request table, build logs and native state.
     pub(crate) store: PathBuf,
     /// A directory for sockets, from [`super::socket_dir`].
     pub(crate) sockets: PathBuf,
     _store: tempfile::TempDir,
-    _sockets: tempfile::TempDir,
+    _sockets: super::SocketDir,
 }
 
 impl Scratch {
-    /// New, empty directories under the target directory.
+    /// A new, empty store under the target directory, and a socket directory.
     pub(crate) fn new() -> TestResult<Self> {
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let store = tempfile::Builder::new().prefix("store-").tempdir_in(tmp)?;

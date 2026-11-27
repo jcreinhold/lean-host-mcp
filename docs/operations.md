@@ -660,8 +660,10 @@ The empty-HOME test clears its children's environment, so it runs under `cargo t
 native work too, so give each run of them a new owner directory, as above.
 
 The tests keep worker sockets in the target directory, not under `HOME`. The servers a test starts use a new `sXXXXXX`
-there. The suites that start workers in their own process share `s`, or use `LEAN_HOST_MCP_SOCKET_DIR` when it is set. A
-directory deeper in `target/` would make socket paths longer than the 103 bytes macOS allows.
+there, the suites that start workers in their own process share `s`, and the installed-test scripts make `s.XXXXXX`. A
+directory deeper in `target/` would make socket paths longer than the 103 bytes macOS allows. A target directory path
+longer than 45 bytes leaves too little room even for these, so set `LEAN_HOST_MCP_SOCKET_DIR` to a shorter private
+directory outside `/tmp`; the tests and those scripts then all use it. CI sets one in the runner's temporary directory.
 
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
