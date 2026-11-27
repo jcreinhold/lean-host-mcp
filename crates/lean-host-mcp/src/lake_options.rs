@@ -1031,9 +1031,8 @@ lean_lib Demo
         );
         std::fs::write(root.join("Demo.lean"), "def sample := 1\n").unwrap();
         let broker = crate::broker::ProjectBroker::new(crate::broker::BrokerConfig {
-            env_default: None,
-            cwd: root.clone(),
-            max_projects: std::num::NonZeroUsize::MIN,
+            lake_root: None,
+            max_workers: std::num::NonZeroUsize::MIN,
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         });

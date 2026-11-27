@@ -28,13 +28,7 @@ async fn open_call_shutdown_round_trip() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let broker = ProjectBroker::new(BrokerConfig {
-        env_default: Some(root.clone()),
-        cwd: root,
-        max_projects: BrokerConfig::default_max_projects(),
-        max_workers_per_project: std::num::NonZeroUsize::MIN,
-        idle_timeout: BrokerConfig::default_idle_timeout(),
-    });
+    let broker = ProjectBroker::new(BrokerConfig::serving(root.clone()));
 
     // Trivial operation: just confirm we can dispatch typed work to the actor
     // and get runtime metadata back.

@@ -176,7 +176,7 @@ impl ProjectBroker {
         use lean_rs_worker_protocol::types::{
             LeanWorkerDeclarationVerificationTarget as Target, LeanWorkerSorryPolicy,
         };
-        let root = self.native_root(&hint)?;
+        let root = self.resolve(&hint)?;
         let meta = self.meta(&root)?;
         let file = PathBuf::from(&options.file_label);
         if !file.starts_with(&root)
@@ -297,7 +297,7 @@ impl ProjectBroker {
             root.clone(),
             crate::cancellation::CallCancellation::current()
                 .remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_projects.get(),
+            self.config.max_workers.get(),
             custody,
             None,
             Some(Box::new((activity, shim_guards))),
@@ -342,7 +342,7 @@ impl ProjectBroker {
         imports: Vec<String>,
         budgets: lean_rs_worker_parent::LeanWorkerOutputBudgets,
     ) -> Result<super::CachedBrokerCall<lean_rs_worker_parent::LeanWorkerModuleQueryBatchOutcome>> {
-        let root = self.native_root(hint)?;
+        let root = self.resolve(hint)?;
         let meta = self.meta(&root)?;
         let (setup, reader, activity) = self.file_reader_with_setup(hint, &meta, file, source).await?;
         let options = LeanWorkerElabOptions::new()
@@ -398,7 +398,7 @@ impl ProjectBroker {
         imports: Vec<String>,
         budgets: lean_rs_worker_parent::LeanWorkerOutputBudgets,
     ) -> Result<BrokerCall<crate::projections::ElabFailure>> {
-        let root = self.native_root(hint)?;
+        let root = self.resolve(hint)?;
         let meta = self.meta(&root)?;
         let (setup, reader, activity) = self.file_reader_with_setup(hint, &meta, file, source).await?;
         let options = LeanWorkerElabOptions::new()
@@ -416,7 +416,7 @@ impl ProjectBroker {
             root,
             crate::cancellation::CallCancellation::current()
                 .remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_projects.get(),
+            self.config.max_workers.get(),
             custody,
             None,
             Some(Box::new((activity, shim_guards))),

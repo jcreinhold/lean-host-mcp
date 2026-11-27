@@ -152,7 +152,7 @@ async fn black_box_pipelined_mailbox_pressure_returns_structured_statuses() {
     };
     // One project in the pool concentrates the whole burst on one worker's
     // mailbox, which is the server's only admission mechanism.
-    let mut server = McpServer::start_with_env(&scenario.project_root, &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")]).await;
+    let mut server = McpServer::start_with_env(&scenario.project_root, &[("LEAN_HOST_MCP_MAX_WORKERS", "1")]).await;
 
     let burst = scenario.calls.iter().cycle().take(12).collect::<Vec<_>>();
     let responses = server

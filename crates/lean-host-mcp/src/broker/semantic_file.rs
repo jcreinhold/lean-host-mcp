@@ -29,7 +29,7 @@ impl ProjectBroker {
         freshness: Vec<String>,
         request: SemanticProofSearchRequest,
     ) -> Result<BrokerCall<SemanticProofSearchResult>> {
-        let root = self.native_root(&hint)?;
+        let root = self.resolve(&hint)?;
         let meta = self.meta(&root)?;
         self.ensure_read(&root).await?;
         let file = request
@@ -95,7 +95,7 @@ impl ProjectBroker {
             "Lean semantic feature reader",
             root,
             cancellation.remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_projects.get(),
+            self.config.max_workers.get(),
             custody,
             None,
             Some(Box::new((activity, shim_guards, runtime_guard))),

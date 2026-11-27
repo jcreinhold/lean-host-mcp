@@ -281,7 +281,7 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
         req.declaration.clone().filter(|value| !value.trim().is_empty()),
     ) {
         let hint = ProjectHint::from_request(req.project.clone());
-        let root = ctx.broker.native_root(&hint)?;
+        let root = ctx.broker.resolve(&hint)?;
         let input = crate::tools::source_input::read_query_file(&root, &file)?;
         return source_profile(
             &root,

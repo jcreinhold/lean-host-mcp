@@ -92,13 +92,7 @@ async fn unchanged_query_sees_a_dependency_rebuilt_by_another_writer() -> TestRe
     lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))?;
     let ctx = ToolContext {
         broker: ProjectBroker::new_with_runtime_config(
-            BrokerConfig {
-                env_default: Some(chain.root.clone()),
-                cwd: chain.root.clone(),
-                max_projects: BrokerConfig::default_max_projects(),
-                max_workers_per_project: std::num::NonZeroUsize::MIN,
-                idle_timeout: BrokerConfig::default_idle_timeout(),
-            },
+            BrokerConfig::serving(chain.root.clone()),
             ProjectRuntimeConfig::default(),
         ),
         config: ToolConfig::default(),

@@ -1308,11 +1308,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            env_default: Some(root.clone()),
-            cwd: root,
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
+            ..BrokerConfig::serving(root.clone())
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),
@@ -1414,11 +1411,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            env_default: Some(root),
-            cwd: tmp.path().to_path_buf(),
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
+            ..BrokerConfig::serving(root)
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),
@@ -1448,11 +1442,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            env_default: Some(root),
-            cwd: tmp.path().to_path_buf(),
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
+            ..BrokerConfig::serving(root)
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),
@@ -1495,11 +1486,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_lake_dir(tmp.path());
         let broker = ProjectBroker::new(BrokerConfig {
-            env_default: Some(root),
-            cwd: tmp.path().to_path_buf(),
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
+            ..BrokerConfig::serving(root)
         });
         let ctx = ToolContext {
             broker: std::sync::Arc::clone(&broker),

@@ -268,7 +268,7 @@ fn fixture_config(
         worker_path: executable,
         lean_sysroot: root.join("unused-sysroot"),
         prepared_host_artifacts: None,
-        native_capacity_limit: crate::broker::DEFAULT_MAX_PROJECTS,
+        native_capacity_limit: crate::broker::DEFAULT_MAX_WORKERS,
         session_id: project.session_id.clone(),
         runtime: Arc::clone(&project.runtime),
         healthy: Arc::clone(&project.healthy),
@@ -354,11 +354,9 @@ impl ActorHarness {
         let root = tempfile::tempdir().expect("private actor fixture");
         let executable = fake_worker(root.path(), remove_executable);
         let broker_config = crate::broker::BrokerConfig {
-            env_default: Some(root.path().to_path_buf()),
-            cwd: root.path().to_path_buf(),
-            max_projects: NonZeroUsize::MIN,
-            max_workers_per_project: NonZeroUsize::MIN,
+            max_workers: NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
+            ..crate::broker::BrokerConfig::serving(root.path().to_path_buf())
         };
         let mut runtime_config = ProjectRuntimeConfig::default();
         if let Some(timeout) = admission_timeout {

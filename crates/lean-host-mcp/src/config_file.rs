@@ -11,7 +11,7 @@
 //! `CLI > env > local file > tracked file > default`: every field here is
 //! `Option`, and a set env var still wins over a file value (see
 //! `ProjectRuntimeConfig::from_env_with_file` /
-//! `BrokerConfig::pool_from_env_with_file`). A missing file contributes
+//! `BrokerConfig::from_env_with_file`). A missing file contributes
 //! nothing; a malformed file is logged and ignored, leaving env and the
 //! built-in defaults in charge.
 
@@ -137,10 +137,9 @@ pub struct RuntimeFileConfig {
     pub worker_session_pool_capacity: Option<usize>,
 }
 
-/// `[broker]` — project-pool knobs.
+/// `[broker]` — worker-pool knobs.
 #[derive(Debug, Default, Deserialize)]
 pub struct BrokerFileConfig {
-    pub max_projects: Option<usize>,
     pub max_workers: Option<usize>,
     pub max_workers_per_project: Option<usize>,
     pub idle_timeout_secs: Option<u64>,
@@ -409,7 +408,7 @@ mod tests {
     fn full_example_parses() {
         let config: ConfigFile = toml::from_str::<toml::Value>(
             "[runtime]\nlean_max_memory_kib = 8388608\nworker_restart_window_secs = 60\n\
-             [broker]\nmax_projects = 4\nidle_timeout_secs = 600\n\
+             [broker]\nmax_workers = 4\nidle_timeout_secs = 600\n\
              [server]\nbind = \"127.0.0.1:8765\"\nhttp_path = \"/mcp\"\n",
         )
         .unwrap()
@@ -417,7 +416,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.runtime.lean_max_memory_kib, Some(8_388_608));
-        assert_eq!(config.broker.max_projects, Some(4));
+        assert_eq!(config.broker.max_workers, Some(4));
         assert_eq!(config.broker.idle_timeout_secs, Some(600));
         assert_eq!(config.server.bind.as_deref(), Some("127.0.0.1:8765"));
         assert_eq!(config.server.http_path.as_deref(), Some("/mcp"));
@@ -427,7 +426,7 @@ mod tests {
     fn empty_config_is_all_none() {
         let config = ConfigFile::default();
         assert!(config.runtime.lean_max_memory_kib.is_none());
-        assert!(config.broker.max_projects.is_none());
+        assert!(config.broker.max_workers.is_none());
         assert!(config.server.bind.is_none());
         assert!(config.install.workers_dir.is_none());
     }

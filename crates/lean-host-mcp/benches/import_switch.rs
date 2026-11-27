@@ -101,13 +101,7 @@ fn bench_import_switch(c: &mut Criterion) {
         return;
     };
     let rt = Runtime::new().unwrap();
-    let broker = ProjectBroker::new(BrokerConfig {
-        env_default: Some(root.clone()),
-        cwd: root,
-        max_projects: BrokerConfig::default_max_projects(),
-        max_workers_per_project: std::num::NonZeroUsize::MIN,
-        idle_timeout: BrokerConfig::default_idle_timeout(),
-    });
+    let broker = ProjectBroker::new(BrokerConfig::serving(root));
     let ctx = ToolContext {
         broker,
         config: ToolConfig::default(),

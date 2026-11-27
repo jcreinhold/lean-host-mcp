@@ -60,7 +60,7 @@ pub(crate) struct PlannedBuild {
 pub(crate) fn plan_build(ctx: &ToolContext, request: &BuildRequest) -> Result<PlannedBuild, McpError> {
     let root = ctx
         .broker
-        .native_root(&ProjectHint::from_request(request.project.clone()))?;
+        .resolve(&ProjectHint::from_request(request.project.clone()))?;
     let config = BuildConfig::load(&root).map_err(|errors| ServerError::BadProject(errors.join("; ")))?;
     let mut planned = plan(&config, request).map_err(|problem| McpError::invalid_params(problem, None))?;
     planned.cap_tail(ctx.config.output.max_field_bytes);
@@ -179,7 +179,7 @@ pub async fn lean_imports(ctx: &ToolContext, request: ImportsRequest) -> Result<
     }
     let root = ctx
         .broker
-        .native_root(&ProjectHint::from_request(request.project))
+        .resolve(&ProjectHint::from_request(request.project))
         .map_err(McpError::from)?;
     let build = root.join(".lake").join("build");
     let mut files = Vec::with_capacity(request.files.len());

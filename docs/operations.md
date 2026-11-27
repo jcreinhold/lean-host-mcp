@@ -70,9 +70,9 @@ Units are shown in the table; GiB figures in descriptions are explanatory, not l
 | `runtime.worker_restart_window_secs` | integer (s) | `60` | `LEAN_HOST_MCP_WORKER_RESTART_WINDOW_SECS` | Rolling window, in seconds, over which worker_restart_limit is counted. |
 | `runtime.worker_import_residue_budget_mib` | integer (MiB) | unset | `LEAN_HOST_MCP_WORKER_IMPORT_RESIDUE_BUDGET_MIB` | Unreclaimable import bytes per worker before a clean recycle. Unset uses a quarter of RAM divided among broker.max_workers, clamped to 9-12 GiB and capped at each worker's RAM share minus 4608 MiB (minimum 1 MiB). This affordability cap can lower the default below 9 GiB. Explicit MiB values bypass RAM sizing; a budget below one import's residue can force frequent recycling. |
 | `runtime.worker_session_pool_capacity` | integer | `8` | `LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY` | How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8. |
-| `broker.max_workers` | integer | `4` | `LEAN_HOST_MCP_MAX_WORKERS (legacy: LEAN_HOST_MCP_MAX_PROJECTS)` | Maximum worker processes across all projects, including startup and shutdown. Idle workers may be evicted to serve another project. max_projects is a deprecated alias; environment values override file values, and the new name wins within each layer. |
-| `broker.max_workers_per_project` | integer | `1` | `LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT` | Maximum independent workers for one canonical project root. Extra workers open only with spare global capacity; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks. Each worker retains its own imports and cache. |
-| `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes. |
+| `broker.max_workers` | integer | `4` | `LEAN_HOST_MCP_MAX_WORKERS` | Worker processes the server may run at once, counting workers that are starting or still exiting. An exiting worker keeps its slot until its exit is confirmed, so a value above max_workers_per_project lets a new worker start while an old one exits. Default 4. |
+| `broker.max_workers_per_project` | integer | `1` | `LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT` | Workers that may serve the project at once. An extra worker opens only when a slot is free; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks: each worker keeps its own imports and cache. Default 1. |
+| `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Stop a worker after this many idle seconds. 0 turns idle retirement off. Default 10 minutes. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
 | `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
 | `server.response_carrier` | string (text, structured, both) | `"text"` | `LEAN_HOST_MCP_RESPONSE_CARRIER` | Which field of the tool result carries the semantic response. text emits one content text block (what the model reads); structured emits only structuredContent; both duplicates onto both. Default text. |
@@ -160,7 +160,7 @@ statistics.
 
 The default residue budget starts at a quarter of system RAM divided by `broker.max_workers`, clamped to 9–12 GiB. It is
 then capped at one worker's share of RAM minus 4.5 GiB for an import in flight; this affordability cap can put it below
-9 GiB. `broker.max_projects` is the legacy name for the same global worker cap.
+9 GiB.
 
 The default heap ceiling is **budget + max(budget, 8 GiB)**. At budgets of at least 8 GiB this doubles the budget; at
 smaller budgets the fixed gap preserves room for Lean allocations outside the residue counter. The measured gap was
@@ -238,16 +238,14 @@ the file and quoting Lake.
 
 ## Concurrency and admission
 
-Each worker owns a child process and a dedicated thread that runs one job at a time. `broker.max_workers` caps workers
-across all projects. `broker.max_workers_per_project` defaults to one. With a larger per-project limit, the broker
-prefers an idle worker, starts another only with spare global capacity, or queues on the least-loaded existing worker.
-Each worker keeps its own import and result caches. The old `max_projects` setting is an alias for the global cap, not a
-separate project quota. Both environment aliases override either file key; the new name wins within the same layer.
+A server serves one Lake project, its `--lake-root`, and refuses calls on any other. Each worker owns a child process
+and a dedicated thread that runs one job at a time. `broker.max_workers_per_project`, default one, caps the workers that
+serve the project at once. `broker.max_workers` caps worker slots, counting workers that are starting or still exiting.
+With a larger per-project limit, the broker prefers an idle worker, starts another only when a slot is free, or queues
+on the least-loaded existing worker. Each worker keeps its own import and result caches.
 `runtime.project_mailbox_capacity` bounds the actor's mailbox. Further callers wait for mailbox admission in FIFO order
-rather than retrying `mailbox_full`. Cold projects also wait in FIFO order for worker capacity; the head waiter retires
-an idle LRU worker when one becomes available. Active workers are never evicted to make room. Different resident
-projects can still execute concurrently. Cancellation removes only its own waiter, and capacity remains reserved until
-worker exit is confirmed.
+rather than retrying `mailbox_full`. A cold start waits in FIFO order for a slot that an exiting worker still holds.
+Cancellation removes only its own waiter, and a slot stays reserved until its worker's exit is confirmed.
 
 Worker-capacity admission, mailbox admission, and time waiting in the actor queue share one
 `runtime.request_timeout_millis` deadline. Expiry returns `project_admission_timeout`, `mailbox_admission_timeout`, or
@@ -653,10 +651,9 @@ generation 1 throughout, 0 restarts, residue 1786 MiB peak and final against a 9
 baseline exercises a repeated import profile; it does not predict the residue growth of a changed-file sweep. The latter
 is bounded by the residue budget and covered by `crates/lean-host-mcp/tests/kanproofs_eval.rs`.
 
-Native worker admission requires an operator-selected primary project: `--lake-root` or `LEAN_HOST_MCP_PROJECT`.
-Filesystem discovery can select a project for metadata. A native request using discovery or an explicit `project=` must
-resolve to the approved canonical directory before the broker prepares Lake options or opens a worker. Worker-side
-source and capability checks still apply.
+A server serves the one project that `--lake-root` or `LEAN_HOST_MCP_PROJECT` names. An explicit `project=` must resolve
+to that canonical directory before the broker reads the project or opens a worker; without a root every call fails.
+Worker-side source and capability checks still apply.
 
 To verify a file in an already-built project, start the stdio server with
 `lean-host-mcp --lake-root /absolute/path/to/project`. Call `lean_verify` with a project-relative file and a

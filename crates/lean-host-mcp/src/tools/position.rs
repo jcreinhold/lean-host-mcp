@@ -2114,11 +2114,8 @@ import Init -- comment
         let root = root.canonicalize().unwrap();
 
         let broker = crate::broker::ProjectBroker::new(crate::broker::BrokerConfig {
-            env_default: Some(root.clone()),
-            cwd: root,
-            max_projects: crate::broker::BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: std::time::Duration::ZERO,
+            ..crate::broker::BrokerConfig::serving(root.clone())
         });
         let ctx = crate::tools::ToolContext {
             broker: std::sync::Arc::clone(&broker),

@@ -119,19 +119,15 @@ header is rejected with HTTP 403; browser access is unsupported.
 
 ## Project resolution and configuration
 
-A per-call `project: "/abs/path"` selects that call's Lake root. When omitted, resolution follows:
-
-1. `--lake-root` or `LEAN_HOST_MCP_PROJECT`.
-2. The nearest `lakefile.lean` or `lakefile.toml` above the server's working directory.
-
-Lean itself runs only for the `--lake-root` project. The server reads two config files there: the tracked
-`lean-host-mcp.toml`, then the ignored `.local/lean-host-mcp/config.toml` that `install` writes, whose keys win. It
-reads no config file from its working directory or your home directory. Run
-`lean-host-mcp config init --lake-root PROJECT` to create a documented tracked file. The
-[operations guide](docs/operations.md#configuration-file) covers precedence, pool sizing, deadlines, memory budgets,
-response presentation, the request table, and the `[build]` and `[recipes]` tables that `lean_build` reads (see
-[builds](docs/operations.md#builds)). By default a project uses one worker; configuring `broker.max_workers_per_project`
-allows concurrent calls in the same project within the global `broker.max_workers` cap.
+A server serves one Lake project: `--lake-root` or `LEAN_HOST_MCP_PROJECT`. A call may name it with
+`project: "/abs/path"`; a call that names another root fails, and so does every call when the server has no root. The
+server reads two config files there: the tracked `lean-host-mcp.toml`, then the ignored
+`.local/lean-host-mcp/config.toml` that `install` writes, whose keys win. It reads no config file from its working
+directory or your home directory. Run `lean-host-mcp config init --lake-root PROJECT` to create a documented tracked
+file. The [operations guide](docs/operations.md#configuration-file) covers precedence, pool sizing, deadlines, memory
+budgets, response presentation, the request table, and the `[build]` and `[recipes]` tables that `lean_build` reads (see
+[builds](docs/operations.md#builds)). By default the project uses one worker; `broker.max_workers_per_project` allows
+concurrent calls within the `broker.max_workers` slots.
 
 ## Versions
 

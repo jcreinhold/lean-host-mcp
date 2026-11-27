@@ -212,7 +212,7 @@ impl ProjectBroker {
         super::verify_file::PreparedReader,
         super::control::PreparationActivityGuard,
     )> {
-        let root = self.native_root(hint)?;
+        let root = self.resolve(hint)?;
         if root != meta.canonical_root {
             return Err(ServerError::BadProject("project selection changed".into()));
         }
@@ -293,7 +293,7 @@ impl ProjectBroker {
             root.to_owned(),
             crate::cancellation::CallCancellation::current()
                 .remaining_or(Duration::from_millis(self.request_timeout_millis())),
-            self.config.max_projects.get(),
+            self.config.max_workers.get(),
             custody,
             None,
             Some(Box::new(activity)),

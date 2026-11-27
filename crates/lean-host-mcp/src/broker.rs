@@ -1,43 +1,40 @@
-//! `ProjectBroker`: the mediator between MCP tool dispatch and
-//! the private per-project Lean runtime.
+//! `ProjectBroker`: the mediator between MCP tool dispatch and the workers of
+//! the one Lake project a server serves.
 //!
 //! Two responsibilities:
 //!
-//! 1. **Resolve** a tool call's [`ProjectHint`] into a canonical Lake-root
-//!    path via the five-step chain
-//!    *explicit → env → cwd-walk → config-default → error*.
-//! 2. **Dispatch** typed semantic operations to a private per-project
-//!    controller, opening the project lazily on first use, reusing it on
-//!    subsequent calls, and evicting under LRU and idle pressure.
+//! 1. **Resolve** a tool call's [`ProjectHint`] to the served root,
+//!    [`BrokerConfig::lake_root`]. A call that names another root fails, and
+//!    so does every call when the broker serves no root.
+//! 2. **Dispatch** typed semantic operations to up to
+//!    [`BrokerConfig::max_workers_per_project`] workers of that root, opening
+//!    one on first use, reusing it, and retiring it when idle.
 //!
 //! Tool modules call narrow domain methods such as
-//! [`ProjectBroker::inspect_declaration`] and never receive raw project actor
-//! handles.
+//! [`ProjectBroker::inspect_declaration`] and never receive raw worker handles.
 //!
-//! **LRU + idle eviction.** The registry is an [`lru::LruCache`] capped by
-//! [`BrokerConfig::max_projects`] (default 4). A background reaper spawned
-//! from [`ProjectBroker::new`] runs every 60 s and evicts entries that have
-//! been idle longer than [`BrokerConfig::idle_timeout`] (default 600 s; set
-//! to [`Duration::ZERO`] to disable idle eviction).
+//! **Idle retirement.** A background reaper spawned from
+//! [`ProjectBroker::new`] runs every 60 s and retires workers idle longer than
+//! [`BrokerConfig::idle_timeout`] (default 600 s; [`Duration::ZERO`] turns
+//! this off).
 //!
-//! **Manifest invalidation.** Every cache hit compares the project's
-//! `lake-manifest.json` hash and treats a mismatch as a miss: the project is
-//! shut down and re-spawned. The hash comes from `ProjectBroker::meta`, which
-//! rebuilds a project's [`LakeProjectMeta`] only when the files it derives from
-//! have changed, so the steady-state cost is five `stat` calls per tool call
-//! rather than a lakefile parse and a manifest hash.
+//! **Manifest invalidation.** Every reuse compares the project's
+//! `lake-manifest.json` hash and treats a mismatch as a miss: the worker shuts
+//! down and a new one starts. The hash comes from `ProjectBroker::meta`, which
+//! rebuilds [`LakeProjectMeta`] only when the files it derives from have
+//! changed, so a call costs a few `stat` calls rather than a manifest hash.
 //!
-//! **Slow-path concurrency.** The registry mutex is never held across
-//! worker spawn or command execution. Concurrent misses for the same
-//! canonical root serialize startup and recheck the per-project worker limit.
+//! **Startup.** The registry mutex is never held across worker spawn or
+//! command execution. Concurrent misses serialize startup and recheck the
+//! worker limit.
 //!
 //! **Admission.** Each worker owns a serialized thread with a bounded
-//! mailbox. Capacity reservations count resident, opening, and retiring workers
-//! until confirmed exit. Ordinary concurrency is [`BrokerConfig::max_projects`]
-//! workers × one in-flight job each. An explicit [`ProjectBroker::runtime_control`] lease
-//! can atomically pause idle-pool admission for a cooperating external caller;
-//! it preserves warm caches against ordinary expiry unless the caller requests
-//! retirement. Independent artifact-writer demand can still retire an idle cache.
+//! mailbox. [`BrokerConfig::max_workers`] slots count resident, opening and
+//! retiring workers until each exit is confirmed. An explicit
+//! [`ProjectBroker::runtime_control`] lease can pause idle-pool admission for a
+//! cooperating external caller; it keeps warm caches from ordinary expiry
+//! unless the caller asks for retirement. A writer's demand can still retire an
+//! idle worker.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -53,7 +50,6 @@ use lean_rs_worker_parent::{
     LeanWorkerModuleQueryBatchOutcome, LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector,
     LeanWorkerOutputBudgets, LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult,
 };
-use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -77,15 +73,14 @@ pub use control::{
     RuntimeAction, RuntimeControlRequest, RuntimeControlResult, RuntimeControlStatus, WorkerActivity, WorkerPoolStatus,
 };
 
-/// Default pool capacity when `LEAN_HOST_MCP_MAX_PROJECTS` is unset.
-pub const DEFAULT_MAX_PROJECTS: usize = 4;
+/// Default worker slots when `LEAN_HOST_MCP_MAX_WORKERS` is unset.
+pub const DEFAULT_MAX_WORKERS: usize = 4;
 
-/// Default idle-eviction window (10 min) when
-/// `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` is unset.
+/// Default idle window (10 min) when `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` is
+/// unset.
 ///
-/// Long enough that an interactive Claude session keeps its projects warm,
-/// short enough that a forgotten project tab releases its worker child
-/// within a reasonable bound.
+/// Long enough that an interactive session keeps its worker warm, short
+/// enough that a forgotten session releases its worker child soon.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
 const REAPER_TICK: Duration = Duration::from_mins(1);
@@ -93,136 +88,92 @@ const ARTIFACT_HANDOFF_TICK: Duration = Duration::from_millis(100);
 /// How often a build checks whether the workers it stopped have exited.
 const WORKER_EXIT_POLL: Duration = Duration::from_millis(25);
 
-/// Bag of broker inputs. Built once at startup from the CLI / env /
-/// config; `cwd` is injectable so tests can drive the cwd-walk step
-/// without `std::env::set_current_dir`.
+/// Broker inputs, built once at startup from the CLI, env and config files.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     /// The one Lake root this broker serves, from `--lake-root` /
-    /// `LEAN_HOST_MCP_PROJECT`. Native calls on any other root are refused,
-    /// and so is every native call when it is unset: finding a lakefile from
-    /// `cwd` never approves a project.
-    pub env_default: Option<PathBuf>,
-    pub cwd: PathBuf,
-    /// Global worker cap. Historical API name; config prefers `max_workers`.
-    /// A cold miss can evict an idle worker, never an active one.
-    pub max_projects: NonZeroUsize,
-    /// Independent worker processes allowed for one canonical project root.
+    /// `LEAN_HOST_MCP_PROJECT`. Calls on any other root are refused, and so
+    /// is every call when it is unset.
+    pub lake_root: Option<PathBuf>,
+    /// Worker slots, counting workers that are starting or still exiting.
+    pub max_workers: NonZeroUsize,
+    /// Workers that may serve the project at once.
     pub max_workers_per_project: NonZeroUsize,
-    /// Idle window after which a project is eligible for the reaper.
-    /// [`Duration::ZERO`] disables idle eviction (LRU only).
+    /// Idle window after which the reaper retires a worker.
+    /// [`Duration::ZERO`] turns idle retirement off.
     pub idle_timeout: Duration,
 }
 
 impl BrokerConfig {
-    /// Parse the two pool-related env vars and return their values, falling
-    /// back to [`DEFAULT_MAX_PROJECTS`] / [`DEFAULT_IDLE_TIMEOUT_SECS`].
-    ///
-    /// `LEAN_HOST_MCP_MAX_PROJECTS = 0` is rejected (it would deadlock the
-    /// pool); `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS = 0` disables idle eviction.
-    ///
-    /// # Errors
-    ///
-    /// [`ServerError::Internal`] when an env var is set but unparseable
-    /// (non-numeric, or `MAX_PROJECTS=0`).
-    pub fn pool_from_env() -> Result<(NonZeroUsize, Duration)> {
-        Self::pool_from_env_with_file(&BrokerFileConfig::default())
-    }
-
-    /// Resolve the pool knobs with a config-file section beneath the env vars:
-    /// each knob is `env var > file > built-in default`. The same zero/deadlock
-    /// guards apply to a file-sourced value as to an env-sourced one.
-    ///
-    /// # Errors
-    ///
-    /// [`ServerError::Internal`] when an env var is set but unparseable, or a
-    /// resolved value (env or file) is zero where zero would deadlock.
-    pub fn pool_from_env_with_file(file: &BrokerFileConfig) -> Result<(NonZeroUsize, Duration)> {
-        let workers = std::env::var("LEAN_HOST_MCP_MAX_WORKERS").ok();
-        let projects = std::env::var("LEAN_HOST_MCP_MAX_PROJECTS").ok();
-        parse_worker_pool_config(
-            workers.as_deref(),
-            projects.as_deref(),
-            std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok().as_deref(),
-            file,
-        )
-    }
-
-    /// Resolve global and per-project worker limits; old configurations retain one worker per project.
-    ///
-    /// # Errors
-    /// Returns an error for zero or malformed per-project limits.
-    pub fn worker_limits_from_file(
-        file: &BrokerFileConfig,
-        max_projects: NonZeroUsize,
-    ) -> Result<(NonZeroUsize, NonZeroUsize)> {
-        let total = max_projects;
-        let per_project = nonzero(
-            resolve_usize(
-                "LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT",
-                std::env::var("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT").ok().as_deref(),
-                file.max_workers_per_project,
-                1,
-            )?,
-            "max_workers_per_project must be positive",
-        )?;
-        Ok((total, per_project))
-    }
-
-    /// Convenience: a [`NonZeroUsize`] with the default pool capacity. Used
-    /// by tests, benches, and any caller that just wants the default pool
-    /// sizing without rederiving it from [`DEFAULT_MAX_PROJECTS`].
+    /// A broker serving `lake_root` with the default pool: one worker, the
+    /// default slots and the default idle window.
     #[must_use]
-    pub fn default_max_projects() -> NonZeroUsize {
-        NonZeroUsize::new(DEFAULT_MAX_PROJECTS).unwrap_or(NonZeroUsize::MIN)
+    pub fn serving(lake_root: PathBuf) -> Self {
+        Self {
+            lake_root: Some(lake_root),
+            max_workers: NonZeroUsize::new(DEFAULT_MAX_WORKERS).unwrap_or(NonZeroUsize::MIN),
+            max_workers_per_project: NonZeroUsize::MIN,
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+        }
     }
 
-    /// Convenience: the default idle window as a [`Duration`].
-    #[must_use]
-    pub const fn default_idle_timeout() -> Duration {
-        Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+    /// Read the pool limits of a broker serving `lake_root`. Each limit is
+    /// `env var > config file > default`.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Internal`] when an env var does not parse or a worker
+    /// limit is zero. An idle timeout of zero turns idle retirement off.
+    pub fn from_env_with_file(lake_root: Option<PathBuf>, file: &BrokerFileConfig) -> Result<Self> {
+        let env = PoolEnv {
+            max_workers: std::env::var("LEAN_HOST_MCP_MAX_WORKERS").ok(),
+            max_workers_per_project: std::env::var("LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT").ok(),
+            idle_timeout_secs: std::env::var("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS").ok(),
+        };
+        parse_pool_config(lake_root, &env, file)
     }
 }
 
-/// Pure parser shared by [`BrokerConfig::pool_from_env_with_file`] and unit
-/// tests. Each knob resolves `env > file > default`; zero/deadlock guards apply
-/// to the resolved value whatever its source.
-fn parse_worker_pool_config(
-    workers: Option<&str>,
-    projects: Option<&str>,
-    idle: Option<&str>,
-    file: &BrokerFileConfig,
-) -> Result<(NonZeroUsize, Duration)> {
-    let resolved = BrokerFileConfig {
-        max_projects: file.max_workers.or(file.max_projects),
-        idle_timeout_secs: file.idle_timeout_secs,
-        ..BrokerFileConfig::default()
-    };
-    parse_pool_config(workers.or(projects), idle, &resolved)
+/// The pool's env vars, as read.
+#[derive(Debug, Default)]
+struct PoolEnv {
+    max_workers: Option<String>,
+    max_workers_per_project: Option<String>,
+    idle_timeout_secs: Option<String>,
 }
 
-fn parse_pool_config(
-    max: Option<&str>,
-    idle: Option<&str>,
-    file: &BrokerFileConfig,
-) -> Result<(NonZeroUsize, Duration)> {
-    let max_projects = nonzero(
+/// Pure parser behind [`BrokerConfig::from_env_with_file`].
+fn parse_pool_config(lake_root: Option<PathBuf>, env: &PoolEnv, file: &BrokerFileConfig) -> Result<BrokerConfig> {
+    let max_workers = nonzero(
         resolve_usize(
-            "LEAN_HOST_MCP_MAX_PROJECTS",
-            max,
-            file.max_projects,
-            DEFAULT_MAX_PROJECTS,
+            "LEAN_HOST_MCP_MAX_WORKERS",
+            env.max_workers.as_deref(),
+            file.max_workers,
+            DEFAULT_MAX_WORKERS,
         )?,
-        "LEAN_HOST_MCP_MAX_PROJECTS=0 would deadlock the pool",
+        "max_workers must be positive",
     )?;
-    // Idle timeout intentionally allows 0 (disables idle eviction).
+    let max_workers_per_project = nonzero(
+        resolve_usize(
+            "LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT",
+            env.max_workers_per_project.as_deref(),
+            file.max_workers_per_project,
+            1,
+        )?,
+        "max_workers_per_project must be positive",
+    )?;
     let idle_timeout = Duration::from_secs(resolve_u64(
         "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS",
-        idle,
+        env.idle_timeout_secs.as_deref(),
         file.idle_timeout_secs,
         DEFAULT_IDLE_TIMEOUT_SECS,
     )?);
-    Ok((max_projects, idle_timeout))
+    Ok(BrokerConfig {
+        lake_root,
+        max_workers,
+        max_workers_per_project,
+        idle_timeout,
+    })
 }
 
 /// Resolve a `usize` knob through `env > file > default`. The env string is
@@ -250,8 +201,8 @@ fn nonzero(value: usize, zero_message: &str) -> Result<NonZeroUsize> {
     NonZeroUsize::new(value).ok_or_else(|| ServerError::Internal(zero_message.to_owned()))
 }
 
-/// Per-call routing hint. `Default` runs the full resolution chain;
-/// `Explicit` short-circuits to the supplied path.
+/// A call's `project` field. `Default` selects the served root; `Explicit`
+/// must name it.
 #[derive(Debug, Clone)]
 pub enum ProjectHint {
     Explicit(PathBuf),
@@ -278,16 +229,14 @@ struct WorkerKey {
 
 struct BrokerInner {
     control: control::ControlState,
-    registry: LruCache<WorkerKey, Arc<LeanProject>>,
+    registry: HashMap<WorkerKey, Arc<LeanProject>>,
     last_used: HashMap<WorkerKey, Instant>,
     opening_locks: HashMap<PathBuf, Weak<AsyncMutex<()>>>,
     shutdown_epoch: u64,
-    /// Last-built [`LakeProjectMeta`] per canonical root, with the stamp of the
-    /// files it came from. Purely a cost cache: [`ProjectBroker::meta`] revalidates
-    /// against disk on every lookup, so an entry is never served stale. Sized to
-    /// the project pool — a root the pool cannot hold is a root whose metadata we
-    /// need only for the cheap non-worker paths, where a rebuild is affordable.
-    meta_cache: LruCache<PathBuf, (ProjectInputStamp, LakeProjectMeta)>,
+    /// Last-built [`LakeProjectMeta`], with the stamp of the files it came
+    /// from. Purely a cost cache: [`ProjectBroker::meta`] revalidates against
+    /// disk on every lookup, so it is never served stale.
+    meta_cache: Option<(ProjectInputStamp, LakeProjectMeta)>,
     /// Fair read and write turns per canonical root.
     locks: crate::project_lock::ProjectLocks,
 }
@@ -347,15 +296,15 @@ impl ProjectBroker {
         let broker = Arc::new(Self {
             inner: Arc::new(Mutex::new(BrokerInner {
                 control: control::ControlState::default(),
-                registry: LruCache::new(config.max_projects),
+                registry: HashMap::new(),
                 last_used: HashMap::new(),
                 opening_locks: HashMap::new(),
                 shutdown_epoch: 0,
-                meta_cache: LruCache::new(config.max_projects),
+                meta_cache: None,
                 locks: crate::project_lock::ProjectLocks::default(),
             })),
             runtime_config,
-            worker_slots: Arc::new(Semaphore::new(config.max_projects.get())),
+            worker_slots: Arc::new(Semaphore::new(config.max_workers.get())),
             capacity_admission: AsyncMutex::new(()),
             config,
         });
@@ -369,7 +318,7 @@ impl ProjectBroker {
         let mut inner = self.inner.lock();
         // As after `acquire`, the actor's root has a project lock.
         inner.locks.get(&root);
-        inner.registry.put(WorkerKey { root, lane: 0 }, project);
+        inner.registry.insert(WorkerKey { root, lane: 0 }, project);
     }
 
     #[cfg(test)]
@@ -391,8 +340,7 @@ impl ProjectBroker {
     #[must_use]
     pub fn config_snapshot(&self) -> BrokerConfigSnapshot {
         BrokerConfigSnapshot {
-            max_projects: self.config.max_projects.get(),
-            max_workers: self.config.max_projects.get(),
+            max_workers: self.config.max_workers.get(),
             max_workers_per_project: self.config.max_workers_per_project.get(),
             idle_timeout_secs: self.config.idle_timeout.as_secs(),
             request_timeout_millis: self.runtime_config.request_timeout_millis(),
@@ -440,27 +388,30 @@ impl ProjectBroker {
         });
     }
 
-    /// Apply the resolution chain. Public so callers can pre-flight the
-    /// resolution without opening a project.
+    /// The canonical served root, which `hint` must select.
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError::BadProject`] when the explicit or
-    /// `--lake-root` path is unusable or no lakefile is reachable from `cwd`.
+    /// Returns [`ServerError::BadProject`] when the broker serves no root, a
+    /// path does not canonicalise, or `hint` names another root.
     pub fn resolve(&self, hint: &ProjectHint) -> Result<PathBuf> {
-        if let ProjectHint::Explicit(p) = hint {
-            return canonicalise(p);
+        let Some(served) = &self.config.lake_root else {
+            return Err(ServerError::BadProject(
+                "this server serves no Lake project; start it with `--lake-root`".into(),
+            ));
+        };
+        let served = canonicalise(served)?;
+        if let ProjectHint::Explicit(path) = hint {
+            let root = canonicalise(path)?;
+            if root != served {
+                return Err(ServerError::BadProject(format!(
+                    "this server serves {}, not {}; start a server with `--lake-root` set to that project",
+                    served.display(),
+                    root.display()
+                )));
+            }
         }
-        if let Some(env) = &self.config.env_default {
-            return canonicalise(env);
-        }
-        if let Some(found) = walk_up_for_lakefile(&self.config.cwd) {
-            return canonicalise(&found);
-        }
-        Err(ServerError::BadProject(format!(
-            "no lakefile found from {} and no --lake-root given",
-            self.config.cwd.display()
-        )))
+        Ok(served)
     }
 
     /// Resolve the hint and load the project's [`LakeProjectMeta`] without
@@ -497,20 +448,18 @@ impl ProjectBroker {
     /// [`ServerError::BadProject`] when the lakefile cannot be parsed or the
     /// manifest cannot be fingerprinted.
     fn meta(&self, root: &Path) -> Result<LakeProjectMeta> {
-        // Revalidate outside the lock: the stamp is five `stat` calls, and the
-        // registry mutex also guards the project pool.
-        let cached = self.inner.lock().meta_cache.get(root).cloned();
+        // Revalidate outside the lock: the stamp is a few `stat` calls, and
+        // the registry mutex also guards the worker pool.
+        let cached = self.inner.lock().meta_cache.clone();
         if let Some((stamp, meta)) = cached
+            && meta.canonical_root == root
             && meta.input_stamp() == stamp
         {
             return Ok(meta);
         }
         let meta = LakeProjectMeta::from_explicit(root)?;
         let stamp = meta.input_stamp();
-        self.inner
-            .lock()
-            .meta_cache
-            .put(root.to_path_buf(), (stamp, meta.clone()));
+        self.inner.lock().meta_cache = Some((stamp, meta.clone()));
         Ok(meta)
     }
 
@@ -883,7 +832,7 @@ impl ProjectBroker {
     ) -> Result<(Arc<LeanProject>, LeanWorkerElabOptions, Instant)> {
         let file_label = options.file_label.clone();
         let admission = async {
-            let root = self.native_root(&hint)?;
+            let root = self.resolve(&hint)?;
             let meta = self.meta(&root)?;
             let options = self.resolve_options(&meta, options).await?;
             let (project, admission_deadline) = self.acquire(root).await?;
@@ -915,32 +864,14 @@ impl ProjectBroker {
         crate::lake_options::resolve(
             &meta.canonical_root,
             options,
-            self.config.max_projects.get(),
+            self.config.max_workers.get(),
             Some(Box::new(activity)),
         )
         .await
     }
 
-    pub(crate) fn native_root(&self, hint: &ProjectHint) -> Result<PathBuf> {
-        let root = self.resolve(hint)?;
-        let Some(served) = &self.config.env_default else {
-            return Err(ServerError::BadProject(
-                "native execution requires an operator-approved project; start the server with `--lake-root`".into(),
-            ));
-        };
-        let served = canonicalise(served)?;
-        if served != root {
-            return Err(ServerError::BadProject(format!(
-                "this server serves {}, not {}; start a server with `--lake-root` set to that project",
-                served.display(),
-                root.display()
-            )));
-        }
-        Ok(root)
-    }
-
     async fn project_for(&self, hint: ProjectHint) -> Result<(Arc<LeanProject>, Instant)> {
-        let root = self.native_root(&hint)?;
+        let root = self.resolve(&hint)?;
         self.acquire(root).await
     }
 
@@ -1047,7 +978,7 @@ impl ProjectBroker {
             let inner = self.inner.lock();
             let lane = (0..self.config.max_workers_per_project.get())
                 .find(|lane| {
-                    !inner.registry.contains(&WorkerKey {
+                    !inner.registry.contains_key(&WorkerKey {
                         root: root.clone(),
                         lane: *lane,
                     })
@@ -1059,8 +990,8 @@ impl ProjectBroker {
             root: root.clone(),
             lane,
         };
-        // Extra workers are opportunistic: never wait for capacity or evict an
-        // unrelated project while this project's existing actor can accept work.
+        // Extra workers are opportunistic: never wait for capacity while an
+        // existing worker can accept work.
         let slot = if growing {
             let Ok(_turn) = self.capacity_admission.try_lock() else {
                 return self
@@ -1086,7 +1017,7 @@ impl ProjectBroker {
         let runtime_config = self.runtime_config.clone();
         let inner = Arc::clone(&self.inner);
         let maintenance = MaintenanceAccess::new(&self.inner);
-        let native_capacity_limit = self.config.max_projects.get();
+        let native_capacity_limit = self.config.max_workers.get();
         let root = root.clone();
         // The blocking startup keeps running if this async caller disappears.
         // The actor owns initialization evidence independently of this waiter.
@@ -1104,7 +1035,7 @@ impl ProjectBroker {
                 opened.shutdown();
                 return Err(Self::pool_unavailable(&root, "project_shutting_down", false));
             }
-            registry.registry.put(key.clone(), Arc::clone(&opened));
+            registry.registry.insert(key.clone(), Arc::clone(&opened));
             registry.last_used.insert(key, Instant::now());
             drop(registry);
             tracing::info!(project = %root.display(), toolchain = %opened.toolchain(), "opened project; worker spawned");
@@ -1167,7 +1098,7 @@ impl ProjectBroker {
             .map(|(key, _)| key.clone())
             .collect();
         for key in stale {
-            if let Some(actor) = inner.registry.pop(&key) {
+            if let Some(actor) = inner.registry.remove(&key) {
                 actor.shutdown();
             }
             inner.last_used.remove(&key);
@@ -1255,44 +1186,15 @@ impl ProjectBroker {
             return Err(Self::pool_unavailable(root, "request_cancelled", false));
         }
         let epoch = self.inner.lock().shutdown_epoch;
-        // One FIFO admission queue owns both idle eviction and slot acquisition.
-        // Later cold projects cannot steal a released slot from an earlier waiter.
+        // One FIFO queue owns slot acquisition: a later caller cannot take a
+        // released slot from an earlier waiter. The project has no resident
+        // worker here, so only workers still exiting hold slots.
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(Self::pool_unavailable(root, "request_cancelled", false)),
             result = tokio::time::timeout_at(deadline, async {
                 let _turn = self.capacity_admission.lock().await;
-                loop {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(Self::pool_unavailable(root, "project_admission_timeout", true));
-                    }
-                    let victim = {
-                        let mut inner = self.inner.lock();
-                        if inner.shutdown_epoch != epoch {
-                            return Err(Self::pool_unavailable(root, "project_shutting_down", false));
-                        }
-                        // This caller already owns an opening-lock Arc. A drain
-                        // waits for it; it must be allowed to finish startup.
-
-                        if let Ok(slot) = Arc::clone(&self.worker_slots).try_acquire_owned() {
-                            return Ok(slot);
-                        }
-                        let victim = pop_idle_lru(&mut inner.registry);
-                        if let Some((path, _)) = &victim {
-                            inner.last_used.remove(path);
-                        }
-                        victim
-                    };
-                    if let Some((path, project)) = victim {
-                        tracing::debug!(evicted = %path.root.display(), "retiring idle LRU project before replacement startup");
-                        project.shutdown();
-                        // Do not retire another worker while this one is stopping.
-                        return self.wait_for_worker_slot(root, epoch, deadline).await;
-                    }
-                    // Only the head waiter polls. Resident activity holds Arc and
-                    // job guards; neither it nor uncertain retirement frees capacity.
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
+                self.wait_for_worker_slot(root, epoch, deadline).await
             }) => result.unwrap_or_else(|_| Err(Self::pool_unavailable(root, "project_admission_timeout", true))),
         }
     }
@@ -1359,8 +1261,8 @@ impl ProjectBroker {
         })
     }
 
-    /// Evict every entry whose `last_used` timestamp is older than
-    /// `config.idle_timeout`. Called every `REAPER_TICK` by the
+    /// Retire each idle, unborrowed worker last used more than
+    /// `config.idle_timeout` ago. Called every `REAPER_TICK` by the
     /// background task; tests call this directly to avoid waiting.
     pub fn reap_idle(&self) {
         crate::worker_retirement::poll_retirements();
@@ -1383,12 +1285,12 @@ impl ProjectBroker {
                 .collect();
             let mut out: Vec<Arc<LeanProject>> = Vec::with_capacity(expired.len());
             for p in &expired {
-                if let Some(proj) = inner.registry.peek(p)
+                if let Some(proj) = inner.registry.get(p)
                     && (!proj.is_idle() || Arc::strong_count(proj) != 1)
                 {
                     continue;
                 }
-                if let Some(proj) = inner.registry.pop(p) {
+                if let Some(proj) = inner.registry.remove(p) {
                     out.push(proj);
                 }
                 inner.last_used.remove(p);
@@ -1445,7 +1347,7 @@ impl ProjectBroker {
         let mut removed = Vec::with_capacity(keys.len());
         for key in &keys {
             inner.last_used.remove(key);
-            removed.extend(inner.registry.pop(key));
+            removed.extend(inner.registry.remove(key));
         }
         drop(inner);
         removed
@@ -1462,14 +1364,8 @@ impl ProjectBroker {
         let projects: Vec<Arc<LeanProject>> = {
             let mut inner = self.inner.lock();
             inner.shutdown_epoch = inner.shutdown_epoch.wrapping_add(1);
-            let paths: Vec<WorkerKey> = inner.registry.iter().map(|(path, _)| path.clone()).collect();
-            let mut projects = Vec::with_capacity(paths.len());
-            for path in paths {
-                if let Some(project) = inner.registry.pop(&path) {
-                    projects.push(project);
-                }
-                inner.last_used.remove(&path);
-            }
+            let projects: Vec<_> = inner.registry.drain().map(|(_, project)| project).collect();
+            inner.last_used.clear();
             inner.opening_locks.retain(|_, lock| lock.strong_count() > 0);
             projects
         };
@@ -1481,9 +1377,8 @@ impl ProjectBroker {
         }
     }
 
-    /// Snapshot of paths currently resident in the pool, ordered MRU-first.
-    /// Public so integration tests can assert eviction without going
-    /// through a tool call.
+    /// The roots that have a resident worker. Public so integration tests can
+    /// assert retirement without a tool call.
     #[must_use]
     pub fn resident_paths(&self) -> Vec<PathBuf> {
         let inner = self.inner.lock();
@@ -1508,28 +1403,6 @@ fn canonicalise(path: &Path) -> Result<PathBuf> {
         .map_err(|e| ServerError::BadProject(format!("canonicalise {}: {e}", path.display())))
 }
 
-/// Walk upward from `start` looking for `lakefile.toml` / `lakefile.lean`.
-/// Returns the directory containing the lakefile.
-fn walk_up_for_lakefile(start: &Path) -> Option<PathBuf> {
-    let mut cur: Option<&Path> = Some(start);
-    while let Some(dir) = cur {
-        if dir.join("lakefile.toml").is_file() || dir.join("lakefile.lean").is_file() {
-            return Some(dir.to_path_buf());
-        }
-        cur = dir.parent();
-    }
-    None
-}
-
-fn pop_idle_lru(registry: &mut LruCache<WorkerKey, Arc<LeanProject>>) -> Option<(WorkerKey, Arc<LeanProject>)> {
-    let key = registry
-        .iter()
-        .rev()
-        .find_map(|(path, project)| (project.is_idle() && Arc::strong_count(project) == 1).then(|| path.clone()))?;
-    let project = registry.pop(&key)?;
-    Some((key, project))
-}
-
 fn broker_call<T>(project: &LeanProject, freshness_imports: &[String], call: ProjectCall<T>) -> BrokerCall<T> {
     let (value, runtime) = call.into_parts();
     BrokerCall {
@@ -1541,7 +1414,6 @@ fn broker_call<T>(project: &LeanProject, freshness_imports: &[String], call: Pro
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct BrokerConfigSnapshot {
-    pub max_projects: usize,
     pub max_workers: usize,
     pub max_workers_per_project: usize,
     pub idle_timeout_secs: u64,
@@ -1598,12 +1470,11 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
-    fn cfg(cwd: PathBuf, env: Option<PathBuf>) -> BrokerConfig {
+    fn cfg(lake_root: Option<PathBuf>) -> BrokerConfig {
         BrokerConfig {
-            env_default: env,
-            cwd,
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
+            lake_root,
+            max_workers: NonZeroUsize::new(DEFAULT_MAX_WORKERS).unwrap(),
+            max_workers_per_project: NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         }
     }
@@ -1618,7 +1489,7 @@ mod tests {
         // This marker permits discovery. There is deliberately no Lean toolchain.
         fs::write(other.join("lakefile.lean"), "").unwrap();
         let canonical = served.canonicalize().unwrap();
-        let broker = ProjectBroker::new(cfg(other.clone(), Some(served.clone())));
+        let broker = ProjectBroker::new(cfg(Some(served.clone())));
         let err = broker
             .prepare_check(ProjectHint::Explicit(other.clone()), LeanWorkerElabOptions::new())
             .await
@@ -1629,23 +1500,26 @@ mod tests {
             "{err:?}"
         );
         assert!(broker.resident_paths().is_empty());
-        assert_eq!(broker.native_root(&ProjectHint::Default).unwrap(), canonical);
+        assert_eq!(broker.resolve(&ProjectHint::Default).unwrap(), canonical);
         assert_eq!(
-            broker.native_root(&ProjectHint::Explicit(served.join("."))).unwrap(),
+            broker.resolve(&ProjectHint::Explicit(served.join("."))).unwrap(),
             canonical
         );
-        // A lakefile found from `cwd` approves nothing.
-        let discovering = ProjectBroker::new(cfg(other, None));
-        let err = discovering
-            .prepare_check(ProjectHint::Default, LeanWorkerElabOptions::new())
-            .await
-            .err()
-            .unwrap();
-        assert!(
-            matches!(&err, ServerError::BadProject(reason) if reason.contains("operator-approved")),
-            "{err:?}"
-        );
-        assert!(discovering.resident_paths().is_empty());
+        // A broker that serves no root refuses every call, even one naming a
+        // directory with a lakefile.
+        let unserved = ProjectBroker::new(cfg(None));
+        for hint in [ProjectHint::Default, ProjectHint::Explicit(other)] {
+            let err = unserved
+                .prepare_check(hint, LeanWorkerElabOptions::new())
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(&err, ServerError::BadProject(reason) if reason.contains("serves no Lake project")),
+                "{err:?}"
+            );
+        }
+        assert!(unserved.resident_paths().is_empty());
     }
 
     #[tokio::test]
@@ -1654,8 +1528,8 @@ mod tests {
         let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
             .canonicalize()
             .unwrap();
-        let mut config = cfg(root.clone(), Some(root.clone()));
-        config.max_projects = NonZeroUsize::new(2).unwrap();
+        let mut config = cfg(Some(root.clone()));
+        config.max_workers = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
         let broker = ProjectBroker::new(config);
         let (first, _) = broker.acquire(root.clone()).await.unwrap();
@@ -1706,8 +1580,8 @@ mod tests {
         let runtime =
             ProjectRuntimeConfig::from_env_with_file(&crate::config_file::ConfigFile::load(Some(&root)).runtime, 2)
                 .unwrap();
-        let mut config = cfg(root.clone(), Some(root));
-        config.max_projects = NonZeroUsize::new(2).unwrap();
+        let mut config = cfg(Some(root));
+        config.max_workers = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
         let broker = ProjectBroker::new_with_runtime_config(config, runtime);
         let import = std::env::var("LEAN_HOST_MCP_PARALLEL_IMPORT").unwrap_or_else(|_| "Lean".to_owned());
@@ -1761,8 +1635,8 @@ mod tests {
     #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
     async fn cancelling_one_project_worker_preserves_its_sibling() {
         let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap());
-        let mut config = cfg(root.clone(), Some(root));
-        config.max_projects = NonZeroUsize::new(2).unwrap();
+        let mut config = cfg(Some(root));
+        config.max_workers = NonZeroUsize::new(2).unwrap();
         config.max_workers_per_project = NonZeroUsize::new(2).unwrap();
         let broker = ProjectBroker::new(config);
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -1802,44 +1676,37 @@ mod tests {
         broker.shutdown_all();
     }
 
+    fn env(max_workers: Option<&str>, per_project: Option<&str>, idle: Option<&str>) -> PoolEnv {
+        PoolEnv {
+            max_workers: max_workers.map(str::to_owned),
+            max_workers_per_project: per_project.map(str::to_owned),
+            idle_timeout_secs: idle.map(str::to_owned),
+        }
+    }
+
     #[test]
-    fn worker_cap_aliases_respect_environment_precedence() {
+    fn worker_limits_take_env_over_file_over_default() {
         let file = BrokerFileConfig {
-            max_projects: Some(4),
             max_workers: Some(3),
+            max_workers_per_project: Some(2),
             ..BrokerFileConfig::default()
         };
-        assert_eq!(parse_worker_pool_config(None, None, None, &file).unwrap().0.get(), 3);
-        assert_eq!(
-            parse_worker_pool_config(None, Some("2"), None, &file).unwrap().0.get(),
-            2
-        );
-        assert_eq!(
-            parse_worker_pool_config(Some("1"), Some("2"), None, &file)
-                .unwrap()
-                .0
-                .get(),
-            1
-        );
-        assert!(parse_worker_pool_config(Some("0"), None, None, &file).is_err());
-        assert!(parse_worker_pool_config(Some("bad"), Some("2"), None, &file).is_err());
+        let limits = |env: PoolEnv| {
+            let config = parse_pool_config(None, &env, &file).unwrap();
+            (config.max_workers.get(), config.max_workers_per_project.get())
+        };
+        assert_eq!(limits(env(None, None, None)), (3, 2));
+        assert_eq!(limits(env(Some("1"), Some("1"), None)), (1, 1));
+        assert!(parse_pool_config(None, &env(None, Some("0"), None), &file).is_err());
+        assert!(parse_pool_config(None, &env(None, Some("bad"), None), &file).is_err());
     }
 
     #[test]
-    fn walk_up_for_lakefile_finds_in_parent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = make_lake_dir(tmp.path(), "myproj");
-        let nested = proj.join("a/b");
-        fs::create_dir_all(&nested).unwrap();
-        assert_eq!(walk_up_for_lakefile(&nested).unwrap(), proj);
-    }
-
-    #[test]
-    fn resolve_returns_canonicalised_path_when_no_resolution_needed() {
+    fn resolve_canonicalises_a_path_to_the_served_root() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "explicit");
-        let resolved = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None))
-            .resolve(&ProjectHint::Explicit(proj.clone()))
+        let resolved = ProjectBroker::new(cfg(Some(proj.clone())))
+            .resolve(&ProjectHint::Explicit(proj.join(".")))
             .unwrap();
         assert_eq!(resolved, proj);
     }
@@ -1847,22 +1714,23 @@ mod tests {
     #[test]
     fn parse_pool_config_uses_defaults_when_unset() {
         let empty = BrokerFileConfig::default();
-        let (max, idle) = parse_pool_config(None, None, &empty).unwrap();
-        assert_eq!(max.get(), DEFAULT_MAX_PROJECTS);
-        assert_eq!(idle, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+        let config = parse_pool_config(None, &PoolEnv::default(), &empty).unwrap();
+        assert_eq!(config.max_workers.get(), DEFAULT_MAX_WORKERS);
+        assert_eq!(config.max_workers_per_project, NonZeroUsize::MIN);
+        assert_eq!(config.idle_timeout, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
     }
 
     #[test]
     fn parse_pool_config_accepts_explicit_values() {
         let empty = BrokerFileConfig::default();
-        let (max, idle) = parse_pool_config(Some("8"), Some("30"), &empty).unwrap();
-        assert_eq!(max.get(), 8);
-        assert_eq!(idle, Duration::from_secs(30));
+        let config = parse_pool_config(None, &env(Some("8"), None, Some("30")), &empty).unwrap();
+        assert_eq!(config.max_workers.get(), 8);
+        assert_eq!(config.idle_timeout, Duration::from_secs(30));
     }
 
     #[test]
     fn shutdown_all_without_resident_projects_is_idempotent() {
-        let broker = ProjectBroker::new(cfg(PathBuf::from("/"), None));
+        let broker = ProjectBroker::new(cfg(None));
         broker.shutdown_all();
         broker.shutdown_all();
         assert!(broker.resident_paths().is_empty());
@@ -1873,7 +1741,7 @@ mod tests {
     fn identity_without_worker_does_not_open_resident_project() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "identity");
-        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None));
+        let broker = ProjectBroker::new(cfg(Some(proj.clone())));
 
         let call = broker
             .project_identity_without_worker(&ProjectHint::Explicit(proj.clone()), vec!["Init".to_owned()])
@@ -1900,7 +1768,7 @@ mod tests {
     fn resolve_meta_reflects_a_manifest_edit_on_the_next_call() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "memo");
-        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None));
+        let broker = ProjectBroker::new(cfg(Some(proj.clone())));
         let hint = ProjectHint::Explicit(proj.clone());
 
         let first = broker.resolve_meta(&hint).unwrap();
@@ -1924,7 +1792,7 @@ mod tests {
     fn resolve_meta_is_stable_while_the_project_is_untouched() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = make_lake_dir(tmp.path(), "stable");
-        let broker = ProjectBroker::new(cfg(tmp.path().to_path_buf(), None));
+        let broker = ProjectBroker::new(cfg(Some(proj.clone())));
         let hint = ProjectHint::Explicit(proj.clone());
 
         let first = broker.resolve_meta(&hint).unwrap();
@@ -1938,48 +1806,48 @@ mod tests {
     #[test]
     fn parse_pool_config_treats_zero_idle_as_disable() {
         let empty = BrokerFileConfig::default();
-        let (_, idle) = parse_pool_config(None, Some("0"), &empty).unwrap();
-        assert_eq!(idle, Duration::ZERO);
+        let config = parse_pool_config(None, &env(None, None, Some("0")), &empty).unwrap();
+        assert_eq!(config.idle_timeout, Duration::ZERO);
     }
 
     #[test]
-    fn parse_pool_config_rejects_max_projects_zero() {
+    fn parse_pool_config_rejects_zero_max_workers() {
         let empty = BrokerFileConfig::default();
-        let err = parse_pool_config(Some("0"), None, &empty).unwrap_err();
+        let err = parse_pool_config(None, &env(Some("0"), None, None), &empty).unwrap_err();
         assert!(matches!(err, ServerError::Internal(_)), "{err:?}");
     }
 
     #[test]
     fn parse_pool_config_rejects_garbage() {
         let e = BrokerFileConfig::default();
-        assert!(parse_pool_config(Some("seven"), None, &e).is_err());
-        assert!(parse_pool_config(None, Some("forever"), &e).is_err());
+        assert!(parse_pool_config(None, &env(Some("seven"), None, None), &e).is_err());
+        assert!(parse_pool_config(None, &env(None, None, Some("forever")), &e).is_err());
     }
 
     #[test]
     fn parse_pool_config_file_value_used_when_env_unset_and_env_wins() {
         let file = BrokerFileConfig {
-            max_projects: Some(7),
+            max_workers: Some(7),
             idle_timeout_secs: Some(45),
             ..BrokerFileConfig::default()
         };
         // Env unset -> file values used.
-        let (max, idle) = parse_pool_config(None, None, &file).unwrap();
-        assert_eq!(max.get(), 7);
-        assert_eq!(idle, Duration::from_secs(45));
+        let config = parse_pool_config(None, &PoolEnv::default(), &file).unwrap();
+        assert_eq!(config.max_workers.get(), 7);
+        assert_eq!(config.idle_timeout, Duration::from_secs(45));
         // Env present -> env wins over the file value.
-        let (max, idle) = parse_pool_config(Some("3"), Some("30"), &file).unwrap();
-        assert_eq!(max.get(), 3);
-        assert_eq!(idle, Duration::from_secs(30));
+        let config = parse_pool_config(None, &env(Some("3"), None, Some("30")), &file).unwrap();
+        assert_eq!(config.max_workers.get(), 3);
+        assert_eq!(config.idle_timeout, Duration::from_secs(30));
     }
 
     #[test]
-    fn parse_pool_config_rejects_zero_max_projects_from_file() {
+    fn parse_pool_config_rejects_zero_max_workers_from_file() {
         let file = BrokerFileConfig {
-            max_projects: Some(0),
+            max_workers: Some(0),
             ..BrokerFileConfig::default()
         };
-        assert!(parse_pool_config(None, None, &file).is_err());
+        assert!(parse_pool_config(None, &PoolEnv::default(), &file).is_err());
     }
     fn capacity_deadline() -> tokio::time::Instant {
         tokio::time::Instant::now().checked_add(Duration::from_secs(5)).unwrap()
@@ -1987,8 +1855,8 @@ mod tests {
 
     #[tokio::test]
     async fn same_root_opening_waiters_preserve_their_original_admission_deadline() {
-        let mut config = cfg(PathBuf::from("/unused"), None);
-        config.max_projects = NonZeroUsize::MIN;
+        let mut config = cfg(None);
+        config.max_workers = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let occupied = broker
             .reserve_worker_slot(Path::new("/occupied"), capacity_deadline())
@@ -2032,8 +1900,8 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_waiters_are_fifo_and_cancelled_waiters_do_not_steal_slots() {
-        let mut config = cfg(PathBuf::from("/unused"), None);
-        config.max_projects = NonZeroUsize::MIN;
+        let mut config = cfg(None);
+        config.max_workers = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let occupied = broker
             .reserve_worker_slot(Path::new("/occupied"), capacity_deadline())
@@ -2074,8 +1942,8 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_rejects_waiting_capacity_without_releasing_unconfirmed_workers() {
-        let mut config = cfg(PathBuf::from("/unused"), None);
-        config.max_projects = NonZeroUsize::MIN;
+        let mut config = cfg(None);
+        config.max_workers = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let occupied = broker
             .reserve_worker_slot(Path::new("/occupied"), capacity_deadline())
@@ -2094,8 +1962,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_retirement_wait_preserves_admission_timeout_and_owned_capacity() {
-        let mut config = cfg(PathBuf::from("/unused"), None);
-        config.max_projects = NonZeroUsize::MIN;
+        let mut config = cfg(None);
+        config.max_workers = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let retiring = broker
             .reserve_worker_slot(Path::new("/retiring"), capacity_deadline())
@@ -2117,8 +1985,8 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_interrupts_retirement_wait_without_unconfirmed_slot_release() {
-        let mut config = cfg(PathBuf::from("/unused"), None);
-        config.max_projects = NonZeroUsize::MIN;
+        let mut config = cfg(None);
+        config.max_workers = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let retiring = broker
             .reserve_worker_slot(Path::new("/retiring"), capacity_deadline())
@@ -2138,7 +2006,7 @@ mod tests {
 
     #[tokio::test]
     async fn opening_locks_survive_shutdown_and_a_disappearing_caller() {
-        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None));
+        let broker = ProjectBroker::new(cfg(None));
         let root = PathBuf::from("/project");
         let original = broker.opening_lock(&root).unwrap();
         let waiting = Arc::clone(&original);
@@ -2153,8 +2021,8 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelling_capacity_wait_keeps_the_retiring_workers_slot_reserved() {
-        let mut config = cfg(PathBuf::from("/unused"), None);
-        config.max_projects = NonZeroUsize::MIN;
+        let mut config = cfg(None);
+        config.max_workers = NonZeroUsize::MIN;
         let broker = ProjectBroker::new(config);
         let retiring = broker
             .reserve_worker_slot(Path::new("/first"), capacity_deadline())
@@ -2182,7 +2050,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_same_project_waiter_does_not_wait_for_startup_or_take_capacity() {
-        let broker = ProjectBroker::new(cfg(PathBuf::from("/unused"), None));
+        let broker = ProjectBroker::new(cfg(None));
         let root = PathBuf::from("/blocked-startup");
         let held = broker.opening_lock(&root).unwrap().lock_owned().await;
         let request = tokio_util::sync::CancellationToken::new();
@@ -2204,10 +2072,7 @@ mod tests {
         };
         drop(result);
         assert_eq!(reason, "request_cancelled");
-        assert_eq!(
-            broker.worker_slots.available_permits(),
-            broker.config.max_projects.get()
-        );
+        assert_eq!(broker.worker_slots.available_permits(), broker.config.max_workers.get());
         drop(held);
     }
 }

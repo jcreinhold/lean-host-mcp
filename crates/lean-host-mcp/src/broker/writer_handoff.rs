@@ -100,12 +100,12 @@ impl ProjectBroker {
             }
             let retired = {
                 let mut inner = self.inner.lock();
-                let eligible = inner.registry.peek(&key).is_some_and(|actor| {
+                let eligible = inner.registry.get(&key).is_some_and(|actor| {
                     identity.ptr_eq(&Arc::downgrade(actor)) && actor.is_idle() && Arc::strong_count(actor) == 1
                 });
                 if eligible {
                     inner.last_used.remove(&key);
-                    inner.registry.pop(&key)
+                    inner.registry.remove(&key)
                 } else {
                     None
                 }
@@ -167,9 +167,8 @@ mod tests {
         }
         fn broker(&self) -> Arc<ProjectBroker> {
             ProjectBroker::new(BrokerConfig {
-                env_default: None,
-                cwd: self.root.clone(),
-                max_projects: std::num::NonZeroUsize::new(2).unwrap(),
+                lake_root: Some(self.project.clone()),
+                max_workers: std::num::NonZeroUsize::new(2).unwrap(),
                 max_workers_per_project: std::num::NonZeroUsize::MIN,
                 idle_timeout: Duration::ZERO,
             })

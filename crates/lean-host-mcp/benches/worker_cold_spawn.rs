@@ -35,13 +35,7 @@ fn bench_worker_cold_spawn(c: &mut Criterion) {
         b.iter(|| {
             // Fresh broker per iteration so each one pays the project open
             // cost (the point of this bench).
-            let broker = ProjectBroker::new(BrokerConfig {
-                env_default: Some(root.clone()),
-                cwd: root.clone(),
-                max_projects: BrokerConfig::default_max_projects(),
-                max_workers_per_project: std::num::NonZeroUsize::MIN,
-                idle_timeout: BrokerConfig::default_idle_timeout(),
-            });
+            let broker = ProjectBroker::new(BrokerConfig::serving(root.clone()));
             let ctx = ToolContext {
                 broker,
                 config: ToolConfig::default(),

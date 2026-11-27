@@ -25,7 +25,7 @@ crates/lean-host-mcp/src/
   main.rs                clap CLI, shared broker setup, rmcp stdio entry
   transport_http.rs      private axum/rmcp Streamable HTTP entry
   server.rs              LeanHostService tool registration
-  broker.rs              ProjectBroker: LRU pool, idle eviction, per-call routing, the reaper
+  broker.rs              ProjectBroker: the served root, worker slots, idle retirement, the reaper
   broker/control.rs      process-local worker activity snapshots and expiring admission leases
   broker/module_setup.rs lake setup-file as a native reader; the import closure for lean_imports
   broker/verify_file.rs  file checks through one-shot Lean programs
@@ -94,7 +94,7 @@ than adding a second admission queue.
 `lean_runtime` coordinates admission under the broker registry mutex. `acquire` requires an idle pool; `drain` pauses
 new admission while admitted work finishes. Preparation utilities, startup locks, queued jobs, and background
 recycling/prewarming all participate in the activity count. The guard survives caller disconnects and registry removal
-through cleanup, so an evicted controller cannot start new maintenance.
+through cleanup, so a retired controller cannot start new maintenance.
 
 A lease expires on monotonic time and is process-local. Its owner renews or releases it with the returned token; status
 only observes it. `retire_idle` closes idle mailboxes once admitted activity finishes, while worker permits remain held
@@ -105,10 +105,10 @@ system RAM, or coordinate unrelated processes. See the
 
 ## Project And Worker Boundary
 
-`ProjectBroker` owns a bounded LRU pool keyed by canonical Lake root. It resolves projects, invalidates changed
-manifests, coalesces opens, and admits up to `max_workers_per_project` independent actors under the global `max_workers`
-cap. Each `LeanProject` actor has one dedicated controller thread, one host handle, its own cache and restart state, and
-one in-flight job. The parent never links `libleanshared`; the per-toolchain worker child does.
+`ProjectBroker` serves one canonical Lake root and refuses a call that names another. It invalidates a changed manifest,
+coalesces opens, and admits up to `max_workers_per_project` actors within the `max_workers` slots. Each `LeanProject`
+actor has one dedicated controller thread, one host handle, its own cache and restart state, and one in-flight job. The
+parent never links `libleanshared`; the per-toolchain worker child does.
 
 Typed `ProjectMessage` variants carry job metadata and a typed reply channel into the bounded actor mailbox.
 `ProjectActorState::handle_message` runs the selected operation through shared lifecycle handling. Queued admission is
@@ -134,10 +134,10 @@ in phase `dispatching` that the SDK never closes: every later build that uses th
 removes the record. The server refuses to start with `LEAN_PATH` set for this reason, since the worker would refuse it
 before connecting. The host copies no files, hashes no build outputs, and writes no import plan.
 
-Same-project startup stays serialized after caller disconnects and rechecks the per-project limit. The broker can evict
-an idle LRU actor, but cannot evict a borrowed actor or one with queued work. Metadata-only degraded responses and pure
-`.ilean` reads use `project_identity_without_worker`; valid module-query cache hits bypass the actor mailbox. A full
-mailbox returns structured retryable pressure.
+Startup stays serialized after caller disconnects and rechecks the per-project limit. Idle retirement skips a borrowed
+actor and one with queued work. Metadata-only degraded responses and pure `.ilean` reads use
+`project_identity_without_worker`; valid module-query cache hits bypass the actor mailbox. A full mailbox returns
+structured retryable pressure.
 
 ### Import memory and session reuse
 
@@ -457,10 +457,10 @@ hands to Lake. Do not add an import graph walk or a build scheduler: a test scan
 queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build` under a read turn.
 
 After a lakefile edit, `lake setup-file` rewrites Lake's configuration cache, and checks hold read turns at once, so two
-can start that rewrite together. Lake locks the cache itself (`importConfigFile` in `Lake/Load/Lean/Elab.lean`):
-readers share the trace lock and a rewrite holds it alone, so the cache stays whole. Of two processes that start a
-rewrite at the same moment, Lake fails one with "could not acquire an exclusive configuration lock"; that check reports
-Lake's error, and a retry reads the new cache.
+can start that rewrite together. Lake locks the cache itself (`importConfigFile` in `Lake/Load/Lean/Elab.lean`): readers
+share the trace lock and a rewrite holds it alone, so the cache stays whole. Of two processes that start a rewrite at
+the same moment, Lake fails one with "could not acquire an exclusive configuration lock"; that check reports Lake's
+error, and a retry reads the new cache.
 
 A raw `lake build` takes no kernel lock, so neither the turns nor the finished-build count see it. Running one while the
 server reads the project is outside the contract.

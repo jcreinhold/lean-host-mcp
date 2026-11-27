@@ -9,9 +9,8 @@
 //! - [`envelope`]: the uniform
 //!   `{result, freshness, runtime, warnings, next_actions}` wrapper every
 //!   semantic tool returns.
-//! - [`broker`]: `ProjectBroker`, the mediator that resolves a per-call
-//!   project hint into typed operations on a private project runtime via the
-//!   `--lake-root` / cwd-walk chain.
+//! - [`broker`]: `ProjectBroker`, which checks that a call names the one
+//!   Lake root the server serves and sends its work to that root's workers.
 //! - `project`: private per-project serialized controller. Owns one worker
 //!   service handle and the bounded module-query cache for one Lake project.
 //! - [`projections`]: pure data-shuffle projection types and helpers from

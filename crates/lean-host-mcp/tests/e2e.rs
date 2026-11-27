@@ -84,16 +84,7 @@ fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
 fn open_broker(root: &Path, runtime: ProjectRuntimeConfig, config: ToolConfig) -> ToolContext {
     lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))
         .expect("helper executable");
-    let broker = ProjectBroker::new_with_runtime_config(
-        BrokerConfig {
-            env_default: Some(root.to_path_buf()),
-            cwd: root.to_path_buf(),
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
-            idle_timeout: BrokerConfig::default_idle_timeout(),
-        },
-        runtime,
-    );
+    let broker = ProjectBroker::new_with_runtime_config(BrokerConfig::serving(root.to_path_buf()), runtime);
     ToolContext { broker, config }
 }
 

@@ -2,9 +2,9 @@
 //! supervised [`lean-rs-worker`] child.
 //!
 //! Stdio is the default transport. `--bind` selects Streamable HTTP.
-//! `--lake-root` (or `LEAN_HOST_MCP_PROJECT`) names the primary Lake project;
-//! the server reads its config files from that root and locks its store.
-//! Without it, calls resolve the Lake project above the working directory.
+//! `--lake-root` (or `LEAN_HOST_MCP_PROJECT`) names the one Lake project the
+//! server serves; the server reads its config files from that root and locks
+//! its store. Without it, every project call fails.
 
 mod transport_http;
 
@@ -96,8 +96,8 @@ enum DoctorCommand {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    /// Select and approve the primary Lake project for native calls (also `LEAN_HOST_MCP_PROJECT`).
-    /// A per-call project can select this root. Discovery alone cannot approve a native project.
+    /// The one Lake project this server serves (also `LEAN_HOST_MCP_PROJECT`).
+    /// A call's `project` field may name this root and no other.
     #[arg(long, env = "LEAN_HOST_MCP_PROJECT")]
     lake_root: Option<PathBuf>,
 
@@ -283,7 +283,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         std::env::var_os("LEAN_PATH").is_none(),
         "LEAN_PATH is set; unset it and start the server again"
     );
-    let cwd = std::env::current_dir()?;
     let lake_root = args
         .lake_root
         .as_deref()
@@ -315,10 +314,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let http_path = args.http_path.clone().or_else(|| file.server.http_path.clone());
     let http = http_config(bind, http_path.as_deref())?;
 
-    let (max_projects, idle_timeout) = BrokerConfig::pool_from_env_with_file(&file.broker)?;
-    let (max_workers, max_workers_per_project) = BrokerConfig::worker_limits_from_file(&file.broker, max_projects)?;
-    let max_projects = max_workers; // Legacy internal name; the limit counts worker processes.
-    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?;
+    let broker_config = BrokerConfig::from_env_with_file(lake_root.clone(), &file.broker)?;
+    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, broker_config.max_workers.get())?;
     let tool_config = resolve_tool_config(&file)?;
     let request_settings = RequestSettings::from_file(&file.requests).map_err(anyhow::Error::msg)?;
     // Workers make their sockets here. Check it now, so a bad or long socket
@@ -344,10 +341,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     tracing::info!(
         lake_root = ?lake_root,
-        cwd = %cwd.display(),
-        max_workers = %max_projects,
-        max_workers_per_project = %max_workers_per_project,
-        idle_timeout_secs = idle_timeout.as_secs(),
+        max_workers = %broker_config.max_workers,
+        max_workers_per_project = %broker_config.max_workers_per_project,
+        idle_timeout_secs = broker_config.idle_timeout.as_secs(),
         lean_max_memory_kib = runtime_config.lean_max_memory_kib(),
         import_residue_budget_mib = runtime_config.import_residue_budget_bytes() / (1024 * 1024),
         project_mailbox_capacity = runtime_config.mailbox_capacity(),
@@ -357,16 +353,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         "starting lean-host-mcp",
     );
 
-    let broker = build_broker(
-        BrokerConfig {
-            env_default: lake_root,
-            cwd,
-            max_projects,
-            max_workers_per_project,
-            idle_timeout,
-        },
-        runtime_config,
-    );
+    let broker = build_broker(broker_config, runtime_config);
     let _process_record = processes::ServerProcessRecord::register(
         transport,
         bind_display.clone(),

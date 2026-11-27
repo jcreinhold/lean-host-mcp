@@ -1,102 +1,68 @@
-//! Resolution-chain unit tests for [`ProjectBroker::resolve`]. These
-//! exercise the four-step chain (explicit → `--lake-root` → cwd-walk →
-//! error) without opening a Lean worker; they construct fake Lake-root
-//! layouts under `tempfile::tempdir()`.
+//! [`ProjectBroker::resolve`] maps a call's `project` field to the one Lake
+//! root a broker serves. These tests build fake Lake roots under a temporary
+//! directory and open no worker.
 
 #![allow(clippy::unwrap_used, reason = "tests assert the branch under test directly")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectHint, ServerError};
+use lean_host_mcp::{BrokerConfig, LakeProjectMeta, ProjectBroker, ProjectHint, ServerError};
 
-/// Build a fake Lake-root directory containing a minimal `lakefile.lean`.
-/// Returns the canonicalised path so tests can compare paths directly.
+/// Build a fake Lake root containing a minimal `lakefile.lean`. Returns the
+/// canonical path so tests can compare paths directly.
 fn make_lake_root(parent: &Path, name: &str) -> PathBuf {
     let dir = parent.join(name);
     fs::create_dir_all(&dir).unwrap();
-    fs::write(
-        dir.join("lakefile.lean"),
-        format!("package {name}\nlean_lib {}\n", name.replace('-', "_")),
-    )
-    .unwrap();
+    fs::write(dir.join("lakefile.lean"), format!("package {name}\n")).unwrap();
     dir.canonicalize().unwrap()
 }
 
-fn broker(cfg: BrokerConfig) -> std::sync::Arc<ProjectBroker> {
-    ProjectBroker::new(cfg)
+fn refused(broker: &ProjectBroker, hint: &ProjectHint, reason: &str) -> bool {
+    matches!(broker.resolve(hint), Err(ServerError::BadProject(message)) if message.contains(reason))
 }
 
-fn cfg(cwd: PathBuf, env_default: Option<PathBuf>) -> BrokerConfig {
-    BrokerConfig {
-        env_default,
-        cwd,
-        max_projects: BrokerConfig::default_max_projects(),
-        max_workers_per_project: std::num::NonZeroUsize::MIN,
-        idle_timeout: std::time::Duration::ZERO,
+#[test]
+fn default_hint_selects_the_served_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let served = make_lake_root(tmp.path(), "served");
+    let broker = ProjectBroker::new(BrokerConfig::serving(served.clone()));
+    assert_eq!(broker.resolve(&ProjectHint::Default).unwrap(), served);
+}
+
+#[test]
+fn explicit_hint_naming_the_served_root_canonicalises() {
+    let tmp = tempfile::tempdir().unwrap();
+    let served = make_lake_root(tmp.path(), "served");
+    let broker = ProjectBroker::new(BrokerConfig::serving(served.join(".")));
+    let resolved = broker.resolve(&ProjectHint::Explicit(served.join("."))).unwrap();
+    assert_eq!(resolved, served);
+}
+
+#[test]
+fn explicit_hint_naming_another_root_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let served = make_lake_root(tmp.path(), "served");
+    let other = make_lake_root(tmp.path(), "other");
+    let broker = ProjectBroker::new(BrokerConfig::serving(served));
+    assert!(refused(&broker, &ProjectHint::Explicit(other), "this server serves"));
+}
+
+#[test]
+fn a_broker_without_a_root_refuses_every_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = make_lake_root(tmp.path(), "project");
+    let broker = ProjectBroker::new(BrokerConfig {
+        lake_root: None,
+        ..BrokerConfig::serving(project.clone())
+    });
+    for hint in [ProjectHint::Default, ProjectHint::Explicit(project)] {
+        assert!(refused(&broker, &hint, "serves no Lake project"));
     }
 }
 
 #[test]
-fn explicit_hint_wins_over_env_default() {
-    let tmp = tempfile::tempdir().unwrap();
-    let explicit = make_lake_root(tmp.path(), "explicit_proj");
-    let envroot = make_lake_root(tmp.path(), "env_proj");
-    let b = broker(cfg(tmp.path().to_path_buf(), Some(envroot)));
-    let resolved = b.resolve(&ProjectHint::Explicit(explicit.clone())).unwrap();
-    assert_eq!(resolved, explicit);
-}
-
-#[test]
-fn env_default_wins_over_cwd_walk() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cwd_proj = make_lake_root(tmp.path(), "cwd_proj");
-    let env_proj = make_lake_root(tmp.path(), "env_proj");
-    // cwd is inside cwd_proj (cwd-walk would otherwise find that root),
-    // but env_default must short-circuit.
-    let cwd = cwd_proj.join("sub");
-    fs::create_dir_all(&cwd).unwrap();
-    let b = broker(cfg(cwd, Some(env_proj.clone())));
-    assert_eq!(b.resolve(&ProjectHint::Default).unwrap(), env_proj);
-}
-
-#[test]
-fn cwd_walk_finds_lakefile_in_parent() {
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = make_lake_root(tmp.path(), "proj");
-    let nested = proj.join("a").join("b").join("c");
-    fs::create_dir_all(&nested).unwrap();
-    let b = broker(cfg(nested, None));
-    assert_eq!(b.resolve(&ProjectHint::Default).unwrap(), proj);
-}
-
-#[test]
-fn no_lakefile_anywhere_surfaces_bad_project() {
-    let tmp = tempfile::tempdir().unwrap();
-    let bare = tmp.path().join("empty");
-    fs::create_dir_all(&bare).unwrap();
-    let b = broker(cfg(bare, None));
-    let err = b.resolve(&ProjectHint::Default).unwrap_err();
-    assert!(
-        matches!(err, ServerError::BadProject(ref msg) if msg.contains("no lakefile found")),
-        "expected BadProject('no lakefile found'); got {err:?}"
-    );
-}
-
-#[test]
-fn explicit_hint_canonicalises_relative_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = make_lake_root(tmp.path(), "rel_proj");
-    let b = broker(cfg(tmp.path().to_path_buf(), None));
-    // Pass a path containing `.` segments; canonicalisation must collapse them.
-    let weird = proj.join(".");
-    let resolved = b.resolve(&ProjectHint::Explicit(weird)).unwrap();
-    assert_eq!(resolved, proj);
-}
-
-#[test]
 fn unparseable_lakefile_toml_surfaces_through_from_explicit() {
-    use lean_host_mcp::LakeProjectMeta;
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("broken");
     fs::create_dir_all(&proj).unwrap();

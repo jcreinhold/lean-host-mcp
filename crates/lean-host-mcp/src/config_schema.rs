@@ -99,14 +99,14 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         overrides: "LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY",
         description: "How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8.",
     },
-    // ---- [broker] — project pool ---------------------------------------
+    // ---- [broker] — worker pool ----------------------------------------
     FieldDoc {
         key: "broker.max_workers",
         ty: "integer",
         value: "4",
         commented: false,
-        overrides: "LEAN_HOST_MCP_MAX_WORKERS (legacy: LEAN_HOST_MCP_MAX_PROJECTS)",
-        description: "Maximum worker processes across all projects, including startup and shutdown. Idle workers may be evicted to serve another project. max_projects is a deprecated alias; environment values override file values, and the new name wins within each layer.",
+        overrides: "LEAN_HOST_MCP_MAX_WORKERS",
+        description: "Worker processes the server may run at once, counting workers that are starting or still exiting. An exiting worker keeps its slot until its exit is confirmed, so a value above max_workers_per_project lets a new worker start while an old one exits. Default 4.",
     },
     FieldDoc {
         key: "broker.max_workers_per_project",
@@ -114,7 +114,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "1",
         commented: false,
         overrides: "LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT",
-        description: "Maximum independent workers for one canonical project root. Extra workers open only with spare global capacity; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks. Each worker retains its own imports and cache.",
+        description: "Workers that may serve the project at once. An extra worker opens only when a slot is free; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks: each worker keeps its own imports and cache. Default 1.",
     },
     FieldDoc {
         key: "broker.idle_timeout_secs",
@@ -122,7 +122,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "600",
         commented: false,
         overrides: "LEAN_HOST_MCP_IDLE_TIMEOUT_SECS",
-        description: "Evict a project's worker after this many idle seconds. 0 disables idle eviction. Default 10 minutes.",
+        description: "Stop a worker after this many idle seconds. 0 turns idle retirement off. Default 10 minutes.",
     },
     // ---- [server] — transport (CLI/env still override) ------------------
     FieldDoc {
@@ -309,9 +309,6 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
     },
 ];
 
-/// Keys the server reads that no row documents: old names it still accepts.
-const ALIASES: &[&str] = &["broker.max_projects"];
-
 /// Split a dotted key into `(table, leaf)`. A top-level key (no `.`) returns an
 /// empty table.
 fn split_key(key: &str) -> (&str, &str) {
@@ -333,7 +330,7 @@ pub(crate) fn is_section(name: &str) -> bool {
 
 /// Whether the server reads the dotted key `key`.
 pub(crate) fn is_documented(key: &str) -> bool {
-    SCHEMA_FIELDS.iter().any(|field| field.key == key) || ALIASES.contains(&key)
+    SCHEMA_FIELDS.iter().any(|field| field.key == key)
 }
 
 /// Render the documented starter config `config init` writes.
@@ -514,14 +511,14 @@ mod tests {
         );
         assert_eq!(
             rt.import_residue_budget_bytes(),
-            ProjectRuntimeConfig::default_for_projects(broker::DEFAULT_MAX_PROJECTS).import_residue_budget_bytes()
+            ProjectRuntimeConfig::default_for_workers(broker::DEFAULT_MAX_WORKERS).import_residue_budget_bytes()
         );
         assert_eq!(
             config.runtime.worker_session_pool_capacity,
             Some(rt.session_pool_capacity())
         );
 
-        assert_eq!(config.broker.max_workers, Some(broker::DEFAULT_MAX_PROJECTS));
+        assert_eq!(config.broker.max_workers, Some(broker::DEFAULT_MAX_WORKERS));
         assert_eq!(config.broker.max_workers_per_project, Some(1));
         assert_eq!(config.broker.idle_timeout_secs, Some(broker::DEFAULT_IDLE_TIMEOUT_SECS));
         assert_eq!(

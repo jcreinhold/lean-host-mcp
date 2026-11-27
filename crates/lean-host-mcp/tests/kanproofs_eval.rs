@@ -29,13 +29,7 @@ fn kanproofs_unbuilt_root() -> Option<PathBuf> {
 }
 
 fn open_ctx(root: &Path) -> ToolContext {
-    let broker = ProjectBroker::new(BrokerConfig {
-        env_default: Some(root.to_path_buf()),
-        cwd: root.to_path_buf(),
-        max_projects: BrokerConfig::default_max_projects(),
-        max_workers_per_project: std::num::NonZeroUsize::MIN,
-        idle_timeout: BrokerConfig::default_idle_timeout(),
-    });
+    let broker = ProjectBroker::new(BrokerConfig::serving(root.to_path_buf()));
     ToolContext {
         broker,
         config: ToolConfig {
@@ -358,13 +352,7 @@ async fn the_residue_recycle_reaches_the_child_before_the_heap_ceiling_aborts_it
         "KanProofs/Topology/Algebra/Group/ClosedSubgroup.lean",
     ];
     let broker = ProjectBroker::new_with_runtime_config(
-        BrokerConfig {
-            env_default: Some(root.clone()),
-            cwd: root,
-            max_projects: BrokerConfig::default_max_projects(),
-            max_workers_per_project: std::num::NonZeroUsize::MIN,
-            idle_timeout: BrokerConfig::default_idle_timeout(),
-        },
+        BrokerConfig::serving(root.clone()),
         ProjectRuntimeConfig::default().with_import_residue_budget_bytes(budget_bytes),
     );
     let ctx = ToolContext {

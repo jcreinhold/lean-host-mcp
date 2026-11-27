@@ -212,7 +212,7 @@ mod tests {
         let named = |text: &str| problems.iter().any(|problem| problem.contains(text));
         assert!(named("[launcher]"), "{problems:?}");
         assert!(named("`max_worker`"), "{problems:?}");
-        assert!(!named("max_projects"), "{problems:?}");
+        assert!(named("[broker]: unknown key `max_projects`"), "{problems:?}");
         assert!(named("lean_max_memory_kib"), "{problems:?}");
         assert!(named("[build]: `timeout_secs`"), "{problems:?}");
         assert!(named("[recipes.lint]: step 0 is empty"), "{problems:?}");

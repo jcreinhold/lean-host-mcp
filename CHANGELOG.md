@@ -57,6 +57,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `trust.source_sha256`.
 - A worker reloads its imports after a build only as a backstop: the finished-build count replaces the import stamps. A
   cached query result lives only as long as the worker that computed it.
+- A server serves one Lake project, its `--lake-root` or `LEAN_HOST_MCP_PROJECT`, and fails every call that names
+  another root, metadata calls too. Without a root every call fails; the server no longer looks for a lakefile above its
+  working directory. `BrokerConfig::lake_root` replaces `env_default` and `cwd`, `max_workers` replaces `max_projects`,
+  `BrokerConfig::serving(root)` builds the default config for one root, and `BrokerConfig::from_env_with_file` replaces
+  `pool_from_env`, `pool_from_env_with_file` and `worker_limits_from_file`.
 - The store keeps the state that went under `HOME`: the SDK's native owner records in `owners/`, the semantic runtime
   cache in `semantic-runtimes/` and the server process records in `processes/`. Serve and install bind the owner
   directory before any native work. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
@@ -80,10 +85,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove MCP Tasks; the `lean_request` tool with its tickets, cancel and acknowledge; the request journal with
   `--request-journal` and `LEAN_HOST_MCP_REQUEST_JOURNAL`; `request_registry` in `lean_runtime`; and the capabilities
   `retained_request_lifecycle_v3` and `retained_request_binding_v1`. Named requests replace them and have no cancel.
-- Remove `ProjectRuntimeConfig::with_operator_primary`. A broker serves `BrokerConfig::env_default` and refuses native
-  work on any other root, or on every root when it is unset; the server set both from `--lake-root`. Tests and benches
-  that built a broker with `ProjectBroker::new` set the root but never approved it, so their native calls failed. The
-  `multi_project` tests and the `multi_project_dispatch` bench, which need several projects in one server, are gone.
+- Remove `ProjectRuntimeConfig::with_operator_primary`: `BrokerConfig::lake_root` alone names the served root. Tests and
+  benches that built a broker with `ProjectBroker::new` set the root but never approved it, so their native calls
+  failed. The `multi_project` tests and the `multi_project_dispatch` bench, which need several projects in one server,
+  are gone.
+- Remove `LEAN_HOST_MCP_MAX_PROJECTS` and `[broker] max_projects`, the old names of `max_workers`; `config check` now
+  names `max_projects` as an unknown key. Remove the `max_projects` field from `lean_status`'s `broker` and from
+  `lean_runtime`'s `effective_settings.broker` and `pool`.
 
 ### Fixed
 

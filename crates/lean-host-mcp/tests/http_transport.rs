@@ -826,7 +826,7 @@ async fn streamable_http_concurrent_sessions_surface_structured_pressure() {
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_str())],
         &[
-            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
+            ("LEAN_HOST_MCP_MAX_WORKERS", "1"),
             ("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full"),
         ],
     )
@@ -933,7 +933,7 @@ async fn streamable_http_five_clients_check_the_same_source_bytes() {
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_str())],
         &[
-            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
+            ("LEAN_HOST_MCP_MAX_WORKERS", "1"),
             ("LEAN_HOST_MCP_TELEMETRY_VERBOSITY", "full"),
         ],
     )
@@ -977,7 +977,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root.path().to_str().unwrap())],
         &[
-            ("LEAN_HOST_MCP_MAX_PROJECTS", "2"),
+            ("LEAN_HOST_MCP_MAX_WORKERS", "2"),
             ("LEAN_HOST_MCP_IDLE_TIMEOUT_SECS", "91"),
             ("LEAN_HOST_MCP_REQUEST_TIMEOUT_MILLIS", "12345"),
             ("LEAN_HOST_MCP_PROJECT_MAILBOX_CAPACITY", "9"),
@@ -1004,7 +1004,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     assert_eq!(status["pool"]["workers_stopped"], true);
     assert_eq!(
         status["effective_settings"]["broker"],
-        json!({"max_projects":2,"max_workers":2,"max_workers_per_project":1,"idle_timeout_secs":91})
+        json!({"max_workers":2,"max_workers_per_project":1,"idle_timeout_secs":91})
     );
     let runtime = &status["effective_settings"]["runtime"];
     assert_eq!(runtime["request_timeout_millis"], 12_345);
@@ -1036,7 +1036,7 @@ async fn streamable_http_named_requests_survive_conflicts_and_dropped_calls() {
     let root_s = root.to_string_lossy();
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_ref())],
-        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
+        &[("LEAN_HOST_MCP_MAX_WORKERS", "1")],
     )
     .await;
     let client = StatelessClient::new(&server.url);
@@ -1089,7 +1089,7 @@ async fn streamable_http_dropped_running_call_stops_lean_and_drains() {
     let root_s = root.to_string_lossy();
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_ref())],
-        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
+        &[("LEAN_HOST_MCP_MAX_WORKERS", "1")],
     )
     .await;
     let client = StatelessClient::new(&server.url);
@@ -1160,7 +1160,7 @@ async fn streamable_http_dropped_startup_preserves_coalesced_worker_at_capacity(
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_ref())],
         &[
-            ("LEAN_HOST_MCP_MAX_PROJECTS", "1"),
+            ("LEAN_HOST_MCP_MAX_WORKERS", "1"),
             ("LEAN_HOST_MCP_WORKERS_DIR", wrapper_dir),
         ],
     )
@@ -1277,7 +1277,7 @@ async fn streamable_http_runtime_lease_preserves_warm_workers_and_retires_only_i
     let root_s = root.to_string_lossy();
     let server = HttpMcpServer::start_with_env(
         &[("--lake-root", root_s.as_ref())],
-        &[("LEAN_HOST_MCP_MAX_PROJECTS", "1")],
+        &[("LEAN_HOST_MCP_MAX_WORKERS", "1")],
     )
     .await;
     let client = StatelessClient::new(&server.url);

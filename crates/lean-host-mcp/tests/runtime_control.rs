@@ -10,11 +10,8 @@ use lean_host_mcp::{BrokerConfig, ProjectBroker, ProjectHint};
 async fn idle_lease_preserves_cache_across_reaper_ticks() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::path::PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE")?);
     let broker = ProjectBroker::new(BrokerConfig {
-        env_default: Some(root.clone()),
-        cwd: root,
-        max_projects: BrokerConfig::default_max_projects(),
-        max_workers_per_project: std::num::NonZeroUsize::MIN,
         idle_timeout: Duration::from_nanos(1),
+        ..BrokerConfig::serving(root.clone())
     });
     let first = broker.admitted_project_runtime(ProjectHint::Default, vec![]).await?;
     let lease = broker.runtime_control(&RuntimeControlRequest {

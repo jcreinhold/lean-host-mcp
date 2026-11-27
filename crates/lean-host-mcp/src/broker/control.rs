@@ -114,7 +114,6 @@ pub struct WorkerPoolStatus {
     /// Identity of this broker lifetime; changes after a server restart.
     pub instance_id: String,
     /// Configured upper bound on resident, opening, and retiring worker slots.
-    pub max_projects: usize,
     pub max_workers: usize,
     pub max_workers_per_project: usize,
     /// Slots still owned, including shutdowns whose exit is not confirmed.
@@ -130,7 +129,7 @@ pub struct WorkerPoolStatus {
     pub lease_remaining_millis: Option<u64>,
     /// Roots with admitted callers preparing, starting, or waiting for startup.
     pub acquiring_projects: Vec<String>,
-    /// Current resident projects, in MRU order.
+    /// Resident workers.
     pub projects: Vec<WorkerActivity>,
 }
 
@@ -411,13 +410,8 @@ impl ProjectBroker {
             if pool_busy(&inner) {
                 result = RuntimeControlStatus::Draining;
             } else if inner.control.lease.as_ref().is_some_and(|lease| lease.retire_idle) {
-                let paths: Vec<_> = inner.registry.iter().map(|(root, _)| root.clone()).collect();
-                for path in paths {
-                    if let Some(project) = inner.registry.pop(&path) {
-                        retiring.push(project);
-                    }
-                    inner.last_used.remove(&path);
-                }
+                retiring.extend(inner.registry.drain().map(|(_, project)| project));
+                inner.last_used.clear();
             }
         }
         let retirement_requested = retiring.len();
@@ -457,8 +451,7 @@ impl ProjectBroker {
             build: crate::status::BuildIdentity::default(),
             effective_settings: crate::status::EffectiveSettings {
                 broker: crate::status::BrokerSettings {
-                    max_projects: self.config.max_projects.get(),
-                    max_workers: self.config.max_projects.get(),
+                    max_workers: self.config.max_workers.get(),
                     max_workers_per_project: self.config.max_workers_per_project.get(),
                     idle_timeout_secs: self.config.idle_timeout.as_secs(),
                 },
@@ -479,7 +472,7 @@ impl ProjectBroker {
         let remaining = inner.control.remaining(now);
         let occupied_slots = self
             .config
-            .max_projects
+            .max_workers
             .get()
             .saturating_sub(self.worker_slots.available_permits());
         let projects: Vec<_> = inner
@@ -508,8 +501,7 @@ impl ProjectBroker {
         acquiring_projects.sort();
         WorkerPoolStatus {
             instance_id: inner.control.instance_id.clone(),
-            max_projects: self.config.max_projects.get(),
-            max_workers: self.config.max_projects.get(),
+            max_workers: self.config.max_workers.get(),
             max_workers_per_project: self.config.max_workers_per_project.get(),
             occupied_slots,
             outstanding_jobs: inner.control.active_jobs.load(Ordering::Acquire),
@@ -576,9 +568,8 @@ mod tests {
 
     fn broker() -> Arc<ProjectBroker> {
         ProjectBroker::new(super::super::BrokerConfig {
-            env_default: None,
-            cwd: PathBuf::from("/unused"),
-            max_projects: std::num::NonZeroUsize::MIN,
+            lake_root: None,
+            max_workers: std::num::NonZeroUsize::MIN,
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         })
