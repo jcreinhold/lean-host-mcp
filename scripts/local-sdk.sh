@@ -6,15 +6,24 @@
 #
 # local_sdk_enable SCRATCH points every later Cargo call in this shell at the checkouts. It writes a
 # private CARGO_HOME whose config patches crates.io, links the real registry and Git caches into it,
-# and saves Cargo.lock, which the patch makes Cargo rewrite. Call local_sdk_restore SCRATCH on exit.
-# The patch lives in CARGO_HOME because Clippy and nextest do not see `cargo --config` patches.
-# Without a checkout both do nothing and the registry crates are used.
+# and saves Cargo.lock, which the patch makes Cargo rewrite. Call it once in a shell, and call
+# local_sdk_restore SCRATCH on exit. The patch lives in CARGO_HOME because Clippy and nextest do not
+# see `cargo --config` patches. Without a checkout both do nothing and the registry crates are used.
 
 # Name prefixes of the patched packages, separated by spaces; empty when nothing is patched.
 LOCAL_SDK_PREFIXES=
+# The scratch directory of the local_sdk_enable call that patched this shell; empty before it.
+LOCAL_SDK_SCRATCH=
 
 local_sdk_enable() {
     [[ -n ${LEAN_RS_CHECKOUT:-}${LEAN_SEMANTIC_SEARCH_CHECKOUT:-} ]] || return 0
+    # A second call would save a lock the patch may have rewritten as the one to restore. It would
+    # also take the first call's CARGO_HOME for the real one, and with the same scratch it would
+    # link the registry to itself.
+    if [[ -n $LOCAL_SDK_SCRATCH ]]; then
+        printf 'local_sdk_enable: this shell already uses the checkouts through %s\n' "$LOCAL_SDK_SCRATCH" >&2
+        return 1
+    fi
     local scratch=$1 real home entry checkout manifest name
     local checkouts=()
     if [[ -n ${LEAN_RS_CHECKOUT:-} ]]; then
@@ -44,6 +53,7 @@ local_sdk_enable() {
     } >"$home/config.toml"
     cp Cargo.lock "$scratch/Cargo.lock.registry"
     export CARGO_HOME="$home"
+    LOCAL_SDK_SCRATCH=$scratch
 }
 
 local_sdk_restore() {
