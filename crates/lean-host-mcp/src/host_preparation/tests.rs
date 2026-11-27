@@ -92,7 +92,14 @@ impl Fixture {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.worker);
-        configure(&mut command, &self.sysroot, &self.writer, &self.root, Mode::Prepare).unwrap();
+        configure(
+            &mut command,
+            &self.sysroot,
+            &self.writer,
+            &self.root,
+            &[OsStr::new(PREPARE_FLAG)],
+        )
+        .unwrap();
         command
     }
 }
@@ -134,10 +141,10 @@ fn actual_preparation_command_scrubs_inherited_native_ownership() {
         &fixture.sysroot,
         &fixture.writer,
         &fixture.root,
-        Mode::Prepare,
+        &[OsStr::new(PREPARE_FLAG)],
     )
     .unwrap();
-    start(command, LIMIT, Mode::Prepare).unwrap().wait().unwrap();
+    start(command, LIMIT).unwrap().wait().unwrap();
     let environment: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.root.join("environment")).unwrap()).unwrap();
     for key in SCRUB_ENV.iter().chain(WRITER_HANDOFF_ENV.iter()) {
@@ -183,7 +190,7 @@ fn abandoned_wait_signals_the_existing_owner_and_keeps_actual_reaping() {
     let fixture = Fixture::new("timeout");
     // Neither the 30s request deadline nor the fixture's 4s fallback can
     // explain a stop observed within the 2s cancellation bound below.
-    let pending = start(fixture.command(), Duration::from_secs(30), Mode::Prepare).unwrap();
+    let pending = start(fixture.command(), Duration::from_secs(30)).unwrap();
     let observed = Arc::clone(&pending.control);
     wait_until(|| fixture.root.join("pid").is_file());
     drop(pending);
@@ -259,7 +266,15 @@ fn readiness_probe_uses_only_read_mode_and_never_falls_through_to_a_writer() {
 #[test]
 fn caller_cancellation_before_launch_does_not_spawn() {
     let fixture = Fixture::new("timeout");
-    let error = prepare_cancellable(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT, &|| true).unwrap_err();
+    let error = run_artifact_mode(
+        &fixture.worker,
+        &fixture.sysroot,
+        &fixture.writer,
+        &[OsStr::new(PREPARE_FLAG)],
+        LIMIT,
+        &|| true,
+    )
+    .unwrap_err();
     assert_eq!(error.disposition, WriterDisposition::NotStarted);
     assert!(!fixture.root.join("pid").exists());
     let error = probe_ready(&fixture.worker, &fixture.sysroot, &fixture.writer, LIMIT, &|| true).unwrap_err();
@@ -281,7 +296,14 @@ fn caller_cancellation_reaps_both_modes_before_their_long_deadline() {
             if ready {
                 probe_ready(&worker, &sysroot, &writer, Duration::from_secs(30), &cancelled)
             } else {
-                prepare_cancellable(&worker, &sysroot, &writer, Duration::from_secs(30), &cancelled).map(Some)
+                run_artifact_mode(
+                    &worker,
+                    &sysroot,
+                    &writer,
+                    &[OsStr::new(PREPARE_FLAG)],
+                    Duration::from_secs(30),
+                    &cancelled,
+                )
             }
         });
         wait_until(|| fixture.root.join("pid").is_file());
@@ -297,7 +319,7 @@ fn caller_cancellation_reaps_both_modes_before_their_long_deadline() {
 #[tokio::test]
 async fn abandoned_async_waiter_token_reaches_the_blocking_child_owner() {
     let fixture = Fixture::new("timeout");
-    let pending = start(fixture.command(), Duration::from_secs(30), Mode::Prepare).unwrap();
+    let pending = start(fixture.command(), Duration::from_secs(30)).unwrap();
     let observed = Arc::clone(&pending.control);
     let cancelled = Arc::new(AtomicBool::new(false));
     let token = Arc::clone(&cancelled);

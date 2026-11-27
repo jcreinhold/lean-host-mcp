@@ -27,15 +27,18 @@ crates/lean-host-mcp/src/
   server.rs              LeanHostService tool registration
   broker.rs              ProjectBroker: the served root, worker slots, idle retirement, the reaper
   broker/control.rs      process-local worker activity snapshots and expiring admission leases
+  broker/host_artifacts.rs the installed shims a worker reads before it opens
   broker/module_setup.rs lake setup-file as a native reader; the import closure for lean_imports
+  broker/semantic_file.rs file-backed semantic proof search through a native reader
   broker/verify_file.rs  file checks through one-shot Lean programs
+  broker/writer_handoff.rs idle workers retired for a writer in another process
   project.rs             LeanProject actor: one serialized controller and worker
   worker_retirement.rs   keeps an actor's capacity until each tracked child has exited
   project_lock.rs        fair read and write turns per Lake root, the shared kernel guard, proxy turns
   build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, the run in one helper
   shared_writer.rs       the SDK writer helper, including its build log mode
   native_reader.rs       one-shot Lean programs in the SDK's native reader scope
-  host_preparation.rs    the worker's host artifacts, prepared before any guarded generation
+  host_preparation.rs    the worker's host-artifact modes: readiness, and the preparation an installer runs
   native_socket.rs       where the SDK's short-lived sockets live
   artifact_reads.rs      parent-only artifact reads that hold shared descriptors until parsing ends
   runtime_compatibility.rs the one native compatibility contract for writers and workers
@@ -57,7 +60,7 @@ crates/lean-host-mcp/src/
   error.rs, trust.rs     the one error type of tool handlers; the trust facts in each reply
   ilean.rs               a reader for Lean's .ilean reference indices
   semantic_search.rs     the lean-semantic-search runtime adapter
-  smoke.rs, diagnosis.rs a smoke test for an installed worker; resolution-health messages
+  smoke.rs, diagnosis.rs the install smoke verdict in worker.json; resolution-health messages
 
 crates/lean-host-mcp-worker/src/
   main.rs, authority.rs  worker child; serves one Lake project from its own build through the roots named at launch
@@ -531,11 +534,11 @@ The supervisor retains a failed replacement process when cleanup cannot confirm 
 cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
 project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.
 
-The parent first asks the worker's runtime-free readiness entry for an exact prepared manifest snapshot. A warm probe
-only reads under shared custody. A cold preparation uses the existing owned drain before acquiring an opening lock or
-native slot, then performs source publication, Lake build and manifest publication through the one writer helper.
-Prepared domains cannot expand within a generation. A changed snapshot or artifact union refuses before the body and
-retires the actor; a later request prepares a fresh actor. The refused request is never replayed.
+Before it takes an opening lock or a worker slot, the parent asks the worker's runtime-free readiness mode for the
+descriptor of the shims `install` built. The mode only reads, under shared custody, and builds nothing. If the shims are
+missing or stale, the open fails with the install command; the server never builds shims. Prepared domains cannot expand
+within a generation. A changed snapshot or artifact union refuses before the body and retires the actor; a later request
+prepares a fresh actor. The refused request is never replayed.
 
 Parent-only cache and index reads hold close-on-exec shared descriptors through parsing and freshness observation.
 External native tools use `native-reader`, whose controlled bootstrap transfers the full read union to the same guardian

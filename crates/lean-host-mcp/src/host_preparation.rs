@@ -1,9 +1,12 @@
-//! Runtime-free artifact preparation, before any guarded native generation.
+//! A worker run in one of its host-artifact modes, which never enter the Lean
+//! runtime: readiness, which checks the installed shims and prints their
+//! descriptor, and preparation, which builds them.
 //!
-//! One pre-created thread owns the actual preparation child from spawn through
-//! reap. Its exit is independent of writer helpers started by preparation:
-//! failures after spawn therefore remain Unknown even when this child stopped.
+//! One pre-created thread owns the actual child from spawn through reap. Its
+//! exit is independent of writer helpers the child started: failures after
+//! spawn therefore remain Unknown even when this child stopped.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read};
 use std::os::fd::AsFd;
@@ -27,6 +30,11 @@ const POLL: Duration = Duration::from_millis(10);
 const CALLER_POLL: Duration = Duration::from_millis(20);
 const NOT_READY_EXIT: i32 = 75;
 const CLEANUP_WAIT: Duration = Duration::from_millis(250);
+/// The worker flag that checks the installed shims without building them.
+const READY_FLAG: &str = "--lean-rs-ready-host-artifacts";
+/// The worker flag that builds the shims compiled into the worker.
+#[cfg(test)]
+const PREPARE_FLAG: &str = "--lean-rs-prepare-host-artifacts";
 // Keep the shared owners-directory registry binding: preparation writers must
 // consult the same orphan/fence namespace as native generations. Only remove
 // inherited lifetime activation and private capabilities here.
@@ -88,28 +96,8 @@ pub(crate) fn probe_ready(
     writer: &Path,
     timeout: Duration,
     cancelled: &impl Fn() -> bool,
-) -> Result<Option<LeanWorkerPreparedHostArtifacts>, PreparationFailure> {
-    run(worker, sysroot, writer, timeout, cancelled, Mode::Ready)
-}
-
-/// Prepare storage facts without entering the worker's native runtime.
-///
-/// The caller must cancel its token when abandoning an async waiter: dropping a
-/// `spawn_blocking` handle alone cannot interrupt its running closure. The token
-/// is polled while the independent owner retains and reaps the actual child.
-///
-/// # Errors
-/// Returns bounded launch, capture, cancellation or artifact-validation failures.
-/// A stopped preparation child cannot certify closure of independent writers.
-pub(crate) fn prepare_cancellable(
-    worker: &Path,
-    sysroot: &Path,
-    writer: &Path,
-    timeout: Duration,
-    cancelled: &impl Fn() -> bool,
-) -> Result<LeanWorkerPreparedHostArtifacts, PreparationFailure> {
-    run(worker, sysroot, writer, timeout, cancelled, Mode::Prepare)?
-        .ok_or_else(|| PreparationFailure::unknown("preparation returned no artifacts", true))
+) -> PreparationResult {
+    run_artifact_mode(worker, sysroot, writer, &[OsStr::new(READY_FLAG)], timeout, cancelled)
 }
 
 #[cfg(test)]
@@ -119,41 +107,55 @@ fn prepare(
     writer: &Path,
     timeout: Duration,
 ) -> Result<LeanWorkerPreparedHostArtifacts, PreparationFailure> {
-    prepare_cancellable(worker, sysroot, writer, timeout, &|| false)
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Mode {
-    Prepare,
-    Ready,
+    run_artifact_mode(worker, sysroot, writer, &[OsStr::new(PREPARE_FLAG)], timeout, &|| false)?
+        .ok_or_else(|| PreparationFailure::unknown("preparation returned no artifacts", true))
 }
 
 type PreparationResult = Result<Option<LeanWorkerPreparedHostArtifacts>, PreparationFailure>;
 type Reply = Option<SyncSender<PreparationResult>>;
 
-fn run(
+/// Run `worker` with the host-artifact `flags`, such as
+/// `--lean-rs-ready-host-artifacts`, and parse the descriptor it prints.
+///
+/// The child gets `LEAN_SYSROOT`, the writer helper and the owner directory,
+/// and none of the handoff or native-lifetime variables this process may have
+/// inherited. `Ok(None)` is the readiness mode's not-ready exit, 75. This is
+/// the one place that runs these modes; an installer that builds shims with
+/// the worker's preparation mode calls it too.
+///
+/// The caller must cancel its token when abandoning an async waiter: dropping a
+/// `spawn_blocking` handle alone cannot interrupt its running closure. The token
+/// is polled while the independent owner retains and reaps the actual child.
+///
+/// # Errors
+/// Returns bounded launch, capture, cancellation or artifact-validation failures.
+/// A stopped child cannot certify closure of independent writers.
+pub(crate) fn run_artifact_mode(
     worker: &Path,
     sysroot: &Path,
     writer: &Path,
+    flags: &[&OsStr],
     timeout: Duration,
     cancelled: &impl Fn() -> bool,
-    mode: Mode,
 ) -> PreparationResult {
     if cancelled() {
         return Err(PreparationFailure::no_spawn("host preparation cancelled before launch"));
     }
     let registry = crate::shared_writer::ownership_registry().map_err(PreparationFailure::no_spawn)?;
     let mut command = Command::new(worker);
-    configure(&mut command, sysroot, writer, &registry, mode).map_err(PreparationFailure::no_spawn)?;
-    start(command, timeout, mode)?.wait_cancellable(cancelled)
+    configure(&mut command, sysroot, writer, &registry, flags).map_err(PreparationFailure::no_spawn)?;
+    start(command, timeout)?.wait_cancellable(cancelled)
 }
 
-fn configure(command: &mut Command, sysroot: &Path, writer: &Path, registry: &Path, mode: Mode) -> io::Result<()> {
+fn configure(
+    command: &mut Command,
+    sysroot: &Path,
+    writer: &Path,
+    registry: &Path,
+    flags: &[&OsStr],
+) -> io::Result<()> {
     command
-        .arg(match mode {
-            Mode::Prepare => "--lean-rs-prepare-host-artifacts",
-            Mode::Ready => "--lean-rs-ready-host-artifacts",
-        })
+        .args(flags)
         .env("LEAN_SYSROOT", sysroot)
         .env(OWNERS_DIRECTORY_ENV, registry)
         .stdin(Stdio::null())
@@ -228,7 +230,7 @@ impl Drop for Pending {
     }
 }
 
-fn start(command: Command, timeout: Duration, mode: Mode) -> Result<Pending, PreparationFailure> {
+fn start(command: Command, timeout: Duration) -> Result<Pending, PreparationFailure> {
     if timeout.is_zero() {
         return Err(PreparationFailure::no_spawn(
             "host preparation needs a positive timeout",
@@ -243,7 +245,7 @@ fn start(command: Command, timeout: Duration, mode: Mode) -> Result<Pending, Pre
     // Thread creation precedes spawn: no Child exists if this operation fails.
     thread::Builder::new()
         .name("lean-host-preparation-owner".to_owned())
-        .spawn(move || own(command, deadline, owner_control.as_ref(), send, mode))
+        .spawn(move || own(command, deadline, owner_control.as_ref(), send))
         .map_err(PreparationFailure::no_spawn)?;
     Ok(Pending {
         receive,
@@ -336,7 +338,7 @@ fn deliver(reply: &mut Reply, result: PreparationResult) {
     }
 }
 
-fn own(mut command: Command, deadline: Instant, control: &Control, send: SyncSender<PreparationResult>, mode: Mode) {
+fn own(mut command: Command, deadline: Instant, control: &Control, send: SyncSender<PreparationResult>) {
     let mut reply = Some(send);
     if control.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
         deliver(
@@ -353,7 +355,7 @@ fn own(mut command: Command, deadline: Instant, control: &Control, send: SyncSen
         }
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drive(&mut child, deadline, control, &mut reply, mode);
+        drive(&mut child, deadline, control, &mut reply);
     }));
     if result.is_err() {
         // The Child remains outside the unwinding frame, so panic cannot drop
@@ -370,7 +372,7 @@ fn observe(child: &mut Child, control: &Control) -> io::Result<Option<ExitStatus
     Ok(status)
 }
 
-fn drive(child: &mut Child, deadline: Instant, control: &Control, reply: &mut Reply, mode: Mode) {
+fn drive(child: &mut Child, deadline: Instant, control: &Control, reply: &mut Reply) {
     let mut pipes = match captures(child) {
         Ok(pipes) => pipes,
         Err(error) => {
@@ -404,7 +406,7 @@ fn drive(child: &mut Child, deadline: Instant, control: &Control, reply: &mut Re
             return;
         }
         match observe(child, control) {
-            Ok(Some(status)) if mode == Mode::Ready && status.code() == Some(NOT_READY_EXIT) => {
+            Ok(Some(status)) if status.code() == Some(NOT_READY_EXIT) => {
                 if pipes.0.eof && pipes.1.eof {
                     deliver(reply, Ok(None));
                     return;

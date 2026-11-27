@@ -63,8 +63,8 @@ use crate::lake_meta::{LakeProjectMeta, ProjectInputStamp};
 use crate::project::{LeanProject, ProjectCall, ProjectRuntimeConfig};
 
 mod control;
+mod host_artifacts;
 pub(crate) mod module_setup;
-mod preparation;
 pub(crate) mod semantic_file;
 pub(crate) mod verify_file;
 mod writer_handoff;
@@ -955,8 +955,7 @@ impl ProjectBroker {
             return Ok(project);
         }
 
-        // Preparation can need EX artifact locks. Do it before retaining an
-        // opening Arc or slot: the owned drain must never wait on this caller.
+        // Read the installed shims before retaining an opening Arc or slot.
         let meta_root = root.clone();
         let meta = tokio::task::spawn_blocking(move || LakeProjectMeta::from_explicit(&meta_root))
             .await
@@ -964,9 +963,9 @@ impl ProjectBroker {
         let (worker, sysroot, _) = crate::project::resolve_worker(&meta)?;
         let cancellation = CallCancellation::current();
         let writer = crate::shared_writer::contract()?.executable;
-        let prepared = self
-            .prepare_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
-            .await?;
+        let prepared =
+            host_artifacts::installed_host_artifacts(&root, &worker, &sysroot, &writer, deadline, &cancellation)
+                .await?;
         let open_guard = self.acquire_opening_guard(&root, deadline, &cancellation).await?;
 
         // Root-local startup serialization closes the race between callers that

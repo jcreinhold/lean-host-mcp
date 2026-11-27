@@ -92,6 +92,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove `LEAN_HOST_MCP_MAX_PROJECTS` and `[broker] max_projects`, the old names of `max_workers`; `config check` now
   names `max_projects` as an unknown key. Remove the `max_projects` field from `lean_status`'s `broker` and from
   `lean_runtime`'s `effective_settings.broker` and `pool`.
+- Remove the shim build when a worker opens. The server reads the shims `install` built and fails with the install
+  command when they are missing or stale; the drain that build took, and the stage `host_artifact_preparation`, are
+  gone.
 
 ### Fixed
 
