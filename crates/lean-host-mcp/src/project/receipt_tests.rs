@@ -381,15 +381,13 @@ impl ActorHarness {
         let root = tempfile::tempdir().expect("private actor fixture");
         let executable = fake_worker(root.path(), remove_executable);
         let broker_config = crate::broker::BrokerConfig {
-            env_default: None,
+            env_default: Some(root.path().to_path_buf()),
             cwd: root.path().to_path_buf(),
             max_projects: NonZeroUsize::MIN,
             max_workers_per_project: NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         };
-        let mut runtime_config = ProjectRuntimeConfig::default()
-            .with_operator_primary(Some(root.path()))
-            .expect("approve the private actor fixture");
+        let mut runtime_config = ProjectRuntimeConfig::default();
         if let Some(timeout) = admission_timeout {
             runtime_config.request_timeout_millis = millis_u64(timeout);
         }

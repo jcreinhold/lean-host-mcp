@@ -79,6 +79,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove MCP Tasks; the `lean_request` tool with its tickets, cancel and acknowledge; the request journal with
   `--request-journal` and `LEAN_HOST_MCP_REQUEST_JOURNAL`; `request_registry` in `lean_runtime`; and the capabilities
   `retained_request_lifecycle_v3` and `retained_request_binding_v1`. Named requests replace them and have no cancel.
+- Remove `ProjectRuntimeConfig::with_operator_primary`. A broker serves `BrokerConfig::env_default` and refuses native
+  work on any other root, or on every root when it is unset; the server set both from `--lake-root`. Tests and benches
+  that built a broker with `ProjectBroker::new` set the root but never approved it, so their native calls failed. The
+  `multi_project` tests and the `multi_project_dispatch` bench, which need several projects in one server, are gone.
 
 ### Fixed
 

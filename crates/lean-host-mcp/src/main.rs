@@ -377,8 +377,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let (max_projects, idle_timeout) = BrokerConfig::pool_from_env_with_file(&file.broker)?;
     let (max_workers, max_workers_per_project) = BrokerConfig::worker_limits_from_file(&file.broker, max_projects)?;
     let max_projects = max_workers; // Legacy internal name; the limit counts worker processes.
-    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?
-        .with_operator_primary(lake_root.as_deref())?;
+    let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?;
     let tool_config = resolve_tool_config(&file)?;
     let request_settings = RequestSettings::from_file(&file.requests).map_err(anyhow::Error::msg)?;
     // One server per store. Take the lock after the config checks, so a bad

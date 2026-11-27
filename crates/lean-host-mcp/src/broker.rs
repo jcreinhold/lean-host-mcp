@@ -99,7 +99,10 @@ const WORKER_EXIT_POLL: Duration = Duration::from_millis(25);
 /// without `std::env::set_current_dir`.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
-    /// The primary Lake root from `--lake-root` / `LEAN_HOST_MCP_PROJECT`.
+    /// The one Lake root this broker serves, from `--lake-root` /
+    /// `LEAN_HOST_MCP_PROJECT`. Native calls on any other root are refused,
+    /// and so is every native call when it is unset: finding a lakefile from
+    /// `cwd` never approves a project.
     pub env_default: Option<PathBuf>,
     pub cwd: PathBuf,
     /// Global worker cap. Historical API name; config prefers `max_workers`.
@@ -946,7 +949,19 @@ impl ProjectBroker {
 
     pub(crate) fn native_root(&self, hint: &ProjectHint) -> Result<PathBuf> {
         let root = self.resolve(hint)?;
-        self.runtime_config.require_operator_primary(&root)?;
+        let Some(served) = &self.config.env_default else {
+            return Err(ServerError::BadProject(
+                "native execution requires an operator-approved project; start the server with `--lake-root`".into(),
+            ));
+        };
+        let served = canonicalise(served)?;
+        if served != root {
+            return Err(ServerError::BadProject(format!(
+                "this server serves {}, not {}; start a server with `--lake-root` set to that project",
+                served.display(),
+                root.display()
+            )));
+        }
         Ok(root)
     }
 
@@ -1621,38 +1636,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_primary_refuses_discovered_and_explicit_project_before_options() {
+    async fn native_calls_refuse_every_root_but_the_served_one_before_options() {
         let tree = tempfile::tempdir().unwrap();
-        let approved = tree.path().join("approved");
+        let served = tree.path().join("served");
         let other = tree.path().join("other");
-        fs::create_dir(&approved).unwrap();
+        fs::create_dir(&served).unwrap();
         fs::create_dir(&other).unwrap();
         // This marker permits discovery. There is deliberately no Lean toolchain.
         fs::write(other.join("lakefile.lean"), "").unwrap();
-        let runtime = ProjectRuntimeConfig::default()
-            .with_operator_primary(Some(&approved))
+        let canonical = served.canonicalize().unwrap();
+        let broker = ProjectBroker::new(cfg(other.clone(), Some(served.clone())));
+        let err = broker
+            .prepare_check(ProjectHint::Explicit(other.clone()), LeanWorkerElabOptions::new())
+            .await
+            .err()
             .unwrap();
-        let broker = ProjectBroker::new_with_runtime_config(cfg(other.clone(), None), runtime);
-        let approved = approved.canonicalize().unwrap();
-        for hint in [ProjectHint::Default, ProjectHint::Explicit(other.clone())] {
-            let err = broker
-                .prepare_check(hint, LeanWorkerElabOptions::new())
-                .await
-                .err()
-                .unwrap();
-            assert!(
-                matches!(&err, ServerError::BadProject(reason) if reason.contains(&format!("this server serves {}", approved.display()))),
-                "{err:?}"
-            );
-            assert!(broker.resident_paths().is_empty());
-        }
-        let canonical = broker.resolve(&ProjectHint::Explicit(approved.join("."))).unwrap();
-        assert!(broker.runtime_config.require_operator_primary(&canonical).is_ok());
         assert!(
-            ProjectRuntimeConfig::default()
-                .require_operator_primary(&canonical)
-                .is_err()
+            matches!(&err, ServerError::BadProject(reason) if reason.contains(&format!("this server serves {}", canonical.display()))),
+            "{err:?}"
         );
+        assert!(broker.resident_paths().is_empty());
+        assert_eq!(broker.native_root(&ProjectHint::Default).unwrap(), canonical);
+        assert_eq!(
+            broker.native_root(&ProjectHint::Explicit(served.join("."))).unwrap(),
+            canonical
+        );
+        // A lakefile found from `cwd` approves nothing.
+        let discovering = ProjectBroker::new(cfg(other, None));
+        let err = discovering
+            .prepare_check(ProjectHint::Default, LeanWorkerElabOptions::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&err, ServerError::BadProject(reason) if reason.contains("operator-approved")),
+            "{err:?}"
+        );
+        assert!(discovering.resident_paths().is_empty());
     }
 
     #[tokio::test]

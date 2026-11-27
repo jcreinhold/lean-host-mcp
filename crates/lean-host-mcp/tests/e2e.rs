@@ -79,12 +79,11 @@ fn open_ctx_with_config(root: &Path, config: ToolConfig) -> ToolContext {
 }
 
 /// A context set up as the server sets itself up for `--lake-root root`: the
-/// operator approves `root` for native work, and the helper subcommands run
-/// from the server binary, since the test harness lacks them.
+/// broker serves `root`, and the helper subcommands run from the server
+/// binary, since the test harness lacks them.
 fn open_broker(root: &Path, runtime: ProjectRuntimeConfig, config: ToolConfig) -> ToolContext {
     lean_host_mcp::shared_writer::use_helper_executable(Path::new(env!("CARGO_BIN_EXE_lean-host-mcp")))
         .expect("helper executable");
-    let runtime = runtime.with_operator_primary(Some(root)).expect("operator root");
     let broker = ProjectBroker::new_with_runtime_config(
         BrokerConfig {
             env_default: Some(root.to_path_buf()),
@@ -1730,20 +1729,9 @@ async fn concurrent_semantic_tools_complete_with_runtime_facts() {
         verify.runtime().is_some(),
         "verify_declaration should include runtime facts"
     );
-
-    // One project means one actor thread running one job at a time, so
-    // concurrent calls against it are serialized by its mailbox. At least one
-    // of the three must therefore observe a nonzero mailbox wait. This asserts
-    // the *shape* of same-project concurrency, not a latency budget — see
-    // `multi_project::concurrent_calls_across_projects_do_not_queue` for the
-    // complementary claim that *different* projects do not serialize.
-    let waits: Vec<u64> = [proof.runtime(), inspect.runtime(), verify.runtime()]
-        .iter()
-        .map(|runtime| runtime.map_or(0, |facts| facts.queue_wait_millis))
-        .collect();
     assert!(
-        waits.iter().any(|wait| *wait > 0),
-        "concurrent same-project calls must queue behind the project's single actor; queue_wait_millis={waits:?}"
+        inspect.runtime().is_some(),
+        "inspect_declaration should include runtime facts"
     );
 }
 

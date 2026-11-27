@@ -7,9 +7,7 @@
 //!
 //! Nothing else covered it. `module_query_roundtrip` calls the *uncached*
 //! `process_module_query` entry point and measures 18–20 ms per query — a full
-//! worker round trip — so it says nothing about a hit. `multi_project_dispatch`
-//! measures broker dispatch (its `warm` arm is where this file's `< 50 µs at
-//! p99` reference target comes from) but never issues a repeat query.
+//! worker round trip — so it says nothing about a hit.
 //!
 //! Two arms against one resident project, differing only in whether the cache
 //! can answer:

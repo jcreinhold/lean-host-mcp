@@ -99,7 +99,7 @@ async fn unchanged_query_sees_a_dependency_rebuilt_by_another_writer() -> TestRe
                 max_workers_per_project: std::num::NonZeroUsize::MIN,
                 idle_timeout: BrokerConfig::default_idle_timeout(),
             },
-            ProjectRuntimeConfig::default().with_operator_primary(Some(&chain.root))?,
+            ProjectRuntimeConfig::default(),
         ),
         config: ToolConfig::default(),
     };

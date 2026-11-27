@@ -66,7 +66,7 @@ fn project() -> TestResult<(Chain, ToolContext)> {
             max_workers_per_project: NonZeroUsize::new(2).ok_or("two workers")?,
             idle_timeout: BrokerConfig::default_idle_timeout(),
         },
-        ProjectRuntimeConfig::default().with_operator_primary(Some(&chain.root))?,
+        ProjectRuntimeConfig::default(),
     );
     let ctx = ToolContext {
         broker,

@@ -33,10 +33,6 @@ name = "module_query_roundtrip"
 
 [[bench]]
 harness = false
-name = "multi_project_dispatch"
-
-[[bench]]
-harness = false
 name = "search_for_proof"
 
 [[bench]]
