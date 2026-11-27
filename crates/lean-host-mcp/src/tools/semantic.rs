@@ -702,8 +702,7 @@ pub async fn lean_verify_targets(ctx: &ToolContext, request: LeanVerifyRequest) 
 
 /// Semantic lookup and discovery.
 ///
-/// Initial public modes: `declaration`, `declarations`, `changed_coverage`,
-/// `proof_search`, and `references`.
+/// Modes: `declaration`, `declarations`, `proof_search`, and `references`.
 ///
 /// # Errors
 ///

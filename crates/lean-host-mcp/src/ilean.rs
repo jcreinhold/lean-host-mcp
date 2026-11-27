@@ -479,7 +479,7 @@ fn parse_references(bytes: &[u8], matcher: &KeyMatcher<'_>) -> Result<ModuleRefe
 ///
 /// # Errors
 ///
-/// As [`load`].
+/// As [`load_references`].
 fn load_declarations(path: &Path) -> Result<ModuleDeclarations, IleanError> {
     let bytes = read_bytes(path)?;
     let doc: ModuleDeclarations =

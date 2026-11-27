@@ -620,8 +620,8 @@ fn version_scalar((major, minor, patch, rc_flag, rc_num): (u32, u32, u32, u8, u3
 /// [`lean_toolchain::SUPPORTED_TOOLCHAINS`] (ordered ascending; each entry's
 /// first version is canonical) — never a hardcoded literal list.
 ///
-/// "Nearest" scans every supported version and picks the one whose key is the
-/// smallest [`version_distance`] from the pin, ties broken toward the newer
+/// "Nearest" scans every supported version and picks the one whose
+/// [`version_scalar`] lies closest to the pin's, ties broken toward the newer
 /// version to bias migration forward. This is why `v4.30.0-rc1` resolves to
 /// `4.30.0` (one rc step away) rather than the window floor: the old logic only
 /// compared the pin against the head and fell back to the floor for everything

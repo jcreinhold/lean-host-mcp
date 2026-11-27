@@ -127,7 +127,8 @@ fn fingerprint_lake_project(lake_root: &Path) -> Result<String> {
 
 /// Project-relative directory holding built module artifacts: `.olean` for the
 /// environment, `.ilean` for the reference index. One definition, because
-/// [`artifact_roots`] and the `.ilean` reader must agree on where Lake writes.
+/// [`manifest_artifact_roots`] and the `.ilean` reader must agree on where Lake
+/// writes.
 pub(crate) const BUILD_LIB_REL: &str = ".lake/build/lib/lean";
 
 /// The project's own import roots in Lean's search order: its build output,
