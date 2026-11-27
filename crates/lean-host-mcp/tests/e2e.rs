@@ -119,6 +119,19 @@ fn copy_dir_recursive(from: &Path, to: &Path) {
     }
 }
 
+/// Copy the fixture into `dir` and add a theorem proved by `sorry` to the
+/// copy's `ProofActions.lean`. The committed fixture has no `sorry`, so its
+/// `lake build` prints no warning.
+fn fixture_with_sorry_theorem(root: &Path, dir: &Path) -> PathBuf {
+    let work = dir.join("fixture");
+    copy_dir_recursive(root, &work);
+    let file = work.join(proof_actions_file());
+    let source = fs::read_to_string(&file).expect("read proof actions")
+        + "\nnamespace LeanRsFixture.ProofActions\n\ntheorem sorryTheorem : True := by\n  sorry\n\nend LeanRsFixture.ProofActions\n";
+    fs::write(&file, source).expect("add the sorry theorem");
+    work
+}
+
 fn semantic_request(kind: &str, args: serde_json::Value) -> SemanticToolRequest {
     let serde_json::Value::Object(map) = args else {
         panic!("semantic request args must be an object");
@@ -880,8 +893,10 @@ async fn inspect_proof_state_try_verify_and_references() {
         } if verification_status == "verified"
     ));
 
+    let tmp = tempfile::tempdir().expect("temp fixture copy");
+    let sorry_ctx = open_ctx(&fixture_with_sorry_theorem(&root, tmp.path()));
     let sorry = verify_declaration(
-        &ctx,
+        &sorry_ctx,
         VerifyDeclarationRequest {
             file: proof_actions_file(),
             declaration: "LeanRsFixture.ProofActions.sorryTheorem".to_owned(),
@@ -1076,7 +1091,8 @@ async fn lean_verify_batches_explicit_file_and_module_targets() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
     };
-    let ctx = open_ctx(&root);
+    let tmp = tempfile::tempdir().expect("temp fixture copy");
+    let ctx = open_ctx(&fixture_with_sorry_theorem(&root, tmp.path()));
 
     let explicit = semantic_data(
         lean_verify(

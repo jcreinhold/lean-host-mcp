@@ -670,16 +670,6 @@ fn fixture_calls() -> Vec<ToolCall> {
             }),
         },
         ToolCall {
-            label: "verify_sorry_theorem",
-            tool_name: "lean_verify",
-            category: "proof_action",
-            arguments: json!({
-                "kind": "explicit",
-                "file": "LeanRsFixture/ProofActions.lean",
-                "declaration": "LeanRsFixture.ProofActions.sorryTheorem"
-            }),
-        },
-        ToolCall {
             label: "proof_state_trivial_cold",
             tool_name: "lean_context",
             category: "position",

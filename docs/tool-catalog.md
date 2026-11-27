@@ -722,7 +722,7 @@ Mixed target groups:
       "file": "LeanRsFixture/ProofActions.lean",
       "declarations": [
         "LeanRsFixture.ProofActions.closedTheorem",
-        "LeanRsFixture.ProofActions.sorryTheorem"
+        "LeanRsFixture.ProofActions.stepTheorem"
       ]
     },
     { "kind": "file_all", "file": "LeanRsFixture/ProofAgent.lean" },
