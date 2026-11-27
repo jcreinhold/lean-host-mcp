@@ -4,12 +4,12 @@
 //! and, under the install directory (`--dir`, default
 //! `<root>/.local/lean-host-mcp`):
 //!
-//! - installs the SDK writer at `bin/lean-rs-writer`;
-//! - copies this executable to `bin/lean-host-mcp`;
+//! - copies this executable to `bin/lean-host-mcp`, which also serves the
+//!   SDK's writer, reader and guardian helpers;
 //! - creates the private server store `store/` (mode 0700);
 //! - installs the worker for the toolchain in `workers/`, by the
-//!   `install-worker` code path, keeping the worker's native state in the
-//!   store.
+//!   `install-worker` code path, with the copy in `bin/` as the writer that
+//!   builds its shims, and keeps the worker's native state in the store.
 //!
 //! Without `--dir`, `LEAN_HOST_MCP_WORKERS_DIR` and `LEAN_HOST_MCP_STORE_DIR`
 //! and an earlier install's paths still apply, as they do for the server. The
@@ -23,18 +23,14 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Context as _;
 use clap::Args;
 
-use super::install_worker::{self, Freshness, WriterInputs};
+use super::install_worker::{self, Freshness};
 use crate::config_file;
 use crate::store;
 use crate::toolchain::{self, ToolchainId, shell_word};
-
-/// File name of the SDK writer helper.
-const WRITER_FILE_NAME: &str = "lean-rs-writer";
 
 /// File name of the installed server executable.
 const SERVER_FILE_NAME: &str = "lean-host-mcp";
@@ -60,13 +56,9 @@ pub struct InstallArgs {
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
 
-    /// Rebuild the worker and the writer even when they are current.
+    /// Rebuild the worker even when it is current.
     #[arg(long)]
     pub force: bool,
-
-    /// Standalone SDK writer to install instead of building `lean-rs-writer`.
-    #[arg(long)]
-    pub standalone_writer: Option<PathBuf>,
 
     /// Workspace root to build the worker from. Defaults to the workspace
     /// this binary was compiled in, else the published crate.
@@ -121,10 +113,6 @@ impl Plan {
     fn binary(&self) -> PathBuf {
         self.bin.join(SERVER_FILE_NAME)
     }
-
-    fn writer(&self) -> PathBuf {
-        self.bin.join(WRITER_FILE_NAME)
-    }
 }
 
 /// Entry point invoked from `main.rs`.
@@ -132,7 +120,7 @@ impl Plan {
 /// # Errors
 ///
 /// Returns an error when the Lake root has no readable `lean-toolchain`, when
-/// the writer or worker install fails, or when a file cannot be written.
+/// the worker install fails, or when a file cannot be written.
 pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("cannot find this executable")?;
     // Nothing recorded the elan home in this process, so this is `ELAN_HOME`,
@@ -148,10 +136,7 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
         store::use_for_native_state(&plan.store_dir)
             .with_context(|| format!("cannot keep native state in the store {}", plan.store_dir.display()))?;
         let source = install_worker::resolve_worker_source(args.source_dir.as_deref())?;
-        let inputs = WriterInputs {
-            writer: Some(writer.to_path_buf()),
-        };
-        install_worker::install_one(workers, id, &source, &inputs).map(drop)
+        install_worker::install_one(workers, id, &source, writer).map(drop)
     })?;
     let binary = plan.binary();
     println!(
@@ -172,8 +157,8 @@ pub fn run(args: &InstallArgs) -> anyhow::Result<()> {
 }
 
 /// Carry out `plan`. `build_worker` installs the worker for a toolchain in a
-/// worker directory, qualifying it with the given writer; tests replace it.
-/// Returns the local config file it wrote.
+/// worker directory, qualifying it with the given writer, the copy of `exe`
+/// in `bin/`; tests replace it. Returns the local config file it wrote.
 fn install(
     plan: &Plan,
     args: &InstallArgs,
@@ -189,9 +174,10 @@ fn install(
     store::create_store_dir(&plan.store_dir, &plan.root)
         .with_context(|| format!("creating store {}", plan.store_dir.display()))?;
 
-    let writer = plan.writer();
-    install_writer(&writer, exe, args.standalone_writer.as_deref(), args.force)?;
-    copy_executable(exe, &plan.binary())?;
+    // Copy the server before the worker build: the copy is the writer that
+    // builds the worker's shims, the file the server will run as.
+    let binary = plan.binary();
+    copy_executable(exe, &binary)?;
 
     fs::create_dir_all(&plan.workers_dir).with_context(|| format!("creating {}", plan.workers_dir.display()))?;
     match install_worker::worker_freshness_in(&plan.workers_dir, &plan.toolchain) {
@@ -199,12 +185,12 @@ fn install(
             println!("worker for {}: current (use --force to rebuild)", plan.toolchain);
         }
         Freshness::Current | Freshness::Absent | Freshness::Stale(_) => {
-            build_worker(&plan.workers_dir, &plan.toolchain, &writer)?;
+            build_worker(&plan.workers_dir, &plan.toolchain, &binary)?;
         }
     }
 
     let mut paths = vec![
-        ("binary", plan.binary()),
+        ("binary", binary),
         ("workers_dir", plan.workers_dir.clone()),
         ("store_dir", plan.store_dir.clone()),
     ];
@@ -212,56 +198,6 @@ fn install(
         paths.push(("elan_home", home.clone()));
     }
     write_local_config(&plan.root, local, &paths)
-}
-
-/// Put the SDK writer at `dest`: `--standalone-writer` when given, else a
-/// `lean-rs-writer` of the pinned SDK version beside this executable, else one
-/// built with `cargo install`. A current writer already at `dest` stays unless
-/// `force` is set.
-fn install_writer(dest: &Path, exe: &Path, standalone: Option<&Path>, force: bool) -> anyhow::Result<()> {
-    if let Some(source) = standalone {
-        return copy_executable(source, dest);
-    }
-    if !force && writer_is_current(dest) {
-        return Ok(());
-    }
-    let sibling = exe.with_file_name(WRITER_FILE_NAME);
-    if writer_is_current(&sibling) {
-        return copy_executable(&sibling, dest);
-    }
-    build_writer(dest)
-}
-
-/// Whether `path` runs and reports the SDK writer version this host pins.
-fn writer_is_current(path: &Path) -> bool {
-    Command::new(path).arg("--version").output().is_ok_and(|output| {
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout).split_whitespace().last() == Some(lean_toolchain::VERSION)
-    })
-}
-
-/// `cargo install` the pinned `lean-rs-writer` into a scratch root beside
-/// `dest`, then move only the binary to `dest`.
-fn build_writer(dest: &Path) -> anyhow::Result<()> {
-    let bin = dest.parent().context("writer destination has no directory")?;
-    let scratch = tempfile::Builder::new().prefix(".cargo-install-").tempdir_in(bin)?;
-    let version = lean_toolchain::VERSION;
-    println!("==> installing {WRITER_FILE_NAME} {version} (crates.io)");
-    let status = Command::new("cargo")
-        .args(["install", "--locked", "--no-track", "--version"])
-        .arg(format!("={version}"))
-        .arg("--root")
-        .arg(scratch.path())
-        .arg(WRITER_FILE_NAME)
-        .status()
-        .context("cannot run cargo")?;
-    anyhow::ensure!(
-        status.success(),
-        "cargo install {WRITER_FILE_NAME}@={version} failed with status {status}; \
-         a Rust toolchain and network access are required, or pass --standalone-writer"
-    );
-    fs::rename(scratch.path().join("bin").join(WRITER_FILE_NAME), dest)?;
-    Ok(())
 }
 
 /// Copy the executable `source` to `dest` with mode 0755, replacing `dest`
@@ -330,7 +266,6 @@ mod tests {
         base: PathBuf,
         root: PathBuf,
         exe: PathBuf,
-        writer: PathBuf,
     }
 
     fn fixture() -> anyhow::Result<Fixture> {
@@ -342,14 +277,11 @@ mod tests {
         fs::write(root.join("lean-host-mcp.toml"), "[broker]\nmax_workers = 2\n")?;
         let exe = base.join("built-lean-host-mcp");
         fs::write(&exe, b"server")?;
-        let writer = base.join("built-writer");
-        fs::write(&writer, b"writer")?;
         Ok(Fixture {
             _tmp: tmp,
             base,
             root,
             exe,
-            writer,
         })
     }
 
@@ -358,7 +290,6 @@ mod tests {
             lake_root: fixture.root.clone(),
             dir,
             force: false,
-            standalone_writer: Some(fixture.writer.clone()),
             source_dir: None,
         }
     }
@@ -374,6 +305,10 @@ mod tests {
             anyhow::ensure!(
                 plan.store_dir.is_dir(),
                 "the worker build keeps native state in the store, so it must exist first"
+            );
+            anyhow::ensure!(
+                fs::read(writer)? == b"server",
+                "the worker build runs the server copy as its writer, so the copy must exist first"
             );
             builds.push((workers.to_path_buf(), id.to_string(), writer.to_path_buf()));
             let slot = workers.join(id.as_str());
@@ -404,7 +339,7 @@ mod tests {
             [(
                 local.join("workers"),
                 "v4.36.0".to_owned(),
-                local.join("bin/lean-rs-writer")
+                local.join("bin/lean-host-mcp")
             )]
         );
         let text = fs::read_to_string(config_file::local_file(root))?;
@@ -431,7 +366,10 @@ mod tests {
 
         assert_eq!(fs::read(local.join("bin/lean-host-mcp"))?, b"server");
         assert_eq!(mode(&local.join("bin/lean-host-mcp"))?, 0o755);
-        assert_eq!(fs::read(local.join("bin/lean-rs-writer"))?, b"writer");
+        let bin: Vec<_> = fs::read_dir(local.join("bin"))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<_>>()?;
+        assert_eq!(bin, ["lean-host-mcp"], "the server copy is also the writer");
         assert_eq!(mode(&local.join("store"))?, 0o700);
         assert_eq!(fs::read_to_string(local.join(".gitignore"))?, "*\n");
         assert_eq!(

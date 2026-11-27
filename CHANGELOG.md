@@ -12,9 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `lean-host-mcp install --lake-root PROJECT` installs everything one project needs under
-  `PROJECT/.local/lean-host-mcp/`: a copy of the server and the SDK writer in `bin/`, the worker for the project's
-  `lean-toolchain` in `workers/`, a private `store/`, and a local `config.toml` that records their absolute paths under
-  `[install]`. `--dir` moves `bin/`, `workers/` and `store/`. It never writes a tracked file.
+  `PROJECT/.local/lean-host-mcp/`: a copy of the server in `bin/`, which is also the SDK writer that builds the worker's
+  shims; the worker for the project's `lean-toolchain` in `workers/`; a private `store/`; and a local `config.toml` that
+  records their absolute paths under `[install]`. `--dir` moves `bin/`, `workers/` and `store/`. It never writes a
+  tracked file.
 - One server per store: a server with `--lake-root` locks `store/server.lock`, and a second one exits and names the pid
   and Lake root of the first. `LEAN_HOST_MCP_STORE_DIR` and `[install] store_dir` move the store.
 - `lean_build` runs Lake targets, or a recipe of Lake steps from the config, under the project's write turn. Checks wait
@@ -134,6 +135,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `store::owner_directory` replaces `ownership_registry`. Its lifecycle and contract tests went with it, since
   `lean-rs-writer` tests the same code, and so did `tests/writer_cli_domain.rs`, whose CLI clients are now the SDK's.
 - Remove the `build_development_shims` example; the worker's preparation mode builds the shims it carries.
+- Breaking: remove `install-worker --standalone-writer` and the standalone SDK writer. The installers build a worker's
+  shims with the server binary, which serves the SDK's writer: `install` with its copy in `bin/`, the file the server
+  runs as, and `install-worker` with its own executable. `install-worker` no longer looks for `lean-rs-writer` beside
+  itself, and `install` no longer installs `bin/lean-rs-writer` or runs `cargo install`. An old `bin/lean-rs-writer` can
+  be deleted.
 
 ### Fixed
 
@@ -154,8 +160,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The server creates a missing `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`. A relative path, or one it cannot create, fails with
   an error that names the variable and the path, in place of a bare `io: No such file or directory`.
 - A worker that exits before it connects no longer leaves its owner record in phase `dispatching`, where it held back
-  every later build that used the owner directory until someone deleted it. lean-rs 0.11 closes the record once it
-  reaps the child.
+  every later build that used the owner directory until someone deleted it. lean-rs 0.11 closes the record once it reaps
+  the child.
 - `lean_verify` and the declaration outline of a file check the whole file, header included, and drop the messages Lean
   marks silent, as `lake build` does. lean-rs 0.10's file driver checked the body without its header, so a header linter
   such as Mathlib's warned on every file. File-backed proof search still elaborates the body apart from its header.

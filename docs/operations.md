@@ -31,8 +31,8 @@ The server finds the Lean toolchain under `ELAN_HOME`, else under the elan home 
 
 The server uses its own executable as the writer helper for its builds, checks and workers, and names it in
 `LEAN_RS_WRITER_EXECUTABLE` for the children it starts. It checks a value in its own environment at startup but does not
-use it. `install` and `install-worker` build and check the worker's shims with the standalone SDK writer:
-`lean-rs-writer` beside the server executable, or the file `--standalone-writer` names.
+use it. The installers use a server executable as the writer too: `install` builds the worker's shims with its copy of
+the server in `bin/`, the file the server will run as, and `install-worker` builds them with its own executable.
 
 ## Configuration file
 
@@ -473,8 +473,7 @@ bootstrap failure.
 | Path | Contents |
 | --- | --- |
 | `.gitignore` | `*`, so Git ignores the directory even when the project does not ignore `.local/` |
-| `bin/lean-host-mcp` | a copy of the running executable |
-| `bin/lean-rs-writer` | the SDK writer that builds and checks the worker's shims |
+| `bin/lean-host-mcp` | a copy of the running executable, which also serves the SDK writer that builds the worker's shims |
 | `workers/` | the worker for the project's toolchain, built as `install-worker` builds it |
 | `store/` | the server's private state, mode 0700, including the native owner records that install binds |
 | `config.toml` | the local config file, with `[install]` set to the absolute `binary`, `workers_dir`, `store_dir` and `elan_home` |
@@ -489,9 +488,7 @@ PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
   `PROJECT/.local/lean-host-mcp/config.toml`, where the server reads it.
 - Without `--dir`, the worker and store directories follow the server's order: `LEAN_HOST_MCP_WORKERS_DIR` or
   `LEAN_HOST_MCP_STORE_DIR`, then an `[install]` value already in the config files, then the default above.
-- A current worker or writer stays; `--force` replaces both.
-- `--standalone-writer PATH` installs that writer. Otherwise install keeps a current `bin/lean-rs-writer`, copies a
-  current one from beside the running executable, or runs `cargo install lean-rs-writer` at the pinned SDK version.
+- A current worker stays; `--force` replaces it.
 - `--source-dir DIR` passes to the worker build, as for `install-worker`.
 
 Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
@@ -531,12 +528,12 @@ The provenance sidecar records the worker wire-protocol version independently of
   are current. Out-of-window toolchains are skipped (a worker for them could never load). `--force` rebuilds current
   workers too (e.g. to re-run the smoke test or replace a corrupted binary).
 - `install-worker --toolchain <id>` builds a fresh generation in its final directory. The new worker writes the shim
-  sources compiled into it to the generation's `shims/` directory and builds them there under the standalone SDK writer;
-  the installer records their identities in `worker.json`. Use `--standalone-writer PATH` to choose the writer. After
-  the builtin `Nat.add_zero` inspection and successful shutdown it atomically updates `current-generation`. Existing
-  workers retain their original paths. Installs without a selector continue to use the legacy directory. The installed
-  shims and their compiled Lean imports run without the source checkout or Cargo source cache. To use a different worker
-  root, reinstall there. The SDK manifest records absolute paths for its generation.
+  sources compiled into it to the generation's `shims/` directory and builds them there with the installer's own
+  executable as the SDK writer; the installer records their identities in `worker.json`. After the builtin
+  `Nat.add_zero` inspection and successful shutdown it atomically updates `current-generation`. Existing workers retain
+  their original paths. Installs without a selector continue to use the legacy directory. The installed shims and their
+  compiled Lean imports run without the source checkout or Cargo source cache. To use a different worker root, reinstall
+  there. The SDK manifest records absolute paths for its generation.
 - `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
   `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
 - `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are
@@ -556,16 +553,18 @@ no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/wor
 
 ### Upgrading from lean-rs 0.10
 
-The server, its writer and its workers must come from one SDK release. A 0.10 writer could leave a storage-turn record
-that 0.11 refuses instead of reading as a stopped writer: a build fails with `writer ownership record has unknown
-fields` or `unrecognized native registry directory .../.writer-storage-v1`. To upgrade:
+The server, its writer and its workers must come from one SDK release; the server is now its own writer. A 0.10 writer
+could leave a storage-turn record that 0.11 refuses instead of reading as a stopped writer: a build fails with `writer
+ownership record has unknown fields` or `unrecognized native registry directory .../.writer-storage-v1`. To upgrade:
 
 1. Stop every server and build that uses the project.
 2. Delete `.writer-storage-v1` from the owner directory: `owners` in the store, or `LEAN_RS_WORKER_OWNERS_DIRECTORY`.
 3. If the project's writer lock file holds a record with a field other than `version`, `owner` and `process`, such as
    `storage_turn`, empty the file. `lean-host-mcp writer-lock-path PROJECT` prints its path as `lock_path`.
-4. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT --force` replaces the writer and the
-   worker, and `install-worker --force` replaces a worker installed on its own.
+4. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT --force` replaces the worker, and
+   `install-worker --force` replaces a worker installed on its own.
+5. Delete an old `bin/lean-rs-writer` from the install directory, `PROJECT/.local/lean-host-mcp` unless install ran with
+   `--dir`. Nothing runs it now.
 
 ## Build, test, lint
 
@@ -581,7 +580,7 @@ scripts/check-parent-link.sh                                  # build and inspec
 LEAN_HOST_MCP_TEST_FIXTURE=/path/to/lean-host-mcp/fixtures/lean \
     cargo test --locked -p lean-host-mcp --test e2e --test build_requests --test artifact_invalidation \
     -- --ignored --test-threads=1                              # one at a time; see below
-LEAN_HOST_MCP_MATCHED_SDK_WRITER=/path/to/lean-rs-writer CARGO_NET_OFFLINE=true \
+CARGO_NET_OFFLINE=true \
     cargo test --locked -p lean-host-mcp --test http_transport install_and_serve_keep_no_state_in_an_empty_home \
     -- --ignored                                               # install and serve with an empty HOME
 ```
@@ -594,8 +593,7 @@ On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs,
 `cargo test --no-run`, then run each printed binary with `--ignored` under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
 `LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_RS_WORKER_OWNERS_DIRECTORY`,
 `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR`, `LEAN_HOST_MCP_STORE_DIR` and `TMPDIR` under the target directory. The empty-HOME
-test clears its children's environment, so it runs under `cargo test`. Build its writer from the lean-rs checkout at the
-version `Cargo.lock` pins, with `--target-dir` under this repository's target directory.
+test clears its children's environment, so it runs under `cargo test`.
 
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses

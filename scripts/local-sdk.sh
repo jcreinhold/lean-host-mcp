@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Sourced by the installed-worker test scripts. Set LEAN_RS_CHECKOUT to an SDK checkout, or
-# LEAN_SEMANTIC_SEARCH_CHECKOUT to a semantic search checkout, to build the writer, worker and host
-# from it instead of crates.io. Nothing here is committed or installed outside the caller's scratch
+# LEAN_SEMANTIC_SEARCH_CHECKOUT to a semantic search checkout, to build the worker and host from it
+# instead of crates.io. Nothing here is committed or installed outside the caller's scratch
 # directory.
 #
 # local_sdk_enable SCRATCH points every later Cargo call in this shell at the checkouts. It writes a
@@ -10,7 +10,6 @@
 # The patch lives in CARGO_HOME because Clippy and nextest do not see `cargo --config` patches.
 # Without a checkout both do nothing and the registry crates are used.
 
-LOCAL_SDK_ROOT=
 # Name prefixes of the patched packages, separated by spaces; empty when nothing is patched.
 LOCAL_SDK_PREFIXES=
 
@@ -19,8 +18,7 @@ local_sdk_enable() {
     local scratch=$1 real home entry checkout manifest name
     local checkouts=()
     if [[ -n ${LEAN_RS_CHECKOUT:-} ]]; then
-        LOCAL_SDK_ROOT=$(CDPATH='' cd -- "$LEAN_RS_CHECKOUT" && pwd -P)
-        checkouts+=("$LOCAL_SDK_ROOT")
+        checkouts+=("$(CDPATH='' cd -- "$LEAN_RS_CHECKOUT" && pwd -P)")
         LOCAL_SDK_PREFIXES="lean-rs lean-toolchain"
     fi
     if [[ -n ${LEAN_SEMANTIC_SEARCH_CHECKOUT:-} ]]; then
@@ -64,18 +62,6 @@ local_sdk_cargo() {
     else
         cargo "$subcommand" --locked "$@"
     fi
-}
-
-# Install the SDK writer into ROOT/bin: from the SDK checkout when one is set, else the pinned
-# release. Print its version so the log shows which writer the tests ran.
-local_sdk_install_writer() {
-    local root=$1 version=$2
-    if [[ -n $LOCAL_SDK_ROOT ]]; then
-        cargo install --debug --locked --path "$LOCAL_SDK_ROOT/crates/lean-rs-writer" --root "$root"
-    else
-        cargo install --debug --locked --version "=$version" --root "$root" lean-rs-writer
-    fi
-    "$root/bin/lean-rs-writer" --version
 }
 
 # Fail when Cargo kept a registry copy of a patched crate in the graph of MANIFEST. Cargo ignores a

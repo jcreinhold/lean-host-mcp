@@ -216,7 +216,8 @@ resolution also rechecks worker readiness, including the current header digest.
 `install-worker` writes `worker.json` beside the installed binary: toolchain id, full `lean.h` SHA-256, build-time Lean
 version, host version, worker protocol, digest support at build time, and runtime smoke outcome. Host version is
 informational; protocol determines wire compatibility. A legacy sidecar without protocol information leaves the worker
-handshake authoritative.
+handshake authoritative. The sidecar names no writer. The installer builds the shims with a server executable, the
+digests of the shim files bind that build, and the server runs its own executable as the writer.
 
 The smoke test opens a worker session importing `Init` and inspects `Nat.add_zero`. Failure exits installation nonzero
 but retains the binary and failed record so `--list` and readiness can explain the problem. Missing provenance or smoke

@@ -48,15 +48,15 @@ lean-host-mcp install --lake-root /path/to/project
 ```
 
 `install` reads `/path/to/project/lean-toolchain` and installs under `/path/to/project/.local/lean-host-mcp/`, which Git
-ignores: a copy of the server and the SDK writer `lean-rs-writer` in `bin/`, the worker for that toolchain in
-`workers/`, the server's private store in `store/`, and `config.toml`, which records their absolute paths under
-`[install]`. `--dir` moves `bin/`, `workers/` and `store/`; without it, `LEAN_HOST_MCP_WORKERS_DIR` and
-`LEAN_HOST_MCP_STORE_DIR` move the worker directory and the store for both `install` and the server. The store also
-holds the native owner records, the semantic runtime cache and the server's process records, and `config.toml` records
-the elan home, so neither `install` nor the server keeps state under `HOME` except its socket directory (see
-[operations](docs/operations.md)). Rerun `install` after a toolchain bump. A server installed from a checkout builds the
-worker from that workspace; `--source-dir` selects another checkout. Build each workspace member with `-p`;
-`cargo build --workspace` would link `libleanshared` into the parent and break multi-toolchain dispatch. See
+ignores: a copy of the server in `bin/`, which is also the SDK writer; the worker for that toolchain in `workers/`; the
+server's private store in `store/`; and `config.toml`, which records their absolute paths under `[install]`. `--dir`
+moves `bin/`, `workers/` and `store/`; without it, `LEAN_HOST_MCP_WORKERS_DIR` and `LEAN_HOST_MCP_STORE_DIR` move the
+worker directory and the store for both `install` and the server. The store also holds the native owner records, the
+semantic runtime cache and the server's process records, and `config.toml` records the elan home, so neither `install`
+nor the server keeps state under `HOME` except its socket directory (see [operations](docs/operations.md)). Rerun
+`install` after a toolchain bump. A server installed from a checkout builds the worker from that workspace;
+`--source-dir` selects another checkout. Build each workspace member with `-p`; `cargo build --workspace` would link
+`libleanshared` into the parent and break multi-toolchain dispatch. See
 [server installation](docs/operations.md#installing-the-server) and
 [development commands](docs/operations.md#build-test-lint).
 

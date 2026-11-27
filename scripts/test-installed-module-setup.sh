@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Package the parent and worker, build and install the pair from the archives, and prepare semantic search with it.
 # With --release, also check the packaged parent's link set and run the stdio suite against the packaged worker.
-# Set LEAN_RS_CHECKOUT or LEAN_SEMANTIC_SEARCH_CHECKOUT to build the pair and writer from those checkouts;
-# release checks leave both unset.
+# Set LEAN_RS_CHECKOUT or LEAN_SEMANTIC_SEARCH_CHECKOUT to build the pair from those checkouts; release
+# checks leave both unset.
 set -euo pipefail
 CDPATH='' cd -- "$(dirname -- "$0")/.."
 # shellcheck source=scripts/local-sdk.sh
@@ -27,7 +27,6 @@ if [[ $CARGO_TARGET_DIR != /* ]]; then
 fi
 export CARGO_TARGET_DIR
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
-sdk=$(python3 -c 'import tomllib; [v]=[p["version"] for p in tomllib.load(open("Cargo.lock","rb"))["package"] if p["name"]=="lean-toolchain"]; print(v)')
 mkdir -p "$CARGO_TARGET_DIR"
 scratch=$(mktemp -d "$CARGO_TARGET_DIR/module-setup.XXXXXX")
 trap 'local_sdk_restore "$scratch"; rm -rf -- "$scratch"' EXIT
@@ -99,11 +98,10 @@ if [[ ! -x $built_parent ]]; then
 fi
 parent="$scratch/shipping-lean-host-mcp"
 cp "$built_parent" "$parent"
-local_sdk_install_writer "$scratch/tools" "$sdk"
+# The packaged parent serves the SDK writer for the worker's shims and the
+# bundled Lean capability. Cold compilation has its own SDK budget.
 "$parent" install-worker --toolchain "$id" --workers-dir "$scratch/workers" \
-    --source-dir "$worker_source" --standalone-writer "$scratch/tools/bin/lean-rs-writer"
-# Build the bundled Lean capability under the packaged writer. Cold
-# compilation has its own SDK budget.
+    --source-dir "$worker_source"
 local_sdk_cargo run --manifest-path "$parent_manifest" --example prepare_semantic_smoke -- \
     "$LEAN_HOST_MCP_SEMANTIC_CACHE_DIR" "$toolchain" "$LEAN_SYSROOT" "$parent"
 if "$release"; then

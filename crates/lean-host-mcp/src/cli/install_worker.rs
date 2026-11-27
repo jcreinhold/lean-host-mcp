@@ -14,8 +14,9 @@
 //!   elan home is [`toolchain::elan_home`], which with `--lake-root` includes
 //!   the root's recorded `[install] elan_home`.
 //!
-//! A build runs the worker's smoke test, which is native work. With
-//! `--lake-root` its state goes in that root's store; without, set
+//! A build uses this executable as the SDK writer for the worker's shims, and
+//! runs the worker's smoke test, which is native work. With `--lake-root` its
+//! state goes in that root's store; without, set
 //! `LEAN_RS_WORKER_OWNERS_DIRECTORY`.
 //! - `--list`: print a table of currently-installed workers, including a
 //!   `protocol` column that reports wire compatibility.
@@ -109,10 +110,6 @@ pub struct InstallWorkerArgs {
     #[arg(long, value_name = "DIR")]
     pub lake_root: Option<PathBuf>,
 
-    /// Explicit standalone writer for preparing the candidate's two shim packages.
-    #[arg(long)]
-    pub standalone_writer: Option<PathBuf>,
-
     /// Workspace root to build from. Defaults to the workspace this
     /// binary was compiled in; useful when the installed binary lives
     /// somewhere other than the source tree.
@@ -158,14 +155,16 @@ pub fn run(args: &InstallWorkerArgs) -> anyhow::Result<()> {
     // the smoke test keeps its native state before a long build.
     use_native_state(lake_root.as_deref())?;
     let source = resolve_worker_source(args.source_dir.as_deref())?;
+    // This executable serves the SDK writer that builds the worker's shims.
+    let writer = std::env::current_exe().map_err(|e| anyhow::anyhow!("cannot find this executable: {e}"))?;
     if let Some(raw) = args.toolchain.as_deref() {
         // `check_arg_combination` ruled out `--toolchain --auto`, so this is a
         // single-toolchain install (always overwrites — no freshness check).
         let id = ToolchainId::parse(raw)?;
-        install_one(&root, &id, &source, &args.writer_inputs())?;
+        install_one(&root, &id, &source, &writer)?;
         return Ok(());
     }
-    run_auto(&root, &source, args)
+    run_auto(&root, &source, &writer, args.force)
 }
 
 /// Keep the native state of a worker's smoke test in the store of the
@@ -201,22 +200,6 @@ fn workers_root(args: &InstallWorkerArgs, lake_root: Option<&Path>) -> anyhow::R
                 "no worker directory; pass --lake-root <project> or --workers-dir <dir>, or set {WORKERS_DIR_ENV}"
             )
         })
-}
-
-/// The SDK writer a worker install builds its shims with.
-#[derive(Debug, Default)]
-pub(super) struct WriterInputs {
-    /// The standalone SDK writer; `None` uses `lean-rs-writer` beside this
-    /// executable.
-    pub(super) writer: Option<PathBuf>,
-}
-
-impl InstallWorkerArgs {
-    fn writer_inputs(&self) -> WriterInputs {
-        WriterInputs {
-            writer: self.standalone_writer.clone(),
-        }
-    }
 }
 
 /// Validate the `--toolchain` target modifier against the chosen action. The
@@ -338,8 +321,7 @@ struct ListRow {
     sort_key: (u8, (u32, u32, u32, u8, u32), String),
 }
 
-fn run_auto(root: &Path, source: &WorkerSource, args: &InstallWorkerArgs) -> anyhow::Result<()> {
-    let force = args.force;
+fn run_auto(root: &Path, source: &WorkerSource, writer: &Path, force: bool) -> anyhow::Result<()> {
     let toolchains = discover_elan_toolchains()?;
     if toolchains.is_empty() {
         let home = toolchain::elan_home().map_or_else(|| "$ELAN_HOME".to_owned(), |home| home.display().to_string());
@@ -353,7 +335,7 @@ fn run_auto(root: &Path, source: &WorkerSource, args: &InstallWorkerArgs) -> any
             AutoDecision::SkipCurrent => {
                 println!("{id}: current; skipping (use --force to rebuild)");
             }
-            AutoDecision::Install(reason) => match install_one(root, &id, source, &args.writer_inputs()) {
+            AutoDecision::Install(reason) => match install_one(root, &id, source, writer) {
                 Ok(_) => println!("{id}: installed ({reason})"),
                 Err(err) => {
                     eprintln!("{id}: failed: {err}");
@@ -608,11 +590,13 @@ fn prune_reason(name: &str, install_dir: &Path) -> Option<&'static str> {
 }
 
 /// Build, qualify and select a worker for `id` in the worker directory `root`.
+/// `writer`, a host executable that serves the SDK helper subcommands, builds
+/// the worker's shims.
 pub(super) fn install_one(
     root: &Path,
     id: &ToolchainId,
     source: &WorkerSource,
-    inputs: &WriterInputs,
+    writer: &Path,
 ) -> anyhow::Result<PathBuf> {
     // Classify against the supported window *before* the multi-minute build —
     // an out-of-window worker would only fail lean-rs-sys's header-digest
@@ -638,12 +622,9 @@ pub(super) fn install_one(
     let elan_dir = id.elan_dir()?;
 
     let dest_dir = root.join(id.as_str());
-    let writer = match &inputs.writer {
-        Some(path) => path.clone(),
-        None => std::env::current_exe()?.with_file_name("lean-rs-writer"),
-    }
-    .canonicalize()
-    .map_err(|e| anyhow::anyhow!("select the installed SDK writer with --standalone-writer: {e}"))?;
+    let writer = writer
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot find the SDK writer {}: {e}", writer.display()))?;
     fs::create_dir_all(&dest_dir)?;
     let _mutation = lock_slot(&dest_dir)?;
     let generation = prepare_generation(&dest_dir, id, &elan_dir.canonicalize()?, &writer, |dir| {

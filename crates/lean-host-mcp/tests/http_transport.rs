@@ -589,17 +589,13 @@ async fn streamable_http_fixture_tool_call() {
 /// `request_id`, so each reply names a server-made `srv-` id.
 ///
 /// `ELAN_HOME`, `CARGO_HOME` and `RUSTUP_HOME` keep their real values, and
-/// install builds the release worker offline. Set
-/// `LEAN_HOST_MCP_MATCHED_SDK_WRITER` to a `lean-rs-writer` built locally at
-/// the version `Cargo.lock` pins, so install downloads nothing. The sockets go
-/// to a short directory in the target directory: `$HOME/.lean-host-mcp-ipc`
-/// with `HOME` there makes socket paths too long for macOS.
+/// install builds the release worker offline; the installed server copy is
+/// the SDK writer, so install downloads nothing. The sockets go to a short
+/// directory in the target directory: `$HOME/.lean-host-mcp-ipc` with `HOME`
+/// there makes socket paths too long for macOS.
 #[tokio::test]
-#[ignore = "builds the release worker; needs LEAN_HOST_MCP_MATCHED_SDK_WRITER"]
+#[ignore = "builds the release worker"]
 async fn install_and_serve_keep_no_state_in_an_empty_home() {
-    let writer = std::env::var_os("LEAN_HOST_MCP_MATCHED_SDK_WRITER")
-        .map(PathBuf::from)
-        .expect("set LEAN_HOST_MCP_MATCHED_SDK_WRITER to a local lean-rs-writer");
     let real_home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let real = |name: &str, default: &str| {
         std::env::var_os(name)
@@ -666,8 +662,6 @@ async fn install_and_serve_keep_no_state_in_an_empty_home() {
         .arg("install")
         .arg("--lake-root")
         .arg(&project)
-        .arg("--standalone-writer")
-        .arg(&writer)
         .env_clear()
         .envs(envs.iter().cloned())
         .stdin(Stdio::null())
