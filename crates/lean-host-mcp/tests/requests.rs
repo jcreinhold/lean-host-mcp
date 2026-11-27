@@ -369,6 +369,71 @@ async fn a_killed_server_interrupts_its_build_and_runs_the_queued_one() -> TestR
     Ok(())
 }
 
+/// A server killed while its worker is warm and a file check runs takes both
+/// with it, guardians included, and the next server's build runs without
+/// waiting for them.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Lean toolchain and an installed worker: set LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT, and LEAN_HOST_MCP_WORKERS_DIR"]
+async fn a_killed_servers_workers_exit_and_the_next_build_runs() -> TestResult {
+    std::env::var_os("LEAN_HOST_MCP_WORKERS_DIR").ok_or("set LEAN_HOST_MCP_WORKERS_DIR to an installed worker")?;
+    let chain = marked_chain()?;
+    chain.write("Slow.lean", "#eval IO.sleep 60000\n")?;
+    let scratch = Scratch::new()?;
+    let launch = Launch::new(&chain.root, &scratch)?;
+    let server = Server::start(&launch, STARTUP).await?;
+    let client = Client::new(&server.url, "warm")?;
+    let trial = json!({"kind": "command", "imports": ["Chain.C"], "commands": "#check b_eq"});
+    client.run("warm-trial-0001", "lean_trial", &trial).await?;
+    let ended = client.ended("warm-trial-0001", PATIENCE).await?;
+    assert_eq!(http::state(&ended), Some("done"), "{ended}");
+    let check = json!({"kind": "file_diagnostics", "file": "Slow.lean"});
+    client.run("slow-check-0001", "lean_status", &check).await?;
+    let until = Instant::now().checked_add(PATIENCE).ok_or("patience")?;
+    let tree = loop {
+        let tree = http::descendants(server.pid()?)?;
+        let lean = |command: &str| {
+            command.contains("Slow.lean")
+                && command
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|program| program.ends_with("/lean"))
+        };
+        if tree.iter().any(|process| lean(&process.command)) {
+            break tree;
+        }
+        if Instant::now() >= until {
+            return Err("no Lean process checks Slow.lean".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let guardians = tree
+        .iter()
+        .filter(|process| process.command.contains("native-guardian"))
+        .count();
+    assert!(guardians >= 2, "a guardian for the worker and the check: {tree:#?}");
+    server.kill().await?;
+    let killed_at = Instant::now();
+    let report = http::watch_until_gone(&tree, killed_at, Duration::from_secs(30));
+    for line in &report {
+        eprintln!("after the kill: {line}");
+    }
+    let left: Vec<&String> = report.iter().filter(|line| line.contains("still running")).collect();
+    assert!(left.is_empty(), "30 s after the kill: {left:#?}");
+
+    let server = Server::start(&launch, STARTUP).await?;
+    let client = Client::new(&server.url, "after")?;
+    let started = Instant::now();
+    client.run("after-build-0001", "lean_build", &mark("after", 0)).await?;
+    assert_passed(&client.ended("after-build-0001", PATIENCE).await?);
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the build took {:?}",
+        started.elapsed()
+    );
+    server.stop().await?;
+    Ok(())
+}
+
 /// A file whose check holds Lean for two seconds.
 const SLOW: &str = "#eval IO.sleep 2000\n";
 

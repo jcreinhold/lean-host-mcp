@@ -674,7 +674,8 @@ requires the setup-aware verification shim. File-backed `lean_lookup` with `kind
 goal elaboration.
 
 Lake writes its own config cache under `.lake/config/` when the lakefile changed, under Lake's own lock, so a file check
-right after a lakefile edit can write there.
+right after a lakefile edit can write there. When two checks start that write at the same moment, Lake fails one with
+"could not acquire an exclusive configuration lock"; retry it.
 
 **Elan maintenance.** Keep the selected canonical Elan toolchain installed and unchanged while its workers run. Drain
 and stop those workers before uninstalling or replacing that toolchain. The host checks release identity at admission;

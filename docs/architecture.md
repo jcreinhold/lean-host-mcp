@@ -440,6 +440,12 @@ process of the build have exited. Lake decides what to build and in which order;
 hands to Lake. Do not add an import graph walk or a build scheduler: a test scans the build path for Lake's import-graph
 queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build` under a read turn.
 
+After a lakefile edit, `lake setup-file` rewrites Lake's configuration cache, and checks hold read turns at once, so two
+can start that rewrite together. Lake locks the cache itself (`importConfigFile` in `Lake/Load/Lean/Elab.lean`):
+readers share the trace lock and a rewrite holds it alone, so the cache stays whole. Of two processes that start a
+rewrite at the same moment, Lake fails one with "could not acquire an exclusive configuration lock"; that check reports
+Lake's error, and a retry reads the new cache.
+
 A raw `lake build` takes no kernel lock, so neither the turns nor the finished-build count see it. Running one while the
 server reads the project is outside the contract.
 
@@ -459,7 +465,8 @@ that checks the code. "None yet" marks a gap.
 | No build starts between a check's `setup-file` and its use of the imports. | `project_lock/tests.rs`: `a_nested_read_reuses_the_turn_while_a_writer_waits` |
 | One writer at a time, across processes and server restarts. | SDK `lean-toolchain/src/writer_lock/tests.rs`; `tests/requests.rs`: `a_killed_server_interrupts_its_build_and_runs_the_queued_one`; `tests/many_clients.rs`: `many_clients_share_one_project` |
 | No lock release while a process of the build may live. | SDK `writer_lock/tests.rs`: `inherited_same_description_loan_retains_exclusion_until_owned_child_exit` |
-| No worker slot returns while its worker may live. | None yet; SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` tests reaping and slot counts nearby |
+| No worker slot returns while its worker may live. | SDK `lean-rs-worker-parent/src/crash_ownership/tests/guarded_release.rs`: `guarded_child_that_exits_before_hello_closes_its_record_and_slot`, for a worker that exits before it connects; otherwise none yet, and SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` tests reaping and slot counts nearby |
+| A killed server's workers and guardians exit with it, and the next server's build runs without waiting for them. | `tests/requests.rs`: `a_killed_servers_workers_exit_and_the_next_build_runs` |
 | A wait for a turn ends at its deadline. | `project_lock/tests.rs`: `a_read_wait_ends_at_its_deadline_or_on_cancel`, `a_write_wait_ends_at_its_deadline_or_on_cancel_and_leaves_the_line` |
 | One launch per request ID; a record before launch; the same ID with other arguments refused; a stored result never changes; a restart ends every recorded request; a call without an ID runs with a server ID and no record; checks on one project hold their read turns at once. | `requests/store_tests.rs`: `parallel_inserts_of_one_id_insert_once`, `one_id_holds_one_call`, `a_final_row_never_changes`; `tests/requests.rs`: `a_named_request_runs_once_and_keeps_its_result`, `the_same_build_sent_three_times_at_once_starts_one_lake`, `another_call_on_an_id_fails_and_makes_no_row`, `a_build_outlives_its_killed_client`, `a_killed_server_interrupts_its_build_and_runs_the_queued_one`, `an_ended_request_survives_a_server_kill`, `a_direct_verify_names_a_server_id`, `checks_on_one_project_run_at_once`; `tests/many_clients.rs`: `many_clients_share_one_project`; `tests/http_transport.rs`: `install_and_serve_keep_no_state_in_an_empty_home` |
 
