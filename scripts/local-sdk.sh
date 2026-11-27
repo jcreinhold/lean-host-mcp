@@ -19,7 +19,7 @@ local_sdk_enable() {
     mkdir -p "$home"
     for entry in registry git; do
         if [[ -e $real/$entry ]]; then
-            ln -s "$real/$entry" "$home/$entry"
+            ln -sfn "$real/$entry" "$home/$entry"
         fi
     done
     {

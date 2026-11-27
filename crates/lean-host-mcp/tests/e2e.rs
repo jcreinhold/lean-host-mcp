@@ -1396,6 +1396,90 @@ async fn lean_trial_command_and_lean_status_file_diagnostics() {
 
 #[tokio::test]
 #[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
+async fn worker_file_checks_see_the_header_and_drop_silent_messages() {
+    let Some(root) = fixture_root() else {
+        panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
+    };
+    // `lake build` checks the whole file, header included, and drops the
+    // messages Lean marks silent. The worker's file checks must do the same,
+    // or a linter that reads the header, such as Mathlib's, warns on every file.
+    let tmp = tempfile::tempdir().expect("temp fixture copy");
+    let work = tmp.path().join("fixture");
+    copy_dir_recursive(&root, &work);
+    fs::write(
+        work.join("LeanRsFixture/WholeFile.lean"),
+        [
+            "import Lean",
+            "open Lean Elab Command",
+            "elab \"#silent_warning\" : command => do logAt (← getRef) m!\"silent warning\" (severity := .warning) (isSilent := true)",
+            "#silent_warning",
+            "elab \"#needs_header\" : command => do",
+            "  unless (← getFileMap).source.startsWith \"import\" do logError m!\"checked without the header\"",
+            "#needs_header",
+            "theorem LeanRsFixture.WholeFile.wholeFile : True := trivial",
+            "",
+        ]
+        .join("\n"),
+    )
+    .expect("write whole-file fixture");
+    let ctx = open_ctx(&work);
+
+    let verify = semantic_data(
+        lean_verify(
+            &ctx,
+            semantic_request_without_kind(serde_json::json!({
+                "targets": [{
+                    "kind": "explicit",
+                    "file": "LeanRsFixture/WholeFile.lean",
+                    "declarations": ["LeanRsFixture.WholeFile.wholeFile"]
+                }],
+                "allow_sorry": false,
+                "detail": "full"
+            })),
+        )
+        .await
+        .expect("lean_verify whole file"),
+    );
+    assert_eq!(
+        verify.pointer("/results/0/verification_status"),
+        Some(&serde_json::json!("verified")),
+        "lean_verify should check the file as `lake build` does: {verify:?}"
+    );
+    let text = verify.to_string();
+    assert!(
+        !text.contains("checked without the header") && !text.contains("silent warning"),
+        "lean_verify should see the header and drop silent messages: {verify:?}"
+    );
+
+    let outline = semantic_data(
+        lean_lookup(
+            &ctx,
+            semantic_request(
+                "declarations",
+                serde_json::json!({
+                    "target": { "kind": "file", "path": "LeanRsFixture/WholeFile.lean" },
+                    "limit": 20
+                }),
+            ),
+        )
+        .await
+        .expect("whole-file outline"),
+    );
+    let row = outline["declarations"]
+        .as_array()
+        .expect("declarations array")
+        .iter()
+        .find(|row| row["name"] == "LeanRsFixture.WholeFile.wholeFile")
+        .unwrap_or_else(|| panic!("outline should list the theorem: {outline:?}"));
+    assert_eq!(
+        row.pointer("/declaration_span/start_line"),
+        Some(&serde_json::json!(8)),
+        "outline spans should be file positions: {row:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a built Lake fixture; set LEAN_HOST_MCP_TEST_FIXTURE to enable"]
 async fn find_references_project_scope_reads_index_with_cross_module_hits() {
     let Some(root) = fixture_root() else {
         panic!("LEAN_HOST_MCP_TEST_FIXTURE not set");
