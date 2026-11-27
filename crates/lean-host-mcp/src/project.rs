@@ -3686,7 +3686,7 @@ mod tests {
             config,
         );
         for _ in 0..3 {
-            let _ = broker.runtime_control(&crate::broker::RuntimeControlRequest::default());
+            let _ = broker.runtime_status();
         }
         let output = buffer.text();
         assert_eq!(output.matches("two-import Mathlib sizing estimate").count(), 1);

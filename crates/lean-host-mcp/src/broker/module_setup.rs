@@ -240,7 +240,7 @@ impl ProjectBroker {
         // The turn and guard G hold from setup-file until the check ends.
         self.ensure_read(&root).await?;
         let setup = self.setup_file(&root, Path::new(file), source).await?;
-        let activity = self.preparation_activity(&root).await?;
+        let activity = self.preparation_activity();
         let reader = self.installed_reader(&root, meta).await?;
         setup.check(&root, &reader.sysroot, &reader.custody)?;
         if fs::read(file)? != source.as_bytes() {
@@ -335,7 +335,7 @@ impl ProjectBroker {
             .elan_dir()
             .map_err(|e| ServerError::BadProject(e.to_string()))?
             .canonicalize()?;
-        let activity = self.preparation_activity(root).await?;
+        let activity = self.preparation_activity();
         let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root)?;
         let lake = sysroot.join("bin/lake");
         let cwd = root.to_owned();

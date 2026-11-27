@@ -10,7 +10,7 @@ coordination uses `lean_compatibility` and `lean_runtime`; `lean_run` and `lean_
 - Shared contracts: [response shape](#response-shape), [output carrier](#output-carrier),
   [request synonyms](#request-synonyms), [proof workflow](#proof-workflow).
 - Coordination: [native compatibility](#native-compatibility), [named requests](#named-requests),
-  [worker activity and admission leases](#worker-activity-and-admission-leases).
+  [worker activity](#worker-activity).
 - Lake: [builds](#lean_build), [import closures](#lean_imports).
 
 ```text
@@ -20,7 +20,7 @@ lean_context -> lean_lookup -> lean_trial -> lean_verify
 
 The semantic tools read files and elaborate in memory without applying source edits automatically. Lean commands,
 tactics, and import initializers can perform IO with the server user's privileges; the worker is not an OS sandbox. Only
-use trusted local clients and projects. `lean_runtime` may pause admission or explicitly retire idle workers.
+use trusted local clients and projects.
 
 Invocation/runtime failures with no domain data set MCP `isError: true` and retain the semantic `errors` and `trust`
 envelope. Negative proof/check verdicts remain successful tool executions with domain data, not MCP errors.
@@ -50,7 +50,7 @@ absence of prior IO, or readiness of arbitrary first-party artifacts.
 Save the contract and instance with the request. Semantic responses carry the actual call's receipt at
 `trust.native_compatibility`, even with quiet telemetry. Validate it against the saved contract before accepting a
 result. To recover a lost reply, read the same `request_id` with `lean_get` rather than sending the call under a new id.
-`lean_runtime(action=status)` remains a non-mutating advisory snapshot and never opens a worker.
+`lean_runtime` is an advisory snapshot and never opens a worker.
 
 `lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and helper
 configuration without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded handshake.
@@ -166,9 +166,10 @@ a tool error of the same shape, whose code is the error's `reason`, `invalid_arg
 [Operations](operations.md#request-table) describes the table and its settings. `lean_runtime` reports
 `requests: {queued, running}` and the capability `durable_requests_v1`.
 
-## Worker Activity And Admission Leases
+## Worker activity
 
-`lean_runtime` always replies at once and never runs as a named request. It has five actions:
+`lean_runtime` takes no arguments, replies at once and never runs as a named request. It reads the server's own state,
+never opens a Lean worker, and pauses or retires nothing.
 
 Every response includes `build` with package `version`, full Git `revision`, and build-time `dirty` state. Missing Git
 metadata (for example, an exported source archive) is reported as null, never guessed from the runtime checkout. A Git
@@ -180,65 +181,22 @@ values the running process actually uses, not the current contents of a configur
 credentials are exposed. Transport addresses are not part of the transport-agnostic tool service.
 
 On a server with a store, `requests: {queued, running}` counts the named requests that have not ended; a server without
-one leaves `requests` out and does not list `durable_requests_v1`. Settings, build identity, request counts, and
-capability discovery never open a Lean worker.
+one leaves `requests` out and does not list `durable_requests_v1`.
 
-| Action | Fields | Behavior |
-| --- | --- | --- |
-| `status` (default) | none | Observe resident workers, startup callers, occupied slots, and admission state. |
-| `acquire` | optional `lease_seconds`, `retire_idle` | Atomically pause admission if no worker request or startup is admitted. |
-| `drain` | optional `lease_seconds`, `retire_idle` | Pause new admission immediately and let already-admitted work finish. |
-| `renew` | `lease_id`, optional `lease_seconds` | Extend the caller's unexpired lease. |
-| `release` | `lease_id` | Release that lease and resume ordinary admission. |
+`pool` describes the workers:
 
-Lease lifetimes default to 30 seconds and must be between 1 and 300 seconds. Keep the returned `lease_id` private;
-status never reveals it. Another connection can renew or release the lease with its token. An expired token cannot
-affect a later lease. Leases expire after client failure and do not survive a server restart; `pool.instance_id`
-identifies this broker lifetime. Renew well before expiry while depending on the pause, and stop relying on it if
-renewal fails. Losing a response can lose the token; in that case wait for expiry rather than assuming ownership.
+| Field | Meaning |
+| --- | --- |
+| `instance_id` | This broker lifetime; it changes when the server restarts. |
+| `max_workers`, `max_workers_per_project` | The configured slot limits. |
+| `occupied_slots` | Slots still owned: a worker starting, resident, retiring, or whose exit is not confirmed. |
+| `outstanding_jobs` | Admitted requests, startups, preparation and maintenance, each counted until its cleanup ends, including work of a worker no longer in `projects`. |
+| `workers_stopped` | True only once every slot and every preparation cleanup is released. |
+| `acquiring_projects` | Roots whose callers are preparing, starting, or waiting for a worker. |
+| `projects` | Each resident worker: `idle`, `outstanding_jobs`, `admitted_caller`, `healthy`, and its last published `runtime` facts. |
 
-Acquire returns `acquired`, `busy` (a request or startup already admitted), or `leased` (another lease holds admission).
-It never cancels existing work or waits for capacity. While held, new worker-backed calls return the retryable semantic
-reason `worker_pool_leased`; cheap project status and runtime coordination remain available. The ordinary worker queue
-and parallelism are unchanged outside a lease. There is no priority or fairness guarantee between competing acquirers.
-
-Servers advertising `draining_lease_v1` also accept `drain`. It returns an owned token with `draining` while earlier
-work finishes, or `acquired` when ready. Later worker-backed requests wait inside the server, with their existing
-timeout and cancellation, rather than overtaking the drain. They resume after release or expiry without client
-resubmission. Already-admitted startup continues; a waiting later caller owns no worker or startup slot.
-
-Renew the same token to advance the drain. With `retire_idle: true`, a successful `ok` renewal confirms workers have
-stopped; `draining` means they have not. A generic status call cannot advance a drain or grant permission to start a
-build. Do not hold a build-file lock while waiting for work that may need that lock to finish. After taking the build
-lock, recheck the live token before starting external work. Competing drain owners still have no fairness guarantee.
-
-Expiry restores server admission, but it does **not** prove an external build stopped. If its owner dies while its child
-keeps writing, TTL alone cannot exclude server work. Keep actual build-file/process protections and stop external work
-when lease ownership is lost. This feature does not claim crash-safe exclusion from arbitrary external writers.
-
-An ordinary status snapshot is advisory: another request can start immediately after it. Only a successful, unexpired
-owned lease closes that race. The admission check and lease acquisition share the registry lock. Admitted callers count
-as active before enqueue, and queued/running messages remain active through cancellation cleanup. An opening caller
-retains startup ownership even if its HTTP connection disappears. Background recycling and prewarming use the same
-admission boundary and count as active work. The pool-level `outstanding_jobs` count also retains work owned by a
-controller that has been removed from the resident registry.
-
-By default acquire keeps workers and their warm caches across ordinary idle-reaper ticks. Independent artifact-writer
-demand can still retire an affected idle generation after admitted work finishes; the lease continues to fence MCP
-admission and is neither advanced nor released by that handoff. For a caller that actually needs their memory,
-explicitly set `retire_idle: true` on acquire. `retirement_requested` counts shutdown requests; it does not acknowledge
-child exit. Wait for `pool.workers_stopped: true`, under the same live lease, before relying on released worker
-capacity. An occupied slot may represent a starting, resident, retiring, or uncertain worker; uncertain shutdown
-continues to count and must not be treated as freed memory. Poll no faster than once per second while waiting, and renew
-the lease if needed.
-
-The lease covers only this server's worker admission. It does not reserve RAM, stop other programs, coordinate another
-server process, bind results to a source revision, or replace a caller's build/output locks. The caller chooses when to
-claim and whether retirement is worth losing warm caches.
-
-For example, obtain a memory handoff with `{"action":"acquire","retire_idle":true,"lease_seconds":30}`, retain its
-token, observe confirmed exit, renew during the external operation, and release in cleanup. If acquire is busy, continue
-independent work or wait for the existing owner; do not kill the active worker.
+A snapshot is advisory: another request can start right after it. A slot counts until its worker's exit is confirmed, so
+an uncertain shutdown is not freed memory.
 
 ## `lean_build`
 

@@ -1036,7 +1036,7 @@ lean_lib Demo
             max_workers_per_project: std::num::NonZeroUsize::MIN,
             idle_timeout: Duration::ZERO,
         });
-        let activity = broker.preparation_activity(&root).await.unwrap();
+        let activity = broker.preparation_activity();
         let task_root = root.clone();
         let contract = fixture_contract(&root);
         let task = tokio::spawn(async move {
@@ -1050,19 +1050,9 @@ lean_lib Demo
             .await
         });
         wait_for_file(&root.join("configuration-started")).await;
-        let busy = broker.runtime_control(&crate::broker::RuntimeControlRequest {
-            action: crate::broker::RuntimeAction::Acquire,
-            ..crate::broker::RuntimeControlRequest::default()
-        });
-        assert_eq!(busy.status, crate::broker::RuntimeControlStatus::Busy);
+        let busy = broker.runtime_status();
         assert_eq!(busy.pool.outstanding_jobs, 1);
         assert!(!busy.pool.workers_stopped);
-        let draining = broker.runtime_control(&crate::broker::RuntimeControlRequest {
-            action: crate::broker::RuntimeAction::Drain,
-            ..crate::broker::RuntimeControlRequest::default()
-        });
-        assert_eq!(draining.status, crate::broker::RuntimeControlStatus::Draining);
-        let lease = draining.lease_id.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         // EX is only obtainable after every native guardian loan has closed.
@@ -1083,11 +1073,7 @@ lean_lib Demo
         assert!(!root.join(".lake").exists());
         let closed = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                let closed = broker.runtime_control(&crate::broker::RuntimeControlRequest {
-                    action: crate::broker::RuntimeAction::Renew,
-                    lease_id: Some(lease.clone()),
-                    ..crate::broker::RuntimeControlRequest::default()
-                });
+                let closed = broker.runtime_status();
                 if closed.pool.workers_stopped {
                     break closed;
                 }
@@ -1096,7 +1082,6 @@ lean_lib Demo
         })
         .await
         .unwrap();
-        assert_eq!(closed.status, crate::broker::RuntimeControlStatus::Ok);
         assert_eq!(closed.pool.outstanding_jobs, 0);
         assert!(closed.pool.workers_stopped);
     }

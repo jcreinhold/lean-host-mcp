@@ -101,7 +101,7 @@ async fn a_named_request_runs_once_and_keeps_its_result() -> TestResult {
     assert!(unnamed_id.starts_with("srv-"), "{unnamed}");
     assert_eq!(table_ids(&scratch.store)?, [id]);
 
-    let status = first.control(&json!({"action": "status"})).await?;
+    let status = first.runtime().await?;
     assert_eq!(
         status.get("requests"),
         Some(&json!({"queued": 0, "running": 0})),

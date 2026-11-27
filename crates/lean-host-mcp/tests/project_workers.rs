@@ -144,7 +144,7 @@ async fn wait_for(path: &Path) -> TestResult {
 async fn wait_for_jobs(client: &Client, jobs: u64) -> TestResult {
     let until = Instant::now().checked_add(PATIENCE).ok_or("patience is too long")?;
     loop {
-        let status = client.control(&json!({"action": "status"})).await?;
+        let status = client.runtime().await?;
         let held = status
             .pointer("/pool/projects")
             .and_then(Value::as_array)

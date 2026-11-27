@@ -605,8 +605,8 @@ async fn immediate_or_past_admission_deadline_sends_no_frame_to_an_idle_worker()
 }
 
 #[tokio::test]
-async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
-    use crate::broker::{ProjectHint, RuntimeAction, RuntimeControlRequest, RuntimeControlStatus};
+async fn the_actor_queue_keeps_the_original_admission_deadline() {
+    use crate::broker::ProjectHint;
 
     let admission_budget = Duration::from_secs(1);
     let harness = ActorHarness::start_with_runtime(false, None, None, Some(admission_budget));
@@ -628,12 +628,6 @@ async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
         .lock()
         .replace(probe_tx)
         .expect("retain the actual actor sender");
-    let drain = harness.broker.runtime_control(&RuntimeControlRequest {
-        action: RuntimeAction::Drain,
-        retire_idle: false,
-        ..RuntimeControlRequest::default()
-    });
-    assert_eq!(drain.status, RuntimeControlStatus::Draining);
     let hint = ProjectHint::Explicit(harness.project.canonical_root.clone());
     let mut waiting = Box::pin(harness.broker.native_compatibility(hint.clone()));
     super::tests::poll_pending(waiting.as_mut()).await;
@@ -643,13 +637,6 @@ async fn broker_wait_and_actor_queue_share_the_original_admission_deadline() {
     let original_deadline_ceiling = observed_admission
         .checked_add(admission_budget)
         .expect("finite original admission budget");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let released = harness.broker.runtime_control(&RuntimeControlRequest {
-        action: RuntimeAction::Release,
-        lease_id: drain.lease_id,
-        ..RuntimeControlRequest::default()
-    });
-    assert_eq!(released.status, RuntimeControlStatus::Ok);
     let message = tokio::time::timeout_at(original_deadline_ceiling.into(), async {
         tokio::select! {
             biased;

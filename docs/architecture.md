@@ -26,7 +26,7 @@ crates/lean-host-mcp/src/
   transport_http.rs      private axum/rmcp Streamable HTTP entry
   server.rs              LeanHostService tool registration
   broker.rs              ProjectBroker: the served root, worker slots, idle retirement, the reaper
-  broker/control.rs      process-local worker activity snapshots and expiring admission leases
+  broker/control.rs      worker activity snapshots for lean_runtime, and the activity count
   broker/host_artifacts.rs the installed shims a worker reads before it opens
   broker/module_setup.rs lake setup-file and lake query as native readers; the import closure and module sources
   broker/semantic_file.rs file-backed semantic proof search through a native reader
@@ -95,17 +95,11 @@ that expected contract. Worker-session configuration enforces the subset after e
 preserves actual receipts independently of telemetry verbosity. This replaces caller-side binary/shim profiles rather
 than adding a second admission queue.
 
-`lean_runtime` coordinates admission under the broker registry mutex. `acquire` requires an idle pool; `drain` pauses
-new admission while admitted work finishes. Preparation utilities, startup locks, queued jobs, and background
-recycling/prewarming all participate in the activity count. The guard survives caller disconnects and registry removal
-through cleanup, so a retired controller cannot start new maintenance.
-
-A lease expires on monotonic time and is process-local. Its owner renews or releases it with the returned token; status
-only observes it. `retire_idle` closes idle mailboxes once admitted activity finishes, while worker permits remain held
-until confirmed shutdown. Idle expiry pauses during a lease, but independent artifact-writer demand may retire affected
-caches. Neither a snapshot nor a shutdown request proves resources are free. The lease does not preempt work, reserve
-system RAM, or coordinate unrelated processes. See the
-[public contract](tool-catalog.md#worker-activity-and-admission-leases).
+`lean_runtime` reads the pool under the broker registry mutex and changes nothing. Preparation utilities, startup locks,
+queued jobs, and background recycling/prewarming all join the activity count it reports. The guard survives caller
+disconnects and registry removal through cleanup, so a retired controller cannot start new maintenance. Worker permits
+stay held until confirmed shutdown; neither a snapshot nor a shutdown request proves resources are free. See the
+[public contract](tool-catalog.md#worker-activity).
 
 ## Project And Worker Boundary
 
@@ -396,8 +390,7 @@ programs; arbitrary user configuration IO is not sandboxed. Private inputs survi
 only after actual scope closure. Files outside a configured library and file-less trials use Lake's root-package
 defaults.
 
-Configuration admission shares the existing broker lease mutex and activity counter. A held lease refuses before
-configuration work; a drain waits without dispatch. An admitted utility keeps its activity guard through the existing
+Option discovery joins the broker's activity count. An admitted utility keeps its activity guard through the existing
 owned cleanup job, including after its async waiter disappears. One preparation group may coexist with a full resident
 actor quota, so option discovery does not evict a warm worker or request exclusive project access.
 
@@ -507,12 +500,12 @@ Cooperating artifact writers announce process-bound demand on the same canonical
 exclusive artifact custody. The broker checks that handoff gate before borrowing a resident actor or admitting idle
 maintenance. Contention pauses affected new calls within their existing cancellation/deadline budget; admitted calls
 finish normally. A separate 100 ms observation in the existing reaper retires only affected idle, unborrowed actors,
-even when ordinary idle expiry is disabled or a lease preserves warm caches. It does not advance or release that lease.
-Retirement still uses the ordinary process owner, so an acknowledgement never releases capacity or artifact custody
-before actual scope closure. Nonoverlapping actors remain available. Matching uses the actor's retained actual
-read-domain receipts, including frozen dependencies and companions, rather than a newly reduced manifest. A brief
-competing reader gate can also cause conservative backpressure or idle retirement; it is not evidence of a writer
-identity. The protocol does not claim FIFO ordering among multiple writers or defeat OS scheduling/filesystem stalls.
+even when ordinary idle expiry is disabled. Retirement still uses the ordinary process owner, so an acknowledgement
+never releases capacity or artifact custody before actual scope closure. Nonoverlapping actors remain available.
+Matching uses the actor's retained actual read-domain receipts, including frozen dependencies and companions, rather
+than a newly reduced manifest. A brief competing reader gate can also cause conservative backpressure or idle
+retirement; it is not evidence of a writer identity. The protocol does not claim FIFO ordering among multiple writers or
+defeat OS scheduling/filesystem stalls.
 
 The generic `reader` and `read-proxy` admissions still refuse writer demand before Ready. They can be composed across
 multiple physical domains, so waiting while retaining an earlier shared lock would create a reader/writer cycle. A

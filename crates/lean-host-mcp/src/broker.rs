@@ -30,11 +30,9 @@
 //!
 //! **Admission.** Each worker owns a serialized thread with a bounded
 //! mailbox. [`BrokerConfig::max_workers`] slots count resident, opening and
-//! retiring workers until each exit is confirmed. An explicit
-//! [`ProjectBroker::runtime_control`] lease can pause idle-pool admission for a
-//! cooperating external caller; it keeps warm caches from ordinary expiry
-//! unless the caller asks for retirement. A writer's demand can still retire an
-//! idle worker.
+//! retiring workers until each exit is confirmed. A writer's demand in another
+//! process retires idle workers; [`ProjectBroker::runtime_status`] observes the
+//! pool.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -69,9 +67,7 @@ pub(crate) mod semantic_file;
 pub(crate) mod verify_file;
 mod writer_handoff;
 pub(crate) use control::MaintenanceAccess;
-pub use control::{
-    RuntimeAction, RuntimeControlRequest, RuntimeControlResult, RuntimeControlStatus, WorkerActivity, WorkerPoolStatus,
-};
+pub use control::{RuntimeStatus, WorkerActivity, WorkerPoolStatus};
 
 /// Default worker slots when `LEAN_HOST_MCP_MAX_WORKERS` is unset.
 pub const DEFAULT_MAX_WORKERS: usize = 4;
@@ -856,7 +852,7 @@ impl ProjectBroker {
         options: LeanWorkerElabOptions,
     ) -> Result<LeanWorkerElabOptions> {
         self.ensure_read(&meta.canonical_root).await?;
-        let activity = self.preparation_activity(&meta.canonical_root).await?;
+        let activity = self.preparation_activity();
         // Resolve availability before evaluating arbitrary project configuration.
         // This is metadata-only and preserves ordinary missing-worker precedence.
         let _worker = crate::project::resolve_worker(meta)?;
@@ -927,25 +923,6 @@ impl ProjectBroker {
     }
 
     async fn acquire_until(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
-        let cancellation = CallCancellation::current();
-        loop {
-            let result = self.acquire_attempt(root.clone(), deadline).await;
-            if !matches!(&result, Err(ServerError::WorkerUnavailable(info)) if info.reason == "worker_pool_draining") {
-                return result;
-            }
-            // Waiting callers own no project Arc, opening lock, or worker slot;
-            // they keep their read turn and guard G until the request ends.
-            // A bounded local timer also observes expiry without another API call.
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return Err(Self::pool_unavailable(&root, "request_cancelled", false)),
-                () = tokio::time::sleep_until(deadline) => return Err(Self::pool_unavailable(&root, "project_admission_timeout", true)),
-                () = tokio::time::sleep(Duration::from_millis(100)) => {},
-            }
-        }
-    }
-
-    async fn acquire_attempt(&self, root: PathBuf, deadline: tokio::time::Instant) -> Result<Arc<LeanProject>> {
         if CallCancellation::current().is_cancelled() {
             return Err(Self::pool_unavailable(&root, "request_cancelled", false));
         }
@@ -993,14 +970,14 @@ impl ProjectBroker {
         let slot = if growing {
             let Ok(_turn) = self.capacity_admission.try_lock() else {
                 return self
-                    .select_existing_worker(&root)?
+                    .select_existing_worker(&root)
                     .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
             };
             match Arc::clone(&self.worker_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
                     return self
-                        .select_existing_worker(&root)?
+                        .select_existing_worker(&root)
                         .ok_or_else(|| Self::pool_unavailable(&root, "worker_pool_busy", true));
                 }
             }
@@ -1058,7 +1035,7 @@ impl ProjectBroker {
         deadline: tokio::time::Instant,
         cancellation: &CallCancellation,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
-        let open_lock = self.opening_lock(root)?;
+        let open_lock = self.opening_lock(root);
         let guard = tokio::select! {
             guard = tokio::time::timeout_at(deadline, open_lock.lock_owned()) => {
                 guard.map_err(|_| Self::pool_unavailable(root, "project_admission_timeout", true))?
@@ -1079,16 +1056,11 @@ impl ProjectBroker {
     /// Prefer a free actor; grow only while the global pool has spare capacity.
     /// A busy actor remains a valid queue, not a reason to refuse a request.
     fn select_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
-        {
-            let mut inner = self.inner.lock();
-            Self::check_runtime_admission(&mut inner, root)?;
-            if !inner.registry.iter().any(|(key, _)| key.root == root) {
-                return Ok(None);
-            }
+        if !self.inner.lock().registry.iter().any(|(key, _)| key.root == root) {
+            return Ok(None);
         }
         let manifest_hash = self.meta(root)?.manifest_hash;
         let mut inner = self.inner.lock();
-        Self::check_runtime_admission(&mut inner, root)?;
         let stale: Vec<_> = inner
             .registry
             .iter()
@@ -1128,9 +1100,8 @@ impl ProjectBroker {
         Ok(inner.registry.get(&key).cloned())
     }
 
-    fn select_existing_worker(&self, root: &Path) -> Result<Option<Arc<LeanProject>>> {
+    fn select_existing_worker(&self, root: &Path) -> Option<Arc<LeanProject>> {
         let mut inner = self.inner.lock();
-        Self::check_runtime_admission(&mut inner, root)?;
         let key = inner
             .registry
             .iter()
@@ -1141,40 +1112,20 @@ impl ProjectBroker {
                     .saturating_add(usize::from(Arc::strong_count(actor) > 1))
             })
             .map(|(key, _)| key.clone());
-        let Some(key) = key else { return Ok(None) };
+        let key = key?;
         inner.last_used.insert(key.clone(), Instant::now());
-        Ok(inner.registry.get(&key).cloned())
+        inner.registry.get(&key).cloned()
     }
 
-    fn opening_lock(&self, root: &Path) -> Result<Arc<AsyncMutex<()>>> {
+    fn opening_lock(&self, root: &Path) -> Arc<AsyncMutex<()>> {
         let mut inner = self.inner.lock();
-        // Claim acquisition uses this same mutex. A cold caller must either
-        // retain its opening lock before the claim, or observe the held lease.
-        Self::check_runtime_admission(&mut inner, root)?;
         inner.opening_locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = inner.opening_locks.get(root).and_then(Weak::upgrade) {
-            return Ok(lock);
+            return lock;
         }
         let lock = Arc::new(AsyncMutex::new(()));
         inner.opening_locks.insert(root.to_path_buf(), Arc::downgrade(&lock));
-        drop(inner);
-        Ok(lock)
-    }
-
-    fn check_runtime_admission(inner: &mut BrokerInner, root: &Path) -> Result<()> {
-        if let Some(remaining) = inner.control.remaining(Instant::now()) {
-            let reason = if inner.control.is_draining() {
-                "worker_pool_draining"
-            } else {
-                "worker_pool_leased"
-            };
-            let mut error = Self::pool_unavailable(root, reason, true);
-            if let ServerError::WorkerUnavailable(info) = &mut error {
-                info.retry_after_millis = Some(remaining);
-            }
-            return Err(error);
-        }
-        Ok(())
+        lock
     }
 
     async fn reserve_worker_slot(&self, root: &Path, deadline: tokio::time::Instant) -> Result<OwnedSemaphorePermit> {
@@ -1270,11 +1221,6 @@ impl ProjectBroker {
         let now = Instant::now();
         let evicted: Vec<Arc<LeanProject>> = {
             let mut inner = self.inner.lock();
-            // A maintenance caller explicitly chose to keep warm caches.
-            // Ordinary idle eviction resumes when its lease ends.
-            if inner.control.remaining(now).is_some() {
-                return;
-            }
             let expired: Vec<WorkerKey> = inner
                 .last_used
                 .iter()
@@ -1522,7 +1468,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE and matching installed worker"]
-    async fn same_project_workers_share_capacity_and_drain_together() {
+    async fn same_project_workers_share_capacity_and_stop_together() {
         let root = PathBuf::from(std::env::var("LEAN_HOST_MCP_TEST_FIXTURE").unwrap())
             .canonicalize()
             .unwrap();
@@ -1537,7 +1483,7 @@ mod tests {
         assert!(Arc::ptr_eq(&third, &first) || Arc::ptr_eq(&third, &second));
         assert_eq!(broker.worker_slots.available_permits(), 0);
         assert_eq!(broker.resident_paths(), vec![root.clone()]);
-        let snapshot = broker.runtime_control(&RuntimeControlRequest::default());
+        let snapshot = broker.runtime_status();
         assert_eq!(snapshot.pool.projects.len(), 2);
         assert_eq!(snapshot.pool.occupied_slots, 2);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -1548,27 +1494,15 @@ mod tests {
                 .is_err()
         );
         assert!(first.is_healthy() && second.is_healthy());
-        let draining = broker.runtime_control(&RuntimeControlRequest {
-            action: RuntimeAction::Drain,
-            retire_idle: true,
-            ..RuntimeControlRequest::default()
-        });
-        assert_eq!(draining.status, RuntimeControlStatus::Draining);
-        assert_eq!(draining.pool.occupied_slots, 2);
         drop((first, second, third));
-        let lease_id = draining.lease_id;
+        broker.shutdown_all();
         for _ in 0..100 {
-            let snapshot = broker.runtime_control(&RuntimeControlRequest {
-                action: RuntimeAction::Renew,
-                lease_id: lease_id.clone(),
-                ..RuntimeControlRequest::default()
-            });
-            if snapshot.pool.workers_stopped {
+            if broker.runtime_status().pool.workers_stopped {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("drain did not confirm both worker exits");
+        panic!("shutdown did not confirm both worker exits");
     }
 
     #[tokio::test]
@@ -1613,13 +1547,7 @@ mod tests {
         }
         assert_ne!(first.freshness.session_id, second.freshness.session_id);
         assert_eq!(broker.resident_paths().len(), 1);
-        assert_eq!(
-            broker
-                .runtime_control(&RuntimeControlRequest::default())
-                .pool
-                .occupied_slots,
-            2
-        );
+        assert_eq!(broker.runtime_status().pool.occupied_slots, 2);
         eprintln!(
             "two same-project checks completed in {:?}; sessions {} and {}",
             started.elapsed(),
@@ -1651,7 +1579,7 @@ mod tests {
         let first = crate::cancellation::with_cancellation(&cancel, run());
         let stop_first = async {
             for _ in 0..200 {
-                let state = broker.runtime_control(&RuntimeControlRequest::default());
+                let state = broker.runtime_status();
                 if state.pool.projects.len() == 2 && state.pool.outstanding_jobs >= 2 {
                     cancel.cancel();
                     return;
@@ -1864,7 +1792,7 @@ mod tests {
             .checked_add(Duration::from_millis(30))
             .unwrap();
         let root = PathBuf::from("/same-cold-project");
-        let held = broker.opening_lock(&root).unwrap().lock_owned().await;
+        let held = broker.opening_lock(&root).lock_owned().await;
         let cancellation = CallCancellation::default();
         let first = broker.acquire_opening_guard(&root, deadline, &cancellation);
         let second = broker.acquire_opening_guard(&root, deadline, &cancellation);
@@ -2006,15 +1934,15 @@ mod tests {
     async fn opening_locks_survive_shutdown_and_a_disappearing_caller() {
         let broker = ProjectBroker::new(cfg(None));
         let root = PathBuf::from("/project");
-        let original = broker.opening_lock(&root).unwrap();
+        let original = broker.opening_lock(&root);
         let waiting = Arc::clone(&original);
         broker.shutdown_all();
         drop(original);
-        let successor = broker.opening_lock(&root).unwrap();
+        let successor = broker.opening_lock(&root);
         assert!(Arc::ptr_eq(&waiting, &successor));
         drop(waiting);
         drop(successor);
-        let _other = broker.opening_lock(Path::new("/other")).unwrap();
+        let _other = broker.opening_lock(Path::new("/other"));
         assert!(!broker.inner.lock().opening_locks.contains_key(&root));
     }
     #[tokio::test]
@@ -2050,7 +1978,7 @@ mod tests {
     async fn cancelled_same_project_waiter_does_not_wait_for_startup_or_take_capacity() {
         let broker = ProjectBroker::new(cfg(None));
         let root = PathBuf::from("/blocked-startup");
-        let held = broker.opening_lock(&root).unwrap().lock_owned().await;
+        let held = broker.opening_lock(&root).lock_owned().await;
         let request = tokio_util::sync::CancellationToken::new();
         let cancel = request.clone();
         let result = tokio::time::timeout(

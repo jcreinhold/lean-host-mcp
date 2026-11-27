@@ -355,9 +355,9 @@ impl Client {
         }
     }
 
-    /// `lean_runtime` with `arguments`: its structured reply.
-    pub(crate) async fn control(&self, arguments: &Value) -> TestResult<Value> {
-        let result = self.call("lean_runtime", arguments).await?;
+    /// `lean_runtime`'s structured reply: build, settings and worker activity.
+    pub(crate) async fn runtime(&self) -> TestResult<Value> {
+        let result = self.call("lean_runtime", &json!({})).await?;
         Ok(structured(&result)?.clone())
     }
 

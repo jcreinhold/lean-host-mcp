@@ -463,7 +463,7 @@ async fn watch_pool(client: Client, stop: Arc<AtomicBool>) -> TestResult<(u64, u
     let mut most = 0;
     let mut limit = 0;
     while !stop.load(Ordering::SeqCst) {
-        let status = client.control(&json!({"action": "status"})).await?;
+        let status = client.runtime().await?;
         let held = status.pointer("/pool/occupied_slots").and_then(Value::as_u64);
         most = most.max(held.ok_or_else(|| format!("no occupied_slots: {status}"))?);
         limit = status

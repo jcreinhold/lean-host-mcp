@@ -24,7 +24,7 @@ Five semantic tool families cover the proof workflow:
 | `lean_status` | `project`, `file_diagnostics`: project status or current-source diagnostics |
 
 `lean_compatibility` describes compiled expectations with `mode: "pure_v1"`, or checks an actual worker in the default
-`loaded` mode. `lean_runtime` observes worker activity and leases an idle worker pool. Any other tool takes an optional
+`loaded` mode. `lean_runtime` reports the server's build, settings and worker activity. Any other tool takes an optional
 `request_id`: the server records the call before it starts, runs it at most once and keeps its result, so a retry
 returns that result. `lean_run` starts such a request and replies at once; `lean_get` reads its state and result.
 

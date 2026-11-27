@@ -32,7 +32,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::broker::{ProjectBroker, ProjectHint, RuntimeControlRequest};
+use crate::broker::{ProjectBroker, ProjectHint};
 use crate::cancellation::{with_cancellation, with_deadline};
 use crate::error::ServerError;
 use crate::request_log::RequestLog;
@@ -43,7 +43,7 @@ use crate::tools::{self, ResponseCarrier, ToolConfig, ToolContext};
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Tools that never run as a request: the two that manage requests, and the
-/// runtime lease, which must answer at once.
+/// runtime status, which must answer at once.
 const DIRECT_ONLY: [&str; 3] = ["lean_run", "lean_get", "lean_runtime"];
 
 /// Run one tool call while heartbeating `notifications/progress` to the client.
@@ -252,13 +252,10 @@ impl LeanHostService {
     }
 
     #[tool(
-        description = "Observe worker activity or atomically lease the idle worker pool. Actions: status, acquire, renew, release. Leases pause MCP admission; independent artifact writers may retire idle caches. Set retire_idle for explicit retirement and renew before expiry while relying on the pause."
+        description = "Report the server's build, effective settings, request counts and worker activity. Takes no arguments and starts nothing."
     )]
-    async fn lean_runtime(
-        &self,
-        Parameters(request): Parameters<RuntimeControlRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let mut result = self.ctx.broker.runtime_control(&request);
+    async fn lean_runtime(&self) -> Result<CallToolResult, McpError> {
+        let mut result = self.ctx.broker.runtime_status();
         result.effective_settings.server = Some(self.ctx.config.into());
         if let Some(runner) = &self.requests {
             match runner.counts().await {

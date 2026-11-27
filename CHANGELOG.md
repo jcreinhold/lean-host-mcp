@@ -105,6 +105,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   binary, tests and benches name. The projections `project_elab_result`, `project_kernel_result`,
   `project_meta_rendered`, `project_meta_bool` and `project_declaration_row`, which nothing called, are gone with their
   types `ElabSuccess`, `KernelOutcome`, `KernelSummary`, `MetaOutcome` and `DeclarationRow`.
+- Remove the `lean_runtime` lease. The tool takes no arguments and only reports. Gone are the actions `acquire`,
+  `drain`, `renew` and `release` with `lease_id`, `lease_seconds` and `retire_idle`; the reply's `status`, `detail`,
+  `lease_id` and `retirement_requested`; `pool.admission_paused` and `pool.lease_remaining_millis`; the reasons
+  `worker_pool_leased` and `worker_pool_draining`; the capability `draining_lease_v1`; and the library's
+  `RuntimeAction`, `RuntimeControlRequest`, `RuntimeControlResult` and `RuntimeControlStatus`. With many sessions on one
+  server, one session's lease paused every other session's calls.
 
 ### Fixed
 

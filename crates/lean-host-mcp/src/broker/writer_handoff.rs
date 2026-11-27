@@ -130,7 +130,7 @@ mod tests {
     use lean_toolchain::writer_demand::WriterDemand;
 
     use super::*;
-    use crate::broker::{BrokerConfig, RuntimeAction, RuntimeControlRequest, RuntimeControlStatus};
+    use crate::broker::BrokerConfig;
     use crate::error::ServerError;
     use crate::lake_meta::LakeProjectMeta;
     use crate::project::LeanProject;
@@ -338,32 +338,6 @@ mod tests {
             1,
             "the proxy turn counts as one finished build"
         );
-        broker.shutdown_all();
-    }
-
-    #[tokio::test]
-    async fn artifact_handoff_remains_automatic_during_a_keep_warm_lease() {
-        let f = Fixture::new();
-        let broker = f.broker();
-        broker.test_register_actor(Fixture::actor(&f.project, vec![f.project.clone()]));
-        let lease = broker.runtime_control(&RuntimeControlRequest {
-            action: RuntimeAction::Acquire,
-            ..Default::default()
-        });
-        assert_eq!(lease.status, RuntimeControlStatus::Acquired);
-        let writer = WriterChild::start(
-            &f.root,
-            &lean_toolchain::shared_writer::project_lock_path(&f.project).unwrap(),
-        );
-        wait_for(|| f.root.join("writer-admitted").exists()).await;
-        assert!(
-            broker
-                .runtime_control(&RuntimeControlRequest::default())
-                .pool
-                .admission_paused,
-            "another owner's lease is not advanced or released"
-        );
-        writer.finish().await;
         broker.shutdown_all();
     }
 

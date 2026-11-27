@@ -989,8 +989,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     )
     .await;
     let client = StatelessClient::new(&server.url);
-    let status = client.control(json!({"action":"status"})).await;
-    assert_eq!(status["status"], "ok");
+    let status = client.control(json!({})).await;
     assert_eq!(status["build"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         status["build"]["revision"],
@@ -1016,10 +1015,7 @@ async fn streamable_http_status_reports_resolved_settings_without_opening_worker
     assert_eq!(runtime["worker_session_pool_capacity"], 6);
     assert_eq!(status["effective_settings"]["server"]["response_carrier"], "both");
     assert_eq!(status["requests"], json!({"queued": 0, "running": 0}));
-    assert_eq!(
-        status["capabilities"],
-        json!(["draining_lease_v1", "durable_requests_v1"])
-    );
+    assert_eq!(status["capabilities"], json!(["durable_requests_v1"]));
     server.shutdown().await;
 }
 
@@ -1202,157 +1198,6 @@ fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.to_str().expect("UTF-8 test path").replace('\'', "'\\''"))
 }
 
-#[tokio::test]
-async fn streamable_http_runtime_lease_is_immediate_and_owned_across_connections() {
-    let root = tempfile::tempdir().unwrap();
-    // A check takes guard G over the manifest's packages before it reaches
-    // the pool, so the manifest must list them.
-    std::fs::write(root.path().join("lake-manifest.json"), "{\"packages\":[]}\n").unwrap();
-    std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
-    std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
-    let root_s = root.path().to_string_lossy();
-    let server = HttpMcpServer::start(&[("--lake-root", root_s.as_ref())]).await;
-    let owner = StatelessClient::new(&server.url);
-    let acquired = owner.control(json!({"action": "acquire"})).await;
-    assert_eq!(acquired["status"], "acquired");
-    assert_eq!(acquired["pool"]["workers_stopped"], true);
-    let token = acquired["lease_id"].as_str().unwrap().to_owned();
-    drop(owner);
-    let reconnected = StatelessClient::new(&server.url);
-    let status = reconnected.control(json!({"action": "status"})).await;
-    assert_eq!(status["pool"]["admission_paused"], true);
-    assert!(status.get("lease_id").is_none());
-    assert_eq!(status["pool"]["instance_id"], acquired["pool"]["instance_id"]);
-    let invalid = reconnected
-        .control(json!({"action": "release", "lease_id": "wrong"}))
-        .await;
-    assert_eq!(invalid["status"], "invalid_lease");
-    let mut legacy = server.new_session().await;
-    let denied = legacy.request("tools/call", json!({"name": "lean_trial", "arguments": {"kind": "command", "imports": ["Init"], "commands": "#check Nat"}})).await.unwrap();
-    assert_eq!(
-        runtime_error_reason(&denied.json).as_deref(),
-        Some("worker_pool_leased"),
-        "{}",
-        denied.json
-    );
-    assert!(
-        denied
-            .json
-            .pointer("/result/structuredContent/request_id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id.starts_with("srv-")),
-        "{}",
-        denied.json
-    );
-    let metadata = legacy
-        .request(
-            "tools/call",
-            json!({"name": "lean_status", "arguments": {"kind": "project"}}),
-        )
-        .await
-        .unwrap();
-    assert!(
-        metadata
-            .json
-            .pointer("/result/structuredContent/data/worker_opened")
-            .is_some_and(|opened| opened == false)
-    );
-    let renewed = reconnected
-        .control(json!({"action": "renew", "lease_id": token, "lease_seconds": 60}))
-        .await;
-    assert_eq!(renewed["status"], "ok");
-    assert!(renewed["pool"]["lease_remaining_millis"].as_u64().unwrap() > 30_000);
-    let released = reconnected
-        .control(json!({"action": "release", "lease_id": token}))
-        .await;
-    assert_eq!(released["status"], "ok");
-    assert_eq!(released["pool"]["admission_paused"], false);
-    server.shutdown().await;
-}
-
-#[tokio::test]
-#[ignore = "requires built Lean fixture and worker binary"]
-async fn streamable_http_runtime_lease_preserves_warm_workers_and_retires_only_idle_work() {
-    let root = fixture_root();
-    let root_s = root.to_string_lossy();
-    let server = HttpMcpServer::start_with_env(
-        &[("--lake-root", root_s.as_ref())],
-        &[("LEAN_HOST_MCP_MAX_WORKERS", "1")],
-    )
-    .await;
-    let client = StatelessClient::new(&server.url);
-    client.command("warm-0001", "#eval (1 : Nat)").await;
-    assert_eq!(
-        client.ended("warm-0001", Duration::from_secs(30)).await["request"]["state"],
-        "done"
-    );
-    let acquired = client.acquire_idle(false).await;
-    assert_eq!(acquired["pool"]["projects"].as_array().unwrap().len(), 1);
-    assert_eq!(acquired["pool"]["occupied_slots"], 1);
-    assert_eq!(acquired["retirement_requested"], 0);
-    let generation = acquired["pool"]["projects"][0]["runtime"]["worker_generation"].clone();
-    let token = acquired["lease_id"].as_str().unwrap().to_owned();
-    client.control(json!({"action": "release", "lease_id": token})).await;
-    client.command("repeat-0001", "#eval (2 : Nat)").await;
-    assert_eq!(
-        client.ended("repeat-0001", Duration::from_secs(10)).await["request"]["state"],
-        "done"
-    );
-    let scratch = tempfile::tempdir().unwrap();
-    let started = scratch.path().join("started");
-    let finished = scratch.path().join("finished");
-    client
-        .command("running-0001", &sentinel_command(&started, Some((&finished, 4_000))))
-        .await;
-    wait_for_sentinel(&started, Duration::from_secs(10)).await;
-    let busy = client.control(json!({"action": "acquire", "retire_idle": true})).await;
-    assert_eq!(busy["status"], "busy");
-    assert!(busy.get("lease_id").is_none());
-    assert_eq!(busy["pool"]["projects"][0]["idle"], false);
-    assert!(busy["pool"]["projects"][0]["outstanding_jobs"].as_u64().unwrap() >= 1);
-    assert_eq!(busy["pool"]["projects"][0]["runtime"]["worker_generation"], generation);
-    assert_eq!(
-        client.ended("running-0001", Duration::from_secs(10)).await["request"]["state"],
-        "done"
-    );
-    assert!(finished.exists(), "claiming must not cancel existing work");
-    let retired = client.acquire_idle(true).await;
-    assert_eq!(retired["retirement_requested"], 1);
-    assert!(retired["pool"]["projects"].as_array().unwrap().is_empty());
-    let token = retired["lease_id"].as_str().unwrap().to_owned();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let status = client.control(json!({"action": "status"})).await;
-            assert_eq!(status["pool"]["admission_paused"], true);
-            if status["pool"]["workers_stopped"] == true {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("retired child must confirm exit");
-    client.command("blocked-0001", "#eval (3 : Nat)").await;
-    let blocked = client.ended("blocked-0001", Duration::from_secs(10)).await;
-    assert_eq!(blocked["request"]["state"], "done", "{blocked}");
-    assert_eq!(
-        runtime_error_reason(&json!({"result": blocked["result"]})).as_deref(),
-        Some("worker_pool_leased"),
-        "{blocked}"
-    );
-    let still_stopped = client.control(json!({"action": "status"})).await;
-    assert_eq!(still_stopped["pool"]["workers_stopped"], true);
-    client.control(json!({"action": "release", "lease_id": token})).await;
-    let healthy = scratch.path().join("healthy");
-    client.command("healthy-0001", &sentinel_command(&healthy, None)).await;
-    assert_eq!(
-        client.ended("healthy-0001", Duration::from_secs(10)).await["request"]["state"],
-        "done"
-    );
-    assert!(healthy.exists());
-    server.shutdown().await;
-}
-
 /// A client of the stateless protocol: one HTTP request per call, no session,
 /// no tasks.
 #[derive(Clone)]
@@ -1428,23 +1273,6 @@ impl StatelessClient {
         self.structured("lean_runtime", arguments).await
     }
 
-    async fn acquire_idle(&self, retire_idle: bool) -> Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let result = self
-                    .control(json!({"action": "acquire", "retire_idle": retire_idle}))
-                    .await;
-                if result["status"] == "acquired" {
-                    return result;
-                }
-                assert_eq!(result["status"], "busy");
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("finished worker must become claimable")
-    }
-
     /// `lean_run` request `id`: the structured reply.
     async fn run(&self, id: &str, tool: &str, arguments: Value) -> Value {
         self.structured(
@@ -1503,7 +1331,7 @@ impl StatelessClient {
     async fn wait_for_jobs(&self, jobs: u64) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let status = self.control(json!({"action": "status"})).await;
+                let status = self.control(json!({})).await;
                 if status["pool"]["outstanding_jobs"]
                     .as_u64()
                     .is_some_and(|count| count >= jobs)
@@ -2003,128 +1831,10 @@ fn semantic_error_code(response: &Value) -> Option<String> {
     None
 }
 
+/// Pure discovery works before any worker or artifact exists. A trap
+/// executable makes accidental preparation visible.
 #[tokio::test]
-async fn streamable_http_drain_waits_then_resumes_without_client_retry() {
-    assert_drain_resumes(false).await;
-}
-
-#[tokio::test]
-#[ignore = "requires matching worker and Lean toolchain"]
-async fn streamable_http_drain_resumes_real_worker() {
-    assert_drain_resumes(true).await;
-}
-
-async fn assert_drain_resumes(real_worker: bool) {
-    let root = tempfile::tempdir().unwrap();
-    // A check takes guard G over the manifest's packages before it waits for
-    // the drain, so the manifest must list them.
-    std::fs::write(root.path().join("lake-manifest.json"), "{\"packages\":[]}\n").unwrap();
-    std::fs::write(root.path().join("lakefile.toml"), "name = \"control\"\n").unwrap();
-    std::fs::copy(
-        fixture_root().join("lean-toolchain"),
-        root.path().join("lean-toolchain"),
-    )
-    .unwrap();
-    let root_s = root.path().to_string_lossy();
-    // The transport-only test must not depend on a cold worker's shim build.
-    // An empty explicit worker directory gives a deterministic post-drain error.
-    let missing_workers = tempfile::tempdir().unwrap();
-    let missing_workers_s = missing_workers.path().to_string_lossy();
-    let envs = if real_worker {
-        vec![]
-    } else {
-        vec![("LEAN_HOST_MCP_WORKERS_DIR", missing_workers_s.as_ref())]
-    };
-    let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s.as_ref())], &envs).await;
-    if real_worker {
-        // Startup may build the bundled shim. Do not count that one-time work
-        // toward the bounded wait that tests release of the drain.
-        let mut warmup = server.new_session().await;
-        let response = warmup
-            .request(
-                "tools/call",
-                json!({"name":"lean_trial", "arguments":{
-                    "kind":"command", "imports":["Init"], "commands":"#check Nat"
-                }}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(envelope_status(&response.json), "ok", "{:?}", response.json);
-    }
-    let owner = StatelessClient::new(&server.url);
-    let mut acquired = owner.control(json!({"action": "drain", "retire_idle": true})).await;
-    let token = acquired["lease_id"].as_str().unwrap().to_owned();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while acquired["status"] == "draining" {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            acquired = owner.control(json!({"action":"renew", "lease_id":token})).await;
-        }
-    })
-    .await
-    .expect("idle worker retirement must finish");
-    assert!(
-        acquired["status"] == "acquired" || acquired["status"] == "ok",
-        "{acquired}"
-    );
-    assert_eq!(acquired["pool"]["workers_stopped"], true);
-    assert!(
-        acquired["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "draining_lease_v1")
-    );
-    let mut session = server.new_session().await;
-    let mut request = tokio::spawn(async move {
-        session
-            .request(
-                "tools/call",
-                json!({"name":"lean_trial", "arguments":{
-                    "kind":"command", "imports":["Init"], "commands":"#check Nat"
-                }}),
-            )
-            .await
-            .unwrap()
-    });
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        !request.is_finished(),
-        "new request must wait rather than fail or overtake drain"
-    );
-    let released = owner.control(json!({"action":"release", "lease_id":token})).await;
-    assert_eq!(released["status"], "ok");
-    let response = match tokio::time::timeout(Duration::from_secs(10), &mut request).await {
-        Ok(result) => result.unwrap(),
-        Err(error) => {
-            request.abort();
-            server.shutdown().await;
-            panic!("request did not resume after drain release: {error}");
-        }
-    };
-    assert_ne!(
-        runtime_error_reason(&response.json).as_deref(),
-        Some("worker_pool_draining")
-    );
-    assert_ne!(
-        runtime_error_reason(&response.json).as_deref(),
-        Some("worker_pool_leased")
-    );
-    if real_worker {
-        assert_eq!(envelope_status(&response.json), "ok", "{:?}", response.json);
-    } else {
-        assert!(
-            response.json.to_string().contains("no worker for leanprover/lean4:"),
-            "{:?}",
-            response.json
-        );
-    }
-    server.shutdown().await;
-}
-
-/// Pure discovery is available before workers/artifacts exist and while worker
-/// admission is paused. A trap executable makes accidental preparation visible.
-#[tokio::test]
-async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
+async fn streamable_http_pure_compatibility_never_opens_a_worker() {
     use std::os::unix::fs::PermissionsExt;
 
     for trap in [false, true] {
@@ -2168,9 +1878,7 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
         ];
         let server = HttpMcpServer::start_with_env(&[("--lake-root", root_s)], &settings).await;
         let owner = StatelessClient::new(&server.url);
-        let acquired = owner.control(json!({"action":"acquire"})).await;
-        assert_eq!(acquired["status"], "acquired");
-        let token = acquired["lease_id"].as_str().unwrap();
+        let before = owner.control(json!({})).await;
         let mut session = server.new_session().await;
         let response = session
             .request(
@@ -2186,7 +1894,7 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
         assert_eq!(payload["status"], "ok", "{payload}");
         let native = &payload["native_compatibility"];
         assert_eq!(native["mode"], "pure_v1");
-        assert_eq!(native["server_instance_id"], acquired["pool"]["instance_id"]);
+        assert_eq!(native["server_instance_id"], before["pool"]["instance_id"]);
         assert_eq!(native["project_root"], root_s);
         assert_eq!(native["lean_toolchain"], "leanprover/lean4:v4.35.0");
         assert_eq!(native["worker_protocol_version"], 13);
@@ -2216,10 +1924,9 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
             native["shared_writer"]["ownership_registry"],
             namespace.to_str().unwrap()
         );
-        let status = owner.control(json!({"action":"status"})).await;
+        let status = owner.control(json!({})).await;
         assert_eq!(status["pool"]["occupied_slots"], 0);
         assert_eq!(status["pool"]["outstanding_jobs"], 0);
-        assert_eq!(status["pool"]["admission_paused"], true);
         assert!(status["pool"]["projects"].as_array().unwrap().is_empty());
         assert!(!marker.exists(), "pure discovery must not invoke a worker");
         assert!(
@@ -2228,10 +1935,6 @@ async fn streamable_http_pure_compatibility_never_opens_worker_under_lease() {
         );
         assert!(!root.join(".lake").exists());
         assert!(!namespace.exists(), "pure discovery cannot reserve native capacity");
-        assert_eq!(
-            owner.control(json!({"action":"release","lease_id":token})).await["status"],
-            "ok"
-        );
         server.shutdown().await;
     }
 }
@@ -2272,7 +1975,7 @@ async fn streamable_http_pure_compatibility_rejects_unknown_mode_before_worker_a
         assert!(response.json["result"].get("structuredContent").is_none());
     }
     let control = StatelessClient::new(&server.url);
-    let status = control.control(json!({"action":"status"})).await;
+    let status = control.control(json!({})).await;
     assert_eq!(status["pool"]["occupied_slots"], 0);
     assert_eq!(status["pool"]["outstanding_jobs"], 0);
     assert!(status["pool"]["projects"].as_array().unwrap().is_empty());
