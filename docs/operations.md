@@ -7,32 +7,22 @@ the [tool catalog](tool-catalog.md) for request and response contracts.
 - [Artifact freshness](#rebuilt-artifacts) and [memory sizing](#memory-and-import-cycling)
 - [Builds](#builds) and [concurrency and admission](#concurrency-and-admission)
 - [Logging](#request-activity-in-the-terminal) and [worker recycles](#observing-worker-recycles)
-- [Process lifetime](#process-lifetime) and [runtime failures](#runtime-error-contract)
-- [Server installation](#installing-the-server), [worker installation](#installing-workers) and
-  [test harnesses](#build-test-lint)
+- [Process lifetime](#process-lifetime), [one server per store](#one-server-per-store) and
+  [runtime failures](#runtime-error-contract)
+- [Server installation](#installing-the-server), [worker installation](#installing-workers),
+  [upgrading to 0.18](#upgrading-to-018) and [test harnesses](#build-test-lint)
 
-
-Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set, otherwise
-`$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700. On macOS a
-socket path holds at most 103 bytes, so the directory's path may hold at most 54. The SDK removes each worker's socket
-on closure. `serve` checks the directory when it starts and exits if it is unsafe or too long.
-
-The server keeps its other state in its [store](#one-server-per-store), not under `HOME`: the SDK's durable owner
-records in `owners/`, the semantic runtime cache in `semantic-runtimes/`, and in `processes/` the PID records that
-`doctor processes` reads. `LEAN_RS_WORKER_OWNERS_DIRECTORY`, `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and
-`LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` move each one. The server binds the owner directory before any native work, the SDK
-creates it, and the server passes it to its SDK helpers as `LEAN_RS_WORKER_OWNERS_DIRECTORY`. Keep the same canonical
-owner directory when restarting the server, including across binary changes. `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` must be
-a canonical absolute path; the server creates the directory if it is missing. A server without `--lake-root` has no
-store and fails every project call; its PID records go under the per-user cache directory.
+The server keeps its state in its [store](#one-server-per-store), not under `HOME`: `server.lock`, `children.lock` and
+`children/`, build logs in `logs/`, the inputs of running short runs in `runs/`, the named request table, the semantic
+runtime cache in `semantic-runtimes/`, and in `processes/` the PID records that `doctor processes` reads.
+`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and `LEAN_HOST_MCP_PROCESS_REGISTRY_DIR` move the last two.
+`LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` must be a canonical absolute path; the server creates the directory if it is missing.
+A server without `--lake-root` has no store and fails every project call; its PID records go under the per-user cache
+directory.
 
 The server finds the Lean toolchain under `ELAN_HOME`, else under the elan home that install recorded as
-`[install] elan_home`, else under `$HOME/.elan`. It passes that home to Lake, Cargo and its helpers as `ELAN_HOME`.
-
-The server uses its own executable as the writer helper for its builds, checks and workers, and names it in
-`LEAN_RS_WRITER_EXECUTABLE` for the children it starts. It checks a value in its own environment at startup but does not
-use it. The installers use a server executable as the writer too: `install` builds the worker's shims with its copy of
-the server in `bin/`, the file the server will run as, and `install-worker` builds them with its own executable.
+`[install] elan_home`, else under `$HOME/.elan`. It passes that home to Lake, Cargo and the processes it starts as
+`ELAN_HOME`.
 
 ## Configuration file
 
@@ -74,6 +64,7 @@ Units are shown in the table; GiB figures in descriptions are explanatory, not l
 | `runtime.worker_session_pool_capacity` | integer | `8` | `LEAN_HOST_MCP_WORKER_SESSION_POOL_CAPACITY` | How many imported Lean environments one worker child keeps warm. Returning to a pooled import profile costs a key comparison instead of a full import, so this should cover the number of distinct per-file import profiles a session moves between — a changed-file sweep touches one per file. A held environment costs about 70 MiB against 2-4 GB for the import it saves. Default 8. |
 | `broker.max_workers` | integer | `4` | `LEAN_HOST_MCP_MAX_WORKERS` | Worker processes the server may run at once, counting workers that are starting or still exiting. An exiting worker keeps its slot until its exit is confirmed, so a value above max_workers_per_project lets a new worker start while an old one exits. Default 4. |
 | `broker.max_workers_per_project` | integer | `1` | `LEAN_HOST_MCP_MAX_WORKERS_PER_PROJECT` | Workers that may serve the project at once. An extra worker opens only when a slot is free; otherwise requests queue on an existing worker. Set 2 only after measuring the memory cost of concurrent checks: each worker keeps its own imports and cache. Default 1. |
+| `broker.max_lean_runs` | integer | `2` | `LEAN_HOST_MCP_MAX_LEAN_RUNS` | Short lean and lake runs the server may run at once: file checks, setup-file runs, options probes and semantic file runs. Each takes a permit before it starts and keeps it until its process group has exited; a run that finds no permit by its deadline does not start. Default 2. |
 | `broker.idle_timeout_secs` | integer (s) | `600` | `LEAN_HOST_MCP_IDLE_TIMEOUT_SECS` | Stop a worker after this many idle seconds. 0 turns idle retirement off. Default 10 minutes. |
 | `server.bind` | string (loopback ADDR:PORT) | unset | `--bind / LEAN_HOST_MCP_BIND` | Loopback address for the Streamable HTTP transport; omit for stdio (the default). Non-loopback addresses are rejected: the server has no built-in authentication or TLS. |
 | `server.http_path` | string | unset | `--http-path / LEAN_HOST_MCP_HTTP_PATH` | HTTP route for the Streamable HTTP transport. Requires bind. Default /mcp. |
@@ -85,7 +76,7 @@ Units are shown in the table; GiB figures in descriptions are explanatory, not l
 | `output.slow_call_warning_millis` | integer (ms) | `10000` | `LEAN_HOST_MCP_OUTPUT_SLOW_CALL_WARNING_MILLIS` | Worker-call CPU time above which every tool response carries a warning naming the elapsed milliseconds and recommending refactoring (splitting the declaration, explicit type annotations, extracted lemmas). Keys on call_cpu_millis, not wallclock, so machine contention never triggers it. Default 10 s. |
 | `install.binary` | path | unset | none | The server executable that install copied, for MCP client configs and scripts that run the server by absolute path. The server itself ignores it. |
 | `install.workers_dir` | path | unset | `LEAN_HOST_MCP_WORKERS_DIR` | Directory of per-toolchain worker installs, shared by install, install-worker and the server. Unset uses .local/lean-host-mcp/workers under the Lake root. A relative path is relative to the Lake root. |
-| `install.store_dir` | path | unset | `LEAN_HOST_MCP_STORE_DIR` | Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. It also holds the native owner records (owners/), the semantic runtime cache (semantic-runtimes/) and the server process records (processes/). Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root. |
+| `install.store_dir` | path | unset | `LEAN_HOST_MCP_STORE_DIR` | Private server state directory (mode 0700). Its lock admits one server at a time; a second server on the same store exits and names the first. It also holds the lock that every process the server starts inherits (children.lock, with one file per running group in children/), the semantic runtime cache that install builds (semantic-runtimes/) and the server process records (processes/). Unset uses .local/lean-host-mcp/store under the Lake root. A relative path is relative to the Lake root. |
 | `install.elan_home` | path | unset | `ELAN_HOME` | Elan's home when install ran: ELAN_HOME, else $HOME/.elan. When ELAN_HOME is unset, the server and install-worker --lake-root look for the Lean toolchain here, not under $HOME, and pass it on as ELAN_HOME. |
 | `requests.retention_hours` | integer (h) | `168` | none | Hours an ended request keeps its row, its stored result and its build log. The server prunes at start and every hour; it never prunes a request that has not ended. Default 7 days. |
 | `requests.max_rows` | integer | `10000` | none | Most rows the request table keeps. Past this, pruning deletes the ended rows that finished first. Default 10000. |
@@ -110,32 +101,28 @@ summary shows nonzero `budget_exceeded`, `not_attempted`, or `output_truncated` 
 A worker session's Lean environment is a snapshot taken at import, and a check reads `.olean` files while it runs, so no
 check may overlap a build of the same project. The server keeps them apart with one fair turn per Lake root:
 
-- A check takes a read turn before it starts a worker job or a native reader, then the shared kernel lock on the
-  project's artifacts, and keeps both until it ends. Read turns do not exclude each other.
-- `lean_build` takes the write turn, stops the project's workers and waits until each has exited, then takes the
-  exclusive kernel lock through the writer helper. It waits for the checks that hold read turns and holds back the
-  checks that arrive after it, so a check sent during a build waits and then sees what the build wrote. The next check
-  starts a fresh worker, even after a build that changed nothing. Turns follow arrival order; a waiting request keeps
-  its place until its deadline.
-- A worker holds the shared lock for its whole life. When a writer in another process asks for the exclusive lock, the
-  server queues a write turn for it and retires the idle workers that hold the lock.
+- A check takes a read turn before it starts a worker job or a short run, and keeps it until it ends. Read turns do not
+  exclude each other, so checks share the turn. A short run whose process group outlives its request keeps a share of
+  the turn until the group exits.
+- `lean_build` takes the write turn, so a build runs alone. It waits for the read turns and shares already held, and
+  holds back the checks that arrive after it, so a check sent during a build waits and then sees what the build wrote.
+  It stops the project's workers and waits until each has exited before Lake starts. The next check starts a fresh
+  worker, even after a build that changed nothing. Turns follow arrival order; a waiting request keeps its place until
+  its deadline.
 
 Each read turn carries the number of builds that have finished on the root. A worker that loaded its imports before a
-later build finished is recycled before reuse, and `artifacts_rebuilt` records that. Since a build in this server stops
-the workers first and workers hold the shared lock for their whole life, this is a backstop for writers in other
-processes. A cached query result answers only while the worker that computed it lives.
+later build finished is recycled before reuse, and `artifacts_rebuilt` records that. Since a build stops the workers
+first, this is a backstop. A cached query result answers only while the worker that computed it lives.
 
-Build through `lean_build`, or through another process that holds the shared writer. A raw `lake build` takes no lock:
-it can rewrite `.olean` files while a check reads them, and the server does not notice. That is outside the contract.
-Bundled shims and installed toolchain contents remain trusted fixed runtime inputs.
+Build through `lean_build`. The turns order only the Lake and Lean runs this server starts: a `lake build` run outside
+the server can rewrite `.olean` files while a check reads them, and the server does not notice. That is outside the
+contract. Bundled shims and installed toolchain contents remain trusted fixed runtime inputs.
 
-File checks and `lake setup-file` runs are native readers. The SDK starts one at a time per owner registry, across all
-projects and servers that share it. A reader that cannot start within 30 seconds, or by its request's deadline if that
-comes first, fails. Each start first removes the files of readers that have ended, while an ended reader may still be
-removing its own inputs. When a start finds such a file gone, it logs `native reader admission found a file gone` and
-tries again, up to three times. Every file check also takes shared custody of the installed shims. When checks start
-together, one may find the SDK's admission gate on the shims held for a moment; it tries again every 20 ms until its
-request's time runs out.
+File checks, `lake setup-file` runs, options probes and semantic file runs are short runs: one `lean` or `lake` process
+in its own process group, with private inputs under the store's `runs/`. At most `broker.max_lean_runs` of them run at
+once (default 2). Each takes a permit before it starts and keeps it until its group has exited, even past its reply. A
+run that gets no permit by its request's deadline does not start, and its error says to raise `broker.max_lean_runs` or
+retry. Short runs take no worker slot.
 
 ### Memory and import cycling
 
@@ -214,12 +201,13 @@ steps = [["build"], ["exe", "lean-fmt", "format", "--check", "--no-build"]]
 append = "each"                     # the request's args go at the end of both steps
 ```
 
-A build takes the project's write turn (see [rebuilt artifacts](#rebuilt-artifacts)), stops the project's workers, and
-opens one writer helper, which holds the exclusive kernel lock while the guard and each step run in it. The first
-failing step ends the build. All output goes to one log under the store's `logs/`, capped at `build.log_limit_mib`; the
-reply gives each step's command and exit code, the log's path and its tail. At the deadline the server stops the running
-step. The turn ends only after the helper and every process of the build have exited, so no check starts while one still
-runs.
+A build takes the project's write turn (see [rebuilt artifacts](#rebuilt-artifacts)), stops the project's workers and
+waits until each has exited, then runs the guard and each step as `lake <args>`, each in its own process group. The
+first failing step ends the build. All output goes to one log under the store's `logs/`, capped at
+`build.log_limit_mib`; the reply gives each step's command and exit code, the log's path and its tail. Cancellation or
+the deadline stops the running step's whole group. A step whose `lake` exits while other members of its group still run
+gets one second; then the server stops the group and the step ends the build with no exit code. The turn ends only after
+every group of the build has exited, so no check starts while one still runs.
 
 Each step runs in the Lake root with the server's environment, except that the server sets `LEAN_SYSROOT` to the
 project's toolchain and sets `LAKE_ARTIFACT_CACHE=false` so that builds land in each package's `.lake/build`. Set a
@@ -254,8 +242,8 @@ Worker-capacity admission, mailbox admission, and time waiting in the actor queu
 `queue_wait_timeout` without dispatching that queued operation. Once dispatch begins, the worker execution timeout
 applies separately. This is not a whole-tool deadline: a tool that submits several worker operations can take longer. A
 named check is the exception: its row fixes one deadline of the same length for the whole call, counted from the moment
-the server records it. Parallel server processes remain independent; lower `broker.max_workers` when the machine cannot
-hold that many workers.
+the server records it. Servers on other checkouts have their own limits; lower `broker.max_workers` when the machine
+cannot hold that many workers.
 
 Cheap metadata paths never open a worker at all: degraded `needs_build` responses, invalid-request responses, and
 project-scope `.ilean` reference reads answer from the Lake files directly. A repeat module query on an unmodified file
@@ -278,10 +266,9 @@ The server prunes the table when it starts and every hour after. It deletes ende
 `requests.retention_hours`, then the oldest ended rows past `requests.max_rows`, and then their logs. It never prunes a
 row that has not ended. At start it also deletes every log that no row names.
 
-Before it listens, a starting server ends the rows an earlier server left. For each project with a `running` row it
-takes the write turn and waits, for up to 15 minutes, until the writer lock is free, which shows that no helper of the
-earlier server still runs; the rows then become `interrupted`. If the lock stays held, the server does not start. It
-then starts the `queued` rows in the order they came, or ends them as `timed_out` past their deadline and as
+Before it listens, a starting server ends the rows an earlier server left. By then it has waited for every process the
+earlier server started (see [one server per store](#one-server-per-store)), so its `running` rows become `interrupted`
+at once. It then starts the `queued` rows in the order they came, or ends them as `timed_out` past their deadline and as
 `interrupted` when their project is gone. No row that said `running` runs again.
 
 ## Request activity in the terminal
@@ -370,12 +357,13 @@ Project shutdown is bounded by the worker layer. The host stops accepting new pr
 `runtime_unavailable` with reason `project_shutting_down`, and the controller then lets `lean-rs-worker-parent` perform
 its structured child shutdown: terminate, bounded graceful wait, kill escalation if needed, and reap. An active request
 may finish normally or run until the configured request timeout before the worker layer reports a terminal runtime
-outcome. Abrupt parent death can still skip Rust `Drop`; child-side parent-loss handling is best effort. Stronger
-containment is the job of the process manager that starts the server.
+outcome. A server killed abruptly runs no Rust `Drop`. Its workers then exit with status 125 once the pipe to the server
+closes, while its short runs and build steps may run on; the next server on the store stops them before it serves (see
+[one server per store](#one-server-per-store)).
 
 On shutdown the server stops its named requests and leaves their rows as they are. At the next start a `running` row
-becomes `interrupted` and a `queued` row runs (see [request table](#request-table)). A build's writer helper ends when
-the server dies, however it dies, so a killed server's build does not finish.
+becomes `interrupted` and a `queued` row runs (see [request table](#request-table)). A killed server's build does not
+finish: the next server stops the build's step before it serves.
 
 Every running server writes a PID record in its store's `processes/` and removes it on normal shutdown. A server without
 `--lake-root` writes it under the per-user cache directory at `lean-host-mcp/processes/` instead, and
@@ -420,54 +408,59 @@ another lean-host-mcp (pid 4242, lake root /work/project) holds the store /work/
 
 The store is `LEAN_HOST_MCP_STORE_DIR`, else `[install] store_dir` from the config files, else
 `.local/lean-host-mcp/store` under the Lake root. The server creates it with mode 0700 after its config checks pass. A
-server without `--lake-root` has no store and takes no lock.
+server without `--lake-root` has no store and takes no lock. The lock binds the store, not the checkout: run one server
+per checkout, and do not point two servers with different stores at one Lake root.
 
-### A stuck `dispatching` owner record
+The server then takes `children.lock` in the store and lets every process it starts inherit it, so the lock stays held
+until the last of them exits. Each build step and short run also gets a locked file in `children/` that its processes
+inherit. The file starts as `starting-…`, takes the number of the child's process group once the child runs, and the
+server deletes it once it has seen the group exit. The server never unlocks either lock. When it starts, it handles
+three cases:
 
-The SDK records each worker the server starts in the owner directory: `STORE/owners`, unless
-`LEAN_RS_WORKER_OWNERS_DIRECTORY` names another. A record is `worker-<generation id>/owner.json`, and it holds one slot
-of `broker.max_workers` until the SDK sees its worker stop. A server that dies, for example by `SIGKILL`, while a worker
-starts and before that worker reports its process leaves a record with `"phase":"dispatching"` and `"process":null`. The
-SDK cannot tell whether that worker exists, so no later server collects the record. This is an SDK limitation.
+- `children.lock` is free: no process of an earlier server runs. The server deletes the files in `children/` and serves.
+- `children.lock` is held: an earlier server died and left processes. The server logs `processes an earlier server
+  started still run; stopping the recorded ones`, sends SIGTERM to each group whose file is locked, waits up to 5
+  seconds, and sends SIGKILL to each group still locked. It never signals a group whose file is free and never looks for
+  processes by name. It then waits up to 30 seconds for `children.lock`, logs `every process of the earlier server has
+  exited`, and serves.
+- `children.lock` is still held after that wait: the server exits with an error such as
 
-Each such record takes a slot from every later server on the owner directory. Once they fill `broker.max_workers`, every
-call that needs a worker fails with:
+  ```text
+  processes an earlier server started still hold /work/project/.local/lean-host-mcp/store/children.lock after 35 s: process groups 51234 still run. Processes the server does not record, such as workers whose pipe to the dead server has not closed yet, may hold it too. `lsof /work/project/.local/lean-host-mcp/store/children.lock` lists every holder; stop them, then start the server again
+  ```
 
-```text
-lake project not usable: worker child setup failed: could not prepare worker parent lifeline: native actor capacity occupied
-```
+`install` and `install-worker --lake-root` take the store the same way, so each one refuses while a server serves that
+store and waits for a dead server's processes as a server does.
 
-When the record's limit differs from the server's `broker.max_workers`, one record blocks every worker:
+These rules hold, and each has a test:
 
-```text
-lake project not usable: worker child setup failed: could not prepare worker parent lifeline: occupied native actor capacity uses a different limit
-```
+| Rule | Test |
+| --- | --- |
+| One server per checkout: a second server on the store exits and names the first. | `store.rs`: `second_lock_names_the_holder`, `a_refused_start_names_the_holder_and_leaves_children_alone`; `tests/http_transport.rs`: `second_server_on_one_store_names_the_first` |
+| Checks share the turn, and a build runs alone. | `project_lock/tests.rs`: `two_requests_hold_read_turns_at_once`, `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`, `a_read_share_keeps_a_build_waiting_after_its_request_ends`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build` |
+| The next server serves only after the last one's children exit. | `children.rs`: `a_held_child_file_gets_its_group_stopped_and_the_lock_frees`, `a_child_file_whose_lock_is_free_is_never_signalled`; `tests/requests.rs`: `the_next_server_serves_only_after_a_killed_servers_build_exits`, `a_killed_servers_workers_exit_and_the_next_build_runs`; `tests/project_workers.rs`: `after_a_kill_during_worker_start_the_next_server_has_every_slot` |
+| At most `broker.max_lean_runs` short runs run at once. | `lake_options.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `two_file_checks_run_lean_at_once`, `with_one_lean_run_two_file_checks_take_turns` |
 
-A call that first reads the Lake options then waits 30 seconds and fails at stage `lake_option_discovery`:
+The [architecture notes](architecture.md#one-server-per-checkout) explain how the locks work and what they miss.
 
-```text
-lake project not usable: Lake option discovery: native reader did not return a complete result; no proof check ran: state=not_started native utility refused before bootstrap spawn: native-reader deadline elapsed
-```
+### A refused start
 
-To recover:
+When a server refuses to start because another holds the store, stop that server by the pid the error names, or use the
+server that already runs.
 
-1. Stop the server that uses the store.
-2. Confirm that no `lean-host-mcp` or `lean-host-mcp-worker` process remains from the dead server.
-   `ps -axo pid,ppid,pgid,stat,command | grep '[l]ean-host-mcp'` lists them. A process with parent PID 1 has outlived
-   its server; stop it by its exact PID.
-3. Find the stuck records and delete each one's directory:
+When it refuses because processes of an earlier server still hold `children.lock`:
+
+1. List every holder:
 
    ```sh
-   grep -l '"phase":"dispatching"' STORE/owners/worker-*/owner.json
-   rm -r STORE/owners/worker-<generation id>
+   lsof STORE/children.lock
    ```
 
-   Leave the other records and `.admission.lock`. A server collects a record by itself once it can confirm that the
-   record's worker stopped.
-4. Start the server.
-
-The dead start also leaves `lean-worker-<first 24 hex digits of the generation id>/parent.sock` in the socket directory.
-It blocks nothing, and you may delete it.
+2. Check each pid with `ps -o pid,pgid,command -p PID`. Expect `lake`, `lean` or `lean-host-mcp-worker` processes that
+   the dead server started.
+3. Stop each one by its exact pid, or its process group when the error names it: `kill -TERM -- -PGID`, then
+   `kill -KILL -- -PGID` if it does not exit. Do not stop processes by name.
+4. Start the server again. It deletes what the dead server left in `children/`.
 
 ## Runtime-error contract
 
@@ -520,9 +513,9 @@ bootstrap failure.
 | Path | Contents |
 | --- | --- |
 | `.gitignore` | `*`, so Git ignores the directory even when the project does not ignore `.local/` |
-| `bin/lean-host-mcp` | a copy of the running executable, which also serves the SDK writer that builds the worker's shims |
+| `bin/lean-host-mcp` | a copy of the running executable |
 | `workers/` | the worker for the project's toolchain, built as `install-worker` builds it |
-| `store/` | the server's private state, mode 0700, including the native owner records that install binds |
+| `store/` | the server's private state, mode 0700, with the semantic search runtime that install builds in `semantic-runtimes/` |
 | `config.toml` | the local config file, with `[install]` set to the absolute `binary`, `workers_dir`, `store_dir` and `elan_home` |
 
 Serve with the installed copy:
@@ -538,12 +531,15 @@ PROJECT/.local/lean-host-mcp/bin/lean-host-mcp --lake-root PROJECT
 - A current worker stays; `--force` replaces it. A worker that another `lean-host-mcp` release built is stale, so
   install replaces it after an upgrade.
 - `--source-dir DIR` passes to the worker build, as for `install-worker`.
+- Install takes the store as a server does (see [one server per store](#one-server-per-store)), so it refuses while a
+  server serves the project. Stop the server, install, then start it again.
+- Install builds the semantic search runtime for the project's toolchain into the store's `semantic-runtimes/`. A server
+  only opens it; a semantic call that finds it unbuilt fails and says to rerun `lean-host-mcp install --lake-root`.
 
 Install replaces the `[install]` table and keeps the local file's other keys, but not its comments. It refuses a local
 file that is not valid TOML before it builds anything. It records `elan_home` as `ELAN_HOME`, else `$HOME/.elan`, so a
 server started without `ELAN_HOME` finds the toolchain without reading `HOME`. Install, then serve, write nothing under
-`HOME` but the socket directory; `install_and_serve_keep_no_state_in_an_empty_home` in `tests/http_transport.rs` checks
-this.
+`HOME`; `install_and_serve_keep_no_state_in_an_empty_home` in `tests/http_transport.rs` checks this.
 
 ## Installing workers
 
@@ -555,7 +551,9 @@ server. The worker uses the shims bundled with `lean-rs-host`.
 `lib/lean`. It installs into `--workers-dir DIR`, or into the worker directory of `--lake-root PROJECT`:
 `LEAN_HOST_MCP_WORKERS_DIR`, then `[install] workers_dir`, then `PROJECT/.local/lean-host-mcp/workers`. The server finds
 workers through the same function. With neither flag, `install-worker` uses `LEAN_HOST_MCP_WORKERS_DIR` and fails when
-it is unset. Source selection is automatic:
+it is unset. With `--lake-root`, `install-worker` takes the project's store as a server does, except for `--list`, so it
+refuses while a server serves the project; then no worker it replaces, prunes or cleans can still run. With only
+`--workers-dir` it takes no store: stop every server that uses that directory first. Source selection is automatic:
 
 - **Registry** (the default for a `cargo install lean-host-mcp` binary): fetch and build the published
   `lean-host-mcp-worker` crate at the server's own version (`cargo install lean-host-mcp-worker --version =<ver>`).
@@ -579,12 +577,12 @@ built the worker:
   skipped (a worker for them could never load). `--force` rebuilds current workers too (e.g. to re-run the smoke test or
   replace a corrupted binary).
 - `install-worker --toolchain <id>` builds a fresh generation in its final directory. The new worker writes the shim
-  sources compiled into it to the generation's `shims/` directory and builds them there with the installer's own
-  executable as the SDK writer; the installer records their identities in `worker.json`. After the builtin
-  `Nat.add_zero` inspection and successful shutdown it atomically updates `current-generation`. Existing workers retain
-  their original paths. Installs without a selector continue to use the legacy directory. The installed shims and their
-  compiled Lean imports run without the source checkout or Cargo source cache. To use a different worker root, reinstall
-  there. The SDK manifest records absolute paths for its generation.
+  sources compiled into it to the generation's `shims/` directory and builds them there with plain Lake; the installer
+  records their digests in `worker.json`. After the builtin `Nat.add_zero` inspection and successful shutdown it
+  atomically updates `current-generation`. Existing workers retain their original paths. Installs without a selector
+  continue to use the legacy directory. The installed shims and their compiled Lean imports run without the source
+  checkout or Cargo source cache. To use a different worker root, reinstall there. The SDK manifest records absolute
+  paths for its generation.
 - `install-worker --list` prints every installed worker; the `protocol` column reads `compatible`, `incompatible`, or
   `unknown` for a legacy sidecar. The runtime handshake remains authoritative for legacy workers.
 - `install-worker --clean` removes all installed workers; `--clean --toolchain <id>` removes just one. Workers are
@@ -602,20 +600,22 @@ the worker directory and ends with the same command:
 no worker for leanprover/lean4:v4.36.0 in /work/project/.local/lean-host-mcp/workers; run: /work/project/.local/lean-host-mcp/bin/lean-host-mcp install --lake-root /work/project
 ```
 
-### Upgrading from lean-rs 0.10
+### Upgrading to 0.18
 
-The server, its writer and its workers must come from one SDK release; the server is now its own writer. A 0.10 writer
-could leave a storage-turn record that 0.11 refuses instead of reading as a stopped writer: a build fails with `writer
-ownership record has unknown fields` or `unrecognized native registry directory .../.writer-storage-v1`. To upgrade:
+A 0.18 server, its workers and its SDK (lean-rs 0.12) upgrade together. A 0.18 server reads none of the locks, records
+and sockets that 0.17 kept. To upgrade:
 
-1. Stop every server and build that uses the project.
-2. Delete `.writer-storage-v1` from the owner directory: `owners` in the store, or `LEAN_RS_WORKER_OWNERS_DIRECTORY`.
-3. If the project's writer lock file holds a record with a field other than `version`, `owner` and `process`, such as
-   `storage_turn`, empty the file. `lean-host-mcp writer-lock-path PROJECT` prints its path as `lock_path`.
-4. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT` replaces the worker, since another release
-   built it, and `install-worker` does the same for a worker installed on its own.
-5. Delete an old `bin/lean-rs-writer` from the install directory, `PROJECT/.local/lean-host-mcp` unless install ran with
-   `--dir`. Nothing runs it now.
+1. Stop every server and build that uses the project. A 0.18 server refuses to start while a 0.17 server holds the
+   store.
+2. Reinstall with the new binary: `lean-host-mcp install --lake-root PROJECT`. It replaces the worker, since another
+   release built it, and builds the semantic search runtime into the store. Use `install-worker` for a worker installed
+   on its own.
+3. Remove `LEAN_HOST_MCP_SOCKET_DIR`, `LEAN_RS_WORKER_OWNERS_DIRECTORY` and the `LEAN_RS_WRITER_*` variables from the
+   server's environment and client configs. Nothing reads them now.
+4. Delete what 0.17 left, which blocks nothing: `owners/` in the store, or the directory that
+   `LEAN_RS_WORKER_OWNERS_DIRECTORY` named; the socket directory (`LEAN_HOST_MCP_SOCKET_DIR`, else
+   `$XDG_RUNTIME_DIR/lean-host-mcp`, else `$HOME/.lean-host-mcp-ipc`); the writer lock file `.lean-rs-writer-*.lock`
+   beside the project in its parent directory; and an old `bin/lean-rs-writer` in the install directory.
 
 ## Build, test, lint
 
@@ -623,8 +623,7 @@ ownership record has unknown fields` or `unrecognized native registry directory 
 cargo build --locked -p lean-host-mcp                          # parent only
 cargo build --locked -p lean-host-mcp-worker                   # worker only (links libleanshared)
 cargo clippy --locked --workspace --all-targets -- -D warnings # safe; clippy doesn't link
-LEAN_RS_WORKER_OWNERS_DIRECTORY=$(mktemp -d "$PWD/target/owners.XXXXXX") \
-    cargo test --locked -p lean-host-mcp --lib                  # parent unit tests
+cargo test --locked -p lean-host-mcp --lib                     # parent unit tests
 cargo test --locked -p lean-host-mcp-worker --all-targets       # worker tests
 scripts/test-installed-stdio.sh --all-targets                  # includes installed-worker EOF and exit
 scripts/test-installed-module-setup.sh                         # packaged pair and semantic search
@@ -636,34 +635,25 @@ CARGO_NET_OFFLINE=true \
     -- --ignored                                               # install and serve with an empty HOME
 ```
 
-Run the ignored tests that start workers one at a time, each with a new owner directory. On macOS a few at once use up
-the SDK's native actor capacity, and the rest fail with "native actor capacity occupied" or "deadline elapsed". A test
-that dies can leave an owner record that holds back every later test on the same directory; see
-[A stuck `dispatching` owner record](#a-stuck-dispatching-owner-record).
+Run the ignored tests that start workers one at a time, each with a new store. They start Lean processes, and the timing
+tests in `tests/requests.rs` assume no other load.
 
 On macOS, Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test binaries it runs, and the installed worker refuses any
 `DYLD_*` variable, so opt-in tests that check files or start a worker fail under `cargo test`. Build them with
 `cargo test --no-run`, then run each printed binary under `env -u DYLD_FALLBACK_LIBRARY_PATH`. Point
 `LEAN_HOST_MCP_WORKERS_DIR` at an installed worker, and keep `LEAN_HOST_MCP_SEMANTIC_CACHE_DIR` and `TMPDIR` under the
-target directory. For one printed binary `BINARY`:
+target directory. A test that ranks proofs needs the semantic runtime built in that cache first, as
+`examples/prepare_semantic_smoke.rs` builds it. For one printed binary `BINARY`:
 
 ```sh
 for name in $(BINARY --list --ignored | sed -n 's/: test$//p'); do
     env -u DYLD_FALLBACK_LIBRARY_PATH LEAN_HOST_MCP_TEST_FIXTURE="$PWD/fixtures/lean" \
-        LEAN_RS_WORKER_OWNERS_DIRECTORY="$(mktemp -d "$PWD/target/owners.XXXXXX")" \
         LEAN_HOST_MCP_STORE_DIR="$(mktemp -d "$PWD/target/store.XXXXXX")" \
         BINARY --ignored --exact "$name"
 done
 ```
 
-The empty-HOME test clears its children's environment, so it runs under `cargo test`. The parent library tests start
-native work too, so give each run of them a new owner directory, as above.
-
-The tests keep worker sockets in the target directory, not under `HOME`. The servers a test starts use a new `sXXXXXX`
-there, the suites that start workers in their own process share `s`, and the installed-test scripts make `s.XXXXXX`. A
-directory deeper in `target/` would make socket paths longer than the 103 bytes macOS allows. A target directory path
-longer than 45 bytes leaves too little room even for these, so set `LEAN_HOST_MCP_SOCKET_DIR` to a shorter private
-directory outside `/tmp`; the tests and those scripts then all use it. CI sets one in the runner's temporary directory.
+The empty-HOME test clears its children's environment, so it runs under `cargo test`.
 
 Build each member with `-p <name>`. Selecting both in `cargo build --workspace` unifies the `lean-rs-sys` feature set
 and silently links `libleanshared` into the parent. Run the packaged smoke test from a clean checkout. It uses
@@ -742,7 +732,7 @@ declaration, for example:
 ```
 
 Under the request's read turn, the server runs the selected toolchain's `lake --no-build --no-cache setup-file <file>`
-as a native reader and checks the current source using that file's options, imports, plugins and dynamic libraries. Lake
+as a short run and checks the current source using that file's options, imports, plugins and dynamic libraries. Lake
 builds nothing here, so keep the project built: when an import is missing or stale, Lake exits 3 and the reply is
 `needs_build`, with a `stale_build` row naming each module Lake lists. This route requires the setup-aware verification
 shim. File-backed `lean_lookup` with `kind="proof_search"` uses the same setup for goal elaboration.
@@ -751,8 +741,8 @@ Lake writes its own config cache under `.lake/config/` when the lakefile changed
 right after a lakefile edit can write there. When two checks start that write at the same moment, Lake fails one with
 "could not acquire an exclusive configuration lock"; retry it.
 
-**Elan maintenance.** Keep the selected canonical Elan toolchain installed and unchanged while its workers run. Drain
-and stop those workers before uninstalling or replacing that toolchain. The host checks release identity at admission;
-it does not acquire an Elan maintenance lock. Generation-based installs retain shared artifact locks. Clean and prune
-require exclusive access to those same domains, including older generations in the slot. Flat legacy installations
-predate these locks and require their workers to be stopped before maintenance.
+**Elan maintenance.** Keep the selected canonical Elan toolchain installed and unchanged while its workers run. Stop the
+servers that use it before uninstalling or replacing that toolchain. The host checks release identity at admission; it
+takes no Elan maintenance lock. `install-worker --lake-root` with `--clean` or `--prune` takes the project's store, so
+it refuses while a server serves the project; with only `--workers-dir`, stop every server that uses the directory
+first.

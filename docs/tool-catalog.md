@@ -35,12 +35,9 @@ envelope. Negative proof/check verdicts remain successful tool executions with d
 
 The broker admits and opens a real host session under its ordinary worker capacity. The handshake executes no target
 proof. It returns `status: "ok"` and one `native_compatibility` object containing the broker instance, a contract
-digest, the expected native API/lifecycle/binding contract, and actual actor/generation-bound loaded receipts. The same
-object carries `shared_writer: {protocol: 1, executable: ...}` from the server's current executable; its required
-protocol is part of the expected contract while the executable is an instance-bound observation. Every writer client
-negotiates that executable's JSON protocol before launching a write. Worker package versions are observations;
-compatibility is not tied to an executable hash or source checkout revision. Compiled Lean version/header facts are
-separate from `runtime_lean_version`, which comes through the loaded version shim.
+digest, the expected native API/lifecycle/binding contract, and actual actor/generation-bound loaded receipts. Worker
+package versions are observations; compatibility is not tied to an executable hash or source checkout revision. Compiled
+Lean version/header facts are separate from `runtime_lean_version`, which comes through the loaded version shim.
 
 The broker binds its required host ABI subset for its lifetime and checks that subset on every later host session,
 including after internal replacement. Extra compatible loaded operations are allowed. A missing or incompatible runtime
@@ -52,9 +49,9 @@ Save the contract and instance with the request. Semantic responses carry the ac
 result. To recover a lost reply, read the same `request_id` with `lean_get` rather than sending the call under a new id.
 `lean_runtime` is an advisory snapshot and never opens a worker.
 
-`lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and helper
-configuration without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded handshake.
-A client requiring pure discovery must not remove the mode or fall back to loaded discovery after an error.
+`lean_compatibility({"project":"/canonical/project","mode":"pure_v1"})` returns compiled expectations and the project
+and toolchain identity without native admission or loaded receipts. Default `mode: "loaded"` retains the manual loaded
+handshake. A client requiring pure discovery must not remove the mode or fall back to loaded discovery after an error.
 
 ## Tool Roles
 
@@ -84,10 +81,10 @@ setup.
 
 The receipt includes lowercase SHA-256 strings `source_sha256`, `module_setup_sha256`, `artifact_identity_sha256`,
 `request_sha256`, and `data_sha256`. These bind the exact source bytes, staged ModuleSetup bytes, checked input
-identities and installed shim digests under read custody, the staged driver request bytes, and the returned `data`
-respectively. The `data` digest uses compact UTF-8 JSON with sorted object keys and unchanged array order. A caller must
-check the exact requested names and compare the source digest against its saved input before accepting a verdict. The
-receipt establishes CLI provenance. Loaded-worker ABI evidence continues to use `trust.native_compatibility`.
+identities and installed shim digests, the staged driver request bytes, and the returned `data` respectively. The `data`
+digest uses compact UTF-8 JSON with sorted object keys and unchanged array order. A caller must check the exact
+requested names and compare the source digest against its saved input before accepting a verdict. The receipt
+establishes CLI provenance. Loaded-worker ABI evidence continues to use `trust.native_compatibility`.
 
 ### Named requests
 
@@ -128,15 +125,16 @@ returns the old result.
 
 Nothing cancels a named request: it ends when its tool returns, at its deadline, or at the next server start. The row
 fixes the deadline when it is written: `runtime.request_timeout_millis` for a check, `[build] timeout_secs` or the
-recipe's `timeout_secs` for a build. The wait for the project's turn counts. A build takes the write turn and the writer
-lock before its row says `running`; a check takes the read turn first. Checks on one project share the read turn, so
-their rows run at once, but the SDK starts their native readers one at a time (see
+recipe's `timeout_secs` for a build. The wait for the project's turn counts. A build takes the write turn before its row
+says `running`; a check takes the read turn first. Checks on one project share the read turn, so their rows run at once,
+with at most `broker.max_lean_runs` Lean or Lake processes of theirs at a time (see
 [Operations](operations.md#rebuilt-artifacts)). A check sent during a build waits for it. Deadlines use wall-clock time,
 which counts a laptop's sleep.
 
-When a server starts, it ends the rows an earlier server left. For a `running` row it first waits until no writer helper
-of that server holds the project, then marks the row `interrupted`. It starts `queued` rows in the order they came,
-unless the deadline has passed (`timed_out`) or the project is gone (`interrupted`).
+When a server starts, it ends the rows an earlier server left. Before it serves, it waits until every process the
+earlier server started has exited (see [Operations](operations.md#one-server-per-store)), then marks each `running` row
+`interrupted`. It starts `queued` rows in the order they came, unless the deadline has passed (`timed_out`) or the
+project is gone (`interrupted`).
 
 A call without `request_id` gets a server-made id `srv-<uuid>` and no row. When its connection drops, the server cancels
 it, as it does on MCP `notifications/cancelled`. A crash loses it.
@@ -210,11 +208,11 @@ an uncertain shutdown is not freed memory.
 
 The build waits for the project's write turn: checks already running finish first, and checks sent later wait until the
 build ends. Then it stops the project's workers, so the next check starts a fresh worker on what the build wrote, even
-when the build changed nothing. One writer helper holds the project's exclusive lock while Lake runs every step. Lake
-decides what to build and in which order. When `[build] guard` names targets, the server adds the step
-`lake build --no-build <guard>` before the build (or where the recipe's `guard` puts it), so a build that would compile
-those targets stops instead. The first failing step ends the build. The config, recipes and the words the server refuses
-are in [operations](operations.md#builds).
+when the build changed nothing. Each step runs as `lake <args>` in its own process group, and the build ends only after
+every group has exited. Lake decides what to build and in which order. When `[build] guard` names targets, the server
+adds the step `lake build --no-build <guard>` before the build (or where the recipe's `guard` puts it), so a build that
+would compile those targets stops instead. The first failing step ends the build. The config, recipes and the words the
+server refuses are in [operations](operations.md#builds).
 
 ```json
 {
@@ -754,10 +752,8 @@ is false when reporting was not requested or the axiom set could not be computed
 
 ## `lean_lookup`
 
-Artifact-backed declaration inventory and reference queries report `unavailable` when shared read custody cannot be
-established. They do not reinterpret a busy or unconfirmed writer as an empty index or a missing build. Retry after the
-current writer finishes. Custody describes a consistent artifact read; source/index freshness and exact content binding
-remain separate trust facts.
+Artifact-backed declaration inventory and reference queries read the project's build under the request's read turn, so
+no build of this server runs while they read. Source and index freshness remain separate trust facts.
 
 ### `kind: "declaration"`
 
@@ -801,9 +797,8 @@ exists:
 
 If module source is unavailable, the mode falls back to a matching `.ilean` and reports its build-freshness facts in
 `trust`. Index rows have declaration and name/selection ranges but omit `kind` and `body_span`. A missing file target
-returns `not_found`; an unavailable module index returns `missing_build`. Shared artifact custody failure returns
-`unavailable`, as described at the start of this section. `limit` defaults to 200 and is capped at 1000; truncation
-keeps a deterministic prefix and sets `truncated: true`.
+returns `not_found`; an unavailable module index returns `missing_build`. `limit` defaults to 200 and is capped at 1000;
+truncation keeps a deterministic prefix and sets `truncated: true`.
 
 ### `kind: "proof_search"`
 

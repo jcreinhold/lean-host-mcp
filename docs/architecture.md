@@ -1,7 +1,8 @@
 # Architecture
 
-This contributor reference explains worker ownership, admission, artifact custody, and result validity. Start with the
-[README](../README.md) for setup and the [tool catalog](tool-catalog.md) for public contracts.
+This contributor reference explains how one server owns a Lake checkout and the processes it starts, how it admits work,
+and when a result stays valid. Start with the [README](../README.md) for setup and the [tool catalog](tool-catalog.md)
+for public contracts.
 
 The five semantic tools expose a declaration-oriented proof workflow. The host resolves names and proof-position
 selectors into bounded jobs, sends them to a supervised Lean worker, and projects typed results into the public
@@ -15,35 +16,32 @@ privileges; the worker is not an OS sandbox.
 - [Reference indices](#reference-indices)
 - [Lake options](#lake-compilation-options), [deadlines](#queue-and-execution-deadlines) and
   [turns and builds](#turns-and-builds)
-- [Artifact custody](#native-ownership-and-artifact-custody) and
-  [external inputs](#pure-compatibility-and-external-input)
+- [One server per checkout](#one-server-per-checkout) and [the rules and their tests](#rules-and-their-tests)
 
 ## Crate Layout
 
 ```
 crates/lean-host-mcp/src/
-  main.rs                clap CLI, shared broker setup, rmcp stdio entry, the SDK's helper subcommands
+  main.rs                clap CLI, shared broker setup, rmcp stdio entry
   transport_http.rs      private axum/rmcp Streamable HTTP entry
   server.rs              LeanHostService tool registration
-  broker.rs              ProjectBroker: the served root, worker slots, idle retirement, the reaper
+  broker.rs              ProjectBroker: the served root, worker slots, short-run permits, idle retirement, the reaper
   broker/control.rs      worker activity snapshots for lean_runtime, and the activity count
   broker/host_artifacts.rs the installed shims a worker reads before it opens
-  broker/module_setup.rs lake setup-file and lake query as native readers; the import closure and module sources
-  broker/semantic_file.rs file-backed semantic proof search through a native reader
+  broker/module_setup.rs lake setup-file and lake query as short runs; the import closure and module sources
+  broker/semantic_file.rs file-backed semantic proof search through a short run
   broker/verify_file.rs  file checks through one-shot Lean programs
-  broker/writer_handoff.rs idle workers retired for a writer in another process
   project.rs             LeanProject actor: one serialized controller and worker
   project/runtime_config.rs the actor's memory budget, Lean heap ceiling, deadline, mailbox and restart limits
   project/restart.rs     why a worker cycled: cause names, which causes count toward the restart limit, the tally
-  project/semantic_runtime.rs the semantic-search runtime, built once per toolchain, and its cache directory
+  project/semantic_runtime.rs the semantic-search runtime that install builds and a server opens, and its cache
   worker_retirement.rs   keeps an actor's capacity until each tracked child has exited
-  project_lock.rs        fair read and write turns per Lake root, the shared kernel guard, proxy turns
-  build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, the run in one helper
-  native_reader.rs       one-shot Lean programs in the SDK's native reader scope
+  project_lock.rs        fair read and write turns per Lake root, and the read shares of short runs
+  build.rs, build/       lean_build: the [build] and [recipes] config, Lake word checks, each step's group, the capped log
+  lean_run.rs            short runs: one lean or lake program in its own process group, with capped output
+  children.rs            children.lock and the per-child files; startup's wait for an earlier server's processes
   host_preparation.rs    the worker's host-artifact modes: readiness, and the preparation an installer runs
-  native_socket.rs       where the SDK's short-lived sockets live
-  artifact_reads.rs      parent-only artifact reads that hold shared descriptors until parsing ends
-  runtime_compatibility.rs the one native compatibility contract for writers and workers
+  runtime_compatibility.rs the one native compatibility contract for workers
   tools/                 semantic.rs facade; declaration/proof_search/proof_action/position internals; build.rs
   projections.rs         stable MCP projections from lean-rs worker types
   lake_meta.rs           minimal Lake-project metadata
@@ -53,7 +51,7 @@ crates/lean-host-mcp/src/
   envelope.rs            internal operation envelope adapted to { data, errors, trust } at the public boundary
   requests/              named requests: the SQLite request table, one launch per id, recovery at start
   request_log.rs         content-free summaries of semantic calls
-  store.rs               the server store: one-server lock, build logs, the native owner directory
+  store.rs               the server store: server.lock, then children.lock, build logs, the semantic runtime cache
   config_file.rs         the tracked and local config files at the Lake root
   config_schema.rs       every config setting, in one table
   cli/                   install, install-worker, config init and doctor processes
@@ -97,6 +95,11 @@ that expected contract. Worker-session configuration enforces the subset after e
 preserves actual receipts independently of telemetry verbosity. This replaces caller-side binary/shim profiles rather
 than adding a second admission queue.
 
+`lean_compatibility(mode = "pure_v1")` describes the compiled expectations and the project and toolchain identity. It
+starts no worker or short run and claims no loaded runtime. Its expected binding fingerprints come from the same
+signature declarations and encoder as the typed host bindings, and every new or replacement session checks those
+expectations before it serves. The default `loaded` mode returns the receipts of a worker it opened.
+
 `lean_runtime` reads the pool under the broker registry mutex and changes nothing. Preparation utilities, startup locks,
 queued jobs, and background recycling/prewarming all join the activity count it reports. The guard survives caller
 disconnects and registry removal through cleanup, so a retired controller cannot start new maintenance. Worker permits
@@ -118,20 +121,25 @@ controller's host handle and stays within synchronous dispatch. It cannot cross 
 The broker reserves a slot before opening a worker. Opening, resident, and retiring actors count against the cap until
 confirmed shutdown. An actor-owned process tracker covers each worker and its replacement generations. Once the actor
 seals, the retirement registry retains its slot until every direct child is reaped. Late exit observation restores
-capacity, including after cleanup-thread creation failure; uncertain cleanup retains the slot. This registry is
-process-local and does not reconcile server crashes or Lake descendants. The cap counts actor runtimes, not memory bytes
-or each transient companion process. External Lean processes are outside it.
+capacity, including after cleanup-thread creation failure; uncertain cleanup retains the slot. This registry lives in
+one server process. After a crash the next server waits for the dead server's workers through `children.lock` (see
+[one server per checkout](#one-server-per-checkout)). The cap counts actor runtimes, not memory bytes or each transient
+companion process. Short runs have their own bound, `broker.max_lean_runs`.
 
 The installed worker reads the project's own build in place. At launch the broker names the project's import roots in
 Lean's search order, from `lake_meta::manifest_artifact_roots`: the root package's `.lake/build/lib/lean`, then each
-manifest package's. For its whole life the worker holds shared the kernel lock of every artifact domain under those
-roots and of the installed shims. It admits an import only when the request's roots are exactly the launch roots, in
-order, then the installed shim roots, and while no root holds a package whose compiled code the worker runs, such as
-`Init` or `Init.olean`; any module names are allowed. A worker that cannot take custody of its project at launch, for
-example after the manifest dropped a package, starts anyway and refuses each import with the reason. A child that exits
-before it connects makes the server wait out the 30-second startup deadline it gives the SDK, which then closes the
-child's owner record once it reaps the child. The server refuses to start with `LEAN_PATH` set, since the worker would
+manifest package's. It admits an import only when the request's roots are exactly the launch roots, in order, then the
+installed shim roots, and while no root holds a package whose compiled code the worker runs, such as `Init` or
+`Init.olean`; any module names are allowed. A worker whose launch roots are not Lake build outputs starts anyway and
+refuses each import with the reason. No lock guards these roots: only the server that launched the worker builds the
+checkout, and it stops the worker before each build. A child that exits before it connects makes the server wait out the
+30-second startup deadline it gives the SDK. The server refuses to start with `LEAN_PATH` set, since the worker would
 refuse it before connecting. The host copies no files, hashes no build outputs, and writes no import plan.
+
+Before it takes an opening turn or a worker slot, the broker asks the worker's readiness mode for the descriptor of the
+shims `install` built (`broker/host_artifacts.rs`), and the worker loads the shims that descriptor names. The mode reads
+and builds nothing. If the shims are missing or stale, the open fails with the install command; the server never builds
+shims.
 
 Startup stays serialized after caller disconnects and rechecks the per-project limit. Idle retirement skips a borrowed
 actor and one with queued work. Metadata-only degraded responses and pure `.ilean` reads use
@@ -169,12 +177,11 @@ Above 60% of the residue budget, a quiet actor can cycle as `import_residue_idle
 the latest profile only if recently served (within one minute), and cycles at most once per quiet period. The
 `import_residue_idle : import_residue` ratio measures how much restart cost lands between requests.
 
-A pooled environment is a snapshot from its import, so no writer may change the artifacts under a live worker. The
-worker holds the shared kernel lock for its whole life, and a build stops the project's workers before it takes the
-exclusive lock (see [turns and builds](#turns-and-builds)). As a backstop for writers in other processes, each job
-carries the finished-build count of its read turn, and the actor keeps the count under which the live generation first
-loaded imports. A higher count cycles the worker before the job as `artifacts_rebuilt`, which is not execution taint,
-and drops every pooled profile.
+A pooled environment is a snapshot from its import, so no build may change the artifacts under a live worker. A build
+stops the project's workers and waits until each has exited before Lake runs (see
+[turns and builds](#turns-and-builds)). As a backstop, each job carries the finished-build count of its read turn, and
+the actor keeps the count under which the live generation first loaded imports. A higher count cycles the worker before
+the job as `artifacts_rebuilt`, which is not execution taint, and drops every pooled profile.
 
 Worker death never authorizes replay: Lean elaboration and tactics may perform IO. The opt-in
 `retry_tainted_non_positive` policy allows one retry of a non-positive trial/verification verdict after a mid-call
@@ -184,7 +191,8 @@ listed in [operations](operations.md#internal-runtime-facts).
 
 The worker loads the bundled `lean_rs_host_*` shim capabilities from `lean-rs-host`. The source-backed proof-search lane
 uses `lean-semantic-search-runtime`, which owns its Lean payload, provenance, materialization, and build. The host
-selects cache roots and toolchain/sysroot. Consumers do not declare, link, or import either support package.
+selects cache roots and toolchain/sysroot: `install` builds the runtime into the store, and a server only opens it.
+Consumers do not declare, link, or import either support package.
 
 ### Toolchain-Readiness Gate
 
@@ -217,9 +225,8 @@ resolution also rechecks worker readiness, including the current header digest.
 version, host version, worker protocol, digest support at build time, and runtime smoke outcome. Protocol determines
 wire compatibility, so the server serves a worker that another host version built. `install` and `install-worker --auto`
 rebuild such a worker: the worker and host crates release together, and a release can keep the protocol. A legacy
-sidecar without protocol information leaves the worker handshake authoritative. The sidecar names no writer. The
-installer builds the shims with a server executable, the digests of the shim files bind that build, and the server runs
-its own executable as the writer.
+sidecar without protocol information leaves the worker handshake authoritative. The installer builds the shims with
+plain Lake in the generation's own directory, and the digests of the shim files bind that build.
 
 The smoke test opens a worker session importing `Init` and inspects `Nat.add_zero`. Failure exits installation nonzero
 but retains the binary and failed record so `--list` and readiness can explain the problem. Missing provenance or smoke
@@ -278,10 +285,9 @@ queries do not request whole info trees or unbounded project scans, so query sha
 `ModuleQueryCache` stores bounded file-keyed outcomes for single and batched queries. A key includes the file path,
 source bytes, query/selector shape and output budgets, session/freshness imports, elaboration options, and the
 finished-build count of the request's read turn. There is no TTL. Each entry names the worker generation that computed
-it and answers only while that generation lives: the worker holds the shared kernel lock for its whole life, so no
-writer has changed what it read. A probe made while another generation lives, or none, drops the entry. The count alone
-is not enough, since a short build in another process can end between two reaper ticks and never move it. Execution
-taint prevents insertion, and unknown query variants bypass caching.
+it and answers only while that generation lives: a build stops every worker before Lake runs, so no build has changed
+what a live generation read. A probe made while another generation lives, or none, drops the entry. Execution taint
+prevents insertion, and unknown query variants bypass caching.
 
 A valid hit bypasses the actor mailbox, but source option discovery still runs. Name-only inspection/search, proof
 attempts, and verification are not cached: their meaning depends on an imported environment and execution policy that
@@ -301,10 +307,10 @@ re-elaborating every source file; the former worker scan took about 3 s/file, or
 `references_to` and `declarations_in_module` use `serde_json` and `walkdir`, adding no Lean linkage or worker
 capability. Raw JSON types and path mapping stay private.
 
-Both functions acquire shared artifact-read custody before opening an index. Reference scans return `Unavailable`
-without reading when custody cannot be established, `NotBuilt` when the build directory is absent, or `Present` after a
-scan. Declaration queries distinguish unavailable custody, an absent project build tree, an absent/unreadable module
-index, and a parsed index. Callers translate these outcomes into public statuses, warnings, and artifact trust facts.
+Callers hold the project's read turn, so no build writes an index while it is read. Reference scans return `NotBuilt`
+when the build directory is absent, or `Present` after a scan. Declaration queries distinguish an absent project build
+tree, an absent/unreadable module index, and a parsed index. Callers translate these outcomes into public statuses,
+warnings, and artifact trust facts.
 
 `ReferenceIndex` carries hits, parsed/skipped module counts, and `stale_sources`. An unreadable, malformed, unsupported,
 or uncovered individual index is skipped and counted. Staleness checks compare source/index mtimes only for modules that
@@ -385,17 +391,17 @@ build graph. Root and direct dependency files use their own package and library 
 options and current `require ... with` options. Source checks for transitive dependencies fail explicitly rather than
 guess their configuration; lookups of already-built declarations are unaffected.
 
-The helper uses the same guardian-owned native reader as external checks. Both root and dependency configuration caches
-live under the existing generation's private `inputs/` directory; framework loading creates no project `.lake` directory
-and changes no shared cache or trace. Real package paths, cwd and `__dir__` remain intact. Parent shared custody
-protects metadata resolution until the guardian receives the same complete read union. These are cooperating read-only
-programs; arbitrary user configuration IO is not sandboxed. Private inputs survive uncertain cleanup and are removed
-only after actual scope closure. Files outside a configured library and file-less trials use Lake's root-package
-defaults.
+The helper is a short run (`lean_run.rs`), like a file check: one program in its own process group, with capped output.
+Both root and dependency configuration caches live in the run's private directory under the store's `runs/`; framework
+loading creates no project `.lake` directory and changes no shared cache or trace. Real package paths, cwd and `__dir__`
+remain intact. The run holds the request's read turn, so no build the server runs changes the files it reads. These are
+cooperating read-only programs; arbitrary user configuration IO is not sandboxed. Private inputs stay until the run's
+group has exited. Files outside a configured library and file-less trials use Lake's root-package defaults.
 
-Option discovery joins the broker's activity count. An admitted utility keeps its activity guard through the existing
-owned cleanup job, including after its async waiter disappears. One preparation group may coexist with a full resident
-actor quota, so option discovery does not evict a warm worker or request exclusive project access.
+Every short run takes a permit from the broker's `broker.max_lean_runs` semaphore before it starts and keeps it until
+its group has exited, even past its reply. A run that finds no permit by its deadline does not start. Short runs also
+join the broker's activity count, but take no worker slot, so option discovery does not evict a warm worker or request
+exclusive project access.
 
 The worker receives typed options, including `weak.*` options. It resolves their types after imports load.
 `-Dname=value` compiler arguments use Lean's parser; other extra compiler arguments return an explicit unsupported
@@ -421,43 +427,42 @@ completion. Neither cancellation nor expiry counts as a successful proof check.
 
 Before source-backed actor calls, the broker keeps metadata/options preparation and project admission within one private
 boundary. A typed `project_admission_timeout` or `request_cancelled` error from that boundary means the actor operation
-was not dispatched; preparation or earlier internal checks may still have effects or uncertain cleanup. Native-reader
-ACK precedes its read-admission/payload boundary, so a lost post-ACK result still cannot infer payload non-dispatch from
-a null start field or missing domains.
+was not dispatched; preparation or earlier internal checks may still have effects or uncertain cleanup. A short run
+whose group outlives its stop reports an unknown outcome, never a run that did not start.
 
 A named request (`requests/`) runs through the same tools. `RequestRunner::run` checks the id and arguments, plans the
 root, kind and deadline, then inserts the row in a `BEGIN IMMEDIATE` transaction that returns the stored row when the id
 exists, so of two parallel calls with one id only one inserts and starts. A check takes its read turn, then commits
 `mark_running`, then calls the tool. A build commits it in its `OnRunning` hook, which runs once the build holds the
-write turn and the writer lock and before its first step. Nothing starts before its row says `running`, and a row in a
-final state never changes: a trigger refuses the update. A check that fails at its deadline waits until the supervisor
-sees its worker request stop before its row says `timed_out`. A dropped connection ends only a client's wait; a call
-without an id keeps the old rule and is cancelled when its connection drops.
+write turn and its workers have exited, before its first step. Nothing starts before its row says `running`, and a row
+in a final state never changes: a trigger refuses the update. A check that fails at its deadline waits until the
+supervisor sees its worker request stop before its row says `timed_out`. A dropped connection ends only a client's wait;
+a call without an id keeps the old rule and is cancelled when its connection drops.
 
 ## Turns and builds
 
 `project_lock.rs` gives each canonical Lake root one fair `tokio::sync::RwLock`. A request takes at most one turn and
 keeps it in a task-local slot, so a nested check in the same request reuses its read turn instead of queueing behind a
-waiting writer. A check takes its read turn before it pins an actor or starts a native reader, then the shared kernel
-guard on the project's artifacts, and holds both until the request ends. A build takes the write turn, then the
-exclusive kernel lock through the SDK writer helper, which the server binary serves as a subcommand
-(`lean_rs_writer::HelperCommand`); a request that holds a read turn cannot take the write turn. Tokio grants turns in
+waiting build. A check takes its read turn before it pins an actor or starts a short run, and holds it until the request
+ends. A short run whose group outlives its request keeps a share of that turn (`project_lock::read_share`) until the
+group exits. A build takes the write turn; a request that holds a read turn cannot take it. Tokio grants turns in
 arrival order, so a queued build holds back later checks, and each waiter keeps its place until its deadline. Each
 finished write turn adds one to the root's finished-build count.
 
-Workers hold the shared kernel lock for their whole generation. When a writer in another process announces demand, the
-reaper queues a proxy write turn on that root, so new checks wait behind it, and retires the idle, unborrowed actors
-whose domains the writer wants. A queued proxy turn always ends as a finished build, even when the demand ended before
-the grant.
-
 `lean_build` (`build.rs`, `tools/build.rs`) plans the run from the `[build]` and `[recipes]` config, takes the write
-turn, stops the project's workers and waits until each has exited (`ProjectBroker::stop_workers`), opens one writer
-helper, and runs the guard and each step in it, with all output in one capped log in the store. The next check starts a
-fresh worker. A build that changes nothing still stops the workers. The turn ends only after the helper and every
-process of the build have exited. Lake decides what to build and in which order; the server checks only the words it
+turn, stops the project's workers and waits until each has exited (`ProjectBroker::stop_workers`), then runs the guard
+and each step as `lake <args>` in the Lake root. Each step runs in its own process group with its own child file (see
+[one server per checkout](#one-server-per-checkout)), and all output goes to one capped log in the store. Cancellation
+or the build's deadline stops the running step's whole group. The next check starts a fresh worker; a build that changes
+nothing still stops the workers. The turn ends only after each step's group has exited, so no check starts while a
+process of the build still runs. Lake decides what to build and in which order; the server checks only the words it
 hands to Lake. Do not add an import graph walk or a build scheduler: a test scans the build path for Lake's import-graph
 queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build`, and the sources of the
 modules the root built from one `lake query +MODULE:lean`, under a read turn.
+
+Lean writes each `.olean` to a temporary file and renames it into place (`src/library/module.cpp` in Lean), so a reader
+never sees a torn file and a file a worker has mapped never changes under it. The turns prevent the one hazard left: a
+check that loads some modules from before a build and some from after.
 
 After a lakefile edit, `lake setup-file` rewrites Lake's configuration cache, and checks hold read turns at once, so two
 can start that rewrite together. Lake locks the cache itself (`importConfigFile` in `Lake/Load/Lean/Elab.lean`): readers
@@ -465,8 +470,9 @@ share the trace lock and a rewrite holds it alone, so the cache stays whole. Of 
 the same moment, Lake fails one with "could not acquire an exclusive configuration lock"; that check reports Lake's
 error, and a retry reads the new cache.
 
-A raw `lake build` takes no kernel lock, so neither the turns nor the finished-build count see it. Running one while the
-server reads the project is outside the contract.
+The turns order only the Lake and Lean runs this server starts. A `lake build` run outside the server can rewrite
+`.olean` files while a check reads them, and neither the turns nor the finished-build count see it. That is outside the
+contract.
 
 ### Rules and their tests
 
@@ -475,116 +481,62 @@ that checks the code. "None yet" marks a gap.
 
 | Rule | Test |
 | --- | --- |
+| One server per checkout: a second server on the same store exits at startup and names the first. | `store.rs`: `second_lock_names_the_holder`, `a_refused_start_names_the_holder_and_leaves_children_alone`, `empty_record_still_refuses`; `tests/http_transport.rs`: `second_server_on_one_store_names_the_first` |
 | Within one server, turns go in arrival order. | `project_lock/tests.rs`: `builds_and_checks_take_turns_in_arrival_order` |
-| No check loads imports while a build runs. | `project_lock/tests.rs`: `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build`, and across processes `a_check_waits_for_a_writer_in_another_process` |
+| Checks share the turn and a build runs alone: checks on one project hold read turns at once, a build waits for every read turn and share, and no check loads imports while a build runs. | `project_lock/tests.rs`: `two_requests_hold_read_turns_at_once`, `a_queued_writer_goes_before_a_later_reader_which_sees_its_finish`, `a_read_share_keeps_a_build_waiting_after_its_request_ends`; `tests/project_workers.rs`: `a_check_sent_during_a_build_waits_and_answers_from_the_new_build`; `tests/requests.rs`: `two_file_checks_run_lean_at_once` |
 | A build stops the project's workers, and each has exited before Lake starts; the next check starts a fresh worker on the new build. | `tests/project_workers.rs`: `a_build_stops_the_project_workers_before_lake_starts` |
 | A worker serves trials, proof positions, lookups and checks of modules with no source file from the project's own build, path dependencies included. | `tests/project_workers.rs`: `a_trial_imports_a_dependency_module_and_prints_its_axioms`, `a_proof_position_and_a_lookup_answer_from_the_project_build`, `a_module_without_a_source_file_is_checked_in_a_worker` |
-| A worker admits an import only through its launch roots, in order, then the shim roots, while no root holds `Init`; a worker that cannot take custody of its project refuses at once. | `tests/project_workers.rs`: `an_import_through_other_roots_is_refused`, `an_import_root_that_holds_init_is_refused`, `a_worker_whose_launch_roots_leave_the_project_refuses_at_once` |
+| A worker admits an import only through its launch roots, in order, then the shim roots, while no root holds `Init`. | `tests/project_workers.rs`: `an_import_through_other_roots_is_refused`, `an_import_root_that_holds_init_is_refused` |
 | Workers stay within `max_workers` and `max_workers_per_project` while checks, trials and builds share a project. | `tests/many_clients.rs`: `many_clients_share_one_project` |
+| At most `broker.max_lean_runs` short runs at once; a run that gets no permit by its deadline never starts. | `lake_options.rs`: `a_run_that_gets_no_permit_by_its_deadline_never_starts`; `tests/requests.rs`: `with_one_lean_run_two_file_checks_take_turns`, and `two_file_checks_run_lean_at_once` for the default of two |
+| A short run stops its whole group on cancel, at its time limit, past its output cap, or when its leader leaves members running, and its reply never waits on a process outside the group. | `lean_run.rs`: `a_cancelled_run_writes_no_inputs_and_never_starts`, `a_run_past_its_limit_stops_the_group`, `output_past_the_cap_stops_the_group`, `a_leftover_member_holding_stdout_open_is_stopped_without_waiting_for_eof` |
 | No build starts between a check's `setup-file` and its use of the imports. | `project_lock/tests.rs`: `a_nested_read_reuses_the_turn_while_a_writer_waits` |
-| One writer at a time, across processes and server restarts. | SDK `lean-toolchain/src/writer_lock/tests.rs`; `tests/requests.rs`: `a_killed_server_interrupts_its_build_and_runs_the_queued_one`; `tests/many_clients.rs`: `many_clients_share_one_project` |
-| No lock release while a process of the build may live. | SDK `writer_lock/tests.rs`: `inherited_same_description_loan_retains_exclusion_until_owned_child_exit` |
-| No worker slot returns while its worker may live. | SDK `lean-rs-worker-parent/src/crash_ownership/tests/guarded_release.rs`: `guarded_child_that_exits_before_hello_closes_its_record_and_slot`, for a worker that exits before it connects; otherwise none yet, and SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` tests reaping and slot counts nearby |
-| A killed server's workers and guardians exit with it, and the next server's build runs without waiting for them. | `tests/requests.rs`: `a_killed_servers_workers_exit_and_the_next_build_runs` |
+| The next server serves only after the last one's children exit: it stops each recorded group whose file lock is held, then waits for `children.lock`. | `children.rs`: `a_held_child_file_gets_its_group_stopped_and_the_lock_frees`, `a_free_children_lock_clears_stale_files_and_passes_to_children`; `tests/requests.rs`: `the_next_server_serves_only_after_a_killed_servers_build_exits`, `a_killed_servers_workers_exit_and_the_next_build_runs` |
+| A server never signals a group whose file lock is free. | `children.rs`: `a_child_file_whose_lock_is_free_is_never_signalled`, `stop_group_kills_members_a_leader_left_only_while_one_holds_the_lock` |
+| No worker slot returns while its worker may live, and a server killed while a worker starts takes no slot from the next server. | `tests/project_workers.rs`: `after_a_kill_during_worker_start_the_next_server_has_every_slot`; SDK `lean-rs-worker-parent/tests/worker_shutdown.rs` tests reaping and slot counts in one server |
 | A wait for a turn ends at its deadline. | `project_lock/tests.rs`: `a_read_wait_ends_at_its_deadline_or_on_cancel`, `a_write_wait_ends_at_its_deadline_or_on_cancel_and_leaves_the_line` |
-| One launch per request ID; a record before launch; the same ID with other arguments refused; a stored result never changes; a restart ends every recorded request; a call without an ID runs with a server ID and no record; checks on one project hold their read turns at once. | `requests/store_tests.rs`: `parallel_inserts_of_one_id_insert_once`, `one_id_holds_one_call`, `a_final_row_never_changes`; `tests/requests.rs`: `a_named_request_runs_once_and_keeps_its_result`, `the_same_build_sent_three_times_at_once_starts_one_lake`, `another_call_on_an_id_fails_and_makes_no_row`, `a_build_outlives_its_killed_client`, `a_killed_server_interrupts_its_build_and_runs_the_queued_one`, `an_ended_request_survives_a_server_kill`, `a_direct_verify_names_a_server_id`, `checks_on_one_project_run_at_once`; `tests/many_clients.rs`: `many_clients_share_one_project`; `tests/http_transport.rs`: `install_and_serve_keep_no_state_in_an_empty_home` |
+| One launch per request ID; a record before launch; the same ID with other arguments refused; a stored result never changes; a restart ends every recorded request; a call without an ID runs with a server ID and no record. | `requests/store_tests.rs`: `parallel_inserts_of_one_id_insert_once`, `one_id_holds_one_call`, `a_final_row_never_changes`; `tests/requests.rs`: `a_named_request_runs_once_and_keeps_its_result`, `the_same_build_sent_three_times_at_once_starts_one_lake`, `another_call_on_an_id_fails_and_makes_no_row`, `a_build_outlives_its_killed_client`, `a_killed_server_interrupts_its_build_and_runs_the_queued_one`, `an_ended_request_survives_a_server_kill`, `a_direct_verify_names_a_server_id`; `tests/many_clients.rs`: `many_clients_share_one_project`; `tests/http_transport.rs`: `install_and_serve_keep_no_state_in_an_empty_home` |
 | A file check reports what `lake build` reports: Lean checks the whole file, header included, and drops messages it marks silent. | `tests/e2e.rs`: `lean_trial_command_and_lean_status_file_diagnostics`, for `file_diagnostics`; `worker_file_checks_see_the_header_and_drop_silent_messages`, for `lean_verify` and `file_outline`, which use the SDK file driver (`LeanRsHostShims/InfoTree.lean`). File-backed proof search keeps it through lean-semantic-search's goal elaboration (`selectGoalSnapshotWithSetup` in `LeanCompat/Frontend.lean`), which that repository's `LeanSemanticSearchTest.lean` checks. |
 | A file check with an out-of-date import builds nothing and replies `needs_build`, naming each module Lake lists. | `broker/module_setup.rs`: `no_build_exit_names_the_targets_lake_lists`; `diagnosis.rs`: `out_of_date_setup_is_needs_build_with_one_stale_row_per_target`; `tests/build_requests.rs`: `a_file_check_with_a_stale_import_names_the_module_to_build` |
-| `serve` refuses a socket directory that is unsafe or too long for a worker socket. | `tests/stdio_lifecycle.rs`: `serve_refuses_a_socket_directory_too_long_for_worker_sockets`; `native_socket.rs`: `worker_socket_path_accepts_maximum_and_refuses_one_byte_more` |
 
-## Native ownership and artifact custody
+## One server per checkout
 
-Each project actor owns its actual worker child and its reaper. Its generations share one durable actor quota in the
-canonical private ownership registry. A native guardian owns the generation's inherited process group and retains the
-complete set of shared artifact descriptors. It acknowledges durable custody before a worker loads a library, runs an
-initializer, imports a module, or executes a submitted body. Cooperating writers acquire the same canonical domains
-exclusively and check ownership fences before dispatch.
+One server serves a Lake checkout and starts every Lake and Lean run on it, so it can order checks and builds in memory.
+Two `flock` locks in the store hold this across processes; the kernel frees each one only when the last process that
+shares its open file description exits, however it exits. Nothing in the server unlocks either one: an unlock would free
+the lock for every process that shares it.
 
-Cooperating artifact writers announce process-bound demand on the same canonical physical domains before waiting for
-exclusive artifact custody. The broker checks that handoff gate before borrowing a resident actor or admitting idle
-maintenance. Contention pauses affected new calls within their existing cancellation/deadline budget; admitted calls
-finish normally. A separate 100 ms observation in the existing reaper retires only affected idle, unborrowed actors,
-even when ordinary idle expiry is disabled. Retirement still uses the ordinary process owner, so an acknowledgement
-never releases capacity or artifact custody before actual scope closure. Nonoverlapping actors remain available.
-Matching uses the actor's retained actual read-domain receipts, including frozen dependencies and companions, rather
-than a newly reduced manifest. A brief competing reader gate can also cause conservative backpressure or idle
-retirement; it is not evidence of a writer identity. The protocol does not claim FIFO ordering among multiple writers or
-defeat OS scheduling/filesystem stalls.
+`server.lock` admits one server per store. The server takes it exclusively, close-on-exec, and writes its pid and Lake
+root into the file; a second server exits at startup and names the first. The lock binds the store, not the checkout:
+two servers that use different stores for one Lake root are outside the contract.
 
-The generic `reader` and `read-proxy` admissions still refuse writer demand before Ready. They can be composed across
-multiple physical domains, so waiting while retaining an earlier shared lock would create a reader/writer cycle. A
-metadata caller holding no other artifact read or write custody may explicitly select `read-proxy --single-domain-wait`.
-This one-domain proxy retries only lock admission under its original absolute admission deadline, closes transient gates
-before waiting, and observes its private FIFO caller on each iteration and again before Ready. EOF or deadline expiry
-emits no Ready. Metadata executes once in the caller after that receipt; neither a metadata body nor a target check is
-retried. SDK multi-domain readiness probes retain the fail-fast default.
+`children.lock` outlives the server. Once it holds `server.lock`, the server takes `children.lock` exclusively and
+clears its close-on-exec flag, so every child it starts, and every descendant of those, shares the lock. Before a build
+step or a short run, the server creates a file `starting-…` in the store's `children/`, locks it, and starts the child
+with that descriptor too (`process_group::spawn_inheriting`). Once the child runs, the server renames the file to the
+child's process group; it deletes the file when it has confirmed the group's exit. A held file lock therefore means a
+process of that group still runs, and a free one means none does. Workers and the `lake` run that opens the semantic
+runtime have no file, since the SDK and the search crate start them. They hold `children.lock` like every child, and a
+worker exits with status 125 once the pipe to its server closes.
 
-Whole-domain admission owns the complete fixed input set. Its opted-in pure helpers report normal exit 75 only for typed
-pre-custody contention (`--report-contention`); every malformed receipt, descriptor, helper failure or uncertain cleanup
-remains a hard error. The SDK verifies successful pre-transfer classification, releases all tentative shared locks
-(including confirmed EOF-proxy helper closure), then waits within the original deadline and cancellation budget. It
-never waits for a later domain while retaining an earlier partial set, and never repeats a payload or metadata body. A
-full-set gate preflight avoids spawning repeated helpers while known writer demand remains; it grants no read custody,
-and the actual nonblocking transfer checks close the following race. Native payload bootstrap and cold worker admission
-finish the full set before guardian acknowledgement. A warm worker's guardian retains earlier generation locks, so warm
-contention uses the existing confirmed pre-body generation cycle instead of waiting behind its own custody. No failure
-after admission is retried.
+At startup, after `server.lock`, `store::hold` takes `children.lock` (`children.rs`):
 
-The supervisor retains a failed replacement process when cleanup cannot confirm its exit. An earlier generation's exit
-cannot satisfy structured shutdown for that replacement. Consequently an internal idle recycle failure also keeps the
-project's capacity occupied until shutdown confirms cleanup, or conservatively retains it if cleanup remains uncertain.
+- If `children.lock` is free, no process of an earlier server runs. The server deletes every file in `children/` and
+  serves.
+- If it is held, the server sends SIGTERM to each recorded group whose file lock is held, waits up to 5 seconds, then
+  sends SIGKILL to each group still held. It deletes each file whose lock is free, then waits up to 30 seconds for
+  `children.lock`, and serves once it has the lock. It never signals a group whose file lock is free and never looks for
+  processes by name.
+- If the lock is still held after that wait, the server exits with an error that names the groups still running and
+  counts the children that had not yet been named. The error says that processes the server does not record, such as a
+  worker whose pipe to the dead server has not closed yet, may hold the lock too, and that `lsof <store>/children.lock`
+  lists every holder.
 
-Before it takes an opening lock or a worker slot, the parent asks the worker's runtime-free readiness mode for the
-descriptor of the shims `install` built. The mode only reads, under shared custody, and builds nothing. If the shims are
-missing or stale, the open fails with the install command; the server never builds shims. Prepared domains cannot expand
-within a generation. A changed snapshot or artifact union refuses before the body and retires the actor; a later request
-prepares a fresh actor. The refused request is never replayed.
+The wait covers every process that kept the inherited descriptor. A process that closed it can outlive the startup wait,
+and one that left its group escapes the signals. If every member left a group while one still holds the file's lock, the
+group number can name another group by the time the signal goes. Recovery steps for a refused start are in
+[operations](operations.md#a-refused-start).
 
-Parent-only cache and index reads hold close-on-exec shared descriptors through parsing and freshness observation.
-External native tools use `native-reader`, whose controlled bootstrap transfers the full read union to the same guardian
-before spawning its one payload. An external read receipt does not assert the loaded shim ABI. All read/write domain
-unions use the same canonical lock-path order.
-
-A timeout or cancelled caller returns no proof result. A confirmed request-bound child exit remains available through
-replacement failure and late reaping. Capacity is released only when the actor is sealed and its actual process scopes
-close. If wait authority is lost but group absence is confirmed, resource capacity and retained observation can recover
-without inventing an exit status or changing the unknown proof outcome. A named request never runs twice: a retry or a
-lost reply returns its stored row, and a restart ends a row that said `running` without starting it again. A store
-failure refuses new rows with a retryable error.
-
-Server death is observed by the guardian through the private channel and exact parent identity. If the guardian dies
-while the parent survives, the parent retains its actual unreaped child and uses the same owned-group termination
-primitive as other supervised commands. Failed kill, or loss of both parent and guardian, retains passive ownership
-fences until actual group absence; recovery never signals a PID recovered from disk. The supported boundary requires
-descendants to remain in the inherited process group. On Linux a short-lived payload waiter adopts orphaned descendants.
-After reaping the payload it checks for children across all groups and sessions. A survivor at verdict time prevents
-success. The bootstrap retains the guardian and its acknowledged read loans until the exact waiter exits and its bounded
-report is collected. A lost waiter or report supplies no verdict. The outer owner separately checks closure of the
-original scope. That closure does not establish that an escaped process stopped writing, including after a waiter crash.
-This check cannot detect a descendant that detached and exited before the verdict. The actor quota bounds admitted
-generations, not every paused pre-admission OS process; one bounded preparation utility may coexist without evicting a
-warm actor. Independent uncoordinated writers and arbitrary user IO outside declared cooperating domains are outside
-this lock protocol.
-
-## Pure compatibility and external input
-
-`lean_compatibility` with explicit `mode: "pure_v1"` describes compiled expectations, project/toolchain identity and the
-canonical helper/ownership namespace. It starts no worker, preparer or native helper and claims no loaded runtime. Its
-expected binding fingerprints come from the same signature declarations and canonical encoder as typed host bindings.
-Every cold or replacement session validates those expectations plus the pinned header/runtime before exposing a body.
-Default `loaded` mode remains an explicit manual handshake returning actual worker receipts. A client requiring pure
-discovery must retain the mode on failure; older servers reject it before their loaded handler.
-
-External `native-reader` payloads have closed stdin by default. Explicit `--stdin` stages one EOF-terminated stream of
-at most 16 MiB in the generation's own inputs. The caller supplies an owned pipe read end or regular file and must not
-share read aliases during capture; terminals and sockets are refused. After guardian admission, the bootstrap hashes and
-rewinds the exact read-only descriptor installed at payload fd0. Optional `stdin_sha256` and `stdin_bytes` receipts bind
-that offered descriptor. They do not attest consumption or loaded ABI. Callers require a matching receipt and a
-complete, non-intervened result before using output; missing output never authorizes implicit replay.
-
-An optional `--cancel-fd` accepts a private, already nonblocking pipe read end. The helper seals inherited descriptors
-against exec; any byte or EOF requests the existing owned-group shutdown while the caller stays alive. Cancellation is
-intent, not a successful result or permission to replay. Optional `payload_usage` comes from the sole wait that reaped
-the actual payload: wall time, user/system CPU and peak RSS normalized to bytes. Kernel accounting may include
-descendants the payload waited for; it does not measure the entire native group. Missing wait evidence produces no usage
-facts, and RSS remains observation only.
+`install` and `install-worker --lake-root` hold the store as a server does, so each refuses while a server serves the
+root. `install` builds the semantic runtime into `<store>/semantic-runtimes`; a serving server only opens it, and a
+runtime that needs a build fails the call with the install command.

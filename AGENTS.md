@@ -19,15 +19,14 @@ cargo build --locked -p lean-host-mcp-worker
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p lean-host-mcp
-LEAN_RS_WORKER_OWNERS_DIRECTORY=$PWD/target/test-owners cargo test --locked -p lean-host-mcp --lib
+cargo test --locked -p lean-host-mcp --lib
 cargo test --locked -p lean-host-mcp-worker --all-targets
 scripts/test-installed-stdio.sh --all-targets
 cargo test --locked -p lean-host-mcp --test http_transport
 ```
 
-The parent library tests need no Lean fixture, but their native work needs an owner directory, so the command puts one
-under `target/`. The all-target runner provisions a disposable installed worker for the stdio EOF check. Opt-in e2e and
-build tests require built fixture `.olean` files and a matching worker:
+The parent library tests need no Lean fixture. The all-target runner provisions a disposable installed worker for the
+stdio EOF check. Opt-in e2e and build tests require built fixture `.olean` files and a matching worker:
 
 ```sh
 LEAN_HOST_MCP_WORKERS_DIR=$PWD/target/release \
@@ -36,11 +35,10 @@ LEAN_HOST_MCP_TEST_FIXTURE=$PWD/fixtures/lean \
     -- --ignored --test-threads=1
 ```
 
-Run these tests one at a time. On macOS a few at once use up the SDK's native actor capacity, and the rest fail with
-"native actor capacity occupied" or "deadline elapsed". On macOS this command also cannot reach a worker: Cargo sets
-`DYLD_FALLBACK_LIBRARY_PATH` for test binaries, and the worker refuses any `DYLD_*` variable. Run the binaries that
-`cargo test --no-run` prints, with the same arguments, under `env -u DYLD_FALLBACK_LIBRARY_PATH` instead; see
-`docs/operations.md`.
+Run these tests one at a time: they start Lean processes, and the timing tests assume no other load. On macOS this
+command also cannot reach a worker: Cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for test binaries, and the worker refuses
+any `DYLD_*` variable. Run the binaries that `cargo test --no-run` prints, with the same arguments, under
+`env -u DYLD_FALLBACK_LIBRARY_PATH` instead; see `docs/operations.md`.
 
 For a non-default toolchain, export `LEAN_SYSROOT=${ELAN_HOME:-$HOME/.elan}/toolchains/leanprover--lean4---<id>` for the
 whole build-and-test invocation. Set `LEAN_HOST_MCP_TARGET_TOOLCHAIN=<id>` for the worker build too. The latter chooses
@@ -73,10 +71,12 @@ tool that already owns that work: Lake for builds, the kernel for locks and proc
 Cargo for dependency overrides. If the native tool can enforce the requirement with a flag or one call, use that.
 Otherwise add one check at the one point where the requirement can fail, and delete it when the requirement goes.
 
-- Builds go through `lean_build`: the root's write turn in `project_lock.rs`, then one writer helper that holds the
-  exclusive kernel lock while Lake runs. Lake decides what to build and in which order; the server checks only the words
-  it hands to Lake. A test fails if the build path queries Lake's import graph. A raw `lake build` takes no lock and is
-  outside the contract.
+- One server owns a checkout. `server.lock` admits one server per store, and every process the server starts inherits
+  `children.lock`, so the next server serves only after those processes exit (`store.rs`, `children.rs`). Never unlock
+  either lock, and never signal a process group whose child file is free.
+- Builds go through `lean_build`: the root's write turn in `project_lock.rs`, then each step as `lake <args>` in its own
+  process group. Lake decides what to build and in which order; the server checks only the words it hands to Lake. A
+  test fails if the build path queries Lake's import graph. A raw `lake build` is outside the contract.
 - Only `crates/lean-host-mcp-worker` links `libleanshared`. The parent uses the link-free worker-parent/protocol and
   toolchain APIs; Lean runtime types and opaque handles stay in the child. The parent's `build.rs` embeds Git identity
   only; the worker's `build.rs` emits the Lean rpath.
@@ -107,8 +107,8 @@ either worker builder:
 - The Lean heap ceiling must exceed healthy import work. `lean_max_memory_kib_for` derives it from the residue budget
   plus `max(budget, 8 GiB)` headroom. Allocator exhaustion can throw a C++ exception through Rust and abort the child
   (status 134); it is not reliably an ordinary Lean-domain result. Do not replace the derived default with a fixed cap.
-- Session-pool capacity and the residue budget are independent. Keep warm profiles when imports change. A worker holds
-  the shared kernel lock for its whole life, so no build changes what its profiles loaded; the finished-build count is a
+- Session-pool capacity and the residue budget are independent. Keep warm profiles when imports change. A build stops
+  every worker before Lake runs, so no build changes what a live worker's profiles loaded; the finished-build count is a
   backstop that cycles the whole worker. Couple reuse hints and `imports_seen` to pool capacity, not the import-count
   backstop.
 - Above the soft residue threshold, prefer the quiet-period recycle and pre-warm path. Preserve its guard against
