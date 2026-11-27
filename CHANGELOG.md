@@ -95,6 +95,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Remove the shim build when a worker opens. The server reads the shims `install` built and fails with the install
   command when they are missing or stale; the drain that build took, and the stage `host_artifact_preparation`, are
   gone.
+- Remove the server's own lakefile parse, with `LakeProjectMeta`'s `package`, `library` and `umbrella_module` fields,
+  `LakeProjectMeta::discover_from`, and the `regex` dependency. Nothing read those fields; Lake evaluates the
+  configuration itself. A root still needs a `lakefile.toml` or `lakefile.lean`.
 
 ### Fixed
 
