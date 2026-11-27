@@ -1,9 +1,10 @@
 //! The build path leaves the import graph to Lake.
 //!
 //! `lean_build` hands Lake its targets and steps and `lean_imports` reads
-//! what `lake setup-file` reports. Neither may walk Lake's import graph
-//! or order modules itself: Lake owns that work. This test fails when a
-//! file on that path names one of Lake's graph queries or a sorter.
+//! what `lake setup-file` and `lake query +MODULE:lean` report. Neither may
+//! walk Lake's import graph or order modules itself: Lake owns that work.
+//! This test fails when a file on that path names one of Lake's graph
+//! queries or a sorter.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 const FORBIDDEN: [&str; 3] = ["TopologicalSorter", ":imports", "--deps-json"];
 
 /// The build path: the build module and its config, the project lock, the
-/// tool handlers and the setup-file reader. A directory stands for every
+/// tool handlers and the Lake readers. A directory stands for every
 /// file in it.
 const BUILD_PATH: [&str; 6] = [
     "src/build.rs",

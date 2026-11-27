@@ -1,15 +1,18 @@
-//! File setup from the selected Lake. Keep Lake's original frame, including
-//! import visibility, plugin entry points and compiler options.
+//! File setup and module sources from the selected Lake. Keep Lake's original
+//! frame, including import visibility, plugin entry points and compiler
+//! options.
 use super::{ProjectBroker, ProjectHint, Result, ServerError};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const SETUP_FILE: &str = "Lake setup-file";
+const MODULE_SOURCES: &str = "Lake module sources";
 
 /// Lake's exit code when `--no-build` meets a target it would have to rebuild
 /// (`noBuildCode`, `Lake/Build/Run.lean`).
@@ -120,6 +123,24 @@ impl StagedSetup {
         }
         Ok(())
     }
+}
+
+/// The `count` paths `lake query --json` printed, one JSON string a line, as
+/// canonical paths.
+fn parse_sources(stdout: &[u8], count: usize) -> io::Result<Vec<PathBuf>> {
+    let text = std::str::from_utf8(stdout).map_err(|_| invalid("Lake module sources are not UTF-8"))?;
+    let sources = text
+        .lines()
+        .map(|line| {
+            let path: PathBuf =
+                serde_json::from_str(line).map_err(|error| invalid(&format!("invalid Lake module source: {error}")))?;
+            path.canonicalize()
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if sources.len() != count {
+        return Err(invalid("Lake named a different number of module sources than asked"));
+    }
+    Ok(sources)
 }
 
 fn parse_setup(bytes: &[u8]) -> io::Result<ModuleSetup> {
@@ -258,10 +279,23 @@ impl ProjectBroker {
         Ok((setup.name, imports))
     }
 
-    /// Run `lake setup-file` as a native reader. The guardian holds the project
-    /// lock shared while Lake reads the build products and prints the setup.
-    /// No step takes the lock exclusively. When an import is out of date, Lake
-    /// builds nothing and this returns [`ServerError::OutOfDate`].
+    /// The source file Lake reads for each of `modules`, in order, as
+    /// `lake query +MODULE:lean` reports it under this request's read turn:
+    /// the module's path under its library's `srcDir`. Lake builds nothing.
+    pub(crate) async fn module_sources(&self, root: &Path, modules: &[&str]) -> Result<Vec<PathBuf>> {
+        if modules.is_empty() {
+            // `lake query` with no target queries the default targets.
+            return Ok(Vec::new());
+        }
+        self.ensure_read(root).await?;
+        let mut args: Vec<OsString> = vec!["query".into(), "--json".into()];
+        args.extend(modules.iter().map(|module| format!("+{module}:lean").into()));
+        let (_, output) = self.lake_reader(root, MODULE_SOURCES, args, &[0]).await?;
+        Ok(parse_sources(&output.stdout, modules.len())?)
+    }
+
+    /// Run `lake setup-file` as a native reader. When an import is out of
+    /// date, Lake builds nothing and this returns [`ServerError::OutOfDate`].
     async fn setup_file(&self, root: &Path, file: &Path, source: &str) -> Result<StagedSetup> {
         if !file.starts_with(root)
             || file.canonicalize()? != file
@@ -272,24 +306,41 @@ impl ProjectBroker {
                 "current source differs from selected verification file".into(),
             ));
         }
+        let domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
+        let args = vec!["setup-file".into(), file.as_os_str().to_owned()];
+        let (sysroot, output) = self.lake_reader(root, SETUP_FILE, args, &[0, NO_BUILD_EXIT]).await?;
+        Ok(stage(setup_output(output)?, &domains, &sysroot, root, file)?)
+    }
+
+    /// Run the project's `lake --no-build --no-cache ARGS` in `root` as a
+    /// native reader, with Lake's caches pointed at the reader's private
+    /// inputs, and return the toolchain prefix with Lake's output. The
+    /// guardian holds the project lock shared while Lake reads; no step takes
+    /// it exclusively.
+    async fn lake_reader(
+        &self,
+        root: &Path,
+        label: &'static str,
+        args: Vec<OsString>,
+        accepted: &'static [i32],
+    ) -> Result<(PathBuf, crate::lake_options::ReaderOutput)> {
         let id =
             crate::toolchain::ToolchainId::from_lake_root(root).map_err(|e| ServerError::BadProject(e.to_string()))?;
         if id.window_verdict() != crate::toolchain::WindowVerdict::Supported {
             return Err(ServerError::BadProject(format!(
-                "{SETUP_FILE} needs a supported toolchain, not {id}"
+                "{label} needs a supported toolchain, not {id}"
             )));
         }
         let sysroot = id
             .elan_dir()
             .map_err(|e| ServerError::BadProject(e.to_string()))?
             .canonicalize()?;
-        let domains = lean_toolchain::shared_writer::project_artifact_roots(root)?;
         let activity = self.preparation_activity(root).await?;
         let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root)?;
         let lake = sysroot.join("bin/lake");
-        let (cwd, source_file) = (root.to_owned(), file.to_owned());
+        let cwd = root.to_owned();
         let output = crate::lake_options::reader_run(
-            SETUP_FILE,
+            label,
             root.to_owned(),
             crate::cancellation::CallCancellation::current()
                 .remaining_or(Duration::from_millis(self.request_timeout_millis())),
@@ -297,19 +348,15 @@ impl ProjectBroker {
             custody,
             None,
             Some(Box::new(activity)),
-            &[0, NO_BUILD_EXIT],
+            accepted,
             move |assets| {
                 // Point any Lake cache at the reader's private inputs.
                 let cache = assets.join("lake-cache");
                 fs::create_dir(&cache)?;
+                let mut command = vec![lake.into_os_string(), "--no-build".into(), "--no-cache".into()];
+                command.extend(args);
                 Ok(crate::native_reader::NativeReaderProgram {
-                    command: vec![
-                        lake.into_os_string(),
-                        "--no-build".into(),
-                        "--no-cache".into(),
-                        "setup-file".into(),
-                        source_file.into_os_string(),
-                    ],
+                    command,
                     environment: vec![
                         ("LAKE_CACHE_DIR".into(), cache.into_os_string()),
                         ("LAKE_ARTIFACT_CACHE".into(), "false".into()),
@@ -323,7 +370,7 @@ impl ProjectBroker {
         )
         .await
         .map_err(|failure| failure.error)?;
-        Ok(stage(setup_output(output)?, &domains, &sysroot, root, file)?)
+        Ok((sysroot, output))
     }
 }
 
@@ -335,6 +382,27 @@ mod tests {
     fn setup_parser_requires_complete_bounded_typed_json() {
         assert!(parse_setup(br#"{"name":"M"}"#).is_err());
         assert!(parse_setup(br#"{"name":"M""#).is_err());
+    }
+
+    #[test]
+    fn sources_parse_one_json_path_a_line_and_must_all_be_there() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        fs::create_dir_all(root.join("src/Inner"))?;
+        fs::write(root.join("src/Inner/X.lean"), "")?;
+        fs::write(root.join("A.lean"), "")?;
+        // Lake joins the package and library `srcDir`s, so `.` parts stay.
+        let stdout = serde_json::to_string(&root.join("./src/Inner/X.lean"))?
+            + "\n"
+            + &serde_json::to_string(&root.join("././A.lean"))?
+            + "\n";
+        assert_eq!(
+            parse_sources(stdout.as_bytes(), 2)?,
+            [root.join("src/Inner/X.lean"), root.join("A.lean")]
+        );
+        assert!(parse_sources(stdout.as_bytes(), 3).is_err());
+        assert!(parse_sources(b"null\n", 1).is_err());
+        Ok(())
     }
 
     #[test]

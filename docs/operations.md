@@ -232,9 +232,9 @@ prints `[build]` and each recipe with their defaults. It runs no Lake and writes
 server.
 
 `lean_imports` lists, for each file, its whole transitive import closure as `lake setup-file --no-build` reports it
-(`importArts`), not only its direct imports: each module, its `.olean`, and its source when Lake built it under the
-project's `.lake/build`. It builds nothing: a missing or stale import fails the call with `setup_file_failed`, naming
-the file and quoting Lake.
+(`importArts`), not only its direct imports: each module, its `.olean`, and, when Lake built it under the project's
+`.lake/build`, the source `lake query +MODULE:lean` names under the library's `srcDir`. It builds nothing: a missing or
+stale import fails the call with `setup_file_failed`, naming the file and quoting Lake.
 
 ## Concurrency and admission
 

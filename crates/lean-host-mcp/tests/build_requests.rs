@@ -342,6 +342,42 @@ async fn imports_list_the_whole_closure_with_first_party_sources() -> TestResult
     Ok(())
 }
 
+/// A library with its own `srcDir` keeps its files off the path its module
+/// names give. Lake names where they are.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(native_owners)]
+#[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
+async fn imports_name_sources_under_a_library_src_dir() -> TestResult {
+    let (chain, ctx) = project()?;
+    chain.write(
+        "lakefile.lean",
+        "import Lake\nopen Lake DSL\n\npackage chain\n\nrequire dep from \"dep\"\n\n@[default_target]\nlean_lib Chain\n\n\
+         lean_lib Inner where\n  srcDir := \"src\"\n",
+    )?;
+    chain.write("src/Inner.lean", "import Inner.X\n")?;
+    chain.write("src/Inner/X.lean", "import Chain.B\n\ndef x : Nat := b\n")?;
+    chain.lake(&["build", "Inner"])?;
+    let reply = imports(&ctx, &["src/Inner.lean"])
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let [file] = reply.files.as_slice() else {
+        return Err(format!("expected one file: {reply:?}").into());
+    };
+    assert_eq!(file.module, "Inner");
+    let source = |module: &str| {
+        file.imports
+            .iter()
+            .find(|import| import.module == module)
+            .map(|import| import.source.clone())
+            .ok_or_else(|| format!("Inner lists no {module}: {reply:?}"))
+    };
+    let path = |relative: &str| Some(chain.root.join(relative).display().to_string());
+    assert_eq!(source("Inner.X")?, path("src/Inner/X.lean"));
+    assert_eq!(source("Chain.A")?, path("Chain/A.lean"));
+    assert_eq!(source("Dep")?, None);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]

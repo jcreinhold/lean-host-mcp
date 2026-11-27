@@ -19,8 +19,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   and Lake root of the first. `LEAN_HOST_MCP_STORE_DIR` and `[install] store_dir` move the store.
 - `lean_build` runs Lake targets, or a recipe of Lake steps from the config, under the project's write turn. Checks wait
   for it. The reply gives each step's command and exit code, the path of the log in `store/logs/`, and the log's tail.
-- `lean_imports` lists each file's whole import closure from `lake --no-build setup-file`. A missing or stale import
-  fails the call with `setup_file_failed` and Lake's own message.
+- `lean_imports` lists each file's whole import closure from `lake --no-build setup-file`, and the source of each module
+  the root built as `lake query +MODULE:lean` names it under the library's `srcDir`. A missing or stale import fails the
+  call with `setup_file_failed` and Lake's own message.
 - Config tables `[build]` (`guard`, `timeout_secs`, `log_limit_mib`) and `[recipes.<name>]` (`steps`, `append`,
   `guard`). `config check --lake-root PROJECT` checks both config files and prints these tables without running Lake.
 - `[install] elan_home`: install records the elan home, `ELAN_HOME` or else `$HOME/.elan`. When `ELAN_HOME` is unset,

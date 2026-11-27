@@ -28,7 +28,7 @@ crates/lean-host-mcp/src/
   broker.rs              ProjectBroker: the served root, worker slots, idle retirement, the reaper
   broker/control.rs      process-local worker activity snapshots and expiring admission leases
   broker/host_artifacts.rs the installed shims a worker reads before it opens
-  broker/module_setup.rs lake setup-file as a native reader; the import closure for lean_imports
+  broker/module_setup.rs lake setup-file and lake query as native readers; the import closure and module sources
   broker/semantic_file.rs file-backed semantic proof search through a native reader
   broker/verify_file.rs  file checks through one-shot Lean programs
   broker/writer_handoff.rs idle workers retired for a writer in another process
@@ -457,7 +457,8 @@ helper, and runs the guard and each step in it, with all output in one capped lo
 fresh worker. A build that changes nothing still stops the workers. The turn ends only after the helper and every
 process of the build have exited. Lake decides what to build and in which order; the server checks only the words it
 hands to Lake. Do not add an import graph walk or a build scheduler: a test scans the build path for Lake's import-graph
-queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build` under a read turn.
+queries. `lean_imports` reads each file's transitive closure from `lake setup-file --no-build`, and the sources of the
+modules the root built from one `lake query +MODULE:lean`, under a read turn.
 
 After a lakefile edit, `lake setup-file` rewrites Lake's configuration cache, and checks hold read turns at once, so two
 can start that rewrite together. Lake locks the cache itself (`importConfigFile` in `Lake/Load/Lean/Elab.lean`): readers

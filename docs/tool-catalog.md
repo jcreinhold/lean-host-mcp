@@ -290,7 +290,8 @@ params before anything runs.
 ## `lean_imports`
 
 `lean_imports` lists each file's whole transitive import closure, not only the file's direct imports. It reads the
-closure from `lake --no-build --no-cache setup-file <file>` (the `importArts` Lake reports) under the project's read
+closure from `lake --no-build --no-cache setup-file <file>` (the `importArts` Lake reports), and the sources of the
+modules the root built from one `lake --no-build --no-cache query --json +MODULE:lean ...`, under the project's read
 turn, so it waits for a running build. It builds nothing.
 
 ```json
@@ -317,11 +318,12 @@ turn, so it waits for a running build. It builds nothing.
 
 - `files` takes 1 to 16 Lean files, absolute or relative to the Lake root. Each reply entry keeps `file` as the request
   named it.
-- `olean` is the absolute path Lake loads. `source` is the absolute source path when the `.olean` lies under the root's
-  own `.lake/build` and the file exists where the module name puts it; otherwise it is null.
+- `olean` is the absolute path Lake loads. `source` is the absolute source path Lake names, under the module's library
+  `srcDir`, when the `.olean` lies under the root's own `.lake/build`; for a dependency's module it is null.
 - When an import of a file is missing or stale, the call fails as a whole: the result sets MCP `isError` and holds
   `{"error":{"code":"setup_file_failed","message":…}}`, whose message names the file and quotes Lake. A file the server
-  cannot read fails the same way with code `invalid_request`. The reply never holds a partial list.
+  cannot read fails the same way with code `invalid_request`, and a source query Lake cannot answer with code
+  `module_sources_failed`. The reply never holds a partial list.
 
 ## Response Shape
 
