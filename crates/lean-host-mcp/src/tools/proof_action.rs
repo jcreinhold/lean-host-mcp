@@ -422,10 +422,7 @@ fn proof_step_needs_build_response(
     response
         .next_actions
         .push("source file was not modified; apply the chosen snippet manually if desired".to_owned());
-    Ok(warn_needs_build(
-        response,
-        &IncompleteCause::MissingOlean(err.to_string()),
-    ))
+    Ok(warn_needs_build(response, &IncompleteCause::from_error(&err)))
 }
 
 /// The proof-attempt result for an unbuilt-dependency degrade: an empty
@@ -746,7 +743,7 @@ pub async fn verify_targets(ctx: &ToolContext, req: LeanVerifyRequest) -> Result
                     .broker
                     .project_identity_without_worker(&hint, prepared.imports.clone())?;
                 last_identity = Some((base.freshness, base.runtime));
-                build_causes.push(IncompleteCause::MissingOlean(err.to_string()));
+                build_causes.push(IncompleteCause::from_error(&err));
                 rows.extend(prepared.targets.into_iter().map(needs_build_row));
                 if let Some(fact) = source_fact {
                     expansion.trust_artifacts.push(fact);
@@ -1434,10 +1431,7 @@ fn verification_needs_build_response(
     response
         .next_actions
         .push("source file was not modified by verification".to_owned());
-    Ok(warn_needs_build(
-        response,
-        &IncompleteCause::MissingOlean(err.to_string()),
-    ))
+    Ok(warn_needs_build(response, &IncompleteCause::from_error(&err)))
 }
 
 /// The verification verdict for an unbuilt-dependency degrade. Same wire shape

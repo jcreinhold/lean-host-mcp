@@ -88,6 +88,7 @@ impl RequestLog {
                     ServerError::WorkerUnavailable(_) => "runtime_unavailable",
                     ServerError::IncompatibleWorker { .. } => "incompatible_worker",
                     ServerError::BadProject(_) | ServerError::PreparationFailed { .. } => "bad_project",
+                    ServerError::OutOfDate { .. } => "needs_build",
                     ServerError::SessionGone => "session_gone",
                     ServerError::Lean(_) => "lean_error",
                     ServerError::Io(_) => "io_error",

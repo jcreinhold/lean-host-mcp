@@ -48,6 +48,30 @@ async fn stdio_shutdown_on_stdin_eof_exits_parent() {
     );
 }
 
+/// `serve` checks the worker socket directory before it takes a call, so a
+/// directory too long for a worker socket stops the server, not its first check.
+#[test]
+fn serve_refuses_a_socket_directory_too_long_for_worker_sockets() {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .canonicalize()
+        .expect("canonical test scratch");
+    let long = scratch.join("s".repeat(120));
+    let registry = tempfile::tempdir_in(&scratch).expect("temp registry");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lean-host-mcp"))
+        .arg("serve")
+        .env("LEAN_HOST_MCP_SOCKET_DIR", &long)
+        .env("LEAN_HOST_MCP_PROCESS_REGISTRY_DIR", registry.path())
+        .env_remove("LEAN_PATH")
+        .env_remove("LEAN_HOST_MCP_PROJECT")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run serve");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "serve started; stderr: {stderr}");
+    assert!(stderr.contains("socket path is too long"), "stderr: {stderr}");
+    assert!(!long.exists(), "serve made the directory it refused");
+}
+
 // Serialize with the other tests that take exclusive custody of the installed shim roots.
 #[tokio::test]
 #[serial_test::serial(installed_shim_custody)]

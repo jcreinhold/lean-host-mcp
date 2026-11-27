@@ -630,7 +630,7 @@ fn proof_state_needs_build_response(
         .with_trust_artifact(source_fact);
     Ok(crate::diagnosis::warn_needs_build(
         response,
-        &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+        &crate::diagnosis::IncompleteCause::from_error(&err),
     ))
 }
 
@@ -787,7 +787,7 @@ fn command_needs_build_response(
         .with_trust_artifact(source_fact);
     Ok(crate::diagnosis::warn_needs_build(
         response,
-        &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+        &crate::diagnosis::IncompleteCause::from_error(&err),
     ))
 }
 
@@ -810,7 +810,7 @@ fn file_diagnostics_needs_build_response(
     .with_trust_artifact(source_fact);
     Ok(crate::diagnosis::warn_needs_build(
         response,
-        &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
+        &crate::diagnosis::IncompleteCause::from_error(&err),
     ))
 }
 
@@ -1200,10 +1200,7 @@ async fn find_references_in_file(
         false,
     );
     let response = match needs_build {
-        Some(err) => crate::diagnosis::warn_needs_build(
-            response,
-            &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
-        ),
+        Some(err) => crate::diagnosis::warn_needs_build(response, &crate::diagnosis::IncompleteCause::from_error(&err)),
         None => response,
     };
     Ok(response)

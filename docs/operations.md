@@ -15,7 +15,7 @@ the [tool catalog](tool-catalog.md) for request and response contracts.
 Worker lifeline sockets use `LEAN_HOST_MCP_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/lean-host-mcp` when XDG is set, otherwise
 `$HOME/.lean-host-mcp-ipc`. Choose a short canonical directory owned by the server user with mode 0700. On macOS a
 socket path holds at most 103 bytes, so the directory's path may hold at most 54. The SDK removes each worker's socket
-on closure.
+on closure. `serve` checks the directory when it starts and exits if it is unsafe or too long.
 
 The server keeps its other state in its [store](#one-server-per-store), not under `HOME`: the SDK's durable owner
 records in `owners/`, the semantic runtime cache in `semantic-runtimes/`, and in `processes/` the PID records that
@@ -669,9 +669,9 @@ declaration, for example:
 
 Under the request's read turn, the server runs the selected toolchain's `lake --no-build --no-cache setup-file <file>`
 as a native reader and checks the current source using that file's options, imports, plugins and dynamic libraries. Lake
-builds nothing here, so keep the project built: a missing or stale import is an error that quotes Lake. This route
-requires the setup-aware verification shim. File-backed `lean_lookup` with `kind="proof_search"` uses the same setup for
-goal elaboration.
+builds nothing here, so keep the project built: when an import is missing or stale, Lake exits 3 and the reply is
+`needs_build`, with a `stale_build` row naming each module Lake lists. This route requires the setup-aware verification
+shim. File-backed `lean_lookup` with `kind="proof_search"` uses the same setup for goal elaboration.
 
 Lake writes its own config cache under `.lake/config/` when the lakefile changed, under Lake's own lock, so a file check
 right after a lakefile edit can write there. When two checks start that write at the same moment, Lake fails one with

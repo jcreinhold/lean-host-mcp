@@ -11,8 +11,34 @@ use std::{
 
 const SETUP_FILE: &str = "Lake setup-file";
 
+/// Lake's exit code when `--no-build` meets a target it would have to rebuild
+/// (`noBuildCode`, `Lake/Build/Run.lean`).
+const NO_BUILD_EXIT: i32 = 3;
+
 fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+/// The setup Lake printed, or [`ServerError::OutOfDate`] naming the targets
+/// Lake would have to rebuild first.
+fn setup_output(output: crate::lake_options::ReaderOutput) -> Result<Vec<u8>> {
+    if output.exit_code != NO_BUILD_EXIT {
+        return Ok(output.stdout);
+    }
+    // `reportResult` (`Lake/Build/Run.lean`) prints this line, then one
+    // `- NAME` line per failed job.
+    let targets = output
+        .stderr
+        .lines()
+        .skip_while(|line| *line != "Some required targets logged failures:")
+        .skip(1)
+        .map_while(|line| line.strip_prefix("- "))
+        .map(str::to_owned)
+        .collect();
+    Err(ServerError::OutOfDate {
+        targets,
+        output: output.stderr,
+    })
 }
 
 #[derive(Deserialize)]
@@ -234,7 +260,8 @@ impl ProjectBroker {
 
     /// Run `lake setup-file` as a native reader. The guardian holds the project
     /// lock shared while Lake reads the build products and prints the setup.
-    /// No step takes the lock exclusively.
+    /// No step takes the lock exclusively. When an import is out of date, Lake
+    /// builds nothing and this returns [`ServerError::OutOfDate`].
     async fn setup_file(&self, root: &Path, file: &Path, source: &str) -> Result<StagedSetup> {
         if !file.starts_with(root)
             || file.canonicalize()? != file
@@ -261,7 +288,7 @@ impl ProjectBroker {
         let custody = crate::artifact_reads::ArtifactReadGuard::try_acquire(root)?;
         let lake = sysroot.join("bin/lake");
         let (cwd, source_file) = (root.to_owned(), file.to_owned());
-        let bytes = crate::lake_options::reader_output(
+        let output = crate::lake_options::reader_run(
             SETUP_FILE,
             root.to_owned(),
             crate::cancellation::CallCancellation::current()
@@ -270,6 +297,7 @@ impl ProjectBroker {
             custody,
             None,
             Some(Box::new(activity)),
+            &[0, NO_BUILD_EXIT],
             move |assets| {
                 // Point any Lake cache at the reader's private inputs.
                 let cache = assets.join("lake-cache");
@@ -295,7 +323,7 @@ impl ProjectBroker {
         )
         .await
         .map_err(|failure| failure.error)?;
-        Ok(stage(bytes, &domains, &sysroot, root, file)?)
+        Ok(stage(setup_output(output)?, &domains, &sysroot, root, file)?)
     }
 }
 
@@ -307,6 +335,27 @@ mod tests {
     fn setup_parser_requires_complete_bounded_typed_json() {
         assert!(parse_setup(br#"{"name":"M"}"#).is_err());
         assert!(parse_setup(br#"{"name":"M""#).is_err());
+    }
+
+    #[test]
+    fn no_build_exit_names_the_targets_lake_lists() {
+        // What Lake 4.36 prints for `lake --no-build setup-file B.lean` when
+        // B imports an unbuilt A.
+        let stderr = "info: toolchain not updated; already up-to-date\n\
+                      ✖ [2/4] Building A\n\
+                      error: target is out-of-date and needs to be rebuilt\n\
+                      Some required targets logged failures:\n\
+                      - A\n";
+        let output = |exit_code| crate::lake_options::ReaderOutput {
+            exit_code,
+            stdout: b"{}".to_vec(),
+            stderr: stderr.to_owned(),
+        };
+        assert!(matches!(
+            setup_output(output(NO_BUILD_EXIT)),
+            Err(ServerError::OutOfDate { targets, output }) if targets == ["A"] && output == stderr
+        ));
+        assert!(matches!(setup_output(output(0)), Ok(bytes) if bytes == b"{}"));
     }
 
     #[test]

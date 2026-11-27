@@ -370,6 +370,29 @@ async fn imports_of_a_file_with_a_stale_import_are_an_error_naming_the_file() ->
     Ok(())
 }
 
+/// A file check builds nothing, so a stale import makes it a needs-build reply
+/// whose `stale_build` row names the module Lake reported.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(native_owners)]
+#[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT"]
+async fn a_file_check_with_a_stale_import_names_the_module_to_build() -> TestResult {
+    let (chain, ctx) = project()?;
+    chain.write(
+        "Chain/B.lean",
+        "import Chain.A\nimport Dep\n\ndef b : Nat := a + dep\ndef extra : Nat := 0\n",
+    )?;
+    let response = diagnostics(&ctx, "Chain/C.lean").await?;
+    let stale = response
+        .trust
+        .artifacts
+        .iter()
+        .filter(|row| row.status == lean_host_mcp::TrustStatus::StaleBuild)
+        .map(|row| row.module.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(stale, [Some("Chain.B")], "{:?}", response.trust.artifacts);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial(native_owners)]
 #[ignore = "requires LEAN_HOST_MCP_TEST_FIXTURE or LEAN_SYSROOT and a matching installed worker"]

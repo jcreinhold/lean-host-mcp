@@ -109,6 +109,12 @@ pub enum ServerError {
         target_check: TargetCheckNotStarted,
     },
 
+    /// `lake --no-build setup-file` exited with Lake's no-build code: Lake must
+    /// rebuild `targets` before it can set up the file, and a check builds
+    /// nothing. `output` is what Lake printed.
+    #[error("Lake must rebuild {} first, and a check builds nothing. Lake printed: {output}", listed(.targets))]
+    OutOfDate { targets: Vec<String>, output: String },
+
     #[error("incompatible Lean worker: {message}")]
     IncompatibleWorker { message: String, recovery_command: String },
 
@@ -120,6 +126,14 @@ pub enum ServerError {
 }
 
 pub type Result<T> = std::result::Result<T, ServerError>;
+
+fn listed(targets: &[String]) -> String {
+    if targets.is_empty() {
+        "an import".to_owned()
+    } else {
+        targets.join(", ")
+    }
+}
 
 impl ServerError {
     pub(crate) fn worker_unavailable(info: WorkerUnavailable) -> Self {
@@ -162,6 +176,7 @@ impl From<ServerError> for McpError {
             other @ (ServerError::Lean(_)
             | ServerError::SessionGone
             | ServerError::BadProject(_)
+            | ServerError::OutOfDate { .. }
             | ServerError::IncompatibleWorker { .. }
             | ServerError::Io(_)
             | ServerError::Internal(_)) => Self::internal_error(other.to_string(), None),

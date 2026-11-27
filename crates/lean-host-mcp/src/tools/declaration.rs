@@ -251,10 +251,7 @@ fn inspection_needs_build_response(
 ) -> Result<Response<DeclarationInspectionResult>> {
     let base = ctx.broker.project_identity_without_worker(&hint, imports)?;
     let response = Response::ok(DeclarationInspectionResult::NeedsBuild, base.freshness).with_runtime(base.runtime);
-    Ok(warn_needs_build(
-        response,
-        &IncompleteCause::MissingOlean(err.to_string()),
-    ))
+    Ok(warn_needs_build(response, &IncompleteCause::from_error(&err)))
 }
 
 fn budgets_for(output: &OutputBudgetOverrides) -> LeanWorkerOutputBudgets {

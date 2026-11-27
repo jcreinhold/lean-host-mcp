@@ -86,6 +86,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A file check whose import is out of date returns a `needs_build` reply, with a `stale_build` row for each module Lake
+  lists, in place of `internal_error`. `lake --no-build setup-file` exits 3 when it would have to rebuild an import, and
+  the server now reads that code.
+- `serve` checks the worker socket directory when it starts and exits if the directory is unsafe or a worker socket path
+  in it would be too long. Before, the first file check found out.
 - File checks that start together no longer fail with `another transient reader admission gate is active`: a check that
   finds the SDK's gate on the installed shims held tries again every 20 ms until its request's time runs out.
 - A native reader whose start finds an ended reader's input file gone tries again, up to three times, instead of failing

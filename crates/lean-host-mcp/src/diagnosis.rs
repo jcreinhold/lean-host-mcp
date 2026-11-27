@@ -16,8 +16,9 @@
 //! As of `lean-rs-worker-protocol` 0.1.18 the worker classifies resolution at
 //! its own boundary: `proof_state` and `verify_declaration` return typed
 //! `NeedsBuild` / `Ambiguous { candidates }` verdicts, so the parent no longer
-//! string-matches those. The one remaining text heuristic,
-//! [`missing_olean_failure`], covers the env-based query path
+//! string-matches those. A file check whose imports Lake reports out of date
+//! arrives typed too, as [`ServerError::OutOfDate`]. The one remaining text
+//! heuristic, in [`missing_olean_failure`], covers the env-based query path
 //! (`find_references`, `search_for_proof`), where an unbuilt transitive
 //! dependency still surfaces as an infrastructure [`ServerError`].
 
@@ -36,6 +37,21 @@ pub(crate) enum IncompleteCause {
     /// A query hit a missing `.olean` (an infrastructure [`ServerError`] whose
     /// text [`missing_olean_failure`] recognised). Carries the error text.
     MissingOlean(String),
+    /// Targets Lake must rebuild before it can set up the file
+    /// ([`ServerError::OutOfDate`]).
+    OutOfDate(Vec<String>),
+}
+
+impl IncompleteCause {
+    /// The cause a build-state failure names: Lake's out-of-date targets when
+    /// it reported them, else the error text.
+    pub(crate) fn from_error(err: &ServerError) -> Self {
+        if let ServerError::OutOfDate { targets, .. } = err {
+            Self::OutOfDate(targets.clone())
+        } else {
+            Self::MissingOlean(err.to_string())
+        }
+    }
 }
 
 /// One competing declaration for a genuinely ambiguous name. `namespace` is the
@@ -47,10 +63,14 @@ pub(crate) struct CompetingDecl {
 }
 
 /// Recognise an infrastructure failure that is really a missing/stale build
-/// artifact rather than a Lean-domain error. Text-coupled heuristic; the only
-/// one left, for the env-based query path the worker does not type. See module
+/// artifact rather than a Lean-domain error: Lake's typed out-of-date verdict,
+/// or text naming a missing `.olean`. The text match is the only heuristic
+/// left, for the env-based query path the worker does not type. See module
 /// docs.
 pub(crate) fn missing_olean_failure(err: &ServerError) -> bool {
+    if matches!(err, ServerError::OutOfDate { .. }) {
+        return true;
+    }
     let text = err.to_string().to_lowercase();
     (text.contains(".olean")
         && (text.contains("does not exist") || text.contains("no such file") || text.contains("object file")))
@@ -102,7 +122,10 @@ pub(crate) fn needs_build_text(project_root: &str, cause: &IncompleteCause) -> (
         IncompleteCause::MissingImports(missing) if !missing.is_empty() => {
             format!(" (missing imports: {})", missing.join(", "))
         }
-        IncompleteCause::MissingImports(_) => String::new(),
+        IncompleteCause::OutOfDate(targets) if !targets.is_empty() => {
+            format!(" (out of date: {})", targets.join(", "))
+        }
+        IncompleteCause::MissingImports(_) | IncompleteCause::OutOfDate(_) => String::new(),
         IncompleteCause::MissingOlean(text) => format!(" (blocked: {})", first_line(text)),
     };
     let warning = format!(
@@ -110,10 +133,10 @@ pub(crate) fn needs_build_text(project_root: &str, cause: &IncompleteCause) -> (
          Run `lake build` in {project_root} and resolve errors, then retry.{detail}"
     );
     let next_action = match cause {
-        IncompleteCause::MissingImports(missing) if !missing.is_empty() => {
+        IncompleteCause::MissingImports(missing) | IncompleteCause::OutOfDate(missing) if !missing.is_empty() => {
             format!("lake build {} # then retry", missing.join(" "))
         }
-        IncompleteCause::MissingImports(_) | IncompleteCause::MissingOlean(_) => {
+        IncompleteCause::MissingImports(_) | IncompleteCause::OutOfDate(_) | IncompleteCause::MissingOlean(_) => {
             "lake build # complete the project environment, then retry".to_owned()
         }
     };
@@ -148,6 +171,16 @@ fn needs_build_trust_artifacts(cause: &IncompleteCause) -> Vec<ArtifactTrust> {
         IncompleteCause::MissingOlean(text) => {
             vec![ArtifactTrust::olean_project_missing_build(first_line(text))]
         }
+        IncompleteCause::OutOfDate(targets) if targets.is_empty() => {
+            vec![ArtifactTrust::olean_project_stale_build(
+                "Lake reports an import out of date",
+            )]
+        }
+        IncompleteCause::OutOfDate(targets) => targets
+            .iter()
+            .cloned()
+            .map(ArtifactTrust::olean_module_stale_build)
+            .collect(),
     }
 }
 
@@ -322,6 +355,43 @@ mod tests {
         let (warning, _) = needs_build_text("/work/proj", &cause);
         assert!(warning.contains("Foo.olean"));
         assert!(!warning.contains("second line"));
+    }
+
+    #[test]
+    fn out_of_date_setup_is_needs_build_with_one_stale_row_per_target() {
+        use crate::trust::{ArtifactKind, TrustScope, TrustStatus};
+        let stale = || ServerError::OutOfDate {
+            targets: vec!["A".to_owned(), "B.C".to_owned()],
+            output: "error: target is out-of-date and needs to be rebuilt".to_owned(),
+        };
+        assert!(matches!(
+            classify_missing_olean::<()>(Err(stale())),
+            Ok(CallOutcome::NeedsBuild(ServerError::OutOfDate { .. }))
+        ));
+        let cause = IncompleteCause::from_error(&stale());
+        let rows = |cause: &IncompleteCause| {
+            needs_build_trust_artifacts(cause)
+                .into_iter()
+                .map(|row| (row.artifact, row.scope, row.status, row.module))
+                .collect::<Vec<_>>()
+        };
+        let stale_module = |module: &str| {
+            (
+                ArtifactKind::Olean,
+                TrustScope::Module,
+                TrustStatus::StaleBuild,
+                Some(module.to_owned()),
+            )
+        };
+        assert_eq!(rows(&cause), [stale_module("A"), stale_module("B.C")]);
+        let (warning, next_action) = needs_build_text("/work/proj", &cause);
+        assert!(warning.contains("out of date: A, B.C"), "{warning}");
+        assert_eq!(next_action, "lake build A B.C # then retry");
+
+        assert_eq!(
+            rows(&IncompleteCause::OutOfDate(Vec::new())),
+            [(ArtifactKind::Olean, TrustScope::Project, TrustStatus::StaleBuild, None)]
+        );
     }
 
     #[test]

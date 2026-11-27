@@ -357,9 +357,9 @@ Rows may also carry `path`, `module`, `detail`, `next_action`, and a source `con
 project-relative when the file is inside the resolved Lake root, and absolute only for files outside that root.
 Source-overlay tools and source-backed declaration inventory report the source file snapshot as `source` / `file` /
 `edit_fresh`; project reference lookup and index-backed declaration inventory report `.ilean` build freshness or
-missing/stale build state; `needs_build` degradations report missing `.olean` artifacts. Duplicate trust rows are
-collapsed while preserving first occurrence order. Runtime counters, cache timings, and import lists remain telemetry,
-not trust.
+missing/stale build state; `needs_build` degradations report missing `.olean` artifacts, or a `stale_build` row for each
+module Lake lists as out of date when it sets up a file. Duplicate trust rows are collapsed while preserving first
+occurrence order. Runtime counters, cache timings, and import lists remain telemetry, not trust.
 
 Every reply whose result came from a source file's text, including a `needs_build` reply, has a `source` / `file` /
 `edit_fresh` row for that file. Its `content_sha256` is the lowercase SHA-256 of the exact bytes the call read and

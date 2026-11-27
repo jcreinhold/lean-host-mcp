@@ -187,6 +187,20 @@ impl ArtifactTrust {
             .next_action("lake build # complete the project environment, then retry")
     }
 
+    pub fn olean_project_stale_build(detail: impl Into<String>) -> Self {
+        Self::new(ArtifactKind::Olean, TrustScope::Project, TrustStatus::StaleBuild)
+            .detail(detail)
+            .next_action("lake build # rebuild what is out of date, then retry")
+    }
+
+    pub fn olean_module_stale_build(module: impl Into<String>) -> Self {
+        let module = module.into();
+        Self::new(ArtifactKind::Olean, TrustScope::Module, TrustStatus::StaleBuild)
+            .module(module.clone())
+            .detail(format!("Lake reports module `{module}` out of date"))
+            .next_action(format!("lake build {module} # then retry"))
+    }
+
     pub fn olean_module_missing_build(module: impl Into<String>) -> Self {
         let module = module.into();
         Self::new(ArtifactKind::Olean, TrustScope::Module, TrustStatus::MissingBuild)

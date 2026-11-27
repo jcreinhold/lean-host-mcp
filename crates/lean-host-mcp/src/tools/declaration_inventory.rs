@@ -281,10 +281,7 @@ fn worker_needs_build_response(
     let response = Response::ok(missing_build_result(err.to_string()), base.freshness)
         .with_runtime(base.runtime)
         .with_trust_artifact(source_fact);
-    Ok(warn_needs_build(
-        response,
-        &IncompleteCause::MissingOlean(err.to_string()),
-    ))
+    Ok(warn_needs_build(response, &IncompleteCause::from_error(&err)))
 }
 
 fn metadata_response(

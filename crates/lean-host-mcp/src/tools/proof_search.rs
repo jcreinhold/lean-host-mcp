@@ -234,10 +234,8 @@ pub async fn search_for_proof(ctx: &ToolContext, req: SearchForProofRequest) -> 
             let response = Response::ok(result, identity.freshness)
                 .with_runtime(identity.runtime)
                 .with_trust_artifacts(source_fact);
-            let response = crate::diagnosis::warn_needs_build(
-                response,
-                &crate::diagnosis::IncompleteCause::MissingOlean(err.to_string()),
-            );
+            let response =
+                crate::diagnosis::warn_needs_build(response, &crate::diagnosis::IncompleteCause::from_error(&err));
             return Ok(response.hint(
                 "supply a valid file or explicit imports; search_for_proof will not broad-import Mathlib as fallback",
             ));

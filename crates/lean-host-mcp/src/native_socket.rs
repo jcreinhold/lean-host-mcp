@@ -5,7 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) fn directory() -> io::Result<PathBuf> {
+/// The private directory that holds worker sockets, made mode 0700 if absent.
+///
+/// # Errors
+///
+/// Fails when no directory is configured, when it is not a canonical,
+/// user-owned mode-0700 directory outside `/tmp`, or when a worker socket path
+/// in it would pass the Unix length limit.
+pub fn directory() -> io::Result<PathBuf> {
     let root = if let Some(path) = std::env::var_os("LEAN_HOST_MCP_SOCKET_DIR") {
         PathBuf::from(path)
     } else if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {

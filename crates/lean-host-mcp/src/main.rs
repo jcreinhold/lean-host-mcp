@@ -380,6 +380,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let runtime_config = ProjectRuntimeConfig::from_env_with_file(&file.runtime, max_workers.get())?;
     let tool_config = resolve_tool_config(&file)?;
     let request_settings = RequestSettings::from_file(&file.requests).map_err(anyhow::Error::msg)?;
+    // Workers make their sockets here. Check it now, so a bad or long socket
+    // directory stops the server rather than its first check.
+    lean_host_mcp::socket_directory()?;
     // One server per store. Take the lock after the config checks, so a bad
     // config leaves the store alone, and before the broker, the process record
     // and the request table open. The store then keeps the native state, before
