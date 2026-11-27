@@ -125,6 +125,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `worker_pool_leased` and `worker_pool_draining`; the capability `draining_lease_v1`; and the library's
   `RuntimeAction`, `RuntimeControlRequest`, `RuntimeControlResult` and `RuntimeControlStatus`. With many sessions on one
   server, one session's lease paused every other session's calls.
+- Breaking: remove `LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER` and the `source_handoff` field of `lean_compatibility`'s
+  `shared_writer`. lean-rs 0.11 removed the source handoff and the storage fence that field reported.
 - Breaking: remove the library's `shared_writer` module, the host's copy of the SDK writer. Use
   `lean_rs_writer::use_helper_executable`, `lean_rs_writer::contract` and `lean_rs_writer::WriterContract`;
   `store::owner_directory` replaces `ownership_registry`. Its lifecycle and contract tests went with it, since

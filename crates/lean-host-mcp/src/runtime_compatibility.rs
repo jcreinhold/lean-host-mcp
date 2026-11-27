@@ -6,14 +6,13 @@
 //! versions are recorded rather than pinned. Only the shared-writer executable identity is observed here; no backend work is submitted.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use lean_rs_worker_parent::{
     LeanWorkerHostRuntimeExpectation, LeanWorkerHostRuntimeMetadata, LeanWorkerRuntimeMetadata,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 pub(crate) const SCHEMA: &str = "lean-host-native-compatibility-v1";
 
@@ -24,108 +23,11 @@ pub struct SharedWriterObservation {
     pub executable: PathBuf,
     /// Namespace bound to this broker's native generation ownership.
     pub ownership_registry: PathBuf,
-    /// Present only on an explicitly approved, pinned writer cohort.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_handoff: Option<SourceHandoffObservation>,
-}
-
-/// Broker approval for the existing registry and the exact standalone image.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct SourceHandoffObservation {
-    pub fence: &'static str,
-    pub executable: PathBuf,
-    pub sha256: String,
-    pub registry_device: u64,
-    pub registry_inode: u64,
-    pub approval_generation: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceHandoffCutover {
-    executable: PathBuf,
-    sha256: String,
-    ownership_registry: PathBuf,
-    registry_device: u64,
-    registry_inode: u64,
-    approval_generation: String,
-}
-
-fn source_handoff_observation(registry: &Path) -> Option<SourceHandoffObservation> {
-    let setting = std::env::var("LEAN_HOST_MCP_SOURCE_HANDOFF_CUTOVER").ok()?;
-    if setting.len() > 8192 {
-        return None;
-    }
-    let pin: SourceHandoffCutover = serde_json::from_str(&setting).ok()?;
-    source_handoff_for_pin(registry, pin)
-}
-
-#[cfg(unix)]
-fn source_handoff_for_pin(registry: &Path, pin: SourceHandoffCutover) -> Option<SourceHandoffObservation> {
-    use std::io::{BufRead as _, BufReader};
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    if pin.ownership_registry != registry
-        || registry.canonicalize().ok()?.as_path() != registry
-        || !registry.is_dir()
-        || !is_digest(&pin.sha256)
-        || pin.approval_generation.len() != 32
-        || !pin
-            .approval_generation
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        || !pin.executable.is_absolute()
-        || pin.executable.canonicalize().ok()? != pin.executable
-    {
-        return None;
-    }
-    let approved = || {
-        let directory = std::fs::symlink_metadata(registry).ok()?;
-        (directory.is_dir() && (directory.dev(), directory.ino()) == (pin.registry_device, pin.registry_inode))
-            .then_some(())
-    };
-    approved()?;
-    let helper = std::fs::File::open(&pin.executable).ok()?;
-    let opened = helper.metadata().ok()?;
-    if !opened.is_file() || opened.permissions().mode() & 0o111 == 0 {
-        return None;
-    }
-    let mut helper = BufReader::new(helper);
-    let mut hash = Sha256::new();
-    loop {
-        let bytes = helper.fill_buf().ok()?;
-        if bytes.is_empty() {
-            break;
-        }
-        hash.update(bytes);
-        let size = bytes.len();
-        helper.consume(size);
-    }
-    let named = std::fs::symlink_metadata(&pin.executable).ok()?;
-    if named.dev() != opened.dev() || named.ino() != opened.ino() || crate::digest::hex(hash.finalize()) != pin.sha256 {
-        return None;
-    }
-    approved()?;
-    Some(SourceHandoffObservation {
-        // The embedded writer checks retained charges before owner publication.
-        fence: "embedded_storage_fence_v1",
-        executable: pin.executable,
-        sha256: pin.sha256,
-        registry_device: pin.registry_device,
-        registry_inode: pin.registry_inode,
-        approval_generation: pin.approval_generation,
-    })
-}
-
-#[cfg(not(unix))]
-fn source_handoff_for_pin(_registry: &Path, _pin: SourceHandoffCutover) -> Option<SourceHandoffObservation> {
-    None
 }
 
 impl From<lean_rs_writer::WriterContract> for SharedWriterObservation {
     fn from(writer: lean_rs_writer::WriterContract) -> Self {
         Self {
-            source_handoff: source_handoff_observation(&writer.ownership_registry),
             protocol: writer.protocol,
             executable: writer.executable,
             ownership_registry: writer.ownership_registry,
@@ -382,46 +284,6 @@ fn is_digest(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn source_handoff_observation_requires_exact_registry_and_executable_pin() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let fixture = tempfile::tempdir()?;
-        let registry = fixture.path().canonicalize()?;
-        let other = registry.join("other");
-        std::fs::create_dir(&other)?;
-        let executable = Path::new("/usr/bin/true").canonicalize()?;
-        let sha256 = crate::digest::sha256_hex(&std::fs::read(&executable)?);
-        use std::os::unix::fs::MetadataExt as _;
-        let approved_registry = std::fs::metadata(&registry)?;
-        let pin = |ownership_registry: PathBuf, sha256: String| SourceHandoffCutover {
-            executable: executable.clone(),
-            sha256,
-            ownership_registry,
-            registry_device: approved_registry.dev(),
-            registry_inode: approved_registry.ino(),
-            approval_generation: "a".repeat(32),
-        };
-        let observed = source_handoff_for_pin(&registry, pin(registry.clone(), sha256.clone()))
-            .ok_or("exact standalone pin must be advertised")?;
-        assert_eq!(observed.fence, "embedded_storage_fence_v1");
-        assert_eq!(observed.approval_generation, "a".repeat(32));
-        assert_eq!(observed.executable, executable);
-        assert_eq!(observed.sha256, sha256);
-        assert!(source_handoff_for_pin(&registry, pin(other, sha256.clone())).is_none());
-        assert!(source_handoff_for_pin(&registry, pin(registry.clone(), "0".repeat(64))).is_none());
-        let registry_path = registry.join("replaceable");
-        std::fs::create_dir(&registry_path)?;
-        let original = std::fs::metadata(&registry_path)?;
-        let mut configured = pin(registry_path.clone(), sha256);
-        configured.registry_device = original.dev();
-        configured.registry_inode = original.ino();
-        std::fs::rename(&registry_path, registry.join("prior"))?;
-        std::fs::create_dir(&registry_path)?;
-        assert!(source_handoff_for_pin(&registry_path, configured).is_none());
-        Ok(())
-    }
 
     fn contract() -> Result<ExpectedContract, String> {
         ExpectedContract::new(BTreeMap::from([("verify_declaration_batch".into(), "a".repeat(64))]))
