@@ -12,13 +12,14 @@
 
 use lean_rs_worker_parent::{
     LeanWorkerDeclarationFlags, LeanWorkerDeclarationInspection as WorkerDeclarationInspection,
-    LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationProofSearchFacts, LeanWorkerDeclarationSearchFacts,
-    LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult, LeanWorkerDeclarationSearchRow,
-    LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationTargetInfo, LeanWorkerDeclarationVerificationFacts,
-    LeanWorkerDeclarationVerificationResult, LeanWorkerDeclarationVerificationStatus, LeanWorkerDiagnostic,
-    LeanWorkerElabFailure, LeanWorkerModuleSourceSpan, LeanWorkerProofAttemptEnvelope, LeanWorkerProofAttemptResult,
-    LeanWorkerProofAttemptRow, LeanWorkerProofAttemptStatus, LeanWorkerRenderedInfo, LeanWorkerRendering,
-    LeanWorkerSourceCoordinateSpace, LeanWorkerSourceRange,
+    LeanWorkerDeclarationInspectionResult, LeanWorkerDeclarationNameMatchKind, LeanWorkerDeclarationProofSearchFacts,
+    LeanWorkerDeclarationSearchFacts, LeanWorkerDeclarationSearchPruning, LeanWorkerDeclarationSearchResult,
+    LeanWorkerDeclarationSearchRow, LeanWorkerDeclarationSearchTimings, LeanWorkerDeclarationTargetInfo,
+    LeanWorkerDeclarationVerificationFacts, LeanWorkerDeclarationVerificationResult,
+    LeanWorkerDeclarationVerificationStatus, LeanWorkerDiagnostic, LeanWorkerElabFailure, LeanWorkerModuleSourceSpan,
+    LeanWorkerProofAttemptEnvelope, LeanWorkerProofAttemptResult, LeanWorkerProofAttemptRow,
+    LeanWorkerProofAttemptStatus, LeanWorkerRenderedInfo, LeanWorkerRendering, LeanWorkerSourceCoordinateSpace,
+    LeanWorkerSourceRange,
 };
 
 use crate::tools::position::{LocalInfo, project_local_info};
@@ -140,6 +141,21 @@ pub struct DeclarationFlags {
     pub is_internal: bool,
 }
 
+/// How a declaration's full name matched a search's name fragment. A search
+/// returns its exact matches first, then prefix matches, then substring
+/// matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclarationNameMatch {
+    /// The full name is the fragment.
+    Exact,
+    /// The full name starts with the fragment, ignoring ASCII case.
+    Prefix,
+    /// The full name contains the fragment after its start, ignoring ASCII
+    /// case.
+    Substring,
+}
+
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DeclarationSummary {
     pub name: String,
@@ -147,8 +163,8 @@ pub struct DeclarationSummary {
     pub module: Option<String>,
     pub source: Option<SourceRange>,
     pub match_reason: String,
-    pub score: i32,
-    pub rank: usize,
+    /// How the name matched, or `None` when the search named no fragment.
+    pub name_match: Option<DeclarationNameMatch>,
     pub flags: DeclarationFlags,
 }
 
@@ -162,7 +178,7 @@ pub struct DeclarationSearchPruning {
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DeclarationSearchTimings {
     pub scan_micros: u64,
-    pub rank_micros: u64,
+    pub sort_micros: u64,
     pub source_micros: u64,
 }
 
@@ -173,7 +189,6 @@ pub struct DeclarationSearchFacts {
     pub after_kind_filter: usize,
     pub after_required_constants_filter: usize,
     pub after_conclusion_filter: usize,
-    pub after_scope_filter: usize,
     pub source_lookups: usize,
     pub broad_pruning: Vec<DeclarationSearchPruning>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -527,9 +542,16 @@ fn project_declaration_summary(row: LeanWorkerDeclarationSearchRow) -> Declarati
         module: row.module,
         source: row.source.map(project_source_range),
         match_reason: row.match_reason,
-        score: row.score,
-        rank: row.rank,
+        name_match: row.name_match.map(project_name_match),
         flags: project_declaration_flags(row.flags),
+    }
+}
+
+const fn project_name_match(kind: LeanWorkerDeclarationNameMatchKind) -> DeclarationNameMatch {
+    match kind {
+        LeanWorkerDeclarationNameMatchKind::Exact => DeclarationNameMatch::Exact,
+        LeanWorkerDeclarationNameMatchKind::Prefix => DeclarationNameMatch::Prefix,
+        LeanWorkerDeclarationNameMatchKind::Substring => DeclarationNameMatch::Substring,
     }
 }
 
@@ -544,7 +566,7 @@ fn project_declaration_search_pruning(row: LeanWorkerDeclarationSearchPruning) -
 fn project_declaration_search_timings(timings: LeanWorkerDeclarationSearchTimings) -> DeclarationSearchTimings {
     DeclarationSearchTimings {
         scan_micros: timings.scan_micros,
-        rank_micros: timings.rank_micros,
+        sort_micros: timings.sort_micros,
         source_micros: timings.source_micros,
     }
 }
@@ -556,7 +578,6 @@ fn project_declaration_search_facts(facts: LeanWorkerDeclarationSearchFacts) -> 
         after_kind_filter: facts.after_kind_filter,
         after_required_constants_filter: facts.after_required_constants_filter,
         after_conclusion_filter: facts.after_conclusion_filter,
-        after_scope_filter: facts.after_scope_filter,
         source_lookups: facts.source_lookups,
         broad_pruning: facts
             .broad_pruning

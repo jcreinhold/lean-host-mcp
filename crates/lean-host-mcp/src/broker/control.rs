@@ -231,6 +231,19 @@ impl ProjectBroker {
         .map(Some)
     }
 
+    /// The longest wait among `root`'s resident workers that abnormal
+    /// restarts keep down, or `None` when each may start a child. It starts
+    /// and asks nothing.
+    pub(crate) fn worker_restart_retry_after(&self, root: &Path) -> Option<std::time::Duration> {
+        self.inner
+            .lock()
+            .registry
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .filter_map(|(_, project)| project.restart_retry_after())
+            .max()
+    }
+
     /// Observe this server's build, settings and workers. It starts nothing
     /// and reserves nothing.
     #[must_use]

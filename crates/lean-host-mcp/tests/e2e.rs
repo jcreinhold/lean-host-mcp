@@ -1953,7 +1953,6 @@ async fn batched_declaration_searches_answer_in_request_order() {
             kind: None,
             required_constants: Vec::new(),
             conclusion_head: None,
-            scope_biases: Vec::new(),
             limit: 8,
             filter: LeanWorkerDeclarationFilter {
                 include_private: false,

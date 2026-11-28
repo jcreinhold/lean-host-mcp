@@ -25,12 +25,12 @@ pub(crate) struct SemanticProofSearchRequest {
 }
 
 /// Candidate declaration returned after storage-neutral semantic retrieval.
+/// Its place in [`SemanticProofSearchResult::candidates`] is its rank.
 #[derive(Debug, Clone)]
 pub(crate) struct SemanticProofCandidate {
     pub(crate) name: String,
     pub(crate) module: String,
     pub(crate) kind: DeclarationKind,
-    pub(crate) score: i32,
     pub(crate) evidence: Vec<String>,
 }
 
@@ -111,13 +111,12 @@ fn rank_semantic_rows(reply: &DriverReply, limit: usize) -> SemanticProofSearchR
     diagnostics.extend(diagnostic_strings(&retrieval.diagnostics));
 
     // Retrieval names only the rows it indexed, so each candidate finds its
-    // row.
+    // row. Candidates keep retrieval's rank order.
     let candidates = retrieval
         .candidates
         .into_iter()
         .filter_map(|candidate| {
             let row = rows_by_id.get(candidate.declaration_id.as_str())?;
-            let rank = i32::try_from(candidate.rank).unwrap_or(i32::MAX);
             let evidence = candidate
                 .explanations
                 .into_iter()
@@ -127,9 +126,6 @@ fn rank_semantic_rows(reply: &DriverReply, limit: usize) -> SemanticProofSearchR
                 name: row.name.clone(),
                 module: row.module.clone(),
                 kind: row.kind,
-                // Keep semantic candidates above lexical-only fallback while
-                // still allowing proof-agent boosts/penalties to reorder them.
-                score: 150_i32.saturating_sub(rank.saturating_mul(4)),
                 evidence,
             })
         })

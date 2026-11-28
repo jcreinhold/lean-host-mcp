@@ -1,7 +1,7 @@
 //! Runtime policy for project actors: the import residue budget and the Lean
 //! heap ceiling derived from it, the request deadline, mailbox depth and the
-//! restart breaker. Each knob resolves env var over config file over a
-//! built-in default, once at server startup.
+//! supervisor's restart limit. Each knob resolves env var over config file over
+//! a built-in default, once at server startup.
 
 use std::time::Duration;
 
@@ -190,6 +190,8 @@ const WORKER_IMPORT_RESIDUE_SOFT_PERCENT: u64 = 60;
 /// call thrashes the pool inside one tool call. Eight costs ~560 MiB held
 /// against 8 GB or more of re-imports avoided.
 const WORKER_SESSION_POOL_CAPACITY: usize = 8;
+/// Abnormal restarts the supervisor makes within [`RESTART_WINDOW`]; it
+/// refuses the next one until the oldest leaves the window.
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
 pub(super) const RESTART_WINDOW: Duration = Duration::from_mins(1);
 

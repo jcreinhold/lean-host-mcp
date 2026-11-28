@@ -222,6 +222,8 @@ fn fixture_project(root: &Path) -> Arc<LeanProject> {
             restarts_by_cause: BTreeMap::new(),
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
+            restart_retry_after: None,
+            child_exited: false,
             compatibility: None,
         })),
         module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
@@ -254,7 +256,7 @@ fn fixture_config(
         request_timeout_millis: millis_u64(EXECUTION_TIMEOUT),
         mailbox_capacity: defaults.mailbox_capacity(),
         max_restarts_per_window: defaults.max_restarts_per_window(),
-        restart_window: RESTART_WINDOW,
+        restart_window: defaults.restart_window(),
         import_residue_budget_bytes: defaults.import_residue_budget_bytes(),
         import_residue_soft_bytes: defaults.import_residue_soft_bytes(),
         session_pool_capacity: defaults.session_pool_capacity(),
@@ -287,7 +289,6 @@ fn ordinary_state(root: &Path, tracker: &LeanWorkerProcessTracker) -> (Arc<LeanP
         loaded_at: None,
         profile_switch_count: 0,
         last_rss_kib: None,
-        abnormal_restart_times: VecDeque::new(),
         restart_stats: RestartStats::default(),
         cycled_while_idle: false,
     };
@@ -719,12 +720,16 @@ async fn actor_failed_replacement_keeps_original_stop_without_replay() {
     assert!(!evidence.uncertain);
     assert_eq!(harness.requests("spawn").len(), 1, "replacement did not start");
     assert_eq!(harness.tracker.active_processes(), 0, "original child reaped");
-    assert!(!harness.project.is_healthy(), "failed spawn seals the dead actor");
-    harness.wait_for_retirement().await;
+    // The supervisor tries again at the next request. A new actor would bring
+    // a new supervisor whose restart window starts empty, so this one stays.
+    assert!(
+        harness.project.is_healthy(),
+        "a failed replacement keeps its supervisor"
+    );
     let (fresh, fresh_evidence) =
         crate::cancellation::with_cancellation_evidence(&CancellationToken::new(), query(&harness.project)).await;
-    assert!(fresh.is_err(), "a fresh call needs a new actor");
-    assert_eq!(fresh_evidence.not_started, 1);
+    assert!(fresh.is_err(), "the replacement still cannot start");
+    assert_eq!(fresh_evidence.not_started, 1, "the fresh call reached no child");
     assert!(!fresh_evidence.uncertain);
     assert_eq!(harness.requests("process_module_query").len(), 1);
     assert_eq!(
@@ -732,6 +737,42 @@ async fn actor_failed_replacement_keeps_original_stop_without_replay() {
         1,
         "the failed request is never replayed"
     );
+    harness.finish().await;
+}
+
+/// Once abnormal restarts fill the supervisor's window, it refuses the next
+/// one, and the call says how long the worker stays down rather than opening
+/// a new supervisor with an empty window.
+#[tokio::test]
+async fn a_full_restart_window_keeps_the_worker_down_and_says_for_how_long() {
+    let harness = ActorHarness::start(true);
+    // A timeout, then a failed start for each call until the window is full.
+    for _ in 0..3 {
+        let _ = query(&harness.project).await.expect_err("no child can start");
+    }
+    let (result, evidence) =
+        crate::cancellation::with_cancellation_evidence(&CancellationToken::new(), query(&harness.project)).await;
+    let refused = failure(result.expect_err("the supervisor refuses a fourth abnormal restart"));
+    assert!(
+        refused.reason.starts_with("restart_limit_exceeded"),
+        "{}",
+        refused.reason
+    );
+    assert!(refused.retryable, "the worker returns once the window clears");
+    let wait = refused.retry_after_millis.expect("the refusal says how long to wait");
+    assert!(wait > 0 && wait <= 60_000, "{wait}");
+    assert_eq!(evidence.not_started, 1, "the refused call reached no child");
+    assert!(!evidence.uncertain);
+    assert!(harness.project.is_healthy(), "the actor waits out the window");
+    assert!(harness.project.restart_retry_after().is_some());
+    assert!(
+        harness
+            .broker
+            .worker_restart_retry_after(&harness.project.canonical_root)
+            .is_some(),
+        "lean_status can report the wait"
+    );
+    assert_eq!(harness.requests("process_module_query").len(), 1);
     harness.finish().await;
 }
 
@@ -776,8 +817,10 @@ async fn abrupt_worker_exit_after_effect_never_replays_actual_proof_attempt() {
     assert_eq!(evidence.returned, 0);
     assert!(!evidence.uncertain);
     assert_eq!(failure.runtime.retry_count, 0);
-    assert!(!harness.project.is_healthy(), "observed child death seals its actor");
-    harness.wait_for_retirement().await;
+    // The supervisor replaced the child, so the actor stays warm.
+    assert!(harness.project.is_healthy(), "a replaced child keeps its actor");
+    assert_eq!(harness.requests("spawn").len(), 2, "one replacement generation");
+    assert_eq!(harness.tracker.active_processes(), 1, "the replacement owns capacity");
     assert_eq!(
         harness.requests("attempt_proof").len(),
         1,
@@ -936,8 +979,11 @@ async fn incompatible_session_metadata_refuses_before_target_body() {
     harness.finish().await;
 }
 
+/// A child that dies while idle stays with its supervisor. The next call
+/// replaces it once and runs on the replacement; the replacement counts
+/// against the restart window, which a new actor would have started empty.
 #[tokio::test]
-async fn idle_worker_death_after_healthy_observation_recovers_capacity_without_a_request() {
+async fn idle_worker_death_is_replaced_by_the_next_call() {
     let harness = ActorHarness::start_with_runtime(false, Some(tokio::runtime::Handle::current()), None, None);
     assert!(
         harness.project.is_healthy(),
@@ -949,11 +995,41 @@ async fn idle_worker_death_after_healthy_observation_recovers_capacity_without_a
         "an ordinary healthy idle poll keeps the worker warm"
     );
     fs::write(harness.root.path().join("idle_exit"), "").expect("release worker after healthy observation");
-    harness.wait_for_retirement().await;
+    tokio::time::timeout(TEST_DEADLINE, async {
+        while !harness.project.runtime.lock().child_exited {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("an idle poll observes the exit");
     assert!(harness.root.path().join("idle_exited").is_file());
-    assert!(!harness.project.is_healthy());
+    assert!(harness.project.is_healthy(), "the supervisor keeps the actor");
+    assert_eq!(
+        harness.project.live_generation(),
+        None,
+        "no cached answer outlives the child that computed it"
+    );
+    fs::remove_file(harness.root.path().join("idle_exit")).expect("let the replacement live");
+
+    let call = open_session(&harness.project, admission_deadline())
+        .await
+        .expect("the replacement serves the call");
+    let restart = call
+        .runtime
+        .call_restart
+        .as_ref()
+        .expect("the call paid for the replacement");
+    assert_eq!(restart.cause, "child_abort", "the child exited with status 23");
+    assert!(!restart.planned);
+    assert_eq!(call.runtime.worker_generation, 2);
+    assert_eq!(call.runtime.final_attempt, FinalAttemptStatus::Completed);
+    assert!(
+        crate::diagnosis::execution_taint(&call.runtime).is_none(),
+        "the call ran once, on the replacement"
+    );
+    assert_eq!(harness.project.live_generation(), Some(2));
     assert!(harness.requests("process_module_query").is_empty());
-    assert_eq!(harness.requests("spawn").len(), 1);
+    assert_eq!(harness.requests("spawn").len(), 2, "one replacement");
     harness.finish().await;
 }
 

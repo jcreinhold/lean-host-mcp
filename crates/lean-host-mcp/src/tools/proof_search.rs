@@ -2,22 +2,20 @@
 //!
 //! `search_for_proof` is an intent-shaped orchestration over existing
 //! bounded primitives: file-backed goal features come from the supervised Lean
-//! frontend, explicit goal text uses declaration search, and ranking stays
-//! local and deterministic. It deliberately does not render declarations.
+//! frontend, explicit goal text uses declaration search, and search's
+//! `merge_hits` puts the two kinds of hit in one order without a score. It
+//! deliberately does not render declarations.
 
 // Tool handlers consume owned requests so worker calls can cross async
 // boundaries without borrow plumbing.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use lean_rs_worker_parent::{
-    LeanWorkerDeclarationFilter, LeanWorkerDeclarationNameMatch, LeanWorkerDeclarationSearch,
-    LeanWorkerDeclarationSearchBias, LeanWorkerDeclarationSearchScope,
-};
+use lean_rs_worker_parent::{LeanWorkerDeclarationFilter, LeanWorkerDeclarationNameMatch, LeanWorkerDeclarationSearch};
 use lean_semantic_search_contract::{ProofGoalFeatureRequest, SourcePosition};
+use lean_semantic_search_retrieval::{LexicalHit, MergedHit, NameMatch, merge_hits};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -25,10 +23,10 @@ use crate::broker::{BrokerCall, ProjectHint};
 use crate::envelope::{Response, RuntimeFacts};
 use crate::error::Result;
 use crate::projections::{
-    DeclarationFlags, DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange,
+    DeclarationNameMatch, DeclarationSearchFacts, DeclarationSearchResult, DeclarationSummary, SourceRange,
     project_declaration_search,
 };
-use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
+use crate::semantic_search::{SemanticProofCandidate, SemanticProofSearchRequest, SemanticProofSearchResult};
 use crate::tools::position::ProofPositionSelector;
 use crate::tools::{ToolContext, session_imports};
 use crate::trust::ArtifactTrust;
@@ -91,7 +89,6 @@ pub struct ProofSearchCandidate {
     pub module: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceRange>,
-    pub score: i32,
     pub match_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_snippet: Option<String>,
@@ -131,6 +128,8 @@ pub struct SearchFunnel {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SearchForProofResult {
+    /// Best first: declarations whose full name is a searched fragment, then
+    /// semantic hits in retrieval's order, then the other lexical hits.
     pub candidates: Vec<ProofSearchCandidate>,
     pub diagnostics: ProofSearchDiagnostics,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -140,8 +139,6 @@ pub struct SearchForProofResult {
 #[derive(Debug, Clone)]
 struct TargetProfile {
     source_declaration: Option<String>,
-    kind: GoalProfileKind,
-    namespace: Option<String>,
     constants: Vec<String>,
     heads: Vec<String>,
     name_fragments: Vec<String>,
@@ -155,6 +152,7 @@ struct TargetProfile {
     source_fact: Option<ArtifactTrust>,
 }
 
+/// The kind of goal, which picks the topical name fragments to search for.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum GoalProfileKind {
     RatArithmetic,
@@ -170,11 +168,15 @@ struct PlannedSearch {
     request: LeanWorkerDeclarationSearch,
 }
 
-#[derive(Debug, Clone)]
-struct CandidateAccumulator {
-    row: DeclarationSummary,
-    score: i32,
-    reasons: BTreeSet<String>,
+impl PlannedSearch {
+    /// Whether the search filters on a broad conclusion head alone. `Eq`,
+    /// `Iff`, `Exists` and `True` head nearly every statement, so such a search
+    /// returns the first theorems by name, whatever they say.
+    fn filters_on_broad_head_alone(&self) -> bool {
+        self.request.name_fragment.is_none()
+            && self.request.required_constants.is_empty()
+            && self.request.conclusion_head.as_deref().is_some_and(is_broad_head)
+    }
 }
 
 /// Search for declarations likely to help the current or supplied proof goal.
@@ -295,7 +297,6 @@ fn target_profile(ctx: &ToolContext, req: SearchForProofRequest, limit: usize) -
 
     Ok(profile_from_text(
         explicit_text,
-        None,
         req.imports,
         "explicit_text".to_owned(),
         None,
@@ -322,7 +323,6 @@ fn source_profile(
     let semantic = semantic_request_for_source(input, declaration, position, None, &imports, limit);
     let mut profile = profile_from_text(
         explicit_text,
-        None,
         imports,
         "semantic_frontend".into(),
         None,
@@ -336,7 +336,6 @@ fn source_profile(
 
 fn profile_from_text(
     text: String,
-    namespace: Option<String>,
     imports: Vec<String>,
     proof_state_status: String,
     cache_status: Option<String>,
@@ -349,8 +348,6 @@ fn profile_from_text(
     let name_fragments = extract_name_fragments(&text, &constants, &heads, kind);
     TargetProfile {
         source_declaration: None,
-        kind,
-        namespace,
         constants,
         heads,
         name_fragments,
@@ -458,14 +455,14 @@ fn plan_searches(profile: &TargetProfile, mode: ProofSearchMode) -> Vec<PlannedS
 
     match mode {
         ProofSearchMode::Rewrite => {
-            push_head_search(&mut out, profile, "rewrite_eq", Some("Eq"));
-            push_head_search(&mut out, profile, "rewrite_iff", Some("Iff"));
-            push_fragment_searches(&mut out, profile, &["rw", "rewrite"]);
+            push_head_search(&mut out, "rewrite_eq", Some("Eq"));
+            push_head_search(&mut out, "rewrite_iff", Some("Iff"));
+            push_fragment_searches(&mut out, &["rw", "rewrite"]);
         }
         ProofSearchMode::Simp => {
-            push_fragment_searches(&mut out, profile, &["simp"]);
+            push_fragment_searches(&mut out, &["simp"]);
             if let Some(head) = primary_head.as_deref() {
-                push_head_search(&mut out, profile, "simp_head", Some(head));
+                push_head_search(&mut out, "simp_head", Some(head));
             }
         }
         ProofSearchMode::Exact | ProofSearchMode::Apply | ProofSearchMode::NextStep => {
@@ -473,41 +470,36 @@ fn plan_searches(profile: &TargetProfile, mode: ProofSearchMode) -> Vec<PlannedS
                 && !(mode == ProofSearchMode::NextStep && constants.is_empty() && is_broad_head(head))
             {
                 // A specific relational head (`LE.le`, `Membership.mem`, …) is a
-                // meaningful filter and labels the search `conclusion_head`, which
-                // counts as corroboration. A broad head (`Eq`/`Iff`/…) matches
-                // nearly everything, so it gets a distinct label and does *not*
-                // corroborate — otherwise generic `*_eq_*` lemmas would outrank
-                // domain name-fragment matches.
+                // meaningful filter and labels the search `conclusion_head`. A
+                // broad head (`Eq`/`Iff`/…) matches nearly everything, so it gets
+                // a label of its own.
                 let label = if is_broad_head(head) {
                     "broad_conclusion_head"
                 } else {
                     "conclusion_head"
                 };
-                push_head_search(&mut out, profile, label, Some(head));
+                push_head_search(&mut out, label, Some(head));
             }
             if !constants.is_empty() {
-                push_required_search(&mut out, profile, "required_constants", constants);
+                push_required_search(&mut out, "required_constants", constants);
             }
         }
     }
 
     for fragment in &profile.name_fragments {
-        push_name_search(&mut out, profile, "name_fragment", fragment);
+        push_name_search(&mut out, "name_fragment", fragment);
     }
 
-    dedupe_searches(out)
+    let mut searches = dedupe_searches(out);
+    // The order of the searches is the order `merge_hits` trusts their hits
+    // in. A search on a broad head alone returns theorems by name, whatever
+    // they say, so its hits go last. The sort is stable, so the rest keep the
+    // order above.
+    searches.sort_by_key(PlannedSearch::filters_on_broad_head_alone);
+    searches
 }
 
-fn base_search(profile: &TargetProfile, label: &'static str) -> PlannedSearch {
-    let mut scope_biases = Vec::new();
-    if let Some(namespace) = profile.namespace.as_deref().filter(|s| !s.is_empty()) {
-        scope_biases.push(LeanWorkerDeclarationSearchBias {
-            scope: LeanWorkerDeclarationSearchScope::Namespace,
-            prefix: namespace.to_owned(),
-            strict: false,
-            weight: 8,
-        });
-    }
+fn base_search(label: &'static str) -> PlannedSearch {
     PlannedSearch {
         label,
         request: LeanWorkerDeclarationSearch {
@@ -516,7 +508,6 @@ fn base_search(profile: &TargetProfile, label: &'static str) -> PlannedSearch {
             kind: Some("theorem".to_owned()),
             required_constants: Vec::new(),
             conclusion_head: None,
-            scope_biases,
             limit: SEARCH_FANOUT,
             filter: LeanWorkerDeclarationFilter {
                 include_private: false,
@@ -528,35 +519,30 @@ fn base_search(profile: &TargetProfile, label: &'static str) -> PlannedSearch {
     }
 }
 
-fn push_head_search(out: &mut Vec<PlannedSearch>, profile: &TargetProfile, label: &'static str, head: Option<&str>) {
+fn push_head_search(out: &mut Vec<PlannedSearch>, label: &'static str, head: Option<&str>) {
     let Some(head) = head else {
         return;
     };
-    let mut search = base_search(profile, label);
+    let mut search = base_search(label);
     search.request.conclusion_head = Some(head.to_owned());
     out.push(search);
 }
 
-fn push_required_search(
-    out: &mut Vec<PlannedSearch>,
-    profile: &TargetProfile,
-    label: &'static str,
-    constants: Vec<String>,
-) {
-    let mut search = base_search(profile, label);
+fn push_required_search(out: &mut Vec<PlannedSearch>, label: &'static str, constants: Vec<String>) {
+    let mut search = base_search(label);
     search.request.required_constants = constants;
     out.push(search);
 }
 
-fn push_name_search(out: &mut Vec<PlannedSearch>, profile: &TargetProfile, label: &'static str, fragment: &str) {
-    let mut search = base_search(profile, label);
+fn push_name_search(out: &mut Vec<PlannedSearch>, label: &'static str, fragment: &str) {
+    let mut search = base_search(label);
     search.request.name_fragment = Some(fragment.to_owned());
     out.push(search);
 }
 
-fn push_fragment_searches(out: &mut Vec<PlannedSearch>, profile: &TargetProfile, fragments: &[&str]) {
+fn push_fragment_searches(out: &mut Vec<PlannedSearch>, fragments: &[&str]) {
     for fragment in fragments {
-        push_name_search(out, profile, "mode_fragment", fragment);
+        push_name_search(out, "mode_fragment", fragment);
     }
 }
 
@@ -617,55 +603,29 @@ fn rank_results(
     let mut pruned_count = 0usize;
     let mut search_truncated = false;
     let mut broad_pruning = Vec::new();
-    let mut by_name: BTreeMap<String, CandidateAccumulator> = BTreeMap::new();
     let mut warnings = warnings;
 
-    let semantic_only = search_results.is_empty() && profile.semantic.is_some();
-    if let Some(semantic) = semantic {
-        generated_count = generated_count.saturating_add(semantic.declaration_rows);
-        for diagnostic in semantic.diagnostics {
-            warnings.push(format!("semantic proof search: {diagnostic}"));
+    // Retrieval decides which matches admit a candidate, and its order is its
+    // ranking. Keep every candidate it returns, in that order.
+    let semantic = match semantic {
+        Some(semantic) => {
+            generated_count = generated_count.saturating_add(semantic.declaration_rows);
+            for diagnostic in semantic.diagnostics {
+                warnings.push(format!("semantic proof search: {diagnostic}"));
+            }
+            if semantic.goal_rows == 0 {
+                warnings.push("semantic proof search produced no proof-goal features".to_owned());
+            }
+            semantic.candidates
         }
-        if semantic.goal_rows == 0 {
-            warnings.push("semantic proof search produced no proof-goal features".to_owned());
-        }
-        // Retrieval decides which matches admit a candidate; a broad head alone
-        // admits none. Keep every candidate it returns.
-        for candidate in semantic.candidates {
-            let row = DeclarationSummary {
-                name: candidate.name,
-                kind: candidate.kind.as_str().to_owned(),
-                module: Some(candidate.module),
-                source: None,
-                match_reason: "semantic".to_owned(),
-                score: candidate.score,
-                rank: 0,
-                flags: DeclarationFlags {
-                    is_private: false,
-                    is_generated: false,
-                    is_internal: false,
-                },
-            };
-            // With no lexical search, retain the semantic ranker's order. A name
-            // penalty must not demote a statement match below a shared constant.
-            let score = if semantic_only {
-                row.score
-            } else {
-                candidate_score(&row, profile, mode, "semantic")
-            };
-            let entry = by_name.entry(row.name.clone()).or_insert_with(|| CandidateAccumulator {
-                row: row.clone(),
-                score,
-                reasons: BTreeSet::new(),
-            });
-            entry.score = entry.score.max(score);
-            entry.reasons.insert("semantic".to_owned());
-            entry.reasons.extend(candidate.evidence);
-        }
-    }
+        None => Vec::new(),
+    };
 
+    // Each search's rows in the worker's order, the searches in the order
+    // `plan_searches` trusts them.
+    let mut lexical = Vec::new();
     for (label, result) in search_results {
-        generated_count = generated_count.saturating_add(result.facts.after_scope_filter);
+        generated_count = generated_count.saturating_add(result.facts.after_conclusion_filter);
         pruned_count = pruned_count.saturating_add(pruned_from_facts(&result.facts, result.declarations.len()));
         search_truncated |= result.truncated || result.facts.truncated;
         for pruning in &result.facts.broad_pruning {
@@ -674,64 +634,29 @@ fn rank_results(
                 label, pruning.stage, pruning.reason, pruning.count
             ));
         }
-        for row in result.declarations {
-            let score = candidate_score(&row, profile, mode, label);
-            let entry = by_name.entry(row.name.clone()).or_insert_with(|| CandidateAccumulator {
-                row: row.clone(),
-                score,
-                reasons: BTreeSet::new(),
-            });
-            entry.score = entry.score.max(score);
-            entry.reasons.insert(label.to_owned());
-            entry.reasons.insert(row.match_reason.clone());
-        }
+        lexical.extend(result.declarations.into_iter().map(|row| (label, row)));
     }
 
-    if let Some(name) = &profile.source_declaration {
-        by_name.remove(name);
-    }
-    // Name-fragment bonus, applied once per candidate now that the full set of
-    // corroborating searches is known. The structural `+10` is earned only when
-    // a head or required-constants search also vouches for the candidate; a bare
-    // lexical hit gets the smaller `+5` and no structural lift.
-    for entry in by_name.values_mut() {
-        let corroborated = is_corroborated(&entry.reasons);
-        let lower = entry.row.name.to_lowercase();
-        let mut bonus = 0i32;
-        for fragment in &profile.name_fragments {
-            if lower.contains(fragment) {
-                bonus = bonus.saturating_add(if corroborated && is_structural_fragment(fragment) {
-                    10
-                } else {
-                    5
-                });
-            }
-        }
-        entry.score = entry.score.saturating_add(bonus);
-    }
-
-    // When any candidate is head-/constant-corroborated, sink the purely lexical
-    // ones below all of them: the worker's +40 name-suffix base outscores its +30
-    // conclusion-head base, so a flat penalty cannot reliably demote noise.
-    let any_corroborated = by_name.values().any(|entry| is_corroborated(&entry.reasons));
-    let mut ranked = by_name.into_values().collect::<Vec<_>>();
-    ranked.sort_by_key(|candidate| {
-        let demoted = any_corroborated && !is_corroborated(&candidate.reasons);
-        (demoted, Reverse(candidate.score), candidate.row.name.clone())
-    });
-    let ranked_count = ranked.len();
-    let candidates = ranked
-        .into_iter()
-        .take(limit)
-        .map(|candidate| ProofSearchCandidate {
-            suggested_snippet: suggested_snippet(mode, &candidate.row),
-            name: candidate.row.name,
-            kind: candidate.row.kind,
-            module: candidate.row.module,
-            source: candidate.row.source,
-            score: candidate.score,
-            match_reason: candidate.reasons.into_iter().collect::<Vec<_>>().join(","),
+    let lexical_hits = lexical
+        .iter()
+        .map(|(_, row)| LexicalHit {
+            name: row.name.clone(),
+            name_match: row.name_match.map(search_name_match),
         })
+        .collect::<Vec<_>>();
+    let semantic_names = semantic
+        .iter()
+        .map(|candidate| candidate.name.clone())
+        .collect::<Vec<_>>();
+    let mut merged = merge_hits(&lexical_hits, &semantic_names);
+    if let Some(name) = &profile.source_declaration {
+        merged.retain(|hit| &hit.name != name);
+    }
+    let ranked_count = merged.len();
+    let candidates = merged
+        .into_iter()
+        .filter_map(|hit| proof_search_candidate(mode, hit, &lexical, &semantic))
+        .take(limit)
         .collect::<Vec<_>>();
 
     // Honesty signal: if the goal carried domain name-fragments but no returned
@@ -830,239 +755,52 @@ fn record_response_bytes(result: &mut SearchForProofResult) {
     }
 }
 
-/// Whether a candidate's accumulated evidence includes a *specific* head or a
-/// required-constants search — i.e. something type-aware vouched for it, not just
-/// a name-substring or a broad `Eq`/`Iff` head (which match nearly everything).
-///
-/// Keyed on the exact parent search label: the worker stamps `conclusion_head`
-/// into its `match_reason` for broad heads too, so a substring test would let
-/// generic `*_eq_*` lemmas masquerade as corroborated. Broad-head searches carry
-/// the distinct `broad_conclusion_head` label and deliberately do not match here.
-fn is_corroborated(reasons: &BTreeSet<String>) -> bool {
-    reasons.iter().any(|reason| {
-        reason == "conclusion_head"
-            || reason == "required_constants"
-            || reason.starts_with("semantic:statement_fingerprint:")
-            || reason.starts_with("semantic:safe_permutation_fingerprint:")
-            || reason.starts_with("semantic:connective_fingerprint:")
-            || reason.starts_with("semantic:conclusion_fingerprint:")
-            || reason.starts_with("semantic:role_conclusion_const:")
-    })
+const fn search_name_match(name_match: DeclarationNameMatch) -> NameMatch {
+    match name_match {
+        DeclarationNameMatch::Exact => NameMatch::Exact,
+        DeclarationNameMatch::Prefix => NameMatch::Prefix,
+        DeclarationNameMatch::Substring => NameMatch::Substring,
+    }
 }
 
-fn candidate_score(
-    row: &DeclarationSummary,
-    profile: &TargetProfile,
+/// The candidate for one merged hit, with the evidence of every search and of
+/// retrieval that found it. Its data come from its first lexical row, which
+/// carries a source range, or else from its semantic candidate.
+fn proof_search_candidate(
     mode: ProofSearchMode,
-    search_label: &str,
-) -> i32 {
-    let mut score = row.score;
-    let lower_name = row.name.to_lowercase();
-    if row.kind == "theorem" {
-        score = score.saturating_add(10);
+    hit: MergedHit,
+    lexical: &[(&'static str, DeclarationSummary)],
+    semantic: &[SemanticProofCandidate],
+) -> Option<ProofSearchCandidate> {
+    let mut reasons = BTreeSet::new();
+    let mut first_row = None;
+    for (label, row) in hit.lexical.iter().filter_map(|&position| lexical.get(position)) {
+        reasons.insert((*label).to_owned());
+        reasons.insert(row.match_reason.clone());
+        first_row = first_row.or(Some(row));
     }
-    if row.source.is_some() {
-        score = score.saturating_add(3);
+    let semantic = hit.semantic.and_then(|position| semantic.get(position));
+    if let Some(candidate) = semantic {
+        reasons.insert("semantic".to_owned());
+        reasons.extend(candidate.evidence.iter().cloned());
     }
-    if let Some(namespace) = profile.namespace.as_deref()
-        && row.name.starts_with(namespace)
-    {
-        score = score.saturating_add(8);
-    }
-    if let (Some(namespace), Some(module)) = (profile.namespace.as_deref(), row.module.as_deref())
-        && namespace
-            .split('.')
-            .next()
-            .is_some_and(|root| !root.is_empty() && module.contains(root))
-    {
-        score = score.saturating_add(4);
-    }
-    if mode == ProofSearchMode::Rewrite && (row.name.contains("iff") || row.name.contains("eq")) {
-        score = score.saturating_add(8);
-    }
-    if mode == ProofSearchMode::Simp && row.name.contains("simp") {
-        score = score.saturating_add(8);
-    }
-    if is_generic_candidate(&row.name) {
-        score = score.saturating_sub(40);
-    }
-    if is_generic_int_solver_candidate(&row.name) && !profile_is_linear_arithmetic(profile) {
-        score = score.saturating_sub(35);
-    }
-    if is_generic_additive_or_cast_candidate(&lower_name) && !profile_allows_generic_additive_or_cast(profile) {
-        score = score.saturating_sub(20);
-    }
-    if is_structural_noise_candidate(&lower_name, row.module.as_deref(), profile) {
-        score = score.saturating_sub(45);
-    }
-    score = score.saturating_add(profile_specific_score_adjustment(&lower_name, profile));
-    if search_label == "required_constants" {
-        score = score.saturating_add(6);
-    }
-    if search_label == "conclusion_head" {
-        score = score.saturating_add(20);
-    }
-    score
-}
-
-fn profile_specific_score_adjustment(lower_name: &str, profile: &TargetProfile) -> i32 {
-    match profile.kind {
-        GoalProfileKind::RatArithmetic => {
-            topical_adjustment(lower_name, &["rat", "den", "num", "denominator", "intcast"], 22, -8)
-        }
-        GoalProfileKind::IntFactorization => topical_adjustment(
-            lower_name,
-            &[
-                "factorization",
-                "factor",
-                "prime",
-                "irreducible",
-                "multiplicity",
-                "normalizedfactors",
-                "associated",
-                "isunit",
-                "dvd",
-            ],
-            24,
-            -12,
-        ),
-        GoalProfileKind::ModelTheoryRelabel => topical_adjustment(
-            lower_name,
-            &[
-                "relabel",
-                "bounded",
-                "formula",
-                "language",
-                "firstorder",
-                "realize",
-                "theory",
-            ],
-            24,
-            -12,
-        ),
-        GoalProfileKind::LinearArithmetic => topical_adjustment(
-            lower_name,
-            &[
-                "int.linear",
-                "int.cooper",
-                "cooper",
-                "omega",
-                "linarith",
-                "linear",
-                "le_of",
-                "lt_of",
-                "add_le",
-                "le_add",
-                "sub_le",
-                "le_sub",
-                "nonneg",
-                "nonpos",
-            ],
-            28,
-            -6,
-        ),
-        GoalProfileKind::Generic => 0,
-    }
-}
-
-fn topical_adjustment(lower_name: &str, topical_fragments: &[&str], boost: i32, miss_penalty: i32) -> i32 {
-    if topical_fragments.iter().any(|fragment| lower_name.contains(fragment)) {
-        boost
-    } else {
-        miss_penalty
-    }
+    let (kind, module, source) = match (first_row, semantic) {
+        (Some(row), _) => (row.kind.clone(), row.module.clone(), row.source.clone()),
+        (None, Some(candidate)) => (candidate.kind.as_str().to_owned(), Some(candidate.module.clone()), None),
+        (None, None) => return None,
+    };
+    Some(ProofSearchCandidate {
+        suggested_snippet: suggested_snippet(mode, &hit.name, &kind),
+        name: hit.name,
+        kind,
+        module,
+        source,
+        match_reason: reasons.into_iter().collect::<Vec<_>>().join(","),
+    })
 }
 
 fn is_broad_head(head: &str) -> bool {
     matches!(head, "Eq" | "Iff" | "Exists" | "True")
-}
-
-fn is_generic_candidate(name: &str) -> bool {
-    let has_generic_segment = name.split('.').any(|segment| {
-        segment == "rec"
-            || segment == "recOn"
-            || segment == "ndrec"
-            || segment.starts_with("rec_")
-            || segment.starts_with("recOn_")
-            || segment.starts_with("ndrec_")
-    });
-    name.starts_with("Acc.") || has_generic_segment
-}
-
-fn is_generic_int_solver_candidate(name: &str) -> bool {
-    name.contains("Int.Linear") || name.contains("Int.Cooper") || name.contains(".Linear.") || name.contains(".Cooper.")
-}
-
-fn is_generic_additive_or_cast_candidate(lower_name: &str) -> bool {
-    contains_any(
-        lower_name,
-        &[
-            "addmonoidhom",
-            "addmonoid",
-            "addcomm",
-            "int.cast",
-            "nat.cast",
-            "zsmul",
-            "nsmul",
-            "coe",
-            "cast",
-        ],
-    )
-}
-
-fn is_structural_noise_candidate(lower_name: &str, module: Option<&str>, profile: &TargetProfile) -> bool {
-    let lower_module = module.unwrap_or_default().to_lowercase();
-    let mentions_data = profile_mentions_any(profile, &["array", "list", "vector", "getelem"]);
-    if !mentions_data
-        && (contains_any(
-            lower_name,
-            &["array.", "list.", "vector.", "getelem", "getelem?", "uget"],
-        ) || contains_any(&lower_module, &["init.data.array", "data.array", "data.list"]))
-    {
-        return true;
-    }
-
-    let mentions_order_morphism = profile_mentions_any(profile, &["antitone", "monotone", "strictmono", "strictanti"]);
-    !mentions_order_morphism
-        && contains_any(
-            lower_name,
-            &["antitone.", "monotone.", "strictmono.", "strictanti.", "reflect_lt"],
-        )
-}
-
-fn profile_mentions_any(profile: &TargetProfile, needles: &[&str]) -> bool {
-    profile
-        .name_fragments
-        .iter()
-        .chain(profile.constants.iter())
-        .any(|item| {
-            let lower = item.to_lowercase();
-            needles.iter().any(|needle| lower.contains(needle))
-        })
-}
-
-fn profile_allows_generic_additive_or_cast(profile: &TargetProfile) -> bool {
-    matches!(
-        profile.kind,
-        GoalProfileKind::RatArithmetic | GoalProfileKind::LinearArithmetic
-    ) || profile.name_fragments.iter().any(|fragment| {
-        matches!(
-            fragment.as_str(),
-            "cast" | "intcast" | "coe" | "add" | "sub" | "linear" | "omega" | "cooper"
-        )
-    })
-}
-
-fn profile_is_linear_arithmetic(profile: &TargetProfile) -> bool {
-    if profile.kind == GoalProfileKind::LinearArithmetic {
-        return true;
-    }
-    profile.name_fragments.iter().any(|fragment| {
-        matches!(
-            fragment.as_str(),
-            "linear" | "omega" | "cooper" | "le" | "lt" | "ge" | "gt" | "add" | "sub"
-        )
-    })
 }
 
 fn classify_goal_profile(text: &str, constants: &[String]) -> GoalProfileKind {
@@ -1139,48 +877,20 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-fn is_structural_fragment(fragment: &str) -> bool {
-    matches!(
-        fragment,
-        "den"
-            | "num"
-            | "denominator"
-            | "cast"
-            | "intcast"
-            | "mul"
-            | "dvd"
-            | "pow"
-            | "factorization"
-            | "factor"
-            | "prime"
-            | "irreducible"
-            | "multiplicity"
-            | "natabs"
-            | "associated"
-            | "isunit"
-            | "sign"
-            | "prod"
-            | "relabel"
-            | "bounded"
-            | "formula"
-            | "language"
-    )
-}
-
 fn pruned_from_facts(facts: &DeclarationSearchFacts, returned: usize) -> usize {
-    let limit_pruned = facts.after_scope_filter.saturating_sub(returned);
+    let limit_pruned = facts.after_conclusion_filter.saturating_sub(returned);
     facts
         .broad_pruning
         .iter()
         .fold(limit_pruned, |acc, pruning| acc.saturating_add(pruning.count))
 }
 
-fn suggested_snippet(mode: ProofSearchMode, row: &DeclarationSummary) -> Option<String> {
+fn suggested_snippet(mode: ProofSearchMode, name: &str, kind: &str) -> Option<String> {
     match mode {
-        ProofSearchMode::Exact if row.kind == "theorem" => Some(format!("exact {}", row.name)),
-        ProofSearchMode::Apply if row.kind == "theorem" => Some(format!("apply {}", row.name)),
-        ProofSearchMode::Rewrite if row.kind == "theorem" => Some(format!("rw [{}]", row.name)),
-        ProofSearchMode::Simp if row.kind == "theorem" => Some(format!("simp [{}]", row.name)),
+        ProofSearchMode::Exact if kind == "theorem" => Some(format!("exact {name}")),
+        ProofSearchMode::Apply if kind == "theorem" => Some(format!("apply {name}")),
+        ProofSearchMode::Rewrite if kind == "theorem" => Some(format!("rw [{name}]")),
+        ProofSearchMode::Simp if kind == "theorem" => Some(format!("simp [{name}]")),
         ProofSearchMode::NextStep
         | ProofSearchMode::Exact
         | ProofSearchMode::Apply
@@ -1501,15 +1211,14 @@ mod tests {
 
     use super::*;
 
-    fn summary(name: &str, module: Option<&str>, score: i32) -> DeclarationSummary {
+    fn summary(name: &str, module: Option<&str>, name_match: Option<DeclarationNameMatch>) -> DeclarationSummary {
         DeclarationSummary {
             name: name.to_owned(),
             kind: "theorem".to_owned(),
             module: module.map(ToOwned::to_owned),
             source: None,
             match_reason: "name fragment".to_owned(),
-            score,
-            rank: 1,
+            name_match,
             flags: crate::projections::DeclarationFlags {
                 is_private: false,
                 is_generated: false,
@@ -1529,17 +1238,57 @@ mod tests {
                 after_kind_filter: n,
                 after_required_constants_filter: n,
                 after_conclusion_filter: n,
-                after_scope_filter: n,
                 source_lookups: 0,
                 broad_pruning: Vec::new(),
                 truncated: false,
                 timings: crate::projections::DeclarationSearchTimings {
                     scan_micros: 0,
-                    rank_micros: 0,
+                    sort_micros: 0,
                     source_micros: 0,
                 },
             },
         }
+    }
+
+    fn semantic_candidate(name: &str, evidence: &str) -> SemanticProofCandidate {
+        SemanticProofCandidate {
+            name: name.to_owned(),
+            module: "Fixture".to_owned(),
+            kind: lean_semantic_search_contract::DeclarationKind::Theorem,
+            evidence: vec![evidence.to_owned()],
+        }
+    }
+
+    fn semantic_result(candidates: Vec<SemanticProofCandidate>) -> SemanticProofSearchResult {
+        SemanticProofSearchResult {
+            declaration_rows: candidates.len(),
+            candidates,
+            diagnostics: Vec::new(),
+            goal_rows: 1,
+        }
+    }
+
+    fn profile(text: &str) -> TargetProfile {
+        profile_from_text(
+            text.to_owned(),
+            Vec::new(),
+            "context".to_owned(),
+            None,
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn names(result: &SearchForProofResult) -> Vec<&str> {
+        result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect()
+    }
+
+    fn kind_of(text: &str) -> GoalProfileKind {
+        classify_goal_profile(text, &extract_constants(text))
     }
 
     #[test]
@@ -1568,15 +1317,7 @@ mod tests {
 
     #[test]
     fn plan_searches_emits_conclusion_head_for_le_goal() {
-        let profile = profile_from_text(
-            "⊢ I ≤ I.saturatedClosure".to_owned(),
-            Some("CategoryTheory".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
+        let profile = profile("⊢ I ≤ I.saturatedClosure");
         assert!(profile.heads.iter().any(|head| head == "LE.le"));
         let searches = plan_searches(&profile, ProofSearchMode::NextStep);
         let head = searches
@@ -1586,25 +1327,32 @@ mod tests {
         assert_eq!(head.request.conclusion_head.as_deref(), Some("LE.le"));
     }
 
+    /// The `Eq` head search still runs, under a label of its own, after every
+    /// search whose filter says more about the goal.
     #[test]
-    fn plan_searches_keeps_eq_head_for_eq_goal_with_constants() {
-        let profile = profile_from_text(
-            "⊢ Nat.succ n = Nat.succ m".to_owned(),
-            Some("Nat".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
+    fn plan_searches_runs_a_broad_head_search_last() {
+        let searches = plan_searches(&profile("⊢ Nat.succ n = Nat.succ m"), ProofSearchMode::Exact);
+        let labels = searches.iter().map(|search| search.label).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "required_constants",
+                "name_fragment",
+                "name_fragment",
+                "broad_conclusion_head"
+            ]
         );
-        let searches = plan_searches(&profile, ProofSearchMode::Exact);
-        // The Eq head search still runs; a broad head carries a distinct label so
-        // it does not falsely corroborate generic equality lemmas.
-        let head = searches
+        let head = searches.last().expect("a search");
+        assert_eq!(head.request.conclusion_head.as_deref(), Some("Eq"));
+    }
+
+    #[test]
+    fn plan_searches_runs_rewrite_head_searches_after_its_name_searches() {
+        let labels = plan_searches(&profile("⊢ a + b = b + a"), ProofSearchMode::Rewrite)
             .iter()
-            .find(|search| search.request.conclusion_head.as_deref() == Some("Eq"))
-            .expect("the plain-Eq head path must still run");
-        assert_eq!(head.label, "broad_conclusion_head");
+            .map(|search| search.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["mode_fragment", "mode_fragment", "rewrite_eq", "rewrite_iff"]);
     }
 
     #[test]
@@ -1623,68 +1371,97 @@ mod tests {
         );
     }
 
+    /// The order is search's merge rule: exact names, then semantic hits, then
+    /// the other lexical hits in the order of their searches.
     #[test]
-    fn lexical_only_candidates_are_demoted_below_corroborated() {
-        let profile = profile_from_text(
-            "⊢ I ≤ I.saturatedClosure".to_owned(),
-            None,
-            Vec::new(),
-            "context".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        // A genuine LE.le head match (low base score) and a high-scoring lexical
-        // suffix hit that no head/constant search corroborates.
-        let head_row = summary(
-            "CategoryTheory.MorphismProperty.le_saturatedClosure",
-            Some("Mathlib.CategoryTheory.MorphismProperty.Basic"),
-            60,
-        );
-        let noise_row = summary("Rat.den_intCast", Some("Mathlib.Data.Rat.Cast"), 120);
+    fn candidates_come_exact_names_first_then_semantic_hits_then_other_lexical_hits() {
+        let semantic = semantic_result(vec![semantic_candidate("Fixture.semantic_hit", "semantic:role_head:1")]);
         let result = rank_results(
-            &profile,
-            ProofSearchMode::NextStep,
+            &profile("⊢ x ≤ y"),
+            ProofSearchMode::Exact,
             10,
-            2,
-            None,
+            3,
+            Some(semantic),
             vec![
-                ("conclusion_head", search_result(vec![head_row])),
-                ("name_fragment", search_result(vec![noise_row])),
+                (
+                    "conclusion_head",
+                    search_result(vec![summary("Fixture.head_hit", None, None)]),
+                ),
+                (
+                    "name_fragment",
+                    search_result(vec![
+                        summary("Fixture.le", None, Some(DeclarationNameMatch::Exact)),
+                        summary("Fixture.le_refl", None, Some(DeclarationNameMatch::Prefix)),
+                    ]),
+                ),
             ],
             Vec::new(),
             false,
         );
         assert_eq!(
-            result.candidates.first().expect("a candidate").name,
-            "CategoryTheory.MorphismProperty.le_saturatedClosure",
-            "the head-corroborated candidate must rank above the higher-scoring lexical hit"
+            names(&result),
+            [
+                "Fixture.le",
+                "Fixture.semantic_hit",
+                "Fixture.head_hit",
+                "Fixture.le_refl"
+            ]
         );
-        assert_eq!(result.candidates.last().expect("a candidate").name, "Rat.den_intCast");
-        assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("lexical guesses")),
-            "a head-corroborated result set is not lexical-only"
+        let first = result.candidates.first().expect("a candidate");
+        assert_eq!(first.suggested_snippet.as_deref(), Some("exact Fixture.le"));
+    }
+
+    /// A declaration two sources find appears once, with the evidence of both,
+    /// and takes its data from the lexical row, which has a source range.
+    #[test]
+    fn a_declaration_found_twice_appears_once_with_all_its_evidence() {
+        let semantic = semantic_result(vec![semantic_candidate(
+            "Fixture.le_closure",
+            "semantic:role_conclusion_const:2",
+        )]);
+        let mut row = summary("Fixture.le_closure", Some("Fixture.Closure"), None);
+        row.source = Some(SourceRange {
+            file: "Fixture/Closure.lean".to_owned(),
+            start_line: 3,
+            start_column: 0,
+            end_line: 4,
+            end_column: 0,
+        });
+        let result = rank_results(
+            &profile("⊢ I ≤ I.saturatedClosure"),
+            ProofSearchMode::NextStep,
+            10,
+            2,
+            Some(semantic),
+            vec![("conclusion_head", search_result(vec![row]))],
+            Vec::new(),
+            false,
         );
+        let [candidate] = result.candidates.as_slice() else {
+            panic!("expected one candidate, got {:?}", result.candidates);
+        };
+        for reason in ["conclusion_head", "semantic", "semantic:role_conclusion_const:2"] {
+            assert!(
+                candidate.match_reason.split(',').any(|part| part == reason),
+                "{reason} missing from {}",
+                candidate.match_reason
+            );
+        }
+        assert_eq!(candidate.module.as_deref(), Some("Fixture.Closure"));
+        assert!(candidate.source.is_some(), "the lexical row's source range is kept");
     }
 
     #[test]
     fn all_lexical_candidates_trigger_lexical_only_warning() {
-        let profile = profile_from_text(
-            "⊢ I ≤ I.saturatedClosure".to_owned(),
-            None,
-            Vec::new(),
-            "context".to_owned(),
-            None,
-            Vec::new(),
-            None,
+        // Only a name-fragment hit (matches the `le` fragment), nothing else
+        // vouches for it.
+        let row = summary(
+            "Rat.le_intCast",
+            Some("Mathlib.Data.Rat.Cast"),
+            Some(DeclarationNameMatch::Substring),
         );
-        // Only a name-fragment hit (matches the `le` fragment), nothing corroborates it.
-        let row = summary("Rat.le_intCast", Some("Mathlib.Data.Rat.Cast"), 100);
         let result = rank_results(
-            &profile,
+            &profile("⊢ I ≤ I.saturatedClosure"),
             ProofSearchMode::NextStep,
             10,
             1,
@@ -1703,31 +1480,62 @@ mod tests {
     }
 
     #[test]
-    fn semantic_candidates_rank_ahead_of_lexical_fallback() {
-        let profile = profile_from_text(
-            "⊢ ↑(c * q.num) = ↑m * q".to_owned(),
-            Some("LeanRsFixture".to_owned()),
-            Vec::new(),
-            "context".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        let lexical = summary("Rat.intCast_num", Some("Mathlib.Data.Rat.Cast"), 120);
-        let semantic = SemanticProofSearchResult {
-            candidates: vec![crate::semantic_search::SemanticProofCandidate {
-                name: "LeanRsFixture.ProofSearchFacts.cast_num_den_helper".to_owned(),
-                module: "LeanRsFixture.ProofSearchFacts".to_owned(),
-                kind: lean_semantic_search_contract::DeclarationKind::Theorem,
-                score: 130,
-                evidence: vec!["semantic:role_conclusion_const:2".to_owned()],
-            }],
-            diagnostics: Vec::new(),
-            declaration_rows: 1,
-            goal_rows: 1,
-        };
+    fn a_head_hit_clears_the_lexical_only_warning() {
         let result = rank_results(
-            &profile,
+            &profile("⊢ I ≤ I.saturatedClosure"),
+            ProofSearchMode::NextStep,
+            10,
+            2,
+            None,
+            vec![
+                (
+                    "conclusion_head",
+                    search_result(vec![summary(
+                        "CategoryTheory.MorphismProperty.le_saturatedClosure",
+                        Some("Mathlib.CategoryTheory.MorphismProperty.Basic"),
+                        None,
+                    )]),
+                ),
+                (
+                    "name_fragment",
+                    search_result(vec![summary(
+                        "Rat.den_intCast",
+                        Some("Mathlib.Data.Rat.Cast"),
+                        Some(DeclarationNameMatch::Substring),
+                    )]),
+                ),
+            ],
+            Vec::new(),
+            false,
+        );
+        assert_eq!(
+            names(&result),
+            ["CategoryTheory.MorphismProperty.le_saturatedClosure", "Rat.den_intCast"]
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("lexical guesses")),
+            "a result set with a head match is not lexical-only"
+        );
+    }
+
+    #[test]
+    fn semantic_candidates_rank_ahead_of_lexical_fallback() {
+        let lexical = summary(
+            "Rat.intCast_num",
+            Some("Mathlib.Data.Rat.Cast"),
+            Some(DeclarationNameMatch::Prefix),
+        );
+        let semantic = semantic_result(vec![SemanticProofCandidate {
+            name: "LeanRsFixture.ProofSearchFacts.cast_num_den_helper".to_owned(),
+            module: "LeanRsFixture.ProofSearchFacts".to_owned(),
+            kind: lean_semantic_search_contract::DeclarationKind::Theorem,
+            evidence: vec!["semantic:role_conclusion_const:2".to_owned()],
+        }]);
+        let result = rank_results(
+            &profile("⊢ ↑(c * q.num) = ↑m * q"),
             ProofSearchMode::NextStep,
             10,
             2,
@@ -1736,41 +1544,25 @@ mod tests {
             Vec::new(),
             false,
         );
+        assert_eq!(
+            names(&result),
+            ["LeanRsFixture.ProofSearchFacts.cast_num_den_helper", "Rat.intCast_num"]
+        );
         let first = result.candidates.first().expect("semantic candidate");
-        assert_eq!(first.name, "LeanRsFixture.ProofSearchFacts.cast_num_den_helper");
         assert!(first.match_reason.contains("semantic:role_conclusion_const"));
+        assert_eq!(first.module.as_deref(), Some("LeanRsFixture.ProofSearchFacts"));
     }
 
+    /// Retrieval's order is its ranking; a candidate whose only evidence is a
+    /// head keeps its place.
     #[test]
-    fn head_only_semantic_candidates_stay_below_corroborated_ones() {
-        let profile = profile_from_text(
-            "⊢ x = y".to_owned(),
-            None,
-            Vec::new(),
-            "context".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        let candidate = |name: &str, score, evidence: &str| crate::semantic_search::SemanticProofCandidate {
-            name: name.to_owned(),
-            module: "Fixture".to_owned(),
-            kind: lean_semantic_search_contract::DeclarationKind::Theorem,
-            score,
-            evidence: vec![evidence.to_owned()],
-        };
-        // Retrieval admitted both; only the shared constant corroborates.
-        let semantic = SemanticProofSearchResult {
-            candidates: vec![
-                candidate("Fixture.head_only", 180, "semantic:role_head:1"),
-                candidate("Fixture.shares_a_constant", 130, "semantic:role_conclusion_const:2"),
-            ],
-            diagnostics: Vec::new(),
-            declaration_rows: 2,
-            goal_rows: 1,
-        };
+    fn semantic_candidates_keep_retrievals_order() {
+        let semantic = semantic_result(vec![
+            semantic_candidate("Fixture.head_only", "semantic:role_head:1"),
+            semantic_candidate("Fixture.shares_a_constant", "semantic:role_conclusion_const:2"),
+        ]);
         let result = rank_results(
-            &profile,
+            &profile("⊢ x = y"),
             ProofSearchMode::NextStep,
             10,
             1,
@@ -1779,27 +1571,38 @@ mod tests {
             Vec::new(),
             true,
         );
-        let names = result
-            .candidates
-            .iter()
-            .map(|candidate| candidate.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, ["Fixture.shares_a_constant", "Fixture.head_only"]);
-        let head_only = result
-            .candidates
-            .iter()
-            .find(|candidate| candidate.name == "Fixture.head_only")
-            .expect("head-only candidate");
-        assert!(head_only.match_reason.contains("semantic:role_head:1"));
+        assert_eq!(names(&result), ["Fixture.head_only", "Fixture.shares_a_constant"]);
         let funnel = result.diagnostics.funnel.expect("full telemetry funnel");
         assert!(funnel.broad_pruning.is_empty(), "{:?}", funnel.broad_pruning);
+    }
+
+    #[test]
+    fn the_goal_declaration_is_dropped_and_the_limit_cuts_from_the_front() {
+        let mut profile = profile("⊢ x ≤ y");
+        profile.source_declaration = Some("Fixture.goal".to_owned());
+        let rows = ["Fixture.goal", "Fixture.first", "Fixture.second"]
+            .into_iter()
+            .map(|name| summary(name, None, Some(DeclarationNameMatch::Substring)))
+            .collect();
+        let result = rank_results(
+            &profile,
+            ProofSearchMode::NextStep,
+            1,
+            1,
+            None,
+            vec![("name_fragment", search_result(rows))],
+            Vec::new(),
+            true,
+        );
+        assert_eq!(names(&result), ["Fixture.first"]);
+        let funnel = result.diagnostics.funnel.expect("full telemetry funnel");
+        assert_eq!(funnel.ranked_count, 2);
     }
 
     #[test]
     fn limit_clamps_to_tool_cap() {
         let profile = profile_from_text(
             "⊢ True".to_owned(),
-            None,
             Vec::new(),
             "explicit_text".to_owned(),
             None,
@@ -1814,33 +1617,19 @@ mod tests {
 
     #[test]
     fn extracts_heads_and_fragments() {
-        let profile = profile_from_text(
-            "⊢ Nat.succ n = Nat.succ m".to_owned(),
-            Some("Nat".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
+        let text = "⊢ Nat.succ n = Nat.succ m";
+        let profile = profile(text);
         assert!(profile.heads.iter().any(|head| head == "Eq"));
         assert!(profile.constants.iter().any(|constant| constant == "Nat.succ"));
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "nat"));
-        assert_eq!(profile.kind, GoalProfileKind::Generic);
+        assert_eq!(kind_of(text), GoalProfileKind::Generic);
     }
 
     #[test]
     fn rat_arithmetic_profile_keeps_useful_lowercase_fragments() {
-        let profile = profile_from_text(
-            "q : ℚ\nm c : ℤ\nhc : m = ↑q.den * c\n⊢ ↑(c * q.num) = ↑m * q".to_owned(),
-            Some("Rat".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        assert_eq!(profile.kind, GoalProfileKind::RatArithmetic);
+        let text = "q : ℚ\nm c : ℤ\nhc : m = ↑q.den * c\n⊢ ↑(c * q.num) = ↑m * q";
+        let profile = profile(text);
+        assert_eq!(kind_of(text), GoalProfileKind::RatArithmetic);
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "den"));
         assert!(profile.name_fragments.iter().any(|fragment| fragment == "num"));
         assert!(
@@ -1855,141 +1644,35 @@ mod tests {
         );
     }
 
+    /// The kind of goal picks the topical fragments the searches ask for.
     #[test]
-    fn generic_recursor_candidates_are_down_ranked() {
-        let profile = profile_from_text(
-            "⊢ ↑(c * q.num) = ↑m * q".to_owned(),
-            Some("Rat".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        let generic = summary("Acc.ndrecOn_eq_ndrecOnC", None, 100);
-        let rat_candidate = summary("Rat.num_den_helper", Some("Mathlib.Data.Rat.Lemmas"), 100);
+    fn goal_kinds_choose_their_topical_fragments() {
+        let factorization = "n : ℤ\nh : n.factorization p ≠ 0\n⊢ p ∣ n";
+        assert_eq!(kind_of(factorization), GoalProfileKind::IntFactorization);
         assert!(
-            candidate_score(&rat_candidate, &profile, ProofSearchMode::NextStep, "name_fragment")
-                > candidate_score(&generic, &profile, ProofSearchMode::NextStep, "name_fragment")
-        );
-    }
-
-    #[test]
-    fn int_factorization_profile_prefers_topical_candidates_over_cast_noise() {
-        let profile = profile_from_text(
-            "n : ℤ\nh : n.factorization p ≠ 0\n⊢ p ∣ n".to_owned(),
-            Some("Int".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        assert_eq!(profile.kind, GoalProfileKind::IntFactorization);
-        assert!(
-            profile
+            profile(factorization)
                 .name_fragments
                 .iter()
                 .any(|fragment| fragment == "factorization")
         );
-        let topical = summary(
-            "Int.factorization_dvd_of_mem_support",
-            Some("Mathlib.Data.Int.Factorization"),
-            90,
-        );
-        let generic_cast = summary("Int.cast_add", Some("Mathlib.Data.Int.Cast"), 100);
+
+        let relabel = "φ : FirstOrder.Language.BoundedFormula L ν n\n⊢ φ.relabel σ = ψ";
+        assert_eq!(kind_of(relabel), GoalProfileKind::ModelTheoryRelabel);
         assert!(
-            candidate_score(&topical, &profile, ProofSearchMode::NextStep, "name_fragment")
-                > candidate_score(&generic_cast, &profile, ProofSearchMode::NextStep, "name_fragment")
+            profile(relabel)
+                .name_fragments
+                .iter()
+                .any(|fragment| fragment == "relabel")
         );
-    }
 
-    #[test]
-    fn model_theory_relabel_profile_prefers_formula_candidates_over_array_noise() {
-        let profile = profile_from_text(
-            "φ : FirstOrder.Language.BoundedFormula L ν n\n⊢ φ.relabel σ = ψ".to_owned(),
-            Some("FirstOrder".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        assert_eq!(profile.kind, GoalProfileKind::ModelTheoryRelabel);
-        assert!(profile.name_fragments.iter().any(|fragment| fragment == "relabel"));
-        let topical = summary(
-            "FirstOrder.Language.BoundedFormula.relabel_id",
-            Some("Mathlib.ModelTheory.Syntax"),
-            90,
-        );
-        let array_noise = summary("Array.map_eq_map_data", Some("Init.Data.Array"), 100);
+        let linear = "x y : ℤ\nh : x + y ≤ 3\n⊢ x ≤ 3";
+        assert_eq!(kind_of(linear), GoalProfileKind::LinearArithmetic);
         assert!(
-            candidate_score(&topical, &profile, ProofSearchMode::NextStep, "name_fragment")
-                > candidate_score(&array_noise, &profile, ProofSearchMode::NextStep, "name_fragment")
+            profile(linear)
+                .name_fragments
+                .iter()
+                .any(|fragment| fragment == "omega")
         );
-    }
-
-    #[test]
-    fn linear_profile_allows_int_solver_candidates_but_factorization_does_not() {
-        let linear = profile_from_text(
-            "x y : ℤ\nh : x + y ≤ 3\n⊢ x ≤ 3".to_owned(),
-            None,
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        assert_eq!(linear.kind, GoalProfileKind::LinearArithmetic);
-        let factorization = profile_from_text(
-            "h : n.factorization p ≠ 0\n⊢ p ∣ n".to_owned(),
-            None,
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        let solver = summary("Int.Linear.cooper_dvd", Some("Mathlib.Tactic.Omega"), 100);
-        assert!(
-            candidate_score(&solver, &linear, ProofSearchMode::NextStep, "name_fragment")
-                > candidate_score(&solver, &factorization, ProofSearchMode::NextStep, "name_fragment")
-        );
-    }
-
-    #[test]
-    fn linear_profile_prefers_solver_and_int_inequality_candidates_over_lt_noise() {
-        let profile = profile_from_text(
-            "x y : ℤ\nhxy : x + 2 * y ≤ 17\nhy : 0 ≤ y\n⊢ x ≤ 17".to_owned(),
-            Some("Int".to_owned()),
-            Vec::new(),
-            "explicit_text".to_owned(),
-            None,
-            Vec::new(),
-            None,
-        );
-        assert_eq!(profile.kind, GoalProfileKind::LinearArithmetic);
-
-        let solver = summary(
-            "Int.Linear.ExprCnstr.denote_le",
-            Some("Mathlib.Tactic.Omega.IntList"),
-            80,
-        );
-        let cooper = summary(
-            "Int.Cooper.proof_of_linear_combination",
-            Some("Mathlib.Tactic.Omega"),
-            80,
-        );
-        let array_noise = summary("Array.getElem?_of_lt", Some("Init.Data.Array.Basic"), 100);
-        let order_noise = summary("Antitone.reflect_lt", Some("Mathlib.Order.Basic"), 100);
-
-        let solver_score = candidate_score(&solver, &profile, ProofSearchMode::NextStep, "name_fragment");
-        let cooper_score = candidate_score(&cooper, &profile, ProofSearchMode::NextStep, "name_fragment");
-        let array_score = candidate_score(&array_noise, &profile, ProofSearchMode::NextStep, "name_fragment");
-        let order_score = candidate_score(&order_noise, &profile, ProofSearchMode::NextStep, "name_fragment");
-
-        assert!(solver_score > array_score, "{solver_score} should beat {array_score}");
-        assert!(cooper_score > order_score, "{cooper_score} should beat {order_score}");
     }
 
     #[test]
@@ -2021,7 +1704,7 @@ mod tests {
         let fact = profile.source_fact.expect("a search from a file names the file");
         assert_eq!(fact.path.as_deref(), Some("Demo.lean"));
         assert_eq!(fact.content_sha256, Some(crate::digest::sha256_hex(text.as_bytes())));
-        let from_text = profile_from_text(String::new(), None, Vec::new(), String::new(), None, Vec::new(), None);
+        let from_text = profile_from_text(String::new(), Vec::new(), String::new(), None, Vec::new(), None);
         assert!(from_text.source_fact.is_none());
     }
 }

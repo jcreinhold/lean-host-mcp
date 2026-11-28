@@ -41,11 +41,11 @@ fn open_ctx(root: &Path) -> ToolContext {
     }
 }
 
+/// One candidate, in the order the search returned it.
 #[derive(Serialize)]
 struct EvalCandidate {
     name: String,
     module: Option<String>,
-    score: i32,
     match_reason: String,
 }
 
@@ -147,7 +147,6 @@ async fn kanproofs_semantic_search_field_eval() {
                 .map(|candidate| EvalCandidate {
                     name: candidate.name,
                     module: candidate.module,
-                    score: candidate.score,
                     match_reason: candidate.match_reason,
                 })
                 .collect(),
@@ -229,8 +228,8 @@ async fn kanproofs_unbuilt_import_degrades_to_build_warning() {
 ///
 /// 1. **Every file is answered.** Recycling mid-sweep is invisible to results.
 /// 2. **Every recycle is a planned residue cycle.** Nothing crashes, times out,
-///    or trips the abnormal-restart breaker under a sweep that deliberately
-///    exhausts the budget.
+///    or uses up the supervisor's restart window under a sweep that
+///    deliberately exhausts the budget.
 /// 3. **The recycle count matches the budget arithmetic** — at most
 ///    `imports x residue-per-import / budget`, rounded up, plus one for the
 ///    generation in flight. More than that means the accounting is wrong; zero

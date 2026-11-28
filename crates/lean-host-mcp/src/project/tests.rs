@@ -80,6 +80,8 @@ fn queued_test_project(limit: Duration) -> (LeanProject, mpsc::Receiver<ProjectM
             restarts_by_cause: BTreeMap::new(),
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
+            restart_retry_after: None,
+            child_exited: false,
             compatibility: None,
         })),
         module_queries: ModuleQueryCache::with_capacity(NonZeroUsize::MIN),
@@ -94,7 +96,7 @@ async fn queue_timeout_returns_before_actor_drains_and_prevents_dispatch() {
     let (project, mut rx, admission_deadline) = queued_test_project(Duration::from_millis(5));
     let (reply, receive) = oneshot::channel();
     let message = ProjectMessage::ModuleQuery {
-        meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
+        meta: project.job_meta(vec![], admission_deadline),
         source: String::new(),
         query: LeanWorkerModuleQuery::Diagnostics,
         options: LeanWorkerElabOptions::default(),
@@ -118,7 +120,7 @@ async fn queue_deadline_includes_both_admission_and_actor_wait() {
     let permits = tx.reserve_many(2).await.unwrap();
     let (reply, receive) = oneshot::channel();
     let message = ProjectMessage::ModuleQuery {
-        meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
+        meta: project.job_meta(vec![], admission_deadline),
         source: String::new(),
         query: LeanWorkerModuleQuery::Diagnostics,
         options: LeanWorkerElabOptions::default(),
@@ -146,7 +148,7 @@ async fn dropping_queued_caller_cancels_message_before_dispatch() {
     let (project, mut rx, admission_deadline) = queued_test_project(Duration::from_secs(1));
     let (reply, receive) = oneshot::channel();
     let message = ProjectMessage::ModuleQuery {
-        meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
+        meta: project.job_meta(vec![], admission_deadline),
         source: String::new(),
         query: LeanWorkerModuleQuery::Diagnostics,
         options: LeanWorkerElabOptions::default(),
@@ -167,7 +169,7 @@ async fn cancellation_of_running_message_waits_for_actor_cleanup() {
     let (project, mut rx, admission_deadline) = queued_test_project(Duration::from_secs(1));
     let (reply, receive) = oneshot::channel();
     let message = ProjectMessage::ModuleQuery {
-        meta: project.job_meta(vec![], RetryPolicy::Never, admission_deadline),
+        meta: project.job_meta(vec![], admission_deadline),
         source: String::new(),
         query: LeanWorkerModuleQuery::Diagnostics,
         options: LeanWorkerElabOptions::default(),
@@ -298,7 +300,6 @@ fn cancelled_queued_messages_keep_their_cancellation_and_release_activity_on_dro
             _created_at: Instant::now(),
             queued_at: Instant::now(),
             correlation_id: uuid::Uuid::new_v4(),
-            retry_policy: RetryPolicy::Never,
             _active_job: ActiveJobGuard {
                 active_jobs: Arc::clone(&active),
                 pool_active_jobs: Arc::clone(&pool_active),

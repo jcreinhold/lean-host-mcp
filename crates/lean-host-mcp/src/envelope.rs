@@ -210,7 +210,7 @@ pub struct RuntimeFacts {
     /// Worker recycles observed over this project's lifetime, all causes. Lets
     /// a client see recycle *frequency* (the per-call cause is in `call_restart`).
     pub restarts_total: u64,
-    /// Lifetime recycle count keyed by stable cause string (e.g. `rss_post_job`).
+    /// Lifetime recycle count keyed by stable cause string (e.g. `import_residue`).
     /// Omitted when no recycle has happened.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub restarts_by_cause: BTreeMap<String, u64>,
@@ -477,8 +477,8 @@ mod tests {
             call_cpu_millis: None,
             call_restart: None,
             last_restart: Some(RuntimeRestartEvent {
-                cause: "rss_post_job".to_owned(),
-                reason: "rss_post_job current_kib=5 limit_kib=4".to_owned(),
+                cause: "rss_ceiling".to_owned(),
+                reason: "rss_ceiling current_kib=5 limit_kib=4".to_owned(),
                 worker_generation: 3,
                 planned: true,
                 rss_kib: Some(5),
@@ -489,7 +489,7 @@ mod tests {
             import_profile: Some("Init".to_owned()),
             profile_switch_count: 1,
             restarts_total: 1,
-            restarts_by_cause: BTreeMap::from([("rss_post_job".to_owned(), 1)]),
+            restarts_by_cause: BTreeMap::from([("rss_ceiling".to_owned(), 1)]),
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
         };
@@ -498,7 +498,7 @@ mod tests {
         assert!(json.pointer("/call_restart").is_none_or(serde_json::Value::is_null));
         assert_eq!(
             json.pointer("/last_restart/cause").and_then(serde_json::Value::as_str),
-            Some("rss_post_job")
+            Some("rss_ceiling")
         );
         assert_eq!(
             json.pointer("/worker_restarted").and_then(serde_json::Value::as_bool),

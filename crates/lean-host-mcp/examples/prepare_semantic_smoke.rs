@@ -31,10 +31,11 @@ fn main() -> Result<()> {
     // A server only opens what install built; check that this opens too.
     let runtime =
         lean_semantic_search_runtime::open(input).context("open the semantic search modules that were just built")?;
+    let lean_path = std::env::join_paths(runtime.lean_path()).context("join the semantic search import path")?;
     println!(
-        "semantic search modules built in {:.1}s at {}",
+        "semantic search modules built in {:.1}s; LEAN_PATH={}",
         started.elapsed().as_secs_f64(),
-        runtime.module_dir().display(),
+        lean_path.to_string_lossy(),
     );
     Ok(())
 }

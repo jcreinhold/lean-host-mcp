@@ -562,6 +562,12 @@ pub struct WorkerStatusData {
     /// generation. Absent when no resident worker has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<crate::runtime_compatibility::CompatibilityEvidence>,
+    /// How long, in milliseconds, this project's worker stays down because
+    /// abnormal restarts reached `runtime.worker_restart_limit` within
+    /// `runtime.worker_restart_window_secs`. Absent while each resident worker
+    /// may start a child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_retry_after_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -784,11 +790,16 @@ pub async fn lean_status(ctx: &ToolContext, req: SemanticToolRequest) -> Result<
                 } else {
                     "lean_status does not open a worker; no resident worker has completed a call"
                 };
+                let restart_retry_after_millis = ctx
+                    .broker
+                    .worker_restart_retry_after(Path::new(&project_root))
+                    .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
                 Some(WorkerStatusData {
                     opened: false,
                     status: TrustStatus::NotApplicable,
                     detail: detail.to_owned(),
                     compatibility,
+                    restart_retry_after_millis,
                 })
             } else {
                 None

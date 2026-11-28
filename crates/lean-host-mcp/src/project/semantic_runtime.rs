@@ -18,19 +18,21 @@ use crate::error::{Result, ServerError};
 
 /// Opened semantic-search runtimes, one per `(toolchain label, Lean sysroot)`.
 ///
-/// Opening asks Lake whether the modules are current, which starts a Lake
-/// process. While the server serves only install builds, so the answer cannot
-/// change and each process opens a key once. The open runs outside the lock;
-/// two callers that race open the same runtime and the second stores an equal
-/// value.
+/// Opening runs two Lake processes: `lake build --no-build`, which says
+/// whether the modules are current, and `lake env`, which says where they
+/// are. Together they take about 0.65 s on Lean 4.36. While the server serves
+/// only install builds, so the answers cannot change and each process opens a
+/// key once. The open runs outside the lock; two callers that race open the
+/// same runtime and the second stores an equal value.
 static SEMANTIC_RUNTIMES: std::sync::LazyLock<
     Mutex<std::collections::HashMap<(String, PathBuf), SemanticSearchRuntime>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// The runtime for `toolchain_label` and `lean_sysroot`, opened once per
 /// process. Failures are not kept, so a later call after an install opens it.
-/// The open waits for the cache's lock, and then for Lake, at most the
-/// `[build] timeout_secs` of the Lake root `project` each.
+/// The open waits for the cache's lock at most the `[build] timeout_secs` of
+/// the Lake root `project`, and then for both Lake runs together at most that
+/// again.
 ///
 /// # Errors
 ///

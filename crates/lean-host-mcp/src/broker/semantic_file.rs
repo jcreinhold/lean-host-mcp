@@ -7,7 +7,7 @@ use crate::cancellation::CallCancellation;
 use crate::error::invalid;
 use crate::semantic_search::{SemanticProofSearchRequest, SemanticProofSearchResult};
 
-use std::{fs, io, time::Duration};
+use std::{fs, time::Duration};
 
 impl ProjectBroker {
     /// Rank declarations that may close the goal at one proof position.
@@ -48,15 +48,15 @@ impl ProjectBroker {
         let label = meta.toolchain.clone();
         let prefix = sysroot.clone();
         let project = root.clone();
-        // Opening asks Lake whether install built the runtime; it builds
-        // nothing.
+        // Opening asks Lake whether install built the runtime and where its
+        // modules are; it builds nothing.
         let runtime = tokio::task::spawn_blocking(move || crate::project::semantic_runtime(&label, &prefix, &project))
             .await
             .map_err(invalid)??;
         let limit = request.limit;
         let body = serde_json::to_vec(&request.into_driver_request(roots)).map_err(invalid)?;
         let driver = runtime.driver().to_owned();
-        let modules = runtime.module_dir().to_owned();
+        let lean_path = std::env::join_paths(runtime.lean_path()).map_err(invalid)?;
         let stdout = super::reader::reader_output(
             "Lean semantic search driver",
             &root,
@@ -77,10 +77,7 @@ impl ProjectBroker {
                         request_file.into_os_string(),
                     ],
                     environment: vec![
-                        (
-                            "LEAN_PATH".into(),
-                            std::env::join_paths([modules]).map_err(io::Error::other)?,
-                        ),
+                        ("LEAN_PATH".into(), lean_path),
                         ("LEAN_SYSROOT".into(), sysroot.into_os_string()),
                     ],
                     cwd: assets.into(),

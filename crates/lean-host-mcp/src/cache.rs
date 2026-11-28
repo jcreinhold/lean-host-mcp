@@ -497,12 +497,16 @@ mod tests {
                 }),
                 ..RuntimeFacts::default()
             };
-            assert_eq!(
-                completed_generation(&runtime),
-                (status == FinalAttemptStatus::Completed).then_some(2)
-            );
-            runtime.call_restart = runtime.previous_attempt_failure.clone();
-            assert_eq!(completed_generation(&runtime), None);
+            let completed = (status == FinalAttemptStatus::Completed).then_some(2);
+            assert_eq!(completed_generation(&runtime), completed);
+            // An abnormal replacement before a completed attempt leaves its
+            // value whole; before an unfinished one it does not.
+            runtime.previous_attempt_failure = None;
+            runtime.call_restart = Some(RuntimeRestartEvent {
+                cause: "child_abort".into(),
+                ..RuntimeRestartEvent::default()
+            });
+            assert_eq!(completed_generation(&runtime), completed);
         }
     }
 

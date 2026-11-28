@@ -1,88 +1,60 @@
-//! Why a worker child was cycled: the cause names the parent reports, which
-//! causes count toward the crash-loop breaker, the per-cause tally, and the
-//! log line each recycle emits.
+//! Why a worker child was cycled: the causes this server names itself, the
+//! event for a restart the supervisor made, the per-cause tally, and the log
+//! line each recycle emits.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use lean_rs_worker_parent::{LeanWorkerError, LeanWorkerRestartReason};
+use lean_rs_worker_parent::LeanWorkerRestartReason;
 
 use crate::envelope::RuntimeRestartEvent;
 
+/// A restart cause this server names: a cycle it asked for, or the failure
+/// that ended a call. The supervisor names its own restarts; see
+/// [`worker_restart_event`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RestartCause {
     /// A `.olean` among the live session's imports was rebuilt on disk. The
     /// session's environment is a snapshot taken at import, so it must be
     /// dropped or the call answers from a stale Lean environment.
     ArtifactsRebuilt,
-    RssPostJob,
-    RssHardLimit,
-    MaxRequests,
-    MaxImports,
-    /// Imports retained the configured budget of unreclaimable bytes, and the
-    /// child was cycled before the next one on the request path.
-    ImportResidue,
-    /// A failed header import left retained memory unmeasured. Retire the child
-    /// before another request; the failed request keeps its original diagnostics.
-    ImportAccountingUnknown,
-    /// The same budget crossed its soft threshold while the mailbox was empty,
-    /// so the cycle ran between requests instead of inside one. The ratio of
-    /// this cause to [`Self::ImportResidue`] is how much of the recycle cost the
-    /// idle path actually moved off the critical path.
+    /// Imports crossed the soft share of the residue budget while the mailbox
+    /// was empty, so the cycle ran between requests instead of inside one. The
+    /// ratio of this cause to the supervisor's `import_residue` is how much of
+    /// the recycle cost the idle path moved off the request path.
     ImportResidueIdle,
-    Idle,
+    RssHardLimit,
     Timeout,
     Cancelled,
     ChildExit,
     ChildAbort,
     SessionMissing,
-    Explicit,
+    /// A restart the supervisor reported without a reason, or several in one
+    /// call, so that no one reason describes them.
     WorkerInternal,
 }
 
 impl RestartCause {
+    /// The cause's name. A failure the supervisor also restarts for has the
+    /// supervisor's name, so one tally key counts both.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::ArtifactsRebuilt => "artifacts_rebuilt",
-            Self::RssPostJob => "rss_post_job",
-            Self::RssHardLimit => "rss_hard_limit_exceeded",
-            Self::MaxRequests => "max_requests",
-            Self::MaxImports => "max_imports",
-            Self::ImportResidue => "import_residue",
-            Self::ImportAccountingUnknown => "import_accounting_unknown",
             Self::ImportResidueIdle => "import_residue_idle",
-            Self::Idle => "idle",
+            Self::RssHardLimit => "rss_hard_limit",
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::ChildExit => "child_exit",
             Self::ChildAbort => "child_abort",
             Self::SessionMissing => "session_missing",
-            Self::Explicit => "explicit",
             Self::WorkerInternal => "worker_internal",
         }
     }
 
-    pub(super) const fn counts_toward_restart_limit(self) -> bool {
-        matches!(
-            self,
-            Self::Timeout
-                | Self::Cancelled
-                | Self::ChildExit
-                | Self::ChildAbort
-                | Self::SessionMissing
-                | Self::RssHardLimit
-                // Not a planned cycle: this is the bucket for a restart whose
-                // cause this build cannot name — an upstream policy added after
-                // it shipped, or a replacement the supervisor reported with no
-                // reason at all. `diagnosis::execution_taint` already treats it
-                // as disrupting; a crash-loop breaker that excused the one cause
-                // it understands least would be exactly backwards.
-                | Self::WorkerInternal
-        )
-    }
-
+    /// Whether this server asked for the restart. Its two cycles replace a
+    /// working child between requests; every other cause ended a call.
     pub(super) const fn is_planned(self) -> bool {
-        !self.counts_toward_restart_limit()
+        matches!(self, Self::ArtifactsRebuilt | Self::ImportResidueIdle)
     }
 }
 
@@ -100,6 +72,24 @@ pub(super) fn restart_event(
         planned: cause.is_planned(),
         rss_kib,
         limit_kib,
+    }
+}
+
+/// The event for a restart the supervisor made, in the supervisor's terms:
+/// its cause name, whether it was planned, and its one-line description,
+/// which for a child that died ends with the child's last stderr.
+pub(super) fn worker_restart_event(
+    reason: &LeanWorkerRestartReason,
+    worker_generation: u64,
+    rss_kib: Option<u64>,
+) -> RuntimeRestartEvent {
+    RuntimeRestartEvent {
+        cause: reason.stable_cause().to_owned(),
+        reason: reason.to_string(),
+        worker_generation,
+        planned: reason.is_planned(),
+        rss_kib,
+        limit_kib: None,
     }
 }
 
@@ -123,9 +113,9 @@ impl RestartStats {
     }
 }
 
-/// Emit one structured log line for a recycle. Level tracks the *signal*, not
-/// `planned`: crash/abnormal causes `warn`, memory-pressure cycles `info` (the
-/// frequency an operator tuning the RSS budget watches), pure hygiene `debug`.
+/// Emit one structured log line for a recycle: `warn` for an abnormal
+/// restart, `info` for a planned one an operator tunes a budget by, and
+/// `debug` for the other planned ones.
 pub(super) fn log_restart(event: &RuntimeRestartEvent, restarts_total: u64) {
     macro_rules! emit {
         ($level:ident, $msg:literal) => {
@@ -141,15 +131,12 @@ pub(super) fn log_restart(event: &RuntimeRestartEvent, restarts_total: u64) {
             )
         };
     }
+    if !event.planned {
+        emit!(warn, "worker recycled (abnormal)");
+        return;
+    }
     match event.cause.as_str() {
-        "rss_hard_limit_exceeded"
-        | "child_abort"
-        | "child_exit"
-        | "session_missing"
-        | "worker_internal"
-        | "timeout"
-        | "cancelled" => emit!(warn, "worker recycled (abnormal)"),
-        "rss_post_job" => emit!(info, "worker recycled (memory pressure)"),
+        "rss_ceiling" => emit!(info, "worker recycled (memory pressure)"),
         "artifacts_rebuilt" => emit!(info, "worker recycled (imports rebuilt on disk)"),
         // Reactive at `info`, proactive at `debug` (via the fallthrough): the
         // ratio between them is the tuning signal, and it is the *reactive*
@@ -160,114 +147,6 @@ pub(super) fn log_restart(event: &RuntimeRestartEvent, restarts_total: u64) {
             "worker retired after an import error; retained memory could not be measured"
         ),
         _ => emit!(debug, "worker recycled (hygiene)"),
-    }
-}
-
-pub(super) fn restart_cause_from_worker(reason: &LeanWorkerRestartReason) -> RestartCause {
-    restart_cause_from_worker_name(reason.stable_cause())
-}
-
-fn restart_cause_from_worker_name(cause: &str) -> RestartCause {
-    match cause {
-        "explicit" => RestartCause::Explicit,
-        "max_requests" => RestartCause::MaxRequests,
-        "max_imports" => RestartCause::MaxImports,
-        "import_residue" => RestartCause::ImportResidue,
-        "import_accounting_unknown" => RestartCause::ImportAccountingUnknown,
-        "rss_ceiling" => RestartCause::RssPostJob,
-        "rss_hard_limit" => RestartCause::RssHardLimit,
-        "idle" => RestartCause::Idle,
-        "cancelled" => RestartCause::Cancelled,
-        "timeout" => RestartCause::Timeout,
-        "child_abort" => RestartCause::ChildAbort,
-        _ => RestartCause::WorkerInternal,
-    }
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "only worker process death variants are restart causes; all other errors are classified elsewhere"
-)]
-pub(super) fn worker_death_cause(err: &LeanWorkerError) -> RestartCause {
-    match err {
-        LeanWorkerError::ChildPanicOrAbort { .. } => RestartCause::ChildAbort,
-        LeanWorkerError::ChildExited { .. } => RestartCause::ChildExit,
-        _ => RestartCause::WorkerInternal,
-    }
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "protocol 13 accounting retirement is handled by stable name above the match, preserving compatibility with published lean-rs"
-)]
-pub(super) fn restart_reason_text(reason: &LeanWorkerRestartReason) -> String {
-    // Match the stable name to retain compatibility with the published lean-rs
-    // version while protocol 13 is prepared for release.
-    if reason.stable_cause() == RestartCause::ImportAccountingUnknown.as_str() {
-        return "import_accounting_unknown: retained memory could not be measured after an import error".to_owned();
-    }
-    match reason {
-        LeanWorkerRestartReason::Explicit => RestartCause::Explicit.as_str().to_owned(),
-        LeanWorkerRestartReason::MaxRequests { limit } => format!("max_requests limit={limit}"),
-        LeanWorkerRestartReason::MaxImports { limit } => format!("max_imports limit={limit}"),
-        LeanWorkerRestartReason::ImportResidue {
-            residue_bytes,
-            limit_bytes,
-        } => format!(
-            "import_residue residue_mib={} limit_mib={}",
-            residue_bytes / (1024 * 1024),
-            limit_bytes / (1024 * 1024)
-        ),
-        LeanWorkerRestartReason::RssCeiling {
-            current_kib, limit_kib, ..
-        } => {
-            format!("rss_ceiling current_kib={current_kib} limit_kib={limit_kib}")
-        }
-        LeanWorkerRestartReason::RssHardLimit {
-            operation,
-            current_kib,
-            limit_kib,
-            ..
-        } => {
-            format!("rss_hard_limit operation={operation} current_kib={current_kib} limit_kib={limit_kib}")
-        }
-        LeanWorkerRestartReason::Idle { idle_for, limit } => {
-            format!(
-                "idle idle_for_millis={} limit_millis={}",
-                millis_u64(*idle_for),
-                millis_u64(*limit)
-            )
-        }
-        LeanWorkerRestartReason::Cancelled { operation } => {
-            format!("cancelled operation={operation}")
-        }
-        // The child's stderr is drained once, at exit, and retained nowhere
-        // else. Dropping it here would leave `child_abort operation=…` as the
-        // whole record of a fatal child — enough to know something died, not
-        // enough to tell a Lean out-of-memory panic from a segfault.
-        LeanWorkerRestartReason::ChildAbort {
-            operation,
-            status,
-            diagnostics,
-        } => {
-            let detail = diagnostics.trim();
-            if detail.is_empty() {
-                format!("child_abort operation={operation} status={status}")
-            } else {
-                format!("child_abort operation={operation} status={status}: {detail}")
-            }
-        }
-        LeanWorkerRestartReason::RequestTimeout { operation, duration } => {
-            format!(
-                "timeout operation={operation} duration_millis={}",
-                millis_u64(*duration)
-            )
-        }
-        // `LeanWorkerRestartReason` is `#[non_exhaustive]`: a cycling policy
-        // added upstream must surface as an unnamed cause rather than fail to
-        // build here. `restart_cause_from_worker` maps the same case to
-        // `WorkerInternal`, so the two agree.
-        other => format!("worker_internal reason={}", other.stable_cause()),
     }
 }
 
@@ -288,130 +167,128 @@ mod tests {
     #[test]
     fn restart_stats_tally_total_and_per_cause() {
         let mut stats = RestartStats::default();
-        stats.observe("rss_post_job");
-        stats.observe("rss_post_job");
+        stats.observe("import_residue");
+        stats.observe("import_residue");
         stats.observe("child_abort");
 
         assert_eq!(stats.total, 3);
-        assert_eq!(stats.by_cause.get("rss_post_job"), Some(&2));
+        assert_eq!(stats.by_cause.get("import_residue"), Some(&2));
         assert_eq!(stats.by_cause.get("child_abort"), Some(&1));
         assert_eq!(stats.by_cause.get("idle"), None);
     }
 
     #[test]
-    fn planned_restart_causes_do_not_consume_abnormal_restart_budget() {
-        assert!(!RestartCause::RssPostJob.counts_toward_restart_limit());
-        assert!(!RestartCause::MaxRequests.counts_toward_restart_limit());
-        assert!(!RestartCause::MaxImports.counts_toward_restart_limit());
-        assert!(!RestartCause::ImportResidue.counts_toward_restart_limit());
-        assert!(!RestartCause::ImportAccountingUnknown.counts_toward_restart_limit());
-        assert!(!RestartCause::ImportResidueIdle.counts_toward_restart_limit());
-        assert!(!RestartCause::Idle.counts_toward_restart_limit());
-
-        assert!(RestartCause::ChildExit.counts_toward_restart_limit());
-        assert!(RestartCause::ChildAbort.counts_toward_restart_limit());
-        assert!(RestartCause::Timeout.counts_toward_restart_limit());
-        assert!(RestartCause::Cancelled.counts_toward_restart_limit());
-        assert!(RestartCause::SessionMissing.counts_toward_restart_limit());
-        assert!(RestartCause::RssHardLimit.counts_toward_restart_limit());
+    fn only_the_servers_own_cycles_are_planned() {
+        assert!(RestartCause::ArtifactsRebuilt.is_planned());
+        assert!(RestartCause::ImportResidueIdle.is_planned());
+        for cause in [
+            RestartCause::RssHardLimit,
+            RestartCause::Timeout,
+            RestartCause::Cancelled,
+            RestartCause::ChildExit,
+            RestartCause::ChildAbort,
+            RestartCause::SessionMissing,
+            RestartCause::WorkerInternal,
+        ] {
+            assert!(!cause.is_planned(), "{}", cause.as_str());
+        }
     }
 
+    /// A call that fails for a reason the supervisor also restarts for must
+    /// use the supervisor's name, or the tally would count one cause under
+    /// two keys.
     #[test]
-    fn unknown_import_accounting_is_a_planned_retirement_not_a_crash() {
-        let cause = restart_cause_from_worker_name("import_accounting_unknown");
-        assert_eq!(cause, RestartCause::ImportAccountingUnknown);
-        assert_eq!(cause.as_str(), "import_accounting_unknown");
-        assert!(cause.is_planned());
-        assert!(!cause.counts_toward_restart_limit());
-        assert!(restart_cause_from_worker_name("unrecognized_policy").counts_toward_restart_limit());
+    fn a_failure_the_supervisor_restarts_for_has_the_supervisors_name() {
+        let pairs = [
+            (
+                RestartCause::RssHardLimit,
+                LeanWorkerRestartReason::RssHardLimit {
+                    operation: "test",
+                    current_kib: 2,
+                    limit_kib: 1,
+                    last_import_stats: None,
+                },
+            ),
+            (
+                RestartCause::Timeout,
+                LeanWorkerRestartReason::RequestTimeout {
+                    operation: "test",
+                    duration: Duration::from_millis(1),
+                },
+            ),
+            (
+                RestartCause::Cancelled,
+                LeanWorkerRestartReason::Cancelled { operation: "test" },
+            ),
+            (
+                RestartCause::ChildExit,
+                LeanWorkerRestartReason::ChildExit {
+                    operation: "test",
+                    status: "exit status: 0".to_owned(),
+                    diagnostics: String::new(),
+                },
+            ),
+            (
+                RestartCause::ChildAbort,
+                LeanWorkerRestartReason::ChildAbort {
+                    operation: "test",
+                    status: "signal: 6 (SIGABRT)".to_owned(),
+                    diagnostics: String::new(),
+                },
+            ),
+            (
+                RestartCause::SessionMissing,
+                LeanWorkerRestartReason::SessionMissing { operation: "test" },
+            ),
+        ];
+        for (cause, reason) in pairs {
+            assert_eq!(cause.as_str(), reason.stable_cause());
+            assert_eq!(cause.is_planned(), reason.is_planned(), "{}", cause.as_str());
+        }
     }
 
+    /// The supervisor's description is the only place the figures an operator
+    /// needs, such as what was retained and what the limit was, or what the
+    /// child printed as it died, reach the response.
     #[test]
-    fn worker_restart_reason_maps_to_stable_cause() {
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::MaxRequests { limit: 1 }).as_str(),
-            "max_requests"
+    fn a_supervisor_restart_keeps_its_name_class_and_description() {
+        let residue = worker_restart_event(
+            &LeanWorkerRestartReason::ImportResidue {
+                residue_bytes: 9 * 1024 * 1024 * 1024,
+                limit_bytes: 12 * 1024 * 1024 * 1024,
+            },
+            3,
+            Some(7),
         );
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::RssCeiling {
-                current_kib: 2,
-                limit_kib: 1,
-                last_import_stats: None,
-            })
-            .as_str(),
-            "rss_post_job"
-        );
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::RssHardLimit {
-                operation: "test",
-                current_kib: 2,
-                limit_kib: 1,
-                last_import_stats: None,
-            })
-            .as_str(),
-            "rss_hard_limit_exceeded"
-        );
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::RequestTimeout {
-                operation: "test",
-                duration: Duration::from_millis(1),
-            })
-            .as_str(),
-            "timeout"
-        );
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::ImportResidue {
-                residue_bytes: 2,
-                limit_bytes: 1,
-            })
-            .as_str(),
-            "import_residue"
-        );
-    }
+        assert_eq!(residue.cause, "import_residue");
+        assert_eq!(residue.reason, "import_residue residue_mib=9216 limit_mib=12288");
+        assert!(residue.planned);
+        assert_eq!((residue.worker_generation, residue.rss_kib), (3, Some(7)));
 
-    /// The reason string is the only place the two figures an operator needs —
-    /// what was retained and what the limit was — reach the response, which is
-    /// why they are not duplicated onto `RuntimeRestartEvent`.
-    #[test]
-    fn the_residue_reason_text_names_both_figures() {
-        let text = restart_reason_text(&LeanWorkerRestartReason::ImportResidue {
-            residue_bytes: 9 * 1024 * 1024 * 1024,
-            limit_bytes: 12 * 1024 * 1024 * 1024,
-        });
-        assert_eq!(text, "import_residue residue_mib=9216 limit_mib=12288");
-    }
+        let abort = worker_restart_event(
+            &LeanWorkerRestartReason::ChildAbort {
+                operation: "worker_attempt_proof",
+                status: "signal: 6 (SIGABRT)".to_owned(),
+                diagnostics: "out of memory\n".to_owned(),
+            },
+            4,
+            None,
+        );
+        assert_eq!(abort.cause, "child_abort");
+        assert_eq!(
+            abort.reason,
+            "child_abort operation=worker_attempt_proof status=signal: 6 (SIGABRT): out of memory"
+        );
+        assert!(!abort.planned);
 
-    /// `LeanWorkerRestartReason` is `#[non_exhaustive]` and its `stable_cause`
-    /// set is open, so a lean-rs upgrade can hand this build a cause it has
-    /// never heard of. It lands on `worker_internal`, which must be treated as
-    /// abnormal: `diagnosis::execution_taint` already counts it as disrupting,
-    /// and a crash-loop breaker that excused the one cause it understands least
-    /// would be exactly backwards. Every cause this build *does* know is
-    /// classified precisely, so nothing routine reaches that bucket.
-    #[test]
-    fn an_unclassified_restart_is_abnormal_and_nothing_routine_reaches_it() {
-        assert!(RestartCause::WorkerInternal.counts_toward_restart_limit());
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::ChildAbort {
-                operation: "test",
-                status: String::from("signal: 6 (SIGABRT)"),
-                diagnostics: String::new(),
-            })
-            .as_str(),
-            "child_abort",
-            "a child abort is a named cause, not an unclassified one"
+        let start = worker_restart_event(
+            &LeanWorkerRestartReason::StartFailed {
+                error: "no such file".to_owned(),
+            },
+            5,
+            None,
         );
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::Explicit).as_str(),
-            "explicit"
-        );
-        assert_eq!(
-            restart_cause_from_worker(&LeanWorkerRestartReason::Idle {
-                idle_for: Duration::from_millis(2),
-                limit: Duration::from_millis(1),
-            })
-            .as_str(),
-            "idle"
-        );
+        assert_eq!(start.cause, "start_failed");
+        assert!(!start.planned);
     }
 }

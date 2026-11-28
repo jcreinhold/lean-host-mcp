@@ -73,7 +73,7 @@ const SCHEMA_FIELDS: &[FieldDoc] = &[
         value: "3",
         commented: false,
         overrides: "LEAN_HOST_MCP_WORKER_RESTART_LIMIT",
-        description: "How many worker restarts are tolerated within the restart window before the project is marked unhealthy.",
+        description: "How many abnormal worker restarts (a timeout, a cancellation, a lost child) the supervisor makes within the restart window. It refuses the next one: the worker stays down, and calls fail with retry_after_millis, until the oldest restart leaves the window. Planned cycles do not count.",
     },
     FieldDoc {
         key: "runtime.worker_restart_window_secs",

@@ -49,6 +49,12 @@ pub struct WorkerUnavailable {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) toolchain_advisories: Vec<String>,
+    /// Whether the failed operation reached no worker child, because the
+    /// supervisor could not start one or refused to. Internal: it becomes the
+    /// call's `not_started` execution evidence, never wire data.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) not_started: bool,
 }
 
 impl WorkerUnavailable {
@@ -219,8 +225,7 @@ pub(crate) fn map_worker_err(err: LeanWorkerError) -> ServerError {
         | LeanWorkerError::Bootstrap { .. }
         | LeanWorkerError::CapabilityBuild { .. }
         | LeanWorkerError::Setup { .. }
-        | LeanWorkerError::Handshake { .. }
-        | LeanWorkerError::CapabilityMetadataMismatch { .. } => ServerError::BadProject(err.to_string()),
+        | LeanWorkerError::Handshake { .. } => ServerError::BadProject(err.to_string()),
         LeanWorkerError::ChildPanicOrAbort { .. } | LeanWorkerError::ChildExited { .. } => ServerError::Lean(format!(
             "worker process exited; project worker will restart before the next request: {err}"
         )),

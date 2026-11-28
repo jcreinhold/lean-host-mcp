@@ -1163,6 +1163,7 @@ impl ProjectBroker {
             window_millis: None,
             runtime: crate::envelope::RuntimeFacts::default(),
             toolchain_advisories: Vec::new(),
+            not_started: false,
         })
     }
 

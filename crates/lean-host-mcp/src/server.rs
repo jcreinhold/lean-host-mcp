@@ -778,6 +778,7 @@ mod tests {
             // A suspect worker carries an open-time advisory; it must survive
             // onto the semantic issue channel, not vanish when the worker dies.
             toolchain_advisories: vec!["lean-toolchain pins nightly-2026-05-20".to_owned()],
+            not_started: false,
         });
         let ServerError::WorkerUnavailable(info) = error else {
             unreachable!("constructed a WorkerUnavailable error")

@@ -8,7 +8,7 @@
 
 #![allow(let_underscore_drop, clippy::needless_pass_by_value)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use lean_rs_worker_parent::{
     LeanWorkerModuleCacheLimits, LeanWorkerModuleQuery, LeanWorkerModuleQueryBatchOutcome,
     LeanWorkerModuleQueryOutcome, LeanWorkerModuleQuerySelector, LeanWorkerOutputBudgets, LeanWorkerProcessTracker,
     LeanWorkerProofAttemptRequest, LeanWorkerProofAttemptResult, LeanWorkerRequestStopReceipt, LeanWorkerRestartPolicy,
+    LeanWorkerRestartReason,
 };
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
@@ -42,12 +43,8 @@ mod restart;
 mod runtime_config;
 mod semantic_runtime;
 
-use restart::{
-    RestartCause, RestartStats, log_restart, millis_u64, restart_cause_from_worker, restart_event, restart_reason_text,
-    worker_death_cause,
-};
+use restart::{RestartCause, RestartStats, log_restart, millis_u64, restart_event, worker_restart_event};
 pub use runtime_config::ProjectRuntimeConfig;
-use runtime_config::RESTART_WINDOW;
 pub(crate) use semantic_runtime::{build_semantic_runtime, runtime_timeout, semantic_runtime};
 
 /// LRU capacity for exact bounded module-query results, applied to the single
@@ -87,19 +84,6 @@ const WORKER_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// A minute of silence is not evidence the caller is coming back to the same
 /// file, and a wrong guess costs a full import.
 const PREWARM_RECENCY: Duration = Duration::from_mins(1);
-/// Backstop on *every* worker cycle in one [`RESTART_WINDOW`], planned or not.
-///
-/// The supervisor's own limit, distinct from
-/// [`ProjectRuntimeConfig::max_restarts_per_window`], which this actor applies
-/// to abnormal causes only. The supervisor cannot make that distinction, so its
-/// default of 16 counts planned cycles too —
-/// and exhausting it is terminal: the supervisor refuses to spawn a
-/// replacement and every later call fails with "shutdown is in progress". A
-/// workload that alternates import profiles reached that state after 16 calls
-/// and never recovered. Sized far above any legitimate cycle rate so that only
-/// a genuine spawn loop can reach it; the discriminating breaker is this
-/// actor's own.
-const SUPERVISOR_RESTART_INTENSITY: u64 = 256;
 
 /// Result of one project actor call.
 #[derive(Debug, Clone)]
@@ -118,21 +102,6 @@ impl<T> ProjectCall<T> {
     }
 }
 
-/// Lean elaboration and commands may perform IO. Recovery never replays a
-/// submitted job, even when its direct child is known to have stopped.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetryPolicy {
-    Never,
-}
-
-impl RetryPolicy {
-    fn retries(self) -> u32 {
-        match self {
-            Self::Never => 0,
-        }
-    }
-}
-
 pub(crate) struct ActiveJobGuard {
     active_jobs: Arc<AtomicUsize>,
     pool_active_jobs: Arc<AtomicUsize>,
@@ -145,9 +114,9 @@ impl Drop for ActiveJobGuard {
     }
 }
 
-/// How a `run_job` retry loop ended. Carrying this out of the loop keeps the
-/// loop's arms to control flow only — the caller computes timing and restart
-/// facts at one finalization point instead of at every exit.
+/// How a `run_job` attempt ended. Carrying this out of the match keeps its
+/// arms to control flow only — the caller computes timing and restart facts at
+/// one finalization point instead of at every exit.
 enum JobExit<R> {
     /// The job produced a value.
     Done(R),
@@ -159,6 +128,9 @@ enum JobExit<R> {
         worker_restarted: bool,
         cause: Option<RestartCause>,
         limit_kib: Option<u64>,
+        /// How long the supervisor stays down, when abnormal restarts used up
+        /// its window.
+        retry_after: Option<Duration>,
     },
 }
 
@@ -216,7 +188,6 @@ struct JobMeta {
     _created_at: Instant,
     queued_at: Instant,
     correlation_id: uuid::Uuid,
-    retry_policy: RetryPolicy,
     _active_job: ActiveJobGuard,
     cancellation: CallCancellation,
     /// The finished-build count of the request's read turn, or `None` when the
@@ -327,6 +298,12 @@ struct RuntimeSnapshot {
     restarts_by_cause: BTreeMap<String, u64>,
     import_residue_bytes: Option<u64>,
     import_residue_limit_bytes: Option<u64>,
+    /// How long the supervisor said the worker stays down, and when it said
+    /// so. Set when abnormal restarts filled the restart window.
+    restart_retry_after: Option<(Instant, Duration)>,
+    /// Whether the actor saw this generation's child exit. The supervisor
+    /// starts the next child, with the next generation, at the next request.
+    child_exited: bool,
     /// The receipt of the last completed call, kept only while its worker
     /// generation is the published one.
     compatibility: Option<LoadedReceipt>,
@@ -431,6 +408,8 @@ impl LeanProject {
             restarts_by_cause: BTreeMap::new(),
             import_residue_bytes: None,
             import_residue_limit_bytes: None,
+            restart_retry_after: None,
+            child_exited: false,
             compatibility: None,
         }));
         let active_jobs = Arc::new(AtomicUsize::new(0));
@@ -520,7 +499,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerModuleQueryOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQuery {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
+            meta: self.job_meta(imports, admission_deadline),
             source,
             query,
             options,
@@ -546,7 +525,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerModuleQueryBatchOutcome>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ModuleQueryBatch {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
+            meta: self.job_meta(imports, admission_deadline),
             source,
             selectors,
             budgets,
@@ -570,7 +549,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerDeclarationInspectionResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationInspection {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
+            meta: self.job_meta(imports, admission_deadline),
             request,
             reply,
         };
@@ -607,7 +586,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<Vec<LeanWorkerDeclarationSearchResult>>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationSearch {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
+            meta: self.job_meta(imports, admission_deadline),
             requests,
             reply,
         };
@@ -629,7 +608,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerProofAttemptResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::ProofAttempt {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
+            meta: self.job_meta(imports, admission_deadline),
             request,
             options,
             reply,
@@ -652,7 +631,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerification {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
+            meta: self.job_meta(imports, admission_deadline),
             request,
             options,
             reply,
@@ -676,7 +655,7 @@ impl LeanProject {
     ) -> Result<ProjectCall<LeanWorkerDeclarationVerificationBatchResult>> {
         let (reply, rx) = oneshot::channel();
         let message = ProjectMessage::DeclarationVerificationBatch {
-            meta: self.job_meta(imports, RetryPolicy::Never, admission_deadline),
+            meta: self.job_meta(imports, admission_deadline),
             request,
             options,
             reply,
@@ -684,7 +663,7 @@ impl LeanProject {
         self.enqueue(message, rx).await
     }
 
-    fn job_meta(&self, imports: Vec<String>, retry_policy: RetryPolicy, admission_deadline: Instant) -> JobMeta {
+    fn job_meta(&self, imports: Vec<String>, admission_deadline: Instant) -> JobMeta {
         let created_at = Instant::now();
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
         self.pool_active_jobs.fetch_add(1, Ordering::AcqRel);
@@ -696,7 +675,6 @@ impl LeanProject {
             _created_at: created_at,
             queued_at: Instant::now(),
             correlation_id: uuid::Uuid::new_v4(),
-            retry_policy,
             _active_job: ActiveJobGuard {
                 active_jobs: Arc::clone(&self.active_jobs),
                 pool_active_jobs: Arc::clone(&self.pool_active_jobs),
@@ -797,6 +775,8 @@ impl LeanProject {
                     && receipt.worker_session_id == self.session_id
                 {
                     operation.stopped(receipt.clone());
+                } else if failure.not_started {
+                    operation.not_started();
                 } else if failure.runtime.final_attempt == FinalAttemptStatus::Completed {
                     // This operation returned. The unavailable payload carries
                     // no proof result.
@@ -867,11 +847,23 @@ impl LeanProject {
         self.healthy.load(Ordering::Acquire) && self.actor_tx.lock().as_ref().is_some_and(|tx| !tx.is_closed())
     }
 
-    /// The generation of this project's worker while the actor is healthy.
-    /// A cached answer is good only while the generation that computed it
-    /// lives. The actor notices a dead child within one liveness poll.
+    /// The generation of this project's worker while the actor is healthy
+    /// and its child runs. A cached answer is good only while the generation
+    /// that computed it lives. The actor notices a dead child within one
+    /// liveness poll, and the child that replaces it has a new generation.
     pub(crate) fn live_generation(&self) -> Option<u64> {
-        self.is_healthy().then(|| self.runtime.lock().worker_generation)
+        if !self.is_healthy() {
+            return None;
+        }
+        let snapshot = self.runtime.lock();
+        (!snapshot.child_exited).then_some(snapshot.worker_generation)
+    }
+
+    /// How long abnormal restarts keep this project's worker down, as the
+    /// supervisor last reported; `None` while it may start a child.
+    pub(crate) fn restart_retry_after(&self) -> Option<Duration> {
+        let (observed, wait) = self.runtime.lock().restart_retry_after?;
+        Some(wait.saturating_sub(observed.elapsed())).filter(|left| !left.is_zero())
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -926,6 +918,7 @@ impl LeanProject {
             window_millis: None,
             runtime,
             toolchain_advisories: self.open_warnings.clone(),
+            not_started: false,
         }
     }
 }
@@ -1140,7 +1133,6 @@ struct ProjectActorState {
     profile_switch_count: u64,
     last_rss_kib: Option<u64>,
     runtime: Arc<Mutex<RuntimeSnapshot>>,
-    abnormal_restart_times: VecDeque<Instant>,
     restart_stats: RestartStats,
     /// Whether this quiet period has already taken its idle cycle.
     ///
@@ -1268,17 +1260,21 @@ impl ProjectActorState {
 
     /// Observe owned process state without sending a health request.
     /// Return whether an active call must retain lifecycle uncertainty.
+    ///
+    /// An exited child does not seal the actor. The supervisor replaces it at
+    /// the next request, or refuses while abnormal restarts fill its window;
+    /// a sealed actor would open a new supervisor, whose window starts empty.
+    /// Only cleanup the supervisor cannot finish on its own seals the actor.
     fn poll_worker_liveness(&mut self) -> bool {
         match self.handle.status() {
-            Ok(lean_rs_worker_parent::LeanWorkerStatus::Running) => {
+            Ok(status) => {
+                if matches!(status, lean_rs_worker_parent::LeanWorkerStatus::Exited(_)) {
+                    self.runtime.lock().child_exited = true;
+                }
                 if self.handle.cleanup_pending() {
                     self.config.healthy.store(false, Ordering::Release);
                     return true;
                 }
-                false
-            }
-            Ok(lean_rs_worker_parent::LeanWorkerStatus::Exited(_)) => {
-                self.config.healthy.store(false, Ordering::Release);
                 false
             }
             Err(_) => {
@@ -1325,277 +1321,257 @@ impl ProjectActorState {
         self.handle
             .set_host_runtime_expectation(expectation)
             .map_err(map_worker_err)?;
-        let mut lifecycle_baseline = self.handle.lifecycle_snapshot();
+        let lifecycle_baseline = self.handle.lifecycle_snapshot();
 
-        let max_retries = meta.retry_policy.retries();
-        let mut retry_count = 0_u32;
-        let mut previous_attempt_failure = None;
         let mut final_attempt = FinalAttemptStatus::Interrupted;
         let mut worker_stop_receipt = None;
-        // Every submitted job uses Never: a stopped worker does not authorize
-        // replaying Lean IO. Outcomes share this finalization point so timing
-        // and lifecycle facts describe the one submitted attempt.
-        let exit = loop {
-            if meta.cancellation.is_cancelled() {
-                return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
+        // Each job runs once: a stopped worker does not authorize replaying
+        // Lean IO, so a call whose child was lost fails even after the
+        // supervisor replaced that child. Outcomes share one finalization
+        // point, so timing and lifecycle facts describe the one attempt.
+        if meta.cancellation.is_cancelled() {
+            return Err(self.shutdown_unavailable(&meta, "request_cancelled"));
+        }
+        let checkpoint = self.handle.request_checkpoint();
+        let requests_before = self.handle.stats().requests;
+        let result = job(&mut self.handle, meta.imports.clone(), meta.cancellation.worker());
+        // The supervisor counts a request once it is sent to a child, so an
+        // unchanged count means this job reached no child: the supervisor
+        // could not start one, or refused to.
+        let reached_child = self.handle.stats().requests > requests_before;
+        if let Err(error) = &result {
+            // Observing status never dispatches work. In particular, an old
+            // request's receipt cannot settle a failed replacement startup.
+            let metadata_refusal =
+                self.handle.host_session_refusal_since(&checkpoint) == Some("worker_host_runtime_metadata");
+            let lifecycle_uncertain = self.poll_worker_liveness();
+            // This exact marker exists only after a typed metadata response
+            // returned and the parent rejected compatibility. Later cleanup
+            // cannot turn that pre-body refusal into unknown execution.
+            let returned = metadata_refusal
+                || (matches!(error, LeanWorkerError::Worker { .. })
+                    && !lifecycle_uncertain
+                    && self.config.healthy.load(Ordering::Acquire)
+                    && !self.config.startup_uncertain.load(Ordering::Acquire));
+            if let (Some(file_label), Some(operation)) = (
+                meta.file_label.as_ref(),
+                self.handle.host_session_refusal_since(&checkpoint),
+            ) {
+                let stage = match operation {
+                    "open_worker_session" => Some("host_session_import"),
+                    "worker_host_runtime_metadata" => Some("host_runtime_validation"),
+                    _ => None,
+                };
+                if let Some(stage) = stage {
+                    meta.cancellation
+                        .target_check_not_started(crate::envelope::TargetCheckNotStarted {
+                            disposition: "not_started".to_owned(),
+                            file_label: file_label.clone(),
+                            stage: stage.to_owned(),
+                        });
+                }
             }
-            let checkpoint = self.handle.request_checkpoint();
-            let result = job(&mut self.handle, meta.imports.clone(), meta.cancellation.worker());
-            if let Err(error) = &result {
-                // Observing status never dispatches work. In particular, an old
-                // request's receipt cannot settle a failed replacement startup.
-                let metadata_refusal =
-                    self.handle.host_session_refusal_since(&checkpoint) == Some("worker_host_runtime_metadata");
-                let lifecycle_uncertain = self.poll_worker_liveness();
-                // This exact marker exists only after a typed metadata response
-                // returned and the parent rejected compatibility. Later cleanup
-                // cannot turn that pre-body refusal into unknown execution.
-                let returned = metadata_refusal
-                    || (matches!(error, LeanWorkerError::Worker { .. })
-                        && !lifecycle_uncertain
-                        && self.config.healthy.load(Ordering::Acquire)
-                        && !self.config.startup_uncertain.load(Ordering::Acquire));
-                if let (Some(file_label), Some(operation)) = (
-                    meta.file_label.as_ref(),
-                    self.handle.host_session_refusal_since(&checkpoint),
-                ) {
-                    let stage = match operation {
-                        "open_worker_session" => Some("host_session_import"),
-                        "worker_host_runtime_metadata" => Some("host_runtime_validation"),
-                        _ => None,
-                    };
-                    if let Some(stage) = stage {
-                        meta.cancellation
-                            .target_check_not_started(crate::envelope::TargetCheckNotStarted {
-                                disposition: "not_started".to_owned(),
-                                file_label: file_label.clone(),
-                                stage: stage.to_owned(),
-                            });
-                    }
-                }
-                if metadata_refusal {
-                    self.config.healthy.store(false, Ordering::Release);
-                }
-                if returned {
-                    // A typed terminal error from the healthy owned child is
-                    // known to have returned. It is not a proof result or exit.
-                    final_attempt = FinalAttemptStatus::Completed;
-                } else {
-                    let deferred_stop = self.defer_stop_observation(
-                        &meta,
-                        self.handle.pending_request_stop_since(&checkpoint),
-                        "main",
-                        self.worker_generation_base,
-                        stop_cause(error, &self.handle.lifecycle_snapshot()),
-                    );
-                    if lifecycle_uncertain && !deferred_stop {
-                        meta.cancellation.mark_uncertain();
-                    }
-                }
-                worker_stop_receipt = self.handle.confirmed_request_stop_since(&checkpoint).map(|receipt| {
-                    confirmed_stop_receipt(
-                        &self.config.session_id,
-                        meta.correlation_id,
-                        "main",
-                        self.worker_generation_base,
-                        receipt,
-                        stop_cause(error, &self.handle.lifecycle_snapshot()),
-                    )
-                });
+            if metadata_refusal {
+                self.config.healthy.store(false, Ordering::Release);
             }
-            match result {
-                Ok(value) => {
-                    let restarts = self
-                        .handle
-                        .lifecycle_snapshot()
-                        .restarts
-                        .saturating_sub(lifecycle_baseline.restarts);
-                    if let Some(event) = self
-                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
-                    {
-                        call_restart = Some(event);
-                    }
-                    if meta.cancellation.is_cancelled() {
-                        break JobExit::Unavailable {
-                            reason: "request_cancelled".to_owned(),
-                            retryable: false,
-                            worker_restarted: self.observed_generation() > generation_before,
-                            cause: Some(RestartCause::Cancelled),
-                            limit_kib: None,
-                        };
-                    }
-                    final_attempt = if restarts > 1 {
-                        call_restart = Some(restart_event(
-                            RestartCause::WorkerInternal,
-                            "multiple worker restarts during final attempt; result unavailable",
-                            self.observed_generation(),
-                            self.last_rss_kib,
-                            None,
-                        ));
-                        FinalAttemptStatus::Unknown
-                    } else if call_restart
-                        .as_ref()
-                        .is_some_and(crate::diagnosis::restart_disrupts_result)
-                    {
-                        FinalAttemptStatus::Interrupted
-                    } else {
-                        FinalAttemptStatus::Completed
-                    };
-                    // Sampled for `RuntimeFacts.rss_kib`, which is reporting
-                    // only: no threshold reads it, and nothing restarts on it.
-                    self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
-                    break JobExit::Done(value);
+            if returned {
+                // A typed terminal error from the healthy owned child is
+                // known to have returned. It is not a proof result or exit.
+                final_attempt = FinalAttemptStatus::Completed;
+            } else {
+                let deferred_stop = self.defer_stop_observation(
+                    &meta,
+                    self.handle.pending_request_stop_since(&checkpoint),
+                    "main",
+                    self.worker_generation_base,
+                    stop_cause(error, &self.handle.lifecycle_snapshot()),
+                );
+                if lifecycle_uncertain && !deferred_stop {
+                    meta.cancellation.mark_uncertain();
                 }
-                Err(_err) if meta.cancellation.is_cancelled() => {
-                    if worker_stop_receipt.is_none() {
-                        self.config.healthy.store(false, Ordering::Release);
-                    }
-                    call_restart = self
-                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
-                    break JobExit::Unavailable {
+            }
+            worker_stop_receipt = self.handle.confirmed_request_stop_since(&checkpoint).map(|receipt| {
+                confirmed_stop_receipt(
+                    &self.config.session_id,
+                    meta.correlation_id,
+                    "main",
+                    self.worker_generation_base,
+                    receipt,
+                    stop_cause(error, &self.handle.lifecycle_snapshot()),
+                )
+            });
+        }
+        let exit = match result {
+            Ok(value) => {
+                if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline) {
+                    call_restart = Some(event);
+                }
+                if meta.cancellation.is_cancelled() {
+                    JobExit::Unavailable {
                         reason: "request_cancelled".to_owned(),
                         retryable: false,
                         worker_restarted: self.observed_generation() > generation_before,
                         cause: Some(RestartCause::Cancelled),
                         limit_kib: None,
-                    };
-                }
-                Err(err) if worker_error_is_recoverable_death(&err) && retry_count < max_retries => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
-                    let first_reason = err.to_string();
-                    previous_attempt_failure =
-                        Some(self.rebuild_after_worker_death(first_reason, worker_death_cause(&err), &meta)?);
-                    call_restart = None;
-                    lifecycle_baseline = self.handle.lifecycle_snapshot();
-                    retry_count = retry_count.saturating_add(1);
-                }
-                Err(err) if worker_error_is_recoverable_death(&err) => {
-                    if let Some(event) = self
-                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
-                    {
-                        call_restart = Some(event);
+                        retry_after: None,
                     }
-                    break JobExit::Unavailable {
-                        reason: format!("worker_died: {err}"),
-                        retryable: true,
-                        worker_restarted: self.observed_generation() > generation_before,
-                        cause: Some(worker_death_cause(&err)),
-                        limit_kib: None,
-                    };
+                } else {
+                    // The supervisor makes its restarts before it sends a
+                    // request, and resends one only when the child it lost
+                    // never ran it, so a value ran once, on the child that
+                    // answered, whatever restarts this call paid for.
+                    final_attempt = FinalAttemptStatus::Completed;
+                    // Sampled for `RuntimeFacts.rss_kib`, which is reporting
+                    // only: no threshold reads it, and nothing restarts on it.
+                    self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
+                    JobExit::Done(value)
                 }
-                Err(err) if worker_error_is_session_missing(&err) && retry_count < max_retries => {
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
-                    previous_attempt_failure = Some(self.rebuild_after_worker_death(
-                        format!("session_missing: {err}"),
-                        RestartCause::SessionMissing,
-                        &meta,
-                    )?);
-                    call_restart = None;
-                    lifecycle_baseline = self.handle.lifecycle_snapshot();
-                    retry_count = retry_count.saturating_add(1);
+            }
+            Err(_err) if meta.cancellation.is_cancelled() => {
+                if worker_stop_receipt.is_none() {
+                    self.config.healthy.store(false, Ordering::Release);
                 }
-                Err(err) if worker_error_is_session_missing(&err) => {
-                    if let Some(event) = self
-                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
-                    {
-                        call_restart = Some(event);
-                    }
-                    break JobExit::Unavailable {
-                        reason: format!("session_missing: {err}"),
-                        retryable: true,
-                        worker_restarted: self.observed_generation() > generation_before,
-                        cause: Some(RestartCause::SessionMissing),
-                        limit_kib: None,
-                    };
+                call_restart = self.account_lifecycle_restarts_since(&lifecycle_baseline);
+                JobExit::Unavailable {
+                    reason: "request_cancelled".to_owned(),
+                    retryable: false,
+                    worker_restarted: self.observed_generation() > generation_before,
+                    cause: Some(RestartCause::Cancelled),
+                    limit_kib: None,
+                    retry_after: None,
                 }
-                Err(LeanWorkerError::RssHardLimitExceeded {
-                    operation,
-                    current_kib,
-                    limit_kib,
-                    ..
-                }) => {
-                    if let Some(event) = self
-                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
-                    {
-                        call_restart = Some(event);
-                    }
-                    break JobExit::Unavailable {
-                        reason: format!(
-                            "rss_hard_limit_exceeded operation={operation} current_kib={current_kib} limit_kib={limit_kib}"
-                        ),
-                        retryable: false,
-                        worker_restarted: true,
-                        cause: Some(RestartCause::RssHardLimit),
-                        limit_kib: Some(limit_kib),
-                    };
+            }
+            Err(err @ (LeanWorkerError::ChildExited { .. } | LeanWorkerError::ChildPanicOrAbort { .. })) => {
+                // The supervisor has replaced the lost child already, but the
+                // job may have run, so this call fails rather than run twice.
+                if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline) {
+                    call_restart = Some(event);
                 }
-                Err(err) if matches!(err, LeanWorkerError::Timeout { .. }) => {
-                    if let Some(event) = self
-                        .account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?
-                    {
-                        call_restart = Some(event);
-                    }
-                    break JobExit::Unavailable {
-                        reason: format!("timeout: {err}"),
-                        retryable: true,
-                        worker_restarted: self.observed_generation() > generation_before,
-                        cause: Some(RestartCause::Timeout),
-                        limit_kib: None,
-                    };
+                let cause = if matches!(err, LeanWorkerError::ChildExited { .. }) {
+                    RestartCause::ChildExit
+                } else {
+                    RestartCause::ChildAbort
+                };
+                JobExit::Unavailable {
+                    reason: format!("worker_died: {err}"),
+                    retryable: true,
+                    worker_restarted: self.observed_generation() > generation_before,
+                    cause: Some(cause),
+                    limit_kib: None,
+                    retry_after: None,
                 }
-                Err(err) => {
-                    // An infrastructure failure may leave an owned generation
-                    // unresolved. Seal this actor before another job can spawn.
-                    if matches!(
-                        err,
-                        LeanWorkerError::Kill { .. }
-                            | LeanWorkerError::Wait { .. }
-                            | LeanWorkerError::WaitTimeout { .. }
-                            | LeanWorkerError::Setup { .. }
-                    ) {
-                        self.config.healthy.store(false, Ordering::Release);
-                    }
-                    self.account_lifecycle_restarts_since(&lifecycle_baseline, &meta)
-                        .map_err(|error| with_stop_receipt(error, worker_stop_receipt.clone()))?;
-                    break JobExit::Unavailable {
-                        reason: format!("worker_operation_failed: {err}"),
-                        retryable: false,
-                        worker_restarted: self.observed_generation() > generation_before,
-                        cause: None,
-                        limit_kib: None,
-                    };
+            }
+            Err(err) if worker_error_is_session_missing(&err) => {
+                if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline) {
+                    call_restart = Some(event);
+                }
+                JobExit::Unavailable {
+                    reason: format!("session_missing: {err}"),
+                    retryable: true,
+                    worker_restarted: self.observed_generation() > generation_before,
+                    cause: Some(RestartCause::SessionMissing),
+                    limit_kib: None,
+                    retry_after: None,
+                }
+            }
+            Err(LeanWorkerError::RssHardLimitExceeded {
+                operation,
+                current_kib,
+                limit_kib,
+                ..
+            }) => {
+                if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline) {
+                    call_restart = Some(event);
+                }
+                JobExit::Unavailable {
+                    reason: format!(
+                        "rss_hard_limit operation={operation} current_kib={current_kib} limit_kib={limit_kib}"
+                    ),
+                    retryable: false,
+                    worker_restarted: true,
+                    cause: Some(RestartCause::RssHardLimit),
+                    limit_kib: Some(limit_kib),
+                    retry_after: None,
+                }
+            }
+            Err(LeanWorkerError::RestartLimitExceeded {
+                restarts,
+                window,
+                retry_after,
+            }) => {
+                // The supervisor refused to start a child. It starts one for
+                // the first request after `retry_after`; until then this
+                // actor stays open, because a new supervisor would start
+                // with an empty restart window.
+                if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline) {
+                    call_restart = Some(event);
+                }
+                JobExit::Unavailable {
+                    reason: restart_limit_reason(restarts, window, retry_after),
+                    retryable: true,
+                    worker_restarted: self.observed_generation() > generation_before,
+                    cause: None,
+                    limit_kib: None,
+                    retry_after: Some(retry_after),
+                }
+            }
+            Err(err) if matches!(err, LeanWorkerError::Timeout { .. }) => {
+                if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline) {
+                    call_restart = Some(event);
+                }
+                JobExit::Unavailable {
+                    reason: format!("timeout: {err}"),
+                    retryable: true,
+                    worker_restarted: self.observed_generation() > generation_before,
+                    cause: Some(RestartCause::Timeout),
+                    limit_kib: None,
+                    retry_after: None,
+                }
+            }
+            Err(err) => {
+                // An infrastructure failure may leave an owned generation
+                // unresolved. Seal this actor before another job can spawn.
+                if matches!(
+                    err,
+                    LeanWorkerError::Kill { .. }
+                        | LeanWorkerError::Wait { .. }
+                        | LeanWorkerError::WaitTimeout { .. }
+                        | LeanWorkerError::Setup { .. }
+                ) {
+                    self.config.healthy.store(false, Ordering::Release);
+                }
+                if let Some(event) = self.account_lifecycle_restarts_since(&lifecycle_baseline) {
+                    call_restart = Some(event);
+                }
+                JobExit::Unavailable {
+                    reason: format!("worker_operation_failed: {err}"),
+                    retryable: false,
+                    worker_restarted: self.observed_generation() > generation_before,
+                    cause: None,
+                    limit_kib: None,
+                    retry_after: None,
                 }
             }
         };
 
-        // A retry or restart may have loaded imports on a new generation,
-        // still under this job's read turn.
+        // A restart may have loaded imports on a new generation, still under
+        // this job's read turn.
         if let Some(granted_at) = meta.granted_at {
             self.note_loaded_at(granted_at);
         }
-        // The one finalization point: elapsed/CPU are sampled after the loop,
-        // and the facts are built and published exactly once per call.
+        // The one finalization point: elapsed/CPU are sampled after the
+        // attempt, and the facts are built and published exactly once per call.
         let call_elapsed_millis = millis_u64(job_started.elapsed());
         let call_cpu_millis = self.cpu_delta_since(cpu_baseline);
         let mut runtime = self.runtime_facts(
             &meta,
             generation_before,
-            retry_count,
             queue_wait_millis,
             call_elapsed_millis,
             call_cpu_millis,
             call_restart,
         );
         runtime.final_attempt = final_attempt;
-        runtime.previous_attempt_failure = previous_attempt_failure;
         let receipt = if matches!(&exit, JobExit::Done(_)) {
             Some(self.loaded_receipt()?)
         } else {
@@ -1605,7 +1581,6 @@ impl ProjectActorState {
         match exit {
             JobExit::Done(value) => {
                 tracing::debug!(
-                    retry_count,
                     rss_kib = ?runtime.rss_kib,
                     worker_generation = runtime.worker_generation,
                     "job complete"
@@ -1618,11 +1593,20 @@ impl ProjectActorState {
                 worker_restarted,
                 cause,
                 limit_kib,
+                retry_after,
             } => {
-                let mut error =
-                    self.worker_unavailable_for(&meta, reason, retryable, worker_restarted, cause, limit_kib, None);
+                let mut error = self.worker_unavailable_for(
+                    &meta,
+                    reason,
+                    retryable,
+                    worker_restarted,
+                    cause,
+                    limit_kib,
+                    retry_after.map(millis_u64),
+                );
                 if let ServerError::WorkerUnavailable(failure) = &mut error {
                     failure.runtime = runtime;
+                    failure.not_started = !reached_child && worker_stop_receipt.is_none();
                     failure.worker_stop_receipt = worker_stop_receipt;
                 }
                 Err(error)
@@ -1695,9 +1679,31 @@ impl ProjectActorState {
             "artifacts_rebuilt imports={} build_finished_since_load",
             meta.imports.len()
         );
-        self.record_restart_or_stop(RestartCause::ArtifactsRebuilt, &reason)
-            .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
-        self.handle.cycle().map_err(map_worker_err)?;
+        if let Err(error) = self.handle.cycle() {
+            // The cycle is planned, but a child the window refused to
+            // replace stays down until the window allows a restart.
+            if let LeanWorkerError::RestartLimitExceeded {
+                restarts,
+                window,
+                retry_after,
+            } = error
+            {
+                let mut refused = self.worker_unavailable_for(
+                    meta,
+                    restart_limit_reason(restarts, window, retry_after),
+                    true,
+                    false,
+                    None,
+                    None,
+                    Some(millis_u64(retry_after)),
+                );
+                if let ServerError::WorkerUnavailable(failure) = &mut refused {
+                    failure.not_started = true;
+                }
+                return Err(refused);
+            }
+            return Err(map_worker_err(error));
+        }
         self.forget_pooled_import_profiles();
         self.note_loaded_at(granted_at);
         let event = restart_event(
@@ -1947,58 +1953,42 @@ impl ProjectActorState {
         }
     }
 
-    fn rebuild_after_worker_death(
-        &mut self,
-        reason: String,
-        cause: RestartCause,
-        meta: &JobMeta,
-    ) -> Result<RuntimeRestartEvent> {
-        self.record_restart_or_stop(cause, &reason)
-            .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
-        let next_generation = self.observed_generation().saturating_add(1);
-        let (handle, _) = open_worker(&self.config)?;
-        self.handle = handle;
-        self.worker_generation_base = next_generation;
-        self.forget_pooled_import_profiles();
-        self.last_rss_kib = self.handle.rss_kib().or(self.last_rss_kib);
-        let event = restart_event(cause, reason, self.observed_generation(), self.last_rss_kib, None);
-        self.record_restart(event.clone());
-        Ok(event)
-    }
-
+    /// Record the restarts the supervisor made since `before` as one event,
+    /// named by the latest reason. The supervisor counts and limits them; this
+    /// only reports them and forgets the profiles the old child held.
     fn account_lifecycle_restarts_since(
         &mut self,
         before: &LeanWorkerLifecycleSnapshot,
-        meta: &JobMeta,
-    ) -> Result<Option<RuntimeRestartEvent>> {
+    ) -> Option<RuntimeRestartEvent> {
         let after = self.handle.lifecycle_snapshot();
-        let restarted = after.restarts.saturating_sub(before.restarts);
-        if restarted == 0 {
-            self.last_rss_kib = after.last_rss_kib.or(self.last_rss_kib);
-            return Ok(None);
-        }
-        let (cause, reason) = after.last_restart_reason.as_ref().map_or_else(
-            || (RestartCause::WorkerInternal, "worker_internal_restart".to_owned()),
-            |reason| (restart_cause_from_worker(reason), restart_reason_text(reason)),
-        );
-        for _ in 0..restarted {
-            self.record_restart_or_stop(cause, &reason)
-                .map_err(|limit| self.restart_limit_error(&meta.imports, limit))?;
-        }
-        // The supervisor replaced the child under us — most often on its own
-        // `max_imports` policy, which is exactly the pooled-profile ceiling.
-        self.forget_pooled_import_profiles();
         self.last_rss_kib = after.last_rss_kib.or(self.last_rss_kib);
-        let event = restart_event(cause, reason, self.observed_generation(), self.last_rss_kib, None);
+        if after.restarts <= before.restarts {
+            return None;
+        }
+        // The supervisor replaced the child under us: on its residue or import
+        // policy between requests, or after a request lost the child.
+        self.forget_pooled_import_profiles();
+        let generation = self.observed_generation();
+        let event = after.last_restart_reason.as_ref().map_or_else(
+            || {
+                restart_event(
+                    RestartCause::WorkerInternal,
+                    "worker_internal_restart",
+                    generation,
+                    self.last_rss_kib,
+                    None,
+                )
+            },
+            |reason| worker_restart_event(reason, generation, self.last_rss_kib),
+        );
         self.record_restart(event.clone());
-        Ok(Some(event))
+        Some(event)
     }
 
     /// The single place a recycle becomes observable: tally it for frequency
     /// reporting, log it at a signal-appropriate level, and store it as the
     /// latest event. Every restart path funnels through here, so adding one is
-    /// a single call. Kept distinct from [`Self::record_restart_or_stop`], which
-    /// owns the orthogonal sliding-window health *policy*.
+    /// a single call. The supervisor owns the restart limit.
     fn record_restart(&mut self, event: RuntimeRestartEvent) {
         self.restart_stats.observe(&event.cause);
         log_restart(&event, self.restart_stats.total);
@@ -2030,77 +2020,6 @@ impl ProjectActorState {
         })
     }
 
-    fn record_restart_or_stop(
-        &mut self,
-        cause: RestartCause,
-        reason: &str,
-    ) -> std::result::Result<(), RestartLimitExceeded> {
-        if !cause.counts_toward_restart_limit() {
-            return Ok(());
-        }
-        let now = Instant::now();
-        while self
-            .abnormal_restart_times
-            .front()
-            .is_some_and(|seen| now.saturating_duration_since(*seen) > self.config.restart_window)
-        {
-            self.abnormal_restart_times.pop_front();
-        }
-        if self.abnormal_restart_times.len() >= self.config.max_restarts_per_window {
-            self.config.healthy.store(false, Ordering::Release);
-            tracing::warn!(
-                cause = cause.as_str(),
-                restarts_in_window = self.abnormal_restart_times.len(),
-                window_millis = millis_u64(self.config.restart_window),
-                "restart limit exceeded; marking project unhealthy"
-            );
-            let message = format!(
-                "restart_limit_exceeded after {} restarts in {:?}; latest: {reason}",
-                self.config.max_restarts_per_window, self.config.restart_window
-            );
-            let event = restart_event(
-                cause,
-                message.clone(),
-                self.observed_generation(),
-                self.last_rss_kib,
-                None,
-            );
-            self.record_restart(event.clone());
-            self.publish_runtime(
-                &RuntimeFacts {
-                    cli_file_verification: None,
-                    worker_generation: self.observed_generation(),
-                    worker_restarted: false,
-                    retry_count: 0,
-                    final_attempt: FinalAttemptStatus::Interrupted,
-                    previous_attempt_failure: None,
-                    queue_wait_millis: 0,
-                    call_elapsed_millis: 0,
-                    call_cpu_millis: None,
-                    call_restart: None,
-                    last_restart: Some(event),
-                    rss_kib: self.last_rss_kib,
-                    worker_lanes: 1,
-                    import_profile: self.current_import_profile().map(str::to_owned),
-                    profile_switch_count: self.profile_switch_count,
-                    restarts_total: self.restart_stats.total,
-                    restarts_by_cause: self.restart_stats.by_cause.clone(),
-                    import_residue_bytes: Some(self.handle.lifecycle_snapshot().import_residue_bytes),
-                    import_residue_limit_bytes: self.config.import_residue_budget_bytes.into(),
-                },
-                None,
-            );
-            return Err(RestartLimitExceeded {
-                message,
-                cause,
-                restarts_in_window: self.abnormal_restart_times.len() as u64,
-                window_millis: millis_u64(self.config.restart_window),
-            });
-        }
-        self.abnormal_restart_times.push_back(now);
-        Ok(())
-    }
-
     fn observed_generation(&self) -> u64 {
         self.worker_generation_base
             .saturating_add(self.handle.lifecycle_snapshot().worker_generation)
@@ -2110,7 +2029,6 @@ impl ProjectActorState {
         &self,
         meta: &JobMeta,
         generation_before: u64,
-        retry_count: u32,
         queue_wait_millis: u64,
         call_elapsed_millis: u64,
         call_cpu_millis: Option<u64>,
@@ -2122,7 +2040,7 @@ impl ProjectActorState {
             cli_file_verification: None,
             worker_generation: generation,
             worker_restarted: call_restart.is_some() || generation > generation_before,
-            retry_count,
+            retry_count: 0,
             final_attempt: FinalAttemptStatus::Unknown,
             previous_attempt_failure: None,
             queue_wait_millis,
@@ -2177,6 +2095,8 @@ impl ProjectActorState {
                 .take()
                 .filter(|kept| kept.worker_generation == runtime.worker_generation)
         });
+        // A new generation's child started after the exit the actor saw.
+        let child_exited = snapshot.child_exited && snapshot.worker_generation == runtime.worker_generation;
         *snapshot = RuntimeSnapshot {
             worker_generation: runtime.worker_generation,
             last_restart: runtime.last_restart.clone().or_else(|| runtime.call_restart.clone()),
@@ -2187,6 +2107,12 @@ impl ProjectActorState {
             restarts_by_cause: runtime.restarts_by_cause.clone(),
             import_residue_bytes: runtime.import_residue_bytes,
             import_residue_limit_bytes: runtime.import_residue_limit_bytes,
+            restart_retry_after: self
+                .handle
+                .lifecycle_snapshot()
+                .restart_retry_after
+                .map(|wait| (Instant::now(), wait)),
+            child_exited,
             compatibility,
         };
     }
@@ -2217,11 +2143,12 @@ impl ProjectActorState {
             rss_kib: self.last_rss_kib,
             limit_kib,
             retry_after_millis,
-            restarts_in_window: Some(self.abnormal_restart_times.len() as u64),
+            restarts_in_window: Some(self.handle.lifecycle_snapshot().abnormal_restarts_in_window),
             window_millis: Some(millis_u64(self.config.restart_window)),
             runtime: snapshot,
             reason,
             toolchain_advisories: self.config.toolchain_advisories.clone(),
+            not_started: false,
         })
     }
 
@@ -2235,31 +2162,6 @@ impl ProjectActorState {
             None,
             None,
         )
-    }
-
-    fn restart_limit_error(&self, imports: &[String], limit: RestartLimitExceeded) -> ServerError {
-        let snapshot = self.runtime.lock().facts();
-        ServerError::worker_unavailable(WorkerUnavailable {
-            retryable: false,
-            worker_restarted: false,
-            worker_stop_receipt: None,
-            project_root: self.config.lake_root.to_string_lossy().into_owned(),
-            project_hash: self.config.manifest_hash.clone(),
-            imports: imports.to_vec(),
-            session_id: self.config.session_id.clone(),
-            lean_toolchain: self.config.toolchain_label.clone(),
-            worker_generation: self.observed_generation(),
-            reason: limit.message,
-            blocked_by: None,
-            restart_cause: Some(limit.cause.as_str().to_owned()),
-            rss_kib: self.last_rss_kib,
-            limit_kib: None,
-            retry_after_millis: Some(limit.window_millis),
-            restarts_in_window: Some(limit.restarts_in_window),
-            window_millis: Some(limit.window_millis),
-            runtime: snapshot,
-            toolchain_advisories: self.config.toolchain_advisories.clone(),
-        })
     }
 }
 
@@ -2301,22 +2203,17 @@ fn stop_cause(error: &LeanWorkerError, after: &LeanWorkerLifecycleSnapshot) -> &
         _ => after
             .last_restart_reason
             .as_ref()
-            .map_or("worker_stopped", |reason| restart_cause_from_worker(reason).as_str()),
+            .map_or("worker_stopped", LeanWorkerRestartReason::stable_cause),
     }
 }
 
-fn with_stop_receipt(mut error: ServerError, receipt: Option<WorkerStopReceipt>) -> ServerError {
-    if let ServerError::WorkerUnavailable(failure) = &mut error {
-        failure.worker_stop_receipt = receipt;
-    }
-    error
-}
-
-struct RestartLimitExceeded {
-    message: String,
-    cause: RestartCause,
-    restarts_in_window: u64,
-    window_millis: u64,
+/// Why a call failed while abnormal restarts keep the worker down.
+fn restart_limit_reason(restarts: u64, window: Duration, retry_after: Duration) -> String {
+    format!(
+        "restart_limit_exceeded: {restarts} abnormal worker restarts within {}s; the worker stays down for {} ms",
+        window.as_secs(),
+        millis_u64(retry_after)
+    )
 }
 
 fn actor_main(
@@ -2358,7 +2255,6 @@ fn actor_main(
         profile_switch_count: 0,
         last_rss_kib: None,
         runtime: Arc::clone(&config.runtime),
-        abnormal_restart_times: VecDeque::new(),
         restart_stats: RestartStats::default(),
         cycled_while_idle: false,
     };
@@ -2478,14 +2374,19 @@ fn open_worker(config: &ActorConfig) -> Result<(LeanWorkerHostHandle, String)> {
 /// as the guard against a child that reports no residue at all.
 ///
 /// Still no `max_rss_kib`, no `max_requests`, no `rss_hard_limit`. The Lean heap
-/// is backstopped above this by [`ProjectRuntimeConfig::lean_max_memory_kib`];
-/// the crash-loop breaker ([`ProjectRuntimeConfig::max_restarts_per_window`])
-/// and the request deadline are this actor's own.
+/// is backstopped above this by [`ProjectRuntimeConfig::lean_max_memory_kib`].
+/// The supervisor counts abnormal restarts against
+/// [`ProjectRuntimeConfig::max_restarts_per_window`] within
+/// [`ProjectRuntimeConfig::restart_window`] and refuses the next, leaving the
+/// worker down until the oldest leaves the window.
 fn residue_restart_policy(config: &ActorConfig) -> LeanWorkerRestartPolicy {
     LeanWorkerRestartPolicy::default()
         .max_import_residue_bytes(config.import_residue_budget_bytes)
         .max_imports(WORKER_MAX_IMPORTS_BACKSTOP)
-        .max_restarts_per_window(SUPERVISOR_RESTART_INTENSITY, RESTART_WINDOW)
+        .max_restarts_per_window(
+            u64::try_from(config.max_restarts_per_window).unwrap_or(u64::MAX),
+            config.restart_window,
+        )
 }
 
 /// The worker child of one actor generation, ordinary or companion: the
@@ -2564,13 +2465,6 @@ fn module_cache_limits() -> LeanWorkerModuleCacheLimits {
 fn actor_thread_name(canonical_root: &Path) -> String {
     let basename = canonical_root.file_name().and_then(|s| s.to_str()).unwrap_or("project");
     format!("lean-host-mcp/project/{basename}")
-}
-
-fn worker_error_is_recoverable_death(err: &LeanWorkerError) -> bool {
-    matches!(
-        err,
-        LeanWorkerError::ChildExited { .. } | LeanWorkerError::ChildPanicOrAbort { .. }
-    )
 }
 
 fn worker_error_is_session_missing(err: &LeanWorkerError) -> bool {

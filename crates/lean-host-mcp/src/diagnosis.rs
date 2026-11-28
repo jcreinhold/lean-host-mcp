@@ -291,64 +291,33 @@ where
 pub(crate) const WORKER_RECYCLED_STATUS: &str = "worker_recycled";
 
 /// Recognise that this call's verdict was computed under infrastructure duress:
-/// the worker was recycled or restarted *during* the call by a job-disrupting
-/// cause, so a non-positive Lean verdict (a rejection, `not_found`, timeout) is
-/// not reliable evidence about the declaration — it may be a casualty of the
-/// recycle, not a real result.
+/// the worker restarted for a reason nobody planned before the call's final
+/// attempt completed, so a non-positive Lean verdict (a rejection,
+/// `not_found`, timeout) is not reliable evidence about the declaration — it
+/// may be a casualty of the restart, not a real result.
 ///
-/// Returns a disrupting final-attempt `call_restart`, or an earlier attempt's
-/// failure unless the controller explicitly recorded a completed retry. A
-/// completed retry does not excuse a new failure in its own attempt.
-/// `max_requests` / `max_imports` / `import_residue` /
-/// `import_residue_idle` / `import_accounting_unknown` / `idle` / `explicit` are excluded: they are planned
-/// hygiene cycles, not duress. A residue cycle in particular runs *before* the
-/// import that would have crossed the budget, so the call it precedes runs in a
-/// fresh child under no pressure at all — the opposite of the RSS causes below,
-/// which fire only once pressure is already being felt.
+/// A final attempt the controller recorded as completed is never tainted. The
+/// supervisor makes its restarts before it sends a request and resends one
+/// only when the child it lost never ran it, so a value that came back ran
+/// once, on the child that answered, even after an abnormal replacement of a
+/// child lost before the call. Otherwise this returns the call's unplanned
+/// `call_restart`, or else an earlier attempt's failure.
 ///
-/// `rss_post_job` *is* job-disrupting even though it fires after the job
-/// returned `Ok`: crossing the post-job RSS budget means the job elaborated
-/// under heavy memory pressure, and report 62 §A documented that exact
-/// condition degrading a verdict — a *valid* lemma returned `not_found` while
-/// the worker sat 2.4 GiB over its 5 GiB cap. The worker returns a degraded
-/// value rather than crashing, so "the job returned `Ok`" is not evidence the
-/// verdict is sound. A `verified` verdict is never relabeled regardless, so a
-/// marginal-overage false positive only costs a retry hint.
-///
-/// This server no longer configures either RSS threshold — one Lean *heap*
-/// budget replaced them — so `rss_post_job` and `rss_hard_limit_exceeded`
-/// cannot fire under the shipped policy. They stay classified because
-/// `restart_cause_from_worker` still maps the upstream causes, and a
-/// classifier that silently reclassifies a cause it stops expecting is worse
-/// than one that keeps a quiet arm.
-///
-/// The cause strings mirror `crate::project::restart::RestartCause::as_str`; the unit
-/// test below pins the disrupting set so a new cause there is a conscious
-/// decision here.
+/// Planned cycles never taint: the supervisor's request, import, residue,
+/// idle and RSS-ceiling cycles, an explicit cycle, and this server's
+/// `artifacts_rebuilt` and `import_residue_idle`. The supervisor marks which of
+/// its restarts were planned, and
+/// `crate::project::restart::RestartCause::is_planned` marks this server's own,
+/// so a new cause is classified where it is named.
 pub(crate) fn execution_taint(runtime: &RuntimeFacts) -> Option<&RuntimeRestartEvent> {
+    if runtime.final_attempt == crate::envelope::FinalAttemptStatus::Completed {
+        return None;
+    }
     runtime
         .call_restart
         .as_ref()
-        .filter(|event| restart_disrupts_result(event))
-        .or_else(|| {
-            (runtime.final_attempt != crate::envelope::FinalAttemptStatus::Completed)
-                .then_some(runtime.previous_attempt_failure.as_ref())
-                .flatten()
-        })
-}
-
-pub(crate) fn restart_disrupts_result(event: &RuntimeRestartEvent) -> bool {
-    matches!(
-        event.cause.as_str(),
-        "rss_post_job"
-            | "rss_hard_limit_exceeded"
-            | "child_abort"
-            | "child_exit"
-            | "session_missing"
-            | "worker_internal"
-            | "timeout"
-            | "cancelled"
-    )
+        .filter(|event| !event.planned)
+        .or(runtime.previous_attempt_failure.as_ref())
 }
 
 /// The canonical `(warning, next_action)` pair for an execution-tainted verdict.
@@ -575,13 +544,13 @@ mod tests {
         assert!(matches!(classify_missing_olean(Ok(7)), Ok(CallOutcome::Ready(7))));
     }
 
-    fn facts_with_restart(cause: &str) -> RuntimeFacts {
+    fn facts_with_restart(cause: &str, planned: bool) -> RuntimeFacts {
         RuntimeFacts {
             call_restart: Some(RuntimeRestartEvent {
                 cause: cause.to_owned(),
                 reason: format!("{cause} current_kib=7000000 limit_kib=5000000"),
                 worker_generation: 9,
-                planned: false,
+                planned,
                 rss_kib: Some(7_000_000),
                 limit_kib: Some(5_000_000),
             }),
@@ -590,80 +559,85 @@ mod tests {
     }
 
     #[test]
-    fn execution_taint_flags_job_disrupting_causes_only() {
-        // Job-disrupting causes taint the verdict.
+    fn execution_taint_flags_unplanned_restarts_only() {
+        // A restart nobody planned taints the verdict.
         for cause in [
-            "rss_post_job",
-            "rss_hard_limit_exceeded",
+            "rss_hard_limit",
             "child_abort",
             "child_exit",
             "session_missing",
+            "request_failed",
+            "start_failed",
             "worker_internal",
             "timeout",
             "cancelled",
         ] {
             assert!(
-                execution_taint(&facts_with_restart(cause)).is_some(),
+                execution_taint(&facts_with_restart(cause, false)).is_some(),
                 "{cause} should taint the verdict"
             );
         }
-        // Planned hygiene cycles do not: the cycle was routine.
+        // A planned cycle runs before the call it precedes, so it does not.
         for cause in [
             "max_requests",
             "max_imports",
             "import_residue",
             "import_residue_idle",
             "import_accounting_unknown",
+            "rss_ceiling",
             "idle",
             "explicit",
+            "artifacts_rebuilt",
         ] {
             assert!(
-                execution_taint(&facts_with_restart(cause)).is_none(),
+                execution_taint(&facts_with_restart(cause, true)).is_none(),
                 "{cause} should not taint the verdict"
             );
         }
+        // The flag decides, not the name.
+        assert!(execution_taint(&facts_with_restart("explicit", false)).is_some());
+        assert!(execution_taint(&facts_with_restart("child_abort", true)).is_none());
         // No restart at all: nothing to flag.
         assert!(execution_taint(&RuntimeFacts::default()).is_none());
     }
 
+    /// Only a final attempt the controller recorded as completed is clean. It
+    /// clears an earlier attempt's failure and an abnormal replacement made
+    /// before the request reached its child; an unfinished one keeps both.
     #[test]
-    fn only_explicit_completed_retry_clears_previous_failure_not_final_restart() {
+    fn only_a_completed_final_attempt_clears_a_restart_or_earlier_failure() {
         use crate::envelope::FinalAttemptStatus;
-        let failure = facts_with_restart("child_abort").call_restart;
+        let failure = facts_with_restart("child_abort", false).call_restart;
         for status in [
             FinalAttemptStatus::Unknown,
             FinalAttemptStatus::Interrupted,
             FinalAttemptStatus::Completed,
         ] {
+            let completed = status == FinalAttemptStatus::Completed;
             let mut facts = RuntimeFacts {
                 retry_count: 1,
                 final_attempt: status,
                 previous_attempt_failure: failure.clone(),
                 ..RuntimeFacts::default()
             };
-            assert_eq!(
-                execution_taint(&facts).is_none(),
-                status == FinalAttemptStatus::Completed
-            );
+            assert_eq!(execution_taint(&facts).is_none(), completed, "{status:?}");
+            facts.previous_attempt_failure = None;
             facts.call_restart = failure.clone();
-            assert!(
-                execution_taint(&facts).is_some(),
-                "final-attempt abort must never be excused"
-            );
+            assert_eq!(execution_taint(&facts).is_none(), completed, "{status:?}");
         }
     }
 
     #[test]
     fn execution_taint_text_names_cause_and_rss_and_offers_a_retry() {
         let (warning, next_action) = execution_taint_text(&RuntimeRestartEvent {
-            cause: "rss_post_job".to_owned(),
+            cause: "rss_hard_limit".to_owned(),
             reason: String::new(),
             worker_generation: 1,
             planned: false,
             rss_kib: Some(7_600_000),
             limit_kib: Some(5_242_880),
         });
-        assert!(warning.contains("rss_post_job"));
+        assert!(warning.contains("rss_hard_limit"));
         assert!(warning.contains("7600000"));
         assert!(warning.contains("5242880"));
         assert!(warning.contains("not trustworthy"));
